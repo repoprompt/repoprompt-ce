@@ -841,12 +841,34 @@ final class ClaudeContextWindowCapLifecycleTests: XCTestCase {
         let legacyDecoded = try JSONDecoder().decode(AgentSession.self, from: JSONSerialization.data(withJSONObject: legacy))
         XCTAssertNil(legacyDecoded.contextWindowCapacity)
         XCTAssertEqual(legacyDecoded.codexContextWindow, 400_000)
+    }
 
-        // The fast metadata header tolerates a malformed capacity instead of failing the file.
-        let malformed = try JSONDecoder().decode(AgentSessionDataService.LenientContextWindowCapacity.self, from: Data(#""bogus""#.utf8))
-        XCTAssertNil(malformed.value)
-        let wellFormed = try JSONDecoder().decode(AgentSessionDataService.LenientContextWindowCapacity.self, from: JSONEncoder().encode(capacity))
-        XCTAssertEqual(wellFormed.value, capacity)
+    /// One malformed capacity must not fail a session file: the retirement scan maps every header
+    /// with a throwing decode, so a throw there would fail the whole scan.
+    func testSessionHeaderLoadTreatsAMalformedCapacityAsAbsent() async throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ClaudeCapacityHeader-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let capacity = AgentContextWindowCapacity(tokens: 1_000_000, agentRaw: "claudeCode", modelRaw: "claude-fable-5")
+        let session = AgentSession(id: UUID(), name: "Capacity header", contextWindowCapacity: capacity)
+        var payload = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(session)) as? [String: Any])
+
+        func loadStub(named name: String) async throws -> AgentSession {
+            let fileURL = folder.appendingPathComponent("AgentSession-\(name).json")
+            try JSONSerialization.data(withJSONObject: payload).write(to: fileURL)
+            return try await AgentSessionDataService.shared.loadAgentSessionStub(from: fileURL)
+        }
+
+        let wellFormed = try await loadStub(named: "well-formed")
+        XCTAssertEqual(wellFormed.contextWindowCapacity, capacity)
+
+        for malformed: Any in ["bogus", 12, ["tokens": "many"]] {
+            payload["contextWindowCapacity"] = malformed
+            let stub = try await loadStub(named: "malformed")
+            XCTAssertEqual(stub.id, session.id, "The session survives")
+            XCTAssertNil(stub.contextWindowCapacity)
+        }
     }
 
     // MARK: - Runtime init

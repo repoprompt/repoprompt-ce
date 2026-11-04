@@ -146,6 +146,20 @@ struct AgentTokenUsagePersist: Codable, Equatable {
 
 // MARK: - Agent Session
 
+/// A model's own context capacity, scoped to the provider and model it was reported for, so a
+/// value from another model never bounds or sizes this one.
+struct AgentContextWindowCapacity: Codable, Equatable {
+    var tokens: Int
+    var agentRaw: String
+    /// The base model without its effort suffix (see `modelKey(forRaw:)`): effort does not change capacity.
+    var modelRaw: String
+
+    /// The identity a capacity is stored under: the base model, or the default model when none is named.
+    static func modelKey(forRaw raw: String?) -> String {
+        ClaudeModelSpecifier(raw: raw).baseModel ?? AgentModel.defaultModel.rawValue
+    }
+}
+
 /// Persisted agent mode session containing the chat transcript and configuration
 struct AgentSession: Codable, Identifiable {
     // 9 adds the granular observer-session Auto-wake target UUID set.

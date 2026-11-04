@@ -111,7 +111,7 @@ actor AgentSessionDataService {
 
     // MARK: - Lightweight decode helpers
 
-    struct LenientContextWindowCapacity: Decodable {
+    private struct LenientContextWindowCapacity: Decodable {
         let value: AgentContextWindowCapacity?
 
         init(from decoder: Decoder) throws {
