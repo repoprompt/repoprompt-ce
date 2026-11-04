@@ -39,7 +39,7 @@ class CandidateTests(unittest.TestCase):
                                  (self.head, self.base, self.tree))
                 self.assertEqual(context['profile'], admission.PROFILE)
                 self.assertEqual(context['timing_policy'], 'clean-enforcing')
-                self.assertEqual(context['products'], 'sentry-privacy-and-release-smoke')
+                self.assertEqual(context['products'], 'sentry-privacy')
 
     def test_reject_wrong_queue_head_ref_action_base_and_zero_base(self):
         group = {'base_sha': self.base, 'head_sha': self.head,
@@ -102,6 +102,22 @@ class CheckoutTests(unittest.TestCase):
         self.assertEqual(self.command('verify', '2', context=json.dumps(second)).returncode, 0)
         with self.assertRaisesRegex(ValueError, 'identity mismatch'):
             admission.verify_build_identity({'producer': 'build-test-bundles', 'context': first}, second)
+
+    def test_legacy_release_profile_cannot_be_relabelled_as_current_integration(self):
+        context = self.context()
+        # Profile and obligations must move together. Neither a legacy receipt
+        # nor a hybrid may be consumed under the new integration guarantee.
+        for fields in (
+            {'profile': 'integration-v1', 'products': 'sentry-privacy-and-release-smoke'},
+            {'profile': 'integration-v1'},
+            {'products': 'sentry-privacy-and-release-smoke'},
+            {'products': ''},
+        ):
+            with self.subTest(fields=fields):
+                result = self.command('verify', context=json.dumps({**context, **fields}))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('Admission failed:', result.stderr)
+        self.assertEqual(self.command('verify', context=json.dumps(context)).returncode, 0)
 
     def test_binding_rejects_other_tree_commit_run_profile_and_producer(self):
         context = self.context()
@@ -166,7 +182,7 @@ class TimingProtocolTests(unittest.TestCase):
             timing = metadata.with_name('typecheck-timing.json')
             timing.write_text('{stale measurement')
             baseline = root / 'baseline.json'
-            baseline.write_text(json.dumps({'typecheck': {}}))
+            baseline.write_text(json.dumps({'typecheck': {}, 'warnings': {'first_party_unique': 0}}))
             with mock.patch.object(ci_build, 'ROOT', root), mock.patch.object(ci_build, 'BASELINE', baseline), \
                     mock.patch.dict('os.environ', {'TYPECHECK_RATCHET_ENFORCE': '1'}), \
                     mock.patch.object(ci_build.subprocess, 'run', return_value=subprocess.CompletedProcess([], 2)):
@@ -182,7 +198,8 @@ class TimingProtocolTests(unittest.TestCase):
                 root = Path(directory)
                 baseline = root / 'baseline.json'
                 baseline.write_text(json.dumps({'typecheck': {
-                    'function_bodies_1000ms': 0, 'expressions_500ms': budget}}))
+                    'function_bodies_1000ms': 0, 'expressions_500ms': budget},
+                    'warnings': {'first_party_unique': 0}}))
                 process = mock.Mock(stdout=io.StringIO(warning + warning))
                 process.wait.return_value = build_status
                 listing = subprocess.CompletedProcess([], 0, stdout='CoreTests.Example/testOne\n')

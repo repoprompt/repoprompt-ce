@@ -282,38 +282,48 @@ import XCTest
         }
 
         func testExportBoundaryDecodesCanonicalGroupAndRejectsMalformedEnvelope() throws {
-            let group = try OracleGroupResult(
-                groupID: OracleGroupID(rawValue: UUID()),
-                status: .partialFailure,
-                oracleResults: [
-                    OracleLaneResult(
-                        laneIndex: 0,
-                        chatID: "chat-0",
-                        providerID: "provider-0",
-                        modelID: "model-0",
-                        status: .completed,
-                        response: "response-0"
-                    ),
-                    OracleLaneResult(
-                        laneIndex: 1,
-                        chatID: "chat-1",
-                        providerID: "provider-1",
-                        modelID: "model-1",
-                        status: .failed,
-                        error: OracleLaneError(
-                            code: "failed",
-                            message: "lane failed",
-                            partialResponse: "partial-1"
+            let groupID = OracleGroupID(rawValue: UUID())
+            func result(elapsedSeconds: Double? = nil) throws -> OracleGroupResult {
+                try OracleGroupResult(
+                    groupID: groupID,
+                    status: .partialFailure,
+                    oracleResults: [
+                        OracleLaneResult(
+                            laneIndex: 0,
+                            chatID: "chat-0",
+                            providerID: "provider-0",
+                            modelID: "model-0",
+                            status: .completed,
+                            elapsedSeconds: elapsedSeconds,
+                            response: "response-0",
+                            assistantReplyID: elapsedSeconds == nil ? nil : groupID.rawValue
+                        ),
+                        OracleLaneResult(
+                            laneIndex: 1,
+                            chatID: "chat-1",
+                            providerID: "provider-1",
+                            modelID: "model-1",
+                            status: .failed,
+                            elapsedSeconds: elapsedSeconds,
+                            error: OracleLaneError(
+                                code: "failed",
+                                message: "lane failed",
+                                partialResponse: "partial-1"
+                            ),
+                            assistantReplyID: elapsedSeconds == nil ? nil : groupID.rawValue
                         )
-                    )
-                ],
-                warnings: [OracleGroupWarning(code: "warning", message: "group warning")]
-            )
+                    ],
+                    warnings: [OracleGroupWarning(code: "warning", message: "group warning")]
+                )
+            }
+            let group = try result(elapsedSeconds: 12.5)
+            let wireProjection = try result()
             var fields = OracleGroupMCPCodec.groupFields(group)
             fields["chat_id"] = .string(group.primary.chatID)
             fields["response"] = try .string(XCTUnwrap(group.primary.response))
 
-            XCTAssertEqual(try MCPOracleToolService.decodeOracleGroupResultForExport(fields), group)
+            XCTAssertEqual(OracleGroupMCPCodec.groupFields(group), OracleGroupMCPCodec.groupFields(wireProjection))
+            XCTAssertEqual(try MCPOracleToolService.decodeOracleGroupResultForExport(fields), wireProjection)
             XCTAssertNil(try MCPOracleToolService.decodeOracleGroupResultForExport([
                 "chat_id": .string("legacy"),
                 "response": .string("legacy response")
@@ -325,40 +335,47 @@ import XCTest
 
         func testTwoOracleExportRetainsCanonicalGroupDetails() throws {
             let groupID = try XCTUnwrap(UUID(uuidString: "11111111-1111-1111-1111-111111111111"))
-            let group = try OracleGroupResult(
-                groupID: OracleGroupID(rawValue: groupID),
-                status: .partialFailure,
-                oracleResults: [
-                    OracleLaneResult(
-                        laneIndex: 0,
-                        chatID: "primary-chat",
-                        providerID: "configured-primary-provider",
-                        modelID: "configured-primary-model",
-                        status: .completed,
-                        executionProfile: OracleExecutionProfile(
-                            providerID: "executed-primary-provider",
-                            modelID: "executed-primary-model",
-                            effectiveReasoningEffort: "high"
+            func result(elapsedSeconds: Double? = nil) throws -> OracleGroupResult {
+                try OracleGroupResult(
+                    groupID: OracleGroupID(rawValue: groupID),
+                    status: .partialFailure,
+                    oracleResults: [
+                        OracleLaneResult(
+                            laneIndex: 0,
+                            chatID: "primary-chat",
+                            providerID: "configured-primary-provider",
+                            modelID: "configured-primary-model",
+                            status: .completed,
+                            elapsedSeconds: elapsedSeconds,
+                            executionProfile: OracleExecutionProfile(
+                                providerID: "executed-primary-provider",
+                                modelID: "executed-primary-model",
+                                effectiveReasoningEffort: "high"
+                            ),
+                            response: "Primary lane answer",
+                            assistantReplyID: elapsedSeconds == nil ? nil : groupID
                         ),
-                        response: "Primary lane answer"
-                    ),
-                    OracleLaneResult(
-                        laneIndex: 1,
-                        chatID: "secondary-chat",
-                        providerID: "configured-secondary-provider",
-                        modelID: "configured-secondary-model",
-                        status: .failed,
-                        error: OracleLaneError(
-                            code: "provider_failed",
-                            message: "Secondary provider failed",
-                            partialResponse: "Secondary partial answer"
+                        OracleLaneResult(
+                            laneIndex: 1,
+                            chatID: "secondary-chat",
+                            providerID: "configured-secondary-provider",
+                            modelID: "configured-secondary-model",
+                            status: .failed,
+                            elapsedSeconds: elapsedSeconds,
+                            error: OracleLaneError(
+                                code: "provider_failed",
+                                message: "Secondary provider failed",
+                                partialResponse: "Secondary partial answer"
+                            ),
+                            assistantReplyID: elapsedSeconds == nil ? nil : groupID
                         )
-                    )
-                ],
-                warnings: [
-                    OracleGroupWarning(code: "lane_failure", message: "One lane failed")
-                ]
-            )
+                    ],
+                    warnings: [
+                        OracleGroupWarning(code: "lane_failure", message: "One lane failed")
+                    ]
+                )
+            }
+            let group = try result(elapsedSeconds: 65.25)
             let request = OracleExportRequest(
                 sourceTool: "oracle_send",
                 mode: "review",
@@ -369,6 +386,11 @@ import XCTest
             )
 
             let markdown = AgentOracleExport.oracleMarkdown(request: request)
+            let timingFree = try OracleExportRequest(
+                sourceTool: "oracle_send", mode: "review", message: "Review it",
+                chatID: "primary-chat", response: "Primary lane answer", groupResult: result()
+            )
+            XCTAssertEqual(markdown, AgentOracleExport.oracleMarkdown(request: timingFree))
 
             XCTAssertTrue(markdown.hasPrefix("# Oracle Review\n\n"))
             XCTAssertTrue(markdown.contains("- Group ID: `\(groupID.uuidString)`"))
