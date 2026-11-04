@@ -217,7 +217,7 @@ struct AgentModeChatDetailView: View {
     /// Non-grouped state
     @State private var resetTextFieldTrigger = false
     // Held without observation so drag updates re-render only the overlay, not the pane.
-    @State private var imageDropController = AgentImageDropController()
+    @State private var attachmentDropController = AgentAttachmentDropController()
     @State private var isTranscriptWindowExpanded = false
 
     // MARK: - Computed Shims (bridge existing references to struct members)
@@ -1783,21 +1783,22 @@ struct AgentModeChatDetailView: View {
             }
             .frame(maxHeight: .infinity)
             .overlay {
-                AgentImageDropOverlay(controller: imageDropController)
+                AgentAttachmentDropOverlay(controller: attachmentDropController)
             }
-            .onDrop(of: AgentImagePaneDropDelegate.acceptedTypes, delegate: imagePaneDropDelegate)
-            .environment(\.agentImageDropController, imageDropController)
+            .onDrop(of: AgentAttachmentPaneDropDelegate.acceptedTypes, delegate: attachmentPaneDropDelegate)
+            .environment(\.agentAttachmentDropController, attachmentDropController)
+            .environment(\.agentAttachmentDropHandler, attachmentPaneDropDelegate.performDrop(pasteboard:))
         }
     }
 
-    private var imagePaneDropDelegate: AgentImagePaneDropDelegate {
+    private var attachmentPaneDropDelegate: AgentAttachmentPaneDropDelegate {
         let tabID = currentTabID
         let agentModeVM = agentModeVM
-        return AgentImagePaneDropDelegate(
-            controller: imageDropController,
+        return AgentAttachmentPaneDropDelegate(
+            controller: attachmentDropController,
             currentTabID: { tabID },
-            prepareAttachImages: { tabID in
-                agentModeVM.prepareImageAttachmentIntake(tabID: tabID)
+            prepareAttach: { tabID in
+                agentModeVM.prepareAttachmentIntake(tabID: tabID)
             }
         )
     }

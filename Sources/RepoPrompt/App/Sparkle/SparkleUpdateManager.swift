@@ -136,6 +136,22 @@ final class SparkleUpdaterManager: ObservableObject {
     /// How often to check for updates (12 hours in seconds)
     private nonisolated static let updateCheckInterval: TimeInterval = 12 * 60 * 60
 
+    /// Minimum spacing between activation-triggered passive checks. Without an activation path a
+    /// release published after the last passive check stays hidden until the 12-hour timer fires
+    /// or the user checks manually (#110). Every passive attempt (launch, timer, activation)
+    /// re-anchors the throttle, so a failing feed cannot be hammered on every focus change.
+    nonisolated static let activationCheckMinimumInterval: TimeInterval = 60 * 60
+
+    /// Owns the shared passive-attempt throttle anchor and reserves activation admission
+    /// synchronously, before the check task is enqueued.
+    private lazy var activationCheckCoordinator = SparkleActivationCheckCoordinator { [weak self] in
+        Task { [weak self] in
+            await self?.performPassiveAppcastCheck()
+        }
+    }
+
+    private var activationCheckObserverInstalled = false
+
     /// UserDefaults key for last passive appcast check timestamp
     private nonisolated static let lastCheckKey = "SparkleLastUpdateCheck"
 
@@ -326,6 +342,7 @@ final class SparkleUpdaterManager: ObservableObject {
             discoveryEnabled = true
             forceSparkleAutomaticChecksOff()
             setupPeriodicUpdateCheck()
+            setupActivationUpdateCheck()
             return
         case .start:
             discoveryEnabled = true
@@ -345,6 +362,7 @@ final class SparkleUpdaterManager: ObservableObject {
 
         // Setup periodic passive update checking if enabled.
         setupPeriodicUpdateCheck()
+        setupActivationUpdateCheck()
     }
 
     nonisolated static func startDecision(
@@ -414,9 +432,57 @@ final class SparkleUpdaterManager: ObservableObject {
 
     @discardableResult
     private func performPassiveAppcastCheck() async -> Bool {
-        await Self.performPassiveAppcastCheck {
+        activationCheckCoordinator.recordPassiveAttempt(at: Date())
+        return await Self.performPassiveAppcastCheck {
             await self.checkAppcastDirectly()
         }
+    }
+
+    /// Re-checks the appcast in the background when the app becomes active, so a release
+    /// published while the app stayed open is discovered on the next focus instead of hours later.
+    /// The launch itself anchors the throttle: the initial and periodic checks already cover it.
+    private func setupActivationUpdateCheck() {
+        guard !activationCheckObserverInstalled else { return }
+        activationCheckObserverInstalled = true
+        activationCheckCoordinator.recordPassiveAttempt(at: Date())
+        NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.performActivationUpdateCheckIfNeeded()
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    /// Respects the passive-check preference, never overlaps an in-flight passive or
+    /// user-initiated check, and is throttled to `activationCheckMinimumInterval`.
+    /// Admission is reserved in this turn by the coordinator, so activations that arrive before
+    /// the enqueued check starts cannot also pass the throttle.
+    func performActivationUpdateCheckIfNeeded(now: Date = Date()) {
+        activationCheckCoordinator.activationDidOccur(
+            now: now,
+            eligibility: .init(
+                passiveChecksEnabled: discoveryEnabled && sparkleConfigurationValid && automaticallyChecksForUpdates,
+                checkInFlight: appcastCheckState == .checking || userInitiatedObserverState.activeRequest != nil,
+                lastSuccessfulCheckTimestamp: UserDefaults.standard.double(forKey: Self.lastCheckKey)
+            )
+        )
+    }
+
+    /// Pure throttle decision for activation re-checks. `lastSuccessfulCheckTimestamp` is the
+    /// persisted `SparkleLastUpdateCheck` value (0 when never checked); `lastAttempt` is the
+    /// in-memory anchor shared by every passive attempt, successful or not.
+    nonisolated static func shouldPerformActivationCheck(
+        lastSuccessfulCheckTimestamp: TimeInterval,
+        lastAttempt: Date?,
+        now: Date,
+        minimumInterval: TimeInterval = activationCheckMinimumInterval
+    ) -> Bool {
+        if let lastAttempt, now.timeIntervalSince(lastAttempt) < minimumInterval {
+            return false
+        }
+        guard lastSuccessfulCheckTimestamp > 0 else { return true }
+        return now.timeIntervalSince1970 - lastSuccessfulCheckTimestamp >= minimumInterval
     }
 
     @discardableResult

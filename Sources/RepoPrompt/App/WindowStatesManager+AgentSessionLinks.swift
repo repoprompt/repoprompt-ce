@@ -266,14 +266,18 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         guard let owner = preparedOversightWindows[sessionID] else { return true }
         guard preparedOversightPreparationInFlight[sessionID, default: 0] <= (preparingReplacement ? 1 : 0),
               owner.agentModeViewModel.sessions.values.allSatisfy({ !$0.runState.isActive }),
-              await !(AgentRunSessionStore.hasActiveRegistration(sessionID: sessionID)) else { return false }
+              await !(AgentRunSessionStore.hasActiveRegistration(sessionID: sessionID)),
+              await !owner.agentModeViewModel.preparedOversightRuntimeIsBusy(),
+              preparedOversightWindows[sessionID] === owner else { return false }
         beginPreparedOversightPreparation(sessionID)
         preparedOversightHandoffs.insert(sessionID)
         defer {
             endPreparedOversightPreparation(sessionID)
             preparedOversightHandoffs.remove(sessionID)
         }
-        guard await owner.agentModeViewModel.settlePreparedOversightHandoff() else { return false }
+        guard await owner.agentModeViewModel.settlePreparedOversightHandoff(),
+              await !owner.agentModeViewModel.preparedOversightRuntimeIsBusy(),
+              preparedOversightWindows[sessionID] === owner else { return false }
         // Withdraw and capture the old exact endpoint before yielding to its final save. This parks
         // the durable link for re-establishment at the newly visited binding, rather than relinking.
         owner.beginClose()
@@ -335,7 +339,9 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
                         preparedOversightOwnerLocations[id] = location
                     }
                     guard owner.agentModeViewModel.sessions.values.allSatisfy({ !$0.runState.isActive }),
-                          await !AgentRunSessionStore.hasActiveRegistration(sessionID: id) else { continue }
+                          await !AgentRunSessionStore.hasActiveRegistration(sessionID: id),
+                          await !owner.agentModeViewModel.preparedOversightRuntimeIsBusy(),
+                          preparedOversightWindows[id] === owner else { continue }
                     if let visit = preparedOversightPendingVisits.removeValue(forKey: id) {
                         await visit()
                     } else if !retained.contains(id), pairs.isEmpty {

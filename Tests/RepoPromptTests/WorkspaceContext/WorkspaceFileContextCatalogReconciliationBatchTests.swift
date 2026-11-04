@@ -183,15 +183,12 @@ final class CatalogBulkAddPerformanceTests: XCTestCase {
     }
 
     func testBulkAddPublicationPreservesIndexesAndEventsWithinBudget() async throws {
-        let smaller = try await measureBulkAddPublication(fileCount: 10000)
-        let larger = try await measureBulkAddPublication(fileCount: 20000)
-        // Double files and folders together: linear work grows 2x and event sorting
-        // about 2.2x. Allow 2.5x, but reject near-quadratic 4x growth without
-        // depending on the shared runner's absolute speed.
-        XCTAssertLessThanOrEqual(larger, smaller * 2.5)
+        for fileCount in [10000, 20000] {
+            try await measureBulkAddPublication(fileCount: fileCount)
+        }
     }
 
-    private func measureBulkAddPublication(fileCount: Int) async throws -> Duration {
+    private func measureBulkAddPublication(fileCount: Int) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let store = WorkspaceFileContextStore(codemapGraphIndexBuildLaunchPolicyForTesting: .disabled)
@@ -210,10 +207,33 @@ final class CatalogBulkAddPerformanceTests: XCTestCase {
         var iterator = events.makeAsyncIterator()
         let filePaths = (0 ..< fileCount).map { "folder-\($0 % folderCount)/child/file-\($0).swift" }
         let deltas = filePaths.map(FileSystemDelta.fileAdded)
+        await store.resetFilesInRootRequestCountForTesting()
+        await store.resetAppliedIndexRecordLookupDiagnosticsForTesting()
         let start = ContinuousClock.now
-        try await store.applyIndexDeltasWithFakeDiskForTesting(rootID: root.id, deltas: deltas)
+        let work = try await store.applyIndexDeltasWithFakeDiskForTesting(rootID: root.id, deltas: deltas)
         let elapsed = start.duration(to: .now)
-        print("CATALOG_BULK_ADD files=\(fileCount) existingFolders=\(folderCount) newFolders=\(folderCount) duration=\(elapsed)")
+        print("CATALOG_BULK_ADD files=\(fileCount) existingFolders=\(folderCount) newFolders=\(folderCount) duration=\(elapsed) sharedRootRecords=\(work.sharedRootInventoryRecords)")
+        // Gate work at the mutation/publication owner rather than comparing two
+        // wall-clock samples on a shared runner. Each file has exactly two
+        // ancestors; discovering its new child folder adds one parent lookup.
+        XCTAssertEqual(work.ancestorMembershipProbes, fileCount * 2)
+        XCTAssertEqual(work.indexedFileVisits, fileCount)
+        XCTAssertEqual(work.parentFolderProbes, fileCount + folderCount)
+        XCTAssertLessThanOrEqual(
+            work.sharedRootInventoryRecords,
+            fileCount + folderCount * 2,
+            "Detach at most one retained inventory, never copy root state for every added file"
+        )
+        let folderEventCount = fileCount * 2 + folderCount
+        func sortBudget(_ count: Int) -> Int {
+            2 * count * Int(ceil(log2(Double(count))))
+        }
+        XCTAssertGreaterThan(work.eventSortComparisons, 0)
+        XCTAssertLessThanOrEqual(work.eventSortComparisons, sortBudget(fileCount) + sortBudget(folderEventCount))
+        let fileEnumerations = await store.fileEnumerationRequestCountForTesting()
+        let recordLookups = await store.appliedIndexRecordLookupDiagnosticsForTesting()
+        XCTAssertEqual(fileEnumerations, 0, "Bulk publication must not enumerate the root's files")
+        XCTAssertEqual(recordLookups.rootSnapshots, 0, "Bulk publication must not materialize whole-root snapshots")
 
         let eventValue = await iterator.next()
         let event = try XCTUnwrap(eventValue)
@@ -252,6 +272,5 @@ final class CatalogBulkAddPerformanceTests: XCTestCase {
         let parent = (first.standardizedRelativePath as NSString).deletingLastPathComponent
         let ancestorPaths = [parent, (parent as NSString).deletingLastPathComponent].sorted()
         XCTAssertEqual(upsert.upsertedFolders, try ancestorPaths.map { try XCTUnwrap(foldersByPath[$0]) })
-        return elapsed
     }
 }

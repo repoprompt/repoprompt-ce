@@ -372,6 +372,11 @@ actor WorkspaceFileContextStore {
     private static let maximumRetainedCodemapPresentationRecordsPerRoot = 64
     private static let maximumCodemapPresentationRequestsPerBundle = 4096
 
+    #if DEBUG
+        /// Follows value copies of a root without changing its canonical indexes.
+        private final class RootMutationOwnership: Sendable {}
+    #endif
+
     private struct RootState {
         let lifetimeID: UUID
         let root: WorkspaceRootRecord
@@ -381,6 +386,9 @@ actor WorkspaceFileContextStore {
         var childFolderIDsByFolderID: [UUID: [UUID]]
         var childFileIDsByFolderID: [UUID: [UUID]]
         var fileExtensionCounts: [String: Int] = [:]
+        #if DEBUG
+            var mutationOwnership = RootMutationOwnership()
+        #endif
     }
 
     private struct FileExtensionCatalogSummary {
@@ -3238,6 +3246,15 @@ actor WorkspaceFileContextStore {
         private var codemapFullRootGraphFreezeCountForTesting = 0
         private var filesInRootRequestCountForTesting = 0
         private var indexDeltaPathsExistForTesting = false
+        struct IndexDeltaPublicationWork {
+            var ancestorMembershipProbes = 0
+            var indexedFileVisits = 0
+            var parentFolderProbes = 0
+            var eventSortComparisons = 0
+            var sharedRootInventoryRecords = 0
+        }
+
+        private var indexDeltaPublicationWorkForTesting: IndexDeltaPublicationWork?
         private var appliedIndexRecordLookupRequestCountForTesting = 0
         private var appliedIndexRecordLookupRequestedRecordCountForTesting = 0
         private var appliedIndexRootSnapshotRequestCountForTesting = 0
@@ -3263,7 +3280,9 @@ actor WorkspaceFileContextStore {
         WorkspaceCodemapRootEpoch: [UUID: CheckedContinuation<Void, Never>]
     ] = [:]
     private var codemapGraphIndexBuildReschedulePendingRootEpochs: Set<WorkspaceCodemapRootEpoch> = []
+    private let codemapRootPausePolicy: WorkspaceCodemapRootPausePolicy
     private var codemapSuspendedRootEpochs: Set<WorkspaceCodemapRootEpoch> = []
+    private var codemapPauseRestoredRootEpochs: Set<WorkspaceCodemapRootEpoch> = []
     private var codemapResumeTransitionIDsByRootEpoch: [WorkspaceCodemapRootEpoch: UUID] = [:]
     private var codemapGraphAccountingByRootEpoch: [
         WorkspaceCodemapRootEpoch: WorkspaceCodemapGraphIncrementalAccounting
@@ -3392,6 +3411,7 @@ actor WorkspaceFileContextStore {
             codemapGraphIndexBuildRetryPolicy: CodemapGraphIndexBuildRetryPolicy = .production,
             nonGitCodeMapsEnabled: Bool = true,
             codeMapsGloballyDisabled: Bool = false,
+            codemapRootPausePolicy: WorkspaceCodemapRootPausePolicy = WorkspaceCodemapRootPausePolicy(),
             codemapGraphIndexBuildLaunchPolicyForTesting: CodemapGraphIndexBuildLaunchPolicyForTesting = .enabled,
             selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory = .production,
             selectionGraphQueryBudgetPolicy: WorkspaceCodemapAutomaticSelectionBudgetPolicy = .initial,
@@ -3430,6 +3450,7 @@ actor WorkspaceFileContextStore {
             self.codemapGraphIndexBuildRetryPolicy = codemapGraphIndexBuildRetryPolicy
             self.nonGitCodeMapsEnabled = nonGitCodeMapsEnabled
             self.codeMapsGloballyDisabled = codeMapsGloballyDisabled
+            self.codemapRootPausePolicy = codemapRootPausePolicy
             self.codemapGraphIndexBuildLaunchPolicyForTesting = codemapGraphIndexBuildLaunchPolicyForTesting
             self.selectionGraphFactory = selectionGraphFactory
             self.selectionGraphQueryBudgetPolicy = selectionGraphQueryBudgetPolicy
@@ -3471,6 +3492,7 @@ actor WorkspaceFileContextStore {
             codemapGraphIndexBuildRetryPolicy: CodemapGraphIndexBuildRetryPolicy = .production,
             nonGitCodeMapsEnabled: Bool = false,
             codeMapsGloballyDisabled: Bool = false,
+            codemapRootPausePolicy: WorkspaceCodemapRootPausePolicy = WorkspaceCodemapRootPausePolicy(),
             selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory = .production,
             selectionGraphQueryBudgetPolicy: WorkspaceCodemapAutomaticSelectionBudgetPolicy = .initial,
             automaticSelectionAccountingMaximum: Int = .max,
@@ -3507,6 +3529,7 @@ actor WorkspaceFileContextStore {
             self.codemapGraphIndexBuildRetryPolicy = codemapGraphIndexBuildRetryPolicy
             self.nonGitCodeMapsEnabled = nonGitCodeMapsEnabled
             self.codeMapsGloballyDisabled = codeMapsGloballyDisabled
+            self.codemapRootPausePolicy = codemapRootPausePolicy
             self.selectionGraphFactory = selectionGraphFactory
             self.selectionGraphQueryBudgetPolicy = selectionGraphQueryBudgetPolicy
             precondition(automaticSelectionAccountingMaximum >= 0)
@@ -7359,13 +7382,19 @@ actor WorkspaceFileContextStore {
 
         /// Exercise canonical mutation/publication without disk probes or watcher
         /// scheduling in the measured interval. This actor-isolated scope never suspends.
-        func applyIndexDeltasWithFakeDiskForTesting(rootID: UUID, deltas: [FileSystemDelta]) throws {
+        @discardableResult
+        func applyIndexDeltasWithFakeDiskForTesting(rootID: UUID, deltas: [FileSystemDelta]) throws -> IndexDeltaPublicationWork {
             let root = try state(for: rootID).root
             let prepared = deltas.compactMap { FileSystemDeltaPreparation.prepare($0, inRoot: root.standardizedFullPath) }
             precondition(!indexDeltaPathsExistForTesting)
             indexDeltaPathsExistForTesting = true
-            defer { indexDeltaPathsExistForTesting = false }
+            indexDeltaPublicationWorkForTesting = IndexDeltaPublicationWork()
+            defer {
+                indexDeltaPathsExistForTesting = false
+                indexDeltaPublicationWorkForTesting = nil
+            }
             applyPreparedIndexDeltaMutations(rootID: rootID, deltas: prepared)
+            return indexDeltaPublicationWorkForTesting!
         }
 
         func replayFileSystemPublicationForInvalidationDiagnosticsForTesting(
@@ -11637,9 +11666,11 @@ actor WorkspaceFileContextStore {
         guard let state = rootStatesByID[rootID] else { return .rootUnavailable }
         let rootEpoch = WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: state.lifetimeID)
 
+        restoreCodemapPausePolicyIfNeeded(rootEpoch: rootEpoch)
         if suspended {
             let cancelledResume = codemapResumeTransitionIDsByRootEpoch.removeValue(forKey: rootEpoch) != nil
             let inserted = codemapSuspendedRootEpochs.insert(rootEpoch).inserted
+            codemapRootPausePolicy.setPaused(true, rootPath: state.root.standardizedFullPath)
             guard inserted || cancelledResume else { return .unchanged }
             codemapGraphIndexBuildReschedulePendingRootEpochs.remove(rootEpoch)
             publishCodemapRootStatusesIfChanged()
@@ -11671,6 +11702,7 @@ actor WorkspaceFileContextStore {
               codemapSuspendedRootEpochs.remove(rootEpoch) != nil
         else { return .unchanged }
         codemapResumeTransitionIDsByRootEpoch.removeValue(forKey: rootEpoch)
+        codemapRootPausePolicy.setPaused(false, rootPath: state.root.standardizedFullPath)
         // The suspension detached this root's authority recovery, but not the requirement it ran
         // for. Restart it before scheduling anything: the schedule below is a no-op while that
         // requirement is registered, and the recovery reschedules the build itself once its scan
@@ -11793,8 +11825,19 @@ actor WorkspaceFileContextStore {
         publishCodemapRootStatusesIfChanged()
     }
 
+    private func restoreCodemapPausePolicyIfNeeded(rootEpoch: WorkspaceCodemapRootEpoch) {
+        guard let state = rootStatesByID[rootEpoch.rootID],
+              state.lifetimeID == rootEpoch.rootLifetimeID,
+              codemapPauseRestoredRootEpochs.insert(rootEpoch).inserted
+        else { return }
+        if codemapRootPausePolicy.isPaused(rootPath: state.root.standardizedFullPath) {
+            codemapSuspendedRootEpochs.insert(rootEpoch)
+        }
+    }
+
     private func codemapGenerationIsSuspended(rootEpoch: WorkspaceCodemapRootEpoch) -> Bool {
-        codeMapsGloballyDisabled || codemapSuspendedRootEpochs.contains(rootEpoch) ||
+        restoreCodemapPausePolicyIfNeeded(rootEpoch: rootEpoch)
+        return codeMapsGloballyDisabled || codemapSuspendedRootEpochs.contains(rootEpoch) ||
             repositoryExcludeObservations[rootEpoch.rootID]?.isBlocked == true
     }
 
@@ -11858,6 +11901,8 @@ actor WorkspaceFileContextStore {
         let launchPhase = codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch]?.phase
         let executionState = codemapGraphIndexExecutionStatesByRootEpoch[rootEpoch]
         let unavailableReason: WorkspaceCodemapRootStatusUnavailableReason? = if codemapCatalogRecoveryRequirementsByRootEpoch[rootEpoch]?.retryExhausted == true {
+            .retryExhausted
+        } else if executionState == .retryExhausted {
             .retryExhausted
         } else if executionState == .exhausted {
             .workerRecoveryExhausted
@@ -12646,6 +12691,7 @@ actor WorkspaceFileContextStore {
             }
             codemapGraphIndexBuildReschedulePendingRootEpochs.remove(rootEpoch)
             codemapSuspendedRootEpochs.remove(rootEpoch)
+            codemapPauseRestoredRootEpochs.remove(rootEpoch)
             codemapResumeTransitionIDsByRootEpoch.removeValue(forKey: rootEpoch)
             codemapGraphAccountingByRootEpoch.removeValue(forKey: rootEpoch)
             codemapGraphIndexExecutionStatesByRootEpoch.removeValue(forKey: rootEpoch)
@@ -15362,11 +15408,23 @@ actor WorkspaceFileContextStore {
                 rootID: file.rootID,
                 rootLifetimeID: state.lifetimeID
             )
-            seedsByRootEpoch[rootEpoch, default: []].append(fileID)
-            seedPathsByFileID[fileID] = WorkspaceCodemapLogicalPresentationPath(
+            let seedPath = WorkspaceCodemapLogicalPresentationPath(
                 rootDisplayName: rootLabels[file.rootID] ?? state.root.name,
                 standardizedRelativePath: file.standardizedRelativePath
             )?.displayPath
+            let fileExtension = (file.name as NSString).pathExtension
+            guard SyntaxManager.supportsCodeMap(fileExtension: fileExtension),
+                  SyntaxManager.shared.language(forFileExtension: fileExtension) != nil
+            else {
+                requestIssues.append(.init(
+                    code: "unsupported_file_type", phase: "seed_resolution", path: seedPath,
+                    retryable: false, retryAfterMilliseconds: nil, attempted: nil, limit: nil,
+                    message: "This file type does not support Code Maps."
+                ))
+                continue
+            }
+            seedsByRootEpoch[rootEpoch, default: []].append(fileID)
+            seedPathsByFileID[fileID] = seedPath
         }
 
         var remainingNodes = budget.maximumNodeCount
@@ -15384,6 +15442,23 @@ actor WorkspaceFileContextStore {
                 let rhs = seedPathsByFileID[$1] ?? $1.uuidString
                 if lhs != rhs { return lhs.utf8.lexicographicallyPrecedes(rhs.utf8) }
                 return $0.uuidString < $1.uuidString
+            }
+            if codemapGenerationIsSuspended(rootEpoch: rootEpoch) {
+                roots.append(unavailableCodemapStructureRoot(
+                    rootEpoch: rootEpoch, rootName: rootName, seedFileIDs: rootSeedIDs,
+                    seedPathsByFileID: seedPathsByFileID,
+                    code: codeMapsGloballyDisabled ? "codemaps_disabled" : (
+                        codemapSuspendedRootEpochs.contains(rootEpoch) ? "root_paused" : "repository_excluded"
+                    ),
+                    message: codeMapsGloballyDisabled
+                        ? "Codemap generation is disabled globally."
+                        : (
+                            codemapSuspendedRootEpochs.contains(rootEpoch)
+                                ? "Code Map generation is paused for this root. Resume it to index code structure."
+                                : "This root is excluded by repository policy."
+                        )
+                ))
+                continue
             }
             let raw: WorkspaceCodemapGraphStructureRootResult
             if remainingNodes <= 0 || remainingBytes == 0 {
@@ -21639,6 +21714,9 @@ actor WorkspaceFileContextStore {
                 if !existed {
                     var parentPath = (relativePath as NSString).deletingLastPathComponent
                     while !parentPath.isEmpty, parentPath != "." {
+                        #if DEBUG
+                            indexDeltaPublicationWorkForTesting?.ancestorMembershipProbes += 1
+                        #endif
                         if rootStatesByID[rootID]?.folderIDsByRelativePath[parentPath] != nil {
                             existingParentPaths.insert(parentPath)
                         }
@@ -23605,8 +23683,18 @@ actor WorkspaceFileContextStore {
             generation: generation,
             rootLifetimeID: rootLifetimeID,
             modifiedFileSourceSnapshotsByID: modifiedFileSourceSnapshotsByID,
-            upsertedFiles: upsertedFiles.sorted { $0.standardizedRelativePath < $1.standardizedRelativePath },
-            upsertedFolders: upsertedFolders.sorted { $0.standardizedRelativePath < $1.standardizedRelativePath },
+            upsertedFiles: upsertedFiles.sorted {
+                #if DEBUG
+                    indexDeltaPublicationWorkForTesting?.eventSortComparisons += 1
+                #endif
+                return $0.standardizedRelativePath < $1.standardizedRelativePath
+            },
+            upsertedFolders: upsertedFolders.sorted {
+                #if DEBUG
+                    indexDeltaPublicationWorkForTesting?.eventSortComparisons += 1
+                #endif
+                return $0.standardizedRelativePath < $1.standardizedRelativePath
+            },
             removedFileIDs: removedFileIDs,
             removedFolderIDs: removedFolderIDs,
             removedFilePaths: removedFilePaths.sorted(),
@@ -23846,6 +23934,19 @@ actor WorkspaceFileContextStore {
 
     private func indexFiles(_ items: [FSItemDTO], root: WorkspaceRootRecord, state: inout RootState, indexes: inout RootIndexBuffers) {
         for item in items {
+            #if DEBUG
+                if indexDeltaPublicationWorkForTesting != nil,
+                   !isKnownUniquelyReferenced(&state.mutationOwnership)
+                {
+                    // Charge the inventory exposed to copy-on-write at this
+                    // mutation, then detach the probe along with this value.
+                    // One initial snapshot is bounded; a copied root per file is not.
+                    indexDeltaPublicationWorkForTesting?.sharedRootInventoryRecords +=
+                        state.fileIDsByRelativePath.count + state.folderIDsByRelativePath.count
+                    state.mutationOwnership = RootMutationOwnership()
+                }
+                indexDeltaPublicationWorkForTesting?.indexedFileVisits += 1
+            #endif
             let relativePath = StandardizedPath.relative(item.relativePath)
             guard state.fileIDsByRelativePath[relativePath] == nil else { continue }
             let parentID = ensureParentFolderID(for: (relativePath as NSString).deletingLastPathComponent, root: root, state: &state, indexes: &indexes)
@@ -23866,6 +23967,9 @@ actor WorkspaceFileContextStore {
     }
 
     private func ensureParentFolderID(for relativePath: String, root: WorkspaceRootRecord, state: inout RootState, indexes: inout RootIndexBuffers) -> UUID {
+        #if DEBUG
+            indexDeltaPublicationWorkForTesting?.parentFolderProbes += 1
+        #endif
         let key = StandardizedPath.relative(relativePath)
         if key.isEmpty || key == "." { return root.id }
         if let existing = state.folderIDsByRelativePath[key] { return existing }

@@ -9,6 +9,65 @@ import SwiftOpenAI
 import XCTest
 
 final class OracleTransportActivityPropagationTests: XCTestCase {
+    func testCodexExactUsageAggregationAndAttribution() async throws {
+        typealias Event = CodexNativeSessionController.Event
+        func usage(_ id: String?, _ input: Int?, _ output: Int = 0, thread: String = "matrix", turn: String = "matrix") -> Event {
+            .responseUsage(
+                threadID: thread,
+                turnID: turn,
+                responseID: id,
+                usage: input.map { .init(inputTokens: $0, outputTokens: output) }
+            )
+        }
+        let cases: [([Event], Int?, Int?)] = [
+            ([usage("a", 2, 3), .tokenUsage(.init(modelContextWindow: 100_000, lastTotalTokens: 900, totalTotalTokens: 9000)), usage("b", 5, 7), usage("a", 2, 3)], 7, 10),
+            ([usage("a", 0), usage("other", 9, thread: "wrong"), usage("old", 9, turn: "wrong")], 0, 0),
+            ([usage("a", 2), usage("a", 3)], nil, nil),
+            ([usage("a", 2), usage("b", nil)], nil, nil),
+            ([usage("a", 2), usage(nil, 3)], nil, nil),
+            ([usage("a", Int.max), usage("b", 1)], nil, nil),
+            ([usage("a", 0, Int.max), usage("b", 0, 1)], nil, nil),
+            ([], nil, nil)
+        ]
+        for (events, input, output) in cases {
+            let controller = RecordingCodexController()
+            controller.scriptedEvents = events + [.assistantDelta("text"), .turnCompleted(turnID: "matrix", status: .completed)]
+            let provider = CodexCLIProvider(sessionControllerFactory: { _, _ in controller })
+            let stream = try await provider.streamMessage(AIMessage(systemPrompt: "", userMessage: "test"), model: .codexCliGpt5Low)
+            var results: [AIStreamResult] = []
+            for try await result in stream {
+                results.append(result)
+            }
+            let stop = try XCTUnwrap(results.first { $0.type == "message_stop" })
+            XCTAssertEqual(stop.promptTokens, input)
+            XCTAssertEqual(stop.completionTokens, output)
+            XCTAssertEqual(results.compactMap(\.text).joined(), "text")
+            XCTAssertEqual(stop.cleanupHandle?.conversationID, "matrix")
+            XCTAssertFalse(controller.hasActiveThread)
+        }
+    }
+
+    func testCodexRecoveredSuccessDiscardsConsumedPartialUsage() async throws {
+        let controller = RecordingCodexController()
+        controller.recoverTerminal = true
+        controller.scriptedEvents = [
+            .responseUsage(threadID: "matrix", turnID: "matrix", responseID: "partial", usage: .init(inputTokens: 12, outputTokens: 3)),
+            .assistantCompleted(.init(scope: .init(turnID: "matrix", itemID: "answer"), text: "recovered text"))
+        ]
+        let provider = CodexCLIProvider(sessionControllerFactory: { _, _ in controller })
+        let stream = try await provider.streamMessage(AIMessage(systemPrompt: "", userMessage: "test"), model: .codexCliGpt5Low)
+        var results: [AIStreamResult] = []
+        for try await result in stream {
+            results.append(result)
+        }
+        let stop = try XCTUnwrap(results.first { $0.type == "message_stop" })
+        XCTAssertNil(stop.promptTokens)
+        XCTAssertNil(stop.completionTokens)
+        XCTAssertEqual(results.compactMap(\.text).joined(), "recovered text")
+        XCTAssertEqual(stop.cleanupHandle?.conversationID, "matrix")
+        XCTAssertFalse(controller.hasActiveThread)
+    }
+
     func testOpenAIDecodedChunkAdapterPreservesChoiceAndDeltaSemantics() throws {
         func chunk(_ object: [String: Any]) throws -> ChatCompletionChunkObject {
             let data = try JSONSerialization.data(withJSONObject: object)
@@ -576,6 +635,103 @@ final class OracleImageSerializationTests: XCTestCase {
         XCTAssertEqual(completion.cost, 0.12)
     }
 
+    func testClaudeStreamJSONReportsNativeInputIncludingCacheTokens() throws {
+        let output = """
+        {"type":"result","subtype":"success","result":"Done","usage":{"input_tokens":2,"cache_read_input_tokens":1772,"cache_creation_input_tokens":1027,"output_tokens":4},"total_cost_usd":0.12}
+        """
+
+        let completion = try ClaudeCodeProvider.test_parseStreamJSONCompletionPayload(Data(output.utf8))
+        XCTAssertEqual(completion.promptTokens, 2801)
+        XCTAssertEqual(completion.completionTokens, 4)
+        XCTAssertEqual(completion.text, "Done")
+        XCTAssertEqual(completion.cost, 0.12)
+
+        let nativeModel = try ClaudeCodeProvider.test_parseStreamJSONCompletionPayload(
+            Data(output.utf8), model: .claudeCodeSonnet
+        )
+        XCTAssertEqual(nativeModel.promptTokens, 2801)
+        XCTAssertEqual(nativeModel.completionTokens, 4)
+    }
+
+    func testClaudeStreamJSONPreservesCompatibleBackendRawInputTokens() throws {
+        let output = """
+        {"type":"result","subtype":"success","result":"Done","usage":{"input_tokens":2,"cache_read_input_tokens":1772,"cache_creation_input_tokens":1027,"output_tokens":4}}
+        """
+
+        for backendID in ClaudeCodeCompatibleBackendID.allCases {
+            let models = ClaudeCodeAIModelCatalog.compatibleBackendModelsForPicker(backendID)
+            XCTAssertFalse(models.isEmpty, "\(backendID)")
+            for model in models {
+                let descriptor = try XCTUnwrap(ClaudeCodeAIModelCatalog.compatibleBackendDescriptor(for: model))
+                XCTAssertEqual(descriptor.backendID, backendID)
+                let completion = try ClaudeCodeProvider.test_parseStreamJSONCompletionPayload(
+                    Data(output.utf8), model: model
+                )
+                XCTAssertEqual(completion.promptTokens, 2, "\(model)")
+                XCTAssertEqual(completion.completionTokens, 4, "\(model)")
+            }
+        }
+    }
+
+    func testClaudeStreamJSONPreservesPartialUsageIndependently() throws {
+        let cases: [(name: String, usage: [String: Any], input: Int?, output: Int?)] = [
+            ("input only", ["input_tokens": 2], 2, nil),
+            ("output only", ["output_tokens": 4], nil, 4),
+            ("cache read only", ["cache_read_input_tokens": 2799], nil, nil),
+            ("cache creation only", ["cache_creation_input_tokens": 2799, "output_tokens": 4], nil, 4),
+            ("missing creation", ["input_tokens": 2, "cache_read_input_tokens": 2799, "output_tokens": 4], 2, 4),
+            ("missing read", ["input_tokens": 2, "cache_creation_input_tokens": 2799, "output_tokens": 4], 2, 4),
+            ("missing raw input", ["cache_read_input_tokens": 1000, "cache_creation_input_tokens": 1799, "output_tokens": 4], nil, 4),
+            ("both caches", ["input_tokens": 2, "cache_read_input_tokens": 1000, "cache_creation_input_tokens": 1799], 2801, nil),
+            ("zero counts", ["input_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "output_tokens": 0], 0, 0),
+            ("no counts", [:], nil, nil)
+        ]
+        for item in cases {
+            let output = try jsonText(["type": "result", "subtype": "success", "result": "Done", "usage": item.usage])
+            let completion = try ClaudeCodeProvider.test_parseStreamJSONCompletionPayload(Data(output.utf8))
+            XCTAssertEqual(completion.promptTokens, item.input, item.name)
+            XCTAssertEqual(completion.completionTokens, item.output, item.name)
+        }
+    }
+
+    func testClaudeStreamJSONFallsBackOnInvalidOrOverflowingInputWithoutLosingOutput() throws {
+        let cases: [(name: String, usage: [String: Any], input: Int?, output: Int?)] = [
+            ("invalid cache", ["input_tokens": 2, "cache_read_input_tokens": "invalid", "cache_creation_input_tokens": 0, "output_tokens": 4], 2, 4),
+            ("negative cache", ["input_tokens": 2, "cache_read_input_tokens": 0, "cache_creation_input_tokens": -1, "output_tokens": 4], 2, 4),
+            ("null cache", ["input_tokens": 2, "cache_read_input_tokens": NSNull(), "cache_creation_input_tokens": 0, "output_tokens": 4], 2, 4),
+            ("boolean cache", ["input_tokens": 2, "cache_read_input_tokens": true, "cache_creation_input_tokens": 0, "output_tokens": 4], 2, 4),
+            ("fractional cache", ["input_tokens": 2, "cache_read_input_tokens": 1.5, "cache_creation_input_tokens": 0, "output_tokens": 4], 2, 4),
+            ("overflowing sum", ["input_tokens": 2, "cache_read_input_tokens": Int.max, "cache_creation_input_tokens": 0, "output_tokens": 4], 2, 4),
+            ("invalid input", ["input_tokens": "invalid", "output_tokens": 4], nil, 4),
+            ("null input", ["input_tokens": NSNull(), "output_tokens": 4], nil, 4),
+            ("boolean input", ["input_tokens": true, "output_tokens": 4], nil, 4),
+            ("negative input", ["input_tokens": -1, "output_tokens": 4], nil, 4),
+            ("fractional input", ["input_tokens": 1.5, "output_tokens": 4], nil, 4),
+            ("invalid output with partial input", ["input_tokens": 2, "cache_read_input_tokens": 2799, "output_tokens": "invalid"], 2, nil),
+            ("boolean output", ["input_tokens": 2, "cache_read_input_tokens": 1772, "cache_creation_input_tokens": 1027, "output_tokens": true], 2801, nil)
+        ]
+        for item in cases {
+            let output = try jsonText(["type": "result", "subtype": "success", "result": "Done", "usage": item.usage])
+            let completion = try ClaudeCodeProvider.test_parseStreamJSONCompletionPayload(Data(output.utf8))
+            XCTAssertEqual(completion.promptTokens, item.input, item.name)
+            XCTAssertEqual(completion.completionTokens, item.output, item.name)
+        }
+    }
+
+    func testClaudeStreamJSONRejectsInexactOrOutOfRangeNumericCountsWithoutLosingOutput() throws {
+        let cases: [(usage: String, input: Int?)] = [
+            (#"{"input_tokens":2.00000000000000000001,"output_tokens":4}"#, nil),
+            (#"{"input_tokens":9223372036854775808,"output_tokens":4}"#, nil),
+            (#"{"input_tokens":2,"cache_read_input_tokens":9223372036854775808,"cache_creation_input_tokens":0,"output_tokens":4}"#, 2)
+        ]
+        for item in cases {
+            let output = #"{"type":"result","subtype":"success","result":"Done","usage":\#(item.usage)}"#
+            let completion = try ClaudeCodeProvider.test_parseStreamJSONCompletionPayload(Data(output.utf8))
+            XCTAssertEqual(completion.promptTokens, item.input, item.usage)
+            XCTAssertEqual(completion.completionTokens, 4, item.usage)
+        }
+    }
+
     func testClaudeStreamJSONPreservesContinuedAnswerWithoutDuplicatingResult() throws {
         let first = String(repeating: "First section. ", count: 20000) + "\n```swift\nfunc handl"
         let output = try [
@@ -940,6 +1096,8 @@ private final class RecordingCodexController: CodexSessionControllerPassiveStubD
         let attachmentFilesExisted: [Bool]
     }
 
+    var scriptedEvents: [CodexNativeSessionController.Event]?
+    var recoverTerminal = false
     private let lock = NSLock()
     private var turn: Turn?
     private var active = false
@@ -980,8 +1138,28 @@ private final class RecordingCodexController: CodexSessionControllerPassiveStubD
             return FileManager.default.fileExists(atPath: path)
         }
         lock.withLock { turn = Turn(text: text, attachmentFilesExisted: existed) }
-        stream.continuation.yield(.turnCompleted(turnID: "matrix", status: .completed))
+        if let scriptedEvents {
+            for event in scriptedEvents {
+                stream.continuation.yield(event)
+            }
+        } else {
+            stream.continuation.yield(.turnCompleted(turnID: "matrix", status: .completed))
+        }
         return CodexTurnStartReceipt(provisionalSubmissionID: "matrix")
+    }
+
+    func readThreadSnapshot(includeTurns _: Bool, timeout _: TimeInterval?) async throws -> CodexNativeSessionController.ThreadSnapshot {
+        .init(
+            conversationID: "matrix",
+            rolloutPath: nil,
+            model: nil,
+            reasoningEffort: nil,
+            runtimeStatus: .idle,
+            currentTurnID: nil,
+            activeTurnIDs: [],
+            latestTerminalTurnID: "matrix",
+            latestTurnStatus: recoverTerminal ? .completed : nil
+        )
     }
 
     func shutdown() async {

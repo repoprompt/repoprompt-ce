@@ -187,6 +187,7 @@ struct AgentComposerPendingSubmission: Equatable, Identifiable {
     let text: String
     let repromptDraft: AgentRepromptUIStore.SubmittedDraft
     let originalDraft: String?
+    var isChoosingWorkflow = false
 }
 
 struct AgentComposerSubmissionLatch {

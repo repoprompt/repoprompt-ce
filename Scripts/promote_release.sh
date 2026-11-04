@@ -466,6 +466,7 @@ validate_app_bundle() {
         "$app_bundle" \
         "arm64,x86_64" \
         "Reviewed ZIP app"
+    python3 "$CONTROL_PLANE_SCRIPTS_DIR/validate_macos_runtime_symbols.py" "$app_bundle"
     "$CONTROL_PLANE_SCRIPTS_DIR/write_app_artifact_manifest.py" verify \
         --app "$app_bundle" \
         --manifest "$artifact_manifest" \
@@ -593,6 +594,7 @@ verify_source_release() {
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_signature.swift"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh"
+    require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_macos_runtime_symbols.py"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/write_app_artifact_manifest.py"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/codex_runtime_artifact.py"
     require_file "$ROOT_DIR/Vendor/Codex/manifest.json"
