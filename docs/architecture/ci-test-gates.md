@@ -1,9 +1,11 @@
 # CI test gate contract
 
-`CI` uses three macOS jobs total: one **Build and Static Gates** job, one
-**Test Root Shards (No Build)** worker running all four logical shards sequentially,
-and the secret-free Sentry build/privacy job. Each shard retains its own execution
-deadline and receipt; ordinary failures do not suppress later shards.
+`CI` uses six macOS jobs total: one **Build and Static Gates** job, four
+**Test Root Shard (No Build)** matrix workers, and the secret-free Sentry
+build/privacy job. Each shard retains its own execution deadline and exact artifact
+output; `fail-fast: false` keeps ordinary failures from cancelling siblings.
+The #1623 sequential-worker experiment is reverted without reverting build-once
+reuse, producer-bound retry validation, or full coverage.
 Universal release packaging and older-runtime artifact smoke instead qualify the
 exact artifacts in Tip, stable, and explicit manual Release Candidate workflows.
 The exact required check **Style** runs last
@@ -100,8 +102,10 @@ partition, checks exactly one current-listing receipt per shard, verifies each
 assignment/execution, and requires the disjoint union to equal the full listing
 and every target to be represented. Missing artifacts or receipts fail closed.
 Hosted products and receipts additionally bind candidate/run/attempt/producer,
-and artifact names include the attempt. Use **Re-run all jobs**: v1 rejects partial
-reruns rather than trusting earlier producers. There are no filters on root shards.
+and artifact names include each execution attempt. Integration-v3 supports failed
+or individual-shard reruns using exact successful producer outputs; Style still
+requires all four receipts. Old v1/v2 runs require **Re-run all jobs** or a branch
+update to obtain the new policy. There are no test-selection filters on root shards.
 `root-build-*` also lasts seven days, so its lifetime matches those receipts.
 After artifact expiry, rerun the build as well as the shards; a shard-only rerun
 cannot reconstruct its attested executable.
