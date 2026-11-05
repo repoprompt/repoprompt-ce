@@ -81,6 +81,9 @@ struct AgentModeView: View {
                             object: nil,
                             userInfo: ["windowID": windowState.windowID]
                         )
+                    },
+                    onNewSession: {
+                        navigationController.requestNewSession(agentModeVM: agentModeVM)
                     }
                 )
                 .navigationSplitViewColumnWidth(
@@ -135,6 +138,9 @@ struct AgentModeView: View {
         }
         .onDisappear {
             navigationController.onDisappear(windowState: windowState, agentModeVM: agentModeVM)
+        }
+        .onChange(of: navigationController.columnVisibility, initial: true) { _, visibility in
+            windowState.setAgentSidebarCollapsed(visibility == .detailOnly)
         }
         .onChange(of: isSystemWorkspaceMode) { _, isSystem in
             navigationController.onWorkspaceModeChanged(

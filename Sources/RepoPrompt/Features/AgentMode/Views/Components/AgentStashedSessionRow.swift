@@ -90,6 +90,7 @@ struct AgentStashedSessionRow: View {
             Image(systemName: "tray.and.arrow.down")
                 .font(.system(size: metrics.leadingIconSize))
                 .foregroundStyle(.secondary)
+                .frame(width: metrics.leadingIconSlotWidth)
 
             VStack(alignment: .leading, spacing: metrics.titleVStackSpacing) {
                 HStack(spacing: metrics.titlePinSpacing) {
@@ -209,6 +210,6 @@ struct AgentStashedSessionRow: View {
 /// file stays free of App-layer references.
 struct AgentStashedSessionRowMetrics: Equatable {
     var rowMinHeight, rowHorizontalPadding, rowVerticalPadding, rowCornerRadius: CGFloat
-    var rowSpacing, titlePinSpacing, titleVStackSpacing, leadingIconSize, pinIconSize: CGFloat
+    var rowSpacing, titlePinSpacing, titleVStackSpacing, leadingIconSize, leadingIconSlotWidth, pinIconSize: CGFloat
     var titleFont: Font
 }
