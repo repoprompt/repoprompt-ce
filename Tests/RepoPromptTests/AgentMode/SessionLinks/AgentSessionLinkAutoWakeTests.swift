@@ -5139,6 +5139,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         // Most tests establish their own explicit policy. Keep the shared fixture off so changing
         // the product's fresh-session default cannot silently change their preconditions.
         session.oversight.autoWakeOnUpdates = false
+        session.oversight.routineWakeIntervalEnabled = false
         session.hasLoadedPersistedState = true
         session.installRunID(UUID())
         // Wake admission begins with a restored session, not an unfinished fresh creation.

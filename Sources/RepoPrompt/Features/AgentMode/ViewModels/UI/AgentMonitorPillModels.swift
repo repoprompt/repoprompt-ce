@@ -232,7 +232,7 @@ enum AgentMonitorAutoWakeCopy {
     static let tooltip = """
     Status updates for these sessions are always attached to this agent’s next turn. Turning this on \
     additionally lets RepoPrompt start a follow-up turn for a routine status update or overflow \
-    summary after any selected delay. A busy agent finishes its current and already-accepted work \
+    summary subject to the selected minimum interval. A busy agent finishes its current and already-accepted work \
     first. Follow-ups can create further updates or attention requests, including feedback loops \
     between sessions. An explicit attention request or a linked session’s transition to waiting for \
     its own user can bypass this master switch, that lane’s toggle, and its status Auto-wake snooze \
