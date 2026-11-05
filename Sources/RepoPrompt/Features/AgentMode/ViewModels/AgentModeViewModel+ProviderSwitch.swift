@@ -742,7 +742,7 @@ extension AgentModeViewModel {
             preview.choices = [
                 .init(mode: .history, carrier: result.full, unavailable: budget.fits(result.full) ? nil : "Full history doesn't fit."),
                 .init(mode: .newestTurns, carrier: result.recent, unavailable: result.recent == nil ? "the last turn alone doesn't fit" : nil, hidden: recentDuplicatesFull && budget.fits(result.full)),
-                .init(mode: .summary, unavailable: preview.isReview ? AgentSessionLinkSendFailure.providerHandoverNeedsReview.message : (result.wordLimit == nil ? "no room for a summary" : nil))
+                .init(mode: .summary, unavailable: preview.isReview ? AgentSessionLinkSendFailure.providerHandoverNeedsReview.message : (result.wordLimit == nil ? "no room for a summary" : nil), hidden: !preview.isReview)
             ]
             if !stale, let payload = originalSlot.payload, let descriptor = preview.originalDescriptor,
                providerSwitchReadReferenceIsCurrent(descriptor, session: session, destination: preview.destination),
@@ -1103,7 +1103,7 @@ extension AgentModeViewModel {
         preview.generatedSummary = summary
         preview.choices[index].carrier = budget.fits(carrier) ? carrier : nil
         preview.choices[index].unavailable = budget.fits(carrier) ? nil : "the summary is too large"
-        if budget.fits(carrier) { preview.selected = .summary }
+        if budget.fits(carrier), !preview.choices[index].hidden { preview.selected = .summary }
     }
 
     /// One claimed, same-identity mutation for Switch/Replace and Discard. Native retirement is

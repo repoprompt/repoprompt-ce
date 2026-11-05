@@ -151,15 +151,6 @@ struct AgentProviderSwitchPreview: View {
                             .buttonStyle(.plain)
                             .disabled(choice.unavailable != nil || choice.bytes == 0 || preview.generationItemID != nil)
                             Spacer()
-                            if choice.mode == .summary, !preview.isReview {
-                                Button(preview.generationItemID == nil ? "Generate" : "Generating…") {
-                                    Task { await viewModel.generateProviderSwitchHandover(preview.id) }
-                                }
-                                .disabled(preview.wordLimit == nil || preview.generationItemID != nil || viewModel.providerSwitchPreviewBlocker(preview) != nil)
-                            }
-                        }
-                        if choice.mode == .summary, !preview.isReview {
-                            Text("Runs one turn on \(preview.sourceAgent.displayName).").foregroundStyle(.secondary)
                         }
                         if choice.mode != .history, let reason = choice.unavailable { Text(Self.unavailableText(reason)).foregroundStyle(.secondary) }
                         if choice.bytes > 0, let budget = preview.budget {
@@ -216,7 +207,7 @@ struct AgentProviderSwitchPreview: View {
                     Text(Self.blockerText(reason)).foregroundStyle(.secondary)
                 }
                 if !preview.building, preview.failure == nil, preview.selected == nil {
-                    Text(preview.isReview ? "No handover fits. You can cancel or discard it." : "No handover fits. Generate a summary if available, or cancel.")
+                    Text(preview.isReview ? "No handover fits. You can cancel or discard it." : "No handover fits. You can cancel.")
                         .foregroundStyle(.secondary)
                 }
                 HStack {

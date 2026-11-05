@@ -3960,18 +3960,32 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     text: "Generated summary", sourceRevision: initial.sourceRevision, cutoff: initial.cutoff,
                     sourceProvider: source.provider, sourceModel: source.model
                 )
-                await vm.openProviderSwitchPreview(agent: .openCode, model: "destination", tabID: session.tabID, retainingSummary: summary)
-                XCTAssertEqual(vm.providerSwitchPreview?.selected, .summary)
                 for explicitPick in [false, true] {
+                    await vm.openProviderSwitchPreview(agent: .openCode, model: "destination", tabID: session.tabID, retainingSummary: summary)
                     let previous = try XCTUnwrap(vm.providerSwitchPreview)
+                    XCTAssertEqual(previous.selected, .history)
+                    XCTAssertNil(previous.explicitSelection)
+                    XCTAssertNotNil(previous.generatedSummary, "Backend retention does not make Summary a fresh UI choice")
+                    XCTAssertFalse(AgentProviderSwitchPreview.visibleChoices(previous.choices).contains { $0.mode == .summary })
+                    vm.selectProviderSwitchChoice(.summary, previewID: previous.id)
+                    XCTAssertEqual(vm.providerSwitchPreview?.selected, .history)
+                    XCTAssertNil(vm.providerSwitchPreview?.explicitSelection, "A hidden summary cannot become an explicit pick")
                     if explicitPick { vm.selectProviderSwitchChoice(.history, previewID: previous.id) }
+                    XCTAssertEqual(vm.providerSwitchPreview?.explicitSelection, explicitPick ? .history : nil)
                     session.draftText += " updated"
                     vm.updateBindingsFromSession(session)
                     try await AsyncTestWait.waitUntil("retained summary refresh completes") {
                         vm.providerSwitchPreview?.id != previous.id && vm.providerSwitchPreview?.building == false
                     }
-                    XCTAssertEqual(vm.providerSwitchPreview?.selected, explicitPick ? .history : .summary)
-                    XCTAssertNotNil(vm.providerSwitchPreview?.generatedSummary)
+                    let refreshed = try XCTUnwrap(vm.providerSwitchPreview)
+                    XCTAssertTrue(refreshed.updated)
+                    XCTAssertEqual(refreshed.selected, .history)
+                    XCTAssertEqual(refreshed.explicitSelection, explicitPick ? .history : nil)
+                    XCTAssertNotNil(refreshed.generatedSummary)
+                    let visible = AgentProviderSwitchPreview.visibleChoices(refreshed.choices)
+                    XCTAssertFalse(visible.contains { $0.mode == .summary })
+                    XCTAssertTrue(visible.allSatisfy { $0.mode == .history || $0.mode == .newestTurns })
+                    XCTAssertTrue(visible.contains { $0.mode == refreshed.selected })
                 }
             }
         }

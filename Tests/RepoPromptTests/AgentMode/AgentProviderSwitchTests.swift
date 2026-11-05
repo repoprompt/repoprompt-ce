@@ -18,15 +18,15 @@
         }
 
         @MainActor
-        func testVisibleChoicesHideOnlyUnavailableHistoryAndAlreadyHiddenRows() {
+        func testFreshVisibleChoicesOfferOnlyFittingHistoryAndRecentTurns() {
             typealias Choice = AgentModeViewModel.ProviderSwitchChoice
             let recent = Choice(mode: .newestTurns, unavailable: "the last turn alone doesn't fit")
-            let summary = Choice(mode: .summary, unavailable: "no room for a summary")
+            let summary = Choice(mode: .summary, unavailable: "no room for a summary", hidden: true)
             let unavailableHistory = Choice(mode: .history, unavailable: "too large")
             let fittingHistory = Choice(mode: .history, retainedPayload: "history")
-            XCTAssertEqual(AgentProviderSwitchPreview.visibleChoices([unavailableHistory, recent, summary]).map(\.mode), [.newestTurns, .summary])
-            XCTAssertEqual(AgentProviderSwitchPreview.visibleChoices([fittingHistory, recent, summary]).map(\.mode), [.history, .newestTurns, .summary])
-            XCTAssertEqual(AgentProviderSwitchPreview.visibleChoices([fittingHistory, Choice(mode: .newestTurns, hidden: true), summary]).map(\.mode), [.history, .summary])
+            XCTAssertEqual(AgentProviderSwitchPreview.visibleChoices([unavailableHistory, recent, summary]).map(\.mode), [.newestTurns])
+            XCTAssertEqual(AgentProviderSwitchPreview.visibleChoices([fittingHistory, recent, summary]).map(\.mode), [.history, .newestTurns])
+            XCTAssertEqual(AgentProviderSwitchPreview.visibleChoices([fittingHistory, Choice(mode: .newestTurns, hidden: true), summary]).map(\.mode), [.history])
         }
 
         @MainActor
@@ -47,6 +47,69 @@
             for (choices, explicit, retained, expected) in cases {
                 XCTAssertEqual(AgentModeViewModel.providerSwitchSelection(choices: choices, explicit: explicit, retained: retained), expected)
             }
+        }
+
+        @MainActor
+        func testStaleAndLateSummarySelectionFallsBackToHistoryThenRecent() throws {
+            typealias Choice = AgentModeViewModel.ProviderSwitchChoice
+            let projection = try Handover.project(AgentTranscript(turns: [fixture(request: "question")]))
+            let generated = try Handover.summary("late generated text", of: projection, source: source(), historyReference: nil)
+            let lateSummary = Choice(mode: .summary, carrier: generated, hidden: true)
+            let history = Choice(mode: .history, retainedPayload: "history")
+            let recent = Choice(mode: .newestTurns, retainedPayload: "recent")
+            for choices in [[history, recent, lateSummary], [recent, lateSummary], [lateSummary]] {
+                let selected = AgentModeViewModel.providerSwitchSelection(choices: choices, explicit: .summary, retained: .summary)
+                XCTAssertEqual(selected, choices.first { $0.mode != .summary }?.mode)
+                XCTAssertFalse(AgentProviderSwitchPreview.visibleChoices(choices).contains { $0.mode == .summary })
+            }
+        }
+
+        @MainActor
+        func testPersistedSummaryReviewKeepsExactAcceptedPayload() throws {
+            typealias Choice = AgentModeViewModel.ProviderSwitchChoice
+            let projection = try Handover.project(AgentTranscript(turns: [fixture(request: "old question")]))
+            let carrier = try Handover.summary("Accepted summary & <details>", of: projection, source: source(), historyReference: nil)
+            let payload = Handover.render(carrier)
+            let saved = AgentSession(id: sessionID, savedAt: date, pendingHandoffProviderSwitchDelivery: .ready, pendingHandoffPayload: payload, pendingHandoffSourceItemID: sessionID)
+            let restored = try JSONDecoder().decode(AgentSession.self, from: JSONEncoder().encode(saved))
+            XCTAssertEqual(restored.pendingHandoffProviderSwitchDelivery, .ready)
+            let retained = try Choice(mode: .summary, retainedPayload: XCTUnwrap(restored.pendingHandoffPayload))
+            let choices = [Choice(mode: .history, retainedPayload: "different fresh history"), retained]
+            let visible = AgentProviderSwitchPreview.visibleChoices(choices)
+            XCTAssertEqual(visible.map(\.mode), [.history, .summary])
+            XCTAssertEqual(visible.last?.retainedPayload, payload)
+            XCTAssertEqual(visible.last?.bytes, payload.utf8.count)
+            XCTAssertEqual(AgentModeViewModel.providerSwitchSelection(choices: choices, explicit: nil, retained: .summary), .summary)
+        }
+
+        @MainActor
+        func testUnavailableSavedSummaryReviewRemainsVisibleWithoutChangingFallback() throws {
+            typealias Choice = AgentModeViewModel.ProviderSwitchChoice
+            let reason = AgentSessionLinkSendFailure.providerHandoverNeedsReview.message
+            // Review construction leaves Summary visible even when the retained-payload fit guard fails.
+            let summary = Choice(mode: .summary, unavailable: reason, hidden: false)
+            let history = Choice(mode: .history, retainedPayload: "fitting fresh history")
+            let recent = Choice(mode: .newestTurns, retainedPayload: "fitting recent turns")
+            for choices in [[history, summary], [recent, summary]] {
+                let row = try XCTUnwrap(AgentProviderSwitchPreview.visibleChoices(choices).first { $0.mode == .summary })
+                XCTAssertEqual(row.label, "Summary")
+                XCTAssertEqual(row.unavailable, reason)
+                XCTAssertNil(row.retainedPayload)
+                XCTAssertEqual(row.bytes, 0)
+                XCTAssertEqual(AgentModeViewModel.providerSwitchSelection(choices: choices, explicit: .summary, retained: .summary), choices.first?.mode)
+            }
+        }
+
+        @MainActor
+        func testBusyAdmissionRequiresExplicitForceAndHardBlockersNeverAllowIt() {
+            typealias Admission = AgentModeViewModel.ProviderSwitchAdmission
+            let causes: [Admission.ForceableCause] = [.running, .waitingForInput, .compaction, .finishingTurn, .sessionTransfer, .stopping, .workInFlight]
+            for cause in causes {
+                XCTAssertFalse(Admission.forceable(cause).isAdmissible(forcing: false))
+                XCTAssertTrue(Admission.forceable(cause).isAdmissible(forcing: true))
+            }
+            XCTAssertFalse(Admission.hard("needs review").isAdmissible(forcing: false))
+            XCTAssertFalse(Admission.hard("needs review").isAdmissible(forcing: true))
         }
 
         @MainActor
