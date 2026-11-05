@@ -1,5 +1,8 @@
 import Foundation
 import MCP
+import RepoPromptACPProviders
+import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptSettingsCore
 import XCTest

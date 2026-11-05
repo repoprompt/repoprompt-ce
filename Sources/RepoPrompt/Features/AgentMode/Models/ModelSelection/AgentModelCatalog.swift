@@ -1,4 +1,9 @@
 import Foundation
+import RepoPromptACPProviders
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
+import RepoPromptClaudeProvider
+import RepoPromptCodexProvider
 import RepoPromptSettingsCore
 
 enum AgentModelCatalog {
@@ -371,7 +376,7 @@ enum AgentModelCatalog {
         codexDynamicModels: [CodexAppServerClient.RemoteModel]? = nil,
         includeClaudeEffortVariants: Bool = true
     ) -> [AgentModelOption] {
-        let generation = AgentAdvertisedModelCatalog.shared.productionGeneration(for: agentKind)
+        let generation = AgentModelCatalogRuntime.shared.productionGeneration(for: agentKind)
         let result = uncachedOptions(
             for: agentKind, availability: availability, codexDynamicModels: codexDynamicModels,
             includeClaudeEffortVariants: includeClaudeEffortVariants
@@ -380,7 +385,7 @@ enum AgentModelCatalog {
            agentKind != .codexExec || codexDynamicModels == nil,
            isAgentAvailable(agentKind, availability: availability)
         {
-            AgentAdvertisedModelCatalog.shared.record(result, for: agentKind, generation: generation)
+            AgentModelCatalogRuntime.shared.record(result, for: agentKind, generation: generation)
         }
         return result
     }
@@ -421,7 +426,7 @@ enum AgentModelCatalog {
         switch agentKind {
         case .codexExec:
             let staticOptions = AgentModel.modelsForAgent(agentKind).map { staticOption($0, for: agentKind) }
-            return AgentCodexModelRegistry.shared.resolvedOptions(
+            return AgentModelCatalogRuntime.shared.codexRegistry.resolvedOptions(
                 staticOptions: staticOptions,
                 preferredLiveModels: codexDynamicModels
             )
@@ -1424,7 +1429,7 @@ enum AgentModelCatalog {
         for agentKind: AgentProviderKind
     ) -> ACPDiscoveredSessionModels? {
         guard let providerID = agentKind.acpProviderID,
-              let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: providerID),
+              let snapshot = AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: providerID),
               !snapshot.options.isEmpty
         else {
             return nil
@@ -1820,12 +1825,7 @@ enum AgentModelCatalog {
     // MARK: - Task Labels
 
     /// Known task label kinds for MCP agent role defaults.
-    enum TaskLabelKind: String, CaseIterable {
-        case explore
-        case engineer
-        case pair
-        case design
-    }
+    typealias TaskLabelKind = AgentTaskLabelKind
 
     /// Metadata for a task label.
     struct TaskLabel {
@@ -2303,14 +2303,4 @@ enum AgentModelCatalog {
         }
         return grantedCaps.map(\.externalName).sorted()
     }
-
-    #if DEBUG
-        @_spi(TestSupport)
-        public static func test_mergeCodexOptions(
-            primary: [AgentModelOption],
-            fallback: [AgentModelOption]
-        ) -> [AgentModelOption] {
-            AgentCodexModelRegistry.shared.test_mergeCodexOptions(primary: primary, fallback: fallback)
-        }
-    #endif
 }

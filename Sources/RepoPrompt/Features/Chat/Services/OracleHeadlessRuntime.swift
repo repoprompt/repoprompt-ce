@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 private actor OracleHeadlessCleanupHandleBox {
     private var handle: ProviderConversationCleanupHandle?

@@ -1,5 +1,7 @@
 import Darwin
 import Foundation
+import RepoPromptACPProviders
+import RepoPromptAIContracts
 import RepoPromptSecureStorage
 import RepoPromptShared
 @_spi(TestSupport) @testable import RepoPromptApp
@@ -18,11 +20,11 @@ private actor OneShotFilteringPolicyWitness {
 final class GrokBuildModelRoutingTests: XCTestCase {
     override func setUp() {
         super.setUp()
-        AgentACPModelRegistry.shared.test_reset(providerID: .grokBuild)
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .grokBuild)
     }
 
     override func tearDown() {
-        AgentACPModelRegistry.shared.test_reset(providerID: .grokBuild)
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .grokBuild)
         super.tearDown()
     }
 
@@ -43,7 +45,7 @@ final class GrokBuildModelRoutingTests: XCTestCase {
             [.grokBuildCustom(name: AgentModel.defaultModel.rawValue)]
         )
 
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+        _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(
             ACPDiscoveredSessionModels(
                 options: [
                     AgentModelOption(
@@ -95,209 +97,6 @@ final class GrokBuildModelRoutingTests: XCTestCase {
         XCTAssertTrue(message.systemPrompt.contains("Do not use any tools"))
     }
 
-    func testOneShotLaunchIsolatesImportsAndSessionStorageAndPreservesAPIKey() {
-        for apiKey in [nil, "xai-test-key-123"] as [String?] {
-            let environment = GrokBuildOneShotHeadlessAgentProvider.launchEnvironment(apiKey: apiKey)
-            XCTAssertEqual(environment["GROK_CLAUDE_MCPS_ENABLED"], "0")
-            XCTAssertEqual(environment["GROK_CURSOR_MCPS_ENABLED"], "0")
-            XCTAssertEqual(environment["GROK_CLAUDE_HOOKS_ENABLED"], "0")
-            XCTAssertEqual(environment["GROK_CURSOR_HOOKS_ENABLED"], "0")
-            XCTAssertEqual(environment["GROK_SESSION_SEARCH"], "0")
-            XCTAssertEqual(environment["GROK_STORAGE_MODE"], "local")
-            XCTAssertEqual(environment["XAI_API_KEY"], apiKey)
-            XCTAssertNil(environment["HOME"])
-            XCTAssertNil(environment["GROK_HOME"])
-        }
-    }
-
-    func testOneShotCleanupUsesEffectiveHomeAndRemovesEntireOwnedFolder() async throws {
-        for homeSelection in ["default", "empty override", "absolute override", "relative override"] {
-            let root = try makeOneShotFixtureRoot()
-            defer { try? FileManager.default.removeItem(at: root) }
-            let promptDirectory = root.appendingPathComponent("rp-grok-oneshot-request", isDirectory: true)
-            try FileManager.default.createDirectory(at: promptDirectory, withIntermediateDirectories: true)
-            let home = root.appendingPathComponent("home", isDirectory: true)
-            let defaultGrokHome = home.appendingPathComponent(".grok", isDirectory: true)
-            var environment = ["HOME": home.path]
-            let grokHome: URL
-            switch homeSelection {
-            case "empty override":
-                environment["GROK_HOME"] = ""
-                grokHome = defaultGrokHome
-            case "absolute override":
-                grokHome = root.appendingPathComponent("custom-grok", isDirectory: true)
-                environment["GROK_HOME"] = grokHome.path
-            case "relative override":
-                environment["GROK_HOME"] = "relative-grok"
-                grokHome = promptDirectory.appendingPathComponent("relative-grok", isDirectory: true)
-            default:
-                grokHome = defaultGrokHome
-            }
-            let encodedCWD = try encodedOneShotCWD(resolvedOneShotCWD(promptDirectory))
-            let owned = grokHome.appendingPathComponent("sessions/\(encodedCWD)", isDirectory: true)
-            try makeStoredOneShotSession(at: owned)
-            let neighborDirectory = grokHome.appendingPathComponent("sessions/rp-grok-oneshot-request-fedcba9876543210")
-            let neighbor = neighborDirectory.appendingPathComponent("prompt_history.jsonl")
-            let configFile = grokHome.appendingPathComponent("config.toml")
-            try writeOneShotFixture("existing config", to: configFile)
-            let unselectedSession = defaultGrokHome.appendingPathComponent("sessions/\(encodedCWD)")
-            if homeSelection == "absolute override" {
-                try makeStoredOneShotSession(at: unselectedSession)
-            }
-
-            try await GrokBuildOneShotHeadlessAgentProvider.withRequestCleanup(
-                promptDirectory: promptDirectory,
-                environment: environment
-            ) {
-                // A newly appeared, similarly named folder with incomplete metadata
-                // is not owned by this request, even when it shares the cwd basename.
-                try writeOneShotFixture("neighbor prompt", to: neighbor)
-                try writeOneShotFixture("/incomplete", to: neighborDirectory.appendingPathComponent(".cwd"))
-            }
-
-            XCTAssertFalse(FileManager.default.fileExists(atPath: owned.path), homeSelection)
-            XCTAssertFalse(FileManager.default.fileExists(atPath: promptDirectory.path), homeSelection)
-            // A relative Grok home lives inside the request cwd and is request-owned too.
-            if homeSelection != "relative override" {
-                XCTAssertEqual(try String(contentsOf: neighbor, encoding: .utf8), "neighbor prompt", homeSelection)
-                XCTAssertEqual(try String(contentsOf: configFile, encoding: .utf8), "existing config", homeSelection)
-            }
-            if homeSelection == "absolute override" {
-                XCTAssertTrue(FileManager.default.fileExists(atPath: unselectedSession.path))
-            }
-        }
-    }
-
-    func testOneShotCleanupUsesResolvedWorkingDirectoryIdentity() async throws {
-        let root = try makeOneShotFixtureRoot()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let physicalParent = root.appendingPathComponent("physical", isDirectory: true)
-        let physicalCWD = physicalParent.appendingPathComponent("rp-grok-oneshot-request", isDirectory: true)
-        try FileManager.default.createDirectory(at: physicalCWD, withIntermediateDirectories: true)
-        let alias = root.appendingPathComponent("alias", isDirectory: true)
-        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: physicalParent)
-        let promptDirectory = alias.appendingPathComponent(physicalCWD.lastPathComponent, isDirectory: true)
-        let grokHome = root.appendingPathComponent("grok-home", isDirectory: true)
-        let owned = try grokHome.appendingPathComponent(
-            "sessions/\(encodedOneShotCWD(resolvedOneShotCWD(promptDirectory)))"
-        )
-        let logicalPathSession = grokHome.appendingPathComponent(
-            "sessions/\(encodedOneShotCWD(promptDirectory.path))"
-        )
-        XCTAssertNotEqual(owned, logicalPathSession)
-        try makeStoredOneShotSession(at: owned)
-        try makeStoredOneShotSession(at: logicalPathSession)
-
-        try await GrokBuildOneShotHeadlessAgentProvider.withRequestCleanup(
-            promptDirectory: promptDirectory,
-            environment: ["GROK_HOME": grokHome.path]
-        ) {}
-
-        XCTAssertFalse(FileManager.default.fileExists(atPath: owned.path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: physicalCWD.path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: logicalPathSession.path))
-    }
-
-    func testOneShotCleanupPreservesSymlinkThenParentHomePaths() async throws {
-        for key in ["GROK_HOME", "HOME"] {
-            for absolute in [false, true] {
-                let label = "\(key), \(absolute ? "absolute" : "relative")"
-                let root = try makeOneShotFixtureRoot()
-                defer { try? FileManager.default.removeItem(at: root) }
-                let requests = root.appendingPathComponent("requests", isDirectory: true)
-                let promptDirectory = requests.appendingPathComponent("rp-grok-oneshot-request", isDirectory: true)
-                let actual = root.appendingPathComponent("actual", isDirectory: true)
-                try FileManager.default.createDirectory(at: promptDirectory, withIntermediateDirectories: true)
-                try FileManager.default.createDirectory(at: actual.appendingPathComponent("child"), withIntermediateDirectories: true)
-                try FileManager.default.createSymbolicLink(
-                    atPath: requests.appendingPathComponent("grok-link").path,
-                    withDestinationPath: "../actual/child"
-                )
-                let physicalCWD = try resolvedOneShotCWD(promptDirectory)
-                let relativeHome = "../grok-link/../grok-home"
-                let homePath = absolute ? try resolvedOneShotCWD(requests) + "/grok-link/../grok-home" : relativeHome
-                let suffix = key == "HOME" ? "grok-home/.grok/sessions" : "grok-home/sessions"
-                let encoded = encodedOneShotCWD(physicalCWD)
-                // The symlink points into actual/child: the following .. reaches
-                // actual, not requests. Expected storage is outside the private cwd.
-                let owned = actual.appendingPathComponent("\(suffix)/\(encoded)")
-                let decoy = requests.appendingPathComponent("\(suffix)/\(encoded)")
-                try makeStoredOneShotSession(at: decoy)
-
-                try await GrokBuildOneShotHeadlessAgentProvider.withRequestCleanup(
-                    promptDirectory: promptDirectory,
-                    environment: [key: homePath]
-                ) {
-                    // Home does not exist when cleanup addressing is captured.
-                    try makeStoredOneShotSession(at: owned)
-                    let filesystemHome = try XCTUnwrap(realpath(physicalCWD + "/" + relativeHome, nil))
-                    defer { free(filesystemHome) }
-                    XCTAssertEqual(String(cString: filesystemHome), try resolvedOneShotCWD(actual.appendingPathComponent("grok-home")), label)
-                }
-
-                XCTAssertFalse(FileManager.default.fileExists(atPath: owned.path), label)
-                XCTAssertEqual(try? String(contentsOf: decoy.appendingPathComponent("prompt_history.jsonl"), encoding: .utf8), "fixture prompt", label)
-                XCTAssertFalse(FileManager.default.fileExists(atPath: promptDirectory.path), label)
-            }
-        }
-    }
-
-    func testOneShotRefusesOverLongPhysicalCWDBeforeLaunchWithoutDeletingSessions() async throws {
-        let root = try makeOneShotFixtureRoot()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let promptDirectory = root
-            .appendingPathComponent(String(repeating: "中", count: 30), isDirectory: true)
-            .appendingPathComponent("rp-grok-oneshot-request", isDirectory: true)
-        try FileManager.default.createDirectory(at: promptDirectory, withIntermediateDirectories: true)
-        let resolvedCWD = try resolvedOneShotCWD(promptDirectory)
-        XCTAssertGreaterThan(encodedOneShotCWD(resolvedCWD).utf8.count, 255)
-        let grokHome = root.appendingPathComponent("grok-home", isDirectory: true)
-        let neighbor = grokHome.appendingPathComponent("sessions/rp-grok-oneshot-request-fedcba9876543210")
-        try makeStoredOneShotSession(at: neighbor)
-        var operationInvoked = false
-        var removedItems: [URL] = []
-
-        do {
-            try await GrokBuildOneShotHeadlessAgentProvider.withRequestCleanup(
-                promptDirectory: promptDirectory,
-                environment: ["GROK_HOME": grokHome.path],
-                removeItem: { url in
-                    removedItems.append(url)
-                    try FileManager.default.removeItem(at: url)
-                }
-            ) {
-                operationInvoked = true
-            }
-            XCTFail("Expected pre-launch refusal for a hashed cwd")
-        } catch let AIProviderError.invalidConfiguration(detail) {
-            XCTAssertTrue(detail.contains("255 bytes"))
-            XCTAssertTrue(detail.contains("shorter temporary directory"))
-        } catch {
-            XCTFail("Expected actionable pre-launch refusal, got \(error)")
-        }
-
-        XCTAssertFalse(operationInvoked, "The request operation must not reach process launch")
-        XCTAssertEqual(removedItems, [promptDirectory], "Only the unused request cwd may be removed")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: promptDirectory.path))
-        XCTAssertEqual(try String(contentsOf: neighbor.appendingPathComponent("prompt_history.jsonl"), encoding: .utf8), "fixture prompt")
-    }
-
-    func testOneShotCleanupWithoutStoredSessionDoesNotCreateGrokHome() async throws {
-        let root = try makeOneShotFixtureRoot()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let promptDirectory = root.appendingPathComponent("rp-grok-oneshot-request", isDirectory: true)
-        try FileManager.default.createDirectory(at: promptDirectory, withIntermediateDirectories: true)
-        let grokHome = root.appendingPathComponent("absent-grok-home", isDirectory: true)
-
-        try await GrokBuildOneShotHeadlessAgentProvider.withRequestCleanup(
-            promptDirectory: promptDirectory,
-            environment: ["GROK_HOME": grokHome.path]
-        ) {}
-
-        XCTAssertFalse(FileManager.default.fileExists(atPath: promptDirectory.path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: grokHome.path))
-    }
-
     func testOneShotCancellationRemovesSessionAfterChildStopsWriting() async throws {
         let root = try makeOneShotFixtureRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -345,61 +144,6 @@ final class GrokBuildModelRoutingTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: ownedPath), "The whole request-owned session must be removed after the child's final write; stored=\(ownedPath), cwd=\(requestCWD)")
         XCTAssertFalse(FileManager.default.fileExists(atPath: requestCWD))
         XCTAssertEqual(try String(contentsOf: neighbor, encoding: .utf8), "neighbor prompt")
-    }
-
-    func testOneShotCleanupFailureReportsBoundedDiagnosticWithoutReplacingOutcome() async throws {
-        for outcome in ["completed", "failed", "timed out", "cancelled"] {
-            let root = try makeOneShotFixtureRoot()
-            defer { try? FileManager.default.removeItem(at: root) }
-            let promptDirectory = root.appendingPathComponent("rp-grok-oneshot-request", isDirectory: true)
-            try FileManager.default.createDirectory(at: promptDirectory, withIntermediateDirectories: true)
-            let grokHome = root.appendingPathComponent("grok-home", isDirectory: true)
-            let owned = try grokHome.appendingPathComponent("sessions/\(encodedOneShotCWD(resolvedOneShotCWD(promptDirectory)))")
-            try makeStoredOneShotSession(at: owned)
-            let deletionError = NSError(
-                domain: "private-prompt-domain",
-                code: NSFileWriteNoPermissionError,
-                userInfo: [NSLocalizedDescriptionKey: String(repeating: "SECRET_PROMPT_CONTENT", count: 100)]
-            )
-            let requestError = NSError(domain: "GrokBuildCLI", code: 7, userInfo: [NSLocalizedDescriptionKey: outcome])
-            var diagnostics: [String] = []
-
-            do {
-                let response = try await GrokBuildOneShotHeadlessAgentProvider.withRequestCleanup(
-                    promptDirectory: promptDirectory,
-                    environment: ["GROK_HOME": grokHome.path],
-                    removeItem: { url in
-                        if url.standardizedFileURL.path == owned.standardizedFileURL.path { throw deletionError }
-                        try FileManager.default.removeItem(at: url)
-                    },
-                    reportFailure: { diagnostics.append($0) }
-                ) {
-                    if outcome == "completed" { return "fixture response" }
-                    if outcome == "cancelled" { throw CancellationError() }
-                    throw requestError
-                }
-                XCTAssertEqual(outcome, "completed")
-                XCTAssertEqual(response, "fixture response")
-            } catch {
-                if outcome == "cancelled" {
-                    XCTAssertTrue(error is CancellationError)
-                } else {
-                    XCTAssertNotEqual(outcome, "completed")
-                    XCTAssertTrue(error as NSError === requestError, "Original request error must remain primary")
-                }
-            }
-
-            XCTAssertEqual(diagnostics.count, 1, outcome)
-            let diagnostic = try XCTUnwrap(diagnostics.first)
-            XCTAssertTrue(diagnostic.contains("cleanup failed"))
-            XCTAssertTrue(diagnostic.contains("\(NSFileWriteNoPermissionError)"))
-            XCTAssertLessThanOrEqual(diagnostic.utf8.count, 160)
-            XCTAssertFalse(diagnostic.contains("SECRET_PROMPT_CONTENT"))
-            XCTAssertFalse(diagnostic.contains(deletionError.domain))
-            XCTAssertFalse(diagnostic.contains(owned.path))
-            XCTAssertTrue(FileManager.default.fileExists(atPath: owned.path), outcome)
-            XCTAssertFalse(FileManager.default.fileExists(atPath: promptDirectory.path), outcome)
-        }
     }
 
     func testOneShotSuccessAppliesIsolationPolicyParsesCompletionAndRemovesEntireSession() async throws {
@@ -699,84 +443,10 @@ final class GrokBuildModelRoutingTests: XCTestCase {
         }
     }
 
-    func testNonAgentAdapterMapsNonSuccessfulStopsToIncomplete() {
-        let incompleteStopReasons = [
-            "max_tokens",
-            "max_turn_requests",
-            "cancelled",
-            "refusal",
-            "future_reason"
-        ]
-        for stopReason in incompleteStopReasons {
-            let normalized = GrokBuildCLIProvider.test_normalizedTerminalResult(
-                AIStreamResult(
-                    type: "message_stop",
-                    text: nil,
-                    promptTokens: 11,
-                    completionTokens: 7,
-                    providerSessionID: "session-1",
-                    stopReason: stopReason,
-                    contextUsedTokens: 13
-                )
-            )
-
-            XCTAssertEqual(normalized.type, AIStreamResult.incompleteType, stopReason)
-            XCTAssertEqual(normalized.stopReason, stopReason, stopReason)
-            XCTAssertEqual(normalized.promptTokens, 11, stopReason)
-            XCTAssertEqual(normalized.completionTokens, 7, stopReason)
-            XCTAssertEqual(normalized.providerSessionID, "session-1", stopReason)
-            XCTAssertEqual(normalized.contextUsedTokens, 13, stopReason)
-        }
-    }
-
-    func testNonAgentAdapterKeepsSuccessfulStopsCompleted() {
-        let successfulStopReasons = [
-            "end_turn",
-            "stop",
-            "stop_sequence",
-            "completed",
-            "complete"
-        ]
-        for stopReason in successfulStopReasons {
-            let normalized = GrokBuildCLIProvider.test_normalizedTerminalResult(
-                AIStreamResult(
-                    type: "message_stop",
-                    text: nil,
-                    stopReason: stopReason
-                )
-            )
-
-            XCTAssertEqual(normalized.type, "message_stop", stopReason)
-            XCTAssertEqual(normalized.stopReason, stopReason, stopReason)
-        }
-
-        let missingReason = GrokBuildCLIProvider.test_normalizedTerminalResult(
-            AIStreamResult(type: "message_stop", text: nil)
-        )
-        XCTAssertEqual(missingReason.type, "message_stop")
-    }
-
-    func testNonAgentCompletionPrefersAuthoritativeFinalContent() {
-        XCTAssertEqual(
-            GrokBuildCLIProvider.test_resolvedCompletionText(
-                streamedParts: ["draft ", "answer"],
-                finalContent: "final answer"
-            ),
-            "final answer"
-        )
-        XCTAssertEqual(
-            GrokBuildCLIProvider.test_resolvedCompletionText(
-                streamedParts: ["streamed ", "answer"],
-                finalContent: nil
-            ),
-            "streamed answer"
-        )
-    }
-
     @MainActor
     func testDropdownDisplaysGrokBuildCatalogName() {
         let model = AIModel.grokBuildCustom(name: "grok-4.6")
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+        _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(
             ACPDiscoveredSessionModels(
                 options: [
                     AgentModelOption(
@@ -822,7 +492,7 @@ final class GrokBuildModelRoutingTests: XCTestCase {
             isProviderDefault: false,
             effortVariant: AgentModelEffortVariant(baseModelRaw: base.rawValue, reasoningEffort: .xhigh)
         )
-        let registry = AgentACPModelRegistry.shared
+        let registry = AgentModelCatalogRuntime.shared.acpRegistry
         XCTAssertTrue(registry.updateDiscoveredModels(
             ACPDiscoveredSessionModels(options: [base, variant], currentModelRaw: base.rawValue),
             for: .grokBuild
@@ -889,7 +559,7 @@ final class GrokBuildModelRoutingTests: XCTestCase {
             ("effort-suffixed base without variant record", [base, suffixBase], suffixBase.rawValue, false, nil),
             ("no catalog", nil, variant.rawValue, false, nil)
         ]
-        let registry = AgentACPModelRegistry.shared
+        let registry = AgentModelCatalogRuntime.shared.acpRegistry
         for row in cases {
             registry.test_reset(providerID: .grokBuild)
             if let options = row.options {

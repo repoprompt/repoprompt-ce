@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentProviderContracts
 
 struct ClaudeModelSpecifier: Equatable {
     let baseModel: String?

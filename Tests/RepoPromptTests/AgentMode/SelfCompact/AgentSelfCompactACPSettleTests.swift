@@ -1,3 +1,4 @@
+import RepoPromptACPProviders
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import XCTest

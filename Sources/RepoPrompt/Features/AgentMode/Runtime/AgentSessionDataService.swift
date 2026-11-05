@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore

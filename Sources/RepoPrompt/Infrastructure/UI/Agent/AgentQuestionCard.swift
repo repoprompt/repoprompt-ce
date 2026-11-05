@@ -1,3 +1,4 @@
+import RepoPromptDomainRuntime
 import SwiftUI
 
 /// A reusable question card component for agent interactions.

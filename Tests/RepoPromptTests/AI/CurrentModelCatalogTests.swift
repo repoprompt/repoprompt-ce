@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptAIContracts
+@testable import RepoPromptHTTPProviders
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
 
@@ -233,7 +235,7 @@ final class OpenAIProModeTests: XCTestCase {
     }
 
     func testForegroundAndBackgroundRequestsPreserveEffortAndOtherSDKFields() throws {
-        let provider = OpenAIProvider(apiKey: "test-key", configuredMaxTokens: 4096)
+        let provider = OpenAIProvider(host: OpenAIProviderAppHost(), apiKey: "test-key", configuredMaxTokens: 4096)
         let message = AIMessage(systemPrompt: "Review carefully", userMessage: "Find defects")
         for (model, effort) in variants {
             for stream in [false, true] {
@@ -266,7 +268,7 @@ final class OpenAIProModeTests: XCTestCase {
     func testProModePreservesExplicitServiceTierAndCustomEndpoint() throws {
         let model = AIModel.openAIServiceTierVariant(base: .gpt6AstraProMax, tier: "flex")
         XCTAssertFalse(model.canStream)
-        let provider = OpenAIProvider(apiKey: "test-key", baseURL: URL(string: "https://example.test/proxy"), overrideVersion: "v4")
+        let provider = OpenAIProvider(host: OpenAIProviderAppHost(), apiKey: "test-key", baseURL: URL(string: "https://example.test/proxy"), overrideVersion: "v4")
         let parameters = try provider.buildForegroundResponseParameters(AIMessage(systemPrompt: "", userMessage: "review"), model: model, maxTokens: nil, stream: false)
         let request = try provider.buildProResponseRequest(parameters, model: model)
         let body = try json(request)
@@ -278,7 +280,7 @@ final class OpenAIProModeTests: XCTestCase {
     }
 
     func testStandardRequestRemainsUnchangedAndCannotUseProAdapter() throws {
-        let provider = OpenAIProvider(apiKey: "test-key")
+        let provider = OpenAIProvider(host: OpenAIProviderAppHost(), apiKey: "test-key")
         let parameters = try provider.buildForegroundResponseParameters(AIMessage(systemPrompt: "", userMessage: "review"), model: .gpt6AstraMax, maxTokens: nil, stream: true)
         let body = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(parameters)) as? [String: Any])
         XCTAssertNil((body["reasoning"] as? [String: Any])?["mode"])

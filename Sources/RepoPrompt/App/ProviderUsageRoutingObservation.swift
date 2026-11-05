@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptProviderQuota
 import RepoPromptSettingsCore
 

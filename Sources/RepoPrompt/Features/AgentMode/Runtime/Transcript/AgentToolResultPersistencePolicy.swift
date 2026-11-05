@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptACPProviders
 import RepoPromptDomainRuntime
 
 struct AgentSanitizedToolResult: Equatable {

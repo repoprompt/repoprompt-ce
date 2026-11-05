@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptACPProviders
 
 enum OpenCodeAgentToolPreferences {
     enum PermissionLevel: String, CaseIterable {

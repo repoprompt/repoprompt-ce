@@ -1,7 +1,10 @@
 import Darwin
 import Foundation
 import MCP
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptCodexProvider
 import RepoPromptSecureStorage
 import XCTest
 

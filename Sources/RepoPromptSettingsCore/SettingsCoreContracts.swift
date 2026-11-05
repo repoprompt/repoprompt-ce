@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 /// Persisted chat mode, independent of the prompt presentation view model.
 package enum SettingsPlanActMode: String, CaseIterable, Codable {

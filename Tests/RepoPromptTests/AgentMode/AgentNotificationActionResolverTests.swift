@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 /// Target double backed by real `AgentTabSession`s. Mutators mirror the view model's id-checked

@@ -1,0 +1,188 @@
+import Foundation
+
+package struct CodexModelSpecifier: Equatable {
+    package typealias ReasoningEffort = CodexReasoningEffort
+
+    package let baseModel: String?
+    package let reasoningEffort: ReasoningEffort?
+    package let serviceTier: String?
+
+    package init(baseModel: String?, reasoningEffort: ReasoningEffort?, serviceTier: String? = nil) {
+        let normalizedBase = baseModel?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let normalizedBase, !normalizedBase.isEmpty, CodexModelIdentity.key(normalizedBase) != "default" {
+            self.baseModel = normalizedBase
+        } else {
+            self.baseModel = nil
+        }
+        self.reasoningEffort = self.baseModel == nil ? nil : reasoningEffort
+        self.serviceTier = self.baseModel == nil ? nil : serviceTier
+    }
+
+    package init(raw: String?, catalogRecords: () -> [CodexDynamicModelRecord]) {
+        let parts = Self.splitLegacyModelID(raw, catalogRecords: catalogRecords)
+        self.init(baseModel: parts.baseModel, reasoningEffort: parts.reasoningEffort, serviceTier: parts.serviceTier)
+    }
+
+    package static func splitLegacyModelID(
+        _ raw: String?,
+        catalogRecords: () -> [CodexDynamicModelRecord]
+    ) -> (baseModel: String?, reasoningEffort: ReasoningEffort?, serviceTier: String?) {
+        guard
+            let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !raw.isEmpty,
+            CodexModelIdentity.key(raw) != "default"
+        else {
+            return (nil, nil, nil)
+        }
+
+        // A provider-advertised exact ID is a model, even when its name ends in a
+        // familiar effort token. Only synthesized variants may be decomposed.
+        let records = catalogRecords()
+        if records.contains(where: { CodexModelIdentity.key($0.id) == CodexModelIdentity.key(raw) }) {
+            return (raw, nil, nil)
+        }
+
+        // First strip any reasoning effort suffix. Legacy efforts remain broadly decoded for
+        // stored selections such as `gpt-5.5-xhigh` and `gpt-5.1-codex-max-low`.
+        // Extended efforts require discovery metadata or a known legacy family, so a
+        // legitimate base ID such as `gpt-5.1-codex-max` is not split by its name alone.
+        let suffixes: [(suffix: String, effort: ReasoningEffort, requiresKnownFamilySupport: Bool)] = [
+            ("-xhigh", .xhigh, false),
+            ("-maximum", .max, true),
+            ("-ultra", .ultra, true),
+            ("-max", .max, true),
+            ("-medium", .medium, false),
+            ("-minimal", .minimal, false),
+            ("-high", .high, false),
+            ("-none", .none, false),
+            ("-low", .low, false)
+        ]
+        var base = raw
+        var effort: ReasoningEffort? = nil
+        let lowered = CodexModelIdentity.key(raw)
+        for (suffix, candidateEffort, requiresKnownFamilySupport) in suffixes where lowered.hasSuffix(suffix) {
+            let candidate = String(raw.dropLast(suffix.count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !candidate.isEmpty else { break }
+            if !requiresKnownFamilySupport || Self.supportsExtendedEffort(
+                candidateEffort,
+                forBaseCandidate: candidate,
+                rawModel: raw,
+                records: records
+            ) {
+                base = candidate
+                effort = candidateEffort
+            }
+            break
+        }
+
+        // Then check for a service tier infix (e.g. "gpt-5.4-fast" → base "gpt-5.4", tier "fast")
+        let knownTiers = CodexServiceTierVariantCatalog.knownServiceTiers
+        var tier: String? = nil
+        let baseLowered = CodexModelIdentity.key(base)
+        for knownTier in knownTiers {
+            let tierSuffix = "-\(knownTier)"
+            if baseLowered.hasSuffix(tierSuffix) {
+                let strippedBase = String(base.dropLast(tierSuffix.count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !strippedBase.isEmpty {
+                    base = strippedBase
+                    tier = knownTier
+                    break
+                }
+            }
+        }
+
+        return (base, effort, tier)
+    }
+
+    private static func supportsExtendedEffort(
+        _ effort: ReasoningEffort,
+        forBaseCandidate candidate: String,
+        rawModel: String,
+        records: [CodexDynamicModelRecord]
+    ) -> Bool {
+        // Exact advertised identities take precedence over synthetic effort suffixes.
+        let rawKey = CodexModelIdentity.key(rawModel)
+        if records.contains(where: { CodexModelIdentity.key($0.id) == rawKey }) {
+            return false
+        }
+        let supportBase = CodexModelIdentity.key(serviceTierStrippedBase(candidate))
+        if let record = records.first(where: { CodexModelIdentity.key($0.id) == supportBase }) {
+            let advertisedEfforts = record.supportedReasoningEfforts.map(\.reasoningEffort)
+                + [record.defaultReasoningEffort].compactMap(\.self)
+            if advertisedEfforts.compactMap(ReasoningEffort.parse).contains(effort) {
+                return true
+            }
+        }
+
+        // Keep decoding saved and backfilled legacy selections when discovery is
+        // unavailable or omits capabilities previously supported by those families.
+        let supported: Set<ReasoningEffort>
+        switch supportBase {
+        case "gpt-6.1-sol":
+            supported = [.max, .ultra]
+        case "gpt-6-sol", "gpt-6-luna", "gpt-6-astra":
+            supported = [.max]
+        case "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra":
+            supported = [.max, .ultra]
+        case "gpt-5.6-luna":
+            supported = [.max]
+        default:
+            return false
+        }
+        return supported.contains(effort)
+    }
+
+    private static func serviceTierStrippedBase(_ candidate: String) -> String {
+        var base = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+        let baseLowered = CodexModelIdentity.key(base)
+        for knownTier in CodexServiceTierVariantCatalog.knownServiceTiers {
+            let tierSuffix = "-\(knownTier)"
+            if baseLowered.hasSuffix(tierSuffix) {
+                let stripped = String(base.dropLast(tierSuffix.count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !stripped.isEmpty {
+                    base = stripped
+                    break
+                }
+            }
+        }
+        return base
+    }
+
+    package var cliModelArgs: [String] {
+        guard let baseModel else { return [] }
+        return ["--model", baseModel]
+    }
+
+    package var cliReasoningConfigArgs: [String] {
+        guard let reasoningEffort else { return [] }
+        return ["-c", "model_reasoning_effort=\(reasoningEffort.rawValue)"]
+    }
+
+    package var cliServiceTierConfigArgs: [String] {
+        guard let supportedServiceTier else { return [] }
+        return ["-c", "service_tier=\(supportedServiceTier)"]
+    }
+
+    package var appServerModelParam: String? {
+        baseModel
+    }
+
+    package var appServerEffortParam: String? {
+        reasoningEffort?.rawValue
+    }
+
+    package var appServerServiceTierParam: String? {
+        supportedServiceTier
+    }
+
+    private var supportedServiceTier: String? {
+        guard let baseModel else { return nil }
+        return CodexServiceTierVariantCatalog.supportedServiceTier(
+            baseModelID: baseModel,
+            serviceTier: serviceTier
+        )
+    }
+}

@@ -102,6 +102,10 @@ provider lifecycle, or persistence ownership; independently constructed instance
 tests. Future catalogue-service extraction should absorb this projection and remove this singleton,
 not duplicate it in individual registries. No other new global owner is authorized by this exception.
 
+## Catalog runtime consolidation (2026-10-29)
+
+`AgentModelCatalogRuntime` replaces the independent advertised, ACP and Codex registry singletons with one application-owned runtime. It owns the existing memory-only admission index and lazily retains the same ACP and Codex registry implementations; provider locks, caches, persistence, warm/reset fences, and invalidation order remain unchanged. Registry-only access does not install the compatible-backend handler. The first advertised operation installs it before proceeding, without holding a runtime slot or activation lock across the registrar. Admission remains exact-ID and memory-only; producers capture generations before reading source snapshots. The existing ACP warm-to-advertised and backend-store-to-invalidation lock order is preserved, and the runtime does not acquire a registry while holding its index lock. The previous exception above is historical: the measured `app_static_shared_declarations` ratchet decreases from 89 to 87. Polling-service lifetimes and app-owned configuration/persistence are not retired by this change.
+
 ## Decisions
 
 | ID | Decision | Status |

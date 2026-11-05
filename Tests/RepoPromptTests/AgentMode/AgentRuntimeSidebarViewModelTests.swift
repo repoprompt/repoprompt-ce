@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptSettingsCore

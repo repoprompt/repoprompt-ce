@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 
 /// App provider-kind adapter over the canonical domain-runtime client policy.

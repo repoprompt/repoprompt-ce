@@ -2,7 +2,11 @@ import Combine
 import Darwin
 import Foundation
 import MCP
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptClaudeProvider
+import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import RepoPromptShared
@@ -1158,8 +1162,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 if inbound {
                     window.apiSettingsViewModel.isClaudeCodeConnected = true
                     try await AsyncTestWait.waitUntil("fixture destination availability") { window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable }
-                    AgentAdvertisedModelCatalog.shared.record([AgentModelOption(rawValue: "sonnet:high", displayName: "Fixture model", description: nil, isPlaceholderDefault: false, isProviderDefault: false)], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
-                    defer { AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode) }
+                    AgentModelCatalogRuntime.shared.record([AgentModelOption(rawValue: "sonnet:high", displayName: "Fixture model", description: nil, isPlaceholderDefault: false, isProviderDefault: false)], for: .claudeCode, generation: AgentModelCatalogRuntime.shared.productionGeneration(for: .claudeCode))
+                    defer { AgentModelCatalogRuntime.shared.invalidate(.claudeCode) }
                     let created = try await connection.callTool(name: MCPWindowToolName.agentSessionLink, arguments: ["op": "create_lane", "model_id": "claudeCode:sonnet:high", "idempotency_key": "discovery-first-lane", "session_name": "Harmless created lane", "_rawJSON": true], timeoutSeconds: 10)
                     let object = try MCPExportWatchdogIntegrationTests.responseObject(from: created)
                     let result = try XCTUnwrap(object["result"] as? [String: Any])
@@ -1348,8 +1352,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 if activate {
                     window.apiSettingsViewModel.isClaudeCodeConnected = true
                     try await AsyncTestWait.waitUntil("activated fixture destination availability") { window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable }
-                    AgentAdvertisedModelCatalog.shared.record([AgentModelOption(rawValue: "sonnet:high", displayName: "Fixture model", description: nil, isPlaceholderDefault: false, isProviderDefault: false)], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
-                    defer { AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode) }
+                    AgentModelCatalogRuntime.shared.record([AgentModelOption(rawValue: "sonnet:high", displayName: "Fixture model", description: nil, isPlaceholderDefault: false, isProviderDefault: false)], for: .claudeCode, generation: AgentModelCatalogRuntime.shared.productionGeneration(for: .claudeCode))
+                    defer { AgentModelCatalogRuntime.shared.invalidate(.claudeCode) }
                     let created = try await connection.callTool(name: MCPWindowToolName.agentSessionLink, arguments: ["op": "create_lane", "model_id": "claudeCode:sonnet:high", "idempotency_key": "activated-discovery-first-lane", "_rawJSON": true], timeoutSeconds: 10)
                     let object = try MCPExportWatchdogIntegrationTests.responseObject(from: created)
                     let result = try XCTUnwrap(object["result"] as? [String: Any])
@@ -1829,7 +1833,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             let turn = "w2-exact-turn-\(owner.attemptID)"
             let raw = (claude ? "toolu_w2_queued_host" : "w2_original_native_call_string") + "-\(owner.attemptID)"
             let mailbox = TestReleaseFence(name: "before first registered noop host callback")
-            var translator = ClaudeSDKNDJSONTranslator()
+            var translator = ClaudeSDKNDJSONTranslator(isRepoPromptToolName: { MCPIntegrationHelper.isRepoPromptToolName($0) })
             var nativeTask: Task<Void, Never>?
             var terminalTask: Task<Void, Never>?
             var nativeIDs: [UUID] = []

@@ -1,5 +1,8 @@
 import Foundation
 import MCP
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
+import RepoPromptCodexProvider
 import RepoPromptSecureStorage
 import RepoPromptShared
 @_spi(TestSupport) @testable import RepoPromptApp

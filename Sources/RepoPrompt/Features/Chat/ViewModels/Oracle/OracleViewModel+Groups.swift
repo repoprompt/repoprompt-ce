@@ -1,5 +1,7 @@
 import Foundation
 import MCP
+import RepoPromptACPProviders
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 
@@ -37,6 +39,60 @@ private enum AppOracleConfiguredRosterDispatch {
 private enum AppOracleConfiguredRosterSingleFallback {
     case executeSingleMCPValue
     case rejectTypedCompletion
+}
+
+enum AppOracleGroupRouting {
+    static func usesGroup(additionalModelRaws: [String]) -> Bool {
+        !additionalModelRaws.isEmpty
+    }
+
+    static func executionProfile(for model: AIModel) -> OracleExecutionProfile? {
+        let effort: String?
+        if model.providerType == .grokBuild {
+            let snapshot = AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshotIncludingStandardStore(for: .grokBuild)
+            effort = GrokBuildModelSpecifier.decompose(
+                raw: model.modelName,
+                options: snapshot?.options ?? []
+            )?.explicitEffort?.rawValue
+        } else {
+            effort = model.defaultReasoningEffort
+        }
+        return try? OracleExecutionProfile(
+            providerID: providerID(for: model),
+            modelID: model.modelName,
+            effectiveReasoningEffort: effort
+        )
+    }
+
+    private static func providerID(for model: AIModel) -> String {
+        if case let .customProvider(_, provider, _) = model {
+            return provider
+        }
+        return providerID(for: model.providerType)
+    }
+
+    private static func providerID(for provider: AIProviderType) -> String {
+        switch provider {
+        case .anthropic: "anthropic"
+        case .openAI: "openAI"
+        case .ollama: "ollama"
+        case .azure: "azure"
+        case .openRouter: "openRouter"
+        case .gemini: "gemini"
+        case .deepseek: "deepseek"
+        case .customProvider: "customProvider"
+        case .fireworks: "fireworks"
+        case .grok: "grok"
+        case .groq: "groq"
+        case .zAI: "zAI"
+        case .claudeCode: "claudeCode"
+        case .codex: "codex"
+        case .openCode: "openCode"
+        case .cursor: "cursor"
+        case .grokBuild: "grokBuild"
+        case .devin: "devin"
+        }
+    }
 }
 
 extension OracleViewModel {

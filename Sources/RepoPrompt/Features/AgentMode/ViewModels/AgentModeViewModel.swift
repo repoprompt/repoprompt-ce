@@ -2,6 +2,10 @@ import Combine
 import CryptoKit
 import Foundation
 import MCP
+import RepoPromptACPProviders
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
+import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptFoundation
@@ -11,14 +15,6 @@ import RepoPromptShared
 import RepoPromptVCS
 import RepoPromptWorkspaceCore
 import SwiftUI
-
-struct AgentContextUsage: Codable, Equatable {
-    var modelContextWindow: Int?
-    var lastTotalTokens: Int?
-    var totalTotalTokens: Int?
-    /// Optional for backward-compatible decoding of older usage snapshots; nil means not pending.
-    var awaitingPostCompactionUsage: Bool? = nil
-}
 
 // MARK: - Agent Mode View Model
 
@@ -1965,7 +1961,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             syncComposerUIState()
         }
         // Note: Registry updates are owned exclusively by CodexModelPollingService.
-        // Do NOT call AgentCodexModelRegistry.shared.updateLiveModels() here.
+        // Do NOT call AgentModelCatalogRuntime.shared.codexRegistry.updateLiveModels() here.
     }
 
     func applyCodexSelectionToBindings(modelRaw: String, reasoningEffortRaw: String?) {
@@ -2406,7 +2402,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard Self.shouldAdoptDiscoveredPreferredModel(for: agent) else { return }
         guard selectedAgent == agent,
               let providerID = agent.acpProviderID,
-              let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: providerID),
+              let snapshot = AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: providerID),
               let preferredModelRaw = snapshot.preferredModelRaw
         else {
             return

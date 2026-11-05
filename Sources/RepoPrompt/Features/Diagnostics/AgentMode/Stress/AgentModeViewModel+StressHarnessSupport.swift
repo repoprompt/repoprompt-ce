@@ -1,6 +1,7 @@
 #if DEBUG
     import Foundation
     import MCP
+    import RepoPromptDomainRuntime
 
     // MARK: - Stress Harness Helpers
 

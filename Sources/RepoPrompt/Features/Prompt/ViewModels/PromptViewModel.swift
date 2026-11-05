@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptCodeMapCore
 import RepoPromptFileSystem
 import RepoPromptInstrumentation

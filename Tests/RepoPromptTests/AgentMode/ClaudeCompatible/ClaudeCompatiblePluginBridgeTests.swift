@@ -1,6 +1,9 @@
 import Foundation
 import MCP
+import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptClaudeProvider
+import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import XCTest
 
@@ -221,11 +224,21 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
                 for: agentKind,
                 modelString: "sonnet"
             )
-            let adapter = try XCTUnwrap(provider as? ClaudeCompatibleHeadlessProviderAdapter)
-            XCTAssertEqual(adapter.runtimeConfig.pluginID.rawValue, expectedPluginID)
-            XCTAssertEqual(adapter.runtimeConfig.mode.rawValue, "discovery")
-            XCTAssertEqual(adapter.runtimeConfig.commandName, "claude")
-            XCTAssertEqual(adapter.runtimeConfig.modelString, "sonnet")
+            let canonicalProvider = try XCTUnwrap(provider as? ClaudeCodeAgentProvider)
+            let actualConfig = canonicalProvider.configurationForTesting
+            let runtimeConfig = ClaudeCompatibleProviderRuntimeBridge.runtimeConfig(from: actualConfig, mode: .discovery)
+            XCTAssertEqual(runtimeConfig.pluginID.rawValue, expectedPluginID)
+            XCTAssertEqual(runtimeConfig.mode.rawValue, "discovery")
+            XCTAssertEqual(runtimeConfig.commandName, "claude")
+            XCTAssertEqual(runtimeConfig.modelString, "sonnet")
+            let context = HeadlessAgentContext(runID: UUID(), environment: [:])
+            XCTAssertEqual(
+                canonicalProvider.buildArguments(context: context),
+                ClaudeCompatibleProviderRuntimeBridge.buildHeadlessArguments(
+                    runtimeConfig: runtimeConfig, mcpConfigPath: nil, launchEnvironment: nil,
+                    resumeSessionID: nil, systemPromptOverride: nil
+                )
+            )
         }
         XCTAssertNil(ClaudeCompatiblePluginBridge.pluginID(for: .codexExec))
 
@@ -533,7 +546,7 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
                 let attemptID = UUID()
                 session.installRunID(runID)
                 session.beginRunAttempt(source: "compaction-replay", attemptID: attemptID)
-                var translator = ClaudeSDKNDJSONTranslator()
+                var translator = ClaudeSDKNDJSONTranslator(isRepoPromptToolName: { MCPIntegrationHelper.isRepoPromptToolName($0) })
                 let sidebar = AgentRuntimeSidebarViewModel()
                 func consume(_ line: String) async throws {
                     var envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])

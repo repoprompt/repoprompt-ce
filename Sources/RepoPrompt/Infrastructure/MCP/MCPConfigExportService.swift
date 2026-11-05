@@ -1,11 +1,13 @@
 import Darwin
 import Foundation
+import RepoPromptAgentProviderContracts
+import RepoPromptDomainRuntime
 import RepoPromptShared
 import RepoPromptVCS
 
 /// Owns one immutable launch configuration. Releasing the lease removes only
 /// the unique file created for that launch; stable wrapper configs are not leased.
-final class MCPConfigLease: @unchecked Sendable {
+final class MCPConfigLease: LaunchConfigLease, @unchecked Sendable {
     fileprivate struct FileIdentity: Equatable {
         let device: dev_t
         let inode: ino_t

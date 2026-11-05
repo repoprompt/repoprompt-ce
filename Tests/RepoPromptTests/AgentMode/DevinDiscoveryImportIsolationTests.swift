@@ -1,5 +1,7 @@
 import Foundation
+import RepoPromptACPProviders
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptProcess
 import XCTest
 

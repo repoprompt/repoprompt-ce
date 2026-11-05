@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentProviderContracts
 import RepoPromptDomainRuntime
 import RepoPromptProcess
 import RepoPromptProviderQuota
@@ -476,7 +477,7 @@ final class ClaudeIntegratedAgentModeRunner {
             return false
         }
 
-        func testConsumeTurnStatus(_ events: [NativeAgentRuntimeEvent], session: AgentTabSession, runID: UUID, owner: AgentRunOwnership) async -> ClaudeNativeProcessSessionController.TurnStatus {
+        func testConsumeTurnStatus(_ events: [NativeAgentRuntimeEvent], session: AgentTabSession, runID: UUID, owner: AgentRunOwnership) async -> NativeAgentRuntimeTurnStatus {
             let stream = AsyncStream<NativeAgentRuntimeEvent> { continuation in
                 for event in events {
                     continuation.yield(event)
@@ -512,7 +513,7 @@ final class ClaudeIntegratedAgentModeRunner {
         var exitedDueToAttemptMismatch = false
         // Keyed answers may settle several unprotected inputs across separate events.
         // Keep their strongest outcome until the existing settlement boundary is terminal.
-        var unprotectedTurnStatus: ClaudeNativeProcessSessionController.TurnStatus = .completed
+        var unprotectedTurnStatus: NativeAgentRuntimeTurnStatus = .completed
         var answeredUnprotected = false
         var hostIDsAtFirstSuccessor: Set<UUID>?
         // Only first-party Claude owns this subscription telemetry. No extra request or
@@ -625,7 +626,7 @@ final class ClaudeIntegratedAgentModeRunner {
                 await hooks.transcript.handleHeadlessStreamResult(result, session, runID, runAttemptID)
             case let .rateLimit(info):
                 if session.selectedAgent == .claudeCode, let quotaLease {
-                    await quotaService.observe(ClaudeCompatibleProviderRuntimeBridge.quotaObservation(from: info), lease: quotaLease, observedAt: Date())
+                    await quotaService.observe(info, lease: quotaLease, observedAt: Date())
                 }
             case let .runtimeInit(status):
                 // Only the window is recomputed, so usage provenance and vouches are left as they are.
@@ -659,7 +660,7 @@ final class ClaudeIntegratedAgentModeRunner {
                 }
             case .turnCompleted, .turnsCompleted:
                 let ids: [UUID]
-                let turnStatus: ClaudeNativeProcessSessionController.TurnStatus
+                let turnStatus: NativeAgentRuntimeTurnStatus
                 let keyed: Bool
                 switch event {
                 case let .turnCompleted(id, status): (ids, turnStatus, keyed) = ([id], status, false)

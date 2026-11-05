@@ -1,6 +1,8 @@
 import Combine
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptFileSystem
+import RepoPromptHTTPProviders
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
 import SwiftUI
