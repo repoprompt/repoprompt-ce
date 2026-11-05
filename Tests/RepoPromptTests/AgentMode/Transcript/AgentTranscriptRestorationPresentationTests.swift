@@ -3791,7 +3791,7 @@ final class AgentSidebarRestoreStabilityTests: XCTestCase {
             XCTAssertTrue(AgentSidebarDateSectionBuilder.activeSections(for: projection.pagedSessions).isEmpty)
             XCTAssertEqual(
                 viewModel.sidebarCollapseAllState(for: incoming.composeTabs, currentTabID: incomingTabID, searchText: ""),
-                .hidden
+                .unavailable
             )
 
             await switchGate.open()
