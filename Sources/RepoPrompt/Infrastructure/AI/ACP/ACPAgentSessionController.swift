@@ -304,7 +304,9 @@ actor ACPAgentSessionController {
 
     /// Provider-owned execution readiness, independent of the app's published run state.
     var hasExecutionInFlight: Bool {
-        if activePromptTurnID != nil { return true }
+        if activePromptTurnID != nil {
+            return true
+        }
         switch state {
         case .launching, .initialized, .openingSession, .promptRunning, .closing:
             return true
@@ -579,7 +581,9 @@ actor ACPAgentSessionController {
         }
 
         func test_waitForSteeringInterruptEntry() async {
-            if testSteeringInterruptEntered { return }
+            if testSteeringInterruptEntered {
+                return
+            }
             await withCheckedContinuation { testSteeringInterruptEntryWaiter = $0 }
         }
 
@@ -937,7 +941,9 @@ actor ACPAgentSessionController {
             settlePromptTurn(promptTurnID, result: .failure(error))
             // Local admission refused before construction or transport; the connection is intact.
             if refusedUnsupportedImages {
-                if state == .promptRunning { state = .sessionOpen }
+                if state == .promptRunning {
+                    state = .sessionOpen
+                }
                 throw error
             }
             if error is CancellationError {
@@ -1922,6 +1928,7 @@ actor ACPAgentSessionController {
             for await chunk in stderrChannel.stream {
                 await handleStderrChunk(chunk)
             }
+            await handleStderrEOF()
         }
     }
 
@@ -1949,21 +1956,28 @@ actor ACPAgentSessionController {
     }
 
     private func handleStderrChunk(_ data: Data) {
-        stderrFramer.feed(data) { lineData in
-            guard
-                let trimmed = trimmedASCIIWhitespace(lineData),
-                let rawText = String(data: trimmed, encoding: .utf8),
-                !rawText.isEmpty
-            else { return }
-            let text = Self.strippingANSIEscapeSequences(from: rawText)
-            guard !text.isEmpty else { return }
-            stderrLineCount += 1
-            lastStderrPreview = Self.truncatedDiagnosticPreview(text)
-            recordActivePromptStderrLine(text)
-            diagnose(.stderrLine(text))
-            guard provider.shouldEmitStderrLine(text) else { return }
-            emit(.stream(AIStreamResult(type: "system", text: text)))
-        }
+        stderrFramer.feed(data) { handleStderrLine($0) }
+    }
+
+    private func handleStderrEOF() {
+        guard provider.providerID == .devin else { return }
+        stderrFramer.flush { handleStderrLine($0) }
+    }
+
+    private func handleStderrLine(_ lineData: Data) {
+        guard
+            let trimmed = trimmedASCIIWhitespace(lineData),
+            let rawText = String(data: trimmed, encoding: .utf8),
+            !rawText.isEmpty
+        else { return }
+        let text = Self.strippingANSIEscapeSequences(from: rawText)
+        guard !text.isEmpty else { return }
+        stderrLineCount += 1
+        lastStderrPreview = Self.truncatedDiagnosticPreview(text)
+        recordActivePromptStderrLine(text)
+        diagnose(.stderrLine(text))
+        guard provider.shouldEmitStderrLine(text) else { return }
+        emit(.stream(AIStreamResult(type: "system", text: text)))
     }
 
     /// CLI providers log with terminal colors; ANSI escape sequences would render as raw
@@ -2221,8 +2235,12 @@ actor ACPAgentSessionController {
             guard var name = (command["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) else {
                 continue
             }
-            if name.hasPrefix("/") { name.removeFirst() }
-            if !name.isEmpty { names.insert(name) }
+            if name.hasPrefix("/") {
+                name.removeFirst()
+            }
+            if !name.isEmpty {
+                names.insert(name)
+            }
         }
         let snapshot = AdvertisedCommands(sessionID: paramsSessionID, names: names)
         advertisedCommandsState.withLock { $0 = snapshot }
@@ -2361,21 +2379,51 @@ actor ACPAgentSessionController {
     }
 
     private func handleProcessExit(_ exitCode: Int32, timedOut: Bool) async {
+        if provider.providerID == .devin, state != .closing, state != .closed,
+           let stderrConsumerTask
+        {
+            // Process termination can overtake the final pipe data. Drain through the
+            // existing reader, but do not hang if a descendant inherited the stderr FD.
+            let completion = AsyncStream<Void>.makeStream()
+            let drain = Task {
+                await stderrConsumerTask.value
+                completion.continuation.finish()
+            }
+            let timeout = Task {
+                try? await Task.sleep(for: .milliseconds(250))
+                completion.continuation.finish()
+            }
+            for await _ in completion.stream {}
+            drain.cancel()
+            timeout.cancel()
+        }
         guard state != .closing, state != .closed else {
             finishEventsIfNeeded()
             return
         }
 
+        // EOF may be held open by a descendant even though the exited process's
+        // final unterminated diagnostic is already buffered by our reader.
+        if provider.providerID == .devin {
+            handleStderrEOF()
+        }
+        var message = timedOut
+            ? "ACP process timed out."
+            : "ACP process exited unexpectedly with code \(exitCode)."
+        // Devin stderr stays out of model/transcript content, but genuine transport
+        // failures must retain its actionable diagnostic (including startup failures).
+        if provider.providerID == .devin, let lastStderrPreview {
+            message += " Last stderr line: `\(lastStderrPreview)`."
+        }
         if state == .promptRunning || !didEmitTerminal {
-            let message = timedOut
-                ? "ACP process timed out."
-                : "ACP process exited unexpectedly with code \(exitCode)."
             emit(.stream(AIStreamResult(type: "error", text: message)))
             emitTerminal(state: .failed, errorText: message)
         }
 
-        failAllPromptSettlementWaiters(with: ControllerError.transportClosed)
-        failPendingRequests(with: ControllerError.transportClosed)
+        let failure: ControllerError = provider.providerID == .devin
+            ? .requestFailed(message) : .transportClosed
+        failAllPromptSettlementWaiters(with: failure)
+        failPendingRequests(with: failure)
         promptImagesSupported = false
         state = .failed
         await clearExpectedAgentPIDIfNeeded()
