@@ -1342,6 +1342,82 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         MonitorSupplementAssertions.assertNotPersisted(in: fixture.session)
     }
 
+    func testQueuedFallbackManagedOnlyProofRechecksRouteBeforePhysicalStart() async throws {
+        #if DEBUG
+            for withdrawRoute in [false, true] {
+                let fixture = try makeFixture()
+                await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+                fixture.session.beginRunAttempt(source: "test.codex.fallback.managed-proof")
+                _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "seed turn", attachments: [])
+                await fixture.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "turn-1"), session: fixture.session, sourceController: fixture.controller)
+                fixture.controller.threadRuntimeStatus = .active(activeFlags: ["turn"])
+                fixture.controller.steerFailure = .noActiveTurn(.init(method: "turn/steer", code: nil, message: "no active turn", data: nil))
+                let outcome = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "managed queued instruction", attachments: [])
+                guard case .queuedFallback = outcome else { return XCTFail("expected fallback, got \(outcome)") }
+                fixture.controller.steerFailure = nil
+                let observer = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+                let target = AgentSessionLinkIdentityTestSupport.endpoint(sessionID: UUID())
+                let authority = DomainAgentSessionLinkAuthority(identity: .init(runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: .distantPast))
+                let observation = DomainAgentSessionObservationSnapshot(sessionID: target.sessionID, displayName: "Managed worker", providerDisplayName: nil, status: .idle, board: .empty, idleForSend: true, pendingInteractionKind: nil, latestVisibleAssistantPreview: nil, visibleRowCount: 0, lastActivityAt: .distantPast)
+                guard case let .reserved(reservation, _) = await authority.reserveLink(observer: observer, target: target),
+                      case let .activated(activation) = await authority.activateLink(reservation: reservation, initialSnapshot: observation, sourcePublicationSequence: 1) else { return XCTFail("activation failed") }
+                let reference = DomainAgentSessionLinkReference(linkID: activation.grant.id, generation: activation.grant.generation)
+                fixture.viewModel.agentSessionLinkPublishPromptInventory(.init(observerSessionID: observer.sessionID, linkSetRevision: 2, items: [.init(targetSessionID: target.sessionID, displayName: "Managed worker", capabilityNames: ["manage", "poll"], reference: reference)]), to: observer)
+                fixture.viewModel.agentSessionLinkPublishPassiveStatusNotices(.init(observerEndpoint: observer, queueEpoch: UUID(), queueRevision: 1, linkSetRevision: 2, isEnabled: true, isDeliverable: true, entries: [.init(reference: reference, targetEndpoint: target, targetSessionID: target.sessionID, displayName: "Managed worker", fromStatus: .running, toStatus: .idle, changeSequence: 1, managedMetadata: .init(observation))], unacknowledgedOverflowCount: 0, overflowProduced: 0), to: observer)
+                let qualification = await fixture.viewModel.qualifyProviderInputRoute(for: fixture.session)
+                XCTAssertTrue(qualification.allowsDispatch)
+                let gate = TestReleaseFence(name: "fallback managed-only proof, withdraw route=\(withdrawRoute)")
+                var proofCalls = 0
+                fixture.viewModel.test_agentSessionLinkManagedMetadataProof = { observer, requirements in
+                    proofCalls += 1
+                    XCTAssertEqual(requirements.count, 1)
+                    await gate.enterAndWait()
+                    XCTAssertFalse(Task.isCancelled, "route withdrawal must not pass by cancelling the proof task")
+                    let proofs = await authority.managedObservationAuthorizations(observer: observer, requirements: requirements)
+                    XCTAssertNotNil(proofs, "Manage stays live; only the provider route is withdrawn")
+                    return proofs
+                }
+                fixture.viewModel.test_agentSessionLinkLocalInputReadProof = { _ in XCTFail("managed-only claim has no local-input decoration")
+                    return false
+                }
+                defer {
+                    gate.release()
+                    fixture.viewModel.test_agentSessionLinkManagedMetadataProof = nil
+                    fixture.viewModel.test_agentSessionLinkLocalInputReadProof = nil
+                }
+                fixture.controller.threadRuntimeStatus = .idle
+                guard await gate.waitUntilEntered() else { return XCTFail("fallback did not enter managed proof") }
+                XCTAssertEqual(fixture.startedTurns.count, 1)
+                XCTAssertTrue(fixture.session.codexController === fixture.controller)
+                if withdrawRoute {
+                    fixture.viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { _, _, _ in nil }
+                    fixture.viewModel.test_agentSessionLinkCurrentRunCatalogRouteToken = { _, _ in false }
+                    let catalog = try XCTUnwrap(fixture.viewModel.agentSessionLinkRunCatalogProjectionByEndpoint[observer])
+                    fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(.init(runID: catalog.runID, routeToken: nil, projectionRevision: catalog.projectionRevision + 1, hasAgentSessionLink: false, hasAnyActiveLink: true), to: observer)
+                    XCTAssertFalse(fixture.viewModel.agentSessionLinkHasCurrentProviderInputRoute(for: fixture.session, qualification: qualification))
+                    XCTAssertTrue(fixture.session.codexController === fixture.controller, "route withdrawal leaves the controller live")
+                }
+                gate.release()
+                if withdrawRoute {
+                    try await AsyncTestWait.waitUntil("managed fallback route refusal settles") {
+                        await MainActor.run { fixture.session.codexFallbackQueue.isEmpty && fixture.session.codexFallbackDispatchInFlight == nil }
+                    }
+                    XCTAssertEqual(fixture.startedTurns.count, 1, "no fallback start after late route withdrawal")
+                    XCTAssertTrue(fixture.session.items.contains { $0.kind == .error && $0.text.contains("lost its exact RepoPrompt MCP route") })
+                    XCTAssertEqual(fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[observer.sessionID]?.entries.count, 1, "refusal does not acknowledge the queued row")
+                } else {
+                    try await AsyncTestWait.waitUntil("control managed fallback physically starts") {
+                        await MainActor.run { fixture.startedTurns.count == 2 }
+                    }
+                    XCTAssertTrue(try XCTUnwrap(fixture.startedTurns.last).contains("run_outcome="))
+                }
+                XCTAssertEqual(proofCalls, 1)
+            }
+        #else
+            throw XCTSkip("Route authority seam requires DEBUG helpers.")
+        #endif
+    }
+
     func testQueuedFallbackMissingRouteRefusesWithoutStartingAnotherTurn() async throws {
         #if DEBUG
             let fixture = try makeFixture()
@@ -1532,6 +1608,30 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             1,
             "accepted auth replay reattaches bytes but is not a second marker producer"
         )
+    }
+
+    func testAuthRecoveryReplayRefusesAcceptedManagedMetadataWithoutLiveGrant() async throws {
+        let fixture = try makeFixture()
+        await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+        _ = try prepareAutoWake(fixture)
+        fixture.session.beginRunAttempt(source: "test.codex.auth.managed-metadata")
+        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "", attachments: [])
+        XCTAssertEqual(fixture.startedTurns.count, 1)
+        var retry = try XCTUnwrap(fixture.session.codexPendingAuthRetryTurn)
+        var claim = try XCTUnwrap(retry.monitoringClaim)
+        let delivered = try XCTUnwrap(claim.passive?.receipt.deliveredStatuses.first)
+        // The adapter fixture publishes presentation only, not a live authority grant. Attach the
+        // exact rendered row requirement to distinguish the real replay fence from epoch-only reuse.
+        claim.managedMetadataRequirements = [.init(reference: delivered.reference, target: delivered.targetEndpoint)]
+        retry.monitoringClaim = claim
+        fixture.session.codexPendingAuthRetryTurn = retry
+        await fixture.coordinator.test_handleCodexNativeEvent(
+            .errorNotification(.init(message: "external auth is active", willRetry: false, threadID: nil, turnID: nil, itemID: nil)),
+            session: fixture.session, sourceController: fixture.controller
+        )
+        let refreshed = await fixture.authRecovery.didRefresh
+        XCTAssertTrue(refreshed)
+        XCTAssertEqual(fixture.startedTurns.count, 1, "accepted managed bytes still need live Manage at auth replay")
     }
 
     func testAuthRecoveryReplayOfSettledAutoWakeRefusesWhenPromptContextIsWithheld() async throws {
