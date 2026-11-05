@@ -5,7 +5,7 @@ Use this guide for contributor-facing XCTest changes. Follow `AGENTS.md` for coo
 ## Fast local feedback and CI escalation
 
 Start with `make check-fast` while iterating. It checks unstaged/staged whitespace,
-repository guardrails, and the existing CI admission/runner/coverage/dependency
+repository guardrails, and CI workflow-contract/admission/diagnostic/runner/coverage/dependency
 selftests, serially and fail-fast. Guardrails evaluate Swift package manifests, so
 the configured Swift toolchain is still required. It does not resolve Swift packages, build or launch
 the app, install tools, or claim complete validation. Untracked-file whitespace and
@@ -22,14 +22,30 @@ provider, module, static, secret and Sentry/privacy obligations. Tip/stable qual
 the exact artifact they publish, including older-runtime compatibility. See
 [integration admission](architecture/ci-admission.md) for the full boundary.
 
-For hosted failures, inspect the failing prerequisite, not just the final Style row.
-For **CI / Style**, use **Re-run all jobs**, never failed-jobs-only: artifacts and receipts are bound to
-one candidate/run/attempt. A failed-jobs-only retry cannot reuse a prior declaration
-and is rejected; it is not evidence of a test flake. Do not issue cosmetic pushes or
-start duplicates to escape a queue. Job creation-to-start is pending time; execution
-starts only after runner assignment. Cancelled/unassigned jobs and inherited retry
-results can have misleading API timestamps. Locally, use the existing conductor
-ticket / `job wait` / request key rather than bypassing shared heavy admission.
+For hosted failures, open **Style's prerequisite table** and the original failing
+job/step, then inspect **CI Recovery** for a bounded automatic recovery decision.
+Recognized startup/transport failures are retried at most to source attempt 3;
+missing evidence or toolchain drift can rebuild the successful producer once.
+Source, assertion, style, coverage and security failures require a code fix.
+On `integration-v3`, use **Re-run failed
+jobs** (or a specific failed job/dependents) only for an evidenced transient failure.
+Successful build evidence is bound to its producer, not the consumer's new attempt.
+For missing/expired artifacts or toolchain drift, rerun **Build and Static Gates**
+and dependents, or **Re-run all jobs**. Old v1/v2 runs still require all-jobs reruns;
+new policy requires new code, not retrying an old commit. A rerun cannot refresh the
+PR base. See the [recovery table](architecture/ci-admission.md#reruns-and-cancellation).
+
+Hosted **Portable Checks** runs `make ci-portable-selftest` and the pinned Codex
+schema contract on Ubuntu before Mac allocation. `make ci-macos-selftest` retains
+Apple-only tooling/native tests and process-supervisor platform coverage; repository
+guardrails also stay on Mac because they inspect manifests/imports with Swift.
+The full local `conductor-selftest` and `release-selftest` commands still include
+their native checks. A Linux pass cannot stand in for those Mac results.
+
+Do not issue cosmetic pushes or duplicate runs to escape a queue. Job creation-to-start
+is pending time; execution starts only after runner assignment. Cancelled/unassigned
+jobs and inherited retry results can have misleading API timestamps. Locally, reuse
+the conductor ticket / `job wait` / request key rather than bypassing shared admission.
 
 ## Claude status-line compatibility experiment (debug only)
 

@@ -169,7 +169,9 @@ class CompatibilityWorkflowTests(unittest.TestCase):
         self.assertNotIn("release artifact", integration)
         style = self.job("ci.yml", "style")
         self.assertIn("integration-products", style)
-        self.assertIn('"$PRODUCTS_RESULT" != success', style)
+        self.assertIn('ci_job_diagnostics.py prerequisites', style)
+        # Every non-success Sentry result is exercised through this actual
+        # command by test_style_command_rejects_each_failed_cancelled_or_skipped_obligation.
 
     def test_publication_waits_for_older_runtime_compatibility(self):
         for workflow, publisher in (("main-tip.yml", "publish"), ("release-promote.yml", "promote")):
