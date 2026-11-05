@@ -19233,7 +19233,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             removePendingUIRefresh(for: tabID)
         }
         if let reactivateSourceTabID, sessions[reactivateSourceTabID] != nil {
-            await promptManager?.switchComposeTab(reactivateSourceTabID)
+            await promptManager?.switchComposeTab(reactivateSourceTabID, focusIntent: .preservesLiveText)
         }
     }
 
@@ -25307,6 +25307,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // synchronization and selected immediately; existing rows keep their positions (§5.4).
         if currentTabID == createdTab.id {
             updateBindingsFromSession(creation.session)
+            promptManager.requestUserComposerActivation(tabID: createdTab.id)
         }
         return createdTab.id
     }

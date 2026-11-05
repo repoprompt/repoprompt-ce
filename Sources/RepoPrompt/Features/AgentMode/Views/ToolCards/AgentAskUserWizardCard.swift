@@ -10,6 +10,8 @@ struct AgentAskUserWizardCard: View {
     let onSkipAll: () -> Void
     let onUserActivity: () -> Void
     var showsTimeout = true
+    var pendingFocusStore: AgentRunInteractionUIStore = .inertFocusSource
+    var pendingFocusTabID: UUID?
 
     @State private var lastActivitySignalAt: Date?
     @State private var activityWorkGate = WorkItemGate()
@@ -36,6 +38,7 @@ struct AgentAskUserWizardCard: View {
             RoundedRectangle(cornerRadius: 8)
                 .stroke(Color.blue.opacity(0.3), lineWidth: 1)
         )
+        .agentPendingCardFocus(store: pendingFocusStore, tabID: pendingFocusTabID, focusTarget: focusCurrentQuestion)
         .onChange(of: pending.id) { _, _ in
             cancelPendingActivitySignal()
             lastActivitySignalAt = nil
@@ -50,6 +53,15 @@ struct AgentAskUserWizardCard: View {
         }
         .onDisappear {
             cancelPendingActivitySignal()
+        }
+    }
+
+    private func focusCurrentQuestion() {
+        guard let question = currentQuestion else { return }
+        if let option = question.options.first {
+            focusedField = .option(question.id, option.label)
+        } else if question.allowsCustom {
+            focusedField = .custom(question.id)
         }
     }
 

@@ -33,6 +33,27 @@ struct AgentRunInteractionUISnapshot: Equatable {
         runState == .running
     }
 
+    /// Identifies the question or approval that should hold focus, following the card order in
+    /// `messageRowsContent`. A merge conflict is excluded: it can stay open for a long time, and
+    /// the composer is how the user asks the agent to help resolve it.
+    var pendingInteractionFocusKey: String? {
+        pendingInteractionFocusKeys.first
+    }
+
+    /// Every pending question or approval, most urgent first.
+    var pendingInteractionFocusKeys: [String] {
+        [
+            pendingCodexHookReview.map { "hook:\($0.id)" },
+            pendingApplyEditsReview.map { "applyEdits:\($0.id)" },
+            pendingWorktreeMergeReview.map { "merge:\($0.id)" },
+            pendingApproval.map { "approval:\($0.id)" },
+            pendingPermissionsRequest.map { "permissions:\($0.id)" },
+            pendingMCPElicitationRequest.map { "elicitation:\($0.id)" },
+            pendingUserInputRequest.map { "input:\($0.id)" },
+            pendingAskUser.map { "askUser:\($0.id)" }
+        ].compactMap(\.self)
+    }
+
     var isWaitingForInstruction: Bool {
         runState == .waitingForUser
     }
@@ -77,10 +98,58 @@ struct AgentRunInteractionUISnapshot: Equatable {
     )
 }
 
+/// What should happen to focus when a session's pending questions and approvals change.
+enum AgentPendingInteractionFocusHandoff: Equatable {
+    case none
+    case returnToComposer
+    case focusNextCard
+
+    /// Focus moves on only when the card that held the top spot was answered. A more urgent card
+    /// pre-empting it must not take focus: Return meant for the question would approve a command.
+    static func evaluate(previousKeys: [String], keys: [String]) -> Self {
+        guard let previousTop = previousKeys.first, !keys.contains(previousTop) else { return .none }
+        return keys.isEmpty ? .returnToComposer : .focusNextCard
+    }
+}
+
 @MainActor
 final class AgentRunInteractionUIStore: ObservableObject {
     var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     @Published private(set) var snapshot: AgentRunInteractionUISnapshot = .empty
+
+    /// One-shot request for a tab's pending card to take focus. A card that merely appears does
+    /// not take focus: a stray Return while typing would otherwise approve a command.
+    struct PendingCardFocusRequest: Equatable {
+        let id = UUID()
+        let tabID: UUID
+        /// Rechecked at delivery, because the user may have moved on since the request.
+        let mayDeliver: @MainActor () -> Bool
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.id == rhs.id
+        }
+    }
+
+    @Published private(set) var pendingCardFocusRequest: PendingCardFocusRequest?
+    /// Changes when a request is issued or withdrawn, which fences any delivery in flight.
+    private(set) var pendingCardFocusGeneration = 0
+
+    func requestPendingCardFocus(tabID: UUID, mayDeliver: @escaping @MainActor () -> Bool = { true }) {
+        pendingCardFocusGeneration += 1
+        pendingCardFocusRequest = .init(tabID: tabID, mayDeliver: mayDeliver)
+    }
+
+    func clearPendingCardFocus() {
+        pendingCardFocusGeneration += 1
+        if pendingCardFocusRequest != nil { pendingCardFocusRequest = nil }
+    }
+
+    /// Returns a request targeting `tabID` once, so only one card takes focus.
+    func takePendingCardFocus(tabID: UUID?) -> PendingCardFocusRequest? {
+        guard let tabID, let request = pendingCardFocusRequest, request.tabID == tabID else { return nil }
+        pendingCardFocusRequest = nil
+        return request
+    }
 
     func update(_ snapshot: AgentRunInteractionUISnapshot) {
         guard self.snapshot != snapshot else {

@@ -3155,8 +3155,9 @@ class WindowState: ObservableObject {
 
         _ = surface
 
+        // An agent asking a question reaches here automatically, so it must not end typing.
         if promptManager.activeComposeTabID != tabID {
-            await promptManager.switchComposeTab(tabID)
+            await promptManager.switchComposeTab(tabID, focusIntent: .preservesLiveText)
         }
 
         return true

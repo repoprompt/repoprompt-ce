@@ -338,16 +338,24 @@ struct AgentRequestUserInputCard: View {
     let onSubmit: (AgentRequestUserInputResponse) -> Void
     let onStop: () -> Void
 
+    private let pendingFocusStore: AgentRunInteractionUIStore
+    private let pendingFocusTabID: UUID?
+
     @State private var draftsByQuestionID: [String: AgentRequestUserInputQuestionDraft]
+    @FocusState private var focusedNoteQuestionID: String?
 
     init(
         request: AgentRequestUserInputRequest,
         allowsRememberedDecision: Bool = true,
+        pendingFocusStore: AgentRunInteractionUIStore = .inertFocusSource,
+        pendingFocusTabID: UUID? = nil,
         onSubmit: @escaping (AgentRequestUserInputResponse) -> Void,
         onStop: @escaping () -> Void
     ) {
         self.request = request
         self.allowsRememberedDecision = allowsRememberedDecision
+        self.pendingFocusStore = pendingFocusStore
+        self.pendingFocusTabID = pendingFocusTabID
         self.onSubmit = onSubmit
         self.onStop = onStop
         _draftsByQuestionID = State(initialValue: Self.makeDrafts(for: request))
@@ -370,9 +378,21 @@ struct AgentRequestUserInputCard: View {
             RoundedRectangle(cornerRadius: 8)
                 .stroke(Color.blue.opacity(0.3), lineWidth: 1)
         )
+        .agentPendingCardFocus(store: pendingFocusStore, tabID: pendingFocusTabID, focusTarget: firstNoteFocusTarget)
         .onChange(of: request.id) { _, _ in
             draftsByQuestionID = Self.makeDrafts(for: request)
         }
+    }
+
+    private func showsNoteField(for question: AgentRequestUserInputQuestion) -> Bool {
+        // CU legacy approval answers are literal one-shot choices, never arbitrary scope text.
+        allowsRememberedDecision || !question.isLegacyMCPToolApproval
+    }
+
+    /// Answers are typed, so the first note field is the natural target when there is one.
+    private var firstNoteFocusTarget: (() -> Void)? {
+        guard let question = request.questions.first, showsNoteField(for: question) else { return nil }
+        return { focusedNoteQuestionID = question.id }
     }
 
     private var headerSection: some View {
@@ -427,15 +447,16 @@ struct AgentRequestUserInputCard: View {
                 }
             }
 
-            // CU legacy approval answers are literal one-shot choices, never arbitrary scope text.
-            if allowsRememberedDecision || !question.isLegacyMCPToolApproval {
+            if showsNoteField(for: question) {
                 if question.isSecret {
                     SecureField(notePlaceholder(for: question), text: noteBinding(for: question))
                         .textFieldStyle(.roundedBorder)
+                        .focused($focusedNoteQuestionID, equals: question.id)
                 } else {
                     TextField(notePlaceholder(for: question), text: noteBinding(for: question), axis: .vertical)
                         .textFieldStyle(.roundedBorder)
                         .lineLimit(2 ... 6)
+                        .focused($focusedNoteQuestionID, equals: question.id)
                 }
             }
         }

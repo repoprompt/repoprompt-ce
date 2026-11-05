@@ -575,3 +575,489 @@ final class AgentRepromptPresentationTests: XCTestCase {
         XCTAssertTrue(fixture.viewModel.repromptUIStore.recoveries[tabID]?.bypassesPreparation == true)
     }
 }
+
+// MARK: - Session activation focus
+
+private final class ActivationFocusWindow: NSWindow {
+    var reportsKeyWindow = true
+    override var isKeyWindow: Bool {
+        reportsKeyWindow
+    }
+}
+
+private struct LiveFieldSibling: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSTextField {
+        let field = NSTextField(string: "")
+        field.identifier = .init("live")
+        return field
+    }
+
+    func updateNSView(_ nsView: NSTextField, context: Context) {}
+}
+
+private struct ReadOnlyTextSibling: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSTextView {
+        let view = NSTextView()
+        view.identifier = .init("readOnly")
+        view.isEditable = false
+        view.isSelectable = true
+        return view
+    }
+
+    func updateNSView(_ nsView: NSTextView, context: Context) {}
+}
+
+private final class FocusActionCounts {
+    var approvals = 0
+    var composerReturns = 0
+}
+
+private struct CardHost: View {
+    let store: AgentRunInteractionUIStore
+    let tabID: UUID
+    let showsCard: Bool
+    let activation: TextFieldFocusActivationRequest?
+    let restore: UUID?
+    let draft: String
+    let identity: UUID
+    var counts = FocusActionCounts()
+    var nativeEditor: TextFieldNativeEditor?
+
+    var body: some View {
+        VStack {
+            if showsCard {
+                Button("Approve") { counts.approvals += 1 }
+                    .keyboardShortcut(.return, modifiers: [])
+                    .frame(height: 40)
+                    .agentPendingCardFocus(store: store, tabID: tabID)
+            }
+            CustomTextField(
+                text: .constant(draft),
+                placeholder: "",
+                onReturn: { counts.composerReturns += 1 },
+                focusRestoreRequest: restore,
+                focusActivationRequest: activation,
+                nativeEditor: nativeEditor,
+                nativeEditorIdentity: AnyHashable(identity),
+                currentHeightPresetIndex: .constant(0),
+                onHeightChange: { _ in }
+            )
+            LiveFieldSibling()
+            ReadOnlyTextSibling().frame(height: 40)
+        }
+        .frame(width: 480, height: 280)
+    }
+}
+
+@MainActor
+final class AgentSessionActivationFocusTests: XCTestCase {
+    private func descendants(_ view: NSView) -> [NSView] {
+        [view] + view.subviews.flatMap { descendants($0) }
+    }
+
+    private struct Fixture {
+        let window: ActivationFocusWindow
+        let host: NSHostingView<CardHost>
+        let editor: AttachmentAwareTextView
+        let coordinator: CustomTextField.Coordinator
+        let store: AgentRunInteractionUIStore
+        let tabID: UUID
+    }
+
+    private func makeFixture(showsCard: Bool = false, draft: String = "Draft") throws -> Fixture {
+        let store = AgentRunInteractionUIStore()
+        let tabID = UUID()
+        let host = NSHostingView(rootView: CardHost(
+            store: store, tabID: tabID, showsCard: showsCard, activation: nil, restore: nil, draft: draft, identity: tabID,
+            nativeEditor: TextFieldNativeEditor()
+        ))
+        let window = ActivationFocusWindow(
+            contentRect: .init(x: 0, y: 0, width: 480, height: 280),
+            styleMask: .borderless,
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        addTeardownBlock { @MainActor in
+            window.contentView = nil
+            window.close()
+        }
+        host.layoutSubtreeIfNeeded()
+        let editor = try XCTUnwrap(descendants(host).compactMap { $0 as? AttachmentAwareTextView }.first)
+        let coordinator = try XCTUnwrap(editor.delegate as? CustomTextField.Coordinator)
+        return Fixture(window: window, host: host, editor: editor, coordinator: coordinator, store: store, tabID: tabID)
+    }
+
+    private func sendActivation(_ fixture: Fixture, overridableTextEntry: ObjectIdentifier?) async throws {
+        let request = TextFieldFocusActivationRequest(overridableTextEntry: overridableTextEntry)
+        fixture.host.rootView = updated(fixture) { $0.activation = request }
+        fixture.host.layoutSubtreeIfNeeded()
+        try await AsyncTestWait.waitUntil("activation reached native editor", timeout: 3) {
+            fixture.coordinator.lastFocusActivationRequest == request
+        }
+        await fixture.coordinator.focusActivationTask?.value
+    }
+
+    private struct RootChanges {
+        var showsCard: Bool
+        var activation: TextFieldFocusActivationRequest?
+        var restore: UUID?
+        var draft: String
+        var identity: UUID
+    }
+
+    private func updated(_ fixture: Fixture, _ change: (inout RootChanges) -> Void) -> CardHost {
+        let root = fixture.host.rootView
+        var changes = RootChanges(
+            showsCard: root.showsCard, activation: root.activation, restore: root.restore,
+            draft: root.draft, identity: root.identity
+        )
+        change(&changes)
+        return CardHost(
+            store: root.store, tabID: root.tabID, showsCard: changes.showsCard, activation: changes.activation,
+            restore: changes.restore, draft: changes.draft, identity: changes.identity,
+            counts: root.counts, nativeEditor: root.nativeEditor
+        )
+    }
+
+    private func sendReturn(_ fixture: Fixture) throws {
+        let event = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 30,
+            windowNumber: fixture.window.windowNumber, context: nil,
+            characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36
+        ))
+        fixture.window.sendEvent(event)
+    }
+
+    private func view(_ identifier: String, in fixture: Fixture) throws -> NSView {
+        try XCTUnwrap(descendants(fixture.host).first { $0.identifier?.rawValue == identifier })
+    }
+
+    // MARK: - Composer
+
+    func testActivationTakesFocusFromNonEditableResponder() async throws {
+        let fixture = try makeFixture()
+        XCTAssertTrue(try fixture.window.makeFirstResponder(view("readOnly", in: fixture)))
+        try await sendActivation(fixture, overridableTextEntry: nil)
+        XCTAssertTrue(fixture.window.firstResponder === fixture.editor)
+    }
+
+    func testAutomatedActivationLeavesLiveFieldAlone() async throws {
+        let fixture = try makeFixture()
+        XCTAssertTrue(try fixture.window.makeFirstResponder(view("live", in: fixture)))
+        let liveResponder = fixture.window.firstResponder
+        try await sendActivation(fixture, overridableTextEntry: nil)
+        XCTAssertTrue(fixture.window.firstResponder === liveResponder, "An automated switch must not interrupt typing")
+    }
+
+    func testUserActivationEndsTypingInAnotherField() async throws {
+        let fixture = try makeFixture()
+        XCTAssertTrue(try fixture.window.makeFirstResponder(view("live", in: fixture)))
+        let entry = try XCTUnwrap(fixture.host.rootView.nativeEditor?.currentTextEntry)
+        try await sendActivation(fixture, overridableTextEntry: entry)
+        XCTAssertTrue(fixture.window.firstResponder === fixture.editor)
+    }
+
+    func testUserActivationDoesNotEndAFieldTheUserMovedToAfterwards() async throws {
+        let fixture = try makeFixture()
+        XCTAssertTrue(try fixture.window.makeFirstResponder(view("live", in: fixture)))
+        let liveResponder = fixture.window.firstResponder
+        // The switch started while a different entry held focus, then the user moved here.
+        let otherEntry = ObjectIdentifier(fixture.window)
+        try await sendActivation(fixture, overridableTextEntry: otherEntry)
+        XCTAssertTrue(fixture.window.firstResponder === liveResponder)
+    }
+
+    func testActivationInNonKeyWindowIsReadyWhenWindowComesForward() async throws {
+        let fixture = try makeFixture()
+        fixture.window.reportsKeyWindow = false
+        XCTAssertTrue(fixture.window.makeFirstResponder(fixture.window))
+        try await sendActivation(fixture, overridableTextEntry: nil)
+        XCTAssertTrue(fixture.window.firstResponder === fixture.editor)
+    }
+
+    func testActivationWaitsForWindowOnFirstMount() async throws {
+        let request = TextFieldFocusActivationRequest(overridableTextEntry: nil)
+        let tabID = UUID()
+        let host = NSHostingView(rootView: CardHost(
+            store: AgentRunInteractionUIStore(), tabID: tabID, showsCard: false, activation: request,
+            restore: nil, draft: "", identity: tabID
+        ))
+        host.layoutSubtreeIfNeeded()
+        let editor = try XCTUnwrap(descendants(host).compactMap { $0 as? AttachmentAwareTextView }.first)
+        let coordinator = try XCTUnwrap(editor.delegate as? CustomTextField.Coordinator)
+        try await AsyncTestWait.waitUntil("activation reached native editor", timeout: 3) {
+            coordinator.lastFocusActivationRequest == request
+        }
+        XCTAssertNil(editor.window)
+
+        let window = ActivationFocusWindow(
+            contentRect: .init(x: 0, y: 0, width: 480, height: 280),
+            styleMask: .borderless,
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        addTeardownBlock { @MainActor in
+            window.contentView = nil
+            window.close()
+        }
+        await coordinator.focusActivationTask?.value
+        XCTAssertTrue(window.firstResponder === editor)
+    }
+
+    func testSwitchingSessionsPutsCaretAfterTheNewDraft() throws {
+        let fixture = try makeFixture(draft: "A longer first draft")
+        fixture.editor.setSelectedRange(NSRange(location: 3, length: 0))
+
+        let otherTab = UUID()
+        let root = fixture.host.rootView
+        fixture.host.rootView = CardHost(
+            store: root.store, tabID: root.tabID, showsCard: false, activation: nil, restore: nil,
+            draft: "Second draft", identity: otherTab
+        )
+        fixture.host.layoutSubtreeIfNeeded()
+        XCTAssertEqual(fixture.editor.string, "Second draft")
+        XCTAssertEqual(fixture.editor.selectedRange(), NSRange(location: 12, length: 0))
+
+        // In the app the new draft arrives in the update after the identity change.
+        let lateDraftTab = UUID()
+        fixture.host.rootView = CardHost(
+            store: root.store, tabID: root.tabID, showsCard: false, activation: nil, restore: nil,
+            draft: "Second draft", identity: lateDraftTab
+        )
+        fixture.host.layoutSubtreeIfNeeded()
+        fixture.host.rootView = CardHost(
+            store: root.store, tabID: root.tabID, showsCard: false, activation: nil, restore: nil,
+            draft: "A much longer third draft", identity: lateDraftTab
+        )
+        fixture.host.layoutSubtreeIfNeeded()
+        XCTAssertEqual(fixture.editor.selectedRange(), NSRange(location: 25, length: 0))
+
+        // A later replacement in the same session keeps its normal caret behavior.
+        fixture.editor.setSelectedRange(NSRange(location: 2, length: 0))
+        fixture.host.rootView = CardHost(
+            store: root.store, tabID: root.tabID, showsCard: false, activation: nil, restore: nil,
+            draft: "A much longer third draft!", identity: lateDraftTab
+        )
+        fixture.host.layoutSubtreeIfNeeded()
+        XCTAssertEqual(fixture.editor.selectedRange(), NSRange(location: 2, length: 0))
+
+        // The caret also resets when both sessions happen to hold the same draft.
+        fixture.host.rootView = CardHost(
+            store: root.store, tabID: root.tabID, showsCard: false, activation: nil, restore: nil,
+            draft: "Second draft", identity: otherTab
+        )
+        fixture.host.layoutSubtreeIfNeeded()
+        fixture.editor.setSelectedRange(NSRange(location: 2, length: 0))
+        fixture.host.rootView = CardHost(
+            store: root.store, tabID: root.tabID, showsCard: false, activation: nil, restore: nil,
+            draft: "Second draft", identity: UUID()
+        )
+        fixture.host.layoutSubtreeIfNeeded()
+        XCTAssertEqual(fixture.editor.selectedRange(), NSRange(location: 12, length: 0))
+    }
+
+    func testCaretPlacedByUserAfterIdenticalDraftSwitchSurvivesLaterReplacement() throws {
+        let fixture = try makeFixture(draft: "Same draft")
+        fixture.host.rootView = updated(fixture) { $0.identity = UUID() }
+        fixture.host.layoutSubtreeIfNeeded()
+        XCTAssertEqual(fixture.editor.selectedRange(), NSRange(location: 10, length: 0))
+
+        fixture.editor.setSelectedRange(NSRange(location: 2, length: 0))
+        fixture.host.rootView = updated(fixture) { $0.draft = "Same draft, edited elsewhere" }
+        fixture.host.layoutSubtreeIfNeeded()
+        XCTAssertEqual(fixture.editor.selectedRange(), NSRange(location: 2, length: 0))
+    }
+
+    func testActivationRequestIsNotReplayedLongAfterItWasIssued() async throws {
+        let fixture = try makeFixture()
+        XCTAssertTrue(fixture.window.makeFirstResponder(fixture.window))
+        var request = TextFieldFocusActivationRequest(overridableTextEntry: nil)
+        request.issuedAt = Date().addingTimeInterval(-(TextFieldFocusActivationRequest.windowWaitSeconds + 1))
+        fixture.host.rootView = updated(fixture) { $0.activation = request }
+        fixture.host.layoutSubtreeIfNeeded()
+        try await AsyncTestWait.waitUntil("request reached native editor", timeout: 3) {
+            fixture.coordinator.lastFocusActivationRequest == request
+        }
+        await fixture.coordinator.focusActivationTask?.value
+        XCTAssertFalse(fixture.window.firstResponder === fixture.editor)
+    }
+
+    func testComposerCountsAsLiveTextOnlyWhenIncluded() throws {
+        let fixture = try makeFixture()
+        let native = TextFieldNativeEditor()
+        native.attach(fixture.editor, identity: nil)
+        XCTAssertTrue(fixture.window.makeFirstResponder(fixture.editor))
+        XCTAssertFalse(native.isTextEntryActive(includingEditor: false))
+        XCTAssertTrue(native.isTextEntryActive(includingEditor: true), "An automated switch must not move someone typing in the composer")
+        XCTAssertTrue(try fixture.window.makeFirstResponder(view("readOnly", in: fixture)))
+        XCTAssertFalse(native.isTextEntryActive(includingEditor: true))
+        XCTAssertTrue(try fixture.window.makeFirstResponder(view("live", in: fixture)))
+        XCTAssertTrue(native.isTextEntryActive(includingEditor: false))
+    }
+
+    // MARK: - Pending cards
+
+    func testFocusMovesOnOnlyWhenTheTopCardWasAnswered() {
+        typealias Handoff = AgentPendingInteractionFocusHandoff
+        XCTAssertEqual(Handoff.evaluate(previousKeys: ["approval:1"], keys: []), .returnToComposer)
+        XCTAssertEqual(Handoff.evaluate(previousKeys: ["approval:1"], keys: ["approval:2"]), .focusNextCard)
+        XCTAssertEqual(
+            Handoff.evaluate(previousKeys: ["askUser:1"], keys: ["approval:2", "askUser:1"]),
+            .none,
+            "A more urgent card pre-empting a question must not take focus"
+        )
+        XCTAssertEqual(Handoff.evaluate(previousKeys: [], keys: ["approval:1"]), .none, "A card arriving mid-session must not take focus")
+        XCTAssertEqual(Handoff.evaluate(previousKeys: ["approval:1", "askUser:2"], keys: ["askUser:2"]), .focusNextCard)
+    }
+
+    func testHandoffWaitsOnlyForTheDepartingField() async throws {
+        let fixture = try makeFixture()
+        let native = try XCTUnwrap(fixture.host.rootView.nativeEditor)
+
+        // Nothing to wait for when the composer or a non-text view holds focus.
+        XCTAssertTrue(fixture.window.makeFirstResponder(fixture.editor))
+        var started = Date()
+        await native.waitForOtherTextEntryToDepart(timeoutSeconds: 5)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2)
+
+        // Bounded: a field that stays is left alone once the wait ends.
+        let live = try view("live", in: fixture)
+        XCTAssertTrue(fixture.window.makeFirstResponder(live))
+        let liveResponder = fixture.window.firstResponder
+        started = Date()
+        await native.waitForOtherTextEntryToDepart(timeoutSeconds: 0.1)
+        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(started), 0.1)
+        XCTAssertTrue(fixture.window.firstResponder === liveResponder)
+
+        // Ends as soon as the field moves on, without waiting out the timeout.
+        started = Date()
+        let wait = Task { @MainActor in await native.waitForOtherTextEntryToDepart(timeoutSeconds: 5) }
+        await Task.yield()
+        XCTAssertTrue(try fixture.window.makeFirstResponder(view("readOnly", in: fixture)))
+        await wait.value
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2)
+    }
+
+    func testUserTypingBetweenRequestAndDeliveryKeepsFocusOffTheCard() async throws {
+        let fixture = try makeFixture(showsCard: true)
+        let native = try XCTUnwrap(fixture.host.rootView.nativeEditor)
+        fixture.host.rootView = updated(fixture) { _ in }
+        fixture.host.layoutSubtreeIfNeeded()
+        XCTAssertTrue(fixture.window.makeFirstResponder(fixture.editor))
+
+        fixture.store.requestPendingCardFocus(tabID: fixture.tabID, mayDeliver: {
+            !native.isTextEntryActive(includingEditor: true)
+        })
+        try await AsyncTestWait.waitUntil("card consumed the request", timeout: 3) {
+            fixture.host.layoutSubtreeIfNeeded()
+            return fixture.store.pendingCardFocusRequest == nil
+        }
+        for _ in 0 ..< 5 {
+            await Task.yield()
+        }
+        XCTAssertTrue(fixture.window.firstResponder === fixture.editor, "A refused delivery must leave the user's field alone")
+    }
+
+    func testWithdrawnRequestDoesNotDeliver() async throws {
+        let fixture = try makeFixture(showsCard: true)
+        XCTAssertTrue(fixture.window.makeFirstResponder(fixture.editor))
+        fixture.store.requestPendingCardFocus(tabID: fixture.tabID)
+        fixture.store.clearPendingCardFocus()
+        fixture.host.layoutSubtreeIfNeeded()
+        for _ in 0 ..< 5 {
+            await Task.yield()
+        }
+        XCTAssertTrue(fixture.window.firstResponder === fixture.editor)
+    }
+
+    func testRequestedCardTakesFocusFromComposerAndResolvingReturnsIt() async throws {
+        let fixture = try makeFixture(showsCard: true)
+        XCTAssertTrue(fixture.window.makeFirstResponder(fixture.editor))
+
+        fixture.store.requestPendingCardFocus(tabID: fixture.tabID)
+        try await AsyncTestWait.waitUntil("card took focus", timeout: 3) {
+            fixture.host.layoutSubtreeIfNeeded()
+            return fixture.window.firstResponder !== fixture.editor
+        }
+        XCTAssertNil(fixture.store.pendingCardFocusRequest, "The request must be consumed by the card")
+        let cardResponder = try XCTUnwrap(fixture.window.firstResponder as? NSView)
+        XCTAssertFalse(cardResponder is NSTextView, "The card, not a text field, must hold focus")
+        XCTAssertTrue(cardResponder.isDescendant(of: fixture.host) || cardResponder === fixture.host)
+
+        // Return must not reach the composer now that the card holds focus.
+        let counts = fixture.host.rootView.counts
+        try sendReturn(fixture)
+        XCTAssertEqual(counts.composerReturns, 0, "Return must not send a message while the card holds focus")
+        _ = try fixture.window.performKeyEquivalent(with: XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 31,
+            windowNumber: fixture.window.windowNumber, context: nil,
+            characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36
+        )))
+        XCTAssertGreaterThanOrEqual(counts.approvals, 1, "Return must reach the card's default action")
+
+        let restore = UUID()
+        fixture.host.rootView = updated(fixture) {
+            $0.showsCard = false
+            $0.restore = restore
+        }
+        fixture.host.layoutSubtreeIfNeeded()
+        try await AsyncTestWait.waitUntil("focus request reached native editor", timeout: 3) {
+            fixture.coordinator.lastFocusRestoreRequest == restore
+        }
+        await fixture.coordinator.focusRestorationTask?.value
+        XCTAssertTrue(fixture.window.firstResponder === fixture.editor, "Answering the card must return focus to the composer")
+    }
+
+    func testCardArrivingMidSessionDoesNotTakeFocus() async throws {
+        let fixture = try makeFixture()
+        XCTAssertTrue(fixture.window.makeFirstResponder(fixture.editor))
+        let root = fixture.host.rootView
+        fixture.host.rootView = CardHost(
+            store: root.store, tabID: root.tabID, showsCard: true, activation: nil, restore: nil,
+            draft: root.draft, identity: root.identity
+        )
+        fixture.host.layoutSubtreeIfNeeded()
+        for _ in 0 ..< 5 {
+            await Task.yield()
+        }
+        XCTAssertTrue(fixture.window.firstResponder === fixture.editor)
+    }
+
+    func testCardFocusRequestIsOneShotAndTabScoped() {
+        let store = AgentRunInteractionUIStore()
+        let tabID = UUID()
+        store.requestPendingCardFocus(tabID: tabID)
+        XCTAssertNil(store.takePendingCardFocus(tabID: UUID()))
+        XCTAssertNil(store.takePendingCardFocus(tabID: nil))
+        XCTAssertNotNil(store.takePendingCardFocus(tabID: tabID))
+        XCTAssertNil(store.takePendingCardFocus(tabID: tabID))
+    }
+
+    func testPendingApprovalClaimsFocusAndEachRequestHasItsOwnKey() {
+        XCTAssertNil(AgentRunInteractionUISnapshot.empty.pendingInteractionFocusKey)
+        func approval(_ requestID: Int) -> AgentApprovalRequest {
+            AgentApprovalRequest(
+                requestID: .codex(.int(requestID)),
+                method: "item/commandExecution/requestApproval",
+                kind: .commandExecution,
+                threadID: "thread",
+                turnID: "turn",
+                itemID: "item",
+                reason: nil,
+                command: "ls",
+                cwd: nil,
+                details: []
+            )
+        }
+        var first = AgentRunInteractionUISnapshot.empty
+        first.pendingApproval = approval(1)
+        var second = AgentRunInteractionUISnapshot.empty
+        second.pendingApproval = approval(2)
+        XCTAssertNotNil(first.pendingInteractionFocusKey)
+        XCTAssertNotEqual(first.pendingInteractionFocusKey, second.pendingInteractionFocusKey)
+    }
+}
