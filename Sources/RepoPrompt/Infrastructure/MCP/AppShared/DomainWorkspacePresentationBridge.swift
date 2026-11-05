@@ -35,14 +35,6 @@ struct DomainWorkspaceFailClosedSaveOutcome {
     }
 }
 
-private enum DomainWorkspaceModelEncoder {
-    static func encode(_ workspace: WorkspaceModel) throws -> Data {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = .sortedKeys
-        return try encoder.encode(workspace)
-    }
-}
-
 /// Revisioned app-process client for the runtime-owned workspace/context authority.
 /// It is the only production persistence dependency injected into a workspace manager.
 struct DomainWorkspaceAuthorityClient {
@@ -53,11 +45,6 @@ struct DomainWorkspaceAuthorityClient {
     /// Admit through the same policy the runtime writer uses, before UI relocation mutates disk.
     func admitStorageRoot(_ root: URL) throws {
         try metadataPathPolicy?.admitWorkspaceRoot(root)
-    }
-
-    /// The exact digest used by document submission, shared with presentation write receipts.
-    static func documentDigest(for workspace: WorkspaceModel) throws -> String {
-        try DomainContentDigest.sha256(DomainWorkspaceModelEncoder.encode(workspace))
     }
 
     #if DEBUG
@@ -331,16 +318,6 @@ struct DomainWorkspaceAuthorityClient {
     func reloadExternalChanges() async -> DomainWorkspaceCatalogSnapshot {
         await store.reloadExternalChanges()
         return await store.snapshot()
-    }
-
-    static func document(for workspace: WorkspaceModel, fileURL: URL) throws -> DomainWorkspaceDocument {
-        let bytes = try DomainWorkspaceModelEncoder.encode(workspace)
-        let document = try DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: fileURL)
-        // Bytes the app encodes from a model always decode back without loss; recording that here,
-        // outside every domain lock, spares the recovery guard a full decode when they are later
-        // discarded (#335).
-        WorkspaceUnreadableDocumentBackup.recordAppEncodedDocument(bytes)
-        return document
     }
 
     /// Retries only the exact same envelope. A changed CAS expectation or payload is a new
