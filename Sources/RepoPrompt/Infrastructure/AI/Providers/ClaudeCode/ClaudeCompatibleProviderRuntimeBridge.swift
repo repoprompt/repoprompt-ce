@@ -25,6 +25,7 @@ typealias ClaudeCompatiblePluginPromptDeliveryMode = RepoPromptClaudeCompatibleP
 typealias ClaudeCompatiblePluginProtocolCodec = RepoPromptClaudeCompatibleProvider.ClaudeSDKProtocolCodec
 typealias ClaudeCompatiblePluginNDJSONTranslator = RepoPromptClaudeCompatibleProvider.ClaudeSDKNDJSONTranslator
 typealias ClaudeCompatiblePluginJSONValue = RepoPromptClaudeCompatibleProvider.ClaudeProviderJSONValue
+typealias ClaudeCompatiblePluginAutoCompactWindow = RepoPromptClaudeCompatibleProvider.ClaudeAutoCompactWindow
 
 /// Infrastructure-level facade for pure Claude-compatible provider package
 /// helpers. This keeps lower-level Claude provider code from depending upward on

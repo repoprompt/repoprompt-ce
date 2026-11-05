@@ -147,9 +147,9 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         XCTAssertNil(context.usedPercent)
     }
 
-    /// Through the real usage handler: after Claude Code -> Kimi, Kimi's window-less first report is
-    /// judged against Claude's window and rejected, so the estimator carries Claude's count forward.
-    /// Neither that count nor Claude's window may be reported as Kimi's load.
+    /// Through the real usage handler: after Claude Code -> Kimi, Kimi's output-only first report
+    /// leaves the estimator carrying Claude's count forward. Neither that count nor Claude's window
+    /// may be reported as Kimi's load, and Claude's capacity never judges Kimi's own readings.
     func testProviderSwitchNeverRelabelsThePreviousProvidersFigures() {
         let viewModel = makeViewModel()
         let tabID = UUID()
@@ -170,13 +170,21 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         XCTAssertNotNil(session.contextUsageSnapshot, "The ring's value is left alone")
         XCTAssertNil(reported())
 
-        // 250k exceeds Claude's inherited 200k window, so the estimator keeps Claude's 180k.
+        // An output-only report carries Claude's 180k forward in the estimator.
         _ = viewModel.ingestNonCodexUsageReport(
-            promptTokens: nil, completionTokens: nil, contextUsedTokens: 250_000,
+            promptTokens: nil, completionTokens: 500, contextUsedTokens: nil,
             modelContextWindow: nil, session: session
         )
         XCTAssertEqual(session.contextUsageSnapshot?.used, 180_000, "Precondition: the carried-forward count")
         XCTAssertNil(reported(), "Claude's count and window are never reported as Kimi's")
+
+        // 250k exceeds Claude's 200k window, but that capacity is Claude's, so Kimi's own reading stands.
+        _ = viewModel.ingestNonCodexUsageReport(
+            promptTokens: nil, completionTokens: nil, contextUsedTokens: 250_000,
+            modelContextWindow: nil, session: session
+        )
+        XCTAssertEqual(reported()?.usedTokens, 250_000)
+        XCTAssertNil(reported()?.windowTokens, "Claude's window is not Kimi's")
 
         // Kimi's own billed prompt count is Kimi's figure (labelled best effort), still without a window.
         _ = viewModel.ingestNonCodexUsageReport(
@@ -339,13 +347,20 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         ), "Precondition: the snapshot is unchanged")
         XCTAssertEqual(reported()?.usedTokens, 150_000)
 
-        // An over-window context count falls back to the input-only prompt count in the estimator;
-        // that undercount is not reported as the context.
+        // Kimi reports its own window, which then bounds its readings.
+        _ = viewModel.ingestNonCodexUsageReport(
+            promptTokens: 150_000, completionTokens: nil, contextUsedTokens: nil,
+            modelContextWindow: 200_000, session: session
+        )
+        XCTAssertEqual(reported()?.usedTokens, 150_000)
+
+        // An over-window context count is rejected, and the estimator does not backfill it with the
+        // input-only prompt count; the conflicting report still withdraws the count.
         _ = viewModel.ingestNonCodexUsageReport(
             promptTokens: 2000, completionTokens: nil, contextUsedTokens: 250_000,
             modelContextWindow: nil, session: session
         )
-        XCTAssertEqual(session.contextUsageSnapshot?.used, 2000, "Precondition: the estimator's fallback")
+        XCTAssertEqual(session.contextUsageSnapshot?.used, 150_000, "Precondition: no prompt-count backfill")
         XCTAssertNil(reported()?.usedTokens)
     }
 

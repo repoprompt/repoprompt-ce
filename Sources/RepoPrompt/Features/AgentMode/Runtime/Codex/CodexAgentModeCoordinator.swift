@@ -2335,6 +2335,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         agentSession.codexModel = session.codexModel
         agentSession.codexReasoningEffort = session.codexReasoningEffort
         agentSession.codexContextWindow = session.codexContextUsage?.modelContextWindow
+        agentSession.contextWindowCapacity = session.contextWindowCapacity
         agentSession.codexLastTotalTokens = session.codexContextUsage?.lastTotalTokens
         agentSession.codexTotalTotalTokens = session.codexContextUsage?.totalTotalTokens
     }

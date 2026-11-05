@@ -221,7 +221,194 @@ final class WindowSessionMCPToolsPreferenceTests: XCTestCase {
         XCTAssertEqual(window.sessionCaptureCandidate().entry?.mcpToolsEnabled, true)
     }
 
+    // MARK: - Persistence follows the requested intent, not registration state
+
+    func testEnablingPersistsIntentWhileRegistrationIsStillPending() async throws {
+        let captured = try await makeCapturedWindow()
+        let window = captured.window
+        let gate = RegistrationGate()
+        defer { gate.release() }
+        window.mcpServer.setAfterWindowToolRegistrationBeforeRetentionForTesting { [gate] in await gate.hold() }
+
+        let enable = Task { await window.mcpServer.setWindowToolsEnabled(true) }
+        try await waitUntil("registration is held") { gate.isHolding }
+        XCTAssertFalse(window.mcpServer.windowToolsEnabled)
+        XCTAssertEqual(captured.recorder.preferences, [true], "The intent change persists before registration completes")
+        try await captured.waitForPersistedPreference(true)
+
+        gate.release()
+        _ = await enable.value
+        XCTAssertEqual(captured.recorder.preferences, [true], "Registration completing is not a second user change")
+    }
+
+    func testFailedRegistrationStillPersistsTheRequestedSwitch() async throws {
+        let captured = try await makeCapturedWindow()
+        let window = captured.window
+        window.mcpServer.setWindowToolRegistrationFailureForTesting(TestRegistrationFailure())
+
+        let registered = await window.mcpServer.setWindowToolsEnabled(true)
+        XCTAssertFalse(registered)
+        XCTAssertFalse(window.mcpServer.windowToolsEnabled)
+        XCTAssertTrue(window.mcpServer.windowToolsAreRequested)
+        try await captured.waitForPersistedPreference(true)
+
+        // Retrying the unchanged intent re-runs registration but is not a new change to persist.
+        window.mcpServer.setWindowToolRegistrationFailureForTesting(nil)
+        let retried = await window.mcpServer.setWindowToolsEnabled(true)
+        XCTAssertTrue(retried)
+        XCTAssertEqual(captured.recorder.preferences, [true])
+    }
+
+    func testRapidOnThenOffWhileRegistrationIsGatedPersistsFinalIntent() async throws {
+        let captured = try await makeCapturedWindow()
+        let window = captured.window
+        let gate = RegistrationGate()
+        defer { gate.release() }
+        window.mcpServer.setAfterWindowToolRegistrationBeforeRetentionForTesting { [gate] in await gate.hold() }
+
+        let enable = Task { await window.mcpServer.setWindowToolsEnabled(true) }
+        try await waitUntil("registration is held") { gate.isHolding }
+        // `windowToolsEnabled` stays false across both changes; the old sink saw nothing here.
+        let disable = Task { await window.mcpServer.setWindowToolsEnabled(false) }
+        try await waitUntil("disable intent recorded") { captured.recorder.preferences.count == 2 }
+        XCTAssertEqual(captured.recorder.preferences, [true, false])
+        // The debounced writer may coalesce both requests into one write of the final intent.
+        try await captured.waitForPersistedPreference(false)
+
+        gate.release()
+        _ = await enable.value
+        _ = await disable.value
+        XCTAssertFalse(window.mcpServer.windowToolsEnabled)
+        XCTAssertEqual(captured.recorder.preferences, [true, false])
+    }
+
+    func testRestoreAppliedBeforeAutoStartSeedingPersistsOnlyTheRestoredIntent() async throws {
+        // No await between creating the window and applying the restore entry: the restore is
+        // accepted before the auto-start seeding task runs.
+        let window = try await makeWindow(globalDefault: true)
+        let captured = try makeCapture(for: window)
+        window.applyWindowRestoreEntry(makeEntry(workspaceID: UUID(), mcpToolsEnabled: false))
+
+        try await waitUntil("the restored preference requested persistence") { !captured.recorder.preferences.isEmpty }
+        for _ in 0 ..< 5 {
+            await Task.yield()
+        }
+        XCTAssertFalse(window.mcpServer.windowToolsAreRequested)
+        XCTAssertEqual(captured.recorder.preferences, [false], "Global-default seeding is not a persisted per-window choice")
+        try await captured.waitForPersistedPreference(false)
+        XCTAssertTrue(GlobalSettingsStore.shared.mcpAutoStart(), "Restore never writes the global default")
+    }
+
+    func testTerminationTeardownDoesNotRequestPersistence() async throws {
+        let captured = try await makeCapturedWindow()
+        let window = captured.window
+        _ = await window.mcpServer.setWindowToolsEnabled(true)
+        XCTAssertEqual(captured.recorder.preferences, [true])
+
+        captured.manager.setTerminatingForTesting(true)
+        defer { captured.manager.setTerminatingForTesting(false) }
+        window.freezeMCPToolsPreferenceForTermination()
+        await window.mcpServer.stopServer()
+        XCTAssertEqual(captured.recorder.preferences, [true], "Quit teardown is not a user change")
+        XCTAssertEqual(window.sessionCaptureCandidate().entry?.mcpToolsEnabled, true)
+    }
+
+    func testClosingWindowDoesNotRequestPersistence() async throws {
+        let captured = try await makeCapturedWindow()
+        captured.window.beginClose()
+        _ = await captured.window.mcpServer.setWindowToolsEnabled(true)
+        XCTAssertEqual(captured.recorder.preferences, [], "A closing window's changes are not persisted")
+    }
+
     // MARK: - Helpers
+
+    @MainActor
+    private final class PersistRequestRecorder {
+        var entries: [WindowSessionEntry?] = []
+        var preferences: [Bool?] {
+            entries.map { $0?.mcpToolsEnabled }
+        }
+    }
+
+    @MainActor
+    private final class RegistrationGate {
+        private var continuation: CheckedContinuation<Void, Never>?
+        private var released = false
+        private(set) var isHolding = false
+
+        func hold() async {
+            guard !released else { return }
+            isHolding = true
+            await withCheckedContinuation { continuation = $0 }
+            isHolding = false
+        }
+
+        func release() {
+            released = true
+            continuation?.resume()
+            continuation = nil
+        }
+    }
+
+    private struct TestRegistrationFailure: Error {}
+
+    /// A window registered with a test-owned manager whose real `persistWindowSession` path writes
+    /// to a temporary session file, plus a recorder of every persistence request.
+    @MainActor
+    private struct CapturedWindow {
+        let window: WindowState
+        let manager: WindowStatesManager
+        let recorder: PersistRequestRecorder
+        let sessionFileURL: URL
+
+        func waitForPersistedPreference(_ expected: Bool, timeout: TimeInterval = 10) async throws {
+            let deadline = Date().addingTimeInterval(timeout)
+            var last: Bool??
+            while Date() < deadline {
+                if let data = try? Data(contentsOf: sessionFileURL),
+                   let snapshot = try? JSONDecoder().decode(WindowSessionSnapshot.self, from: data)
+                {
+                    last = snapshot.windows.first?.mcpToolsEnabled
+                    if last == expected { return }
+                }
+                try await Task.sleep(nanoseconds: 50_000_000)
+            }
+            XCTFail("Session file never recorded mcpToolsEnabled=\(expected); last=\(String(describing: last))")
+        }
+    }
+
+    private var testOwnedManagers: [WindowStatesManager] = []
+
+    private func makeCapture(for window: WindowState) throws -> CapturedWindow {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mcp-session-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let sessionFileURL = directory.appendingPathComponent("windowSessions.json")
+        let manager = WindowStatesManager.makeForTesting(windowSessionFileURL: sessionFileURL)
+        testOwnedManagers.append(manager)
+        window.windowStatesManager = manager
+        manager.registerWindowState(window)
+        let recorder = PersistRequestRecorder()
+        window.mcpToolsPersistRequestObserverForTesting = { [recorder] in recorder.entries.append($0) }
+        addTeardownBlock { @MainActor in
+            window.mcpServer.setAfterWindowToolRegistrationBeforeRetentionForTesting(nil)
+            window.mcpServer.setWindowToolRegistrationFailureForTesting(nil)
+            manager.unregisterWindowState(window)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        return CapturedWindow(window: window, manager: manager, recorder: recorder, sessionFileURL: sessionFileURL)
+    }
+
+    /// A window on a real (non-system) workspace, so session capture produces a live entry.
+    private func makeCapturedWindow(globalDefault: Bool = false) async throws -> CapturedWindow {
+        let window = try await makeWindow(globalDefault: globalDefault)
+        let workspace = WorkspaceModel(name: "Captured", repoPaths: [NSTemporaryDirectory()])
+        await window.workspaceManager.awaitInitialized()
+        window.workspaceManager.workspaces = [workspace]
+        window.workspaceManager.activeWorkspace = workspace
+        window.setWorkspaceInstanceAssignment(.init(workspaceID: workspace.id, number: 1))
+        return try makeCapture(for: window)
+    }
 
     private func makeWindow(globalDefault: Bool) async throws -> WindowState {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()

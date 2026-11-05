@@ -867,16 +867,15 @@ class WindowState: ObservableObject {
         }
 
         // The per-window MCP tools switch is part of the saved window session (#143), so a change
-        // re-captures the session like a workspace switch does. Persistence stays gated during
-        // restore, so the auto-start seeding at launch cannot overwrite the saved snapshot, and
-        // quit teardown disabling every window's tools is not a user change worth persisting.
-        mcpServer.$windowToolsEnabled
-            .dropFirst()
-            .removeDuplicates()
-            .receive(on: RunLoop.main)
+        // re-captures the session like a workspace switch does. This observes the requested
+        // intent that capture records, not registration state: a pending or failed registration
+        // must not hide the user's change. The subject only emits real changes (no initial value),
+        // synchronously on the main actor. Persistence stays gated during restore, so the
+        // auto-start seeding at launch cannot overwrite the saved snapshot, and quit teardown
+        // disabling every window's tools is not a user change worth persisting.
+        mcpServer.windowToolsRequestChanges
             .sink { [weak self] _ in
-                guard let self, !isClosing, let manager = windowStatesManager, !manager.isTerminating else { return }
-                manager.persistWindowSession(reason: "mcpToolsEnabled:\(windowID)")
+                self?.mcpToolsRequestDidChange()
             }
             .store(in: &cancellables)
 
@@ -2044,6 +2043,20 @@ class WindowState: ObservableObject {
             mcpToolsEnabled: terminationMCPToolsPreference ?? mcpServer.windowToolsAreRequested
         )
     }
+
+    private func mcpToolsRequestDidChange() {
+        guard !isClosing, !(windowStatesManager ?? WindowStatesManager.shared).isTerminating else { return }
+        #if DEBUG
+            mcpToolsPersistRequestObserverForTesting?(sessionCaptureCandidate().entry)
+        #endif
+        windowStatesManager?.persistWindowSession(reason: "mcpToolsEnabled:\(windowID)")
+    }
+
+    #if DEBUG
+        /// Receives the entry session capture would record each time an MCP tools intent change
+        /// requests persistence, so tests can write it through the real session writer.
+        var mcpToolsPersistRequestObserverForTesting: ((WindowSessionEntry?) -> Void)?
+    #endif
 
     /// Pins the MCP tools request for every session capture from here on. Called synchronously by
     /// `WindowStatesManager.signalTermination()` before `stopAllServers()` clears the live request;

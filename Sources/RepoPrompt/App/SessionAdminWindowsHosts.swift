@@ -835,22 +835,44 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
     func unbindWorktrees(
         sessionID: UUID,
         worktreeID: String?,
-        isStillAuthorized: @escaping @MainActor () -> Bool
+        isStillAuthorized: @escaping @MainActor () -> Bool,
+        bindingsRemoved: @escaping @MainActor (Set<String>) -> Void
     ) async throws -> [String] {
         guard let owner = SessionAdminWindows.runtimeOwner(for: sessionID) else {
             throw SessionAdminHostError.sessionUnavailable
         }
-        let viewModel = owner.location.window.agentModeViewModel
-        let session = owner.session
+        return try await unbindWorktrees(
+            sessionID: sessionID, worktreeID: worktreeID,
+            viewModel: owner.location.window.agentModeViewModel, session: owner.session,
+            isStillAuthorized: { isStillAuthorized() && SessionAdminWindows.isCurrent(owner) },
+            bindingsRemoved: bindingsRemoved
+        )
+    }
+
+    /// Shared production unbind seam over an exact view model and live session.
+    func unbindWorktrees(
+        sessionID: UUID,
+        worktreeID: String?,
+        viewModel: AgentModeViewModel,
+        session: AgentTabSession,
+        isStillAuthorized: @escaping @MainActor () -> Bool,
+        bindingsRemoved: @escaping @MainActor (Set<String>) -> Void
+    ) async throws -> [String] {
         let repoPaths = viewModel.workspaceManager?.activeWorkspace?.repoPaths
         let existing = viewModel.worktreeBindings(forAgentSessionID: sessionID)
         let removed = existing.filter { worktreeID == nil || $0.worktreeID == worktreeID }
         guard !removed.isEmpty else { return [] }
         guard isIdle(viewModel, session) else { throw SessionAdminHostError.notIdle }
         let remaining = existing.filter { worktreeID != nil && $0.worktreeID != worktreeID }
-        try await transition(remaining, owner: owner, isStillAuthorized: {
-            isStillAuthorized() && viewModel.workspaceManager?.activeWorkspace?.repoPaths == repoPaths
-        })
+        let removedIDs = Set(removed.map(\.worktreeID))
+        try await transition(
+            remaining, sessionID: sessionID, viewModel: viewModel,
+            isStillAuthorized: {
+                isStillAuthorized() && viewModel.workspaceManager?.activeWorkspace?.repoPaths == repoPaths
+            },
+            // Publication, not the later required save, is the commit point for the removal.
+            bindingsCommitted: { bindingsRemoved(removedIDs) }
+        )
         return removed.map(\.worktreeID)
     }
 
@@ -881,6 +903,7 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         bindingsCommitted: @escaping @MainActor () -> Void = {}
     ) async throws {
         guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
+        var published = false
         do {
             _ = try await viewModel.transitionWorktreeBindings(
                 desired, forSessionID: sessionID, intent: .externalManagement,
@@ -895,13 +918,18 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
                     guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
                     try $0()
                 },
-                afterCommit: bindingsCommitted
+                afterCommit: {
+                    published = true
+                    bindingsCommitted()
+                }
             )
         } catch SessionAdminHostError.authorityEnded {
             throw SessionAdminHostError.authorityEnded
         } catch {
             // A run that started during preparation refuses the transition; that is "not idle".
-            if let session = try? viewModel.authoritativeLiveSession(for: sessionID), !isIdle(viewModel, session) {
+            // After publication the change is committed: a run that starts while the required save
+            // awaits must not turn a completion failure into a retryable pre-commit refusal.
+            if !published, let session = try? viewModel.authoritativeLiveSession(for: sessionID), !isIdle(viewModel, session) {
                 throw SessionAdminHostError.notIdle
             }
             throw error

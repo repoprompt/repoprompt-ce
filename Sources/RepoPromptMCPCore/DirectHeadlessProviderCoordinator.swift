@@ -505,7 +505,7 @@ actor DirectHeadlessProviderCoordinator {
         let terminal = snapshot(
             record: record,
             status: outcome.snapshotStatus,
-            statusText: outcome.assistantText,
+            statusText: Self.terminalStatusText(for: outcome),
             assistantText: outcome.assistantText,
             failure: outcome.failureReason
         )
@@ -517,6 +517,33 @@ actor DirectHeadlessProviderCoordinator {
             commitID: UUID(),
             successorKind: nil
         )
+    }
+
+    /// Concise terminal `status_text`. The final reply travels only in the bounded
+    /// `assistant_text`; a failure keeps its first diagnostic line here, and the failure
+    /// reason is carried explicitly by the outcome rather than re-derived from this label.
+    ///
+    /// Contract for every snapshot producer, including any new headless or start-expiry
+    /// snapshot: publish a short `status_text`, carry the reply only in `assistant_text`, and
+    /// when rebuilding a snapshot from another one copy `latestAssistantPreviewTotalCharacters`
+    /// (plus `worktreeBindingState` / `parentIsWorktreeBound`) along with the preview.
+    /// Omitting the total makes every already-bounded preview, ASCII included, republish without
+    /// both `assistant_text_truncated` and `assistant_text_characters`; only the marker remains.
+    nonisolated static func terminalStatusText(for outcome: DomainAgentRunTerminalOutcome) -> String {
+        switch outcome.kind {
+        case .completed:
+            return "Completed"
+        case .cancelled:
+            return "Cancelled"
+        case .failed:
+            let firstLine = outcome.assistantText?
+                .split(whereSeparator: \.isNewline)
+                .lazy
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .first { !$0.isEmpty }
+            guard let firstLine else { return "Failed" }
+            return DomainAgentRunSnapshot.boundedStatusText("Failed: \(firstLine)")
+        }
     }
 
     private func retainedSnapshot(_ record: AgentRecord) -> DomainAgentRunSnapshot {
