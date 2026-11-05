@@ -2508,7 +2508,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     var unscopedRepromptEnabled = false
     var repromptDispatchTexts: [UUID: String] = [:]
     var repromptDispatchOriginals: [UUID: String] = [:]
-    var repromptOperation: AgentRepromptOperation?
+    /// One preparation per composer tab, so a rewrite outlives a switch to another session.
+    var repromptOperations: [UUID: AgentRepromptOperation] = [:]
+    /// The preparation owned by the visible composer.
+    var repromptOperation: AgentRepromptOperation? {
+        currentTabID.flatMap { repromptOperations[$0] }
+    }
+
     var repromptSpeculations: [UUID: RepromptSpeculation] = [:]
     var repromptAudits: [UUID: AgentAutomationTurnAudit.Reprompt] = [:]
     var repromptAvailability: ((AIModel) -> Bool)?
@@ -23122,7 +23128,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         origin: AgentModeRunService.CancellationOrigin = .explicitStop
     ) async {
         guard let session = sessions[tabID] else { return }
-        if let operation = repromptOperation, operation.sourceTabID == tabID {
+        if let operation = repromptOperations[tabID] {
             operation.invalidate(reason: "The run was stopped.")
             if !session.runState.isActive {
                 return
@@ -23280,8 +23286,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         requireActiveTabOwnership: Bool
     ) -> AgentComposerSubmitClaimResult {
         let target = attempt.target
-        if requireActiveTabOwnership, let operation = repromptOperation,
-           operation.sourceTabID == target.tabID, operation.phase != .completed
+        if requireActiveTabOwnership, let operation = repromptOperations[target.tabID],
+           operation.phase != .completed
         {
             return .rejected(.activeAttemptExists(activeAttemptID: operation.id))
         }
