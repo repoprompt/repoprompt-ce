@@ -130,13 +130,14 @@ struct AgentModeSessionsSidebarView: View {
     private var sidebarHeader: some View {
         let metrics = AgentSidebarMetrics(preset: fontScale.preset)
         return VStack(spacing: metrics.controlSpacing) {
-            AgentSidebarTabStrip(selection: sidebarUI.snapshot.sidebarTab) { selected in
+            AgentSidebarTabStrip(selection: sidebarUI.snapshot.sidebarTab, metrics: metrics) { selected in
                 storedSidebarTab = selected.rawValue
                 agentModeVM.setSidebarTab(selected)
             }
             AgentSidebarSearchField(
                 text: agentModeVM.sidebarSearchBinding(),
-                placeholder: sidebarUI.snapshot.sidebarTab.searchPlaceholder
+                placeholder: sidebarUI.snapshot.sidebarTab.searchPlaceholder,
+                metrics: metrics
             )
         }
         .padding(.horizontal, metrics.gutter)
@@ -1480,6 +1481,25 @@ struct ArchivedSessionsList: View {
 }
 
 // MARK: - Stashed Row Metrics
+
+extension AgentSidebarMetrics {
+    /// The sidebar owns the App-layer font managers; the header controls file stays free of them.
+    init(preset: FontScalePreset) {
+        gutter = preset.scaledClamped(10, max: 14)
+        rowHorizontalPadding = preset.scaledClamped(10, max: 14)
+        rowSpacing = preset.scaledClamped(8, max: 11)
+        firstSectionHeaderTopPadding = preset.scaledClamped(2, max: 3)
+        searchHeight = preset.scaledClamped(28, min: 28, max: 38)
+        trackHeight = preset.scaledClamped(26, min: 26, max: 34)
+        trackInset = preset.scaledClamped(2, min: 2, max: 3)
+        controlSpacing = preset.scaledClamped(8, max: 11)
+        titlebarToTabsGap = preset.scaledClamped(8, max: 11)
+        searchToFirstHeaderGap = preset.scaledClamped(16, max: 22)
+        searchIconSize = preset.scaledClamped(12, max: 16)
+        searchFont = preset.swiftUIFont(sizeAtNormal: 13)
+        tabFont = preset.swiftUIFont(sizeAtNormal: 12, weight: .medium)
+    }
+}
 
 extension AgentStashedSessionRowMetrics {
     /// The sidebar owns the App-layer font managers; the row file itself stays free of them.

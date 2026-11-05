@@ -10,75 +10,57 @@ import SwiftUI
 // SEARCH-HELPER: sidebar header, sidebar search, sidebar tabs, collapse all threads.
 
 /// The sidebar's layout grid, shared by the header, section headers and rows so they cannot drift.
-@MainActor
+/// Holds resolved values only: the preset-aware initializer lives next to the call site in
+/// `AgentSessionsSidebarView`, so this file stays free of App-layer font references.
 struct AgentSidebarMetrics {
     /// The unified toolbar is 52pt tall and centers its 28pt buttons, leaving this much empty
     /// toolbar under them. The header's top inset absorbs it, so the visible gap is the intended one.
     private static let titlebarSlackBelowButtons: CGFloat = 12
-
-    let preset: FontScalePreset
 
     /// The status plate leading each row. Section header chevrons and the search icon use this slot
     /// too, so all of them line up in one column.
     static let statusPlateSize: CGFloat = 16
 
     /// The shared gutter: sidebar edge to the tab track, search field and row backgrounds.
-    var gutter: CGFloat {
-        preset.scaledClamped(10, max: 14)
-    }
-
+    var gutter: CGFloat
     /// Row background edge to its content.
-    var rowHorizontalPadding: CGFloat {
-        preset.scaledClamped(10, max: 14)
-    }
-
+    var rowHorizontalPadding: CGFloat
     /// Between a row's status plate and its title.
-    var rowSpacing: CGFloat {
-        preset.scaledClamped(8, max: 11)
-    }
+    var rowSpacing: CGFloat
+    /// Above the first section header in the list.
+    var firstSectionHeaderTopPadding: CGFloat
+    /// Matches the rows' minimum height.
+    var searchHeight: CGFloat
+    var trackHeight: CGFloat
+    /// Gap between the track and its selected pill. Both are capsules, so the pill's radius is
+    /// always the track's radius minus this inset.
+    var trackInset: CGFloat
+    /// Tabs to search.
+    var controlSpacing: CGFloat
+    /// Titlebar buttons to tabs, as seen.
+    var titlebarToTabsGap: CGFloat
+    /// Search to the first section header, as seen.
+    var searchToFirstHeaderGap: CGFloat
+    var searchIconSize: CGFloat
+    var searchFont: Font
+    var tabFont: Font
 
     /// Row background edge to row title text, measured inside the gutter. Section headers use it too.
     var rowTextInset: CGFloat {
         rowHorizontalPadding + Self.statusPlateSize + rowSpacing
     }
 
-    /// Above the first section header in the list.
-    var firstSectionHeaderTopPadding: CGFloat {
-        preset.scaledClamped(2, max: 3)
-    }
-
-    /// Matches the rows' minimum height.
-    var searchHeight: CGFloat {
-        preset.scaledClamped(28, min: 28, max: 38)
-    }
-
-    var trackHeight: CGFloat {
-        preset.scaledClamped(26, min: 26, max: 34)
-    }
-
-    /// Gap between the track and its selected pill. Both are capsules, so the pill's radius is
-    /// always the track's radius minus this inset.
-    var trackInset: CGFloat {
-        preset.scaledClamped(2, min: 2, max: 3)
-    }
-
     var segmentHeight: CGFloat {
         trackHeight - trackInset * 2
     }
 
-    /// Titlebar buttons to tabs: 8pt visible.
     var topInset: CGFloat {
-        preset.scaledClamped(8, max: 11) - Self.titlebarSlackBelowButtons
+        titlebarToTabsGap - Self.titlebarSlackBelowButtons
     }
 
-    /// Tabs to search.
-    var controlSpacing: CGFloat {
-        preset.scaledClamped(8, max: 11)
-    }
-
-    /// Search to the first section header: 16pt visible, including that header's own top padding.
+    /// The first section header's own top padding counts toward the gap.
     var bottomInset: CGFloat {
-        preset.scaledClamped(16, max: 22) - firstSectionHeaderTopPadding
+        searchToFirstHeaderGap - firstSectionHeaderTopPadding
     }
 }
 
@@ -87,25 +69,21 @@ struct AgentSidebarMetrics {
 struct AgentSidebarSearchField: View {
     @Binding var text: String
     let placeholder: String
+    let metrics: AgentSidebarMetrics
 
     @FocusState private var isFocused: Bool
-    @ObservedObject private var fontScale = FontScaleManager.shared
-
-    private var metrics: AgentSidebarMetrics {
-        AgentSidebarMetrics(preset: fontScale.preset)
-    }
 
     var body: some View {
         HStack(spacing: metrics.rowSpacing) {
             Image(systemName: "magnifyingglass")
-                .font(.system(size: fontScale.preset.scaledClamped(12, max: 16), weight: .medium))
+                .font(.system(size: metrics.searchIconSize, weight: .medium))
                 .foregroundStyle(.secondary)
                 .frame(width: AgentSidebarMetrics.statusPlateSize)
                 .accessibilityHidden(true)
 
             TextField(placeholder, text: $text)
                 .textFieldStyle(.plain)
-                .font(fontScale.preset.swiftUIFont(sizeAtNormal: 13))
+                .font(metrics.searchFont)
                 .focused($isFocused)
                 .onKeyPress(.escape) {
                     guard !text.isEmpty else { return .ignored }
@@ -118,7 +96,7 @@ struct AgentSidebarSearchField: View {
                     text = ""
                 } label: {
                     Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: fontScale.preset.scaledClamped(12, max: 16)))
+                        .font(.system(size: metrics.searchIconSize))
                         .foregroundStyle(.secondary)
                         .contentShape(Rectangle())
                 }
@@ -146,13 +124,12 @@ struct AgentSidebarSearchField: View {
 
 struct AgentSidebarTabStrip: View {
     let selection: AgentSidebarTab
+    let metrics: AgentSidebarMetrics
     let onSelect: (AgentSidebarTab) -> Void
 
     @Namespace private var selectionNamespace
-    @ObservedObject private var fontScale = FontScaleManager.shared
 
     var body: some View {
-        let metrics = AgentSidebarMetrics(preset: fontScale.preset)
         let tabs = AgentSidebarTab.allCases
         AgentSidebarTabTrackLayout {
             ForEach(Array(tabs.enumerated()), id: \.element) { index, tab in
@@ -162,6 +139,7 @@ struct AgentSidebarTabStrip: View {
                     // No divider touches the selected pill.
                     showsLeadingDivider: index > 0 && tab != selection && tabs[index - 1] != selection,
                     selectionNamespace: selectionNamespace,
+                    metrics: metrics,
                     action: { onSelect(tab) }
                 )
             }
@@ -209,14 +187,10 @@ private struct AgentSidebarTabButton: View {
     let isSelected: Bool
     let showsLeadingDivider: Bool
     let selectionNamespace: Namespace.ID
+    let metrics: AgentSidebarMetrics
     let action: () -> Void
 
     @State private var isHovered = false
-    @ObservedObject private var fontScale = FontScaleManager.shared
-
-    private var metrics: AgentSidebarMetrics {
-        AgentSidebarMetrics(preset: fontScale.preset)
-    }
 
     private var foreground: Color {
         if isSelected || isHovered {
@@ -229,7 +203,7 @@ private struct AgentSidebarTabButton: View {
         Button(action: action) {
             // One weight in every state, so selecting a tab never shifts its neighbours.
             Text(tab.title)
-                .font(fontScale.preset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
+                .font(metrics.tabFont)
                 .lineLimit(1)
                 .minimumScaleFactor(0.85)
                 .foregroundStyle(foreground)
