@@ -209,3 +209,131 @@ no local test can prove hosted capacity improvement.
 Sources: repository commits and linked runs above;
 https://docs.github.com/en/actions/reference/limits and
 https://docs.github.com/en/actions/concepts/workflows-and-actions/concurrency.
+
+## Reliability incident and recovery
+
+**Historical scope:** this section describes the initial #1628 repair. Later
+commits also changed production workflow definitions in the PR: automatic Tip
+can select a passing main ancestor, uses separately pinned protected-main tooling,
+and has a final publication-result job; CI also gained bounded automatic recovery.
+The exact-current-main-only and no-production-workflow-change statements below
+are superseded, not descriptions of the current PR. See
+[the follow-up review and outstanding acceptance](ci-reliability-2026-11-05.md#follow-up-review-of-head-a3b9d1053)
+and [current admission policy](ci-admission.md).
+
+### Observed failure, not a capacity hypothesis
+
+Baseline inspected: main `26ccf4fa8bbe41b9b7cfb95bb8aa9a1afeb6ee83`,
+2026-11-04. The recent capacity changes retained all integration obligations,
+but their combined state was not validated adequately:
+
+- #1623 consolidated four logical shards onto one worker.
+- `test_required_style_retains_core_and_sentry_without_release_builds` still
+  asserted the removed `shard: [1, 2, 3, 4]` matrix text.
+- That contract was in `conductor-selftest`, but absent from the path-selected
+  CI harness used to validate the worker change. #1624 passed on an independent
+  baseline. A mechanical merge check did not exercise the combined contracts.
+
+Three fresh runs failed the same assertion in **Run conductor tests**, before
+app compilation. Times are UTC, from job metadata and downloaded logs:
+
+| PR / job | Mac job start → finish | Failing step |
+|---|---|---|
+| [#1619](https://github.com/repoprompt/repoprompt-ce/actions/runs/41834884057/job/126591327513) | 13:05:35 → 13:22:56 | 13:22:13 → 13:22:48 |
+| [#1595](https://github.com/repoprompt/repoprompt-ce/actions/runs/41835681343/job/126594026803) | 13:14:13 → 13:32:16 | 13:31:38 → 13:32:10 |
+| [#1583](https://github.com/repoprompt/repoprompt-ce/actions/runs/41844822703/job/126625678735) | 14:10:17 → 14:25:53 | 14:25:15 → 14:25:48 |
+
+These three failed Mac jobs consumed **51 minutes of observed job execution**
+combined, not queue time or billing, to rediscover a portable contract failure.
+Locally, baseline `python3 Scripts/test_modularization_tooling.py` reproduced
+exactly one failure out of 31 tests. The repaired suite retains the full four-shard
+obligation instead of asserting an obsolete scheduling shape. Running this contract
+on Ubuntu before Mac admission avoids allocating Macs for this known defect class.
+No hosted latency improvement is claimed from this local reproduction.
+
+Separately, [main CI attempt 3](https://github.com/repoprompt/repoprompt-ce/actions/runs/41833167618/attempts/3)
+inherited a successful candidate declaration whose **log** contained attempt 2
+(12:59:02). Style received that context at 14:25:56 and rejected it at 14:26:03.
+The build, worker and Sentry jobs were skipped by attempt-equality conditions.
+The jobs API labelled inherited rows with attempt 3; API row labels alone cannot
+establish execution lineage. This is a policy dead end, not evidence of a test flake.
+
+### End-to-end authority and the repair
+
+1. **Local iteration:** `check-fast` now includes the cross-workflow contracts.
+   Mandatory commit/push safety still performs secret scans and guardrails;
+   `pr-ready` selects additional lanes. None is a substitute for hosted acceptance.
+2. **PR/queue/main CI:** portable contracts run in a separate Ubuntu job before
+   scarce Mac work. Secret Scan remains dependent only on candidate declaration,
+   so a tooling-contract failure cannot suppress a main push's introduced-range scan. Candidate
+   identity stays immutable; successful root producers carry their own attempt
+   and Swift/Xcode identity. Native partial reruns reuse exact successful ancestors,
+   never a guessed/latest artifact. Rebuilding invalidates old worker receipts.
+3. **Merge:** exact head/base and final Style still gate acceptance. A change in
+   either invalidates prior evidence. No bypass, required-check or ruleset changes.
+4. **Release:** unsuccessful main CI blocks automatic Tip eligibility. Successful
+   exact-current-main CI may start Tip; signed-artifact, smoke and compatibility
+   qualification still gate publication. Stable/manual flows have separate gates.
+   No production workflows or release credentials are changed by this repair.
+5. **Visibility:** each executing job reports failed step IDs; Style shows upstream
+   results and recovery before parsing potentially missing admission output.
+   Reports are explanatory, never a second success authority or a flakiness oracle.
+
+### Tradeoffs and acceptance evidence
+
+- Native retry reuse saves successful ancestor work **only when a retry occurs**.
+  Missing outputs, expired artifacts and changed Swift/Xcode fail closed and require
+  rebuilding. Exact hosted reuse still needs a real GitHub exercise.
+- Workflow contracts add a small Ubuntu prerequisite and run locally too. This
+  intentionally catches control-plane failures before dependencies/style/Mac work.
+  Test failures must describe current invariants, not obsolete YAML formatting.
+- Diagnostics add no API permissions, write token, polling service or external
+  messages. They cannot run before a runner is assigned or after runner loss, and
+  cancellation may suppress even an `always()` step. The lightweight Ubuntu jobs
+  have explicit ten-minute deadlines rather than the default six-hour envelope. The Actions timeline and
+  read-only queue reporter remain necessary; a missing report is unknown.
+- Three Mac jobs, four full logical shards, all tests, per-suite deadlines, clean
+  typecheck policy, Sentry/privacy, secret scan and release qualification remain.
+  This does not create capacity or prove that long-running product tests are healthy.
+
+Local regression acceptance includes native later-attempt selection, wrong
+run/candidate/future attempt rejection, toolchain drift, missing outputs, actual
+coverage-CLI acceptance of retried worker receipts and rejection after a rebuild,
+and every failed/cancelled/skipped prerequisite blocking Style with diagnostics.
+The combined release suite also caught an old shell-text assertion in
+`test_manual_candidate_qualifies_exact_archive_without_entering_style`; it now
+checks the new gate entrypoint. The existing executable prerequisite test still
+rejects every non-success Sentry result.
+
+Run the combined CI harness, conductor/release selftests, guardrails and actionlint,
+not only isolated admission tests.
+
+**Hosted acceptance still required:** retain a complete successful PR run, rerun the
+root worker, Sentry and Style independently, and verify original producer outputs
+and exact coverage survive. Verify a real failed job's ID reaches the aggregate
+summary. Do not call the incident permanently solved until those receipts exist.
+Main/Tip publication is not a canary for this: use a non-production PR and do not
+cancel healthy jobs or alter release/security settings to manufacture a failure.
+
+Measure time-to-Style, allocation delay, execution minutes and recovery cost on
+comparable successful runs. Keep failed/cancelled runs separate. Billing, account
+runner limits and organization-wide contention are not established by these logs.
+
+### Rollback and remaining visibility boundary
+
+Rollback the producer-reuse change through a reviewed PR and return to the explicit
+all-jobs policy if hosted semantics fail. Keep the corrected workflow contract and
+early diagnostics. Never remove Style, coverage, secrets or release gates as rollback.
+Existing runs retain their original commit's behavior; retrying them cannot install
+this fix. Update affected PR branches after integration rather than repeatedly
+rerunning deterministic old failures.
+
+`Publish Tip` still skips its setup on unsuccessful CI. CI now explains that blocked
+eligibility, but a dedicated Tip-side rejection summary would require a separately
+reviewed change to the production workflow. No such change is made here.
+
+Maintainer-guidance check: user impact is blocked feedback/releases; confirmed
+causes are the stale contract and attempt equality, not inferred test flakiness.
+GitHub job results plus exact producer/coverage identity remain the authority.
+No user data or credentials change. Remaining risks are hosted reuse semantics,
+runner loss and scarce capacity; local mocks cannot prove those boundaries.
