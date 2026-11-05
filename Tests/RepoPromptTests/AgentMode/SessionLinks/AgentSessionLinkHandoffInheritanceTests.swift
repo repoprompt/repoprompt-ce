@@ -12,6 +12,13 @@ import XCTest
 /// have been inherited. A failed first save remains recoverable, but cannot authorize inheritance.
 @MainActor
 final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
+    #if DEBUG
+        override func setUpWithError() throws {
+            try super.setUpWithError()
+            _ = try WorkspaceTestProcessSandbox.validate()
+        }
+    #endif
+
     func testHandoffDurablySavesBeforeInheritanceAndActivation() async throws {
         try await withFixture { fixture in
             let cutoffItemID = try XCTUnwrap(fixture.sourceSession.items.last?.id)
@@ -4030,6 +4037,15 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 try installSwitch(fixture)
                 await vm.openProviderSwitchPreview(agent: .openCode, model: "destination", tabID: session.tabID)
                 let preview = try XCTUnwrap(vm.providerSwitchPreview)
+                let installedProbe = try XCTUnwrap(vm.providerSwitchExactOwnerProbe)
+                defer { vm.providerSwitchExactOwnerProbe = installedProbe }
+                vm.providerSwitchExactOwnerProbe = nil
+                XCTAssertNotNil(vm.providerSwitchDiscardBlocker(preview))
+                vm.providerSwitchExactOwnerProbe = { _ in false }
+                XCTAssertNotNil(vm.providerSwitchDiscardBlocker(preview))
+                vm.providerSwitchExactOwnerProbe = { candidate in candidate === session }
+                XCTAssertNil(vm.providerSwitchDiscardBlocker(preview))
+                vm.providerSwitchExactOwnerProbe = installedProbe
                 session.draftText = "draft changed after preview"
                 XCTAssertNil(vm.providerSwitchDiscardBlocker(preview))
                 session.runState = .running
@@ -4365,6 +4381,113 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testSwitchExactOwnerProbeUsesOrdinaryAndCustomComposition() async throws {
+            for customFactory in [false, true] {
+                try await withFixture(computerUseReady: customFactory) { fixture in
+                    let probe = try XCTUnwrap(fixture.viewModel.providerSwitchExactOwnerProbe)
+                    XCTAssertTrue(probe(fixture.sourceSession))
+                    let replacement = AgentTabSession(tabID: fixture.sourceTabID)
+                    replacement.testInstallPersistentSessionBinding(sessionID: try XCTUnwrap(fixture.sourceSession.activeAgentSessionID))
+                    XCTAssertEqual(replacement.activeAgentSessionID, fixture.sourceSession.activeAgentSessionID)
+                    XCTAssertFalse(probe(replacement))
+                    XCTAssertFalse(probe(AgentTabSession(tabID: UUID())))
+                }
+            }
+        }
+
+        func testSwitchExactOwnerProbeUsesFreshPreparedOwnerWitness() async throws {
+            try await withFixture { fixture in
+                let manager = WindowStatesManager.shared
+                let workspaces = fixture.window.workspaceManager
+                let index = try XCTUnwrap(workspaces.workspaces.firstIndex { $0.id == fixture.workspace.id })
+                let savedID = UUID()
+                let tab = ComposeTabState(id: UUID(), name: "Private owner", activeAgentSessionID: savedID)
+                _ = try await AgentSessionDataService.shared.saveAgentSession(
+                    AgentSession(id: savedID, workspaceID: fixture.workspace.id, composeTabID: tab.id, name: "Private owner", items: []),
+                    for: workspaces.workspaces[index]
+                )
+                workspaces.workspaces[index].stashedTabs.append(StashedTab(tab: tab))
+                workspaces.activeWorkspace = workspaces.workspaces[index]
+                let originalFactory = manager.test_preparedOversightOwnerFactory
+                let originalRegistry = AgentSessionCarrierResolver.preparedSessionRuntimes
+                var factoryCalls = 0
+                var providerCalls = 0
+                manager.test_preparedOversightOwnerFactory = { workspace, source in
+                    factoryCalls += 1
+                    return WindowState.makePreparedSessionOwner(workspace: workspace, borrowing: source, agentModeViewModelFactory: { windowID, prompt, workspaceManager, server in
+                        let vm = AgentModeViewModel(
+                            testWindowID: windowID,
+                            codexControllerFactory: { _, _, _, _, _, _ in
+                                providerCalls += 1
+                                preconditionFailure("Private-owner fixture must never construct a provider")
+                            },
+                            claudeControllerFactory: { _, _, _, _ in
+                                providerCalls += 1
+                                preconditionFailure("Private-owner fixture must never construct a provider")
+                            },
+                            testMCPServer: server,
+                            testWorkspaceFileContextStore: prompt.workspaceFileContextStore
+                        )
+                        vm.promptManager = prompt
+                        vm.workspaceManager = workspaceManager
+                        return vm
+                    })
+                }
+                AgentSessionCarrierResolver.preparedSessionRuntimes = manager
+                manager.beginPreparedOversightPreparation(savedID)
+                @MainActor func cleanupPreparedOwner() async {
+                    if let owner = manager.preparedOversightWindows.removeValue(forKey: savedID) {
+                        owner.beginClose()
+                        let retired = await owner.tearDownPreparedSessionOwner()
+                        XCTAssertTrue(retired)
+                    }
+                    manager.preparedOversightRunObservations.removeValue(forKey: savedID)?.invalidate()
+                    manager.preparedOversightCarrierSubscriptions.removeValue(forKey: savedID)
+                    manager.preparedOversightOwnerLocations.removeValue(forKey: savedID)
+                    manager.preparedOversightLocations.removeValue(forKey: savedID)
+                    manager.test_preparedOversightOwnerFactory = originalFactory
+                    AgentSessionCarrierResolver.preparedSessionRuntimes = originalRegistry
+                    manager.endPreparedOversightPreparation(savedID)
+                }
+                do {
+                    let result = await manager.prepareSavedOversightTarget(savedID, isStillAuthorized: { true })
+                    guard case let .success(owner) = result else {
+                        XCTFail("Private-owner preparation must succeed: \(result)")
+                        throw CancellationError()
+                    }
+                    XCTAssertTrue(owner.isPreparedSessionOwner)
+                    XCTAssertFalse(owner === fixture.window)
+                    XCTAssertEqual(factoryCalls, 1)
+                    XCTAssertTrue(manager.preparedOversightWindows[savedID] === owner)
+                    let session = try XCTUnwrap(owner.agentModeViewModel.sessions[tab.id])
+                    let probe = try XCTUnwrap(owner.agentModeViewModel.providerSwitchExactOwnerProbe)
+                    XCTAssertTrue(probe(session))
+                    let replacement = AgentTabSession(tabID: tab.id)
+                    replacement.testInstallPersistentSessionBinding(sessionID: savedID)
+                    XCTAssertEqual(replacement.activeAgentSessionID, session.activeAgentSessionID)
+                    XCTAssertFalse(probe(replacement))
+                    let stash = workspaces.workspaces[index].stashedTabs
+                    workspaces.workspaces[index].stashedTabs.removeAll { $0.tab.id == tab.id }
+                    workspaces.activeWorkspace = workspaces.workspaces[index]
+                    XCTAssertFalse(probe(session), "The same closure must observe withdrawal of its saved carrier witness")
+                    XCTAssertFalse(probe(replacement))
+                    workspaces.workspaces[index].stashedTabs = stash
+                    workspaces.activeWorkspace = workspaces.workspaces[index]
+                    XCTAssertTrue(probe(session), "A fresh restored witness must be observed without replacing the closure")
+                    XCTAssertEqual(providerCalls, 0)
+                    let released = await manager.releasePreparedOversightOwnerForVisit(sessionID: savedID, preparingReplacement: true)
+                    XCTAssertTrue(released)
+                    XCTAssertNil(manager.preparedOversightWindows[savedID])
+                    XCTAssertNil(manager.preparedOversightCarrierSubscriptions[savedID])
+                    XCTAssertNil(manager.preparedOversightOwnerLocations[savedID])
+                    await cleanupPreparedOwner()
+                } catch {
+                    await cleanupPreparedOwner()
+                    throw error
+                }
+            }
+        }
+
         func testProviderSwitchScaleThreeHundredSavedChatsThreeWindowsTenLinks() async throws {
             let clock = ContinuousClock()
             let started = clock.now
@@ -4635,6 +4758,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     )
                     vm.promptManager = prompt
                     vm.workspaceManager = manager
+                    vm.test_setupObservers()
                     return vm
                 }, contextBuilderProviderFactory: { _, _, _, _ in preconditionFailure("Parity fixture never runs Context Builder") })
             } else { window = WindowState() }

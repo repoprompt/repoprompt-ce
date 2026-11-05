@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
@@ -16,6 +17,517 @@ import RepoPromptSettingsCore
 // MARK: - Atomic idle-only attributed send
 
 extension AgentModeViewModel {
+    struct ProviderSwitchPhysicalDispatch: Equatable {
+        let dispatchID: AgentSessionLinkPromptDispatchID?
+        let binding: AgentSessionRestorationBindingToken?
+        let admission: ProviderSwitchAdmissionEvidence
+        let acceptedInputID: UUID?
+        let composerAttemptID: UUID?
+        let autoWakeID: UUID?
+        let stopFence: AgentRunStartStopFence
+        /// Value identities only: never retains a task, session, controller, or terminal resource.
+        let runOwnership: AgentRunOwnership?
+        let runID: UUID?
+
+        func bindingDispatch(_ id: AgentSessionLinkPromptDispatchID, runID: UUID) -> Self {
+            .init(
+                dispatchID: id,
+                binding: binding,
+                admission: admission,
+                acceptedInputID: acceptedInputID,
+                composerAttemptID: composerAttemptID,
+                autoWakeID: autoWakeID,
+                stopFence: stopFence,
+                runOwnership: runOwnership,
+                runID: runID
+            )
+        }
+
+        func associatingRun(_ ownership: AgentRunOwnership) -> Self? {
+            guard runOwnership == nil, runID == nil, dispatchID == nil,
+                  let binding,
+                  ownership.binding.tabID == binding.bindingIdentity.tabID,
+                  ownership.binding.persistentSessionID == binding.bindingIdentity.sessionID,
+                  ownership.binding.persistentBindingGeneration == binding.bindingIdentity.generation,
+                  ownership.binding.bindingTransitionGeneration == binding.bindingTransitionGeneration
+            else { return nil }
+            return .init(
+                dispatchID: nil,
+                binding: binding,
+                admission: admission,
+                acceptedInputID: acceptedInputID,
+                composerAttemptID: composerAttemptID,
+                autoWakeID: autoWakeID,
+                stopFence: stopFence,
+                runOwnership: ownership,
+                runID: nil
+            )
+        }
+    }
+
+    /// Request-local composition evidence, not a persisted preview or a second admission owner.
+    struct ProviderSwitchSendPreparation {
+        let binding: AgentSessionRestorationBindingToken?
+        private(set) var handoff: PendingHandoffState
+        let agent: AgentProviderKind
+        let model: String
+        let rawInput: String
+        let augmentedInput: String
+        let initialThreadInput: String
+        let instructions: [String]
+        let inputAlreadyIncludesSupplement: Bool
+        let historyToolAllowed: Bool
+        let computerUseArmed: Bool
+        let catalogWindow: Int?
+        let composerAttemptID: UUID?
+        let autoWakeID: UUID?
+        let stopFence: AgentRunStartStopFence
+        var acceptedInputID: UUID?
+
+        @MainActor
+        func accepting(_ itemID: UUID, session: TabSession) -> Self {
+            var copy = self
+            copy.acceptedInputID = itemID
+            if session.currentRestorationBindingToken == binding, session.pendingHandoff == handoff {
+                copy.handoff.providerSwitchDispatch = copy.physicalDispatch
+                session.pendingHandoff.providerSwitchDispatch = copy.handoff.providerSwitchDispatch
+            }
+            return copy
+        }
+
+        var physicalDispatch: ProviderSwitchPhysicalDispatch {
+            .init(
+                dispatchID: nil,
+                binding: binding,
+                admission: .init(self),
+                acceptedInputID: acceptedInputID,
+                composerAttemptID: composerAttemptID,
+                autoWakeID: autoWakeID,
+                stopFence: stopFence,
+                runOwnership: nil,
+                runID: nil
+            )
+        }
+    }
+
+    struct ProviderSwitchAdmissionEvidence: Equatable {
+        let agent: AgentProviderKind
+        let model: String
+        let catalogWindow: Int?
+        let computerUseArmed: Bool
+        let historyToolAllowed: Bool
+        let inputAlreadyIncludesSupplement: Bool
+        let instructionsDigest: SHA256.Digest
+
+        init(_ preparation: ProviderSwitchSendPreparation) {
+            agent = preparation.agent
+            model = preparation.model
+            catalogWindow = preparation.catalogWindow
+            computerUseArmed = preparation.computerUseArmed
+            historyToolAllowed = preparation.historyToolAllowed
+            inputAlreadyIncludesSupplement = preparation.inputAlreadyIncludesSupplement
+            instructionsDigest = Self.digest(preparation.instructions)
+        }
+
+        static func digest(_ strings: [String]) -> SHA256.Digest {
+            var hash = SHA256()
+            for string in strings {
+                hash.update(data: Data("\(string.utf8.count):".utf8))
+                hash.update(data: Data(string.utf8))
+            }
+            return hash.finalize()
+        }
+    }
+
+    /// ONE admission implementation for every input producer. Composition finishes before any
+    /// input row/receipt is accepted. Start consumes this evidence; it never re-expands or re-fits.
+    func providerSwitchSendAdmission(
+        session: TabSession,
+        input: String,
+        attachments: [AgentFileAttachment] = [],
+        taggedFiles: [AgentTaggedFileAttachment] = [],
+        skipsAugmentation: Bool = false,
+        skipsSlashExpansion: Bool = false,
+        inputAlreadyIncludesSupplement: Bool = false,
+        supplementalInput: String? = nil,
+        autoWakeID: UUID? = nil,
+        isCurrent: @MainActor () -> Bool = { !Task.isCancelled }
+    ) async -> Result<ProviderSwitchSendPreparation?, AgentSessionLinkSendFailure> {
+        guard let delivery = session.pendingHandoff.providerSwitchDelivery else { return .success(nil) }
+        guard delivery == .ready else {
+            guard Self.providerSwitchHasOwnedCarryingAttempt(session) else { return .failure(.providerSwitchUnconfirmed) }
+            return .failure(Self.providerSwitchNeedsReview(session) ? .providerHandoverNeedsReview : .targetNotIdle)
+        }
+        guard !Self.providerSwitchNeedsReview(session) else { return .failure(.providerHandoverNeedsReview) }
+        guard !session.runState.isActive, session.activeRunOwnership == nil else { return .failure(.targetNotIdle) }
+        let handoff = session.pendingHandoff
+        let binding = session.currentRestorationBindingToken
+        let agent = session.selectedAgent
+        let model = session.selectedModelRaw
+        let computerUseArmed = session.isCodexComputerUseArmed
+        let catalogWindow = providerSwitchCatalogWindow(agent: agent, model: model)
+        let historyAllowed = providerSwitchHistoryToolAllowed(session)
+        let instructions = providerSwitchInstructionStrings(session, includeSupplement: !inputAlreadyIncludesSupplement)
+        let composerAttemptID = session.activeComposerSubmitAttempt?.id
+        let stopFence = AgentRunStartStopFence(session: session)
+        let augmented = skipsAugmentation ? input : await augmentUserMessageForProviderSend(
+            input, attachments: attachments, taggedFileAttachments: taggedFiles,
+            agent: agent, session: session, ignoresPendingHandoff: true,
+            skipsSlashExpansion: skipsSlashExpansion
+        )
+        let initial = await buildInitialThreadMessageIfNeeded(
+            tabID: session.tabID, session: session, initialMessage: augmented
+        )
+        guard isCurrent(), !Task.isCancelled else { return .failure(.targetStopped) }
+        guard !session.runState.isActive, session.activeRunOwnership == nil else { return .failure(.targetNotIdle) }
+        guard sessions[session.tabID] === session,
+              session.currentRestorationBindingToken == binding,
+              session.pendingHandoff == handoff,
+              session.selectedAgent == agent, session.selectedModelRaw == model,
+              session.isCodexComputerUseArmed == computerUseArmed,
+              !Self.providerSwitchNeedsReview(session)
+        else { return .failure(.providerHandoverNeedsReview) }
+        guard providerSwitchCatalogWindow(agent: agent, model: model) == catalogWindow,
+              providerSwitchHistoryToolAllowed(session) == historyAllowed,
+              providerSwitchInstructionStrings(session, includeSupplement: !inputAlreadyIncludesSupplement) == instructions
+        else { return .failure(.providerHandoverNeedsReview) }
+        guard let payload = handoff.payload, !payload.isEmpty else { return .failure(.providerHandoverNeedsReview) }
+        let bytes = payload.utf8.count
+        guard bytes <= AgentProviderHandover.maximumBytes else { return .failure(.providerHandoverDoesNotFit) }
+        guard let descriptor = ProviderSwitchCarrierDescriptor(payload),
+              providerSwitchReadReferenceIsCurrent(descriptor, session: session)
+        else { return .failure(.providerHandoverNeedsReview) }
+        var budgetInstructions = instructions
+        if let supplementalInput, let current = budgetInstructions.last,
+           supplementalInput.utf8.count > current.utf8.count { budgetInstructions[budgetInstructions.count - 1] = supplementalInput }
+        let budget = AgentProviderHandover.Budget(
+            catalogWindow: catalogWindow,
+            instructions: budgetInstructions, composedInput: "\n\n" + initial, isPreview: false
+        )
+        guard descriptor.mode != "summary" || bytes <= AgentProviderHandover.maximumSummaryBytes,
+              AgentProviderHandover.estimate(payload) <= budget.remainingCarrierTokens
+        else { return .failure(.providerHandoverDoesNotFit) }
+        return .success(ProviderSwitchSendPreparation(
+            binding: binding, handoff: handoff, agent: agent, model: model, rawInput: input,
+            augmentedInput: augmented, initialThreadInput: initial, instructions: instructions,
+            inputAlreadyIncludesSupplement: inputAlreadyIncludesSupplement,
+            historyToolAllowed: historyAllowed, computerUseArmed: computerUseArmed,
+            catalogWindow: catalogWindow, composerAttemptID: composerAttemptID, autoWakeID: autoWakeID, stopFence: stopFence
+        ))
+    }
+
+    func providerSwitchCatalogWindow(agent: AgentProviderKind, model: String) -> Int? {
+        if agent.usesClaudeNativeRuntime {
+            return ClaudeCompatibleModelCatalogAdapter.contextWindowTokens(forRequestedModelRaw: model, agentKind: agent)
+                ?? AgentModel.resolvedModel(forRaw: model, agentKind: agent)?.contextWindowTokens
+        }
+        return AgentModel.resolvedModel(forRaw: model, agentKind: agent)?.contextWindowTokens
+    }
+
+    /// Existing prompt owners author all these strings. Rendering current inventory in full is
+    /// conservative for a pending fresh context and neither reserves nor acknowledges a claim.
+    func providerSwitchInstructionStrings(_ session: TabSession, includeSupplement: Bool = true, destination: AgentProviderKind? = nil, includeOwedContent: Bool = true) -> [String] {
+        let agent = destination ?? session.selectedAgent
+        let prompt = SystemPromptService.agentModePrompt(
+            agentKind: agent, taskLabelKind: session.mcpControlContext?.taskLabelKind,
+            codeMapsDisabled: GlobalSettingsStore.shared.globalCodeMapsDisabled()
+        )
+        let packagedPrompt = agent.usesClaudeNativeRuntime
+            ? ClaudeCompatiblePluginBridge.providerBoundUserMessage("", instructions: prompt, delivery: ClaudeAgentToolPreferences.agentModePromptDelivery()) : ""
+        var strings = [packagedPrompt.isEmpty ? prompt : packagedPrompt]
+        if includeOwedContent, let note = session.selfCompactState.parkedNote { strings.append(note.frame) }
+        var supplement = ""
+        if includeSupplement, let context = agentSessionLinkPromptContext(for: session), context.epoch.allowsSupplement {
+            let baseline = AgentSessionLinkPrompts.rendered(.init(
+                membershipKind: context.inventory.isEmpty ? nil : .inventory,
+                inventory: context.inventory, passiveNotices: includeOwedContent ? context.passiveNotices : nil,
+                toolReference: context.epoch.toolReference
+            ))
+            supplement = includeOwedContent ? (AgentSessionLinkRuntimeBridge.shared.localInputDecoration(
+                observer: context.epoch.endpoint, inventory: context.inventory, baseline: baseline
+            )?.fragment ?? baseline.fragment) : baseline.fragment
+        }
+        strings.append(supplement)
+        return strings
+    }
+
+    static func providerSwitchStartRefusal(_ session: TabSession) -> AgentSessionLinkSendFailure {
+        session.pendingHandoff.providerSwitchDelivery == .ready ? .providerHandoverNeedsReview : .providerSwitchUnconfirmed
+    }
+
+    static func providerSwitchHasOwnedCarryingAttempt(_ session: TabSession) -> Bool {
+        guard let delivery = session.pendingHandoff.providerSwitchDelivery,
+              let proof = session.pendingHandoff.providerSwitchDispatch,
+              proof.binding == session.currentRestorationBindingToken,
+              proof.stopFence.permitsStart(of: session),
+              delivery == .ready || session.pendingHandoff.isStagedForSend else { return false }
+        if let ownership = proof.runOwnership {
+            return session.isCurrentRunAttempt(ownership, expectedRunID: proof.runID)
+        }
+        if let wakeID = proof.autoWakeID, let attempt = session.oversight.pendingAutoWake,
+           attempt.wakeID == wakeID, !attempt.isPeriodic, attempt.phase == .preparingDispatch,
+           attempt.physicalOutcome == .notAttempted
+        { return true }
+        if let claimID = proof.composerAttemptID, session.activeComposerSubmitAttempt?.id == claimID { return true }
+        if let inputID = proof.acceptedInputID {
+            if session.hasLocalComposerCandidate(itemID: inputID, fence: proof.stopFence) { return true }
+            // Non-local producers (session-link send, MCP resident, auto/periodic wakes) leave no
+            // composer candidate, and their claim can be released before the spawned run registers
+            // ownership. The durably accepted row itself is the carrying attempt until then.
+            return session.items.contains { $0.id == inputID }
+        }
+        return false
+    }
+
+    static func providerSwitchUnconfirmed(_ session: TabSession) -> Bool {
+        session.pendingHandoff.providerSwitchDelivery == .sending && !providerSwitchHasOwnedCarryingAttempt(session)
+    }
+
+    /// Accepted input after the saved cutoff invalidates the ready seed. The exact input currently
+    /// being started is excluded, never arbitrary equal text. Missing retained cutoff fails closed.
+    static func providerSwitchNeedsReview(_ session: TabSession, excluding inputID: UUID? = nil) -> Bool {
+        guard session.pendingHandoff.providerSwitchDelivery != nil else { return false }
+        // Once the carrying dispatch is physically bound, the handover is already en route to the
+        // destination; input accepted after it is ordinary traffic on that run, never staleness.
+        if session.pendingHandoff.providerSwitchDispatch?.dispatchID != nil { return false }
+        let ownedInputID = inputID ?? (providerSwitchHasOwnedCarryingAttempt(session) ? session.pendingHandoff.providerSwitchDispatch?.acceptedInputID : nil)
+        var positions: [UUID: Int] = [:]
+        var inputs: [UUID: Int] = [:]
+        func record(_ id: UUID, _ sequence: Int, input: Bool) {
+            positions[id] = sequence
+            if input, id != ownedInputID { inputs[id] = sequence }
+        }
+        for turn in session.transcript.turns {
+            if let request = turn.request { record(request.id, request.sequenceIndex, input: true) }
+            for activity in turn.allActivities {
+                record(
+                    activity.id,
+                    activity.sequenceIndex,
+                    input: activity.itemKind == .user
+                        || activity.text == AgentLaneUpdateDisplayAttribution.canonicalSystemText
+                        || activity.text == AgentChatItem.overseerCompactionRequestText
+                )
+            }
+            for diagnostic in turn.summary?.recoveryDiagnostics ?? [] {
+                record(diagnostic.id, diagnostic.sequenceIndex, input: false)
+            }
+        }
+        for item in session.items {
+            record(
+                item.id,
+                item.sequenceIndex,
+                input: item.kind == .user
+                    || item.text == AgentLaneUpdateDisplayAttribution.canonicalSystemText
+                    || item.text == AgentChatItem.overseerCompactionRequestText
+            )
+        }
+        guard let cutoffID = session.pendingHandoff.sourceItemID else { return !inputs.isEmpty }
+        guard let cutoff = positions[cutoffID] else { return true }
+        return inputs.values.contains { $0 > cutoff }
+    }
+
+    /// Sole M1 insertion point. Required-save sending before invoking any runner. Currency failure
+    /// after acceptance withholds start; it is not a second fit/admission decision.
+    func prepareProviderSwitchHandoverForSend(
+        _ preparation: ProviderSwitchSendPreparation?, session: TabSession,
+        stopFence: AgentRunStartStopFence
+    ) async -> (user: String, initial: String)? {
+        guard let preparation else { return nil }
+        guard providerSwitchPreparationIsCurrent(preparation, session: session),
+              stopFence.permitsStart(of: session),
+              let payload = preparation.handoff.payload,
+              let workspaceID = workspaceManager?.activeWorkspaceID
+        else { return nil }
+        session.pendingHandoff.providerSwitchDelivery = .sending
+        session.pendingHandoff.isStagedForSend = true
+        session.pendingHandoff.providerSwitchDispatch = preparation.physicalDispatch
+        let sending = session.pendingHandoff
+        session.isDirty = true
+        var sendingSaverReturned = false
+        let sendingSave = await flushSaveRequired(for: session.tabID, workspaceID: workspaceID, observingSavePhase: {
+            if case .writeReturned = $0 { sendingSaverReturned = true }
+        })
+        guard case .success = sendingSave else {
+            if sendingSaverReturned, sessions[session.tabID] === session,
+               session.currentRestorationBindingToken == preparation.binding, session.pendingHandoff == sending
+            {
+                // This VM has not released input to a runner. A known returned write may re-save
+                // ready, but never authorizes dispatch or replay of the accepted input.
+                await providerSwitchRestoreReadyBeforeDispatch(session: session, sending: sending, workspaceID: workspaceID)
+            }
+            // Unknown writes or loss of the exact no-runner proof remain inert sending.
+            if sessions[session.tabID] === session, session.currentRestorationBindingToken == preparation.binding,
+               session.pendingHandoff == sending
+            {
+                session.pendingHandoff.isStagedForSend = false
+                session.pendingHandoff.providerSwitchDispatch = nil
+            }
+            return nil
+        }
+        guard sessions[session.tabID] === session, session.currentRestorationBindingToken == preparation.binding,
+              session.pendingHandoff == sending else { return nil }
+        guard !Task.isCancelled, stopFence.permitsStart(of: session),
+              !session.runState.isActive, session.activeRunOwnership == nil,
+              session.selectedAgent == preparation.agent, session.selectedModelRaw == preparation.model,
+              session.isCodexComputerUseArmed == preparation.computerUseArmed,
+              providerSwitchCatalogWindow(agent: preparation.agent, model: preparation.model) == preparation.catalogWindow,
+              providerSwitchHistoryToolAllowed(session) == preparation.historyToolAllowed,
+              providerSwitchInstructionStrings(session, includeSupplement: !preparation.inputAlreadyIncludesSupplement) == preparation.instructions
+        else {
+            // Only this VM path proves the runner has not been invoked. An unacknowledged ready
+            // re-save restores sending; controller-specific failures never enter this path.
+            await providerSwitchRestoreReadyBeforeDispatch(session: session, sending: sending, workspaceID: workspaceID)
+            return nil
+        }
+        return (payload + "\n\n" + preparation.augmentedInput, payload + "\n\n" + preparation.initialThreadInput)
+    }
+
+    func providerSwitchPreparationIsCurrent(_ preparation: ProviderSwitchSendPreparation, session: TabSession) -> Bool {
+        sessions[session.tabID] === session && session.currentRestorationBindingToken == preparation.binding
+            && session.selectedAgent == preparation.agent && session.selectedModelRaw == preparation.model
+            && !session.runState.isActive && session.activeRunOwnership == nil
+            && session.pendingHandoff == preparation.handoff
+            && providerSwitchCatalogWindow(agent: preparation.agent, model: preparation.model) == preparation.catalogWindow
+            && providerSwitchHistoryToolAllowed(session) == preparation.historyToolAllowed
+            && session.isCodexComputerUseArmed == preparation.computerUseArmed
+            && !Self.providerSwitchNeedsReview(session, excluding: preparation.acceptedInputID)
+            && providerSwitchInstructionStrings(session, includeSupplement: !preparation.inputAlreadyIncludesSupplement) == preparation.instructions
+    }
+
+    func providerSwitchRestoreReadyBeforeDispatch(
+        session: TabSession, sending: PendingHandoffState, workspaceID: UUID
+    ) async {
+        guard sessions[session.tabID] === session, session.pendingHandoff == sending,
+              let proof = sending.providerSwitchDispatch, proof.binding == session.currentRestorationBindingToken,
+              proof.runOwnership == nil, proof.runID == nil, proof.dispatchID == nil,
+              !session.runState.isActive, session.activeRunOwnership == nil else { return }
+        let binding = session.currentRestorationBindingToken
+        session.pendingHandoff.providerSwitchDelivery = .ready
+        session.pendingHandoff.isStagedForSend = false
+        session.pendingHandoff.providerSwitchDispatch = nil
+        let ready = session.pendingHandoff
+        session.isDirty = true
+        var readySaverReturned = false
+        let readySave = await flushSaveRequired(for: session.tabID, workspaceID: workspaceID, observingSavePhase: {
+            if case .writeReturned = $0 { readySaverReturned = true }
+        })
+        if case .failure = readySave,
+           !(readySaverReturned && !session.runState.isActive && session.activeRunOwnership == nil),
+           sessions[session.tabID] === session, session.currentRestorationBindingToken == binding,
+           session.pendingHandoff == ready
+        {
+            session.pendingHandoff = sending
+            session.pendingHandoff.isStagedForSend = false
+            session.pendingHandoff.providerSwitchDispatch = nil
+            session.isDirty = true
+        }
+    }
+
+    /// Called at the existing physical acquisition hook, not pipeline admission. Binding one exact
+    /// logical dispatch is transient evidence; losing it on restart leaves durable sending inert.
+    func providerSwitchAcquirePhysicalDispatch(session: TabSession, dispatchID: AgentSessionLinkPromptDispatchID) -> Bool {
+        guard session.pendingHandoff.providerSwitchDelivery != nil else { return true }
+        guard session.pendingHandoff.providerSwitchDelivery == .sending,
+              session.pendingHandoff.isStagedForSend else { return false }
+        let effectiveID = agentSessionLinkEffectiveDispatchID(for: session, dispatchID: dispatchID)
+        guard let staged = session.pendingHandoff.providerSwitchDispatch,
+              sessions[session.tabID] === session, staged.binding == session.currentRestorationBindingToken,
+              staged.stopFence.permitsStart(of: session),
+              let ownership = staged.runOwnership, let runID = session.runID,
+              session.isCurrentRunAttempt(ownership, expectedRunID: staged.runID),
+              !Self.providerSwitchNeedsReview(session, excluding: staged.acceptedInputID),
+              staged.admission.agent == session.selectedAgent, staged.admission.model == session.selectedModelRaw,
+              staged.admission.catalogWindow == providerSwitchCatalogWindow(agent: session.selectedAgent, model: session.selectedModelRaw),
+              staged.admission.computerUseArmed == session.isCodexComputerUseArmed,
+              staged.admission.historyToolAllowed == providerSwitchHistoryToolAllowed(session),
+              staged.admission.instructionsDigest == ProviderSwitchAdmissionEvidence.digest(providerSwitchInstructionStrings(session, includeSupplement: !staged.admission.inputAlreadyIncludesSupplement))
+        else { return false }
+        if let boundID = staged.dispatchID { return boundID == effectiveID && staged.runID == runID }
+        guard staged.runID == nil else { return false }
+        session.pendingHandoff.providerSwitchDispatch = staged.bindingDispatch(effectiveID, runID: runID)
+        return true
+    }
+
+    func providerSwitchRunSettled(_ session: TabSession, revision: AgentRunTerminalCommitRevision, publication: AgentRunTerminalPublicationResult) {
+        guard publication.isResolved, sessions[session.tabID] === session,
+              let proof = session.pendingHandoff.providerSwitchDispatch,
+              proof.binding == session.currentRestorationBindingToken,
+              proof.runOwnership == revision.ownership,
+              proof.runID == nil || proof.runID == revision.expectedRunID
+        else { return }
+        session.pendingHandoff.providerSwitchDispatch = nil
+    }
+
+    /// Existing physical acceptance context is stronger than the legacy handoff Boolean (ACP's
+    /// Boolean is earlier than its actual prompt return). Late/foreign contexts cannot clear M1.
+    func providerSwitchRecordPhysicalAcceptance(session: TabSession, context: AgentSessionLinkDispatchContext?) {
+        guard sessions[session.tabID] === session,
+              let context, session.pendingHandoff.providerSwitchDelivery == .sending,
+              session.pendingHandoff.isStagedForSend,
+              let staged = session.pendingHandoff.providerSwitchDispatch,
+              staged.dispatchID == context.dispatchID, staged.binding == session.currentRestorationBindingToken,
+              let workspaceID = workspaceManager?.activeWorkspaceID else { return }
+        let sending = session.pendingHandoff
+        let binding = session.currentRestorationBindingToken
+        session.pendingHandoff.clearAfterSend()
+        let cleared = session.pendingHandoff
+        let model = inputBarModelDisplayName(rawModel: session.selectedModelRaw, agentKind: session.selectedAgent)
+        let text = "Handover sent to \(session.selectedAgent.displayName) / \(model)."
+        session.appendItem(.system(text, sequenceIndex: session.nextSequenceIndex, recoveryDiagnostic: .init(
+            reason: "providerSwitch", outcome: "sent", text: text
+        )))
+        session.isDirty = true
+        Task { @MainActor [weak self, weak session] in
+            guard let self, let session else { return }
+            // A returned frozen clear must survive later save-token drift. The ordinary fresh-save
+            // owner carries it forward; only an unacknowledged write restores uncertainty.
+            var saverReturned = false
+            let result = await flushSaveRequired(for: session.tabID, workspaceID: workspaceID, observingSavePhase: {
+                if case .writeReturned = $0 { saverReturned = true }
+            })
+            if case .failure = result, !saverReturned,
+               sessions[session.tabID] === session, session.currentRestorationBindingToken == binding,
+               session.pendingHandoff == cleared
+            {
+                session.pendingHandoff = sending
+                session.pendingHandoff.isStagedForSend = false
+                session.pendingHandoff.providerSwitchDispatch = nil
+                session.isDirty = true
+                scheduleSave(for: session.tabID)
+            }
+        }
+    }
+
+    func providerSwitchHistoryToolAllowed(_ session: TabSession, destination: AgentProviderKind? = nil) -> Bool {
+        guard AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(toolName: "history", taskLabelKind: session.mcpControlContext?.taskLabelKind) else { return false }
+        if (destination ?? session.selectedAgent).usesClaudeNativeRuntime {
+            return !MCPIntegrationHelper.claudeDisallowedTools(for: .agentRun).contains("mcp__\(MCPIntegrationHelper.repoPromptMCPServerName)__history")
+        }
+        return true
+    }
+
+    func providerSwitchReadReferenceIsCurrent(_ descriptor: ProviderSwitchCarrierDescriptor, session: TabSession, destination: AgentProviderKind? = nil) -> Bool {
+        guard !descriptor.readableMarkers.isEmpty else { return true }
+        guard let sessionID = session.activeAgentSessionID,
+              providerSwitchHistoryToolAllowed(session, destination: destination)
+        else { return false }
+        let server = (destination ?? session.selectedAgent) == .grokBuild
+            ? RepoPromptMCPServerConfiguration.grokBuildRuntimeServerName : MCPIntegrationHelper.repoPromptMCPServerName
+        return descriptor.readableMarkers.allSatisfy { marker in
+            guard let first = Int(marker.attributes["first"] ?? ""), let last = Int(marker.attributes["last"] ?? ""),
+                  first >= 0, last >= first, last < session.transcript.turns.count else { return false }
+            guard let reference = try? AgentProviderHandover.HistoryReference(server: server, sessionID: sessionID, historyAllowed: true, indicesMatch: true) else { return false }
+            let expected = AgentProviderHandover.readableHistoryInstruction(first ... last, reference: reference)
+            return marker.text.trimmingCharacters(in: .whitespacesAndNewlines) == expected
+        }
+    }
+
+    static func providerSwitchIsInFlightOnActiveRun(_ session: TabSession) -> Bool {
+        session.pendingHandoff.providerSwitchDelivery == .sending
+            && session.runState.isActive && Self.providerSwitchHasOwnedCarryingAttempt(session)
+            && session.pendingHandoff.providerSwitchDispatch?.dispatchID != nil
+    }
+
     /// Assembles the pure readiness snapshot from live target state.
     ///
     /// Every field is read directly off `TabSession`; nothing is derived or defaulted here, so a
@@ -491,5 +1003,76 @@ extension AgentModeViewModel {
         updateBindingsFromSession(session)
         requestUIRefresh(tabID: tabID, urgent: true)
         scheduleSave(for: tabID)
+    }
+}
+
+/// Parse persisted M1 as data, never instructions. No external entity/network resolution.
+final class ProviderSwitchCarrierDescriptor: NSObject, XMLParserDelegate {
+    struct Marker {
+        let attributes: [String: String]
+        var text: String
+    }
+
+    private(set) var mode = ""
+    private(set) var sourceProvider = ""
+    private(set) var sourceModel = ""
+    private(set) var readableMarkers: [Marker] = []
+    private(set) var omissions: [String] = []
+    private var depth = 0
+    private var markerDepth: Int?
+    private var validRoot = false
+
+    init?(_ payload: String) {
+        super.init()
+        guard payload.utf8.count <= AgentProviderHandover.maximumBytes,
+              !payload.contains("<!DOCTYPE"), !payload.contains("<!ENTITY") else { return nil }
+        let parser = XMLParser(data: Data(payload.utf8))
+        parser.shouldResolveExternalEntities = false
+        parser.delegate = self
+        guard parser.parse(), validRoot else { return nil }
+    }
+
+    func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?, qualifiedName: String?, attributes: [String: String]) {
+        depth += 1
+        if depth == 1 {
+            mode = attributes["mode"] ?? ""
+            sourceProvider = attributes["source_provider"] ?? ""
+            sourceModel = attributes["source_model"] ?? ""
+            validRoot = elementName == "repoprompt_provider_handover" && attributes["version"] == "1"
+                && ["history", "newest_turns", "summary"].contains(mode)
+                && (try? AgentProviderHandover.Source(provider: sourceProvider, model: sourceModel)) != nil
+        }
+        if elementName == "omitted" {
+            switch attributes["kind"] {
+            case "older_turns":
+                guard let first = Int(attributes["first"] ?? ""), let last = Int(attributes["last"] ?? ""), first >= 0, last >= first else {
+                    parser.abortParsing()
+                    return
+                }
+                let (difference, differenceOverflow) = last.subtractingReportingOverflow(first)
+                let (count, countOverflow) = difference.addingReportingOverflow(1)
+                guard !differenceOverflow, !countOverflow, count > 0 else {
+                    parser.abortParsing()
+                    return
+                }
+                omissions.append("\(count) older turns")
+            case "tool_output": omissions.append("tool outputs")
+            case "image": omissions.append("images")
+            default: break
+            }
+        }
+        if elementName == "omitted", attributes["availability"] == "readable" {
+            readableMarkers.append(.init(attributes: attributes, text: ""))
+            markerDepth = depth
+        }
+    }
+
+    func parser(_ parser: XMLParser, foundCharacters string: String) {
+        if markerDepth != nil, !readableMarkers.isEmpty { readableMarkers[readableMarkers.count - 1].text += string }
+    }
+
+    func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName: String?) {
+        if markerDepth == depth { markerDepth = nil }
+        depth -= 1
     }
 }

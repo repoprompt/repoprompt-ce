@@ -1114,6 +1114,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         ) async -> AgentRunTerminalPublicationResult)?
     #endif
     weak var preparedSessionRuntimes: (any PreparedAgentSessionRuntimeRegistry)?
+    var providerSwitchExactOwnerProbe: (@MainActor (TabSession) -> Bool)?
     private var hasPreparedForWindowClose = false
     private var windowClosePreparationTask: Task<Void, Never>?
     private static let uiRefreshCoalesceDelayNanos: UInt64 = 75_000_000

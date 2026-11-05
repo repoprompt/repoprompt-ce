@@ -731,54 +731,6 @@ extension AgentModeViewModel {
         case durablySaved(AgentSessionRestorationBindingToken)
     }
 
-    struct ProviderSwitchPhysicalDispatch: Equatable {
-        let dispatchID: AgentSessionLinkPromptDispatchID?
-        let binding: AgentSessionRestorationBindingToken?
-        let admission: ProviderSwitchAdmissionEvidence
-        let acceptedInputID: UUID?
-        let composerAttemptID: UUID?
-        let autoWakeID: UUID?
-        let stopFence: AgentRunStartStopFence
-        /// Value identities only: never retains a task, session, controller, or terminal resource.
-        let runOwnership: AgentRunOwnership?
-        let runID: UUID?
-
-        func bindingDispatch(_ id: AgentSessionLinkPromptDispatchID, runID: UUID) -> Self {
-            .init(
-                dispatchID: id,
-                binding: binding,
-                admission: admission,
-                acceptedInputID: acceptedInputID,
-                composerAttemptID: composerAttemptID,
-                autoWakeID: autoWakeID,
-                stopFence: stopFence,
-                runOwnership: runOwnership,
-                runID: runID
-            )
-        }
-
-        func associatingRun(_ ownership: AgentRunOwnership) -> Self? {
-            guard runOwnership == nil, runID == nil, dispatchID == nil,
-                  let binding,
-                  ownership.binding.tabID == binding.bindingIdentity.tabID,
-                  ownership.binding.persistentSessionID == binding.bindingIdentity.sessionID,
-                  ownership.binding.persistentBindingGeneration == binding.bindingIdentity.generation,
-                  ownership.binding.bindingTransitionGeneration == binding.bindingTransitionGeneration
-            else { return nil }
-            return .init(
-                dispatchID: nil,
-                binding: binding,
-                admission: admission,
-                acceptedInputID: acceptedInputID,
-                composerAttemptID: composerAttemptID,
-                autoWakeID: autoWakeID,
-                stopFence: stopFence,
-                runOwnership: ownership,
-                runID: nil
-            )
-        }
-    }
-
     struct PendingHandoffState: Equatable {
         var payload: String?
         var createdAt: Date?
