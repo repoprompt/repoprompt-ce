@@ -152,6 +152,19 @@ final class AgentRepromptHistoryTests: XCTestCase {
         XCTAssertTrue(history[0].user.hasPrefix("latest"))
     }
 
+    func testOversizedNewestExchangeIsTrimmedRatherThanLeavingNoContext() throws {
+        for fill in ["x", "\"", "é🙂"] {
+            let spec = "SPEC START " + String(repeating: fill, count: 20000) + " SPEC END"
+            let history = AgentRepromptHistory.make(items: turn("first", "reply one") + turn(spec, "reply two"), compactedAt: nil, hasActiveTurn: false)
+            XCTAssertEqual(history.count, 1, fill)
+            let kept = try XCTUnwrap(history.first)
+            XCTAssertTrue(kept.user.hasPrefix("SPEC START") && kept.user.hasSuffix("SPEC END"), fill)
+            XCTAssertEqual(kept.assistant, "reply two", fill)
+            XCTAssertLessThanOrEqual(try JSONEncoder().encode(history).count, 8 * 1024, fill)
+            XCTAssertNoThrow(try AgentRepromptService.message(for: .init(originalText: "Proceed with that", recentChat: history)), fill)
+        }
+    }
+
     func testCompactionBoundaryAndDiffsAreExcluded() {
         let boundary = Date(timeIntervalSince1970: 100)
         let before = turn("before", "before reply", at: boundary.addingTimeInterval(-10))

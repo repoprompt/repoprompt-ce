@@ -96,13 +96,13 @@ and billing terms apply; do not send secrets you do not want that recipient to r
 profile (available in Settings and the pill's right-click menu). Only sessions with at least two prior closed user turns may send excerpts:
 the last up to three prior user bubble texts (the rewritten text when applicable), the names and kinds
 of files sent in each, and each turn's final assistant reply, trimmed to approximately 1.5 KiB retaining start and end. The serialized excerpt budget is 8 KiB;
-oldest turns are dropped first. Only post-compaction turns qualify. The same setting sends the session
+oldest turns are dropped first, and a newest exchange over budget by itself has its user text trimmed instead. Only post-compaction turns qualify. The same setting sends the session
 title, unless it is still an automatic placeholder.
 Tool calls/results, thinking, diffs, attachment contents and system/workflow envelopes are excluded.
 The strip says **with chat context** when excerpts are actually used. Fixed, non-editable framing
 limits history to resolving what the current message refers to: the current message always wins, assistant
-claims are unverified, and corrections/redirections must abandon rather than perpetuate failed
-approaches. Turn history never creates new requirements unless the current message restates them.
+claims are unverified, a correction changes only what it corrects, and only an explicit request to abandon
+or redo the work drops the prior approach. Turn history never creates new requirements unless the current message restates them.
 
 Calls are stateless and tool-less: **no Oracle consults, Context Builder, repository file contents,
 git review packaging or selection mutations**. Attachment and tagged-file contents are not sent to
@@ -125,7 +125,7 @@ the edited rewrite stays available through undo/recovery. Send original is avail
 fresh-claim admission. Cancel/Esc restores the original; Undo preserves the edited brief in the local
 recovery banner. Switching sessions does not interrupt a rewrite: each session has its own preparation,
 which keeps streaming into its own draft, and Send automatically waits to dispatch until you return to
-that session. Invalidation (target/settings changes, closing the session or Stop) restores the original when
+that session and until it can dispatch. Invalidation (target/settings changes, closing the session or Stop) restores the original when
 the composer is still operation-owned. New edits stay intact with explicit Restore original / Keep
 rewrite choices, rather than silently starting another rewrite from generated output. Truncated output
 is recoverable but cannot be sent as a successful preparation.

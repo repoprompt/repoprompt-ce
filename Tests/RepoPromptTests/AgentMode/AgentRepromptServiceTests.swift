@@ -37,6 +37,14 @@ final class AgentRepromptServiceTests: XCTestCase {
         }
     }
 
+    func testOnlyAnExplicitRequestAbandonsPriorWork() {
+        let framing = AgentRepromptHistory.framing
+        XCTAssertTrue(framing.contains("changes only what it"))
+        XCTAssertTrue(framing.contains("explicitly asks to abandon or redo"))
+        XCTAssertFalse(framing.contains("signals frustration"), "Frustration alone must not read as a scope change")
+        XCTAssertFalse(framing.contains("if useful"), "Abandonment language must not be optional colour on a correction")
+    }
+
     func testAttachmentAndTitleInputsAreEncodedAndBounded() throws {
         let request = AgentRepromptRequest(originalText: "See this", attachments: [.init(name: "shot.png", kind: "image")], sessionTitle: "CI gating")
         let message = try AgentRepromptService.message(for: request)

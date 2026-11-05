@@ -119,6 +119,13 @@ final class AgentRepromptUIStore: ObservableObject {
         let generation: UInt64
     }
 
+    /// Set only when the composer shows the text to send and can dispatch it. Consuming a request
+    /// is one-shot, so it must wait for a live submit target rather than be spent on a stale one.
+    func autoSendReadyID(tabID: UUID?, visibleDraft: String, canSubmit: Bool) -> UUID? {
+        guard canSubmit, let tabID, let request = autoSendRequests[tabID], request.text == visibleDraft else { return nil }
+        return request.operationID
+    }
+
     struct OneShotDisclosureRequest: Identifiable {
         let id = UUID()
         let target: AgentComposerSubmitTarget

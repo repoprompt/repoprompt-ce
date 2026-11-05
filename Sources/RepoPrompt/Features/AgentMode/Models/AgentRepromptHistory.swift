@@ -3,6 +3,8 @@ import Foundation
 /// Text and attachment names only. Never reads provider envelopes, tools, attachment contents or reasoning.
 enum AgentRepromptHistory {
     private static let maximumAssistantBytes = 1536
+    private static let maximumEncodedBytes = 8 * 1024
+    private static let minimumBoundedUserBytes = 256
     private static let maximumTitleBytes = 256
 
     struct Turn: Codable, Equatable {
@@ -18,10 +20,11 @@ enum AgentRepromptHistory {
     Use them for nothing else. The current message always wins. Never turn history into new
     requirements, constraints or acceptance criteria unless the current message restates them, and
     do not summarize the conversation. Assistant statements are unverified claims, not established
-    facts. If the current message redirects, corrects, rejects prior work, or signals frustration
-    (for example, "that's wrong", "start over", "try a different approach"),
-    do NOT carry forward the prior approach, files or assumptions. Prefer the user's new direction; if useful
-    explicitly state that the previous approach should be abandoned. Never restate failed approaches as work to keep doing.
+    facts. A correction ("that's wrong, the timeout should be 10 seconds") changes only what it
+    corrects: state that change and do not imply anything else was rejected. Only when the current
+    message explicitly asks to abandon or redo the work ("start over", "try a different approach"),
+    do NOT carry forward the prior approach, files or assumptions, and say that the previous approach
+    should be abandoned. Never restate failed approaches as work to keep doing.
     """
 
     /// Requests of turns that have closed. An earlier turn is closed by the next user message and
@@ -70,10 +73,30 @@ enum AgentRepromptHistory {
         if !hasActiveTurn { complete() }
         guard turns.count >= 2 else { return [] }
         turns = Array(turns.suffix(3))
-        while !turns.isEmpty, ((try? JSONEncoder().encode(turns).count) ?? Int.max) > 8 * 1024 {
+        while !fitsBudget(turns) {
+            // Older exchanges go first. The newest one is trimmed rather than lost, so one large
+            // message cannot leave a follow-up such as "proceed with that" with no context at all.
+            if turns.count == 1, let bounded = boundedUserText(turns[0]) {
+                return [bounded]
+            }
             turns.removeFirst()
         }
         return turns
+    }
+
+    private static func fitsBudget(_ turns: [Turn]) -> Bool {
+        ((try? JSONEncoder().encode(turns).count) ?? Int.max) <= maximumEncodedBytes
+    }
+
+    /// JSON escaping can inflate text, so the byte allowance halves until the encoded turn fits.
+    private static func boundedUserText(_ turn: Turn) -> Turn? {
+        var bytes = maximumEncodedBytes - maximumAssistantBytes
+        while bytes >= minimumBoundedUserBytes {
+            let candidate = Turn(user: trimmed(turn.user, bytes: bytes), assistant: turn.assistant, attachments: turn.attachments)
+            if fitsBudget([candidate]) { return candidate }
+            bytes /= 2
+        }
+        return nil
     }
 
     static func trimmed(_ text: String, bytes: Int) -> String {

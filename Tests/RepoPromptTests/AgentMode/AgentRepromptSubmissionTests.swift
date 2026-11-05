@@ -881,6 +881,36 @@ final class AgentRepromptSubmissionTests: XCTestCase {
         XCTAssertFalse(vm.consumeRepromptAutoSend(request, tabID: tabID, visibleDraft: request.text, hasMarkedText: false), "Exactly once")
     }
 
+    func testAutoSendIsNotSpentUntilItCanDispatch() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.enableReprompt()
+        fixture.viewModel.setRepromptMode(.sendAutomatically)
+        let vm = fixture.viewModel
+        let store = vm.repromptUIStore
+        let tabID = fixture.session.tabID
+        vm.repromptService = .init(transport: { _, _, publish in try await publish("Finished brief") })
+        XCTAssertTrue(try fixture.begin(text: "Original"))
+        try await AsyncTestWait.waitUntil("parked send", timeout: 5) { store.autoSendRequests[tabID] != nil }
+        let request = try XCTUnwrap(store.autoSendRequests[tabID])
+
+        XCTAssertNil(store.autoSendReadyID(tabID: tabID, visibleDraft: request.text, canSubmit: false), "A stale or missing target must not trigger consumption")
+        XCTAssertNil(store.autoSendReadyID(tabID: tabID, visibleDraft: "Previous chunk", canSubmit: true))
+        XCTAssertNil(store.autoSendReadyID(tabID: UUID(), visibleDraft: request.text, canSubmit: true))
+        XCTAssertNil(store.autoSendReadyID(tabID: nil, visibleDraft: request.text, canSubmit: true))
+        XCTAssertEqual(store.autoSendReadyID(tabID: tabID, visibleDraft: request.text, canSubmit: true), request.operationID, "Becoming dispatchable fires it")
+
+        // The request survives the wait, and consuming it leads to a real claim of the rewrite.
+        XCTAssertTrue(vm.consumeRepromptAutoSend(request, tabID: tabID, visibleDraft: request.text, hasMarkedText: false))
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: fixture.session))
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: request.text)
+        guard case let .claimed(claim) = vm.claimComposerSubmitForImmediatePresentation(attempt) else {
+            return XCTFail("A consumed request must be able to dispatch")
+        }
+        defer { vm.finishPresentedComposerSubmitAttempt(claim, result: .blocked(message: "test cleanup")) }
+        XCTAssertEqual(vm.ui.composer.pendingSubmissions[attempt.id]?.text, "Finished brief")
+    }
+
     func testBackgroundRewriteStillStopsForStopSettingsAndTurningOff() async throws {
         for change in ["stop", "settings", "off"] {
             let fixture = try await AgentRepromptTestFixture()

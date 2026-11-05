@@ -412,12 +412,10 @@ struct AgentComposerView: View, Equatable {
         currentTabID.flatMap { repromptStore.presentations[$0] }
     }
 
-    /// Set once the visible composer shows the text to auto-send. A rewrite that finished in a
-    /// session not on screen waits here until its composer is back and has loaded that text.
+    /// A rewrite that finished in a session not on screen waits here until its composer is back,
+    /// has loaded that text and can dispatch it.
     private var repromptAutoSendReadyID: UUID? {
-        guard let request = currentTabID.flatMap({ repromptStore.autoSendRequests[$0] }),
-              request.text == localInputText else { return nil }
-        return request.operationID
+        repromptStore.autoSendReadyID(tabID: currentTabID, visibleDraft: localInputText, canSubmit: canSubmitToRenderedTarget)
     }
 
     private var repromptUndoRecovery: AgentRepromptUIStore.Recovery? {
@@ -645,6 +643,7 @@ struct AgentComposerView: View, Equatable {
             // streaming chunk. Native edits already revoke the operation before mutation.
             await Task.yield()
             guard !Task.isCancelled, let tabID = currentTabID, let request = repromptStore.autoSendRequests[tabID],
+                  repromptAutoSendReadyID == request.operationID,
                   let viewModel = repromptViewModel,
                   viewModel.consumeRepromptAutoSend(
                       request, tabID: currentTabID, visibleDraft: localInputText,
