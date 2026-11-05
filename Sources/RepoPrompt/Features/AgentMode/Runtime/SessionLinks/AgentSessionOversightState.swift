@@ -42,9 +42,9 @@ struct AgentSessionOversightState {
 
     // MARK: Durable routine wake interval
 
-    /// Minimum spacing between *routine* automatic wakes. Off by default; exact purposeful attention
+    /// Minimum spacing between *routine* automatic wakes. On for new sessions; exact purposeful attention
     /// and the user's own `Wake now` bypass it without changing it.
-    var routineWakeIntervalEnabled: Bool = false
+    var routineWakeIntervalEnabled: Bool = true
     /// The chosen interval, retained while limiting is off. Read through
     /// `normalizedRoutineWakeIntervalSeconds`: a decoded value is never trusted raw.
     var routineWakeIntervalSeconds: Int = AgentSessionLinkRoutineWakeInterval.defaultSeconds
@@ -313,6 +313,14 @@ enum AgentSessionLinkRoutineWakeInterval {
     static let optionsSeconds = [60, 300, 600, 900, 1800, 3600, 10800]
     static let defaultSeconds = 300
     static let maximumSeconds = 10800
+
+    static func pickerSeconds(enabled: Bool, seconds: Int) -> Int {
+        enabled ? normalized(seconds) : 0
+    }
+
+    static func pickerSelection(_ seconds: Int, retaining currentSeconds: Int) -> (enabled: Bool, seconds: Int) {
+        seconds == 0 ? (false, normalized(currentSeconds)) : (true, normalized(seconds))
+    }
 
     static func normalized(_ seconds: Int) -> Int {
         for option in optionsSeconds where option >= seconds {
