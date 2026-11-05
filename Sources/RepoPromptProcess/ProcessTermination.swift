@@ -299,6 +299,34 @@ package enum ProcessTermination {
         currentTiming().cooperativeWaitTimeout
     }
 
+    #if DEBUG
+        /// Test seam (#481): invoked once per cleanup poll sleep, inside the task that performs
+        /// cleanup, so a regression test can bound reaper iterations after cancellation.
+        @TaskLocal static var reaperPollObserverForTesting: (@Sendable () -> Void)?
+    #endif
+
+    private static let cleanupPollTimerQueue = DispatchQueue.global(qos: .userInitiated)
+
+    /// Suspends for one cleanup poll interval regardless of task cancellation.
+    ///
+    /// Cleanup escalation (SIGTERM grace, then SIGKILL grace) frequently runs inside a task
+    /// that has already been cancelled — `waitForTerminationStatus` enters it *because* of
+    /// cancellation. `Task.sleep` returns immediately on a cancelled task, which turned the
+    /// bounded wait into a busy loop of `waitpid`/`killpg` probes until the deadline (#481).
+    /// A one-shot Dispatch timer does not observe task cancellation, so the configured
+    /// cadence holds either way; the continuation is resumed exactly once by that timer.
+    private static func sleepBetweenCleanupPolls(nanoseconds: UInt64) async {
+        #if DEBUG
+            reaperPollObserverForTesting?()
+        #endif
+        let delay = Int(min(nanoseconds, UInt64(Int.max)))
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            cleanupPollTimerQueue.asyncAfter(deadline: .now() + .nanoseconds(delay)) {
+                continuation.resume()
+            }
+        }
+    }
+
     package static func currentTimeoutCleanupPolicy() -> TimeoutCleanupPolicy {
         let timing = currentTiming()
         return TimeoutCleanupPolicy(
@@ -442,7 +470,7 @@ package enum ProcessTermination {
                     return true
                 }
             }
-            try? await Task.sleep(nanoseconds: pollIntervalNs)
+            await sleepBetweenCleanupPolls(nanoseconds: pollIntervalNs)
         }
         return false
     }
@@ -619,7 +647,7 @@ package enum ProcessTermination {
         let termDeadline = ProcessInfo.processInfo.systemUptime + max(sigtermGrace ?? timing.sigtermGrace, 0)
         while ProcessInfo.processInfo.systemUptime < termDeadline {
             guard processGroupExists(processGroupID) else { return }
-            try? await Task.sleep(nanoseconds: shortPollNs)
+            await sleepBetweenCleanupPolls(nanoseconds: shortPollNs)
         }
         guard processGroupExists(processGroupID) else { return }
 
@@ -631,7 +659,7 @@ package enum ProcessTermination {
         let killDeadline = ProcessInfo.processInfo.systemUptime + max(sigkillGrace ?? timing.sigkillGrace, 0)
         while ProcessInfo.processInfo.systemUptime < killDeadline {
             guard processGroupExists(processGroupID) else { return }
-            try? await Task.sleep(nanoseconds: shortPollNs)
+            await sleepBetweenCleanupPolls(nanoseconds: shortPollNs)
         }
         if processGroupExists(processGroupID) {
             logger("Process group \(processGroupID) remained after bounded SIGKILL cleanup")
