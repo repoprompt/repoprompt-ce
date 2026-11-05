@@ -30,10 +30,18 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: xcode-workspace-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   validate:
     name: Validate Generated Xcode Workspace
+    # Keep native ARM coverage and the original enforcing measurement platform.
     runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
     steps:
       - name: Check out repository
         uses: actions/checkout@v6

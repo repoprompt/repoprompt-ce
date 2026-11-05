@@ -811,6 +811,7 @@ allowed_tracked_docs=(
   "docs/architecture/ci-admission.md"
   "docs/architecture/ci-capacity-2026-11-04.md"
   "docs/architecture/ci-reliability-2026-10-23.md"
+  "docs/architecture/ci-reliability-2026-11-05.md"
   "docs/architecture/ci-test-gates.md"
   "docs/architecture/codex-app-server-schema-gate.md"
   "docs/architecture/codex-user-mcp-import.md"
