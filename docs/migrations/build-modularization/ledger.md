@@ -1945,3 +1945,100 @@ final-source validation can keep the PR Draft; the user's review is the later
 merge gate. The eight passing hosted checks at `0c541c018` are not validation of
 this integration repair. Fresh hosted results and the final published SHA belong
 in the PR readiness record.
+
+#### M6 current-main integration (2026-11-06)
+
+Normal merge `a6eaa002098525220f349eff1aae31a937777bcd` incorporates main
+`348957d5db58e782cd851d591a906d9ef74fac71` into PR head
+`5b3bf9f0d8edccc4bea41e6eb5a2780550441998`. Published history is preserved.
+The separate local `wt/1401-milestone-1` checkout was inspected read-only:
+its `ba3f3cb0b` head has no commits absent from the PR head (168 commits behind),
+and its untracked investigation report was not modified or included.
+
+Integration decisions:
+
+- Retain both sides' direct imports in `ResizableTextField`, Oracle-pill routing
+  tests and runtime-sidebar tests. Add the missing WorkspaceContext import to
+  main's workspace-switch convergence test. Relative to incorporated main, these
+  four files differ only by the extraction's direct import.
+- Move main's new `WorkspaceCodemapRootPausePolicy` beside its extracted store.
+  Its standardized-path keys, defaults values and pause/resume semantics are
+  unchanged. Package access permits the store's package initializer defaults and
+  existing app-test injection. Forward the new policy argument through **both**
+  Debug and Release app composition initializers; the initial merge omitted that
+  forwarding, which app-test compilation detected. This new file is additional
+  integration work, not one of the historical 103 byte-audited production moves.
+- Keep the PR's bounded DispatchIO-backed buffered capture, cancellable input
+  writer and sole waiter/reaper ownership rather than restoring main's blocking
+  buffered-reader implementation. Adopt main's shared output hooks and timeout,
+  retiring the duplicated stream/nonstream hook fields and parameters. Both
+  existing cancellation/drain tests and main's captured-output regression remain.
+  No timeout was increased, and no cleanup/authority fence was removed.
+- Preserve main's operation-count scale-test gates from #1580. Main removed the
+  wall-clock assertions; this does **not** waive this PR's recorded 50 ms
+  performance acceptance or diagnose the historical failure.
+
+Validation host: macOS 26.7.2 (25G332), arm64, Apple Swift 6.4
+(`swiftlang-6.4.0.34.1`). All build/test jobs used this worktree's conductor queue;
+heavy admission retained the existing machine configuration. No visible app was
+launched, stopped or relaunched.
+
+| Boundary | Conductor ticket | Receipt |
+| --- | --- | --- |
+| App-free WorkspaceContext owning target | `8d5642e9-9a16-4a8d-9cf5-65ed5ef67551` | 34 executed, zero failures; 8m44s execution, 41ms heavy wait |
+| Process owning target | `a4308ed5-a633-4204-a69b-007c4813ddd2` | 34 executed, zero failures; 44.6s execution, 7m58s queue, 12ms heavy wait |
+| Guardrails | `2d9623a3-4c47-4482-8565-4fe7c87f674d` | exit 0; no ratchet limit raised by this integration |
+| Both Debug products, before forwarding repair | `c7cb5067-6582-4f8f-b810-606cce4c9903` | exit 0; 11m02s execution, 1m12s queue; not packaging/live proof |
+| Lint after forwarding repair | `f4aa9f01-de86-46e2-b5d5-fe875abe20d8` | exit 0; 0/1,943 files need formatting; strict SwiftLint |
+| Both Debug products after forwarding repair | `e0a7ca64-69b3-4e78-b263-69fb56d04f2d` | exit 0; 26.5s execution, 48.4s queue; not packaging/live proof |
+| Broader full suite | `6b0ec11d-99a7-443b-9580-e8b035fc956c` | dispatched; completion is pending, not a pass |
+
+Scoped pinned SwiftFormat ran on the eight integration-owned Swift files and
+changed none. Initial lint `a42134a9` failed because pinned SwiftFormat was absent;
+the repository installer supplied 0.61.1, then full lint passed (`52c7598d` and
+the post-repair ticket above). Initial app-test ticket `b0de49dd` failed compilation
+at the missing policy-forwarding argument. The dependent full-suite attempt
+`3bc60398` was canceled, not passed. An earlier selector correction canceled
+`53e97b37` during package preparation; it is not test evidence.
+
+Post-repair focused run `211d5c13-c9e5-4271-b062-30a56799aa3f` is **NOT PASSING**:
+169 passed, 2 failed, 4 explicitly skipped (175 named cases; auxiliary zero-match
+bundles add no coverage). Failures are:
+
+- `CodemapAutomaticSelectionGraphNativeTests.testFilesystemSiblingRootsRemainIsolatedAfterWatcherEdit`:
+  line 1236 returned `[]` instead of `AlphaReplacedProps` after overlay publication.
+  The test differs from incorporated main only by its WorkspaceContext import.
+  Isolated reproduction `8483edd8-cbb4-44ba-adb1-a50b11af9834` executed that one
+  test and passed in 1.043s (58.6s job). This does not diagnose or erase the failure.
+- `SessionAdminWorktreeRecoveryTests.testStandaloneIdentifyingBindStillRefusesTwoOwningCheckoutsWithoutRepoRoot`:
+  fixture setup timed out waiting for `foreground drafts published` at 3.0s.
+  Isolated reproduction `0c9b4997-8098-42fc-91e2-3d631bc0e8fa` executed that
+  one test and passed in 3.702s (47.0s job). No deadline, retry count or assertion
+  was weakened; the mixed-run failure remains unexplained.
+
+The 30/300-chat diagnostic in that same run retained twenty samples per case.
+Nearest-rank refresh/menu p95 was **4.960041/2.605875 ms** at 30 chats and
+**49.806/71.928959 ms** at 300 chats. Restore was 71.047375/262.1375 ms;
+both cases recorded four restore reads, 470 visits and 35 publications. The
+300-chat menu result still exceeds the recorded **50 ms** acceptance budget even
+though main's operation-count test passed. These are candidate-only observations
+from the integration suite, not an exclusive-load matched baseline experiment
+or an established explanation of the historical failure. Raw samples remain in
+the ticket's `OVERSIGHT_SCALE` log lines.
+
+After the successful isolated test regenerated the source fingerprint,
+`python3 Scripts/modularization_index_graph.py check` passed at **1,304/1,360**
+wrong-way file edges and **54/66** cycle components. An earlier query made during
+an active app-index build correctly refused unproven freshness; it was not a pass.
+
+The bounded local Oracle resolution review found no behavioral regression; it
+noted optional duplicate-test and test-hook deadline-order cleanups. Both were
+left unchanged to preserve upstream coverage and existing bounded-drain semantics.
+This is not the overseer's separate independent review or an approval to merge.
+
+Acceptance remains open. In particular, no selected-workspace fixture is relabeled
+as #1402's workspace-free lane-creation contract. The matched launch experiment
+still requires explicit lifecycle authorization: the incorporated baseline and
+final candidate, identical host/toolchain/profile/security policy, exclusive
+heavy-work interval, two warm-ups and twenty retained samples per head, with the
+unchanged 10% budget. No old slow sample or failure is discarded.
