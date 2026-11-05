@@ -307,10 +307,10 @@ struct AgentSessionLinkOversightWakeDispatch: Equatable {
 /// The approved routine-wake interval durations and the one normalization every writer shares —
 /// decode paths, the durable setter, restoration, and the picker.
 ///
-/// Ceiling to an approved option: a stored 61 becomes 5 minutes rather than 1, and anything past the
+/// Ceiling to an approved option: a stored 61 becomes 3 minutes rather than 1, and anything past the
 /// largest option is capped rather than rejected.
 enum AgentSessionLinkRoutineWakeInterval {
-    static let optionsSeconds = [60, 300, 600, 900, 1800, 3600, 10800]
+    static let optionsSeconds = [60, 180, 300, 600, 900, 1800, 3600, 10800]
     static let defaultSeconds = 300
     static let maximumSeconds = 10800
 
