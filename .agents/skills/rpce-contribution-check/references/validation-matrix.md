@@ -13,12 +13,18 @@ Default `push` is a safety gate. It does not run heavyweight lint, test, provide
 
 After timing initialization, `pr-ready` makes a best-effort attempt to write a local schema-v1 timing receipt under `.build/validation-artifacts/pr-ready/` and print its path on normal success or ordinary failure. The ignored receipt is measurement-only and non-gating: initialization, state-transition, collision, or publication failure is warning-only and cannot change the validation result. Receipt status is authoritative only for normal process completion; signal termination is deliberately not inferred from an exit code, and a receipt produced around HUP/INT/TERM is non-authoritative and may be absent. No receipt is promised for pre-initialization failure, any signal (including SIGKILL), process crash, or power loss. Receipts record UTC timestamps, monotonic elapsed durations, safe commit/range provenance, selection counts and lane IDs, and ordered phase outcomes; the schema-v1 `signal` field remains null. They deliberately exclude repository paths, usernames, remote URLs, changed filenames/path lists, raw commands or output, secret-scan findings, conductor tickets/logs, environment variables, and signing or credential data. `commit` and `push` do not emit timing receipts, and measurement does not alter validation command execution or the existing HUP/INT/TERM exit traps.
 
+## Fast iteration
+
+`make check-fast` runs whitespace checks, guardrails, and CI harness selftests without
+Swift builds or app launch. It is not a safety preflight, Swift test/lint pass, or
+release qualification. See `docs/testing.md` for the escalation path.
+
 ## Focused and PR-ready evidence
 
 | Changed boundary | Focused / PR-ready evidence |
 | --- | --- |
-| `Scripts/conductor.py`, conductor/preflight control-plane tests, the contribution preflight script or timing helper, or `Makefile` conductor wiring | `make conductor-selftest`; included in `pr-ready` for these paths. |
-| Hosted app-test CI runner and process supervision (`.github/workflows/ci.yml`, `Scripts/ci_app_test_runner.py`, `Scripts/ci_process_session.py`, `Scripts/ci_resolve_packages.py`, and their selftests) | `make ci-app-test-runner-selftest`; included in `pr-ready` for these paths. Hosted CI follow-up is still required for real macOS runner/process behavior. |
+| `Scripts/conductor.py`, conductor/preflight control-plane tests, the contribution preflight script or timing helper, `Scripts/test_fast_check.py`, or `Makefile` conductor wiring | `make conductor-selftest`; included in `pr-ready` for these paths. |
+| Hosted integration admission, app-test runner, coverage/artifact/timing gates, and process supervision (`.github/workflows/ci.yml`, `.github/workflows/ci-integration-products.yml`, `.github/workflows/ci-recovery.yml`, `Scripts/ci_admission.py`, `Scripts/ci_recovery.py`, `Scripts/ci_app_test_runner.py`, `Scripts/ci_test_coverage.py`, `Scripts/modularization_ci_{artifact,build}.py`, `Scripts/ci_process_session.py`, `Scripts/ci_resolve_packages.py`, `Scripts/ci_status_report.py`, `Scripts/ci_job_diagnostics.py`, and their selftests) | `make ci-app-test-runner-selftest` (includes `ci-workflow-selftest`, including cross-workflow contract tests); included in `pr-ready` for these paths. Hosted CI follow-up is still required for real queue/rerun, macOS runner, Sentry, release-package, and smoke behavior; see `docs/architecture/ci-admission.md`. |
 | Swift files | `make dev-lint`; included in `pr-ready` for Swift paths. Run `make dev-format` first when formatting mutation is intended. |
 | Root app source, root tests, or shared root-test support | Use the smallest focused `make dev-test FILTER=<Suite>` during iteration. Full `make dev-test` is the PR-ready/full local lane when required and is included in `pr-ready` for `Sources/RepoPrompt/`, `Tests/RepoPrompt*Tests/`, or `Tests/RepoPromptTestSupport/`. |
 | Provider package source or tests | `make dev-provider-test`; included in `pr-ready` for provider-package paths. |

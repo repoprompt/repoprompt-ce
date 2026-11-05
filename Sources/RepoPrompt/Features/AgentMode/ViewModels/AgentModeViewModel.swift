@@ -708,6 +708,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var test_agentSessionLinkLocalInputDecoration: ((AgentSessionLinkPromptRenderResult) -> AgentSessionLinkLocalInputDecoration?)?
         /// Gates only the Read proof, retaining the production claim and synchronous handoff owners.
         var test_agentSessionLinkLocalInputReadProof: ((AgentSessionLinkLocalInputDecoration) async -> Bool)?
+        /// Routes isolated native fixtures to their real authority; final Manage fences remain production-owned.
+        var test_agentSessionLinkManagedMetadataProof: ((DomainAgentSessionLinkEndpointIdentity, [DomainAgentSessionManagedObservationRequirement]) async -> [DomainAgentSessionLinkCommitAuthorization]?)?
     #endif
 
     /// Endpoints whose prompt inventory is fenced while one or more membership writes that will change
@@ -769,6 +771,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private let workflowStore = AgentWorkflowStore.shared
     let attachmentStore = AgentAttachmentStore()
     let attachmentWorkspaceDirectoryProvider: () -> URL?
+    /// App composition owns launch policy and the live window registry; standalone tests inject both.
+    let attachmentPersistenceIsSuppressed: () -> Bool
+    let attachmentSweepViewModels: () -> [AgentModeViewModel]
+    /// Overrides `<workspace>/AgentSessions/attachments` (tests); `nil` uses the active workspace.
+    var sessionAttachmentsRootOverride: (() -> URL?)?
+    var sessionAttachmentLimits: AgentSessionAttachmentStore.Limits = .standard
+    /// Latest blocked-attach notice surfaced in the composer instead of a mid-run transcript row.
+    var imageAttachmentNotice: AgentImageAttachmentNoticeProps?
+    /// Off-main moves of finished turns' images into session storage, keyed by a per-move token.
+    var attachmentRetentionTasks: [UUID: Task<Void, Never>] = [:]
+    /// Attachment roots already swept this process (`AgentModeViewModel+DraftsAttachments`).
+    static var sweptSessionAttachmentRoots: Set<String> = []
+    /// Delay before the startup sweep runs, so it never competes with workspace restore.
+    var sessionAttachmentSweepDelayNanoseconds: UInt64 = 20_000_000_000
+    /// The most recently scheduled sweep; its value is `nil` when the view model went away first.
+    var sessionAttachmentSweepTask: Task<AgentSessionAttachmentStore.SweepResult?, Never>?
     let workspacePathProvider: () -> String?
     /// Source of demand-scoped OpenCode model-parameter observations for the composer. Defaults
     /// to the shared polling service; the DEBUG test init can inject a scripted provider so
@@ -822,6 +840,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     var freshTaskRoutingByTabID: [UUID: FreshTaskRoutingOwnership] = [:]
+    var autoWorkflowJudgments: [UUID: Task<DecisionOutcome, Never>] = [:]
+    #if DEBUG
+        var test_autoWorkflowCatalog: [AgentWorkflowDefinition]?
+    #endif
 
     var isRestoringState = false
     private var activeUISyncSuppressionDepth = 0
@@ -1246,17 +1268,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             await runService.test_publishNaturalCompletion(session)
         }
 
+        @discardableResult
         func test_initializeRunService(
             mcpServerEnabler: MCPServerEnabler? = nil,
             connectionPolicyInstaller: ConnectionPolicyInstaller? = nil,
             expectedPIDPolicyArmer: ((MCPBootstrapLeaseSpec) async -> Bool)? = nil
-        ) {
+        ) -> AgentModeRunService {
             if mcpServerEnabler == nil, connectionPolicyInstaller == nil, expectedPIDPolicyArmer == nil {
                 _ = runService
             } else {
                 precondition(sessions.values.allSatisfy { $0.activeRunOwnership == nil })
                 runService = makeRunService(mcpServerEnabler: mcpServerEnabler, connectionPolicyInstaller: connectionPolicyInstaller, expectedPIDPolicyArmer: expectedPIDPolicyArmer)
             }
+            return runService
         }
 
         func test_consumeClaudeTerminalEvents(
@@ -1270,7 +1294,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             for session: TabSession,
             initialMessage: String
         ) async {
-            await startFollowUpRun(for: session, initialMessage: initialMessage)
+            await startFollowUpRun(for: session, instruction: .providerOnly(initialMessage))
         }
 
         var test_isCursorModelPollingActive: Bool {
@@ -2492,13 +2516,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     var repromptDefaultModel: (provider: AgentProviderKind?, model: AIModel)?
 
     private func makeClaudeCoordinatorHostCapabilities() -> ClaudeAgentModeCoordinator.HostCapabilities {
-        ClaudeAgentModeCoordinator.HostCapabilities(
+        var capabilities = ClaudeAgentModeCoordinator.HostCapabilities(
             isSessionCurrent: { [weak self] session in
                 guard let self else { return false }
                 return sessions[session.tabID] === session
             },
             requestUIRefresh: { [weak self] session, urgent in
                 guard let self, sessions[session.tabID] === session else { return }
+                session.noteMonitorObservationInputsChanged()
+                handleObservedMCPStateChange(for: session)
                 requestUIRefresh(tabID: session.tabID, urgent: urgent)
             },
             scheduleSave: { [weak self] session in
@@ -2556,6 +2582,76 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 self?.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
             }
         )
+        capabilities.adoptProviderTurn = { [weak self] session, listener, turnID, fence in
+            guard let self else { return false }
+            let activation = session.mcpControlActivationGeneration
+            defer {
+                if sessions[session.tabID] === session, session.mcpControlActivationGeneration == activation,
+                   fence.permitsStart(of: session),
+                   listener.subscription == nil || session.activeRunOwnership != nil
+                {
+                    session.mcpFollowUpRunPending = false
+                    handleObservedMCPStateChange(for: session)
+                }
+            }
+            return await runService.adoptClaudeProviderTurn(session: session, listener: listener, turnID: turnID, fence: fence) {
+                await self.prepareClaudeProviderEpoch(session: session, fence: fence)
+            }
+        }
+        capabilities.cleanupProviderRun = { [weak self] session, runID in
+            guard let self else { return }
+            await cleanupMCPRunRoutingIfPresent(boundSessionID: boundSessionID(for: session.tabID), liveSession: session, explicitRunID: runID, reason: "claudeNative.providerInitiated")
+        }
+        return capabilities
+    }
+
+    func preparedOversightRuntimeIsBusy() async -> Bool {
+        for session in sessions.values {
+            let fence = AgentRunStartStopFence(session: session)
+            if session.runState.isActive || claudeCoordinator.hasPendingProviderWork(for: session) { return true }
+            if let controller = session.claudeController {
+                let busy = await controller.hasTurnInFlight
+                guard sessions[session.tabID] === session, fence.permitsStart(of: session),
+                      session.claudeController.map({ ObjectIdentifier($0) }) == ObjectIdentifier(controller)
+                else { return true }
+                if busy || session.runState.isActive || claudeCoordinator.hasPendingProviderWork(for: session) { return true }
+            }
+        }
+        return false
+    }
+
+    private func prepareClaudeProviderEpoch(session: TabSession, fence: AgentRunStartStopFence) async -> Bool {
+        guard sessions[session.tabID] === session, fence.permitsStart(of: session), !Task.isCancelled else { return false }
+        session.mcpFollowUpRunPending = true
+        handleObservedMCPStateChange(for: session)
+        guard let original = session.mcpControlContext else { return true }
+        let activation = session.mcpControlActivationGeneration
+        if original.preparedEpoch == nil {
+            do {
+                try await withMCPRunEpochTransition(sessionID: original.sessionID, kind: .relatedFollowUp) {
+                    await self.prepareMCPWaitTrackingForRunStart(session: session, stopFence: fence)
+                    guard session.mcpControlContext?.preparedEpoch != nil else { throw CancellationError() }
+                }
+            } catch { return false }
+        }
+        guard !Task.isCancelled, fence.permitsStart(of: session), sessions[session.tabID] === session,
+              session.mcpControlActivationGeneration == activation,
+              let context = session.mcpControlContext,
+              context.activationID == original.activationID,
+              let prepared = context.preparedEpoch, context.currentEpoch == prepared,
+              mcpControlledSession(sessionID: context.sessionID) === session
+        else { return false }
+        let storeEpoch = await AgentRunSessionStore.currentEpoch(for: context.registration)
+        let snapshot = await AgentRunSessionStore.snapshot(for: context.registration)
+        guard !Task.isCancelled, fence.permitsStart(of: session), sessions[session.tabID] === session,
+              session.mcpControlActivationGeneration == activation,
+              session.mcpControlContext?.registration == context.registration,
+              session.mcpControlContext?.preparedEpoch == prepared,
+              storeEpoch == prepared, snapshot?.status.isTerminal != true,
+              prepared.activationID == context.activationID,
+              prepared.registrationGeneration == context.registration.generation
+        else { return false }
+        return true
     }
 
     init(
@@ -2563,6 +2659,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         promptManager: PromptViewModel,
         workspaceManager: WorkspaceManagerViewModel,
         mcpServer: MCPServerViewModel,
+        attachmentPersistenceIsSuppressed: @escaping () -> Bool,
+        attachmentSweepViewModels: @escaping () -> [AgentModeViewModel],
         oracleViewModel: OracleViewModel? = nil,
         applyEditsApprovalStore: ApplyEditsApprovalStore = .shared,
         clearConsumedAttachmentsAfterProviderConsumption: Bool = true,
@@ -2579,6 +2677,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         workspaceFileContextStore = promptManager.workspaceFileContextStore
         self.workspaceManager = workspaceManager
         self.mcpServer = mcpServer
+        self.attachmentPersistenceIsSuppressed = attachmentPersistenceIsSuppressed
+        self.attachmentSweepViewModels = attachmentSweepViewModels
         self.oracleViewModel = oracleViewModel
         self.applyEditsApprovalStore = applyEditsApprovalStore
         self.modelRouterSettingsStore = modelRouterSettingsStore
@@ -2791,6 +2891,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             testWindowID: Int = 1,
             testWorkspacePath: String? = nil,
             testWorkspaceDirectory: URL? = nil,
+            attachmentPersistenceIsSuppressed: @escaping () -> Bool = { false },
+            attachmentSweepViewModels: @escaping () -> [AgentModeViewModel] = { [] },
             applyEditsApprovalStore: ApplyEditsApprovalStore = .shared,
             clearConsumedAttachmentsAfterProviderConsumption: Bool = true,
             shouldManageCodexTooling: Bool = false,
@@ -2866,6 +2968,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             workspaceFileContextStore = testWorkspaceFileContextStore
             workspaceManager = nil
             mcpServer = testMCPServer
+            self.attachmentPersistenceIsSuppressed = attachmentPersistenceIsSuppressed
+            self.attachmentSweepViewModels = attachmentSweepViewModels
             modelRouterSettingsStore = testModelRouterSettingsStore
             self.applyEditsApprovalStore = applyEditsApprovalStore
             catalogDiagnosticsSink = testCatalogDiagnosticsSink
@@ -3548,6 +3652,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 flushPendingAssistantDelta: { [weak self] session in
                     self?.flushPendingAssistantDelta(session)
                 },
+                beginClaudeProviderOutputSegment: { [weak self] session in
+                    self?.flushPendingAssistantDelta(session)
+                    self?.endActiveAssistantSegment(session)
+                },
                 clearPendingAssistantDelta: { [weak self] session in
                     self?.clearPendingAssistantDelta(session)
                 }
@@ -3684,15 +3792,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         )
                         return
                     }
-                    let stopFence = instruction.stopFence ?? AgentRunStartStopFence(session: session)
+                    let instruction = instruction.retainingStopFence(instruction.stopFence ?? AgentRunStartStopFence(session: session))
                     Task { @MainActor [weak self, weak session] in
                         guard let self, let session else { return }
-                        await startFollowUpRun(
-                            for: session,
-                            initialMessage: instruction.providerText,
-                            stopFence: stopFence,
-                            skipsSlashExpansion: instruction.skipsSlashExpansion
-                        )
+                        await startFollowUpRun(for: session, instruction: instruction)
                     }
                 },
                 startTypedACPFollowUpRun: { [weak self] session, instruction in
@@ -3820,9 +3923,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private func startFollowUpRun(
         for session: TabSession,
-        initialMessage: String,
-        stopFence: AgentRunStartStopFence? = nil,
-        skipsSlashExpansion: Bool = false
+        instruction: TabSession.PendingInstruction
     ) async {
         guard sessions[session.tabID] === session else {
             session.mcpFollowUpRunPending = false
@@ -3837,11 +3938,26 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             handleObservedMCPStateChange(for: session)
             return
         }
+        let fence = instruction.stopFence ?? AgentRunStartStopFence(session: session)
+        let outcome = AgentRunStartOutcomeRecorder()
         await startAgentRun(
             tabID: session.tabID,
-            initialMessage: initialMessage,
-            directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: skipsSlashExpansion, stopFence: stopFence)
+            initialMessage: instruction.providerText,
+            directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: instruction.skipsSlashExpansion, stopFence: fence),
+            startOutcome: outcome
         )
+        if !outcome.outcome.didStart,
+           sessions[session.tabID] === session, fence.permitsStart(of: session),
+           session.selectedAgent.usesClaudeNativeRuntime,
+           session.activeRunOwnership.map({ session.claudeTerminalAnchor?.0 == $0 }) == true
+        {
+            // Terminal dispatch dequeued this instruction before adoption won admission.
+            // Its original typed payload stays owed to the next ordinary terminal boundary.
+            session.pendingInstructions.insert(instruction.retainingStopFence(fence), at: 0)
+            session.isDirty = true
+            updateBindingsFromSession(session)
+            scheduleSave(for: session.tabID)
+        }
     }
 
     /// Build the generic orchestration hooks that provider tool tracking handlers need.
@@ -4918,6 +5034,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func prepareForWindowClose() async {
+        autoWorkflowJudgments.values.forEach { $0.cancel() }
+        autoWorkflowJudgments.removeAll()
         cancelReprompt()
         repromptUIStore.recoveries.removeAll()
         if let task = windowClosePreparationTask {
@@ -5976,6 +6094,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         }
 
+        if session.claudeController != nil {
+            let retiredRunID = session.runID
+            claudeCoordinator.prepareForConversationResetSync(session)
+            if let retiredRunID {
+                Task { await self.cleanupMCPRunRoutingIfPresent(boundSessionID: previousSessionID, liveSession: nil, explicitRunID: retiredRunID, reason: "claudeNative.rebind") }
+            }
+        }
         if invalidateAsyncWork {
             cancelPersistedLoad(for: session)
             removePendingUIRefresh(for: session.tabID)
@@ -7449,6 +7574,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             isColdLoad: true,
             builtPresentation: payload.builtPresentation
         )
+        repairRetainedAttachmentPathsAfterHydration(session, sessionID: payload.sessionID)
         session.hasSentFirstMessage = payload.transcript.turns.contains { $0.request != nil }
         session.parentSessionID = agentSession.parentSessionID
         session.createdByOverseerSessionID = agentSession.createdByOverseerSessionID
@@ -7522,15 +7648,29 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.selfCompactState = agentSession.selfCompactState ?? .init()
         session.selfCompactPersistenceWarning = agentSession.selfCompactPersistenceWarning
 
+        session.contextWindowCapacity = agentSession.contextWindowCapacity
+        // A hydrated conversation has no process yet; its runtime init reports the cap that applies.
+        session.claudeAutoCompactWindowTokens = nil
         codexCoordinator.restoreCodexMetadata(from: agentSession, session: session)
         switch session.selectedAgent {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             session.contextCompactedAt = session.providerTokenUsageByTurn.last(where: { $0.contextCompacted })?.timestamp
             if session.codexContextUsage?.lastTotalTokens == nil || session.contextCompactedAt != nil {
-                session.codexContextUsage = Self.contextUsageFromClaudeProviderTokens(
+                // The stored window may be an auto-compact cap, so restored rows are bounded only by
+                // the model's verified capacity; the stored window stays the displayed window.
+                let capacity = claudeContextUsageEstimator.verifiedCapacity(reported: nil, session: session)
+                let displayedWindow = session.codexContextUsage?.modelContextWindow ?? capacity
+                if var rebuilt = Self.contextUsageFromClaudeProviderTokens(
                     session.providerTokenUsageByTurn,
-                    modelContextWindow: session.codexContextUsage?.modelContextWindow
-                )
+                    modelContextWindow: capacity
+                ) {
+                    rebuilt.modelContextWindow = displayedWindow
+                    session.codexContextUsage = rebuilt
+                } else if !session.providerTokenUsageByTurn.isEmpty, let displayedWindow {
+                    session.codexContextUsage = AgentContextUsage(modelContextWindow: displayedWindow, lastTotalTokens: nil, totalTotalTokens: nil)
+                } else {
+                    session.codexContextUsage = nil
+                }
             }
         case .codexExec, .openCode, .cursor, .grokBuild, .antigravity, .devin:
             break
@@ -8475,7 +8615,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             await test_afterMCPStoreEpochBegan?()
         #endif
         guard case let .accepted(epoch) = result,
-              stopFence.permitsStart(of: session),
+              stopFence.binding == session.persistentSessionBindingIdentity,
+              !session.bindingTransitionInProgress,
               session.mcpControlActivationGeneration == activationGeneration,
               var context = session.mcpControlContext,
               context.activationID == originalContext.activationID,
@@ -8497,6 +8638,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             context.pendingEpochTransition = nil
         }
         session.mcpControlContext = context
+        // An accepted epoch belongs to this binding even if Stop won during the actor hop.
+        // Retain it unconsumed for the next start; never leave the store ahead of its owner.
+        guard stopFence.permitsStart(of: session), !Task.isCancelled else { return }
         if !session.mcpFollowUpRunPending {
             session.mcpFollowUpRunPending = true
             handleObservedMCPStateChange(for: session)
@@ -8599,7 +8743,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                session.agentTask == nil,
                session.pendingInstructions.isEmpty,
                session.claudeSteeringFlushTask == nil,
-               session.acpSteeringFlushTask == nil
+               session.acpSteeringFlushTask == nil,
+               !claudeCoordinator.hasPendingProviderWork(for: session)
             {
                 Self.steeringDebugLog("[AgentRunSteeringWake] clearing stale MCP running mask sessionID=\(context.sessionID) tab=\(session.tabID) runState=\(session.runState.rawValue) terminal=\(terminalStatus.rawValue) followUp=\(session.mcpFollowUpRunPending) superseding=\(session.pendingSupersedingTurnCompletions)")
                 session.mcpFollowUpRunPending = false
@@ -8716,7 +8861,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             parentSessionID: session.parentSessionID,
             failureReason: failureReason,
             worktreeBindings: session.worktreeBindings.map { AgentRunMCPSnapshot.WorktreeBinding(binding: $0) },
-            appActiveWorktreeMerges: session.worktreeMergeOperations.activeWorktreeMergeSummaries
+            appActiveWorktreeMerges: session.worktreeMergeOperations.activeWorktreeMergeSummaries,
+            // Publishes whether the parent holds bindings so an unbound task-aware child can be
+            // flagged in start/poll responses (#400). Unresolvable parents stay `nil`.
+            parentIsWorktreeBound: session.parentSessionID.flatMap { parentSessionID in
+                worktreeBindingState(forAgentSessionID: parentSessionID).bindings.map { !$0.isEmpty }
+            }
         )
     }
 
@@ -16568,6 +16718,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // activation is still the owner) or leaves it to the successor that superseded it; a stale
         // owner can never settle a level it does not own.
         let discoveryEpoch = beginAgentSessionLinkDiscoveryEpoch(workspaceID: workspace?.id)
+        // Synchronous: only schedules the delayed, low-priority sweep for this workspace's storage.
+        scheduleSessionAttachmentSweepIfNeeded(for: workspace)
         #if DEBUG
             let workspaceSwitchStartMS = restorePerfRecorder.timestampMSIfEnabled()
             let workspaceSwitchInitialSessions = sessions.count
@@ -18721,11 +18873,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
         }
+        let original = repromptDispatchOriginals[claim.attempt.id] ?? claim.attempt.rawDraftSnapshot
+        let autoWorkflow = original.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/")
+            ? nil
+            : await chooseAutoWorkflow(
+                text: Self.automationJudgingText(original: original, reprompted: repromptedText),
+                claim: claim, session: session
+            )
+        guard !Task.isCancelled, composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session else {
+            return .blocked(message: Self.staleComposerSubmitTargetMessage)
+        }
         return await submitUserTurnAfterFreshTaskRouting(
             text: text,
             claim: claim,
             session: session,
             destinationTabID: destinationTabID,
+            autoWorkflow: autoWorkflow,
             repromptedText: repromptedText,
             precomputedRouting: repromptSpeculations[claim.attempt.id]
         )
@@ -19055,6 +19218,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         autoEffortAudit: AgentAutomationTurnAudit.Feature? = nil,
         routerAudit: AgentAutomationTurnAudit.Feature? = nil,
+        autoWorkflow: AutoWorkflowTurnSelection? = nil,
         repromptedText: String? = nil,
         repromptAudit: AgentAutomationTurnAudit.Reprompt? = nil,
         isLocalComposerInput: Bool = true
@@ -19110,7 +19274,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         scheduleSkillCatalogRefresh()
 
-        let activeWorkflow = session.selectedWorkflow
+        let restorationSelectedWorkflow = session.selectedWorkflow
+        let activeWorkflow = effectiveWorkflow(session: session, autoWorkflow: autoWorkflow)
         let restorationSelectedWorkflowMutationGeneration = session.userWorkflowSelectionMutationGeneration
         let nativePreparedTurn: NativeSlashPreparedUserTurn?
         if let nativeSlashCommand = resolvedNativeSlashCommand(in: trimmedText, session: session) {
@@ -19222,7 +19387,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     routerAudit: routerAudit,
                     repromptedText: repromptedText,
                     repromptAudit: repromptAudit,
-                    restorationSelectedWorkflow: activeWorkflow,
+                    restorationSelectedWorkflow: restorationSelectedWorkflow,
                     restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
                     stopFence: stopFence,
                     isLocalComposerInput: isLocalComposerInput
@@ -19247,7 +19412,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             routerAudit: routerAudit,
             repromptedText: repromptedText,
             repromptAudit: repromptAudit,
-            restorationSelectedWorkflow: activeWorkflow,
+            restorationSelectedWorkflow: restorationSelectedWorkflow,
             restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
             isLocalComposerInput: isLocalComposerInput
         )
@@ -21856,6 +22021,75 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let originalBindingToken = session.currentRestorationBindingToken
         let originalWorkspaceID = workspaceManager?.activeWorkspaceID
         let originalStopFence = directStartOptions.stopFence ?? AgentRunStartStopFence(session: session)
+        var preparedClaudeEvents: ClaudeAttemptEventReservation?
+        var claudeEventsTransferred = false
+        defer {
+            if !claudeEventsTransferred, let preparedClaudeEvents {
+                preparedClaudeEvents.listener.close(preparedClaudeEvents.subscription, returningTail: true)
+                preparedClaudeEvents.listener.terminalPublished(for: preparedClaudeEvents.subscription)
+            }
+        }
+        func recordClaudeStartRefusal() {
+            let message = ClaudeAgentModeCoordinator.inputNotSentMessage
+            startOutcome?.recordStartFailure(message: message)
+            if directStartOptions.localComposerCandidate != nil {
+                session.appendItem(.error(message, sequenceIndex: session.nextSequenceIndex))
+                session.isDirty = true
+                scheduleSave(for: tabID)
+                requestUIRefresh(tabID: tabID, urgent: true)
+            }
+        }
+        if session.selectedAgent.usesClaudeNativeRuntime, session.claudeController != nil {
+            // Reserve before host preparation suspends. If adoption already won preparation,
+            // only a plain local instruction can transfer to the existing steering owner.
+            if let adoption = claudeCoordinator.pendingProviderAdoption(for: session) {
+                await adoption.value
+                guard originalStopFence.permitsStart(of: session), sessions[tabID] === session,
+                      session.currentRestorationBindingToken == originalBindingToken,
+                      workspaceManager?.activeWorkspaceID == originalWorkspaceID
+                else {
+                    startOutcome?.recordStartFailure(message: nil)
+                    return nil
+                }
+            }
+            if session.runState.isActive {
+                guard session.activeRunOwnership.map({ session.claudeTerminalAnchor?.0 == $0 }) == true,
+                      directStartOptions.localComposerCandidate != nil,
+                      directStartOptions.periodicWakeID == nil, directStartOptions.laneUpdateWakeID == nil,
+                      directStartOptions.providerControlCommand == nil, directStartOptions.selfCompactDispatchID == nil,
+                      !directStartOptions.skipsUserAugmentation, !directStartOptions.ignoresPendingHandoff,
+                      codexFallbackContext == nil
+                else {
+                    recordClaudeStartRefusal()
+                    return nil
+                }
+                let existingItem = directStartOptions.initialUserItemID.flatMap { id in session.items.first { $0.id == id } }
+                let userItem = existingItem ?? AgentChatItem.user(initialMessage, sequenceIndex: session.nextSequenceIndex)
+                if existingItem == nil { session.appendItem(userItem) }
+                if let owner = session.activeRunOwnership { session.claudeTerminalAnchor = (owner, .exact(userItem.id)) }
+                submitActiveProviderSteering(
+                    .claudeNativeInterrupt, session: session, wrappedText: initialMessage,
+                    attachmentsToSend: attachments, taggedFilesToSend: taggedFileAttachments,
+                    trimmedText: initialMessage, userItem: userItem,
+                    userInputTokenEstimate: Self.estimateRuntimeTokens(for: initialMessage),
+                    localComposerCandidate: directStartOptions.localComposerCandidate,
+                    skipsSlashExpansion: directStartOptions.skipsSlashExpansion
+                )
+                candidateTransferred = true
+                startOutcome?.recordAccepted()
+                updateBindingsFromSession(session)
+                scheduleSave(for: tabID)
+                requestUIRefresh(tabID: tabID, urgent: true)
+                return nil
+            }
+            if session.claudeController != nil {
+                guard let reservation = claudeCoordinator.reserveEventsForHostPreparation(for: session) else {
+                    recordClaudeStartRefusal()
+                    return nil
+                }
+                preparedClaudeEvents = reservation
+            }
+        }
         await prepareSessionForRunStart(tabID: tabID, session: session)
         guard sessions[tabID] === session,
               session.currentRestorationBindingToken == originalBindingToken,
@@ -21972,7 +22206,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
 
+        guard preparedClaudeEvents?.listener.isCurrent() != false else {
+            recordClaudeStartRefusal()
+            return nil
+        }
         candidateTransferred = true
+        claudeEventsTransferred = true
         return await runService.startRun(
             tabID: tabID,
             session: session,
@@ -21986,7 +22225,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             startOutcome: startOutcome,
             stopFence: stopFence,
             localComposerCandidate: directStartOptions.localComposerCandidate,
-            initialUserItemID: directStartOptions.initialUserItemID
+            initialUserItemID: directStartOptions.initialUserItemID,
+            preparedClaudeEvents: preparedClaudeEvents
         )
     }
 
@@ -22300,14 +22540,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 // very last item if system events (e.g. rate-limit telemetry) were
                 // interleaved, which can prematurely finalize the streaming segment.
                 // Walk past system items but stop at tool calls, user messages, etc.
+                let attemptStartKey = session.quietLedger.startKey(owner: owner) ?? session.nextSequenceIndex
+                let providerStartKey = session.claudeProviderOutputBoundary.flatMap { $0.attemptID == owner.attemptID ? $0.startSequenceIndex : nil }
+                let outputStartKey = max(attemptStartKey, providerStartKey ?? attemptStartKey)
                 let tailAssistantIndex: Int? = {
-                    if let streamingAssistantIndex = self.resumableStreamingAssistantIndexAcrossTrailingUserInterjections(in: session) {
+                    if let streamingAssistantIndex = self.resumableStreamingAssistantIndexAcrossTrailingUserInterjections(in: session),
+                       session.items[streamingAssistantIndex].sequenceIndex >= outputStartKey
+                    {
                         return streamingAssistantIndex
                     }
                     for i in session.items.indices.reversed() {
                         switch session.items[i].kind {
                         case .assistant:
-                            return i
+                            return session.items[i].sequenceIndex >= outputStartKey ? i : nil
                         case .system:
                             continue
                         default:
@@ -23996,16 +24241,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         scheduleSave(for: session.tabID)
     }
 
+    @discardableResult
     func prepareAgentRunCancellation(
         session: TabSession,
         intent: DomainAgentRunCancellationIntent,
         origin: AgentModeRunService.CancellationOrigin
-    ) {
+    ) -> (@MainActor () async -> Void)? {
         cancelPendingInstruction(for: session)
+        let providerTeardown = claudeCoordinator.cancelPendingProviderAdoption(for: session)
         // Every cancellation fences this session's own deferred starts.
         session.stopState.invalidateScheduledStarts()
         // Overseer-facing withdrawal belongs to an explicit user or managed Stop only.
-        guard intent == .userStop, origin == .explicitStop else { return }
+        guard intent == .userStop, origin == .explicitStop else { return providerTeardown }
         session.stopState.invalidateQueuedDeliveries()
         session.mcpFollowUpRunPending = false
         agentSessionLinkRetractAutoWakeForUserStop(session)
@@ -24015,6 +24262,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 requiringNoCommittedDrain: false
             )
         }
+        return providerTeardown
     }
 
     private func cancelPendingInstruction(for session: TabSession) {
@@ -24360,6 +24608,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // Detach before clearing the provider session ID so async cleanup cannot
         // restore the old conversation or affect a replacement controller.
         claudeCoordinator.prepareForConversationResetSync(session)
+        // The cap described the process just torn down; the next process's runtime init reports its own.
+        session.claudeAutoCompactWindowTokens = nil
         session.providerSessionID = nil
         session.providerCleanupHandle = nil
         session.providerTokenUsageByTurn.removeAll()
@@ -25245,6 +25495,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             sourceTabID: sourceTabID,
             sourceSession: sourceSession
         )
+        // Pin attachment authority alongside the transcript before payload/tab preparation can
+        // suspend or the window can switch workspaces.
+        let handoffAttachmentStore = sessionAttachmentsRootURL().map {
+            AgentSessionAttachmentStore(rootURL: $0, limits: sessionAttachmentLimits)
+        }
+        let handoffTemporaryRoot = attachmentWorkspaceDirectoryProvider().map {
+            AgentAttachmentStore.managedStorageRootURL(for: $0)
+        }
 
         // 1) Build the handoff payload from the same transcript universe used for migration.
         let payload = await buildHandoffPayload(
@@ -25255,10 +25513,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
 
         // 2) Build migrated transcript items (prefix copy up to cutoff, no thinking, no streaming)
-        let migratedItems = buildHandoffTranscriptItems(
+        var migratedItems = buildHandoffTranscriptItems(
             sourceTranscript: sourceTranscript,
             upToItemID: upToItemID
         )
+        let localAttachments = migratedItems.flatMap(\.attachments).filter {
+            if case .localFile = $0.source { true } else { false }
+        }
 
         // Capture the destination through the actual creation owner, before a visible tab can
         // suspend in Oracle cloning or activation. Never claim its later occupant by tab UUID.
@@ -25311,7 +25572,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
         func destinationIsCurrent() -> Bool {
+            // Storage placement can change without rebinding the tab. Copied paths must still
+            // belong to the destination's current root at every later preparation boundary.
             freshSessionCreationIsCurrent(destinationCreation)
+                && (localAttachments.isEmpty || sessionAttachmentsRootURL() == handoffAttachmentStore?.rootURL)
         }
         #if DEBUG
             await test_afterHandoffDestinationCreation?(destSession)
@@ -25343,6 +25607,56 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 sessionID: destinationClaim.sessionID, code: "target_changed",
                 detail: "The fork was created, but its destination changed during chat cloning."
             )
+        }
+        if !localAttachments.isEmpty {
+            guard let handoffAttachmentStore else {
+                throw SessionAdminPartialForkError(
+                    sessionID: destinationClaim.sessionID, code: "attachment_copy_failed",
+                    detail: "The fork could not keep its images because conversation attachment storage is unavailable."
+                )
+            }
+            do {
+                let copied = try await AgentSessionDataService.shared.copyHandoffAttachments(
+                    localAttachments,
+                    sourceSessionID: sourceWorktreeSnapshot.sourceSessionID,
+                    destinationSessionID: destinationClaim.sessionID,
+                    store: handoffAttachmentStore,
+                    temporaryRoot: handoffTemporaryRoot
+                )
+                guard destinationIsCurrent() else {
+                    throw PersistentBindingMutationError.staleTransition
+                }
+                if Task.isCancelled {
+                    // Nothing has published these paths or saved this payload yet. Only this
+                    // still-current fresh generation may roll back its completed copy. A changed
+                    // binding keeps its files, just as the existing failed-creation owner does.
+                    handoffAttachmentStore.removeSessionFolder(sessionID: destinationClaim.sessionID)
+                    throw CancellationError()
+                }
+                migratedItems = migratedItems.map { item in
+                    var item = item
+                    item.attachments = item.attachments.map { attachment in
+                        guard case .localFile = attachment.source, let copy = copied[attachment.id] else { return attachment }
+                        return AgentFileAttachment(
+                            id: attachment.id, source: copy.source,
+                            title: attachment.title, createdAt: attachment.createdAt,
+                            kind: attachment.kind, fileName: attachment.fileName, byteCount: attachment.byteCount
+                        )
+                    }
+                    return item
+                }
+            } catch PersistentBindingMutationError.staleTransition {
+                throw SessionAdminPartialForkError(
+                    sessionID: destinationClaim.sessionID, code: "target_changed",
+                    detail: "The fork was created, but its destination changed during image copying."
+                )
+            } catch {
+                throw SessionAdminPartialForkError(
+                    sessionID: destinationClaim.sessionID,
+                    code: error is CancellationError ? "cancelled" : "attachment_copy_failed",
+                    detail: "The fork could not keep its images: \(error.localizedDescription)"
+                )
+            }
         }
         // 5) Populate only the captured fresh destination.
         destSession.selectedAgent = destinationAgent
@@ -25382,7 +25696,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let stagedSave = await saveSessionCore(for: destTabID, creationSave: .recovery(destinationCreation))
             guard case let .durablySaved(token) = stagedSave,
                   token == expectedChildBindingToken,
-                  destSession.currentRestorationBindingToken == expectedChildBindingToken
+                  destSession.currentRestorationBindingToken == expectedChildBindingToken,
+                  destinationIsCurrent()
             else {
                 throw SessionAdminPartialForkError(
                     sessionID: expectedChildBindingToken.bindingIdentity.sessionID, code: "persist_failed",
@@ -25454,6 +25769,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             throw SessionAdminPartialForkError(
                 sessionID: expectedChildBindingToken.bindingIdentity.sessionID, code: "persist_failed",
                 detail: "The fork exists, but its configured first save did not complete: \(reason)"
+            )
+        }
+        guard destinationIsCurrent() else {
+            throw SessionAdminPartialForkError(
+                sessionID: destinationClaim.sessionID, code: "target_changed",
+                detail: "The fork was saved, but its destination changed during its first save."
             )
         }
         // Acknowledged configured durability cannot be undone by late cancellation. Keep the

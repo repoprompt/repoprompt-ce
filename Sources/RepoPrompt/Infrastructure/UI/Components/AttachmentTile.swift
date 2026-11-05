@@ -195,8 +195,12 @@ struct AttachmentTile: View {
     }
 }
 
-private final class AttachmentTilePreviewCache: @unchecked Sendable {
+final class AttachmentTilePreviewCache: @unchecked Sendable {
     static let shared = AttachmentTilePreviewCache()
+
+    /// The same process owner supplies retained-image renditions and invalidations across windows.
+    /// Keep their bounded caches separate from generic tile JPEGs and full-size preview lifetimes.
+    let retainedImages = AgentAttachmentThumbnailCache()
 
     private let cache = NSCache<NSString, NSImage>()
 

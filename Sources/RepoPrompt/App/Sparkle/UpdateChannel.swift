@@ -58,7 +58,18 @@ enum UpdateChannel: String, CaseIterable, Identifiable {
     }
 }
 
+@MainActor
 final class SparkleUpdateFeedDelegate: NSObject, SPUUpdaterDelegate {
+    var postponeInstallation: ((@escaping () -> Void) -> Bool)?
+
+    func updater(
+        _ updater: SPUUpdater,
+        shouldPostponeRelaunchForUpdate item: SUAppcastItem,
+        untilInvokingBlock installHandler: @escaping () -> Void
+    ) -> Bool {
+        postponeInstallation?(installHandler) ?? false
+    }
+
     func feedURLString(for updater: SPUUpdater) -> String? {
         UpdateChannel.load().feedURLString
     }

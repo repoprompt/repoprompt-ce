@@ -142,8 +142,13 @@ struct AgentInputBar: View {
             cancelRun: { target in _ = await agentModeVM.cancelAgentRun(target: target) },
             cancelRouting: { tabID in await agentModeVM.cancelFreshTaskRouting(tabID: tabID) },
             attachFiles: { tabID, urls in
+                guard attachmentAdmission(tabID) else { return }
+                if let reason = agentModeVM.imageAttachmentBlockReason(tabID: tabID) {
+                    agentModeVM.reportImageAttachmentBlocked(reason, tabID: tabID)
+                    return
+                }
                 await agentModeVM.attachFiles(tabID: tabID, urls: urls, admission: {
-                    attachmentAdmission(tabID)
+                    attachmentAdmission(tabID) && agentModeVM.imageAttachmentBlockReason(tabID: tabID) == nil
                 }).value
             },
             reportAttachmentFailures: { tabID, failures in
@@ -324,7 +329,6 @@ struct AgentComposerView: View, Equatable {
     @State private var isInputEmpty: Bool = true
     @State private var chromeOcclusion: CGFloat = 0
     @State private var isSyncingDraftFromSession: Bool = false
-    @State private var isAttachmentDropTargeted: Bool = false
     @State private var showCodexToolsPopover: Bool = false
     @State private var showPermissionPopover: Bool = false
     @State private var showClaudeToolsPopover: Bool = false
@@ -335,6 +339,8 @@ struct AgentComposerView: View, Equatable {
 
     @ObservedObject private var fontScale = FontScaleManager.shared
     @ObservedObject private var globalSettings = GlobalSettingsStore.shared
+    @Environment(\.agentAttachmentDropController) private var attachmentDropController
+    @Environment(\.agentAttachmentDropHandler) private var attachmentDropHandler
     private var fontPreset: FontScalePreset {
         fontScale.preset
     }
@@ -386,8 +392,6 @@ struct AgentComposerView: View, Equatable {
         props.canUseLinkedAgentSession
     }
 
-    private static let attachmentDropTypes: [UTType] = [.fileURL, .image]
-
     private var canAttachFiles: Bool {
         // Grok Build advertises no ACP image capability; its provider rejects attachments.
         !props.isAgentBusy && currentTabID.map(canMutateAttachments) == true && props.selectedAgent != .grokBuild
@@ -417,7 +421,9 @@ struct AgentComposerView: View, Equatable {
     }
 
     private var repromptEditTransaction: TextFieldExternalEditTransaction? {
-        if let presentation = repromptPresentation { return .init(id: presentation.id, isComplete: presentation.phase == .completed) }
+        if let presentation = repromptPresentation {
+            return .init(id: presentation.id, isComplete: presentation.phase == .completed)
+        }
         return repromptUndoRecovery.map { .init(id: $0.id, isComplete: true) }
     }
 
@@ -590,7 +596,9 @@ struct AgentComposerView: View, Equatable {
         }
         .onDisappear {
             // Store draft when leaving
-            if let tabID = currentTabID { flushDraftOnDeparture(tabID: tabID) }
+            if let tabID = currentTabID {
+                flushDraftOnDeparture(tabID: tabID)
+            }
             steeringUnsupportedDismissTask?.cancel()
             steeringUnsupportedDismissTask = nil
             modelMenuSnapshotReleaseTask?.cancel()
@@ -600,7 +608,9 @@ struct AgentComposerView: View, Equatable {
         .onChange(of: currentTabID) { oldTabID, newTabID in
             composerFocusRestoreRequest = nil
             // Switch drafts when tab changes
-            if let oldTabID { flushDraftOnDeparture(tabID: oldTabID) }
+            if let oldTabID {
+                flushDraftOnDeparture(tabID: oldTabID)
+            }
             if let newTabID {
                 loadDraftFromSession(for: newTabID)
             }
@@ -681,8 +691,10 @@ struct AgentComposerView: View, Equatable {
                 showSteeringUnsupportedNotice(event.message)
             }
         }
-        .onDrop(of: Self.attachmentDropTypes, isTargeted: $isAttachmentDropTargeted, perform: handleAttachmentDrop(providers:))
-        .overlay(attachmentDropOutline)
+        .onChange(of: props.imageAttachmentNotice) { _, notice in
+            guard let notice, notice.tabID == currentTabID else { return }
+            showSteeringUnsupportedNotice(notice.message)
+        }
     }
 
     // MARK: - Transient Submit Guidance
@@ -758,6 +770,14 @@ struct AgentComposerView: View, Equatable {
                 onReturn: sendMessage,
                 resetTrigger: $resetTextFieldTrigger,
                 onAttachmentPaste: handleAttachmentPaste(pasteboard:),
+                onAttachmentDrop: attachmentDropHandler,
+                onAttachmentDragHoverChange: { [weak attachmentDropController] isActive, pasteboard in
+                    if isActive, let pasteboard {
+                        attachmentDropController?.textViewDragEntered(pasteboard: pasteboard, currentTabID: currentTabID)
+                    } else {
+                        attachmentDropController?.setTextViewAttachmentDragActive(false)
+                    }
+                },
                 features: .agentInputBar(
                     fileTagStore: promptManager.fileManager.workspaceFileContextStore,
                     fileTagSearchService: workspaceSearchService,
@@ -775,8 +795,9 @@ struct AgentComposerView: View, Equatable {
                 externalUpdateTick: externalTextUpdateTick,
                 externalEditTransaction: repromptEditTransaction,
                 onUndoExternalEdit: { [id = repromptPresentation?.id, recoveryID = repromptUndoRecovery?.id, tabID = currentTabID] in
-                    if let id { undoRepromptDraft(expectedID: id) }
-                    else if let tabID, let recoveryID, repromptStore.recoveries[tabID]?.id == recoveryID {
+                    if let id {
+                        undoRepromptDraft(expectedID: id)
+                    } else if let tabID, let recoveryID, repromptStore.recoveries[tabID]?.id == recoveryID {
                         _ = repromptViewModel?.restoreRepromptRecovery(tabID: tabID, confirmedReplacement: false)
                     }
                 },
@@ -790,8 +811,11 @@ struct AgentComposerView: View, Equatable {
                 },
                 onEscape: repromptPresentation == nil ? nil : { [id = repromptPresentation?.id] in
                     guard let id, let operation = repromptViewModel?.repromptOperation, operation.id == id else { return }
-                    if operation.phase == .completed { undoRepromptDraft(expectedID: id) }
-                    else { operation.cancel() }
+                    if operation.phase == .completed {
+                        undoRepromptDraft(expectedID: id)
+                    } else {
+                        operation.cancel()
+                    }
                 },
                 onCommandReturn: repromptViewModel == nil ? nil : repromptAgain,
                 commandReturnMatcher: { LocalKeyboardShortcut.matches($0, .repromptDraft) },
@@ -1785,17 +1809,6 @@ struct AgentComposerView: View, Equatable {
         }
     }
 
-    @ViewBuilder
-    private var attachmentDropOutline: some View {
-        if isAttachmentDropTargeted {
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(style: StrokeStyle(lineWidth: 2, dash: [8]))
-                .foregroundColor(.accentColor)
-                .padding(.horizontal, 2)
-                .padding(.bottom, Self.footerHeight)
-        }
-    }
-
     // MARK: - Actions
 
     private func sendRepromptOriginal(expectedID: UUID) {
@@ -1858,7 +1871,9 @@ struct AgentComposerView: View, Equatable {
         }
         setLocalInputText(rawDraftSnapshot)
         actions.storeDraft(submitTarget.tabID, rawDraftSnapshot, acknowledgedDraftRestorationSequenceByTab[submitTarget.tabID] ?? 0)
-        if actions.prepareReprompt(submitTarget, rawDraftSnapshot) { return }
+        if actions.prepareReprompt(submitTarget, rawDraftSnapshot) {
+            return
+        }
         guard let attempt = submissionLatch.begin(
             target: submitTarget,
             rawDraftSnapshot: rawDraftSnapshot
@@ -2006,21 +2021,6 @@ struct AgentComposerView: View, Equatable {
         }
     }
 
-    private func handleAttachmentDrop(providers: [NSItemProvider]) -> Bool {
-        guard let tabID = currentTabID, canMutateAttachments(tabID: tabID) else {
-            return false
-        }
-        return attachmentIntake.loadPreparedAttachments(from: providers) { prepared, failures in
-            guard !prepared.isEmpty || !failures.isEmpty else { return }
-            Task { @MainActor in
-                actions.reportAttachmentFailures(tabID, failures)
-                if !prepared.isEmpty {
-                    attachPreparedAttachments(prepared, tabID: tabID)
-                }
-            }
-        }
-    }
-
     private func handleAttachmentPaste(pasteboard: NSPasteboard) -> Bool {
         guard let tabID = currentTabID, canMutateAttachments(tabID: tabID) else {
             return false
@@ -2126,6 +2126,25 @@ struct AgentAttachmentIntake {
             return true
         }
         return shouldConsumeNSImageReadablePasteboard(pasteboard)
+    }
+
+    /// Build the same per-item intake used by SwiftUI. A file representation wins only within
+    /// its own item; a separate raw-image item must not disappear beside file URL items.
+    func dropProviders(from pasteboard: NSPasteboard) -> [NSItemProvider] {
+        (pasteboard.pasteboardItems ?? []).compactMap { item in
+            if item.types.contains(.fileURL) {
+                let value: NSSecureCoding = if let data = item.data(forType: .fileURL) {
+                    data as NSData
+                } else {
+                    (item.string(forType: .fileURL) ?? "") as NSString
+                }
+                return NSItemProvider(item: value, typeIdentifier: UTType.fileURL.identifier)
+            }
+            guard let identifier = bestImageTypeIdentifier(from: item.types.map(\.rawValue)) else { return nil }
+            let data = item.data(forType: NSPasteboard.PasteboardType(identifier)) ?? Data()
+            let canonical = canonicalImageType(forIdentifier: identifier)?.identifier ?? identifier
+            return NSItemProvider(item: data as NSData, typeIdentifier: canonical)
+        }
     }
 
     func loadPreparedAttachments(

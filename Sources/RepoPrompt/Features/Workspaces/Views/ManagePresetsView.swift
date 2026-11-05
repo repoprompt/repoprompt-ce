@@ -58,7 +58,10 @@ struct ManagePresetsView: View {
                 .padding(16)
             }
         }
-        .frame(minWidth: fontPreset.scaledMetric(500), minHeight: fontPreset.scaledMetric(400))
+        .frame(
+            minWidth: showCloseButton ? fontPreset.scaledMetric(500) : 0,
+            minHeight: showCloseButton ? fontPreset.scaledMetric(400) : 0
+        )
         .sheet(item: $presetBeingRenamed) { p in
             renameSheet(preset: p)
         }

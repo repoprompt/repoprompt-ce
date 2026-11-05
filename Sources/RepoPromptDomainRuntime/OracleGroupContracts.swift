@@ -538,7 +538,17 @@ package struct OracleExecutionProfile: Codable, Equatable {
     }
 }
 
+/// Invalid optional timing never invalidates an otherwise valid canonical outcome.
+package func normalizedOracleElapsed(_ value: Double?) -> Double? {
+    guard let value, value.isFinite, value >= 0,
+          Int(exactly: value.rounded(.down)) != nil else { return nil }
+    return value == 0 ? 0 : value
+}
+
 package struct OracleLaneResult: Codable, Equatable {
+    /// Exact assistant reply captured at creation; never inferred from message content or dates.
+    package let assistantReplyID: UUID?
+    package let elapsedSeconds: Double?
     package let laneIndex: Int
     package let role: OracleLaneRole
     package let chatID: String
@@ -546,6 +556,8 @@ package struct OracleLaneResult: Codable, Equatable {
     package let modelID: String
     package let status: OracleLaneResultStatus
     package let executionProfile: OracleExecutionProfile?
+    /// Exact assistant-message display text captured by the app; absent for older/direct results.
+    package let capturedModelName: String?
     package let response: String?
     package let error: OracleLaneError?
 
@@ -555,9 +567,12 @@ package struct OracleLaneResult: Codable, Equatable {
         providerID: String?,
         modelID: String,
         status: OracleLaneResultStatus,
+        elapsedSeconds: Double? = nil,
         executionProfile: OracleExecutionProfile? = nil,
+        capturedModelName: String? = nil,
         response: String? = nil,
-        error: OracleLaneError? = nil
+        error: OracleLaneError? = nil,
+        assistantReplyID: UUID? = nil
     ) throws {
         let role: OracleLaneRole = laneIndex == 0 ? .primary : .additional
         try Self.validate(
@@ -577,6 +592,9 @@ package struct OracleLaneResult: Codable, Equatable {
         self.modelID = try OracleRosterContract.normalizedModelID(modelID)
         self.status = status
         self.executionProfile = executionProfile
+        self.capturedModelName = capturedModelName
+        self.elapsedSeconds = normalizedOracleElapsed(elapsedSeconds)
+        self.assistantReplyID = assistantReplyID
         self.response = response
         self.error = error
     }
@@ -589,6 +607,9 @@ package struct OracleLaneResult: Codable, Equatable {
         case modelID = "model_id"
         case status
         case executionProfile = "execution_profile"
+        case capturedModelName = "captured_model_name"
+        case elapsedSeconds = "elapsed_seconds"
+        case assistantReplyID = "assistant_reply_id"
         case response
         case error
     }
@@ -602,6 +623,9 @@ package struct OracleLaneResult: Codable, Equatable {
         let modelID = try container.decode(String.self, forKey: .modelID)
         let status = try container.decode(OracleLaneResultStatus.self, forKey: .status)
         let executionProfile = try container.decodeIfPresent(OracleExecutionProfile.self, forKey: .executionProfile)
+        let capturedModelName = try container.decodeIfPresent(String.self, forKey: .capturedModelName)
+        let elapsedSeconds = try? container.decodeIfPresent(Double.self, forKey: .elapsedSeconds)
+        let assistantReplyID = try? container.decodeIfPresent(UUID.self, forKey: .assistantReplyID)
         let response = try container.decodeIfPresent(String.self, forKey: .response)
         let error = try container.decodeIfPresent(OracleLaneError.self, forKey: .error)
         try Self.validate(
@@ -621,6 +645,9 @@ package struct OracleLaneResult: Codable, Equatable {
         self.modelID = try OracleRosterContract.normalizedModelID(modelID)
         self.status = status
         self.executionProfile = executionProfile
+        self.capturedModelName = capturedModelName
+        self.elapsedSeconds = normalizedOracleElapsed(elapsedSeconds)
+        self.assistantReplyID = assistantReplyID
         self.response = response
         self.error = error
     }
@@ -1058,7 +1085,7 @@ package extension OracleGroupDocument {
             name: name,
             revision: revision &+ 1,
             createdAt: createdAt,
-            updatedAt: finishedAt,
+            updatedAt: max(updatedAt, finishedAt),
             roster: roster,
             members: members,
             turns: Array(turns.dropLast()) + [terminalTurn]

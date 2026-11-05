@@ -8,8 +8,8 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
         let readers = DispatchSemaphore(value: 0)
         let runner = CLIProcessRunner(
             config: CLIProcessConfiguration(command: "/bin/sh", processPurpose: .tool, enableDebugLogging: false),
-            beforeNonStreamingRead: { readers.wait() },
-            beforeNonStreamingDrain: {
+            beforeOutputRead: { readers.wait() },
+            beforeOutputDrain: {
                 readers.signal()
                 readers.signal()
             }
@@ -33,7 +33,7 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
         let readers = DispatchSemaphore(value: 0)
         let runner = CLIProcessRunner(
             config: CLIProcessConfiguration(command: "/bin/sh", processPurpose: .tool, enableDebugLogging: false),
-            beforeNonStreamingRead: { readers.wait() }, nonStreamingDrainTimeout: 0.2
+            beforeOutputRead: { readers.wait() }, outputDrainTimeout: 0.2
         )
         addTeardownBlock {
             for _ in 0 ..< 4 {
@@ -63,7 +63,7 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
         }
         let runner = CLIProcessRunner(
             config: CLIProcessConfiguration(command: "/bin/sh", processPurpose: .tool, enableDebugLogging: false),
-            nonStreamingDrainTimeout: 0.2
+            outputDrainTimeout: 0.2
         )
         do {
             _ = try await runner.run(
@@ -104,7 +104,7 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
         let release = DispatchSemaphore(value: 0)
         let runner = CLIProcessRunner(
             config: CLIProcessConfiguration(command: "/bin/sh", processPurpose: .tool, enableDebugLogging: false),
-            beforeNonStreamingDrain: { entered.fulfill()
+            beforeOutputDrain: { entered.fulfill()
                 release.wait()
             }
         )
@@ -290,9 +290,9 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
         // drain boundary, so close-before-drain loses bytes deterministically.
         let runner = makeRunner(statusObserver: { pid, beforeReap, completion in
             reaper.observe(pid: pid, beforeReap: beforeReap, completion: completion)
-        }, beforeStreamingRead: {
+        }, beforeOutputRead: {
             readers.wait()
-        }, beforeStreamingDrain: {
+        }, beforeOutputDrain: {
             readers.signal()
             readers.signal()
         })
@@ -360,9 +360,9 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
         let terminated = expectation(description: "cleanup after reader release")
         let runner = makeRunner(statusObserver: { pid, beforeReap, completion in
             reaper.observe(pid: pid, beforeReap: beforeReap, completion: completion)
-        }, beforeStreamingRead: {
+        }, beforeOutputRead: {
             readers.wait()
-        }, streamingDrainTimeout: 0)
+        }, outputDrainTimeout: 0)
         addTeardownBlock {
             readers.signal()
             readers.signal()
@@ -629,18 +629,18 @@ final class CLIProcessRunnerCancellationTests: XCTestCase {
 
     private func makeRunner(
         statusObserver: @escaping ChildProcessExitObserver.StatusObserver,
-        beforeStreamingRead: (@Sendable () -> Void)? = nil,
-        beforeStreamingDrain: (@Sendable () -> Void)? = nil,
-        streamingDrainTimeout: TimeInterval = 5
+        beforeOutputRead: (@Sendable () -> Void)? = nil,
+        beforeOutputDrain: (@Sendable () -> Void)? = nil,
+        outputDrainTimeout: TimeInterval = 5
     ) -> CLIProcessRunner {
         CLIProcessRunner(
             config: CLIProcessConfiguration(command: "/bin/sh", processPurpose: .tool, enableDebugLogging: false),
             processExitObserverFactory: { pid in
                 ChildProcessExitObserver(pid: pid, statusObserver: statusObserver)
             },
-            beforeStreamingRead: beforeStreamingRead,
-            beforeStreamingDrain: beforeStreamingDrain,
-            streamingDrainTimeout: streamingDrainTimeout
+            beforeOutputRead: beforeOutputRead,
+            beforeOutputDrain: beforeOutputDrain,
+            outputDrainTimeout: outputDrainTimeout
         )
     }
 }

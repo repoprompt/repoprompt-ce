@@ -721,10 +721,11 @@ final class ACPIntegratedAgentModeRunner {
                 return false
             }
             inputProof = await hooks.providerInput.proveAgentSessionLinkProviderInput(session, decorated.claim)
-            if decorated.claim?.localInput != nil {
-                guard !Task.isCancelled, session.runID == runID,
-                      session.activeRunAttemptID == runAttemptID, session.acpController === controller
-                else { return false }
+            guard !Task.isCancelled, session.runID == runID,
+                  session.activeRunAttemptID == runAttemptID, session.acpController === controller
+            else {
+                hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, oversightDispatch)
+                return false
             }
             guard hooks.providerInput.acquireAgentSessionLinkPhysicalDispatch(
                 session,
@@ -1222,10 +1223,11 @@ final class ACPIntegratedAgentModeRunner {
                 return .cancelled
             }
             inputProof = await hooks.providerInput.proveAgentSessionLinkProviderInput(session, decorated.claim)
-            if decorated.claim?.localInput != nil {
-                guard !Task.isCancelled, session.runID == runID,
-                      session.activeRunAttemptID == runAttemptID, session.acpController === controller
-                else { return .cancelled }
+            guard !Task.isCancelled, session.runID == runID,
+                  session.activeRunAttemptID == runAttemptID, session.acpController === controller
+            else {
+                hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, oversightDispatch)
+                return .cancelled
             }
             guard hooks.providerInput.acquireAgentSessionLinkPhysicalDispatch(
                 session,
@@ -1711,19 +1713,21 @@ final class ACPIntegratedAgentModeRunner {
         runID: UUID,
         runAttemptID: UUID,
         controller: ACPAgentSessionController,
-        lease _: MCPBootstrapLease,
+        lease: MCPBootstrapLease,
         attachmentReservationID: UUID?
     ) async {
         guard let ownership = session.activeRunOwnership,
               ownership.attemptID == runAttemptID
         else { return }
+        let outcome = await lease.acquireFailureOutcome
         hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
             binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: runID,
-            terminalState: .cancelled,
+            terminalState: outcome.terminalState,
             source: "acp.acquireFailure",
+            errorText: outcome.errorText,
             attachmentReservationID: attachmentReservationID,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: true,

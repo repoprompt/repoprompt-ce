@@ -29,7 +29,7 @@ struct AgentContextPill: View {
         runtimeVM.snapshot.displayUsedTokens
     }
 
-    private var contextWindowTokens: Int {
+    private var contextWindowTokens: Int? {
         runtimeVM.snapshot.effectiveContextWindowTokens
     }
 
@@ -80,6 +80,7 @@ struct AgentContextPill: View {
         if runtimeVM.snapshot.awaitingPostCompactionUsage {
             lines.append(runtimeVM.snapshot.displayUsageLabel)
         } else if let usedTokens = estimatedUsedTokens,
+                  let contextWindowTokens,
                   contextWindowTokens > 0
         {
             let usedPercent = min(max((Double(usedTokens) / Double(contextWindowTokens)) * 100, 0), 100)
@@ -87,6 +88,7 @@ struct AgentContextPill: View {
             lines.append("\(AgentContextIndicator.formatTokens(usedTokens)) / \(AgentContextIndicator.formatTokens(contextWindowTokens)) tokens")
         } else if let usedTokens = estimatedUsedTokens {
             lines.append("Used tokens: \(AgentContextIndicator.formatTokens(usedTokens))")
+            lines.append(AgentContextIndicator.unknownWindowText)
         } else {
             lines.append("Context usage unavailable")
         }

@@ -5,15 +5,18 @@ package struct OracleGroupRuntime: Sendable {
     private let claimManager: OracleGroupClaimManager
     private let coordinator = OracleGroupCoordinator()
     private let now: @Sendable () -> Date
+    private let elapsedNow: @Sendable () -> ContinuousClock.Instant
 
     package init(
         store: any OracleGroupStore,
         claimManager: OracleGroupClaimManager,
-        now: @escaping @Sendable () -> Date = Date.init
+        now: @escaping @Sendable () -> Date = Date.init,
+        elapsedNow: @escaping @Sendable () -> ContinuousClock.Instant = { .now }
     ) {
         self.store = store
         self.claimManager = claimManager
         self.now = now
+        self.elapsedNow = elapsedNow
     }
 
     package func execute(
@@ -239,7 +242,7 @@ extension OracleGroupRuntime {
             name: current.name,
             revision: current.revision &+ 1,
             createdAt: current.createdAt,
-            updatedAt: timestamp,
+            updatedAt: max(current.updatedAt, timestamp),
             roster: current.roster,
             members: current.members,
             turns: current.turns + [OracleTurnRecord(input: request.input, state: .prepared, startedAt: timestamp)]
@@ -288,6 +291,7 @@ extension OracleGroupRuntime {
                 turnID: turn.id,
                 input: turn.input,
                 plans: plans,
+                elapsedNow: elapsedNow,
                 progress: callbacks.progress
             )
         } catch {
@@ -333,7 +337,9 @@ extension OracleGroupRuntime {
                 ),
                     current.revision == prepared.revision,
                     current.turns.last?.id == prepared.turns.last?.id,
-                    current.turns.last?.state == .prepared
+                    current.turns.last?.state == .prepared,
+                    current.group == prepared.group,
+                    current.members == prepared.members
                 else { return }
                 let rawMessage = String(executionDescription.prefix(512))
                 let message = rawMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty

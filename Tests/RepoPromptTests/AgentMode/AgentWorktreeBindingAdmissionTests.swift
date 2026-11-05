@@ -233,6 +233,42 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         }
     }
 
+    func testSessionAdminUnbindForwardsPublicationCallbackBeforeACompletionFailure() async throws {
+        for busyDuringSave in [false, true] {
+            let fixture = try await durableFixture()
+            defer { fixture.git.cleanup() }
+            let original = fixture.session.worktreeBindings
+            XCTAssertFalse(original.isEmpty)
+            struct SaveFailure: Error {}
+            fixture.viewModel.test_setAgentSessionSaver { _, _, _ in
+                // A run that becomes pending while the required save awaits must not turn the
+                // committed unbind into a pre-commit "not idle" refusal.
+                if busyDuringSave { fixture.session.mcpFollowUpRunPending = true }
+                throw SaveFailure()
+            }
+            var removed: Set<String>?
+            var bindingsAtCallback: [AgentSessionWorktreeBinding]?
+            do {
+                _ = try await SessionAdminWindowsWorktreeHost().unbindWorktrees(
+                    sessionID: fixture.sessionID, worktreeID: nil, viewModel: fixture.viewModel, session: fixture.session,
+                    isStillAuthorized: { true },
+                    bindingsRemoved: { ids in
+                        removed = ids
+                        bindingsAtCallback = fixture.session.worktreeBindings
+                    }
+                )
+                XCTFail("A failed required save cannot produce a completed unbind")
+            } catch SessionAdminHostError.notIdle {
+                XCTFail("A published unbind must not be reported as a busy target (busyDuringSave=\(busyDuringSave))")
+            } catch {
+                // The completion failure surfaces; the callback is the commit evidence.
+            }
+            XCTAssertEqual(removed, Set(original.map(\.worktreeID)), "busyDuringSave=\(busyDuringSave)")
+            XCTAssertEqual(bindingsAtCallback, [], "The callback runs at publication")
+            XCTAssertEqual(fixture.session.worktreeBindings, [])
+        }
+    }
+
     func testVisualOnlyChangePreservesActiveRuntimeAndExecutionMapping() async throws {
         let fixture = try await durableFixture()
         defer { fixture.git.cleanup() }

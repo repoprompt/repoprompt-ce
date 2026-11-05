@@ -2878,7 +2878,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
             ),
             agentModeVM: state.agentModeViewModel, sidebarUI: state.agentModeViewModel.ui.sessionSidebar,
             promptManager: state.promptManager, apiSettingsVM: state.apiSettingsViewModel,
-            currentTabID: tabID, onManageWorkspaces: {}
+            currentTabID: tabID, onManageWorkspaces: {}, onNewSession: {}
         )
     }
 

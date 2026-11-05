@@ -115,6 +115,7 @@ final class HeadlessAgentModeRunner {
                 guard acquired else {
                     await self.handleAcquireFailure(
                         session: session,
+                        lease: lease,
                         runID: runID,
                         ownership: ownership,
                         attachmentReservationID: attachmentReservationID
@@ -150,17 +151,20 @@ final class HeadlessAgentModeRunner {
 
     private func handleAcquireFailure(
         session: AgentTabSession,
+        lease: MCPBootstrapLease,
         runID: UUID,
         ownership: AgentRunOwnership,
         attachmentReservationID: UUID?
     ) async {
+        let outcome = await lease.acquireFailureOutcome
         hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
             binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: runID,
-            terminalState: .cancelled,
+            terminalState: outcome.terminalState,
             source: "headless.acquireFailure",
+            errorText: outcome.errorText,
             attachmentReservationID: attachmentReservationID,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: true,
@@ -211,8 +215,9 @@ final class HeadlessAgentModeRunner {
                 throw CancellationError()
             }
             let proof = await hooks.providerInput.proveAgentSessionLinkProviderInput(session, monitoring.claim)
-            if monitoring.claim?.localInput != nil {
-                guard !Task.isCancelled, session.isCurrentRunAttempt(ownership, expectedRunID: runID) else { throw CancellationError() }
+            guard !Task.isCancelled, session.isCurrentRunAttempt(ownership, expectedRunID: runID) else {
+                hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, .headlessRun(runID: runID))
+                throw CancellationError()
             }
             guard hooks.providerInput.acquireAgentSessionLinkPhysicalDispatch(
                 session,

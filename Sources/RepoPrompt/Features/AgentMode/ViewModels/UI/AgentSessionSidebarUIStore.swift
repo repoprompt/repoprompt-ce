@@ -1,8 +1,67 @@
 import Foundation
 import RepoPromptInstrumentation
 
+/// Filter tabs above the session list. `.all` is the unfiltered sidebar; the others narrow the same
+/// list to matching sessions (plus their parent rows for context).
+enum AgentSidebarTab: String, CaseIterable, Identifiable {
+    // Display order: the default, then state and curation filters, then Overseers, which is a
+    // different axis (what a session is, not what state it is in).
+    case all
+    case active
+    case pinned
+    case overseers
+
+    var id: Self {
+        self
+    }
+
+    var title: String {
+        switch self {
+        case .all: "All"
+        case .pinned: "Pinned"
+        case .active: "Active"
+        case .overseers: "Overseers"
+        }
+    }
+
+    var emptyTitle: String {
+        switch self {
+        case .all: "No sessions"
+        case .pinned: "No pinned sessions"
+        case .active: "Nothing running or waiting on you"
+        case .overseers: "No sessions are overseeing others"
+        }
+    }
+
+    /// What the tab lists, in the user's terms. Shown as the tab's tooltip.
+    var helpText: String {
+        switch self {
+        case .all: "Every session in this workspace"
+        case .pinned: "Sessions you pinned"
+        case .active: "Running now, waiting on you, or failed while you were away"
+        case .overseers: "Sessions overseeing others, grouped with the sessions they oversee"
+        }
+    }
+
+    /// Names the scope search applies to, so the field shows what it will narrow.
+    var searchPlaceholder: String {
+        switch self {
+        case .all: "Search sessions\u{2026}"
+        case .pinned: "Search pinned\u{2026}"
+        case .active: "Search active\u{2026}"
+        case .overseers: "Search overseers\u{2026}"
+        }
+    }
+
+    /// What the collapse control folds in this tab.
+    var collapsibleNoun: String {
+        self == .overseers ? "overseer groups" : "sub-agent threads"
+    }
+}
+
 struct AgentSessionSidebarSnapshot: Equatable {
     var searchText: String
+    var sidebarTab: AgentSidebarTab = .all
     var visibleSessionCount: Int
     var archivedVisibleSessionCount: Int
     var collapsedThreadKeys: Set<AgentSidebarThreadKey> = []
@@ -49,6 +108,12 @@ final class AgentSessionSidebarUIStore: ObservableObject {
             force: false,
             affectsRowContent: false
         )
+    }
+
+    func setSidebarTab(_ tab: AgentSidebarTab) {
+        var next = snapshot
+        next.sidebarTab = tab
+        _ = publish(next, eventName: "sessionSidebar.tab", force: false, affectsRowContent: false)
     }
 
     func handleSelectionGesture(
@@ -238,9 +303,10 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         )
     }
 
+    /// Unfolds only `eligibleKeys`, so expanding one tab leaves folds made in the other tabs alone.
     func expandAllSidebarThreads(eligibleKeys: [AgentSidebarThreadKey]) {
         var next = snapshot
-        next.collapsedThreadKeys.removeAll()
+        next.collapsedThreadKeys.subtract(eligibleKeys)
         next.defaultCollapsedThreadKeysHandled.formUnion(eligibleKeys)
         _ = publish(
             next,
@@ -275,6 +341,17 @@ final class AgentSessionSidebarUIStore: ObservableObject {
              .waitingForUser, .waitingForQuestion, .waitingForApproval:
             true
         case .idle, .running, .cancelled:
+            false
+        }
+    }
+
+    /// Unseen states that keep a session in the Active tab because it still needs the user. An unseen
+    /// completion keeps its badge on the row, but it is finished work rather than activity.
+    static func needsUser(_ state: AgentSessionRunState) -> Bool {
+        switch state {
+        case .failed, .waitingForUser, .waitingForQuestion, .waitingForApproval:
+            true
+        case .idle, .running, .completed, .cancelled:
             false
         }
     }

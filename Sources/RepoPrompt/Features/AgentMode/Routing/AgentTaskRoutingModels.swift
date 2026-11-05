@@ -1,6 +1,19 @@
 import Foundation
 import RepoPromptSettingsCore
 
+/// Auto Workflow shares Model Router's service, but has independent enablement and cancellation.
+struct AutoWorkflowConfiguration: Equatable {
+    let enabled: Bool
+    let selectedBackendRawValue: String?
+    let revision: UInt64
+
+    var selectedBackendID: DecisionServiceID? {
+        guard let raw = selectedBackendRawValue,
+              !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return DecisionServiceID(rawValue: raw)
+    }
+}
+
 /// Complete executable identity used for candidate deduplication and commit/rollback.
 /// It deliberately retains effort and normalized ACP parameters; provider/model alone is not executable identity.
 struct AgentRoutingExecutableTarget: Hashable {

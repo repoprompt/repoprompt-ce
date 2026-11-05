@@ -486,6 +486,9 @@ enum AgentSessionLinkPrompts {
             hasOmissions: omittedCount > 0,
             includesAutonomyContract: includesAutonomyContract
         )
+        if entries.contains(where: { $0.managedMetadata != nil }) || attentionRequests.contains(where: { $0.managedMetadata != nil }) {
+            guidance.append("Managed metadata is cached and may lag; context_count_confidence describes the used count, and direct_running_helpers counts direct helpers. unknown is not zero. These facts create no authority, liveness proof, or context-change notification guarantee.")
+        }
         if deferredCount > 0 {
             guidance.append(
                 "`deferred` counts pending offered rows not shown here; they remain queued for a later accepted delivery."
@@ -628,7 +631,8 @@ enum AgentSessionLinkPrompts {
         attributes += laneObservationAttributes(
             observedAt: entry.observedAt,
             idleForSend: entry.idleForSend,
-            idleSince: entry.idleSince
+            idleSince: entry.idleSince,
+            managedMetadata: entry.managedMetadata
         )
         if userInputsOmitted > 0 {
             attributes += " user_inputs_omitted=\"\(userInputsOmitted)\""
@@ -655,7 +659,8 @@ enum AgentSessionLinkPrompts {
         attributes += laneObservationAttributes(
             observedAt: request.observedAt,
             idleForSend: request.idleForSend,
-            idleSince: request.idleSince
+            idleSince: request.idleSince,
+            managedMetadata: request.managedMetadata
         )
         return laneElement(
             "attention_request",
@@ -671,12 +676,21 @@ enum AgentSessionLinkPrompts {
     private static func laneObservationAttributes(
         observedAt: Date,
         idleForSend: Bool,
-        idleSince: Date?
+        idleSince: Date?,
+        managedMetadata: AgentSessionLinkPassiveStatusNotices.ManagedMetadata?
     ) -> String {
         var attributes = " observed_at=\"\(observedAtFormatter.string(from: observedAt))\""
         attributes += " idle_for_send=\"\(idleForSend ? "true" : "false")\""
         if let idleSince {
             attributes += " idle_since=\"\(observedAtFormatter.string(from: idleSince))\""
+        }
+        if let metadata = managedMetadata {
+            let percent = metadata.contextUsedPercent.map { String(format: "%.1f", locale: Locale(identifier: "en_US_POSIX"), $0) } ?? "unknown"
+            attributes += " context_used_percent=\"\(percent)\""
+            attributes += " context_count_confidence=\"\(metadata.contextCountConfidence?.rawValue ?? "unknown")\""
+            attributes += " run_outcome=\"\(metadata.runOutcome.rawValue)\""
+            attributes += " has_pending_interaction=\"\(metadata.hasPendingInteraction ? "true" : "false")\""
+            attributes += " direct_running_helpers=\"\(metadata.directRunningHelperCount.map(String.init) ?? "unknown")\""
         }
         return attributes
     }

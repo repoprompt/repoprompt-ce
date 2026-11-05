@@ -1,23 +1,44 @@
 # CI test gate contract
 
-`CI` uses five macOS jobs total: one **Build and Static Gates** job, then four
-**Test Root Shard (No Build)** jobs. The exact required check **Style** runs last
-on Linux. It depends on the shared job, all shards, and Secret Scan; every
-prerequisite must succeed (failed, skipped, or cancelled is not success).
+`CI` uses six macOS jobs total: one **Build and Static Gates** job, four
+**Test Root Shard (No Build)** matrix workers, and the secret-free Sentry
+build/privacy job. Each shard retains its own execution deadline and exact artifact
+output; `fail-fast: false` keeps ordinary failures from cancelling siblings.
+The #1623 sequential-worker experiment is reverted without reverting build-once
+reuse, producer-bound retry validation, or full coverage.
+Universal release packaging and older-runtime artifact smoke instead qualify the
+exact artifacts in Tip, stable, and explicit manual Release Candidate workflows.
+The exact required check **Style** runs last
+on Linux. It depends on the candidate declaration, shared job, all shards,
+Secret Scan, and Sentry/privacy; every prerequisite must succeed
+(failed, skipped, or cancelled is not success).
 The final gate prints those prerequisite results in its job summary so an
 upstream test or infrastructure failure is not mistaken for a formatting error.
 All former style/static/provider/import/index gates remain blocking. Compiler
-warning timing remains report-only on PRs and enforced on main, as before.
+warning timing uses the same clean, enforcing protocol on PRs, merge groups,
+and main, with unchanged budgets and retained success/failure measurements.
+See [integration admission](ci-admission.md) for profile/provenance, rerun policy,
+and the explicit gated queue/ruleset rollout; workflow deployment alone does not
+activate repository settings.
 
 The shared job also runs every app-free owning module test from
 `Scripts/modularization/modules.json` sequentially on its warm VM. These are no
 longer post-merge-only jobs. A module test failure or exhausted dependency fetch
 therefore blocks the existing required Style check before merge. Sentry-enabled
-build/privacy checks remain in CI (main), with complete console logs, explicit
-resolution retry failures, and no test/build retries or continue-on-error.
-Superseded commits coalesce independently per PR and main ref. CI (main) also
-cancels an older Sentry run when a newer main commit arrives; release and publish
-workflow cancellation policy is separate.
+build/privacy checks now also gate Style through the secret-free product workflow.
+CI (main) and Release Candidate remain supplemental workflows with independent
+scheduling. Only obsolete first-attempt PR previews supersede one another in CI;
+queue/main profile runs retain their evidence. There are no test/build retries
+or continue-on-error.
+
+Sentry/privacy waits for the root build, all root shards, and secret scan to
+succeed, so rejected candidates do not consume additional macOS capacity. Skipped
+Sentry/privacy remains a failing prerequisite for Style. The manual Release Candidate
+job can reuse a main-diagnostic-seeded cache of compatible SwiftPM intermediates, but still rebuilds and
+packages the current candidate and executes every smoke check. Root type-check
+measurements remain clean, and the Sentry job's dependency-only cache policy is
+unchanged. See [capacity and scheduling](ci-admission.md#runner-capacity-and-scheduling)
+for the measured backlog and the isolated-run latency tradeoff.
 
 ## Evidence and coverage authority
 
@@ -80,8 +101,11 @@ target inventory independently. Final Style recomputes the deterministic
 partition, checks exactly one current-listing receipt per shard, verifies each
 assignment/execution, and requires the disjoint union to equal the full listing
 and every target to be represented. Missing artifacts or receipts fail closed.
-Artifact overwrite supports rerunning failed jobs without reusing failed
-execution receipts. There are no filters on root shards.
+Hosted products and receipts additionally bind candidate/run/attempt/producer,
+and artifact names include each execution attempt. Integration-v3 supports failed
+or individual-shard reruns using exact successful producer outputs; Style still
+requires all four receipts. Old v1/v2 runs require **Re-run all jobs** or a branch
+update to obtain the new policy. There are no test-selection filters on root shards.
 `root-build-*` also lasts seven days, so its lifetime matches those receipts.
 After artifact expiry, rerun the build as well as the shards; a shard-only rerun
 cannot reconstruct its attested executable.
@@ -107,12 +131,12 @@ Exhaustion is labeled infrastructure failure and remains red. Builds and tests
 are never retried to hide deterministic failures.
 
 Remaining limits: caches and retries cannot guarantee GitHub/Sentry availability;
-skipped tests are visible exceptions, not proof their assertions ran; Sentry's
-opt-in configuration still validates after merge; raw-log/receipt parsing is
-XCTest-specific and intentionally fails closed if its output format changes.
-Main-only Sentry failures still require maintainer triage. Moving all owning
-module checks to PRs removes the reported module-coverage post-merge blind spot
-without increasing the macOS runner budget.
+skipped tests are visible exceptions, not proof their assertions ran; raw-log/receipt
+parsing is XCTest-specific and intentionally fails closed if its output format
+changes. Sentry failures block integration; packaging and artifact compatibility failures
+block release qualification/publication, not Style. The integration profile uses
+six macOS jobs; this scheduling boundary does not eliminate transport failures,
+runner capacity limits, or timing variance. Green Style alone is not publishability.
 
 See the [October 23 reliability audit](ci-reliability-2026-10-23.md) for the
 historical failure census, same-commit retry evidence, repairs, and unresolved

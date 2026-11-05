@@ -466,3 +466,74 @@ final class ModelRouterDecisionPolicyTests: XCTestCase {
         )
     }
 }
+
+// MARK: - Auto Workflow regressions
+
+final class AutoWorkflowPolicyTests: XCTestCase {
+    func testExplicitNoneAndUnknownOrFailedOutcomes() throws {
+        let prepared = try build([AgentWorkflow.review.definition])
+        XCTAssertEqual(prepared.request.consumerID, .autoWorkflow)
+        XCTAssertEqual(prepared.selection(for: .selected(opaqueKey: "workflow-none", evidence: nil)), .noWorkflow)
+        XCTAssertEqual(prepared.selection(for: .selected(opaqueKey: "workflow-0", evidence: nil)), .workflow(AgentWorkflow.review.definition))
+        XCTAssertNil(prepared.selection(for: .selected(opaqueKey: "unknown", evidence: nil)))
+        XCTAssertNil(prepared.selection(for: .unavailable))
+        XCTAssertNil(prepared.selection(for: .cancelled))
+        XCTAssertNil(prepared.selection(for: .abstained(reasonCode: "uncertain", evidence: nil)))
+        let lowConfidence = DecisionEvidence(
+            acceptancePolicyVersion: "test-v1", confidence: 0.5,
+            scores: nil, scoreSemantics: nil, probabilities: nil, probabilitySemantics: nil, usage: nil
+        )
+        XCTAssertNil(prepared.selection(for: .selected(opaqueKey: "workflow-0", evidence: lowConfidence)))
+    }
+
+    func testMetadataIsMaskedAndTemplatesNeverLeaveProcess() throws {
+        let workflow = AgentWorkflowDefinition(
+            customID: UUID(), displayName: "Review private implementation",
+            tooltipText: "TOOLTIP_NOT_SENT",
+            descriptionText: "Inspect /Users/private/project/file.swift with token=private-value and test the parser",
+            template: "TEMPLATE_NOT_SENT $ARGUMENTS"
+        )
+        let prepared = try build([workflow])
+        let payload = String(describing: prepared.request)
+        for excluded in ["TEMPLATE_NOT_SENT", "TOOLTIP_NOT_SENT", "/Users/private", "private-value", workflow.id] {
+            XCTAssertFalse(payload.contains(excluded), excluded)
+        }
+        XCTAssertTrue(payload.contains("[path omitted]"))
+        XCTAssertTrue(payload.contains("[credential omitted]"))
+        XCTAssertEqual(prepared.selection(for: .selected(opaqueKey: "workflow-0", evidence: nil)), .workflow(workflow))
+    }
+
+    func testDuplicateIDsAreNotOfferedAndLimitsNeverTruncateCatalog() throws {
+        let duplicate = AgentWorkflow.review.definition
+        let prepared = try build([duplicate, duplicate, AgentWorkflow.refactor.definition])
+        XCTAssertEqual(prepared.workflowsByKey.count, 1)
+        XCTAssertEqual(prepared.request.question.choices.count, 2)
+        let largeCatalog = (0 ..< 12).map { index in
+            AgentWorkflowDefinition(customID: UUID(), displayName: "Workflow \(index)", descriptionText: "A workflow")
+        }
+        XCTAssertThrowsError(try build(largeCatalog))
+        var capabilities = Self.capabilities
+        capabilities = .init(contextKinds: [], finiteChoice: capabilities.finiteChoice, evidence: capabilities.evidence)
+        XCTAssertFalse(AutoWorkflowDecisionPolicy.supports(capabilities))
+        XCTAssertThrowsError(try AutoWorkflowDecisionPolicy().build(
+            requestID: UUID(), maskedTaskExcerpt: "Review parser", workflows: [duplicate], capabilities: capabilities
+        ))
+    }
+
+    private func build(_ workflows: [AgentWorkflowDefinition]) throws -> AutoWorkflowDecisionPolicy.PreparedDecision {
+        try AutoWorkflowDecisionPolicy().build(
+            requestID: UUID(), maskedTaskExcerpt: "Review the parser for errors", workflows: workflows,
+            capabilities: Self.capabilities
+        )
+    }
+
+    static let capabilities = DecisionServiceCapabilities(
+        contextKinds: [.text],
+        finiteChoice: .init(
+            minimumChoices: 2, maximumChoices: 12, maximumContextBytes: 24 * 1024,
+            maximumInstructionsBytes: 16 * 1024, maximumChoiceDescriptionBytes: 8 * 1024,
+            maximumAggregateBytes: 128 * 1024
+        ),
+        evidence: .init(confidence: true, probabilityDistribution: true, usage: true)
+    )
+}

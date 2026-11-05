@@ -163,6 +163,11 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
         let decoded = try Self.decodeWorkspace(documentBytes: data)
         let workspace = decoded.workspace
         let normalizationRequiresSave = decoded.normalizationRequiresSave
+        WorkspaceUnreadableDocumentBackup.preserveIfNeeded(
+            documentBytes: data,
+            documentURL: standardizedURL,
+            droppedComposeTabCount: workspace.composeTabsDroppedDuringDecode
+        )
 
         if let keyAfterRead = try? metadataKey(for: fileURL),
            keyAfterRead == keyBeforeRead
@@ -9869,7 +9874,17 @@ class WorkspaceManagerViewModel: ObservableObject {
                     tabID: snapshot.id
                 ) ?? liveUISelection
             }
-            snapshot.expandedFolders = fileManager.snapshotExpandedFolderFullPaths()
+            // Expansion comes from a Set. Equal UI emissions and saves must retain the
+            // stored order instead of treating incidental enumeration order as a content edit.
+            let expandedFolders = fileManager.snapshotExpandedFolderFullPaths()
+            if let base,
+               expandedFolders == base.expandedFolders
+               || Set(expandedFolders) == Set(base.expandedFolders)
+            {
+                snapshot.expandedFolders = base.expandedFolders
+            } else {
+                snapshot.expandedFolders = expandedFolders
+            }
             snapshot.promptText = promptViewModel.promptText
             snapshot.selectedMetaPromptIDs = promptViewModel.getSelectedPromptIDsSnapshot()
             snapshot.activeSubView = promptViewModel.storedActiveSubView
@@ -11060,11 +11075,6 @@ class WorkspaceManagerViewModel: ObservableObject {
             )
             snapshot.selection = saveSelection.selection
             let storedTab = workspace.composeTabs[tabIndex]
-            // Expansion is collected from a Set. Preserve the stored order when membership did
-            // not change, so a timer capture cannot turn incidental ordering into a new document.
-            if Set(snapshot.expandedFolders) == Set(storedTab.expandedFolders) {
-                snapshot.expandedFolders = storedTab.expandedFolders
-            }
             // The caller still owns dirty-state persistence and interrupted-save convergence.
             // This guard only avoids publishing a capture that adds timestamps without content.
             let tabChanged = Self.composeTabSnapshotHasMeaningfulChanges(snapshot, comparedTo: storedTab, touchModified: false)
@@ -15498,6 +15508,10 @@ class WorkspaceManagerViewModel: ObservableObject {
         let rootName: String
     }
 
+    /// After three catch-up passes, let the existing keep-fresh listener finish in the
+    /// background. Continuous catalog churn must not hold workspace hydration forever.
+    nonisolated static let maxSearchIndexConvergenceRebuilds = 3
+
     private nonisolated static var maxConcurrentWorkspaceRootLoads: Int {
         3
     }
@@ -15898,10 +15912,15 @@ class WorkspaceManagerViewModel: ObservableObject {
             _ = await warmedGeneration
         #endif
         guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else { return }
+        var convergenceRebuilds = 0
         while true {
             let currentCatalogGeneration = await fileManager.workspaceFileContextStore.catalogGeneration(rootScope: .visibleWorkspace)
-            guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else { return }
+            guard !Task.isCancelled,
+                  isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id)
+            else { return }
             guard currentCatalogGeneration != indexGeneration else { break }
+            guard convergenceRebuilds < Self.maxSearchIndexConvergenceRebuilds else { break }
+            convergenceRebuilds += 1
             #if DEBUG
                 let loopSearchCatalogSnapshotStartMS = restorePerfRecorder.timestampMSIfEnabled()
             #endif
@@ -15964,6 +15983,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 "catalogFolders": "\(snapshot.diagnostics.folderCount)",
                 "catalogFiles": "\(snapshot.diagnostics.fileCount)",
                 "rebuildCount": "\(searchIndexRebuildCount)",
+                "convergenceRebuilds": "\(convergenceRebuilds)",
                 "failureCount": "\(failures.count)",
                 "catalogSnapshotDuration": restorePerfRecorder.formatMS(totalSearchCatalogSnapshotDurationMS),
                 "searchRebuildDuration": restorePerfRecorder.formatMS(totalSearchIndexRebuildDurationMS),
@@ -16572,6 +16592,32 @@ class WorkspaceManagerViewModel: ObservableObject {
             && workspaceFileURL(for: capture.localWorkspace) == capture.fileURL
     }
 
+    #if DEBUG
+        /// Value-only conflict evidence: names of differing stored properties, never their contents.
+        static func workspaceModelDiffLabelsForTesting(_ current: WorkspaceModel?, _ captured: WorkspaceModel) -> String {
+            guard let current else { return "missing" }
+            func differing(_ lhs: Any, _ rhs: Any) -> [(String, Any, Any)] {
+                zip(Mirror(reflecting: lhs).children, Mirror(reflecting: rhs).children).compactMap { left, right in
+                    String(reflecting: left.value) == String(reflecting: right.value)
+                        ? nil : (left.label ?? "?", left.value, right.value)
+                }
+            }
+            var labels: [String] = []
+            for (label, left, right) in differing(current, captured) {
+                if let leftTabs = left as? [ComposeTabState], let rightTabs = right as? [ComposeTabState],
+                   leftTabs.count == rightTabs.count
+                {
+                    for (index, pair) in zip(leftTabs, rightTabs).enumerated() {
+                        labels += differing(pair.0, pair.1).map { "\(label)[\(index)].\($0.0)" }
+                    }
+                } else {
+                    labels.append(label)
+                }
+            }
+            return labels.isEmpty ? "none" : labels.joined(separator: ",")
+        }
+    #endif
+
     private func retryStaleDomainAuthoritySave(
         proposal: WorkspaceModel,
         capture: DomainAuthoritySaveCapture,
@@ -16598,6 +16644,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 "capturedState": String(capture.stateVersion),
                 "currentState": String(stateVersionByWorkspaceID[proposal.id, default: 0]),
                 "modelEqual": String(workspace(withID: proposal.id) == capture.localWorkspace),
+                "modelDiff": Self.workspaceModelDiffLabelsForTesting(workspace(withID: proposal.id), capture.localWorkspace),
                 "capturedWorking": capture.revisions.map { String($0.workingRevision) } ?? "none",
                 "currentWorking": domainWorkspaceRevisionsByID[proposal.id].map { String($0.workingRevision) } ?? "none",
                 "capturedSaved": capture.revisions.map { String($0.savedRevision) } ?? "none",
@@ -16606,7 +16653,13 @@ class WorkspaceManagerViewModel: ObservableObject {
                 "currentAdoption": String(fullDocumentAdoptionGenerations[proposal.id, default: 0]),
                 "capturedRoot": String(capture.rootEditGeneration),
                 "currentRoot": String(rootEditGenerationByWorkspaceID[proposal.id, default: 0]),
-                "remainingRetries": String(remainingRetryCount)
+                "remainingRetries": String(remainingRetryCount),
+                "recaptureActivation": recaptureActivationGeneration.map(String.init) ?? "none",
+                "currentActivation": String(rootActivationGeneration),
+                "activeOwner": String(activeWorkspaceID == proposal.id),
+                "switching": String(isSwitchingWorkspace),
+                "refreshing": String(isRefreshing),
+                "closing": String(isPreparingForWindowClose)
             ])
         #endif
         guard var current = workspace(withID: proposal.id) else { throw WorkspaceDirectWriteError.workspaceUnavailable }
@@ -17323,14 +17376,21 @@ class WorkspaceManagerViewModel: ObservableObject {
         documentBytes: Data,
         fileURL: URL
     ) throws -> WorkspaceModel {
-        _ = fileURL
         #if DEBUG
-            return try WorkspaceProjectionDecodeDiagnostics.measure(inputBytes: documentBytes.count) {
+            let workspace = try WorkspaceProjectionDecodeDiagnostics.measure(inputBytes: documentBytes.count) {
                 try WorkspaceFileDecodeCache.decodeWorkspace(documentBytes: documentBytes).workspace
             }
         #else
-            return try WorkspaceFileDecodeCache.decodeWorkspace(documentBytes: documentBytes).workspace
+            let workspace = try WorkspaceFileDecodeCache.decodeWorkspace(documentBytes: documentBytes).workspace
         #endif
+        // The domain authority re-writes this document from the projected value, so the original
+        // bytes must be preserved here, before any projection consumer can commit a lossy copy.
+        WorkspaceUnreadableDocumentBackup.preserveIfNeeded(
+            documentBytes: documentBytes,
+            documentURL: fileURL,
+            droppedComposeTabCount: workspace.composeTabsDroppedDuringDecode
+        )
+        return workspace
     }
 
     nonisolated static func loadWorkspaceFromFileResult(
@@ -17344,8 +17404,12 @@ class WorkspaceManagerViewModel: ObservableObject {
             try AppProfileLocations.current.validateCustomWorkspaceDirectory(customRoot)
         }
         let normalizationSaveTask: Task<Void, Never>?
+        // A lossy decode never writes itself back on its own: the normalized value would replace
+        // tabs this build could not read. The original bytes were preserved at decode time, and
+        // an explicit user save remains possible.
         if scheduleNormalizationWriteback,
            !cachedResult.workspace.isEphemeral,
+           !cachedResult.workspace.composeTabsDecodeWasLossy,
            cachedResult.normalizationRequiresSave,
            WorkspaceFileDecodeCache.shared.claimNormalizationSave(for: cachedResult.cacheKey)
         {

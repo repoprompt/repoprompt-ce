@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -196,16 +197,23 @@ class CatalogTests(unittest.TestCase):
             self.assertEqual(affected.select(root, ['Sources/Core/Core.swift'], catalog), ['CoreTests'])
             self.assertEqual(affected.select(root, ['Package.swift'], catalog), ['CoreTests'])
 
-    def test_conductor_passes_timing_policy_to_ci_child(self) -> None:
+    def test_conductor_passes_timing_policy_and_pinned_toolchain_to_ci_children(self) -> None:
         registry = conductor.OperationRegistry(SCRIPT_DIR.parent)
-        with mock.patch.dict('os.environ', {'TYPECHECK_RATCHET_ENFORCE': '0'}):
+        pin = '/Applications/Xcode_26.6.app/Contents/Developer'
+        with mock.patch.dict('os.environ', {'TYPECHECK_RATCHET_ENFORCE': '0', 'DEVELOPER_DIR': pin}):
             snapshot = registry.client_env_snapshot()
         self.assertEqual(snapshot['TYPECHECK_RATCHET_ENFORCE'], '0')
-        argv, _, _, env, _ = registry.prepare({
-            'operation': 'ci-build-tests', 'args': {}, 'env': snapshot,
-        })
-        self.assertEqual(Path(argv[1]).name, 'modularization_ci_build.py')
-        self.assertEqual(env['TYPECHECK_RATCHET_ENFORCE'], '0')
+        self.assertEqual(snapshot['DEVELOPER_DIR'], pin)
+        for operation, args in (('ci-build-tests', {}), ('ci-shard', {'shardCount': 4, 'shardIndex': 1}),
+                                ('swift-build', {'product': 'RepoPrompt'}), ('test', {}), ('provider-test', {})):
+            with self.subTest(operation=operation):
+                argv, _, _, env, _ = registry.prepare({
+                    'operation': operation, 'args': args, 'env': snapshot,
+                })
+                if operation == 'ci-build-tests':
+                    self.assertEqual(Path(argv[1]).name, 'modularization_ci_build.py')
+                self.assertEqual(env['TYPECHECK_RATCHET_ENFORCE'], '0')
+                self.assertEqual(env['DEVELOPER_DIR'], pin)
 
     def test_conductor_transports_execution_location_ui_smoke_env(self) -> None:
         registry = conductor.OperationRegistry(SCRIPT_DIR.parent)
@@ -248,7 +256,8 @@ class CatalogTests(unittest.TestCase):
             (root / 'Package.swift').write_text('// fixture manifest')
             baseline = root / 'baseline.json'
             baseline.write_text(json.dumps({'typecheck': {'function_bodies_1000ms': 0,
-                                                          'expressions_500ms': 0}}))
+                                                          'expressions_500ms': 0},
+                                            'warnings': {'first_party_unique': 0}}))
             with mock.patch.object(ci_build, 'ROOT', root), mock.patch.object(ci_build, 'BASELINE', baseline), \
                     mock.patch.object(ci_build.subprocess, 'run', side_effect=[subprocess.CompletedProcess([], 0), listing, subprocess.CompletedProcess([], 0, stdout=json.dumps({'targets': [{'type': 'test', 'name': 'RepoPromptTests'}]}))]) as run, \
                     mock.patch.object(ci_build.subprocess, 'Popen', return_value=BuildProcess()), \
@@ -270,7 +279,8 @@ class CatalogTests(unittest.TestCase):
             (root / 'Package.swift').write_text('// fixture manifest')
             baseline = root / 'baseline.json'
             baseline.write_text(json.dumps({'typecheck': {'function_bodies_1000ms': 0,
-                                                          'expressions_500ms': 0}}))
+                                                          'expressions_500ms': 0},
+                                            'warnings': {'first_party_unique': 0}}))
             with mock.patch.object(ci_build, 'ROOT', root), mock.patch.object(ci_build, 'BASELINE', baseline), \
                     mock.patch.object(ci_build.subprocess, 'run', side_effect=[listing, subprocess.CompletedProcess([], 0, stdout=json.dumps({'targets': [{'type': 'test', 'name': 'RepoPromptTests'}]}))]) as run, \
                     mock.patch.object(ci_build.subprocess, 'Popen', return_value=BuildProcess()), \
@@ -278,6 +288,32 @@ class CatalogTests(unittest.TestCase):
                     mock.patch.dict('os.environ', {'TYPECHECK_RATCHET_ENFORCE': '0'}):
                 self.assertEqual(ci_build.main(), 0)
                 self.assertEqual(run.call_count, 2)
+
+    def test_enforced_warning_ratchet_fails_a_new_first_party_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lines = [f'{root}/Sources/RepoPromptShared/X.swift:1:2: warning: new warning\n'] * 3
+            lines.append(f'{root}/.build/checkouts/dep/Sources/D/D.swift:1:2: warning: dependency\n')
+
+            class BuildProcess:
+                stdout = iter(lines)
+
+                def wait(self) -> int:
+                    return 0
+
+            (root / 'Package.swift').write_text('// fixture manifest')
+            baseline = root / 'baseline.json'
+            baseline.write_text(json.dumps({'typecheck': {'function_bodies_1000ms': 0, 'expressions_500ms': 0},
+                                            'warnings': {'first_party_unique': 0}}))
+            with mock.patch.object(ci_build, 'ROOT', root), mock.patch.object(ci_build, 'BASELINE', baseline), \
+                    mock.patch.object(ci_build.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), \
+                    mock.patch.object(ci_build.subprocess, 'Popen', return_value=BuildProcess()), \
+                    mock.patch.dict('os.environ', {'TYPECHECK_RATCHET_ENFORCE': '1'}), \
+                    mock.patch('builtins.print'):
+                self.assertEqual(ci_build.main(), 1)
+            report = json.loads((root / '.build/modularization/typecheck-timing.json').read_text())
+            self.assertEqual(report['first_party_warnings']['unique'], 1)
+            self.assertEqual(report['first_party_warnings']['locations'][0]['path'], 'Sources/RepoPromptShared/X.swift')
 
     def test_import_scanner_handles_backticks_multiline_attributes_and_testing(self) -> None:
         source = ('import `AppKit`\n@_spi(\n Private\n) import `Testing`\n'
@@ -330,19 +366,149 @@ class CatalogTests(unittest.TestCase):
         self.assertNotIn('compression-level:', cache_save)
         self.assertNotIn('if-no-files-found:', cache_save)
 
-    def test_required_style_is_final_and_mac_job_budget_is_five(self) -> None:
+    def test_required_style_retains_core_and_sentry_without_release_builds(self) -> None:
         ci = (SCRIPT_DIR.parent / '.github/workflows/ci.yml').read_text()
         final = ci.split('  style:', 1)[1].split('  secret-scan:', 1)[0]
         self.assertIn('name: Style', final)
-        self.assertIn('needs: [build-test-bundles, build-and-test, secret-scan]', final)
+        self.assertIn('needs: [candidate, workflow-contracts, build-test-bundles, build-and-test, secret-scan, integration-products]', final)
         self.assertIn('if: always()', final)
         self.assertIn('ci_test_coverage.py', final)
-        self.assertEqual(ci.count('runs-on: macos-26'), 2)  # one shared job + 4 matrix children
-        self.assertIn('shard: [1, 2, 3, 4]', ci)
+        self.assertEqual(ci.count('runs-on: macos-26\n'), 2)  # shared root build + four-worker matrix template
+        products = (SCRIPT_DIR.parent / '.github/workflows/ci-integration-products.yml').read_text()
+        self.assertEqual(products.count('runs-on: macos-26\n'), 1)  # Sentry/privacy only
+        self.assertIn('SentryTelemetryPrivacyTests', products)
+        self.assertNotIn('release artifact', products)
+        self.assertNotIn('macos-compatibility.yml', products)
+        self.assertNotIn('continue-on-error', products)
+        worker = ci.split('\n  build-and-test:\n', 1)[1].split('\n  style:\n', 1)[0]
+        self.assertIn('shard: [1, 2, 3, 4]', worker)
+        self.assertIn('fail-fast: false', worker)
+        self.assertIn('--shard-count 4 --shard-index ${{ matrix.shard }} --timeout 1800', worker)
         self.assertNotIn('continue-on-error', ci)
         for line in ci.splitlines():
-            if line.startswith('    name:'):
+            if line.startswith('    name:') and line != '    name: Test Root Shard (No Build) (${{ matrix.shard }})':
                 self.assertNotIn('${{', line)
+
+    def test_partial_reruns_select_successful_producer_outputs_after_prerequisite_report(self) -> None:
+        root = SCRIPT_DIR.parent / '.github/workflows'
+        ci = (root / 'ci.yml').read_text()
+        products = (root / 'ci-integration-products.yml').read_text()
+        self.assertNotIn('fromJSON(', ci)
+        self.assertNotIn('fromJSON(', products)
+        worker = ci.split('\n  build-and-test:\n', 1)[1].split('\n  style:\n', 1)[0]
+        self.assertIn('needs.build-test-bundles.outputs.context', worker)
+        self.assertIn('steps.selected.outputs.build_artifact', worker)
+        self.assertIn('--check-toolchain', worker)
+        final = ci.split('\n  style:\n', 1)[1].split('\n  secret-scan:\n', 1)[0]
+        self.assertLess(final.index('ci_job_diagnostics.py prerequisites'), final.index('ci_admission.py select'))
+        self.assertIn('steps.selected.outputs.coverage_artifact', final)
+        self.assertIn('toJSON(needs.build-and-test.outputs)', final)
+        for shard in range(1, 5):
+            self.assertIn(f'steps.selected.outputs.receipt_artifact_{shard}', final)
+        self.assertNotIn('pattern:', final)
+        contracts = ci.split('\n  workflow-contracts:\n', 1)[1].split('\n  integration-products:\n', 1)[0]
+        self.assertIn('make ci-portable-selftest', contracts)
+        self.assertIn('Scripts/test_modularization_tooling.py', (SCRIPT_DIR.parent / 'Makefile').read_text().split('ci-workflow-selftest:', 1)[1].split('\n\n', 1)[0])
+
+    def test_contract_failure_never_suppresses_the_main_commit_range_secret_scan(self) -> None:
+        ci = (SCRIPT_DIR.parent / '.github/workflows/ci.yml').read_text()
+        candidate = ci.split('\n  candidate:\n', 1)[1].split('\n  workflow-contracts:\n', 1)[0]
+        self.assertNotIn('make ci-workflow-selftest', candidate)
+        secret = ci.split('\n  secret-scan:\n', 1)[1].split('    steps:', 1)[0]
+        self.assertIn('    needs: candidate\n', secret)
+        self.assertNotIn('workflow-contracts', secret)
+        build = ci.split('\n  build-test-bundles:\n', 1)[1].split('    steps:', 1)[0]
+        self.assertIn('    needs: [candidate, workflow-contracts, secret-scan]\n', build)
+
+    def test_main_coalescing_preserves_scans_and_running_work(self) -> None:
+        ci = (SCRIPT_DIR.parent / '.github/workflows/ci.yml').read_text()
+        for name in ('candidate', 'workflow-contracts', 'secret-scan', 'style'):
+            job = re.split(r'\n  [a-z][\w-]*:\n', ci.split(f'\n  {name}:\n', 1)[1], maxsplit=1)[0]
+            self.assertNotIn('concurrency:', job, name)
+        for name, group in (('build-test-bundles', 'build'), ('build-and-test', 'tests'),
+                            ('integration-products', 'sentry')):
+            job = re.split(r'\n  [a-z][\w-]*:\n', ci.split(f'\n  {name}:\n', 1)[1], maxsplit=1)[0]
+            self.assertIn(f'group: ci-{group}-', job)
+            self.assertIn("github.event_name == 'push'", job)
+            self.assertIn("github.ref == 'refs/heads/main'", job)
+            self.assertIn("github.run_attempt == '1'", job)
+            self.assertIn("'main' || github.run_id", job)
+            self.assertIn('cancel-in-progress: false', job)
+
+    def test_portable_checks_run_before_mac_allocation_without_duplicate_suites(self) -> None:
+        ci = (SCRIPT_DIR.parent / '.github/workflows/ci.yml').read_text()
+        contracts = ci.split('\n  workflow-contracts:\n', 1)[1].split('\n  integration-products:\n', 1)[0]
+        build = ci.split('\n  build-test-bundles:\n', 1)[1].split('\n  build-and-test:\n', 1)[0]
+        self.assertIn('make guardrails', build)
+        self.assertLess(build.index('make guardrails'), build.index('Resolve dependency downloads'))
+        self.assertIn('make codex-schema-check', contracts)
+        self.assertNotIn('make conductor-selftest', build)
+        self.assertNotIn('make release-selftest', build)
+        self.assertIn('make ci-macos-selftest', build)
+        commands = subprocess.run(['make', '--no-print-directory', '-n', 'ci-portable-selftest'],
+                                  cwd=SCRIPT_DIR.parent, capture_output=True, text=True, check=True).stdout.splitlines()
+        tests = [line.strip() for line in commands if line.startswith(('python3 ', './Scripts/test_'))]
+        self.assertEqual(len(tests), len(set(tests)), 'portable suites must not run twice through nested Make targets')
+        for script in ('test_ci_admission.py', 'test_ci_job_diagnostics.py', 'test_ci_app_test_runner.py',
+                       'test_ci_test_coverage.py', 'test_ci_resolve_packages.py', 'test_modularization_tooling.py',
+                       'test_conductor_heavy_admission.py', 'test_release_tooling.py'):
+            self.assertTrue(any(script in line for line in tests), script)
+        self.assertFalse(any('test_local_production_installer.py' in line or 'Scripts/test_tip_history.py' in line
+                             for line in tests), 'Apple plutil/ICU checks must stay on macOS')
+        native = subprocess.run(['make', '--no-print-directory', '-n', 'ci-macos-selftest'],
+                                cwd=SCRIPT_DIR.parent, capture_output=True, text=True, check=True).stdout
+        self.assertIn('Scripts/test_local_production_installer.py', native)
+        self.assertIn('Scripts/test_tip_history.py', native)
+        self.assertIn('ArchiveTests.test_real_ditto_and_codesign_reject_unsigned_fixture_without_running_it', native)
+        self.assertIn('Scripts/test_modularization_index_graph.py LibraryBindingTests', native)
+
+    def test_supplemental_product_workflows_are_manual_only(self) -> None:
+        # Sentry is already blocking; universal qualification belongs to publication
+        # or an explicit diagnostic, not another automatic copy per push.
+        for name in ('ci-main.yml', 'release-candidate.yml'):
+            with self.subTest(workflow=name):
+                workflow = (SCRIPT_DIR.parent / '.github/workflows' / name).read_text()
+                events = workflow.split('\non:\n', 1)[1].split('\n\n', 1)[0]
+                self.assertEqual(events.strip(), 'workflow_dispatch:')
+
+    def test_package_deadlines_outlive_the_conductor_artifact_budget(self) -> None:
+        # The old 120-minute job killed a valid four-hour operation on main.
+        # Compare the independent owners rather than pinning another timeout copy.
+        root = SCRIPT_DIR.parent
+        products = (root / '.github/workflows/release-candidate.yml').read_text()
+        package = products.split('\n  artifact:\n', 1)[1]
+        job_seconds = int(package.split('    timeout-minutes:', 1)[1].splitlines()[0]) * 60
+        step = package.split('      - name: Package secret-free universal ad-hoc release candidate\n', 1)[1]
+        step = step.split('\n      - name:', 1)[0]
+        step_seconds = int(step.split('        timeout-minutes:', 1)[1].splitlines()[0]) * 60
+        operation_seconds = conductor.OperationRegistry(root)._default_timeout('release', {'subcommand': 'artifact'})
+        self.assertGreaterEqual(step_seconds, operation_seconds + 5 * 60,
+                                'Conductor must report its own deadline before GitHub cancels the step')
+        self.assertGreaterEqual(job_seconds, step_seconds + 15 * 60,
+                                'Preflight, smoke, and diagnostic upload need time outside the package step')
+
+    def test_style_command_rejects_each_failed_cancelled_or_skipped_obligation(self) -> None:
+        import os
+        import textwrap
+        import ci_job_diagnostics
+        ci = (SCRIPT_DIR.parent / '.github/workflows/ci.yml').read_text()
+        gate = ci.split('      - name: Report prerequisites and release eligibility', 1)[1]
+        command = textwrap.dedent(gate.split('        run: |\n', 1)[1].split('\n      - name:', 1)[0])
+        needs = {key: {'result': 'success', 'outputs': {}} for key in ci_job_diagnostics.JOBS}
+        with tempfile.TemporaryDirectory() as directory:
+            env = {**{k: v for k, v in os.environ.items() if not k.startswith('GITHUB_')}, 'HOME': directory, 'NEEDS_CONTEXT': json.dumps(needs), 'GITHUB_STEP_SUMMARY': directory + '/summary',
+                   'GITHUB_SERVER_URL': 'https://github.com', 'GITHUB_REPOSITORY': 'example/repo',
+                   'GITHUB_RUN_ID': '42', 'GITHUB_RUN_ATTEMPT': '2', 'GITHUB_EVENT_NAME': 'push'}
+            self.assertEqual(subprocess.run(['bash', '-c', command], cwd=SCRIPT_DIR.parent,
+                                           env=env, capture_output=True).returncode, 0)
+            for key in needs:
+                for result in ('failure', 'cancelled', 'skipped'):
+                    with self.subTest(obligation=key, result=result):
+                        changed = {**needs, key: {'result': result}}
+                        run = subprocess.run(['bash', '-c', command], cwd=SCRIPT_DIR.parent,
+                                             env={**env, 'NEEDS_CONTEXT': json.dumps(changed)}, capture_output=True)
+                        self.assertNotEqual(run.returncode, 0)
+                        self.assertIn(b'Style is the aggregate', run.stdout)
 
     def test_ci_typecheck_warning_classification(self) -> None:
         warning = '/checkout/Sources/RepoPrompt/App/X.swift:3:4: warning: expression took 502ms to type-check'
@@ -370,6 +536,57 @@ class CatalogTests(unittest.TestCase):
         ci_build.record_warning(expression.replace(':3:4:', ':3:5:'), durations)
         ci_build.record_warning(function.replace(':1:1:', ':2:1:'), durations)
         self.assertEqual(ci_build.timing_counts(durations), {'function_body': 2, 'expression': 2})
+
+    def test_first_party_warning_identity_excludes_dependencies_and_timing(self) -> None:
+        root = Path('/checkout')
+        warning = "/checkout/Sources/RepoPromptShared/X.swift:7:9: warning: var 'x' was never mutated"
+        self.assertEqual(ci_build.first_party_warning(warning, root), (
+            'Sources/RepoPromptShared/X.swift', '7', '9', "var 'x' was never mutated",
+        ))
+        colored = warning.replace('warning:', '\x1b[1;35mwarning: \x1b[0m\x1b[1m')
+        self.assertEqual(ci_build.first_party_warning(colored, root), ci_build.first_party_warning(warning, root))
+        linked = ("/checkout/Sources/X.swift:1:2: warning: 'f' is deprecated [#\x1b]8;;"
+                  "https://docs.swift.org/compiler/documentation/diagnostics/deprecated-declaration\x1b\\"
+                  "DeprecatedDeclaration\x1b]8;;\x1b\\]")
+        self.assertEqual(ci_build.first_party_warning(linked, root), (
+            'Sources/X.swift', '1', '2', "'f' is deprecated [#DeprecatedDeclaration]",
+        ))
+        for owned in ('/checkout/Tests/RepoPromptTests/T.swift', '/checkout/Packages/P/Sources/P/P.swift',
+                      '/checkout/Sources/TreeSitterScannerSupport/src/scanner.c'):
+            with self.subTest(owned=owned):
+                self.assertIsNotNone(ci_build.first_party_warning(f'{owned}:1:2: warning: w', root))
+        for foreign in (
+            '/checkout/.build/checkouts/swift-nio/Sources/NIO/N.swift:1:2: warning: w',
+            '/checkout/Packages/P/.build/checkouts/dep/Sources/D/D.swift:1:2: warning: w',
+            '/checkout/Vendor/UniversalCharsetDetection/Sources/U/U.swift:1:2: warning: w',
+            '/elsewhere/Sources/RepoPrompt/X.swift:1:2: warning: w',
+            '/checkout/Sources/RepoPrompt/App/X.swift:3:4: warning: expression took 502ms to type-check',
+            '/checkout/Sources/RepoPrompt/App/X.swift:3:4: error: e',
+            'warning: unhandled resource in target RepoPrompt',
+            'ld: warning: object file built for newer macOS',
+        ):
+            with self.subTest(foreign=foreign):
+                self.assertIsNone(ci_build.first_party_warning(foreign, root))
+
+    def test_warning_ratchet_counts_unique_diagnostics_not_emissions(self) -> None:
+        root = Path('/checkout')
+        warnings: set[tuple[str, str, str, str]] = set()
+        line = '/checkout/Sources/RepoPrompt/App/X.swift:3:4: warning: capture of non-Sendable value'
+        for _ in range(25):  # one diagnostic re-emitted by many frontend jobs (#519)
+            warnings.add(ci_build.first_party_warning(line, root))
+        warnings.add(ci_build.first_party_warning(line.replace('non-Sendable', 'mutable'), root))
+        warnings.add(ci_build.first_party_warning(line.replace(':3:4:', ':5:4:'), root))
+        self.assertEqual(len(warnings), 3)
+        with mock.patch('builtins.print'):
+            self.assertFalse(ci_build.report_warning_ratchet(warnings, {'first_party_unique': 3}))
+            self.assertTrue(ci_build.report_warning_ratchet(warnings, {'first_party_unique': 2}))
+        self.assertEqual(ci_build.warning_summary(warnings), ['     3  Sources/RepoPrompt/App/X.swift'])
+
+    def test_warning_ratchet_budget_is_committed(self) -> None:
+        ratchets = json.loads(ci_build.BASELINE.read_text(encoding='utf-8'))
+        ceiling = ratchets['warnings']['first_party_unique']
+        self.assertIsInstance(ceiling, int)
+        self.assertGreaterEqual(ceiling, 0)
 
 
 if __name__ == '__main__':

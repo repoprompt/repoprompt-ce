@@ -168,7 +168,7 @@ final class DebugStateBootstrapTests: XCTestCase {
         }
     }
 
-    func testEveryNormalSeedRefreshesByValueAndCleanSlateDoesNotStick() throws {
+    func testExplicitSnapshotCopiesByValueAndCleanResetArchivesPriorDebugState() throws {
         let f = Fixture()
         defer { f.cleanup() }
         let settings = f.release.applicationSupportRoot.appendingPathComponent("Settings/globalSettings.json")
@@ -336,7 +336,7 @@ final class DebugStateBootstrapTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: unknown), Data("preserve".utf8))
     }
 
-    func testNormalRefreshPreservesDebugApprovalsAndEndpointWorkspaceWhileRefreshingOtherState() throws {
+    func testExplicitSnapshotPreservesDebugApprovalsAndEndpointWorkspaceWhileRefreshingOtherState() throws {
         let f = Fixture()
         defer { f.cleanup() }
         let workspaceID = UUID(), sessionID = UUID(), tabID = UUID()
@@ -401,6 +401,187 @@ final class DebugStateBootstrapTests: XCTestCase {
 }
 
 extension DebugStateBootstrapTests {
+    private func oracleStore(_ locations: AppProfileLocations, interrupt: Bool = false) -> (DomainOracleConversationStore, URL) {
+        let identity = DomainRuntimeIdentity(runtimeID: UUID(), lifecycleGeneration: 1, processID: 42, mode: .standalone, createdAt: Date())
+        let persistence = DomainPersistenceCoordinator(configuration: .init(
+            mode: .standalone, profileIdentifier: locations.profileIdentifier,
+            storageDirectory: locations.applicationSupportRoot,
+            eventDirectory: locations.applicationSupportRoot.appendingPathComponent("Events"),
+            temporaryDirectory: locations.applicationSupportRoot.appendingPathComponent("Temporary"), externalReloadInterval: nil
+        ), identity: identity)
+        return (DomainOracleConversationStore(persistence: persistence, identity: identity, mutationObserver: { phase in
+            if interrupt, case .journalPersisted = phase { throw OraclePersistenceError.invalidDocument("fixture_interruption") }
+        }), persistence.oracleStorageRoot)
+    }
+
+    private func oracleGroup(workspace: UUID, seed: String, context: OracleContextEnvelope? = nil) async throws -> OracleGroupDocument {
+        let model = try OracleModelReference(providerID: "fixture", modelID: "model")
+        let owner = try await OracleViewModel.oracleGroupOwner(workspaceID: workspace, tabID: UUID())
+        let second = try OracleModelReference(providerID: "fixture", modelID: "second")
+        let members = try [model, second].enumerated().map { index, model in
+            try OracleGroupMember(laneID: OracleLaneID(index: index), publicChatID: index == 0 ? seed : seed + "-second", model: model)
+        }
+        let turn = try OracleTurnRecord(input: OracleInput(mode: .chat, userMessage: seed, context: context), state: .prepared, startedAt: Date(timeIntervalSince1970: 1000))
+        return try OracleGroupDocument(
+            group: OracleGroupDescriptor(size: 2),
+            owner: owner,
+            name: seed,
+            revision: 1,
+            createdAt: turn.startedAt,
+            updatedAt: turn.startedAt,
+            roster: OracleRoster(primary: model, additional: [second]),
+            members: members,
+            turns: [turn]
+        )
+    }
+
+    private func retainOracleWorkspace(_ f: Fixture, id: UUID) throws {
+        let workspace = f.debug.workspaceRoot.appendingPathComponent("Workspace-Fixture-" + id.uuidString)
+        try f.writeJSON([["id": id.uuidString, "name": "Fixture"]], f.debug.workspaceRoot.appendingPathComponent("workspacesIndex.json"))
+        try f.writeJSON(["id": id.uuidString, "name": "Fixture", "composeTabs": []], workspace.appendingPathComponent("workspace.json"))
+        let grant = DomainDelegationScopeGrant(id: UUID(), granteeSessionID: UUID(), kind: .workspace(workspaceID: id), capabilities: [.observe], guardrails: .init(), origin: .user, grantedAt: Date())
+        let encoder = JSONEncoder()
+        try f.write(encoder.encode(DelegationScopeDocument(scopes: [grant])), f.debug.applicationSupportRoot.appendingPathComponent("delegationScopes.json"))
+    }
+
+    func testOracleRetentionRecoversCapturedIndexJournalAndReseedsWithoutResurrection() async throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let workspace = UUID()
+        try retainOracleWorkspace(f, id: workspace)
+        let (release, releaseRoot) = oracleStore(f.release)
+        let (debug, debugRoot) = oracleStore(f.debug, interrupt: true)
+        let retained = try await oracleGroup(workspace: workspace, seed: "debug-member")
+        let deleted = try await oracleGroup(workspace: workspace, seed: "release-deleted")
+        let unrelated = try await oracleGroup(workspace: UUID(), seed: "release-member")
+        try await release.create(deleted)
+        try await release.create(unrelated)
+        do { try await debug.create(retained)
+            XCTFail("Expected interruption")
+        } catch {}
+        let journalDirectory = debugRoot.appendingPathComponent("transactions")
+        let journal = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: journalDirectory, includingPropertiesForKeys: nil).first)
+        let journalBytes = try Data(contentsOf: journal)
+        let releaseIndex = try Data(contentsOf: releaseRoot.appendingPathComponent("index.json"))
+        for iteration in 0 ..< 2 {
+            _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:])
+            let (cold, _) = oracleStore(f.debug)
+            let loaded = try await cold.load(member: .init(publicChatID: "debug-member"), owner: retained.owner)
+            XCTAssertEqual(loaded, retained)
+            let other = try await cold.load(member: .init(publicChatID: "release-member"), owner: unrelated.owner)
+            XCTAssertEqual(other, unrelated)
+            let absent = try await cold.load(member: .init(publicChatID: "release-deleted"), owner: deleted.owner)
+            XCTAssertNil(absent)
+            XCTAssertEqual(try Data(contentsOf: releaseRoot.appendingPathComponent("index.json")), releaseIndex)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: journal.path))
+            if iteration == 0 {
+                let archives = try FileManager.default.contentsOfDirectory(at: f.recovery, includingPropertiesForKeys: nil)
+                let relative = DomainPersistenceCoordinator.runtimeDirectoryName(profileIdentifier: f.debug.profileIdentifier) + "/oracle/transactions/" + journal.lastPathComponent
+                XCTAssertTrue(archives.contains { (try? Data(contentsOf: $0.appendingPathComponent(relative))) == journalBytes }, "The original journal survives unchanged in the archived source profile")
+            }
+        }
+        let results = try retained.members.map { member in
+            try OracleLaneResult(laneIndex: member.laneID.index, chatID: member.publicChatID, providerID: member.model.providerID, modelID: member.model.modelID, status: .completed, response: "completed reply")
+        }
+        let preparedTurn = try XCTUnwrap(retained.turns.last)
+        let terminalTurn = OracleTurnRecord(id: preparedTurn.id, input: preparedTurn.input, state: .terminal, startedAt: preparedTurn.startedAt, finishedAt: preparedTurn.startedAt.addingTimeInterval(1), status: .completed, warnings: [], results: results)
+        let terminal = try OracleGroupDocument(group: retained.group, owner: retained.owner, name: retained.name, revision: 2, createdAt: retained.createdAt, updatedAt: preparedTurn.startedAt.addingTimeInterval(1), roster: retained.roster, members: retained.members, turns: [terminalTurn])
+        let (interrupted, _) = oracleStore(f.debug, interrupt: true)
+        do { try await interrupted.save(terminal, expectedRevision: retained.revision)
+            XCTFail("Expected interruption")
+        } catch {}
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:])
+        let (beforeDeletion, _) = oracleStore(f.debug)
+        let loadedTerminal = try await beforeDeletion.load(groupID: retained.group.id, owner: retained.owner)
+        XCTAssertEqual(loadedTerminal, terminal)
+        try await beforeDeletion.delete(groupID: retained.group.id, owner: retained.owner, expectedRevision: terminal.revision)
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:])
+        let (cold, _) = oracleStore(f.debug)
+        let absent = try await cold.load(member: .init(publicChatID: "release-deleted"), owner: deleted.owner)
+        XCTAssertNil(absent, "An empty retained debug set must not fall back to release")
+        let deletedGroup = try await cold.load(groupID: retained.group.id, owner: retained.owner)
+        XCTAssertNil(deletedGroup)
+        for member in retained.members {
+            let deletedMember = try await cold.load(member: .init(publicChatID: member.publicChatID), owner: retained.owner)
+            XCTAssertNil(deletedMember)
+        }
+        let survivingRelease = try await cold.load(member: .init(publicChatID: "release-member"), owner: unrelated.owner)
+        XCTAssertEqual(survivingRelease, unrelated)
+    }
+
+    func testOracleRetentionPreservesUnknownGroupFieldsAndReferencedArtifactBytes() async throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let workspace = UUID()
+        try retainOracleWorkspace(f, id: workspace)
+        let (debug, debugRoot) = oracleStore(f.debug)
+        let artifactBytes = Data("retained frozen context\n".utf8)
+        let artifactID = try await debug.storeArtifact(artifactBytes)
+        let context = OracleContextEnvelope(content: .durableArtifact(id: artifactID), sha256: artifactID)
+        let retained = try await oracleGroup(workspace: workspace, seed: "byte-preservation", context: context)
+        try await debug.create(retained)
+        let groupURL = debugRoot.appendingPathComponent("groups/" + retained.group.id.rawValue.uuidString + ".json")
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: groupURL)) as? [String: Any])
+        json["future_retention_fixture"] = "unknown field must survive"
+        let groupBytes = try JSONSerialization.data(withJSONObject: json, options: [.sortedKeys, .prettyPrinted])
+        try groupBytes.write(to: groupURL)
+        let artifactURL = debugRoot.appendingPathComponent("artifacts/" + artifactID + ".blob")
+
+        for _ in 0 ..< 2 {
+            _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:])
+            XCTAssertEqual(try Data(contentsOf: groupURL), groupBytes)
+            XCTAssertEqual(try Data(contentsOf: artifactURL), artifactBytes)
+            let (cold, _) = oracleStore(f.debug)
+            for member in retained.members {
+                let loaded = try await cold.load(member: .init(publicChatID: member.publicChatID), owner: retained.owner)
+                XCTAssertEqual(loaded, retained)
+            }
+        }
+    }
+
+    func testOracleRetentionRetriesOptionalStoreAppearanceButIgnoresTemporaryChurn() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        try retainOracleWorkspace(f, id: UUID())
+        try FileManager.default.createDirectory(at: f.release.applicationSupportRoot, withIntermediateDirectories: true)
+        let (_, releaseRoot) = oracleStore(f.release)
+        let (_, debugRoot) = oracleStore(f.debug)
+        var captures = 0
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:], retryDelay: 0) { _ in
+            captures += 1
+            if captures == 1 { try f.write(Data("future".utf8), releaseRoot.appendingPathComponent("future-metadata")) }
+        }
+        XCTAssertEqual(captures, 2)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: debugRoot.appendingPathComponent("future-metadata").path))
+        captures = 0
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:], retryDelay: 0) { _ in
+            captures += 1
+            try f.write(Data("transient".utf8), releaseRoot.appendingPathComponent(".DS_Store"))
+            try f.write(Data(), releaseRoot.appendingPathComponent("locks/new.lock"))
+        }
+        XCTAssertEqual(captures, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: debugRoot.appendingPathComponent(".DS_Store").path))
+    }
+
+    func testOracleRetentionOmitsOpaqueReleaseFilesAndPreservesDebugBytes() async throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let workspace = UUID()
+        try retainOracleWorkspace(f, id: workspace)
+        let (release, releaseRoot) = oracleStore(f.release)
+        let (debug, debugRoot) = oracleStore(f.debug)
+        try await release.create(oracleGroup(workspace: UUID(), seed: "release"))
+        try await debug.create(oracleGroup(workspace: workspace, seed: "debug"))
+        try f.write(Data("release".utf8), releaseRoot.appendingPathComponent("future-metadata"))
+        try f.write(Data("debug".utf8), debugRoot.appendingPathComponent("future-metadata"))
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:])
+        let receipt = try Data(contentsOf: f.debug.applicationSupportRoot.appendingPathComponent("debugSeedRetainedContinuity.json"))
+        let report = try XCTUnwrap(JSONSerialization.jsonObject(with: receipt) as? [String: Any])
+        XCTAssertEqual(report["oracleReleaseOmissions"] as? [[String: String]], [["path": "future-metadata", "reason": "opaque_release_file"]])
+        XCTAssertEqual(try Data(contentsOf: releaseRoot.appendingPathComponent("future-metadata")), Data("release".utf8))
+        XCTAssertEqual(try Data(contentsOf: debugRoot.appendingPathComponent("future-metadata")), Data("debug".utf8))
+    }
+
     func testRealLegacyScopesAndOwnershipRetainArchivedCarriersWithoutLinksOrDatabase() throws {
         for kind in ["session", "tree", "workspace", "grantee", "ownership"] {
             let f = Fixture()
@@ -959,9 +1140,236 @@ extension DebugStateBootstrapTests {
     }
 
     func testStartEmptyIsOfferedOnlyWhereAnEmptyProfileCanRecover() {
-        let recoverable: [Error] = [DebugStateSnapshot.Failure.sourceChanged, DebugStateSnapshot.Failure.unsafeFile, DebugStateSnapshot.Failure.database(SQLITE_BUSY), DebugStateSnapshot.Failure.unsupportedWAL]
+        let recoverable: [Error] = [DebugStateSnapshot.Failure.oracleRetention("fixture"), DebugStateSnapshot.Failure.sourceChanged, DebugStateSnapshot.Failure.unsafeFile, DebugStateSnapshot.Failure.database(SQLITE_BUSY), DebugStateSnapshot.Failure.unsupportedWAL]
         let unrecoverable: [Error] = [DebugStateSnapshot.Failure.cancelled, DebugStateSnapshot.Failure.unsafeDestination, DebugProfileAccessLease.Failure.busy, ProfileLocationError.releaseAlias("/fixture")]
         XCTAssertEqual(recoverable.map(DebugStateBootstrap.startEmptyCanRecover), Array(repeating: true, count: recoverable.count))
         XCTAssertEqual(unrecoverable.map(DebugStateBootstrap.startEmptyCanRecover), Array(repeating: false, count: unrecoverable.count))
+    }
+}
+
+final class DebugProfileInitializationTests: XCTestCase {
+    private let connectionKeys = [
+        "ClaudeCodeConnected", "CodexCLIConnected", "OpenCodeCLIConnected",
+        "CursorCLIConnected", "GrokBuildCLIConnected"
+    ]
+
+    func testNormalRelaunchPreservesEveryCLIConnectionAndDebugSettings() throws {
+        try withProfile { fixture, defaults, domain in
+            let sourceSettings = fixture.release.applicationSupportRoot.appendingPathComponent("Settings/globalSettings.json")
+            let debugSettings = fixture.debug.applicationSupportRoot.appendingPathComponent("Settings/globalSettings.json")
+            let releasePreferences = Dictionary(uniqueKeysWithValues: connectionKeys.map { ($0, false) })
+            try writeReleasePreferences(releasePreferences, fixture: fixture)
+            try fixture.writeJSON(["value": "production"], sourceSettings)
+
+            XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain), .imported)
+            XCTAssertEqual(try Data(contentsOf: debugSettings), try Data(contentsOf: sourceSettings))
+            for key in connectionKeys {
+                XCTAssertFalse(defaults.bool(forKey: key), key)
+                defaults.set(true, forKey: key)
+            }
+            defaults.set(17, forKey: "fontSize")
+            try fixture.writeJSON(["value": "debug-only"], debugSettings)
+            let debugBytes = try Data(contentsOf: debugSettings)
+            let receiptURL = fixture.debug.applicationSupportRoot.appendingPathComponent("debugSeed.json")
+            let receiptBytes = try Data(contentsOf: receiptURL)
+            try fixture.writeJSON(["value": "production changed"], sourceSettings)
+            try writeReleasePreferences(releasePreferences, fixture: fixture)
+
+            for _ in 0 ..< 2 {
+                XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain, preferenceSourceURL: fixture.home), .reused)
+                for key in connectionKeys {
+                    XCTAssertTrue(defaults.bool(forKey: key), key)
+                }
+                XCTAssertEqual(defaults.integer(forKey: "fontSize"), 17)
+                XCTAssertEqual(try Data(contentsOf: debugSettings), debugBytes)
+                XCTAssertEqual(try Data(contentsOf: receiptURL), receiptBytes)
+            }
+            XCTAssertEqual(try fixture.object(sourceSettings)["value"] as? String, "production changed")
+        }
+    }
+
+    func testExistingDebugFilesOrPreferencesWithoutReceiptAreAdopted() throws {
+        for hasExistingFile in [false, true] {
+            try withProfile { fixture, defaults, domain in
+                let existingFile = fixture.debug.applicationSupportRoot.appendingPathComponent("unknown-debug-state.bin")
+                let bytes = Data([0, 17, 255])
+                if hasExistingFile {
+                    try fixture.write(bytes, existingFile)
+                } else {
+                    defaults.set(false, forKey: "ClaudeCodeConnected")
+                }
+                let previousPreferences = defaults.persistentDomain(forName: domain) ?? [:]
+
+                XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain, preferenceSourceURL: fixture.home), .reused)
+
+                XCTAssertTrue(NSDictionary(dictionary: previousPreferences).isEqual(to: defaults.persistentDomain(forName: domain) ?? [:]))
+                XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.debug.applicationSupportRoot.appendingPathComponent("debugSeed.json").path))
+                if hasExistingFile { XCTAssertEqual(try Data(contentsOf: existingFile), bytes) }
+            }
+        }
+    }
+
+    func testLegacyReceiptWithoutPublicationIDDoesNotReplayOldPreferences() throws {
+        try withProfile { fixture, defaults, domain in
+            let receiptURL = fixture.debug.applicationSupportRoot.appendingPathComponent("debugSeed.json")
+            try fixture.writeJSON([
+                "version": 1, "profile": fixture.debug.preferencesDomain,
+                "cleanSlate": false, "copiedFiles": 0, "copiedBytes": 0, "seconds": 0
+            ], receiptURL)
+            let snapshotURL = fixture.debug.applicationSupportRoot.appendingPathComponent("seedPreferences.plist")
+            let staleSnapshot = Data("not a plist: warm launches must not load this snapshot".utf8)
+            try fixture.write(staleSnapshot, snapshotURL)
+            defaults.set(true, forKey: "CodexCLIConnected")
+            defaults.set(19, forKey: "fontSize")
+
+            XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain, preferenceSourceURL: fixture.home), .reused)
+
+            XCTAssertTrue(defaults.bool(forKey: "CodexCLIConnected"))
+            XCTAssertEqual(defaults.integer(forKey: "fontSize"), 19)
+            XCTAssertNil(defaults.object(forKey: DebugStateBootstrap.preferencesIDKey))
+            XCTAssertEqual(try Data(contentsOf: snapshotURL), staleSnapshot)
+        }
+    }
+
+    func testExplicitCleanSlateRemainsEmptyUntilAnotherExplicitReset() throws {
+        try withProfile { fixture, defaults, domain in
+            try writeReleasePreferences(["CodexCLIConnected": true], fixture: fixture)
+            let sourceSettings = fixture.release.applicationSupportRoot.appendingPathComponent("Settings/globalSettings.json")
+            let debugSettings = fixture.debug.applicationSupportRoot.appendingPathComponent("Settings/globalSettings.json")
+            try fixture.writeJSON(["value": "production"], sourceSettings)
+            XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain), .imported)
+
+            XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain, cleanSlate: true), .reset)
+            let resetID = try XCTUnwrap(defaults.string(forKey: DebugStateBootstrap.preferencesIDKey))
+            XCTAssertNil(defaults.object(forKey: "CodexCLIConnected"))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: debugSettings.path))
+            XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain), .reused)
+            XCTAssertNil(defaults.object(forKey: "CodexCLIConnected"))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: debugSettings.path))
+            XCTAssertEqual(defaults.string(forKey: DebugStateBootstrap.preferencesIDKey), resetID)
+
+            defaults.set(true, forKey: "CodexCLIConnected")
+            try fixture.writeJSON(["value": "new debug settings"], debugSettings)
+            XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain, cleanSlate: true), .reset)
+            XCTAssertNil(defaults.object(forKey: "CodexCLIConnected"))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: debugSettings.path))
+            XCTAssertNotEqual(defaults.string(forKey: DebugStateBootstrap.preferencesIDKey), resetID)
+            XCTAssertEqual(try fixture.object(sourceSettings)["value"] as? String, "production")
+        }
+    }
+
+    func testInterruptedPreferencePublicationRecoversOnceWithoutRecapturingProduction() throws {
+        try withProfile { fixture, defaults, domain in
+            let sourceSettings = fixture.release.applicationSupportRoot.appendingPathComponent("Settings/globalSettings.json")
+            let debugSettings = fixture.debug.applicationSupportRoot.appendingPathComponent("Settings/globalSettings.json")
+            try fixture.writeJSON(["value": "captured production"], sourceSettings)
+            defaults.set(false, forKey: "ClaudeCodeConnected")
+            let receipt = try DebugStateBootstrap.seed(
+                locations: fixture.debug,
+                cleanSlate: false,
+                releasePreferences: ["ClaudeCodeConnected": true, "fontSize": 15]
+            )
+            try fixture.writeJSON(["value": "new production state"], sourceSettings)
+
+            XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain, preferenceSourceURL: fixture.home), .recoveredPreferences)
+            XCTAssertTrue(defaults.bool(forKey: "ClaudeCodeConnected"))
+            XCTAssertEqual(defaults.integer(forKey: "fontSize"), 15)
+            XCTAssertEqual(defaults.string(forKey: DebugStateBootstrap.preferencesIDKey), try XCTUnwrap(receipt.preferencesID).uuidString)
+            XCTAssertEqual(try fixture.object(debugSettings)["value"] as? String, "captured production")
+
+            defaults.set(false, forKey: "ClaudeCodeConnected")
+            defaults.set(21, forKey: "fontSize")
+            XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain, preferenceSourceURL: fixture.home), .reused)
+            XCTAssertFalse(defaults.bool(forKey: "ClaudeCodeConnected"))
+            XCTAssertEqual(defaults.integer(forKey: "fontSize"), 21)
+        }
+    }
+
+    func testHeadlessWriterAllowsReuseButPreventsImportAndReset() throws {
+        for hasExistingPreferences in [false, true] {
+            try withProfile { fixture, defaults, domain in
+                if hasExistingPreferences { defaults.set(true, forKey: "CursorCLIConnected") }
+                do {
+                    let writer = try DebugProfileAccessLease.acquire(locations: fixture.debug, exclusive: false)
+                    defer { withExtendedLifetime(writer) {} }
+                    if hasExistingPreferences {
+                        XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain), .reused)
+                    } else {
+                        XCTAssertThrowsError(try prepare(fixture, defaults: defaults, domain: domain)) { error in
+                            guard case DebugProfileAccessLease.Failure.busy = error else { return XCTFail("Unexpected error: \(error)") }
+                        }
+                    }
+                    XCTAssertThrowsError(try prepare(fixture, defaults: defaults, domain: domain, cleanSlate: true)) { error in
+                        guard case DebugProfileAccessLease.Failure.busy = error else { return XCTFail("Unexpected error: \(error)") }
+                    }
+                }
+                XCTAssertEqual(defaults.bool(forKey: "CursorCLIConnected"), hasExistingPreferences)
+                XCTAssertNil(defaults.object(forKey: DebugStateBootstrap.preferencesIDKey))
+                XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.debug.applicationSupportRoot.appendingPathComponent("debugSeed.json").path))
+            }
+        }
+    }
+
+    func testFailedInitialImportLeavesNoCompletedProfileAndCanRetry() throws {
+        try withProfile { fixture, defaults, domain in
+            let sourcePreferences = releasePreferencesURL(fixture)
+            try fixture.write(Data("invalid property list".utf8), sourcePreferences)
+
+            XCTAssertThrowsError(try prepare(fixture, defaults: defaults, domain: domain))
+            XCTAssertTrue((defaults.persistentDomain(forName: domain) ?? [:]).isEmpty)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.debug.applicationSupportRoot.path))
+
+            try writeReleasePreferences(["GrokBuildCLIConnected": true], fixture: fixture)
+            XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain), .imported)
+            XCTAssertTrue(defaults.bool(forKey: "GrokBuildCLIConnected"))
+        }
+    }
+
+    func testFinderBookkeepingAloneDoesNotSuppressInitialImport() throws {
+        try withProfile { fixture, defaults, domain in
+            try fixture.write(Data([0]), fixture.debug.applicationSupportRoot.appendingPathComponent(".DS_Store"))
+            try writeReleasePreferences(["OpenCodeCLIConnected": true], fixture: fixture)
+
+            XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain), .imported)
+            XCTAssertTrue(defaults.bool(forKey: "OpenCodeCLIConnected"))
+        }
+    }
+
+    private func withProfile(_ body: (DebugStateBootstrapTests.Fixture, UserDefaults, String) throws -> Void) throws {
+        let fixture = DebugStateBootstrapTests.Fixture()
+        let domain = "DebugProfileInitializationTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: domain))
+        defer {
+            defaults.removePersistentDomain(forName: domain)
+            fixture.cleanup()
+        }
+        try body(fixture, defaults, domain)
+    }
+
+    private func prepare(
+        _ fixture: DebugStateBootstrapTests.Fixture,
+        defaults: UserDefaults,
+        domain: String,
+        cleanSlate: Bool = false,
+        preferenceSourceURL: URL? = nil
+    ) throws -> DebugStateBootstrap.PreparationAction {
+        try DebugStateBootstrap.prepareProfile(
+            locations: fixture.debug,
+            defaults: defaults,
+            preferencesDomain: domain,
+            cleanSlate: cleanSlate,
+            preferenceSourceURL: preferenceSourceURL
+        ).action
+    }
+
+    private func releasePreferencesURL(_ fixture: DebugStateBootstrapTests.Fixture) -> URL {
+        fixture.home.appendingPathComponent("Library/Preferences/\(fixture.release.preferencesDomain).plist")
+    }
+
+    private func writeReleasePreferences(_ preferences: [String: Any], fixture: DebugStateBootstrapTests.Fixture) throws {
+        try fixture.write(
+            PropertyListSerialization.data(fromPropertyList: preferences, format: .binary, options: 0),
+            releasePreferencesURL(fixture)
+        )
     }
 }

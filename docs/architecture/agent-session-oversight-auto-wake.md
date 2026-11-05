@@ -116,8 +116,9 @@ ascending as a deterministic tie-break). The runtime caches the per-grantee proj
 decoding all history on every status/render. Only this 16-item projection is bounded: the backing
 `scopeEndings` map and persisted terminal rows remain unbounded; retention pruning is deferred.
 Restore-time drops in `recoverContinuity` and `reactivate` (deleted sessions, orphan grants, invalid
-children) still record no ending evidence. Passive expiry projection can also hide a grant before
-lazy expiry materializes its ending. These are remaining observability gaps, not explained endings.
+children) still record no ending evidence. These are remaining observability gaps, not explained
+endings. A scope-owner deadline now materializes live expiry without a later query; authority checks
+still enforce wall-clock expiry independently if deadline execution is delayed.
 `record(id:)` remains authority-only; only status uses
 `statusRecord(id:)` to project persisted history. MCP status remains caller-owned; knowing another
 scope UUID does not authorize reading its historical details. Scope status also reports continuity
@@ -140,6 +141,28 @@ defect in this subsystem.
 | Wake coordinator | Temporary admission policy: may this lane start an automatic turn *right now*? | `AgentModeViewModel+SessionLinkAutoWake` |
 
 The lane board is derived data in the existing passive observation pipeline, not a fifth owner. The target view model combines its own run outcome, stamped failure reason, send-readiness blockers, and a current child-session census into the observation snapshot; the runtime bridge publishes that snapshot through link authority, and `poll`/`wait` render it. A board change can advance the existing `wait(until: "change")` cursor, but it creates no new status or attention edge for the passive reducer, changes no Auto-wake admission rule, and persists no board state.
+
+Existing managed-link status and attention rows also carry cached `context_used_percent`,
+`context_count_confidence`, `run_outcome`, `has_pending_interaction`, and
+`direct_running_helpers`. Missing context figures/confidence and unavailable child censuses are
+rendered as `unknown`, not zero; a known empty census renders zero direct running helpers. A
+workspace-mismatched or unbuilt census is unavailable. These are the accepted observation's cached
+facts, not fresh telemetry, interaction details, a context-change wake, or a compaction/liveness
+notification guarantee. Poll JSON remains unchanged. A census-availability-only publication refreshes
+private cached state and its source high-water mark, but does not advance public change sequences,
+notify change waiters, or signal send readiness. Full internal value equality still distinguishes it.
+
+This supplemental metadata refreshes pending rows without advancing status/attention occurrence
+identity, status timestamps, receipt cutoffs, or the wake fingerprint. An older accepted receipt may
+settle the row even if newer cached decoration was not delivered: decoration is not separately owed
+content. Both row kinds share the existing renderer and its byte budget. Only rendered managed rows
+contribute exact Manage requirements to the immutable claim. Existing consent, capability-elevation,
+and link-revocation fences are rechecked at physical handoff, including after asynchronous proof;
+withdrawal discloses no managed bytes and acknowledges no receipt. After a managed proof suspension,
+pending batches are reclaimed against the complete current inventory (including watch-only rows) and
+observer eligibility. Already accepted recovery instead preserves its immutable bytes under the existing
+reuse contract. All provider adapters recheck their existing ownership, Stop, and route fences after
+proof regardless of whether the claim includes local-input decoration.
 
 `wait` accepts returned `wait_cursor` strings directly in `cursors`, without a separate session ID
 list. Existing `{session_id, cursor}` records remain valid and may be mixed with strings. The link
@@ -216,6 +239,9 @@ Rules that hold the scope design together:
 - **Cards bind arguments.** A batch card is bound to the scope generation, operation, item set,
   idempotency key, and a canonical digest of the call's other arguments. Changed arguments under
   the same key conflict instead of riding the approval, and an approval applies once.
+  Worktree-release rows also freeze the selected worktree IDs: a changed selection refuses before
+  application, and the host's mutation predicate fences the complete starting binding set across
+  suspensions. An explicit `worktree_id` card shows only that selected effect.
 - **Scopes are keyed by session, not by incarnation.** Unlike link grants, a scope is durable and is
   granted to a session UUID, so every live incarnation of that session (for example the same session
   open in two windows) holds it. The caller is still resolved only from exact server-owned run
@@ -271,7 +297,9 @@ Rules that hold the scope design together:
   claimed with `beginApplying` and settled with `finishApplying`, including when unticking brought
   the batch to or below the threshold, so a successful application always ends `applied` and a
   failed one (a thrown error, or a handler result that refuses the whole batch with a top-level
-  `denied`) returns the card to `approved`. Per-item refusals inside an applied batch consume it. Undo tokens are
+  `denied`) returns the card to `approved`. A wholly refused `worktree_release` (`not_applied`)
+  likewise keeps its approval for retry. Retire retains its existing single-use no-op and partial
+  receipt contract. Per-item refusals inside an applied or partially applied batch consume it. Undo tokens are
   re-authorized as the original operation over the original targets at redemption.
 
 Structural operations (Milestone 1, Lane C) keep those rules. They register through the same front
@@ -1496,7 +1524,12 @@ limits. It does not widen membership, grant human-only actions, or enable read-o
 Ordinary Grant still cannot exceed the request. Active delegations display the actual capabilities
 and allow immediate revocation. No tool argument can invoke Grant all or enable auto-approval.
 
-Grant, denial, and revocation generate app-authored decision notices for the requesting session.
+Grant, denial, revocation, and live expiry generate app-authored decision notices for the requesting session.
+The scope runtime owns one cancellable deadline at the earliest active grant's expiry, rearmed on
+scope changes and restoration and cancelled on termination. Its sweep expires every overdue scope
+and attenuated descendant through the existing authority, persistence, confirmation invalidation,
+and catalog publication paths. Query-triggered expiry remains a fallback; a terminal scope emits no
+second expiry notice. Expiry notices use the same requester delivery queue, not passive Auto-wake.
 These use noncomposer submission after the active turn settles, without reading/clearing the user's
 draft, attachments, workflow or interview state. The queue is bound to the presenting session and
 its Stop fence. It is not attention, a link grant, an interaction response, or passive Auto-wake;

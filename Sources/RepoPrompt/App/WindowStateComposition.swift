@@ -83,6 +83,7 @@ enum WindowStateCompositionFactory {
         keyManager injectedKeyManager: KeyManager? = nil,
         aiQueriesServiceFactory: ((_ keyManager: KeyManager) -> AIQueriesService)? = nil,
         workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
+        workspaceSearchService injectedWorkspaceSearchService: WorkspaceSearchService? = nil,
         storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
         workspaceSwitchTimingPolicy: WorkspaceSwitchTimingPolicy = .production,
         loadStoredAPISettingsDataOnInit: Bool = true,
@@ -121,7 +122,7 @@ enum WindowStateCompositionFactory {
             )
         #endif
         let workspaceFileContextStore = injectedWorkspaceFileContextStore ?? defaultWorkspaceFileContextStore
-        let workspaceSearchService = WorkspaceSearchService()
+        let workspaceSearchService = injectedWorkspaceSearchService ?? WorkspaceSearchService()
         let workspaceFilesViewModel = WorkspaceFilesViewModel(
             workspaceFileContextStore: workspaceFileContextStore,
             restorePerfRecorder: AppWorkspaceRestorePerfRecorder()
@@ -276,6 +277,8 @@ enum WindowStateCompositionFactory {
             promptManager: promptManager,
             workspaceManager: workspaceManager,
             mcpServer: mcpServer,
+            attachmentPersistenceIsSuppressed: { AppLaunchConfiguration.current.suppressesAgentSessionPersistence },
+            attachmentSweepViewModels: { WindowStatesManager.shared.allWindows.map(\.agentModeViewModel) },
             oracleViewModel: oracleViewModel,
             applyEditsApprovalStore: applyEditsApprovalStore,
             modelRouterSettingsStore: settingsStore,

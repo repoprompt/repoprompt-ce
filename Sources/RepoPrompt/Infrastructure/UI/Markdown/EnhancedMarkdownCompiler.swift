@@ -300,8 +300,14 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
         for child in blockQuote.children {
             let childString = visit(child).mutableCopy() as! NSMutableAttributedString
 
-            // Apply paragraph style to the entire child string
-            childString.addAttribute(.paragraphStyle, value: paragraphStyle, range: NSRange(location: 0, length: childString.length))
+            if child is Markdown.ListItemContainer || child is Markdown.Table {
+                // Lists and tables carry their own direction, indentation, tab stops and table
+                // blocks; indent them by the quote instead of replacing their styles.
+                composeQuoteIndentation(into: childString, quoteStyle: paragraphStyle)
+            } else {
+                // Apply paragraph style to the entire child string
+                childString.addAttribute(.paragraphStyle, value: paragraphStyle, range: NSRange(location: 0, length: childString.length))
+            }
 
             // Adjust text color for quote, but preserve link colors.
             // Use a dynamic system color so quoted text stays readable in both
@@ -318,6 +324,35 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
             result.append(NSAttributedString(string: "\n\n", attributes: attributes(font: NSFont.systemFont(ofSize: fontSize).rounded())))
         }
         return result
+    }
+
+    /// Adds the quote's indent to every paragraph style in `content` while keeping direction,
+    /// alignment and tab-stop layout; table cells (`textBlocks`) are left untouched and unstyled
+    /// runs take the plain quote style.
+    private func composeQuoteIndentation(
+        into content: NSMutableAttributedString,
+        quoteStyle: NSParagraphStyle
+    ) {
+        let indent = quoteStyle.headIndent
+        let fullRange = NSRange(location: 0, length: content.length)
+        var updates: [(NSRange, NSParagraphStyle)] = []
+        content.enumerateAttribute(.paragraphStyle, in: fullRange) { value, range, _ in
+            guard let existing = value as? NSParagraphStyle else {
+                updates.append((range, quoteStyle))
+                return
+            }
+            guard existing.textBlocks.isEmpty else { return }
+            let composed = existing.mutableCopy() as! NSMutableParagraphStyle
+            composed.headIndent += indent
+            composed.firstLineHeadIndent += indent
+            composed.tabStops = existing.tabStops.map { tab in
+                NSTextTab(textAlignment: tab.alignment, location: tab.location + indent, options: tab.options)
+            }
+            updates.append((range, composed))
+        }
+        for (range, style) in updates {
+            content.addAttribute(.paragraphStyle, value: style, range: range)
+        }
     }
 
     mutating func visitCustomBlock(_ customBlock: Markdown.CustomBlock) -> NSAttributedString {
@@ -366,11 +401,23 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
     // MARK: - List Item ------------------------------------------------------
 
     mutating func visitListItem(_ listItem: Markdown.ListItem) -> NSAttributedString {
-        let result = NSMutableAttributedString()
+        renderListItemChildren(listItem).body
+    }
 
-        // Render children
+    /// Renders each child of `listItem` exactly once and records the UTF-16 ranges of the prose
+    /// paragraphs the item owns directly (not those of nested lists, code blocks, tables or quotes).
+    private mutating func renderListItemChildren(
+        _ listItem: Markdown.ListItem
+    ) -> (body: NSMutableAttributedString, ownedParagraphRanges: [NSRange]) {
+        let result = NSMutableAttributedString()
+        var ownedParagraphRanges: [NSRange] = []
+
         for child in listItem.children {
+            let start = result.length
             result.append(visit(child))
+            if child is Markdown.Paragraph {
+                ownedParagraphRanges.append(NSRange(location: start, length: result.length - start))
+            }
         }
 
         // Trailing newline (single) when there are more items following
@@ -380,7 +427,71 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
                 attributes: attributes(font: NSFont.systemFont(ofSize: fontSize).rounded())
             ))
         }
-        return result
+        return (result, ownedParagraphRanges)
+    }
+
+    /// One list item: `marker` (already carrying `markerStyle`) followed by the rendered children.
+    ///
+    /// The item's first line (marker plus the first TextKit paragraph of a leading prose
+    /// paragraph) uses `markerStyle`; every later TextKit paragraph of the prose paragraphs the
+    /// item owns (hard-break lines, loose-list paragraphs) uses `continuationStyle`, so they keep
+    /// the list's direction and start at the content indent. Nested lists, code blocks, tables and
+    /// other blocks keep their own paragraph styles; when the item does not start with a prose
+    /// paragraph only the marker itself is styled, so a leading block's style and `textBlocks`
+    /// are never overwritten.
+    private mutating func renderListItem(
+        _ listItem: Markdown.ListItem,
+        marker: NSAttributedString,
+        markerStyle: NSParagraphStyle,
+        continuationStyle: NSParagraphStyle
+    ) -> NSAttributedString {
+        let (body, ownedParagraphRanges) = renderListItemChildren(listItem)
+        body.insert(marker, at: 0)
+        let markerLength = marker.length
+        let string = body.string as NSString
+
+        for paragraphRange in ownedParagraphRanges {
+            let range = NSRange(location: paragraphRange.location + markerLength, length: paragraphRange.length)
+            guard range.length > 0 else { continue }
+            var continuationStart = range.location
+            if paragraphRange.location == 0 {
+                // Leading prose paragraph: its first TextKit paragraph shares the marker's line.
+                let firstLine = string.paragraphRange(for: NSRange(location: range.location, length: 0))
+                continuationStart = min(NSMaxRange(firstLine), NSMaxRange(range))
+                body.addAttribute(
+                    .paragraphStyle,
+                    value: markerStyle,
+                    range: NSRange(location: range.location, length: continuationStart - range.location)
+                )
+            }
+            if continuationStart < NSMaxRange(range) {
+                body.addAttribute(
+                    .paragraphStyle,
+                    value: continuationStyle,
+                    range: NSRange(location: continuationStart, length: NSMaxRange(range) - continuationStart)
+                )
+            }
+        }
+        return body
+    }
+
+    /// Marker-line and continuation styles for one list level. Continuation paragraphs start at the
+    /// content tab stop (`headIndent`) instead of the marker column.
+    private func listItemParagraphStyles(
+        direction: NSWritingDirection?,
+        markerColumnEnd: CGFloat,
+        contentStart: CGFloat
+    ) -> (marker: NSParagraphStyle, continuation: NSParagraphStyle) {
+        let markerStyle = NSMutableParagraphStyle()
+        MarkdownStructureDirection.apply(direction, to: markerStyle)
+        markerStyle.tabStops = [
+            NSTextTab(textAlignment: .right, location: markerColumnEnd),
+            NSTextTab(textAlignment: .left, location: contentStart)
+        ]
+        markerStyle.headIndent = contentStart
+        let continuationStyle = markerStyle.mutableCopy() as! NSMutableParagraphStyle
+        continuationStyle.firstLineHeadIndent = contentStart
+        return (markerStyle, continuationStyle)
     }
 
     private func listParagraphStyle(depth: Int) -> NSParagraphStyle {
@@ -419,44 +530,42 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
                 attributes: [.font: numeralFont]
             ).size().width
         )
+        // One direction per list keeps markers and continuation indents on the same side for
+        // every item, even when an item starts with a code span or a word in the other script.
+        let listDirection = MarkdownStructureDirection.baseWritingDirection(for: orderedList)
+
+        let baseLeftMargin: CGFloat = 15.0
+        let leftMarginOffset = baseLeftMargin + (20.0 * CGFloat(orderedList.listDepth))
+        let spacingFromIndex: CGFloat = 8.0
+        let firstTabLocation = leftMarginOffset + numeralColumnWidth
+        let styles = listItemParagraphStyles(
+            direction: listDirection,
+            markerColumnEnd: firstTabLocation,
+            contentStart: firstTabLocation + spacingFromIndex
+        )
 
         for (idx, child) in orderedList.children.enumerated() {
             guard let listItem = child as? Markdown.ListItem else { continue }
 
-            var listItemAttributes: [NSAttributedString.Key: Any] = [:]
-            let paragraphStyle = NSMutableParagraphStyle()
-
-            let baseLeftMargin: CGFloat = 15.0
-            let leftMarginOffset = baseLeftMargin + (20.0 * CGFloat(orderedList.listDepth))
-            let spacingFromIndex: CGFloat = 8.0
-            let firstTabLocation = leftMarginOffset + numeralColumnWidth
-            let secondTabLocation = firstTabLocation + spacingFromIndex
-
-            paragraphStyle.tabStops = [
-                NSTextTab(textAlignment: .right, location: firstTabLocation),
-                NSTextTab(textAlignment: .left, location: secondTabLocation)
-            ]
-            paragraphStyle.headIndent = secondTabLocation
-
-            listItemAttributes[.paragraphStyle] = paragraphStyle
-            listItemAttributes[.font] = bodyFont
-            listItemAttributes[.listDepth] = orderedList.listDepth
+            var numberAttributes: [NSAttributedString.Key: Any] = [:]
+            numberAttributes[.paragraphStyle] = styles.marker
+            numberAttributes[.font] = numeralFont
+            numberAttributes[.listDepth] = orderedList.listDepth
             // Use the same text colour we apply everywhere else so markers react to dark/light mode
             let resolvedColour = forceTextColor ?? Color.primary
-            listItemAttributes[.foregroundColor] = NSColor(resolvedColour)
-
-            let body = visit(listItem).mutableCopy() as! NSMutableAttributedString
+            numberAttributes[.foregroundColor] = NSColor(resolvedColour)
 
             // Prefix with the number using numeral font
-            var numberAttributes = listItemAttributes
-            numberAttributes[.font] = numeralFont
             let numberString = NSAttributedString(
                 string: "\t\(idx + Int(orderedList.startIndex)).\t",
                 attributes: numberAttributes
             )
-            body.insert(numberString, at: 0)
-
-            result.append(body)
+            result.append(renderListItem(
+                listItem,
+                marker: numberString,
+                markerStyle: styles.marker,
+                continuationStyle: styles.continuation
+            ))
         }
 
         // Trailing spacing rules (single NL if nested, double otherwise)
@@ -476,45 +585,39 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
         let result = NSMutableAttributedString()
 
         let font = NSFont.systemFont(ofSize: fontSize, weight: .regular).rounded()
+        // See `visitOrderedList`: one direction per list.
+        let listDirection = MarkdownStructureDirection.baseWritingDirection(for: unorderedList)
+
+        let baseLeftMargin: CGFloat = 15.0
+        let leftMarginOffset = baseLeftMargin + (20.0 * CGFloat(unorderedList.listDepth))
+        let spacingFromIndex: CGFloat = 8.0
+        // Width of the bullet glyph so text after aligns nicely
+        let bulletWidth = ceil(
+            NSAttributedString(string: "•", attributes: [.font: font]).size().width
+        )
+        let firstTabLocation = leftMarginOffset + bulletWidth
+        let styles = listItemParagraphStyles(
+            direction: listDirection,
+            markerColumnEnd: firstTabLocation,
+            contentStart: firstTabLocation + spacingFromIndex
+        )
 
         // Iterate over each list item so we can prepend bullet + tab stops
         for case let listItem as Markdown.ListItem in unorderedList.children {
-            var listItemAttributes: [NSAttributedString.Key: Any] = [:]
-
-            // Paragraph-style identical to reference implementation
-            let paragraphStyle = NSMutableParagraphStyle()
-            let baseLeftMargin: CGFloat = 15.0
-            let leftMarginOffset = baseLeftMargin + (20.0 * CGFloat(unorderedList.listDepth))
-            let spacingFromIndex: CGFloat = 8.0
-
-            // Width of the bullet glyph so text after aligns nicely
-            let bulletWidth = ceil(
-                NSAttributedString(string: "•", attributes: [.font: font]).size().width
-            )
-            let firstTabLocation = leftMarginOffset + bulletWidth
-            let secondTabLocation = firstTabLocation + spacingFromIndex
-
-            paragraphStyle.tabStops = [
-                NSTextTab(textAlignment: .right, location: firstTabLocation),
-                NSTextTab(textAlignment: .left, location: secondTabLocation)
-            ]
-            paragraphStyle.headIndent = secondTabLocation
-
-            listItemAttributes[.paragraphStyle] = paragraphStyle
-            listItemAttributes[.font] = font
-            listItemAttributes[.listDepth] = unorderedList.listDepth
+            var bulletAttributes: [NSAttributedString.Key: Any] = [:]
+            bulletAttributes[.paragraphStyle] = styles.marker
+            bulletAttributes[.font] = font
+            bulletAttributes[.listDepth] = unorderedList.listDepth
             // Use dynamic colour so the bullet adapts to the current appearance
             let resolvedColour = forceTextColor ?? Color.primary
-            listItemAttributes[.foregroundColor] = NSColor(resolvedColour)
+            bulletAttributes[.foregroundColor] = NSColor(resolvedColour)
 
-            // Render the list item body
-            let body = visit(listItem).mutableCopy() as! NSMutableAttributedString
-            // Prefix bullet and tab characters
-            body.insert(
-                NSAttributedString(string: "\t•\t", attributes: listItemAttributes),
-                at: 0
-            )
-            result.append(body)
+            result.append(renderListItem(
+                listItem,
+                marker: NSAttributedString(string: "\t•\t", attributes: bulletAttributes),
+                markerStyle: styles.marker,
+                continuationStyle: styles.continuation
+            ))
         }
 
         // After the list, insert two new-lines unless this list is itself inside another one
@@ -595,10 +698,14 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
 
         guard !rows.isEmpty else { return NSAttributedString() }
         removeCanonicalSeparatorRows(from: &rows, headerRowCount: &headerRowCount)
+        // One direction per table: every NSTextTable cell paragraph shares it, so alignment does
+        // not depend on whether a given cell holds Hebrew, Arabic or English. The plain fallback
+        // uses it for row alignment and keeps the same left-to-right column order.
+        let tableDirection = MarkdownStructureDirection.baseWritingDirection(for: table)
         if shouldUsePlainTableFallback(rows) {
-            return renderPlainTable(rows, table: table)
+            return renderPlainTable(rows, table: table, direction: tableDirection)
         }
-        return renderTextTable(rows, headerRowCount: headerRowCount, table: table)
+        return renderTextTable(rows, headerRowCount: headerRowCount, table: table, direction: tableDirection)
     }
 
     private func shouldUsePlainTableFallback(_ rows: [[NSAttributedString]]) -> Bool {
@@ -611,13 +718,34 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
 
     private func renderPlainTable(
         _ rows: [[NSAttributedString]],
-        table sourceTable: Markdown.Table
+        table sourceTable: Markdown.Table,
+        direction: NSWritingDirection?
     ) -> NSAttributedString {
         let bodyFont = NSFont.systemFont(ofSize: max(fontSize - 1, 10), weight: .regular).rounded()
         let bodyAttributes: [NSAttributedString.Key: Any] = [
             .font: bodyFont,
             .foregroundColor: NSColor(forceTextColor ?? Color.primary)
         ]
+        // Column order must not depend on which script a row's cells hold, and must match the
+        // NSTextTable path, which TextKit lays out in string order (column 0 on the left) for every
+        // direction. A single paragraph direction cannot do that: neutral " | " separators between
+        // two same-direction cells take that direction and the row reorders. So, display-only:
+        // - every row is a left-to-right paragraph (right-aligned for a right-to-left table), and
+        // - every non-empty cell is wrapped in a left-to-right embedding, prepended to any direction
+        //   it already carries (inline code), while separators stay outside every cell embedding.
+        // Embeddings are not isolates: bidi controls already inside a cell (an unmatched isolate
+        // initiator in particular) can still reorder its row. A table without any strong character
+        // (nil direction) gets no explicit direction at all.
+        let rowParagraphStyle = NSMutableParagraphStyle()
+        if direction != nil {
+            rowParagraphStyle.baseWritingDirection = .leftToRight
+            if direction == .rightToLeft {
+                rowParagraphStyle.alignment = .right
+            }
+        }
+        let cellEmbedding = NSNumber(
+            value: NSWritingDirection.leftToRight.rawValue | NSWritingDirectionFormatType.embedding.rawValue
+        )
         let result = NSMutableAttributedString()
         if sourceTable.hasPredecessor {
             result.append(NSAttributedString(string: "\n", attributes: bodyAttributes))
@@ -626,15 +754,43 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
             if rowIndex > 0 {
                 result.append(NSAttributedString(string: "\n", attributes: bodyAttributes))
             }
+            let rowStart = result.length
             for (columnIndex, cell) in row.enumerated() {
                 if columnIndex > 0 {
                     result.append(NSAttributedString(string: "  |  ", attributes: bodyAttributes))
                 }
-                result.append(cell)
+                if direction != nil, cell.length > 0 {
+                    result.append(Self.prependingWritingDirection(cellEmbedding, to: cell))
+                } else {
+                    result.append(cell)
+                }
             }
+            result.addAttribute(
+                .paragraphStyle,
+                value: rowParagraphStyle,
+                range: NSRange(location: rowStart, length: result.length - rowStart)
+            )
         }
         if sourceTable.hasSuccessorConsideringBlockElements {
             result.append(NSAttributedString(string: "\n", attributes: bodyAttributes))
+        }
+        return result
+    }
+
+    /// `attributed` with `embedding` added as the outermost `.writingDirection` level over its
+    /// whole range; existing (inner) levels such as inline code's embedding are kept after it.
+    private static func prependingWritingDirection(
+        _ embedding: NSNumber,
+        to attributed: NSAttributedString
+    ) -> NSAttributedString {
+        let result = attributed.mutableCopy() as! NSMutableAttributedString
+        let fullRange = NSRange(location: 0, length: result.length)
+        var updates: [(NSRange, [NSNumber])] = []
+        result.enumerateAttribute(.writingDirection, in: fullRange) { value, range, _ in
+            updates.append((range, [embedding] + ((value as? [NSNumber]) ?? [])))
+        }
+        for (range, levels) in updates {
+            result.addAttribute(.writingDirection, value: levels, range: range)
         }
         return result
     }
@@ -668,7 +824,8 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
     private func renderTextTable(
         _ rows: [[NSAttributedString]],
         headerRowCount: Int,
-        table sourceTable: Markdown.Table
+        table sourceTable: Markdown.Table,
+        direction: NSWritingDirection?
     ) -> NSAttributedString {
         let columnCount = rows.map(\.count).max() ?? 0
         guard columnCount > 0 else { return NSAttributedString() }
@@ -704,7 +861,8 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
                 )
                 let paragraphStyle = tableParagraphStyle(
                     block: block,
-                    alignment: tableTextAlignment(for: sourceTable, columnIndex: columnIndex)
+                    alignment: tableTextAlignment(for: sourceTable, columnIndex: columnIndex),
+                    direction: direction
                 )
                 let cell = columnIndex < row.count
                     ? row[columnIndex]
@@ -756,10 +914,15 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
         return block
     }
 
-    private func tableParagraphStyle(block: NSTextTableBlock, alignment: NSTextAlignment) -> NSParagraphStyle {
+    private func tableParagraphStyle(
+        block: NSTextTableBlock,
+        alignment: NSTextAlignment,
+        direction: NSWritingDirection?
+    ) -> NSParagraphStyle {
         let paragraphStyle = NSMutableParagraphStyle()
         paragraphStyle.textBlocks = [block]
         paragraphStyle.alignment = alignment
+        MarkdownStructureDirection.apply(direction, to: paragraphStyle)
         paragraphStyle.lineBreakMode = .byWordWrapping
         paragraphStyle.paragraphSpacing = 0
         paragraphStyle.paragraphSpacingBefore = 0
@@ -770,7 +933,11 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
         let alignment = columnIndex < table.columnAlignments.count
             ? table.columnAlignments[columnIndex]
             : nil
-        switch alignment ?? .left {
+        // An unspecified column follows the table's direction (leading edge); LTR tables are
+        // unchanged because `.natural` resolves to left there.
+        switch alignment {
+        case nil:
+            return .natural
         case .left:
             return .left
         case .right:

@@ -1146,6 +1146,8 @@ import XCTest
                 let liveOrder = manager.fileManager.snapshotExpandedFolderFullPaths()
                 XCTAssertEqual(liveOrder.count, 2)
                 manager.workspaces[index].composeTabs[0].expandedFolders = Array(liveOrder.reversed())
+                // A queued equal UI observation must not turn Set ordering into a content edit.
+                manager.publishActiveComposeTabSnapshot()
                 manager.markWorkspaceDirty(workspaceID: fixture.workspace.id)
                 let reorderSave = await manager.pollAndSaveStateWithOutcomeAsync()
                 XCTAssertTrue(reorderSave.acceptedForLifecycleAdmission, "\(reorderSave)")

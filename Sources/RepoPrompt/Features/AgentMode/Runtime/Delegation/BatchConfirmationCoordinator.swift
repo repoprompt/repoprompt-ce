@@ -8,6 +8,15 @@ struct BatchConfirmationItem: Identifiable, Hashable {
     let title: String
     /// Human-readable per-item effect, for example "Unbind worktree and mark stale".
     let effect: String
+    /// Exact release effects shown to the user, not a selector to resolve again at apply time.
+    let worktreeIDs: Set<String>?
+
+    init(sessionID: UUID, title: String, effect: String, worktreeIDs: Set<String>? = nil) {
+        self.sessionID = sessionID
+        self.title = title
+        self.effect = effect
+        self.worktreeIDs = worktreeIDs
+    }
 
     var id: UUID {
         sessionID

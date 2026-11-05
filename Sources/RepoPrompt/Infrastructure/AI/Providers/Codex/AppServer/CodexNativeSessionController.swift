@@ -550,6 +550,11 @@ final class CodexNativeSessionController {
         let turnID: String?
     }
 
+    struct ResponseUsage: Equatable {
+        let inputTokens: Int
+        let outputTokens: Int
+    }
+
     enum Event {
         case assistantDelta(String)
         case canonicalAssistantDelta(text: String, scope: ItemScope)
@@ -557,6 +562,7 @@ final class CodexNativeSessionController {
         case reasoningDelta(ReasoningDeltaPayload)
         case reasoningCompleted(ReasoningCompletionPayload)
         case tokenUsage(AgentContextUsage)
+        case responseUsage(threadID: String, turnID: String, responseID: String?, usage: ResponseUsage?)
         case turnStarted(turnID: String?)
         case turnCompleted(turnID: String?, status: TurnStatus, failure: TurnFailure? = nil)
         case contextCompacted(turnID: String?)
@@ -712,6 +718,7 @@ final class CodexNativeSessionController {
         /// A finite timeout prevents indefinite hangs when the app-server becomes wedged.
         /// Does NOT apply to turn/start, which can block for extended model reasoning.
         var requestTimeout: TimeInterval?
+        var exactResponseUsageEnabled = false
         var configOverridesProvider: () async -> [String: Any]
         var approvalPolicyProvider: () -> CodexAgentToolPreferences.ApprovalPolicy
         var sandboxModeProvider: () -> CodexAgentToolPreferences.SandboxMode
@@ -1875,6 +1882,9 @@ final class CodexNativeSessionController {
         }
 
         var params: [String: Any] = [:]
+        if options.exactResponseUsageEnabled {
+            params["experimentalRawEvents"] = true
+        }
         if let model {
             params["model"] = model
         }
@@ -4264,6 +4274,17 @@ final class CodexNativeSessionController {
                     }
                 }
             }
+        case "rawResponse/completed":
+            if options.exactResponseUsageEnabled,
+               let threadID = Self.notificationThreadID(from: params),
+               let turnID = Self.notificationTurnID(from: params)
+            {
+                await emit(.responseUsage(
+                    threadID: threadID, turnID: turnID,
+                    responseID: Self.nonEmptyString(params["responseId"] as? String),
+                    usage: Self.parseResponseUsage(from: params)
+                ))
+            }
         case "thread/tokenUsage/updated":
             if let usage = parseTokenUsage(from: params) {
                 await emit(.tokenUsage(usage))
@@ -4530,6 +4551,9 @@ final class CodexNativeSessionController {
             // Null is valid; missing metadata or scope is not a decoded notification.
             turnScope(threadID: params["threadId"] as? String, turnID: params["turnId"] as? String) != nil
                 && params["metadata"] != nil ? .protocolMetadata : nil
+        case "thread/name/updated":
+            nonEmptyString(params["threadId"] as? String) != nil
+                && (params["threadName"] == nil || params["threadName"] is NSNull || params["threadName"] is String) ? .protocolMetadata : nil
         case "thread/settings/updated":
             nonEmptyString(params["threadId"] as? String) != nil
                 && isThreadSettingsMetadata(params["threadSettings"]) ? .protocolMetadata : nil
@@ -5072,6 +5096,13 @@ final class CodexNativeSessionController {
 
         func test_configureSnapshotRuntime(version: CodexRuntimeAuthority.Version) {
             usesBoundedThreadSnapshots = Self.supportsBoundedThreadSnapshots(version)
+        }
+
+        func test_startThreadBinding() async throws -> [String: Any] {
+            try await requestThreadBinding(
+                resumeThreadID: nil, existing: nil, baseInstructions: "",
+                model: nil, serviceTier: nil, configOverrides: [:], timeout: 5
+            )
         }
 
         func test_resumeThreadBinding(existing: SessionRef, timeout: TimeInterval = 5) async throws -> [String: Any] {
@@ -6144,6 +6175,24 @@ final class CodexNativeSessionController {
             .replacingOccurrences(of: "-", with: "")
     }
 
+    private static func parseResponseUsage(from params: [String: Any]) -> ResponseUsage? {
+        func count(_ value: Any?) -> Int? {
+            guard let number = value as? NSNumber,
+                  CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  // CodexJSONValue uses Double; beyond its safe integer range the wire count
+                  // may already have rounded before normalization. Do not claim exact usage.
+                  number.doubleValue < 9_007_199_254_740_992,
+                  let integer = Int(number.stringValue), integer >= 0
+            else { return nil }
+            return integer
+        }
+        guard let usage = params["usage"] as? [String: Any],
+              let input = count(usage["inputTokens"]),
+              let output = count(usage["outputTokens"])
+        else { return nil }
+        return ResponseUsage(inputTokens: input, outputTokens: output)
+    }
+
     private func parseTokenUsage(from params: [String: Any]) -> AgentContextUsage? {
         Self.parseTokenUsagePayload(from: params)
     }
@@ -6398,6 +6447,8 @@ final class CodexNativeSessionController {
             "turnCompleted turnID=\(turnID ?? "nil") status=\(status) failure=\(failure != nil)"
         case let .contextCompacted(turnID):
             "contextCompacted turnID=\(turnID ?? "nil")"
+        case .responseUsage:
+            "responseUsage"
         case let .tokenUsage(usage):
             "tokenUsage modelContextWindow=\(usage.modelContextWindow.map(String.init(describing:)) ?? "nil") lastTotalTokens=\(usage.lastTotalTokens.map(String.init(describing:)) ?? "nil") totalTotalTokens=\(usage.totalTotalTokens.map(String.init(describing:)) ?? "nil")"
         case let .livenessActivity(activity):

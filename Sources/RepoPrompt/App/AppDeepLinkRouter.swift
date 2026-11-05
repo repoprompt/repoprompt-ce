@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptWorkspaceCore
 
 @MainActor
@@ -81,6 +82,68 @@ final class AppDeepLinkRouter {
 
     func route(agentSession route: AgentSessionDeepLinkRoute) async -> AgentSessionRouteResult {
         await routeAgentSession(route, sourceURL: nil)
+    }
+
+    func routeLoadedAgentSession(sessionID: UUID) async {
+        await Self.routeLoadedAgentSession(sessionID: sessionID, resolve: { sessionID in
+            self.windowStatesManager.agentSessionLinkCandidates(
+                forSessionIDs: [sessionID], includeLocation: false
+            )[sessionID] ?? []
+        }, isAvailable: { candidate in
+            guard let window = self.windowStatesManager.allWindows.first(where: {
+                $0.windowID == candidate.windowID && !$0.isClosing
+            }), window.workspaceManager.isInitialized,
+            let workspace = window.workspaceManager.activeWorkspace,
+            workspace.id == candidate.workspaceID else { return false }
+            return workspace.composeTabs.contains {
+                $0.id == candidate.tabID && $0.activeAgentSessionID == sessionID
+            }
+        }, prepareNavigation: { route in
+            guard let window = self.windowStatesManager.allWindows.first(where: {
+                $0.windowID == route.windowID && !$0.isClosing
+            }) else { return }
+            if window.promptManager.activeComposeTabID != route.tabID {
+                await window.promptManager.switchComposeTab(route.tabID)
+            }
+        }, navigate: { route in
+            guard let window = self.windowStatesManager.allWindows.first(where: {
+                $0.windowID == route.windowID && !$0.isClosing
+            }), window.promptManager.activeComposeTabID == route.tabID else { return }
+            NSApp?.activate(ignoringOtherApps: true)
+            window.focusWindowIfPossible()
+        })
+    }
+
+    static func routeLoadedAgentSession(
+        sessionID: UUID,
+        resolve: (UUID) -> [AgentSessionLinkEndpointCandidate],
+        isAvailable: (AgentSessionLinkEndpointCandidate) -> Bool,
+        prepareNavigation: (AgentSessionDeepLinkRoute) async -> Void = { _ in },
+        navigate: (AgentSessionDeepLinkRoute) -> Void
+    ) async {
+        let matches = resolve(sessionID)
+        guard matches.count == 1, let candidate = matches.first, candidate.sessionID == sessionID,
+              !candidate.isClosing, !candidate.isDeletionInProgress,
+              candidate.eligibilityInput.hasLoadedPersistedState, !candidate.bindingTransitionInProgress,
+              isAvailable(candidate) else { return }
+        let route = AgentSessionDeepLinkRoute(
+            windowID: candidate.windowID, workspaceID: candidate.workspaceID,
+            tabID: candidate.tabID, sessionID: sessionID
+        )
+        await prepareNavigation(route)
+        // Switching tabs suspends. Never let an older badge click restore a binding replaced
+        // during that suspension; the final check and focus have no intervening actor hop.
+        let refreshed = resolve(sessionID)
+        guard refreshed.count == 1, let current = refreshed.first,
+              current.windowID == candidate.windowID, current.workspaceID == candidate.workspaceID,
+              current.tabID == candidate.tabID, current.sessionID == candidate.sessionID,
+              current.persistentBindingGeneration == candidate.persistentBindingGeneration,
+              current.bindingTransitionGeneration == candidate.bindingTransitionGeneration,
+              current.restorationReadiness == candidate.restorationReadiness,
+              !current.isClosing, !current.isDeletionInProgress,
+              current.eligibilityInput.hasLoadedPersistedState, !current.bindingTransitionInProgress,
+              isAvailable(current) else { return }
+        navigate(route)
     }
 
     private func routeLegacyURL(_ url: URL, preferredWindow: WindowState?) async {

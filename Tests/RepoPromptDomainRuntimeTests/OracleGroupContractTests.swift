@@ -4,6 +4,65 @@ import MCP
 import XCTest
 
 final class OracleGroupContractTests: XCTestCase {
+    func testOptionalElapsedNormalizationRoundTripAndStrictCoreDecoding() throws {
+        let input = try OracleInput(mode: .chat, userMessage: "ask")
+        let replyID = UUID()
+        let cases: [(Double, Double?)] = [
+            (0, 0), (-0.0, 0), (0.125, 0.125), (1234.56789, 1234.56789),
+            (-1, nil), (.infinity, nil), (-.infinity, nil), (.nan, nil), (Double(Int.max), nil)
+        ]
+        for (value, expected) in cases {
+            let lane = try OracleLaneResult(
+                laneIndex: 0,
+                chatID: "chat",
+                providerID: "fixture",
+                modelID: "model",
+                status: .completed,
+                elapsedSeconds: value,
+                response: "answer",
+                assistantReplyID: replyID
+            )
+            XCTAssertEqual(lane.elapsedSeconds, expected)
+            XCTAssertEqual(lane.assistantReplyID, replyID)
+            if lane.elapsedSeconds == 0 { XCTAssertEqual(lane.elapsedSeconds?.sign, .plus) }
+            XCTAssertEqual(try JSONDecoder().decode(OracleLaneResult.self, from: JSONEncoder().encode(lane)), lane)
+            let terminal = OracleTurnRecord(
+                input: input,
+                state: .terminal,
+                startedAt: Date(timeIntervalSince1970: 100),
+                finishedAt: Date(timeIntervalSince1970: 90),
+                status: .completed,
+                results: [lane]
+            )
+            XCTAssertEqual(try JSONDecoder().decode(OracleTurnRecord.self, from: JSONEncoder().encode(terminal)), terminal)
+        }
+        let lane = try OracleLaneResult(
+            laneIndex: 0,
+            chatID: "chat",
+            providerID: "fixture",
+            modelID: "model",
+            status: .completed,
+            response: "answer"
+        )
+        var laneObject = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(lane)) as? [String: Any])
+        XCTAssertNil(laneObject["elapsed_seconds"])
+        XCTAssertNil(laneObject["assistant_reply_id"])
+        XCTAssertNil(try JSONDecoder().decode(OracleLaneResult.self, from: JSONEncoder().encode(lane)).assistantReplyID)
+        let turn = OracleTurnRecord(input: input, state: .terminal, startedAt: Date(), status: .completed, results: [lane])
+        var turnObject = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(turn)) as? [String: Any])
+        XCTAssertNil(turnObject["elapsedSeconds"])
+        for malformed in [NSNull(), "wrong", ["value": 1], -1, 1e30] as [Any] {
+            laneObject["elapsed_seconds"] = malformed
+            laneObject["assistant_reply_id"] = malformed
+            let decodedLane = try JSONDecoder().decode(OracleLaneResult.self, from: JSONSerialization.data(withJSONObject: laneObject))
+            XCTAssertEqual(decodedLane, lane)
+        }
+        laneObject["status"] = "unknown"
+        XCTAssertThrowsError(try JSONDecoder().decode(OracleLaneResult.self, from: JSONSerialization.data(withJSONObject: laneObject)))
+        turnObject.removeValue(forKey: "input")
+        XCTAssertThrowsError(try JSONDecoder().decode(OracleTurnRecord.self, from: JSONSerialization.data(withJSONObject: turnObject)))
+    }
+
     func testDisplayLabelUsesOracleAndNumberedLanes() {
         XCTAssertEqual(
             (0 ... 4).map(OracleRosterContract.displayLabel(laneIndex:)),
@@ -335,7 +394,37 @@ final class OracleGroupContractTests: XCTestCase {
         XCTAssertEqual(result.primary.role, .primary)
         XCTAssertEqual(result.oracleResults[1].role, .additional)
         XCTAssertTrue(result.oracleResults.allSatisfy { $0.executionProfile == nil })
+        XCTAssertTrue(result.oracleResults.allSatisfy { $0.capturedModelName == nil })
         XCTAssertEqual(try JSONDecoder().decode(OracleGroupResult.self, from: JSONEncoder().encode(result)), result)
+    }
+
+    func testCapturedModelNameRoundTripsVerbatimAndMissingHistoricalFieldRemainsNil() throws {
+        let capturedName = "  CLI·Captured model (High)\n"
+        let result = try OracleLaneResult(
+            laneIndex: 0,
+            chatID: "chat",
+            providerID: "codex",
+            modelID: "configured-raw",
+            status: .completed,
+            capturedModelName: capturedName,
+            response: "answer"
+        )
+        let encoded = try JSONEncoder().encode(result)
+        let decoded = try JSONDecoder().decode(OracleLaneResult.self, from: encoded)
+        XCTAssertEqual(decoded, result)
+        XCTAssertEqual(decoded.capturedModelName, capturedName)
+
+        var historicalObject = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        historicalObject.removeValue(forKey: "captured_model_name")
+        let historical = try JSONDecoder().decode(
+            OracleLaneResult.self,
+            from: JSONSerialization.data(withJSONObject: historicalObject)
+        )
+        XCTAssertNil(historical.capturedModelName)
+        XCTAssertEqual(historical.modelID, result.modelID)
+        XCTAssertEqual(historical.response, result.response)
+        XCTAssertNotEqual(historical, result, "Captured identity changes must participate in result equality")
+        try assertRoundTrip(historical)
     }
 
     func testExecutionProfileRoundTripsAndUsesCanonicalMCPShape() throws {

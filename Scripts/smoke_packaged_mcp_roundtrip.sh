@@ -177,6 +177,7 @@ env -i \
     LOGNAME="${LOGNAME:-${USER:-runner}}" \
     LANG=C \
     LC_ALL=C \
+    REPOPROMPT_TELEMETRY_DISABLED=1 \
     "$APP_EXECUTABLE" >"$APP_LOG" 2>&1 &
 APP_PID=$!
 sleep 0.2

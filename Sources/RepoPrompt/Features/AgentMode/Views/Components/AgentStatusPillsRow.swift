@@ -53,6 +53,7 @@ struct AgentStatusPillsRow: View {
 
                 AgentWorkflowPill(
                     statusPillsUI: statusPillsUI,
+                    settingsStore: agentModeVM.modelRouterSettingsStore,
                     windowID: windowID,
                     selectWorkflow: { agentModeVM.selectWorkflow($0) }
                 )

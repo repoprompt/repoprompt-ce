@@ -1328,6 +1328,17 @@ final class MCPServerViewModel: ObservableObject {
         windowToolsRequested
     }
 
+    private let windowToolsRequestSubject = PassthroughSubject<Bool, Never>()
+    /// The per-window MCP tools switch as the user (or a restore/bootstrap caller) set it, emitted
+    /// on the main actor each time the requested intent actually changes, synchronously inside
+    /// `setWindowToolsEnabled` before registration starts. Registration outcomes
+    /// (`windowToolsEnabled`) never emit here, and repeating an unchanged intent does not emit
+    /// even though it still retries registration. Seeding from the global auto-start default does
+    /// not emit either: it is not a per-window choice. Session persistence observes this (#143).
+    var windowToolsRequestChanges: AnyPublisher<Bool, Never> {
+        windowToolsRequestSubject.eraseToAnyPublisher()
+    }
+
     func presentCodeStructureSettlementLimitNotice(generation: UInt64) {
         guard generation > codeStructureSettlementLimitNoticeGenerationTombstone else { return }
         codeStructureSettlementLimitNoticeGenerationTombstone = generation
@@ -1348,6 +1359,7 @@ final class MCPServerViewModel: ObservableObject {
     private var activeWindowToolRegistrationHandle: MCPDomainToolRegistrationHandle?
     #if DEBUG
         private var afterWindowToolRegistrationBeforeRetentionForTesting: (@MainActor @Sendable () async -> Void)?
+        private var windowToolRegistrationFailureForTesting: (any Error)?
     #endif
 
     /// Controls whether the approval overlay is visible
@@ -3084,6 +3096,12 @@ final class MCPServerViewModel: ObservableObject {
             afterWindowToolRegistrationBeforeRetentionForTesting = handler
         }
 
+        /// Makes every following window-catalog registration fail with `error` (nil restores it).
+        @MainActor
+        func setWindowToolRegistrationFailureForTesting(_ error: (any Error)?) {
+            windowToolRegistrationFailureForTesting = error
+        }
+
         @MainActor
         func windowToolRegistrationIntentGenerationForTesting() -> UInt64 {
             toolRegistrationIntentGeneration
@@ -3174,7 +3192,8 @@ final class MCPServerViewModel: ObservableObject {
         // after the domain registry owns the complete catalog.
         if GlobalSettingsStore.shared.mcpAutoStart() {
             Task { [weak self] in
-                _ = await self?.setWindowToolsEnabled(true)
+                // Seeding from the global default is not a per-window choice to persist (#143).
+                _ = await self?.setWindowToolsEnabled(true, publishesRequestChange: false)
             }
         }
     }
@@ -3368,14 +3387,21 @@ final class MCPServerViewModel: ObservableObject {
     @discardableResult
     func setWindowToolsEnabled(
         _ enabled: Bool,
-        invalidateCatalogBeforeUpdate: Bool = true
+        invalidateCatalogBeforeUpdate: Bool = true,
+        publishesRequestChange: Bool = true
     ) async -> Bool {
         toolRegistrationIntentGeneration &+= 1
         let intentGeneration = toolRegistrationIntentGeneration
+        let requestChanged = windowToolsRequested != enabled
         windowToolsRequested = enabled
         windowToolRegistrationFailureDescription = nil
         if !enabled {
             windowToolsEnabled = false
+        }
+        // Before the first await, so observers see the intent even if registration stays pending
+        // or fails; an unchanged intent still re-runs the transition below.
+        if requestChanged, publishesRequestChange {
+            windowToolsRequestSubject.send(enabled)
         }
 
         // MainActor methods are reentrant at every await. Chain transitions so an
@@ -3447,6 +3473,11 @@ final class MCPServerViewModel: ObservableObject {
         }
 
         do {
+            #if DEBUG
+                if let windowToolRegistrationFailureForTesting {
+                    throw windowToolRegistrationFailureForTesting
+                }
+            #endif
             let registration = try await AppDomainRuntimeComposition.shared.register(windowToolCatalogService)
             #if DEBUG
                 await afterWindowToolRegistrationBeforeRetentionForTesting?()

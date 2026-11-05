@@ -23,7 +23,7 @@ jobs:
   validate-ref:
     name: Validate Approved Release Ref
     if: github.ref == 'refs/heads/main'
-    runs-on: macos-26
+    runs-on: ubuntu-latest
     outputs:
       commit: ${{ steps.release-ref.outputs.commit }}
       tooling-commit: ${{ steps.release-ref.outputs.tooling-commit }}
@@ -41,14 +41,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          echo "commit=$(./Scripts/verify_release_ref.sh "$RELEASE_TAG")" >> "$GITHUB_OUTPUT"
-          echo "tooling-commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          commit="$(./Scripts/verify_release_ref.sh "$RELEASE_TAG")"
+          tooling_commit="$(git rev-parse HEAD)"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ && "$tooling_commit" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "Release source and tooling must resolve to full lowercase commit SHAs" >&2
+            exit 1
+          }
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "tooling-commit=$tooling_commit" >> "$GITHUB_OUTPUT"
 
   smoke-reviewed-helper:
     name: Smoke Reviewed Helper Without Release Secrets
     needs: validate-ref
     if: github.ref == 'refs/heads/main'
     runs-on: macos-26
+    outputs:
+      artifact-name: ${{ steps.archive-name.outputs.name }}
     # GitHub hides draft release assets from read-only workflow tokens. This
     # token is used only by the download step; helper execution below uses env -i.
     permissions:
@@ -134,11 +143,38 @@ jobs:
             "Reviewed packaged app" \
             "$ARTIFACT_MANIFEST_PATH"
 
+      - name: Identify reviewed release artifact
+        id: archive-name
+        env:
+          ARTIFACT_NAME: reviewed-release-compatibility-${{ github.run_id }}-${{ github.run_attempt }}
+        run: printf 'name=%s\n' "$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Transfer reviewed bytes for older macOS compatibility
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: ${{ steps.archive-name.outputs.name }}
+          path: |
+            reviewed-assets/*.zip
+            reviewed-assets/SHA256SUMS
+            reviewed-assets/*-artifact-manifest.json
+          if-no-files-found: error
+          retention-days: 7
+
+  compatibility:
+    name: Older macOS Reviewed Artifact Compatibility
+    needs: [validate-ref, smoke-reviewed-helper]
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/macos-compatibility.yml
+    with:
+      artifact-name: ${{ needs.smoke-reviewed-helper.outputs.artifact-name }}
+      tooling-ref: ${{ needs.validate-ref.outputs.tooling-commit }}
+
   promote:
     name: Mirror and Promote Reviewed Draft
     needs:
       - validate-ref
       - smoke-reviewed-helper
+      - compatibility
     if: github.ref == 'refs/heads/main'
     environment: release
     runs-on: macos-26

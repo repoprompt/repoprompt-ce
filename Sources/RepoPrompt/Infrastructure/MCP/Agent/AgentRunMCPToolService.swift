@@ -2193,7 +2193,7 @@ struct AgentRunMCPToolService {
         steeringMessage: String? = nil
     ) -> Value {
         var object = representativeSnapshot.asObject()
-        object.removeValue(forKey: "assistant_text")
+        AgentRunMCPSnapshot.removeAssistantText(from: &object)
         object["status_text"] = .string("Wait interrupted by a new steering instruction; the agent run is still running.")
         object["_meta"] = .object([
             "wake_reason": .string(AgentRunSessionStore.WakeReason.steeringRequested.rawValue),
@@ -2216,7 +2216,7 @@ struct AgentRunMCPToolService {
         object["snapshots"] = .array(snapshots.map { snapshot in
             var snapshotObject = snapshot.asObject()
             if !snapshot.status.isTerminal {
-                snapshotObject.removeValue(forKey: "assistant_text")
+                AgentRunMCPSnapshot.removeAssistantText(from: &snapshotObject)
             }
             return .object(snapshotObject)
         })
@@ -2446,6 +2446,22 @@ struct AgentRunMCPToolService {
                 throw MCPError.internalError("Agent run snapshot was not an object.")
             }
             return try snapshot(from: object)
+        }
+
+        /// Runs the real single-wait finalization (decode, decorate, `_meta` merge) over an
+        /// already published wait value.
+        func test_finalDecoratedSingleWaitValue(
+            from rawValue: Value,
+            agentModeVM: AgentModeViewModel
+        ) async throws -> Value {
+            let sessionID = rawValue.objectValue?["session_id"]?.stringValue.flatMap(UUID.init(uuidString:)) ?? UUID()
+            return try await finalDecoratedSingleWaitValue(
+                from: rawValue,
+                sessionID: sessionID,
+                agentModeVM: agentModeVM,
+                workflow: nil,
+                initialDelivery: nil
+            )
         }
 
         static func test_decoratedMultiWaitInterruptValue(
@@ -2725,7 +2741,7 @@ struct AgentRunMCPToolService {
         if !snapshot.status.isTerminal,
            delivery?.isActiveRunDispatch == true || wakeReason?.suppressesAssistantPreview == true
         {
-            object.removeValue(forKey: "assistant_text")
+            AgentRunMCPSnapshot.removeAssistantText(from: &object)
         }
         if wakeReason == .steeringRequested {
             object["status_text"] = .string("Wait interrupted by a new steering instruction; the agent run is still running.")
@@ -2884,6 +2900,18 @@ struct AgentRunMCPToolService {
         let worktreeBindings = try worktreeBindings(from: object)
         let activeWorktreeMerges = try activeWorktreeMerges(from: object)
         let modelParameterSelections = try modelParameterSelections(from: agent)
+        // An absent state key with no bindings means the producer did not publish binding
+        // knowledge (legacy or resident/expired payload); never infer `unbound` from it.
+        let worktreeBindingState = object["worktree_binding_state"]?.stringValue
+            .flatMap(AgentRunMCPSnapshot.WorktreeBindingState.init(rawValue:))
+            ?? (worktreeBindings.isEmpty ? .unknown : nil)
+        let parentIsWorktreeBound = object["parent_worktree_bound"]?.boolValue
+        // Keep the published truncation state explicitly: a bounded preview may be shorter than
+        // the cap (byte-only truncation, oversized grapheme), so it cannot be re-derived.
+        let assistantPreview = object["assistant_text"]?.stringValue
+        let assistantPreviewTotalCharacters = object["assistant_text_truncated"]?.boolValue == true
+            ? object["assistant_text_characters"]?.intValue ?? assistantPreview?.count
+            : nil
         return AgentRunMCPSnapshot(
             sessionID: sessionID,
             runID: runID,
@@ -2896,7 +2924,8 @@ struct AgentRunMCPToolService {
             modelParameterSelections: modelParameterSelections,
             status: status,
             statusText: object["status_text"]?.stringValue,
-            latestAssistantPreview: object["assistant_text"]?.stringValue,
+            latestAssistantPreview: assistantPreview,
+            latestAssistantPreviewTotalCharacters: assistantPreviewTotalCharacters,
             interaction: interaction,
             hookGate: hookGate,
             transcriptItemCount: object["transcript_item_count"]?.intValue ?? 0,
@@ -2904,7 +2933,9 @@ struct AgentRunMCPToolService {
             parentSessionID: parentSessionID,
             failureReason: failureReason,
             worktreeBindings: worktreeBindings,
-            appActiveWorktreeMerges: activeWorktreeMerges
+            appActiveWorktreeMerges: activeWorktreeMerges,
+            worktreeBindingState: worktreeBindingState,
+            parentIsWorktreeBound: parentIsWorktreeBound
         )
     }
 

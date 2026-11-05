@@ -519,6 +519,8 @@ package actor WorkspaceCodemapBindingEngine {
         var manifestStagedByteCount: UInt64
         var manifestSealState: GraphIndexManifestSealState
         var retryAttempt: UInt64
+        var retryCatalogToken: WorkspaceCodemapGraphIndexCatalogToken?
+        var retryCheckpointCandidateCount: UInt64
         var retry: WorkspaceCodemapGraphIndexRetry?
         var budget: WorkspaceCodemapGraphIndexBudget?
         var checkpoint: WorkspaceCodemapGraphIndexCheckpoint?
@@ -1389,7 +1391,7 @@ package actor WorkspaceCodemapBindingEngine {
             switch existing.phase {
             case .complete:
                 return .handedOff
-            case .budgetLimited:
+            case .budgetLimited, .retryExhausted:
                 return .handedOff
             case .cancelled, .superseded:
                 _ = cancelGraphIndexJob(rootEpoch: rootEpoch, terminalPhase: existing.phase)
@@ -1435,6 +1437,8 @@ package actor WorkspaceCodemapBindingEngine {
             manifestStagedByteCount: 0,
             manifestSealState: .collecting,
             retryAttempt: 0,
+            retryCatalogToken: nil,
+            retryCheckpointCandidateCount: 0,
             retry: nil,
             budget: nil,
             checkpoint: nil,
@@ -1526,7 +1530,7 @@ package actor WorkspaceCodemapBindingEngine {
         switch job.phase {
         case .complete:
             return .alreadyComplete
-        case .cancelled, .superseded:
+        case .cancelled, .superseded, .retryExhausted:
             _ = cancelGraphIndexJob(rootEpoch: rootEpoch, terminalPhase: job.phase)
             return scheduleGraphIndex(rootEpoch: rootEpoch) == .handedOff ? .scheduled : .unavailable
         case .budgetLimited:
@@ -2054,6 +2058,7 @@ package actor WorkspaceCodemapBindingEngine {
         rootEpoch: WorkspaceCodemapRootEpoch
     ) -> WorkspaceCodemapGraphIndexExecutionState {
         guard let job = graphIndexJobs[rootEpoch] else { return .available }
+        if job.phase == .retryExhausted { return .retryExhausted }
         if job.phase == .budgetLimited, let budget = job.budget {
             return .budgetLimited(budget)
         }
@@ -2781,7 +2786,9 @@ package actor WorkspaceCodemapBindingEngine {
                     return
                 }
                 guard await waitForGraphIndexRetry(jobID: jobID, rootEpoch: rootEpoch) else {
-                    completionReason = Task.isCancelled ? .cancelled : .retryCancelled
+                    completionReason = Task.isCancelled ? .cancelled : (
+                        graphIndexJobs[rootEpoch]?.phase == .retryExhausted ? .retryExhausted : .retryCancelled
+                    )
                     return
                 }
                 guard updateGraphIndexPhase(
@@ -2808,7 +2815,9 @@ package actor WorkspaceCodemapBindingEngine {
                 return
             case .retry:
                 guard await waitForGraphIndexRetry(jobID: jobID, rootEpoch: rootEpoch) else {
-                    completionReason = Task.isCancelled ? .cancelled : .retryCancelled
+                    completionReason = Task.isCancelled ? .cancelled : (
+                        graphIndexJobs[rootEpoch]?.phase == .retryExhausted ? .retryExhausted : .retryCancelled
+                    )
                     return
                 }
                 guard updateGraphIndexPhase(
@@ -3140,6 +3149,12 @@ package actor WorkspaceCodemapBindingEngine {
                   overlaySnapshot.catalogGeneration == job.catalogGeneration,
                   overlaySnapshot.rootAuthority == job.rootAuthority
             else { return .retry }
+            // Re-entering the same page/generation is not durable progress.
+            if let previous = job.retryCatalogToken, previous != page.token {
+                job.retryAttempt = 0
+                job.retryCheckpointCandidateCount = 0
+            }
+            job.retryCatalogToken = page.token
             job.generation = WorkspaceCodemapGraphIndexGeneration(
                 catalogToken: page.token,
                 rootAuthority: job.rootAuthority,
@@ -3712,7 +3727,11 @@ package actor WorkspaceCodemapBindingEngine {
         job.progress = progress
         job.inBatchProgress = nil
         job.pageStartProcessedCandidateBaseline = nil
-        job.retryAttempt = 0
+        // Replaying a checkpoint (including the final page) is not new durable progress.
+        if page.supportedCandidateCountThroughPage > job.retryCheckpointCandidateCount {
+            job.retryAttempt = 0
+            job.retryCheckpointCandidateCount = page.supportedCandidateCountThroughPage
+        }
         job.retry = nil
         if !job.workerRecoveryExhausted {
             job.workerRecoveryCount = 0
@@ -3780,6 +3799,7 @@ package actor WorkspaceCodemapBindingEngine {
             completedJob.progress = accepted
             completedJob.inBatchProgress = nil
             completedJob.pageStartProcessedCandidateBaseline = nil
+            completedJob.retryAttempt = 0
             completedJob.retry = nil
             completedJob.checkpoint = makeGraphIndexCheckpoint(completedJob)
             graphIndexJobs[rootEpoch] = completedJob
@@ -5043,6 +5063,25 @@ package actor WorkspaceCodemapBindingEngine {
         guard var job = graphIndexJobs[rootEpoch], job.id == jobID, graphIndexJobIsCurrent(job) else {
             return false
         }
+        guard job.retryAttempt < policy.maximumGraphIndexConsecutiveRetryCount else {
+            job.phase = .retryExhausted
+            job.phaseEnteredUptimeNanoseconds = uptimeNanoseconds()
+            job.progress = graphIndexProgress(job.progress, phase: .retryExhausted)
+            job.retry = nil
+            job.inBatchProgress = nil
+            job.pageStartProcessedCandidateBaseline = nil
+            discardGraphIndexManifestStages(&job)
+            job.checkpoint = makeGraphIndexCheckpoint(job)
+            graphIndexJobs[rootEpoch] = job
+            publishGraphIndexExecutionState(rootEpoch: rootEpoch)
+            emit(
+                .graphIndexRetry,
+                rootEpoch: rootEpoch,
+                numericValue: job.retryAttempt,
+                graphIndexPhase: .retryExhausted
+            )
+            return false
+        }
         let attempt = addingChecked(job.retryAttempt, 1) ?? .max
         let shift = min(attempt - 1, 62)
         let multiplier = UInt64(1) << shift
@@ -5163,7 +5202,7 @@ package actor WorkspaceCodemapBindingEngine {
         discardGraphIndexManifestStages(&job)
         job.resources = .zero
         job.pendingManifestMutationCount = 0
-        job.retryAttempt = 0
+        // Preserve the retry budget until a different catalog token is actually observed.
         job.retry = nil
         job.budget = nil
         job.checkpoint = nil
@@ -5841,7 +5880,7 @@ package actor WorkspaceCodemapBindingEngine {
         case .admissionUnavailable, .checkpointTransitionRejected, .generationResetRejected,
              .retryCancelled:
             reason
-        case .complete, .budgetLimited, .cancelled, .superseded, .currentnessLost,
+        case .complete, .budgetLimited, .retryExhausted, .cancelled, .superseded, .currentnessLost,
              .watchdogNoProgress, .watchdogRecoveryExhausted, .prioritizeRestart:
             nil
         }
@@ -5866,7 +5905,7 @@ package actor WorkspaceCodemapBindingEngine {
 
     private func graphIndexJobPhaseIsTerminal(_ phase: WorkspaceCodemapGraphIndexPhase) -> Bool {
         switch phase {
-        case .budgetLimited, .complete, .cancelled, .superseded:
+        case .budgetLimited, .retryExhausted, .complete, .cancelled, .superseded:
             true
         case .scheduled, .waitingForAdmission, .readingCatalogPage, .loadingEnvelopes,
              .classifyingBatch, .resolvingArtifacts, .stagingManifestCache,
@@ -5889,6 +5928,7 @@ package actor WorkspaceCodemapBindingEngine {
             case .checkpointTransitionRejected: .workerCheckpointTransitionRejected
             case .generationResetRejected: .workerGenerationResetRejected
             case .retryCancelled: .workerRetryCancelled
+            case .retryExhausted: .workerRetryExhausted
             case .watchdogNoProgress: .watchdogNoProgress
             case .watchdogRecoveryExhausted: .watchdogRecoveryExhausted
             case .prioritizeRestart: .prioritizeRestart

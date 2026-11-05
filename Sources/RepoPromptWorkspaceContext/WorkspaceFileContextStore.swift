@@ -374,6 +374,11 @@ package actor WorkspaceFileContextStore {
     private static let maximumRetainedCodemapPresentationRecordsPerRoot = 64
     private static let maximumCodemapPresentationRequestsPerBundle = 4096
 
+    #if DEBUG
+        /// Follows value copies of a root without changing its canonical indexes.
+        private final class RootMutationOwnership: Sendable {}
+    #endif
+
     private struct RootState {
         let lifetimeID: UUID
         let root: WorkspaceRootRecord
@@ -383,6 +388,9 @@ package actor WorkspaceFileContextStore {
         var childFolderIDsByFolderID: [UUID: [UUID]]
         var childFileIDsByFolderID: [UUID: [UUID]]
         var fileExtensionCounts: [String: Int] = [:]
+        #if DEBUG
+            var mutationOwnership = RootMutationOwnership()
+        #endif
     }
 
     private struct FileExtensionCatalogSummary {
@@ -3037,7 +3045,23 @@ package actor WorkspaceFileContextStore {
         let folders: [WorkspaceFolderRecord]
         let logicalMutationCount: Int
         let pathIndexChangedFileIDs: Set<UUID>
+        #if DEBUG
+            var work = RootCatalogPatchWork()
+        #endif
     }
+
+    #if DEBUG
+        /// Actual merge work, not elapsed time. Flat immutable arrays require linear visits;
+        /// only replacement records may be sorted. Kept local to each build (no global counters).
+        struct RootCatalogPatchWork {
+            var fileVisits = 0
+            var folderVisits = 0
+            var fileComparisons = 0
+            var folderComparisons = 0
+            var sortedFileCount = 0
+            var sortedFolderCount = 0
+        }
+    #endif
 
     private struct SearchCatalogRootDependency: Hashable {
         let canonicalIdentity: String
@@ -3225,6 +3249,15 @@ package actor WorkspaceFileContextStore {
         private var codemapFullRootGraphFreezeCountForTesting = 0
         private var filesInRootRequestCountForTesting = 0
         private var indexDeltaPathsExistForTesting = false
+        struct IndexDeltaPublicationWork {
+            var ancestorMembershipProbes = 0
+            var indexedFileVisits = 0
+            var parentFolderProbes = 0
+            var eventSortComparisons = 0
+            var sharedRootInventoryRecords = 0
+        }
+
+        private var indexDeltaPublicationWorkForTesting: IndexDeltaPublicationWork?
         private var appliedIndexRecordLookupRequestCountForTesting = 0
         private var appliedIndexRecordLookupRequestedRecordCountForTesting = 0
         private var appliedIndexRootSnapshotRequestCountForTesting = 0
@@ -3250,7 +3283,9 @@ package actor WorkspaceFileContextStore {
         WorkspaceCodemapRootEpoch: [UUID: CheckedContinuation<Void, Never>]
     ] = [:]
     private var codemapGraphIndexBuildReschedulePendingRootEpochs: Set<WorkspaceCodemapRootEpoch> = []
+    private let codemapRootPausePolicy: WorkspaceCodemapRootPausePolicy
     private var codemapSuspendedRootEpochs: Set<WorkspaceCodemapRootEpoch> = []
+    private var codemapPauseRestoredRootEpochs: Set<WorkspaceCodemapRootEpoch> = []
     private var codemapResumeTransitionIDsByRootEpoch: [WorkspaceCodemapRootEpoch: UUID] = [:]
     private var codemapGraphAccountingByRootEpoch: [
         WorkspaceCodemapRootEpoch: WorkspaceCodemapGraphIncrementalAccounting
@@ -3378,6 +3413,7 @@ package actor WorkspaceFileContextStore {
             codemapGraphIndexBuildRetryPolicy: CodemapGraphIndexBuildRetryPolicy = .production,
             nonGitCodeMapsEnabled: Bool = true,
             codeMapsGloballyDisabled: Bool = false,
+            codemapRootPausePolicy: WorkspaceCodemapRootPausePolicy = WorkspaceCodemapRootPausePolicy(),
             codemapGraphIndexBuildLaunchPolicyForTesting: CodemapGraphIndexBuildLaunchPolicyForTesting = .enabled,
             selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory = .production,
             selectionGraphQueryBudgetPolicy: WorkspaceCodemapAutomaticSelectionBudgetPolicy = .initial,
@@ -3422,6 +3458,7 @@ package actor WorkspaceFileContextStore {
             self.codemapGraphIndexBuildRetryPolicy = codemapGraphIndexBuildRetryPolicy
             self.nonGitCodeMapsEnabled = nonGitCodeMapsEnabled
             self.codeMapsGloballyDisabled = codeMapsGloballyDisabled
+            self.codemapRootPausePolicy = codemapRootPausePolicy
             self.codemapGraphIndexBuildLaunchPolicyForTesting = codemapGraphIndexBuildLaunchPolicyForTesting
             self.selectionGraphFactory = selectionGraphFactory
             self.selectionGraphQueryBudgetPolicy = selectionGraphQueryBudgetPolicy
@@ -3462,6 +3499,7 @@ package actor WorkspaceFileContextStore {
             codemapGraphIndexBuildRetryPolicy: CodemapGraphIndexBuildRetryPolicy = .production,
             nonGitCodeMapsEnabled: Bool = false,
             codeMapsGloballyDisabled: Bool = false,
+            codemapRootPausePolicy: WorkspaceCodemapRootPausePolicy = WorkspaceCodemapRootPausePolicy(),
             selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory = .production,
             selectionGraphQueryBudgetPolicy: WorkspaceCodemapAutomaticSelectionBudgetPolicy = .initial,
             automaticSelectionAccountingMaximum: Int = .max,
@@ -3504,6 +3542,7 @@ package actor WorkspaceFileContextStore {
             self.codemapGraphIndexBuildRetryPolicy = codemapGraphIndexBuildRetryPolicy
             self.nonGitCodeMapsEnabled = nonGitCodeMapsEnabled
             self.codeMapsGloballyDisabled = codeMapsGloballyDisabled
+            self.codemapRootPausePolicy = codemapRootPausePolicy
             self.selectionGraphFactory = selectionGraphFactory
             self.selectionGraphQueryBudgetPolicy = selectionGraphQueryBudgetPolicy
             precondition(automaticSelectionAccountingMaximum >= 0)
@@ -7358,13 +7397,19 @@ package actor WorkspaceFileContextStore {
 
         /// Exercise canonical mutation/publication without disk probes or watcher
         /// scheduling in the measured interval. This actor-isolated scope never suspends.
-        func applyIndexDeltasWithFakeDiskForTesting(rootID: UUID, deltas: [FileSystemDelta]) throws {
+        @discardableResult
+        func applyIndexDeltasWithFakeDiskForTesting(rootID: UUID, deltas: [FileSystemDelta]) throws -> IndexDeltaPublicationWork {
             let root = try state(for: rootID).root
             let prepared = deltas.compactMap { FileSystemDeltaPreparation.prepare($0, inRoot: root.standardizedFullPath) }
             precondition(!indexDeltaPathsExistForTesting)
             indexDeltaPathsExistForTesting = true
-            defer { indexDeltaPathsExistForTesting = false }
+            indexDeltaPublicationWorkForTesting = IndexDeltaPublicationWork()
+            defer {
+                indexDeltaPathsExistForTesting = false
+                indexDeltaPublicationWorkForTesting = nil
+            }
             applyPreparedIndexDeltaMutations(rootID: rootID, deltas: prepared)
+            return indexDeltaPublicationWorkForTesting!
         }
 
         func replayFileSystemPublicationForInvalidationDiagnosticsForTesting(
@@ -7584,7 +7629,7 @@ package actor WorkspaceFileContextStore {
             folderIDsByPath: [String: UUID],
             managedOnlyFileIDs: Set<UUID> = [],
             managedOnlyFolderIDs: Set<UUID> = []
-        ) -> (shard: RootCatalogShardComparisonView, logicalMutationCount: Int, changedFileIDs: Set<UUID>)? {
+        ) -> (shard: RootCatalogShardComparisonView, logicalMutationCount: Int, changedFileIDs: Set<UUID>, work: RootCatalogPatchWork)? {
             guard !event.requiresFullResync, !event.isRootUnload,
                   let output = mergeRootCatalogShardRecords(
                       event: event,
@@ -7612,7 +7657,7 @@ package actor WorkspaceFileContextStore {
                 previousPathSearchIndex: previous.pathSearchIndex,
                 appliedIndexGeneration: event.generation
             )
-            return (comparisonView(shard), output.logicalMutationCount, output.pathIndexChangedFileIDs)
+            return (comparisonView(shard), output.logicalMutationCount, output.pathIndexChangedFileIDs, output.work)
         }
 
         func applyAppliedIndexEventToRootCatalogShardForTesting(
@@ -9588,6 +9633,21 @@ package actor WorkspaceFileContextStore {
               removedFolderPaths.isDisjoint(with: replacementFolderPaths)
         else { return nil }
 
+        #if DEBUG
+            var work = RootCatalogPatchWork()
+            func filePrecedes(_ lhs: WorkspaceFileRecord, _ rhs: WorkspaceFileRecord) -> Bool {
+                work.fileComparisons += 1
+                return searchRootCatalogFilePrecedes(lhs, rhs)
+            }
+            func folderPrecedes(_ lhs: WorkspaceFolderRecord, _ rhs: WorkspaceFolderRecord) -> Bool {
+                work.folderComparisons += 1
+                return searchCatalogFolderPrecedes(lhs, rhs)
+            }
+        #else
+            let filePrecedes = searchRootCatalogFilePrecedes
+            let folderPrecedes = searchCatalogFolderPrecedes
+        #endif
+
         // Only affected ancestor membership is collected, not another whole-root identity map.
         var neededFolderIDs = Set<UUID>()
         func validateParentChain(from startingID: UUID?) -> Bool {
@@ -9625,6 +9685,9 @@ package actor WorkspaceFileContextStore {
         var foundModifiedFolderIDs = Set<UUID>()
         // Resolve displaced identities before checking retained parent links in the merge pass.
         for folder in oldFolders {
+            #if DEBUG
+                work.folderVisits += 1
+            #endif
             if modifiedFolderIDs.contains(folder.id) { foundModifiedFolderIDs.insert(folder.id) }
             if removedFolderIDs.contains(folder.id) { foundRemovedFolderIDs.insert(folder.id) }
             if removedFolderPaths.contains(folder.standardizedRelativePath) {
@@ -9660,15 +9723,22 @@ package actor WorkspaceFileContextStore {
               foundModifiedFolderIDs == modifiedFolderIDs,
               neededFolderIDs.isSubset(of: representedNeededFolderIDs)
         else { return nil }
-        let sortedFolderReplacements = folderReplacements.values.sorted(by: searchCatalogFolderPrecedes)
+        #if DEBUG
+            work.sortedFolderCount = folderReplacements.count
+            work.sortedFileCount = fileReplacements.count
+        #endif
+        let sortedFolderReplacements = folderReplacements.values.sorted(by: folderPrecedes)
         var folders: [WorkspaceFolderRecord] = []
         folders.reserveCapacity(oldFolders.count + sortedFolderReplacements.count)
         var folderCursor = 0
         for folder in oldFolders {
+            #if DEBUG
+                work.folderVisits += 1
+            #endif
             if touchedFolderIDs.contains(folder.id) { continue }
             guard folder.parentFolderID.map({ !absentFolderIDs.contains($0) }) ?? true else { return nil }
             while folderCursor < sortedFolderReplacements.count,
-                  searchCatalogFolderPrecedes(sortedFolderReplacements[folderCursor], folder)
+                  folderPrecedes(sortedFolderReplacements[folderCursor], folder)
             {
                 folders.append(sortedFolderReplacements[folderCursor])
                 folderCursor += 1
@@ -9677,7 +9747,7 @@ package actor WorkspaceFileContextStore {
         }
         folders.append(contentsOf: sortedFolderReplacements[folderCursor...])
 
-        let sortedFileReplacements = fileReplacements.values.sorted(by: searchRootCatalogFilePrecedes)
+        let sortedFileReplacements = fileReplacements.values.sorted(by: filePrecedes)
         var files: [WorkspaceFileRecord] = []
         files.reserveCapacity(oldFiles.count + sortedFileReplacements.count)
         var fileCursor = 0
@@ -9686,6 +9756,9 @@ package actor WorkspaceFileContextStore {
         var foundRemovedFilePaths = Set<String>()
         var foundModifiedFileIDs = Set<UUID>()
         for file in oldFiles {
+            #if DEBUG
+                work.fileVisits += 1
+            #endif
             if modifiedFileIDs.contains(file.id) { foundModifiedFileIDs.insert(file.id) }
             if removedFileIDs.contains(file.id) { foundRemovedFileIDs.insert(file.id) }
             if removedFilePaths.contains(file.standardizedRelativePath) {
@@ -9694,7 +9767,7 @@ package actor WorkspaceFileContextStore {
             if let replacement = fileReplacements[file.id], file.isByteIdentical(to: replacement) {
                 touchedFileIDs.remove(file.id)
                 while fileCursor < sortedFileReplacements.count,
-                      searchRootCatalogFilePrecedes(sortedFileReplacements[fileCursor], file)
+                      filePrecedes(sortedFileReplacements[fileCursor], file)
                 {
                     files.append(sortedFileReplacements[fileCursor])
                     fileCursor += 1
@@ -9721,7 +9794,7 @@ package actor WorkspaceFileContextStore {
             }
             guard file.parentFolderID.map({ !absentFolderIDs.contains($0) }) ?? true else { return nil }
             while fileCursor < sortedFileReplacements.count,
-                  searchRootCatalogFilePrecedes(sortedFileReplacements[fileCursor], file)
+                  filePrecedes(sortedFileReplacements[fileCursor], file)
             {
                 files.append(sortedFileReplacements[fileCursor])
                 fileCursor += 1
@@ -9733,12 +9806,16 @@ package actor WorkspaceFileContextStore {
               foundModifiedFileIDs == modifiedFileIDs
         else { return nil }
         files.append(contentsOf: sortedFileReplacements[fileCursor...])
-        return RootCatalogShardBuilderOutput(
+        var output = RootCatalogShardBuilderOutput(
             files: files,
             folders: folders,
             logicalMutationCount: touchedFileIDs.count + touchedFolderIDs.count,
             pathIndexChangedFileIDs: touchedFileIDs
         )
+        #if DEBUG
+            output.work = work
+        #endif
+        return output
     }
 
     private static func catalogFileBytesEqual(_ lhs: WorkspaceFileRecord, _ rhs: WorkspaceFileRecord) -> Bool {
@@ -11604,9 +11681,11 @@ package actor WorkspaceFileContextStore {
         guard let state = rootStatesByID[rootID] else { return .rootUnavailable }
         let rootEpoch = WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: state.lifetimeID)
 
+        restoreCodemapPausePolicyIfNeeded(rootEpoch: rootEpoch)
         if suspended {
             let cancelledResume = codemapResumeTransitionIDsByRootEpoch.removeValue(forKey: rootEpoch) != nil
             let inserted = codemapSuspendedRootEpochs.insert(rootEpoch).inserted
+            codemapRootPausePolicy.setPaused(true, rootPath: state.root.standardizedFullPath)
             guard inserted || cancelledResume else { return .unchanged }
             codemapGraphIndexBuildReschedulePendingRootEpochs.remove(rootEpoch)
             publishCodemapRootStatusesIfChanged()
@@ -11638,6 +11717,7 @@ package actor WorkspaceFileContextStore {
               codemapSuspendedRootEpochs.remove(rootEpoch) != nil
         else { return .unchanged }
         codemapResumeTransitionIDsByRootEpoch.removeValue(forKey: rootEpoch)
+        codemapRootPausePolicy.setPaused(false, rootPath: state.root.standardizedFullPath)
         // The suspension detached this root's authority recovery, but not the requirement it ran
         // for. Restart it before scheduling anything: the schedule below is a no-op while that
         // requirement is registered, and the recovery reschedules the build itself once its scan
@@ -11760,8 +11840,19 @@ package actor WorkspaceFileContextStore {
         publishCodemapRootStatusesIfChanged()
     }
 
+    private func restoreCodemapPausePolicyIfNeeded(rootEpoch: WorkspaceCodemapRootEpoch) {
+        guard let state = rootStatesByID[rootEpoch.rootID],
+              state.lifetimeID == rootEpoch.rootLifetimeID,
+              codemapPauseRestoredRootEpochs.insert(rootEpoch).inserted
+        else { return }
+        if codemapRootPausePolicy.isPaused(rootPath: state.root.standardizedFullPath) {
+            codemapSuspendedRootEpochs.insert(rootEpoch)
+        }
+    }
+
     private func codemapGenerationIsSuspended(rootEpoch: WorkspaceCodemapRootEpoch) -> Bool {
-        codeMapsGloballyDisabled || codemapSuspendedRootEpochs.contains(rootEpoch) ||
+        restoreCodemapPausePolicyIfNeeded(rootEpoch: rootEpoch)
+        return codeMapsGloballyDisabled || codemapSuspendedRootEpochs.contains(rootEpoch) ||
             repositoryExcludeObservations[rootEpoch.rootID]?.isBlocked == true
     }
 
@@ -11825,6 +11916,8 @@ package actor WorkspaceFileContextStore {
         let launchPhase = codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch]?.phase
         let executionState = codemapGraphIndexExecutionStatesByRootEpoch[rootEpoch]
         let unavailableReason: WorkspaceCodemapRootStatusUnavailableReason? = if codemapCatalogRecoveryRequirementsByRootEpoch[rootEpoch]?.retryExhausted == true {
+            .retryExhausted
+        } else if executionState == .retryExhausted {
             .retryExhausted
         } else if executionState == .exhausted {
             .workerRecoveryExhausted
@@ -12613,6 +12706,7 @@ package actor WorkspaceFileContextStore {
             }
             codemapGraphIndexBuildReschedulePendingRootEpochs.remove(rootEpoch)
             codemapSuspendedRootEpochs.remove(rootEpoch)
+            codemapPauseRestoredRootEpochs.remove(rootEpoch)
             codemapResumeTransitionIDsByRootEpoch.removeValue(forKey: rootEpoch)
             codemapGraphAccountingByRootEpoch.removeValue(forKey: rootEpoch)
             codemapGraphIndexExecutionStatesByRootEpoch.removeValue(forKey: rootEpoch)
@@ -15329,11 +15423,23 @@ package actor WorkspaceFileContextStore {
                 rootID: file.rootID,
                 rootLifetimeID: state.lifetimeID
             )
-            seedsByRootEpoch[rootEpoch, default: []].append(fileID)
-            seedPathsByFileID[fileID] = WorkspaceCodemapLogicalPresentationPath(
+            let seedPath = WorkspaceCodemapLogicalPresentationPath(
                 rootDisplayName: rootLabels[file.rootID] ?? state.root.name,
                 standardizedRelativePath: file.standardizedRelativePath
             )?.displayPath
+            let fileExtension = (file.name as NSString).pathExtension
+            guard SyntaxManager.supportsCodeMap(fileExtension: fileExtension),
+                  SyntaxManager.shared.language(forFileExtension: fileExtension) != nil
+            else {
+                requestIssues.append(.init(
+                    code: "unsupported_file_type", phase: "seed_resolution", path: seedPath,
+                    retryable: false, retryAfterMilliseconds: nil, attempted: nil, limit: nil,
+                    message: "This file type does not support Code Maps."
+                ))
+                continue
+            }
+            seedsByRootEpoch[rootEpoch, default: []].append(fileID)
+            seedPathsByFileID[fileID] = seedPath
         }
 
         var remainingNodes = budget.maximumNodeCount
@@ -15351,6 +15457,23 @@ package actor WorkspaceFileContextStore {
                 let rhs = seedPathsByFileID[$1] ?? $1.uuidString
                 if lhs != rhs { return lhs.utf8.lexicographicallyPrecedes(rhs.utf8) }
                 return $0.uuidString < $1.uuidString
+            }
+            if codemapGenerationIsSuspended(rootEpoch: rootEpoch) {
+                roots.append(unavailableCodemapStructureRoot(
+                    rootEpoch: rootEpoch, rootName: rootName, seedFileIDs: rootSeedIDs,
+                    seedPathsByFileID: seedPathsByFileID,
+                    code: codeMapsGloballyDisabled ? "codemaps_disabled" : (
+                        codemapSuspendedRootEpochs.contains(rootEpoch) ? "root_paused" : "repository_excluded"
+                    ),
+                    message: codeMapsGloballyDisabled
+                        ? "Codemap generation is disabled globally."
+                        : (
+                            codemapSuspendedRootEpochs.contains(rootEpoch)
+                                ? "Code Map generation is paused for this root. Resume it to index code structure."
+                                : "This root is excluded by repository policy."
+                        )
+                ))
+                continue
             }
             let raw: WorkspaceCodemapGraphStructureRootResult
             if remainingNodes <= 0 || remainingBytes == 0 {
@@ -21606,6 +21729,9 @@ package actor WorkspaceFileContextStore {
                 if !existed {
                     var parentPath = (relativePath as NSString).deletingLastPathComponent
                     while !parentPath.isEmpty, parentPath != "." {
+                        #if DEBUG
+                            indexDeltaPublicationWorkForTesting?.ancestorMembershipProbes += 1
+                        #endif
                         if rootStatesByID[rootID]?.folderIDsByRelativePath[parentPath] != nil {
                             existingParentPaths.insert(parentPath)
                         }
@@ -23572,8 +23698,18 @@ package actor WorkspaceFileContextStore {
             generation: generation,
             rootLifetimeID: rootLifetimeID,
             modifiedFileSourceSnapshotsByID: modifiedFileSourceSnapshotsByID,
-            upsertedFiles: upsertedFiles.sorted { $0.standardizedRelativePath < $1.standardizedRelativePath },
-            upsertedFolders: upsertedFolders.sorted { $0.standardizedRelativePath < $1.standardizedRelativePath },
+            upsertedFiles: upsertedFiles.sorted {
+                #if DEBUG
+                    indexDeltaPublicationWorkForTesting?.eventSortComparisons += 1
+                #endif
+                return $0.standardizedRelativePath < $1.standardizedRelativePath
+            },
+            upsertedFolders: upsertedFolders.sorted {
+                #if DEBUG
+                    indexDeltaPublicationWorkForTesting?.eventSortComparisons += 1
+                #endif
+                return $0.standardizedRelativePath < $1.standardizedRelativePath
+            },
             removedFileIDs: removedFileIDs,
             removedFolderIDs: removedFolderIDs,
             removedFilePaths: removedFilePaths.sorted(),
@@ -23813,6 +23949,19 @@ package actor WorkspaceFileContextStore {
 
     private func indexFiles(_ items: [FSItemDTO], root: WorkspaceRootRecord, state: inout RootState, indexes: inout RootIndexBuffers) {
         for item in items {
+            #if DEBUG
+                if indexDeltaPublicationWorkForTesting != nil,
+                   !isKnownUniquelyReferenced(&state.mutationOwnership)
+                {
+                    // Charge the inventory exposed to copy-on-write at this
+                    // mutation, then detach the probe along with this value.
+                    // One initial snapshot is bounded; a copied root per file is not.
+                    indexDeltaPublicationWorkForTesting?.sharedRootInventoryRecords +=
+                        state.fileIDsByRelativePath.count + state.folderIDsByRelativePath.count
+                    state.mutationOwnership = RootMutationOwnership()
+                }
+                indexDeltaPublicationWorkForTesting?.indexedFileVisits += 1
+            #endif
             let relativePath = StandardizedPath.relative(item.relativePath)
             guard state.fileIDsByRelativePath[relativePath] == nil else { continue }
             let parentID = ensureParentFolderID(for: (relativePath as NSString).deletingLastPathComponent, root: root, state: &state, indexes: &indexes)
@@ -23833,6 +23982,9 @@ package actor WorkspaceFileContextStore {
     }
 
     private func ensureParentFolderID(for relativePath: String, root: WorkspaceRootRecord, state: inout RootState, indexes: inout RootIndexBuffers) -> UUID {
+        #if DEBUG
+            indexDeltaPublicationWorkForTesting?.parentFolderProbes += 1
+        #endif
         let key = StandardizedPath.relative(relativePath)
         if key.isEmpty || key == "." { return root.id }
         if let existing = state.folderIDsByRelativePath[key] { return existing }

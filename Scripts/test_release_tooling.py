@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import os
+import plistlib
 import re
 import stat
 import subprocess
@@ -14,12 +15,65 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+
+import conductor
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
 ROLLOUT_TOOL = SCRIPT_DIR / "stable_rollout.py"
 POLICY = SCRIPT_DIR / "apple_identity_policy.json"
 PROFILE_TOOL = SCRIPT_DIR / "embedded_provisioning_profile.py"
+
+
+class ReleaseBuildCachePolicyTests(unittest.TestCase):
+    def test_conductor_release_artifact_keeps_incremental_builds_explicit(self) -> None:
+        policy = "REPOPROMPT_CLEAN_PUBLIC_SWIFTPM_BUILDS"
+        for requested, keeps_cache in ((None, False), ("1", False), ("0", True)):
+            with self.subTest(requested=requested), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                scripts = root / "Scripts"
+                scripts.mkdir()
+                builder = scripts / "build_swiftpm_release_products.sh"
+                builder.write_bytes((SCRIPT_DIR / builder.name).read_bytes())
+                builder.chmod(0o755)
+                fixtures = {
+                    "release.sh": '#!/usr/bin/env bash\n[[ "$1" == artifact ]] || exit 76\nexec "$(dirname "$0")/build_swiftpm_release_products.sh"\n',
+                    "run_without_github_tokens.sh": '#!/usr/bin/env bash\nexec "$@"\n',
+                    "patch_keyboard_shortcuts_resource_lookup.sh": '#!/usr/bin/env bash\nexit 77\n',
+                    "compare_swiftpm_release_resources.py": '#!/usr/bin/env python3\n',
+                    "lipo": '#!/usr/bin/env bash\nexit 0\n',
+                    "ditto": '#!/usr/bin/env bash\nexit 0\n',
+                }
+                for name, source in fixtures.items():
+                    script = scripts / name
+                    script.write_text(source)
+                    script.chmod(0o755)
+                sentinel = root / ".build/public-release-swiftpm/previous-build"
+                sentinel.parent.mkdir(parents=True)
+                sentinel.touch()
+                client_env = {"PATH": f"{scripts}:{os.environ['PATH']}"}
+                if requested is not None:
+                    client_env[policy] = requested
+                with mock.patch.dict(os.environ, client_env, clear=True):
+                    snapshot = conductor.OperationRegistry.client_env_snapshot()
+                request = json.loads(json.dumps({
+                    "operation": "release", "args": {"subcommand": "artifact"}, "env": snapshot,
+                }))
+                with mock.patch.dict(os.environ, {policy: "1" if requested == "0" else "0"}):
+                    argv, _, cwd, environment, _ = conductor.OperationRegistry(root).prepare(request)
+                result = subprocess.run(argv, cwd=cwd, env=environment,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 77, result.stdout + result.stderr)
+                self.assertEqual(sentinel.exists(), keeps_cache, result.stdout + result.stderr)
+                self.assertTrue((sentinel.parent / ".repoprompt-public-swiftpm-scratch").is_file())
+
+    def test_release_cache_policy_changes_request_identity(self) -> None:
+        registry = conductor.OperationRegistry(ROOT_DIR)
+        request = {"operation": "release", "args": {"subcommand": "artifact"}}
+        clean = {**request, "env": {"REPOPROMPT_CLEAN_PUBLIC_SWIFTPM_BUILDS": "1"}}
+        incremental = {**request, "env": {"REPOPROMPT_CLEAN_PUBLIC_SWIFTPM_BUILDS": "0"}}
+        self.assertNotEqual(registry.fingerprint(clean), registry.fingerprint(incremental))
 
 
 class PromotionCurlConfigTests(unittest.TestCase):
@@ -120,6 +174,127 @@ class DebugPackagingIdentityTests(unittest.TestCase):
         self.assertTrue(placeholders)
         for placeholder in sorted(placeholders):
             self.assertIn(f'"{placeholder}":', validator, placeholder)
+
+
+class SparkleInstallerLauncherGuardTests(unittest.TestCase):
+    """#42: an unsandboxed app must never enable Sparkle's installer launcher."""
+
+    VALIDATOR = SCRIPT_DIR / "validate_sparkle_installer_launcher.py"
+
+    def validate(self, info_plist: Path, entitlements: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(self.VALIDATOR), "--info-plist", str(info_plist),
+             "--entitlements", str(entitlements), "--label", "fixture"],
+            text=True, capture_output=True, timeout=30,
+        )
+
+    def fixture_result(self, info: dict[str, object], entitlements: dict[str, object]) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Info.plist").write_bytes(plistlib.dumps(info))
+            (root / "app.entitlements").write_bytes(plistlib.dumps(entitlements))
+            return self.validate(root / "Info.plist", root / "app.entitlements")
+
+    def test_committed_release_templates_pass(self) -> None:
+        result = self.validate(
+            ROOT_DIR / "AppBundle" / "Info.plist.template",
+            ROOT_DIR / "AppBundle" / "RepoPrompt.entitlements.template",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_launcher_without_sandbox_fails(self) -> None:
+        for value in (True, "YES", 1):
+            with self.subTest(value=value):
+                result = self.fixture_result(
+                    {"SUEnableInstallerLauncherService": value},
+                    {"com.apple.security.cs.allow-jit": True},
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("SUEnableInstallerLauncherService", result.stderr)
+                self.assertIn("not sandboxed", result.stderr)
+
+    def test_absent_or_disabled_launcher_and_sandboxed_launcher_pass(self) -> None:
+        cases = [
+            ({}, {}),
+            ({"SUEnableInstallerLauncherService": False}, {}),
+            ({"SUEnableInstallerLauncherService": True}, {"com.apple.security.app-sandbox": True}),
+        ]
+        for info, entitlements in cases:
+            with self.subTest(info=info, entitlements=entitlements):
+                self.assertEqual(self.fixture_result(info, entitlements).returncode, 0)
+
+    def test_release_preflight_and_staged_validation_run_the_guard(self) -> None:
+        release = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
+        preflight = release.split("run_preflight() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn('"$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_installer_launcher.py"', preflight)
+        self.assertIn('--info-plist "$ROOT_DIR/AppBundle/Info.plist.template"', preflight)
+        staged = (SCRIPT_DIR / "validate_staged_release.sh").read_text(encoding="utf-8")
+        self.assertIn('"$SCRIPT_DIR/validate_sparkle_installer_launcher.py"', staged)
+        self.assertIn('--info-plist "$APP_BUNDLE/Contents/Info.plist"', staged)
+
+
+class ReleaseStagePhaseTests(unittest.TestCase):
+    """#166: the workflow runs stage-publish's phases as separate, observable steps."""
+
+    PHASES = ["stage-verify-source", "stage-prepare", "stage-package", "stage-validate", "stage-archive"]
+
+    def source_release(self, body: str, **env: str) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        environment.update({"RELEASE_TAG": "v0.0.0", "RELEASE_COMMIT": "0" * 40, "REPOPROMPT_ENABLE_SENTRY": "1", **env})
+        return subprocess.run(
+            ["bash", "-c", f'set -euo pipefail; source "$1"; {body}', "test", str(SCRIPT_DIR / "release.sh")],
+            cwd=ROOT_DIR, env=environment, text=True, capture_output=True, timeout=30,
+        )
+
+    def stage_job(self) -> str:
+        workflow = (ROOT_DIR / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        return workflow.split("\n  stage:\n", 1)[1].split("\n  publish:\n", 1)[0]
+
+    def test_stage_publish_runs_every_phase_in_workflow_order(self) -> None:
+        stubs = "; ".join(
+            f'{phase.replace("-", "_")}() {{ printf "%s\\n" {phase}; }}' for phase in self.PHASES
+        )
+        result = self.source_release(f"{stubs}; stage_publish_release")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split(), self.PHASES)
+
+    def test_workflow_stage_job_runs_the_phases_in_order(self) -> None:
+        job = self.stage_job()
+        modes = re.findall(r"run: \./trusted-control-plane/Scripts/release\.sh (\S+)", job)
+        self.assertEqual(modes, self.PHASES)
+        self.assertNotIn("stage-publish", modes)
+        steps = job.split("\n      - name: ")
+        with_token = [step.split("\n", 1)[0] for step in steps if "GH_TOKEN:" in step]
+        self.assertEqual(with_token, ["Verify approved release tag"])
+        for step in steps:
+            if "run: ./trusted-control-plane/Scripts/release.sh stage-" in step:
+                self.assertIn('REPOPROMPT_ENABLE_SENTRY: "1"', step)
+                self.assertIn("REPOPROMPT_RELEASE_SOURCE_ROOT:", step)
+                self.assertIn("REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR:", step)
+
+    def test_phases_after_tag_verification_scrub_github_tokens(self) -> None:
+        stubs = (
+            'ditto() { return 99; }; '
+            'resolve_without_lockfile_drift() { printf "token=%s\\n" "${GH_TOKEN-unset}"; }; '
+            "run_preflight() { :; }; prepare_dist() { :; }"
+        )
+        result = self.source_release(f"{stubs}; stage_prepare", GH_TOKEN="fixture-token")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "token=unset")
+        source = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
+        for function in ("stage_prepare", "stage_package", "stage_validate", "stage_archive"):
+            body = source.split(f"{function}() {{", 1)[1].split("\n}", 1)[0]
+            self.assertIn("unset GH_TOKEN GITHUB_TOKEN SOURCE_GH_TOKEN", body, function)
+
+    def test_phases_require_sentry_linking(self) -> None:
+        result = self.source_release("stage_prepare", REPOPROMPT_ENABLE_SENTRY="0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("REPOPROMPT_ENABLE_SENTRY=1", result.stderr)
+
+    def test_release_dispatch_accepts_each_phase(self) -> None:
+        source = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
+        for phase in self.PHASES:
+            self.assertIn(f"        {phase}) {phase.replace('-', '_')} ;;", source)
 
 
 class PackagedSmokeExternalProbeTests(unittest.TestCase):
