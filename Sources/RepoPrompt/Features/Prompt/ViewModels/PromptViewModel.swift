@@ -3199,7 +3199,7 @@ class PromptViewModel: ObservableObject {
 
         // Switch to an existing tab if the ID is known.
         if let id, let existing = manager.composeTab(with: id) {
-            await switchComposeTab(id)
+            await switchComposeTab(id, focusIntent: .preservesLiveText)
             return manager.composeTab(with: id)
         }
 
@@ -3209,7 +3209,7 @@ class PromptViewModel: ObservableObject {
             name: name
         ) else { return nil }
 
-        await switchComposeTab(newTab.id)
+        await switchComposeTab(newTab.id, focusIntent: .preservesLiveText)
         return manager.composeTab(with: newTab.id) ?? newTab
     }
 
@@ -3937,9 +3937,20 @@ class PromptViewModel: ObservableObject {
         await promptApplyTask?.value
     }
 
+    /// Asks this window's composer to take focus because the user activated `tabID`. Unlike a
+    /// tab change alone, this also covers re-selecting the tab that is already active.
+    @MainActor
+    func requestUserComposerActivation(tabID: UUID) {
+        NotificationCenter.default.post(
+            name: .composerActivationRequested,
+            object: nil,
+            userInfo: ["tabID": tabID, "windowID": windowID]
+        )
+    }
+
     /// Switch to a compose tab and wait for the tab state to fully apply.
     @MainActor
-    func switchComposeTab(_ id: UUID) async {
+    func switchComposeTab(_ id: UUID, focusIntent: ComposeTabFocusIntent = .userInitiated) async {
         guard
             let manager = workspaceManager,
             let workspace = manager.activeWorkspace,
@@ -3970,6 +3981,7 @@ class PromptViewModel: ObservableObject {
                       let selected = manager.composeTabCarrierWorkspace(workspaceID: workspace.id),
                       selected.workspace.activeComposeTabID == id
                 else { return }
+                if focusIntent == .userInitiated { requestUserComposerActivation(tabID: id) }
                 loadComposeTabsFromWorkspace(selected.workspace)
                 guard manager.activeWorkspaceID == workspace.id, activeComposeTabID == id,
                       let current = manager.composeTabCarrierWorkspace(workspaceID: workspace.id),
@@ -7159,8 +7171,16 @@ private extension String {
     }
 }
 
+/// Who is switching tabs, which decides whether the composer may end typing in another field.
+enum ComposeTabFocusIntent {
+    case userInitiated
+    /// MCP and other automated switches must never interrupt the user's typing.
+    case preservesLiveText
+}
+
 extension Notification.Name {
     static let activeComposeTabChanged = Notification.Name("activeComposeTabChanged")
+    static let composerActivationRequested = Notification.Name("composerActivationRequested")
 }
 
 extension PromptViewModel {

@@ -1991,7 +1991,7 @@ launched, stopped or relaunched.
 | Both Debug products, before forwarding repair | `c7cb5067-6582-4f8f-b810-606cce4c9903` | exit 0; 11m02s execution, 1m12s queue; not packaging/live proof |
 | Lint after forwarding repair | `f4aa9f01-de86-46e2-b5d5-fe875abe20d8` | exit 0; 0/1,943 files need formatting; strict SwiftLint |
 | Both Debug products after forwarding repair | `e0a7ca64-69b3-4e78-b263-69fb56d04f2d` | exit 0; 26.5s execution, 48.4s queue; not packaging/live proof |
-| Broader full suite | `6b0ec11d-99a7-443b-9580-e8b035fc956c` | dispatched; completion is pending, not a pass |
+| Broader full suite | `6b0ec11d-99a7-443b-9580-e8b035fc956c` | timed out at 60 minutes, exit 124; 3,125 completed passes, 10 skips and 4 failures; incomplete |
 
 Scoped pinned SwiftFormat ran on the eight integration-owned Swift files and
 changed none. Initial lint `a42134a9` failed because pinned SwiftFormat was absent;
@@ -2042,3 +2042,134 @@ still requires explicit lifecycle authorization: the incorporated baseline and
 final candidate, identical host/toolchain/profile/security policy, exclusive
 heavy-work interval, two warm-ups and twenty retained samples per head, with the
 unchanged 10% budget. No old slow sample or failure is discarded.
+
+#### M6 Round 2 baseline investigation (2026-11-06)
+
+Candidate source `4a53016cdb4e60ced9d235d795ee6741e8b2fb8f` was compared
+with its incorporated main `348957d5db58e782cd851d591a906d9ef74fac71` in an
+independent detached worktree. The baseline had its own conductor queue/build
+output; machine-wide heavy admission was not bypassed or reconfigured. It was
+moved from the candidate's ignored `.build` directory to ignored `build` before
+any successful candidate cache publication, to avoid including the nested
+checkout in conductor's recursive build-cache snapshot. No pre-existing other
+worktree or dirty primary was changed.
+
+**Full-suite result is incomplete, not green.** Ticket `6b0ec11d` reached its
+unchanged 60-minute execution timeout after 3,125 named passes, 10 skips and four
+failures. The two original mixed-run cases had not yet run. Failures were:
+`AgentProjectionRepairIdempotenceTests.testRepeatedProjectionAtThreeWindowScaleStaysWithinBudget`
+(6.186231166s versus 5s),
+`AgentSessionLinkCatalogScaleTests.testWarmActualRouteCatalogAtApprovedScale`
+(p95 558.0045ms versus 500ms),
+`AgentSessionLinkLateQualificationTests.testAvailabilityProducerABAVetoesRetainedOffer`
+and `AgentSessionLinkLiveDiscoveryTests.testW4ProvisionalDeclarationNeverAppearsInAnyPublishedSnapshot`
+(both timedOut(4)). Execution last entered
+`AgentTranscriptTurnCacheGroupingTests.testLargeProjectionGroupingMatchesHistoricalSlicesWithinBudget`.
+These failures are recorded, not attributed solely to machine load.
+
+**Original mixed failures:**
+
+- Candidate diagnostic `b6fa38b1-f86e-4395-8d02-717aca756952` executed 46 cases:
+  39 passed, seven CodeMap cases failed; WorktreeRecovery passed 27/27.
+  The original sibling-root failure reproduced. At overlay generation 9, the
+  graph was sealed but partial: one supported, zero classified, one pending,
+  zero contributed, no symbols. Presentation had returned fresh text after
+  0.310866708s. No native watcher callback was recorded before the assertion;
+  the manually replayed invalidation completed in 0.0036605s. This contradicts
+  a late native-watcher explanation for this observation. The pending graph
+  publication/demand ordering remains unresolved; no desired-symbol polling,
+  deadline increase or speculative production fix was substituted.
+- Candidate exact diagnostic `a6f45827-b3f7-4189-8988-e519241dfd8c` passed the
+  original worktree method but failed the sibling test earlier, while initially
+  resolving artifacts, before the edit. It does not exonerate the original failure.
+- Unmodified baseline mixed run `886c05f7-3ef7-4d4b-8549-1d7dd87e4e0f` executed
+  173 cases: 165 passed, four skipped, four failed. All failures were the same
+  `foreground drafts published` fixture timeout, in
+  `testCreateDefaultBindKeepsARepositoryPathThatReadsAsASelectorLiteral`,
+  `testCreateDefaultBindUsesTheElectedRootWhenTwoCheckoutsShareItsRepository`,
+  `testCreateRecoverySelectorKeepsALinkedPrimaryCheckout`, and
+  `testUnopenedLaneModelAndEffortUseItsWriterDespiteEarlierWorkspaceReplica`.
+  The original standalone and sibling-root methods passed. Cold baseline job
+  `2dc4b950` timed out compiling and executed no tests; it is not a pass.
+- Baseline diagnostic `89f56efb-c8fa-48ef-91cb-875918d7bcce` executed 46 cases:
+  43 passed, three failed. Worktree fixture failures occurred in
+  `testBusyCreateBindRecoveryCallCarriesTheElectedRootWhenTwoCheckoutsShareItsRepository`
+  and `testCreateDefaultBindCompletesForASoleRepositoryWhosePathReadsAsASelector`.
+  Captured transitions show the replica draft initially present, then the target
+  tab absent from its active-workspace projection within 18/50ms. The live draft
+  strings and active tab IDs remained correct; switching and selection-mirror
+  flags were false. Explicit snapshot publication after timeout did not restore
+  the missing projected tab. Thus this is not merely a delayed 120ms debounce:
+  asynchronous projection replacement invalidates the fixture's directly
+  installed replica. The exact replacing producer is not yet identified.
+  WorkspaceManager differs from this baseline only by its extraction import.
+  The inherited fixture failure mode is proven; no production repair is claimed.
+  The other failure was
+  `testGlobalDisableCancelsDiscoveryAndIndexingAcrossStoresAndPreservesManualPause`.
+  The original sibling-root method passed again with generation 9 fully classified;
+  baseline reproduction of the original empty graph remains absent.
+
+Diagnostic modifications only captured state and rethrew original errors;
+original assertions/deadlines were retained. They were removed after the jobs.
+Their logs/patches remain local, not shipped runtime machinery.
+
+**Unchanged scale acceptance, twenty retained samples per case:**
+
+| Source/run | 30-chat refresh/menu p95 (ms) | 300-chat refresh/menu p95 (ms) |
+| --- | --- | --- |
+| Candidate `211d5c13` | 4.960041 / 2.605875 | 49.806 / 71.928959 |
+| Candidate full-suite `6b0ec11d` | 6.585208 / 3.963958 | 34.610916 / 57.253834 |
+| Incorporated main `886c05f7` | 9.528166 / 3.190791 | 54.340833 / 117.786416 |
+| Candidate after late merge `dbfaafe5` | 6.877542 / 2.462917 | 45.69475 / 147.639083 |
+
+The benchmark source is byte-identical across these heads. Both baseline and
+candidate exceed the **50ms** menu p95 limit. Each recorded four restore reads,
+470 candidate visits and 35 publications. Different, heavily contended host
+intervals prevent attributing the difference to this PR or claiming improvement.
+All slow samples remain evidence; the acceptance limit is unchanged and open.
+
+**Workspace-free distinction:** the existing canonical two-lane tool contract
+omits the `workspace` argument but installs an active workspace and uses a
+controlled endpoint host. It can prove returned bare cursor replay and cleanup,
+not production creation with zero active-workspace owners or provider completion.
+`AgentSessionLaneMCPToolService.resolveDestination` filters window candidates by
+`activeWorkspace`, returning `callerWindowHasNoWorkspace` with no eligible owner.
+Allocation in `WindowStatesManager+AgentSessionLanes` and
+`AgentModeViewModel+SessionLinkLanes` rechecks that authority. A positive zero-owner
+proof needs an implemented durable placement/admission/discovery/retirement owner
+independent of active window selection, followed by a real route contract. Removing
+these guards or launching an app is not a substitute. This acceptance remains open.
+
+Release Candidate run [42057513544](https://github.com/repoprompt/repoprompt-ce/actions/runs/42057513544)
+passed at exact source `4a53016c`: release package, embedded MCP roundtrip, and
+macOS 15 x86_64/arm64 artifact smokes. It is ancestor-head evidence after the next
+merge, not final-head CI, a real-provider journey, or the matched local launch
+experiment. Local visible-app lifecycle remains unauthorized and unperformed.
+
+The late normal merge incorporates `5a3f112253508c972b0952a95ea9c56e90b909b0`
+(#1632 Re-prompt, #1619 verified recovery backups, #1634 input focus). Its sole
+text conflict was additive imports in `WorkspaceProjectionDecodeTests`; both
+main's SettingsCore import and M6's WorkspaceContext import are retained.
+Main's recovery-backup refusal/authority and session-scoped UI changes remain
+intact. No threshold, guard, or ratchet is relaxed.
+
+Post-merge focused ticket `dbfaafe5-4e46-4887-919c-327f2c1279ce` completed with
+**265 passes, one explicit diagnostic skip, zero failures** (266 named cases).
+Coverage includes 20 DomainRecoveryBackup cases, 10 WorkspaceDiskWriterContract,
+six DirectHeadlessWorkingDirectoryBinding, the Re-prompt suites, 23 titlebar
+safety, 47 first-lane-save, 23 production-organizer, four workspace-switch and
+six workspace-projection cases (the opt-in measurement matrix was skipped).
+The canonical two-lane bare-cursor/retirement contract passed in 0.894s; the
+production first-lane full-document-adoption case passed in 6.440s. Neither is
+a zero-active-workspace or real-provider proof. The original CodeMap failure
+was not included in this merge-boundary filter and remains unresolved.
+Post-merge lint `2ad7380c-953e-4c92-95a7-770868580938` passed: no formatting
+drift in 1,946 files and strict SwiftLint. Oracle re-review could not run because
+the MCP transport was closed; no visible-app restart was used to repair it.
+
+Both Debug products passed in `94fbfe87-75a5-444e-94e9-cebe7b749b8b`
+(61s execution after 39m09s queue). The fresh post-build compiler-index check
+passed at **1,304/1,360 wrong-way file edges** and **54/66 cycle components**.
+This is build/index evidence, not packaging or visible-app proof. Mandatory
+staged-index commit and outgoing-range push preflights are publication gates;
+final-head hosted status is reported on the PR, not inferred from these receipts.

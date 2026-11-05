@@ -201,8 +201,8 @@ extension AgentModeViewModel {
         if let session = session(for: tabID, createIfNeeded: false) {
             guard session.draftText != text else { return }
             session.draftText = text
-            if repromptOperation?.sourceTabID == tabID {
-                repromptOperation?.noteUserMutation(text: text, generation: session.draftMutationGeneration)
+            if let operation = repromptOperations[tabID] {
+                operation.noteUserMutation(text: text, generation: session.draftMutationGeneration)
             } else if var recovery = repromptUIStore.recoveries[tabID], recovery.bypassesPreparation,
                       !recovery.draftAtInvalidation.utf8.elementsEqual(text.utf8)
             {

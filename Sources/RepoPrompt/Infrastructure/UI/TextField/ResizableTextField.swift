@@ -282,6 +282,19 @@ struct TextFieldExternalEditTakeover {
     let revision: Int
 }
 
+/// One-shot request for a composer to take focus because its session became active.
+struct TextFieldFocusActivationRequest: Equatable {
+    /// Bounds the wait for a window on first mount; nothing else is retried.
+    static let windowWaitSeconds: TimeInterval = 2
+
+    let id = UUID()
+    var issuedAt = Date()
+    /// The one text entry this request may end: the field the user was in when they started the
+    /// switch. Nil for automated switches. Anything the user moves to afterwards is a different
+    /// entry and keeps its focus.
+    let overridableTextEntry: ObjectIdentifier?
+}
+
 @MainActor
 final class TextFieldNativeEditor {
     struct Snapshot {
@@ -295,6 +308,29 @@ final class TextFieldNativeEditor {
     func snapshot(matching identity: AnyHashable) -> Snapshot? {
         guard self.identity == identity, let textView, textView.window != nil else { return nil }
         return .init(text: textView.string, hasMarkedText: textView.hasMarkedText())
+    }
+
+    /// The live text entry currently holding focus in this editor's window, if any.
+    var currentTextEntry: ObjectIdentifier? {
+        guard let window = textView?.window else { return nil }
+        return CustomTextField.Coordinator.liveTextEntry(of: window.firstResponder, in: window)
+    }
+
+    /// True while the user could be typing in live text other than `overridable`.
+    /// `includingEditor` decides whether this editor itself counts.
+    func isTextEntryActive(includingEditor: Bool, excepting overridable: ObjectIdentifier? = nil) -> Bool {
+        guard let textView, let entry = currentTextEntry, entry != overridable else { return false }
+        return includingEditor || entry != ObjectIdentifier(textView)
+    }
+
+    /// Gives a card's own field a moment to leave once the card was answered, so a handoff is not
+    /// refused because of the field it is replacing. Bounded: a field that stays is not departing.
+    func waitForOtherTextEntryToDepart(timeoutSeconds: TimeInterval = 0.5) async {
+        guard let textView, let departing = currentTextEntry, departing != ObjectIdentifier(textView) else { return }
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while currentTextEntry == departing, Date() < deadline, !Task.isCancelled {
+            try? await Task.sleep(for: .milliseconds(30))
+        }
     }
 
     func attach(_ textView: NSTextView, identity: AnyHashable?) {
@@ -332,6 +368,8 @@ struct ResizableTextField: View {
     var onReadOnlyReturn: (() -> Void)?
     /// Explicit, scoped handoff after a transient composer interaction finishes.
     var focusRestoreRequest: UUID?
+    /// One-shot request to take focus because the owning session became active.
+    var focusActivationRequest: TextFieldFocusActivationRequest?
     var nativeEditor: TextFieldNativeEditor?
     var nativeEditorIdentity: AnyHashable?
 
@@ -403,6 +441,7 @@ struct ResizableTextField: View {
             commandReturnMatcher: commandReturnMatcher,
             onReadOnlyReturn: onReadOnlyReturn,
             focusRestoreRequest: focusRestoreRequest,
+            focusActivationRequest: focusActivationRequest,
             nativeEditor: nativeEditor,
             nativeEditorIdentity: nativeEditorIdentity,
             currentHeightPresetIndex: $currentHeightPresetIndex,
@@ -453,6 +492,8 @@ struct CustomTextField: NSViewRepresentable {
     var onReadOnlyReturn: (() -> Void)?
     /// Explicit, scoped handoff after a transient composer interaction finishes.
     var focusRestoreRequest: UUID?
+    /// One-shot request to take focus because the owning session became active.
+    var focusActivationRequest: TextFieldFocusActivationRequest?
     var nativeEditor: TextFieldNativeEditor?
     var nativeEditorIdentity: AnyHashable?
     @Binding var currentHeightPresetIndex: Int
@@ -568,6 +609,7 @@ struct CustomTextField: NSViewRepresentable {
         defer { context.coordinator.connectNativeEditor(textView: textView) }
         textView.isEditable = !isReadOnly
         context.coordinator.restoreFocusIfRequested(textView: textView)
+        context.coordinator.activateFocusIfRequested(textView: textView)
         context.coordinator.beginExternalEditIfNeeded()
         textView.commandReturnHandler = isReadOnly ? nil : onCommandReturn
         textView.commandReturnMatcher = commandReturnMatcher
@@ -646,6 +688,10 @@ struct CustomTextField: NSViewRepresentable {
             }
         }
         context.coordinator.pendingExternalTextUpdate = nil
+        if isNativeIdentityChanging || (appliedProgrammaticTextChange && context.coordinator.isCaretResetPendingForNewDraft) {
+            context.coordinator.placeCaretAtEnd(of: textView)
+            context.coordinator.isCaretResetPendingForNewDraft = isNativeIdentityChanging && !appliedProgrammaticTextChange
+        }
         context.coordinator.nativeEditorIdentity = nativeEditorIdentity
         context.coordinator.completeExternalEditIfNeeded()
         if appliedProgrammaticTextChange, !isReadOnly {
@@ -668,6 +714,7 @@ struct CustomTextField: NSViewRepresentable {
         textView.beginUserEditingHandler = nil
         coordinator.connectedNativeEditor?.detach(textView)
         coordinator.focusRestorationTask?.cancel()
+        coordinator.focusActivationTask?.cancel()
         textView.isAutomaticSpellingCorrectionEnabled = false
         coordinator.clearUndoHistory()
         coordinator.dismissFileTagOverlay()
@@ -680,6 +727,10 @@ struct CustomTextField: NSViewRepresentable {
         var parent: CustomTextField
         var lastFocusRestoreRequest: UUID?
         var focusRestorationTask: Task<Void, Never>?
+        var lastFocusActivationRequest: TextFieldFocusActivationRequest?
+        /// The new session's draft can arrive in a later update than the identity change.
+        var isCaretResetPendingForNewDraft = false
+        var focusActivationTask: Task<Void, Never>?
         weak var connectedNativeEditor: TextFieldNativeEditor?
         var nativeEditorIdentity: AnyHashable?
 
@@ -718,6 +769,73 @@ struct CustomTextField: NSViewRepresentable {
                       Self.mayRestoreFocus(to: textView, in: window) else { return }
                 window.makeFirstResponder(textView)
             }
+        }
+
+        /// Identifies attached, editable text the user could be typing in. A shared field editor
+        /// is identified by its owning field; one whose field has left the window no longer counts.
+        static func liveTextEntry(of responder: NSResponder?, in window: NSWindow) -> ObjectIdentifier? {
+            guard let editor = responder as? NSTextView, editor.window === window, editor.isEditable else { return nil }
+            if editor.isFieldEditor, let owner = editor.delegate as? NSView {
+                return owner.window === window ? ObjectIdentifier(owner) : nil
+            }
+            return ObjectIdentifier(editor)
+        }
+
+        /// Session activation may take focus from anything except live text, other than the one
+        /// entry the request may end. A non-key window is allowed: its first responder is invisible
+        /// until the user brings it forward, so this cannot move the user's keyboard focus.
+        static func mayActivateFocus(
+            to textView: NSTextView,
+            in window: NSWindow,
+            overridableTextEntry: ObjectIdentifier?
+        ) -> Bool {
+            guard let entry = liveTextEntry(of: window.firstResponder, in: window),
+                  entry != ObjectIdentifier(textView) else { return true }
+            return entry == overridableTextEntry
+        }
+
+        /// Waits only for a window to appear on first mount. A refused request is dropped rather
+        /// than retried, so focus can never move later, after the user has moved on.
+        func activateFocusIfRequested(textView: NSTextView) {
+            let request = parent.focusActivationRequest
+            guard request != lastFocusActivationRequest else { return }
+            lastFocusActivationRequest = request
+            focusActivationTask?.cancel()
+            focusActivationTask = nil
+            let deadline = request?.issuedAt.addingTimeInterval(TextFieldFocusActivationRequest.windowWaitSeconds)
+            // A field remounted long after the request must not replay it.
+            guard let request, let deadline, Date() < deadline else { return }
+            focusActivationTask = Task { @MainActor [weak self, weak textView] in
+                await Task.yield()
+                while true {
+                    guard let self, let textView, !Task.isCancelled, isActive,
+                          parent.focusActivationRequest == request else { return }
+                    if let window = textView.window {
+                        guard window.firstResponder !== textView,
+                              Self.mayActivateFocus(
+                                  to: textView,
+                                  in: window,
+                                  overridableTextEntry: request.overridableTextEntry
+                              ) else { return }
+                        window.makeFirstResponder(textView)
+                        return
+                    }
+                    guard Date() < deadline else { return }
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
+            }
+        }
+
+        /// A different session's draft starts with the caret after its text, not at the previous
+        /// session's character offset.
+        func placeCaretAtEnd(of textView: NSTextView) {
+            isCaretResetPendingForNewDraft = false
+            let end = (textView.string as NSString).length
+            let wasInProgress = internalUpdateInProgress
+            internalUpdateInProgress = true
+            textView.setSelectedRange(NSRange(location: end, length: 0))
+            textView.scrollRangeToVisible(NSRange(location: end, length: 0))
+            internalUpdateInProgress = wasInProgress
         }
 
         var internalUpdateInProgress = false
@@ -789,9 +907,13 @@ struct CustomTextField: NSViewRepresentable {
                 } else {
                     lastAppliedExternalUpdateTick = pendingExternalTextUpdate.tick
                 }
+                if nativeEditorIdentity != pendingExternalTextUpdate.identity {
+                    placeCaretAtEnd(of: textView)
+                }
                 nativeEditorIdentity = pendingExternalTextUpdate.identity
                 connectNativeEditor(textView: textView)
             } else {
+                isCaretResetPendingForNewDraft = false
                 parent.text = textView.string
             }
 
@@ -808,6 +930,8 @@ struct CustomTextField: NSViewRepresentable {
 
         func textViewDidChangeSelection(_ notification: Notification) {
             guard isActive, let textView = notification.object as? NSTextView else { return }
+            // A caret the user placed must not be moved by a later programmatic replacement.
+            if !internalUpdateInProgress { isCaretResetPendingForNewDraft = false }
             // Selection changes fire frequently while typing; debounce to avoid duplicate
             // refreshes alongside textDidChange.
             scheduleFileTagSuggestionsRefresh(for: textView, immediate: false)

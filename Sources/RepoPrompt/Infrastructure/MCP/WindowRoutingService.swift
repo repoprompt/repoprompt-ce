@@ -2947,7 +2947,7 @@ final class WindowRoutingService: Service {
                     }
 
                     if shouldFocus {
-                        await targetWindow.promptManager.switchComposeTab(tab.id)
+                        await targetWindow.promptManager.switchComposeTab(tab.id, focusIntent: .preservesLiveText)
                     }
 
                     return ManageWorkspacesResponse(action: "select_tab", workspaces: nil, status: "ok")
@@ -3019,7 +3019,7 @@ final class WindowRoutingService: Service {
                     }
 
                     if shouldFocus {
-                        await targetWindow.promptManager.switchComposeTab(newTab.id)
+                        await targetWindow.promptManager.switchComposeTab(newTab.id, focusIntent: .preservesLiveText)
                     }
 
                     let summary = await MainActor.run {

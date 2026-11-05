@@ -2509,7 +2509,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     var unscopedRepromptEnabled = false
     var repromptDispatchTexts: [UUID: String] = [:]
     var repromptDispatchOriginals: [UUID: String] = [:]
-    var repromptOperation: AgentRepromptOperation?
+    /// One preparation per composer tab, so a rewrite outlives a switch to another session.
+    var repromptOperations: [UUID: AgentRepromptOperation] = [:]
+    /// The preparation owned by the visible composer.
+    var repromptOperation: AgentRepromptOperation? {
+        currentTabID.flatMap { repromptOperations[$0] }
+    }
+
     var repromptSpeculations: [UUID: RepromptSpeculation] = [:]
     var repromptAudits: [UUID: AgentAutomationTurnAudit.Reprompt] = [:]
     var repromptAvailability: ((AIModel) -> Bool)?
@@ -19204,7 +19210,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             removePendingUIRefresh(for: tabID)
         }
         if let reactivateSourceTabID, sessions[reactivateSourceTabID] != nil {
-            await promptManager?.switchComposeTab(reactivateSourceTabID)
+            await promptManager?.switchComposeTab(reactivateSourceTabID, focusIntent: .preservesLiveText)
         }
     }
 
@@ -23091,7 +23097,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         origin: AgentModeRunService.CancellationOrigin = .explicitStop
     ) async {
         guard let session = sessions[tabID] else { return }
-        if let operation = repromptOperation, operation.sourceTabID == tabID {
+        if let operation = repromptOperations[tabID] {
             operation.invalidate(reason: "The run was stopped.")
             if !session.runState.isActive {
                 return
@@ -23249,8 +23255,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         requireActiveTabOwnership: Bool
     ) -> AgentComposerSubmitClaimResult {
         let target = attempt.target
-        if requireActiveTabOwnership, let operation = repromptOperation,
-           operation.sourceTabID == target.tabID, operation.phase != .completed
+        if requireActiveTabOwnership, let operation = repromptOperations[target.tabID],
+           operation.phase != .completed
         {
             return .rejected(.activeAttemptExists(activeAttemptID: operation.id))
         }
@@ -25278,6 +25284,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // synchronization and selected immediately; existing rows keep their positions (§5.4).
         if currentTabID == createdTab.id {
             updateBindingsFromSession(creation.session)
+            promptManager.requestUserComposerActivation(tabID: createdTab.id)
         }
         return createdTab.id
     }

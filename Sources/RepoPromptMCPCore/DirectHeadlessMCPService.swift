@@ -162,7 +162,10 @@ package actor DirectHeadlessMCPService {
             eventDirectory: locations.eventDirectory,
             temporaryDirectory: locations.temporaryDirectory,
             hostDrainTimeout: .seconds(5),
-            metadataPathPolicy: pathPolicy
+            metadataPathPolicy: pathPolicy,
+            // Headless cannot decode the app's workspace model; refuse to discard any compose-tab
+            // identity without a verified recovery backup (#335).
+            durableReplacementGuard: .composeTabLoss { try pathPolicy?.validate($0) }
         ), resolveChildLaunchPlan: { toolName, arguments, securityContext in
             try await childLaunchCoordinator.resolvePlan(
                 toolName: toolName,

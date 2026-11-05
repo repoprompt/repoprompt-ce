@@ -28,6 +28,7 @@ struct WindowContentView: View {
     var body: some View {
         ContentView(windowState: windowState)
             .safeAreaInset(edge: .top) { GlobalSettingsPersistenceBlockBanner(allowsSessionDismissal: true) }
+            .safeAreaInset(edge: .top) { WorkspaceRecoveryBackupBlockBanner(workspaceManager: windowState.workspaceManager) }
             .debugBuildWindowEdge()
             .environmentObject(windowState) // If your subviews need it
             .environment(\.windowIsPresentationVisible, windowState.isPresentationVisible)

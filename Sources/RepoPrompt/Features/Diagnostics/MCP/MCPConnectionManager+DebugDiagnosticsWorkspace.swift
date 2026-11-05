@@ -102,7 +102,7 @@ import RepoPromptWorkspaceCore
             let requestedFields = WorkspaceSelectionDebugSignature.unprefixedFields(for: selection)
             let targetTabID = window.selectionCoordinator.activeTabID()
             if let targetTabID, window.promptManager.activeComposeTabID != targetTabID {
-                await window.promptManager.switchComposeTab(targetTabID)
+                await window.promptManager.switchComposeTab(targetTabID, focusIntent: .preservesLiveText)
             }
             if window.workspaceFilesViewModel.currentTabIDForDebugOwnerTrace != targetTabID {
                 window.workspaceFilesViewModel.setActiveTabID(targetTabID)
@@ -121,7 +121,7 @@ import RepoPromptWorkspaceCore
                 if let candidateTabID,
                    candidate.promptManager.activeComposeTabID != candidateTabID
                 {
-                    await candidate.promptManager.switchComposeTab(candidateTabID)
+                    await candidate.promptManager.switchComposeTab(candidateTabID, focusIntent: .preservesLiveText)
                 }
                 if candidate.workspaceFilesViewModel.currentTabIDForDebugOwnerTrace != candidateTabID {
                     candidate.workspaceFilesViewModel.setActiveTabID(candidateTabID)
