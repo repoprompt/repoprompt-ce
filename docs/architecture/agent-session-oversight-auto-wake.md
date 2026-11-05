@@ -148,7 +148,9 @@ Existing managed-link status and attention rows also carry cached `context_used_
 rendered as `unknown`, not zero; a known empty census renders zero direct running helpers. A
 workspace-mismatched or unbuilt census is unavailable. These are the accepted observation's cached
 facts, not fresh telemetry, interaction details, a context-change wake, or a compaction/liveness
-notification guarantee. Poll JSON remains unchanged.
+notification guarantee. Poll JSON remains unchanged. A census-availability-only publication refreshes
+private cached state and its source high-water mark, but does not advance public change sequences,
+notify change waiters, or signal send readiness. Full internal value equality still distinguishes it.
 
 This supplemental metadata refreshes pending rows without advancing status/attention occurrence
 identity, status timestamps, receipt cutoffs, or the wake fingerprint. An older accepted receipt may
@@ -156,7 +158,11 @@ settle the row even if newer cached decoration was not delivered: decoration is 
 content. Both row kinds share the existing renderer and its byte budget. Only rendered managed rows
 contribute exact Manage requirements to the immutable claim. Existing consent, capability-elevation,
 and link-revocation fences are rechecked at physical handoff, including after asynchronous proof;
-withdrawal discloses no managed bytes and acknowledges no receipt.
+withdrawal discloses no managed bytes and acknowledges no receipt. After a managed proof suspension,
+pending batches are reclaimed against the complete current inventory (including watch-only rows) and
+observer eligibility. Already accepted recovery instead preserves its immutable bytes under the existing
+reuse contract. All provider adapters recheck their existing ownership, Stop, and route fences after
+proof regardless of whether the claim includes local-input decoration.
 
 `wait` accepts returned `wait_cursor` strings directly in `cursors`, without a separate session ID
 list. Existing `{session_id, cursor}` records remain valid and may be mixed with strings. The link

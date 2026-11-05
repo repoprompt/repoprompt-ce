@@ -1918,10 +1918,11 @@ final class ClaudeAgentModeCoordinator {
                     return .superseded
                 }
                 let inputProof = await hostCapabilities.proveLocalInput(session, monitoring.claim)
-                if monitoring.claim?.localInput != nil {
-                    guard !Task.isCancelled, intentIsCurrent(intent, for: session),
-                          sessionOwnsClaudeController(controller, for: session)
-                    else { return .superseded }
+                guard !Task.isCancelled, intentIsCurrent(intent, for: session),
+                      sessionOwnsClaudeController(controller, for: session)
+                else {
+                    hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
+                    return .superseded
                 }
                 guard hostCapabilities.acquireAgentSessionLinkPhysicalDispatch(
                     session,

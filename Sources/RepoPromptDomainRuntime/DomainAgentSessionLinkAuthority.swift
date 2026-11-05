@@ -1210,11 +1210,13 @@ package actor DomainAgentSessionLinkAuthority {
         // Nil is an accepted producer value too. Update it before public equality can return.
         record.runFacts = runFacts
         let canonical = canonicalSnapshot(snapshot, previous: record.snapshot)
-        guard canonical != record.snapshot else {
+        let publishedStateChanged = !canonical.hasSamePublishedState(as: record.snapshot)
+        // Accept private availability as well as run facts/high-water without creating public debt.
+        record.snapshot = canonical
+        guard publishedStateChanged else {
             targets[endpoint.sessionID] = record
             return .unchanged(changeSequence: record.changeSequence)
         }
-        record.snapshot = canonical
         record.changeSequence = allocateChangeSequence(for: endpoint.sessionID)
         targets[endpoint.sessionID] = record
 

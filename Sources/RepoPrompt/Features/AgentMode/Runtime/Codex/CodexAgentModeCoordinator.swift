@@ -3690,23 +3690,26 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         session.noteAcceptedTaskInput() // Fallback replay on reused/new ownership remains ordinary.
         let inputProof = await viewModel?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
-        if monitoring?.claim?.localInput != nil {
-            guard session.codexFallbackDispatchInFlight?.id == head.id,
-                  session.activeRunAttemptID == dispatchAttemptID, session.runID == head.originRunID,
-                  session.codexController.map(ObjectIdentifier.init) == head.originControllerInstanceID,
-                  session.codexControllerGeneration == head.originControllerGeneration,
-                  session.codexConversationID == head.originThreadID
-            else {
-                viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
-                return false
-            }
-            guard !Task.isCancelled, head.stopFence?.permitsStart(of: session) ?? true,
-                  viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: qualification) == true
-            else {
-                viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
-                await failCodexFallbackDispatch(session: session, entry: head, message: nil)
-                return false
-            }
+        // Managed metadata and quiet qualification can suspend too, even without local input.
+        guard session.codexFallbackDispatchInFlight?.id == head.id,
+              session.activeRunAttemptID == dispatchAttemptID, session.runID == head.originRunID,
+              session.codexController.map(ObjectIdentifier.init) == head.originControllerInstanceID,
+              session.codexControllerGeneration == head.originControllerGeneration,
+              session.codexConversationID == head.originThreadID
+        else {
+            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
+            return false
+        }
+        guard !Task.isCancelled, head.stopFence?.permitsStart(of: session) ?? true,
+              viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: qualification) == true
+        else {
+            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
+            await failCodexFallbackDispatch(
+                session: session, entry: head,
+                message: Task.isCancelled || !(head.stopFence?.permitsStart(of: session) ?? true)
+                    ? nil : "Codex queued follow-up lost its exact RepoPrompt MCP route before dispatch."
+            )
+            return false
         }
         let acquiredPhysicalDispatch = viewModel?.agentSessionLinkAcquirePhysicalDispatch(
             for: session,
@@ -6165,7 +6168,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 guard !Task.isCancelled, session.runState.isActive,
                       computerUseRecoveryStopFence.permitsStart(of: session), session.runID == runID,
                       session.activeRunAttemptID == computerUseRecoveryAttemptID,
-                      session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(controller) else { return false }
+                      session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(controller),
+                      viewModel.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) else { return false }
             } else {
                 replayProof = nil
             }
@@ -8348,16 +8352,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         }
                         guard await computerUsePhysicalDispatchIsCurrent() else { throw CancellationError() }
                         let proof = await viewModel?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
-                        if monitoring?.claim?.localInput != nil || monitoring?.claim?.dispatchID.isAutoWakeFamily == true {
-                            guard !Task.isCancelled, effectiveStopFence.permitsStart(of: session),
-                                  session.runID == sendRunID, session.activeRunAttemptID == sendRunAttemptIDAtEntry,
-                                  session.codexController.map(ObjectIdentifier.init) == expectedControllerID,
-                                  session.pendingCodexComputerUseActivation?.id == computerUseActivationID,
-                                  computerUseActivationID != nil || session.codexControllerFeatureState?.computerUseEnabled != true,
-                                  computerUseActivationID == nil || (session.codexControllerFeatureState?.computerUseEnabled == true && computerUseAdmissionMessage(session: session) == nil),
-                                  isSelfNote || viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
-                            else { throw CancellationError() }
-                        }
+                        guard !Task.isCancelled, effectiveStopFence.permitsStart(of: session),
+                              session.runID == sendRunID, session.activeRunAttemptID == sendRunAttemptIDAtEntry,
+                              session.codexController.map(ObjectIdentifier.init) == expectedControllerID,
+                              session.pendingCodexComputerUseActivation?.id == computerUseActivationID,
+                              computerUseActivationID != nil || session.codexControllerFeatureState?.computerUseEnabled != true,
+                              computerUseActivationID == nil || (session.codexControllerFeatureState?.computerUseEnabled == true && computerUseAdmissionMessage(session: session) == nil),
+                              isSelfNote || viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
+                        else { throw CancellationError() }
                         guard acquireFinalizedAgentSessionLinkDispatch() else { throw CancellationError() }
                         // A parked note remains unattempted throughout optional Read proof.
                         // Claim it before synchronous frontier consumption, with no intervening await.
@@ -8445,16 +8447,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 }
                 do {
                     let proof = await viewModel?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
-                    if monitoring?.claim?.localInput != nil || monitoring?.claim?.dispatchID.isAutoWakeFamily == true {
-                        guard !Task.isCancelled, effectiveStopFence.permitsStart(of: session),
-                              session.runID == sendRunID, session.activeRunAttemptID == sendRunAttemptIDAtEntry,
-                              session.codexController.map(ObjectIdentifier.init) == expectedControllerID,
-                              session.pendingCodexComputerUseActivation?.id == computerUseActivationID,
-                              computerUseActivationID != nil || session.codexControllerFeatureState?.computerUseEnabled != true,
-                              computerUseActivationID == nil || (session.codexControllerFeatureState?.computerUseEnabled == true && computerUseAdmissionMessage(session: session) == nil),
-                              viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
-                        else { throw CancellationError() }
-                    }
+                    guard !Task.isCancelled, effectiveStopFence.permitsStart(of: session),
+                          session.runID == sendRunID, session.activeRunAttemptID == sendRunAttemptIDAtEntry,
+                          session.codexController.map(ObjectIdentifier.init) == expectedControllerID,
+                          session.pendingCodexComputerUseActivation?.id == computerUseActivationID,
+                          computerUseActivationID != nil || session.codexControllerFeatureState?.computerUseEnabled != true,
+                          computerUseActivationID == nil || (session.codexControllerFeatureState?.computerUseEnabled == true && computerUseAdmissionMessage(session: session) == nil),
+                          viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
+                    else { throw CancellationError() }
                     guard acquireFinalizedAgentSessionLinkDispatch() else { throw CancellationError() }
                     if let parkedNote {
                         guard session.selfCompactNoteDispatchIsCurrent(parkedNote.dispatchID) else {

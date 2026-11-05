@@ -285,6 +285,14 @@ package struct DomainAgentSessionLaneBoard: Hashable, Sendable {
         self.subagentCountsKnown = subagentCountsKnown
     }
 
+    /// Publication equivalence excludes only private census availability. Full value equality
+    /// still includes it so internal caches can distinguish unknown from known zero.
+    package func hasSamePublishedState(as other: Self) -> Bool {
+        runOutcome == other.runOutcome && failureReason == other.failureReason
+            && sendBlockers == other.sendBlockers && subagentRunning == other.subagentRunning
+            && subagentFinished == other.subagentFinished
+    }
+
     /// Explicit quiet board for fixtures; snapshot construction itself has no default.
     package static let empty = DomainAgentSessionLaneBoard(
         runOutcome: .none,
@@ -313,6 +321,19 @@ package struct DomainAgentSessionObservationSnapshot: Hashable, Sendable {
 
     package var hasPendingInteraction: Bool {
         pendingInteractionKind != nil
+    }
+
+    /// Public change cursors preserve their existing semantics while private cached metadata
+    /// can refresh independently. Keep every public observation field in this comparison.
+    package func hasSamePublishedState(as other: Self) -> Bool {
+        sessionID == other.sessionID && displayName == other.displayName
+            && providerDisplayName == other.providerDisplayName && status == other.status
+            && board.hasSamePublishedState(as: other.board) && idleForSend == other.idleForSend
+            && idleSince == other.idleSince && waitingOn == other.waitingOn
+            && pendingInteractionKind == other.pendingInteractionKind
+            && latestVisibleAssistantPreview == other.latestVisibleAssistantPreview
+            && visibleRowCount == other.visibleRowCount && lastActivityAt == other.lastActivityAt
+            && context == other.context
     }
 
     /// Normalizes and byte-caps every textual field at construction so a buggy bridge cannot publish

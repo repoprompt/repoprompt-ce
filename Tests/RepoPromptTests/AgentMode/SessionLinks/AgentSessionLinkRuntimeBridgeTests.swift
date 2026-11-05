@@ -9635,6 +9635,43 @@ extension AgentSessionLinkRuntimeBridgeTests {
         XCTAssertEqual(fixture.host.observationSnapshotCalls[fixture.target.sessionID, default: 0], reads)
     }
 
+    func testPrivateCensusAvailabilityRefreshesObserverMetadataWithoutPublicChange() async throws {
+        let fixture = makeFixture()
+        func observation(known: Bool) -> DomainAgentSessionObservationSnapshot {
+            .init(
+                sessionID: fixture.target.sessionID,
+                displayName: "Worker",
+                providerDisplayName: nil,
+                status: .idle,
+                board: .init(runOutcome: .completed, failureReason: nil, sendBlockers: [], subagentRunning: 0, subagentFinished: 0, subagentCountsKnown: known),
+                idleForSend: true,
+                pendingInteractionKind: nil,
+                latestVisibleAssistantPreview: nil,
+                visibleRowCount: 0,
+                lastActivityAt: .distantPast
+            )
+        }
+        fixture.host.snapshotOverrides[fixture.target.sessionID] = observation(known: false)
+        guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
+        await fixture.bridge.test_settleProjections()
+        let initial = await pollState(fixture)
+        var samples: [AgentSessionLinkPassiveStatusNotices.Sample] = []
+        fixture.bridge.test_onPassiveSample = { samples.append($0) }
+        defer { fixture.bridge.test_onPassiveSample = nil }
+        for known in [true, false] {
+            samples.removeAll()
+            fixture.host.snapshotOverrides[fixture.target.sessionID] = observation(known: known)
+            fixture.host.fireObservation(for: fixture.target.sessionID)
+            await fixture.bridge.test_settleTargetPublications()
+            let metadata = try XCTUnwrap(samples.last?.managedMetadata, "unchanged-publication fanout must refresh private metadata")
+            XCTAssertEqual(metadata.directRunningHelperCount, known ? 0 : nil)
+            let refreshed = await pollState(fixture)
+            XCTAssertEqual(refreshed?.changeSequence, initial?.changeSequence)
+            let passive = try XCTUnwrap(fixture.host.publishedPassiveNoticesByEndpoint[fixture.observer.domainEndpoint])
+            XCTAssertTrue(passive.entries.isEmpty, "private availability is not new passive status debt")
+        }
+    }
+
     func testFactsOnlyPublicationPairsWithoutPublicSequenceOrReadinessActivityAndDeduplicates() async throws {
         let fixture = makeFixture()
         fixture.host.runFacts[fixture.target.sessionID] = .init(settledThrough: 8, ordinaryThrough: 8)

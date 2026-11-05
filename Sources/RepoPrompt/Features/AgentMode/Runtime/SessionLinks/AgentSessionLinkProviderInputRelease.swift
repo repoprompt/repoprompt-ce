@@ -106,7 +106,11 @@ enum AgentSessionLinkProviderInputRelease {
         guard proof.permitsManagedMetadata(original) else {
             return ReleasedDispatchContext(claim: nil, fragment: nil, mustAbortDispatch: original.dispatchID.isAutoWakeFamily, disclosedLocalInputs: false)
         }
-        if original.localInput == nil, !original.routineQuietCheckIn,
+        // Manage proof suspends and covers only managed rows. Reclaim the entire pending batch
+        // afterwards so watch rows and observer eligibility cannot ride another row's proof.
+        // Already accepted recovery uses handoffAcceptedReplay instead of this pending path.
+        if original.managedMetadataRequirements.isEmpty,
+           original.localInput == nil, !original.routineQuietCheckIn,
            !original.dispatchID.isAutoWakeFamily || isPending(original)
         {
             return ReleasedDispatchContext(claim: original, fragment: original.fragment, mustAbortDispatch: false, disclosedLocalInputs: false)

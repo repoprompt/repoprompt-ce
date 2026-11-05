@@ -4693,7 +4693,7 @@ final class AgentSessionLinkRuntimeBridge {
         if chain.scheduledFrame == nil, facts == nil, lastPublishedSnapshotBySession[sessionID] == snapshot { return }
         // Deduplicate the pair. Private settlement advancement is not public activity/readiness.
         guard chain.scheduledFrame?.snapshot != snapshot || chain.scheduledFrame?.runFacts != facts else { return }
-        let publicChanged = lastPublishedSnapshotBySession[sessionID] != snapshot
+        let publicChanged = lastPublishedSnapshotBySession[sessionID]?.hasSamePublishedState(as: snapshot) != true
         lastPublishedSnapshotBySession[sessionID] = snapshot
         if publicChanged, snapshot.idleForSend {
             notePendingSendReadiness(forTargetSession: sessionID)
@@ -4724,7 +4724,7 @@ final class AgentSessionLinkRuntimeBridge {
                 break
             default: return
             }
-            // Only facts-only advancement lacks an authority event. Reuse the existing directional
+            // Private run facts and census availability lack an authority event. Reuse the existing directional
             // inbound query and coalescer. Its inherited O(links) scans are measured, not optimized.
             #if DEBUG
                 let fanoutStart = test_onFactsFanout.map { _ in ContinuousClock.now }
