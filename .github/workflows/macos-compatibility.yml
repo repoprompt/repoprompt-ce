@@ -12,7 +12,7 @@ on:
         type: string
         required: true
       admission:
-        description: CI candidate identity; empty for independently validated release workflows
+        description: Immutable CI candidate identity; empty for independently validated release workflows
         type: string
         default: ''
 
@@ -22,7 +22,6 @@ permissions:
 jobs:
   smoke:
     name: macOS 15 ${{ matrix.architecture }} artifact smoke
-    if: ${{ inputs.admission == '' || fromJSON(inputs.admission).attempt == github.run_attempt }}
     strategy:
       fail-fast: false
       matrix:
@@ -41,7 +40,7 @@ jobs:
           path: tooling
           persist-credentials: false
 
-      - name: Verify CI candidate and attempt identity
+      - name: Verify immutable CI candidate identity
         if: inputs.admission != ''
         working-directory: tooling
         env:
@@ -49,6 +48,11 @@ jobs:
         run: |
           python3 Scripts/ci_admission.py verify --context "$ADMISSION_CONTEXT" \
             --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
+
+      - name: Require an exact producer artifact
+        env:
+          PRODUCER_ARTIFACT: ${{ inputs.artifact-name }}
+        run: test -n "$PRODUCER_ARTIFACT"
 
       - name: Download the existing release artifact without rebuilding
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131

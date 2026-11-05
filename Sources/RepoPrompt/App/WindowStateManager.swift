@@ -562,7 +562,8 @@ class WindowStatesManager: ObservableObject {
     private(set) var isTerminating = false
 
     /// Prevent accidental secondary instances
-    private init() {
+    private init(windowSessionFileURL: URL = WindowSessionStore.sessionFileURL()) {
+        windowSessionWriter = WindowSessionDiskWriter(fileURL: windowSessionFileURL)
         modelRouterRuntime.usageBalancer = providerQuotaRuntime.usageAdvisor
         autoRestoreWorkspacesEnabled = UserDefaults.standard.object(forKey: WindowStatesManager.autoRestoreDefaultsKey) as? Bool ?? false
         GlobalSettingsStore.shared.objectWillChange
@@ -698,9 +699,7 @@ class WindowStatesManager: ObservableObject {
     private var windowOpenWaiters: [WindowOpenWaiter] = []
     private var pendingInitialRefreshDeferrals: [WindowInitialRefreshDeferral] = []
 
-    private let windowSessionWriter = WindowSessionDiskWriter(
-        fileURL: WindowSessionStore.sessionFileURL()
-    )
+    private let windowSessionWriter: WindowSessionDiskWriter
     private var explicitlyClosingWindowIDs: Set<Int> = []
     /// A closing window may leave `allWindows` before app termination starts. Weak retention
     /// lets termination join any still-live teardown without extending the window's lifetime.
@@ -1408,6 +1407,12 @@ class WindowStatesManager: ObservableObject {
     }
 
     #if DEBUG
+        /// A test-owned manager whose session snapshots go to `windowSessionFileURL`, never to the
+        /// shared Application Support session file.
+        static func makeForTesting(windowSessionFileURL: URL) -> WindowStatesManager {
+            WindowStatesManager(windowSessionFileURL: windowSessionFileURL)
+        }
+
         func setTerminatingForTesting(_ isTerminating: Bool) {
             self.isTerminating = isTerminating
             if !isTerminating {

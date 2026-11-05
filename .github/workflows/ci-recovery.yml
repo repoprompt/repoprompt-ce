@@ -1,0 +1,43 @@
+name: CI Recovery
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: write
+  checks: read
+  pull-requests: read
+
+concurrency:
+  group: ci-recovery-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    name: Diagnose and recover infrastructure failures
+    if: >-
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      contains(fromJSON('["failure", "cancelled"]'), github.event.workflow_run.conclusion)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out trusted recovery controller
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: Scripts/ci_recovery.py
+          sparse-checkout-cone-mode: false
+
+      - name: Recover only the current candidate within its attempt budget
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 Scripts/ci_recovery.py
+          --event-path "$GITHUB_EVENT_PATH"
+          --repository "$GITHUB_REPOSITORY"
+          --summary "$GITHUB_STEP_SUMMARY"
+          --execute

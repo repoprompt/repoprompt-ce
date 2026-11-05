@@ -274,6 +274,7 @@ class ReleaseStagePhaseTests(unittest.TestCase):
 
     def test_phases_after_tag_verification_scrub_github_tokens(self) -> None:
         stubs = (
+            'ditto() { return 99; }; '
             'resolve_without_lockfile_drift() { printf "token=%s\\n" "${GH_TOKEN-unset}"; }; '
             "run_preflight() { :; }; prepare_dist() { :; }"
         )

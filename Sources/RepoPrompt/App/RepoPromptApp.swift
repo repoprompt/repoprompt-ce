@@ -253,8 +253,8 @@ public enum RepoPromptApplication {
         if let code = ClaudeCLIUsageCollector.runIfInvoked(arguments: ProcessInfo.processInfo.arguments) { exit(code) }
         // Before defaults migration, provider launch snapshots, property wrappers,
         // or any settings/session singleton can observe or normalize this profile.
-        Self.checkDebugStateBoundary()
         let bootstrapSpan = StartupPhaseLog.begin(.bootstrap)
+        Self.checkDebugStateBoundary()
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
         let defaultsReport = BundleIdentityDefaultsMigration.migrateIfNeeded()
         let defaultsOutcome: IdentityTransitionDiagnosticEvent.Outcome = switch defaultsReport.outcome {

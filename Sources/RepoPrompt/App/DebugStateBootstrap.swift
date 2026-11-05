@@ -21,11 +21,6 @@ enum DebugStateBootstrap {
         return arguments.contains(freshProfileArgument) ? .fresh : .reuse
     }
 
-    struct Preparation {
-        let lease: DebugProfileAccessLease
-        let receipt: DebugStateSnapshot.Receipt?
-    }
-
     struct PendingPreferencesFailure: LocalizedError {
         var underlyingDescription: String?
 
@@ -81,7 +76,7 @@ enum DebugStateBootstrap {
     static func startEmptyCanRecover(from error: Error) -> Bool {
         guard let failure = error as? DebugStateSnapshot.Failure else { return false }
         switch failure {
-        case .sourceChanged, .unsafeFile, .duplicateDestination, .database, .unsupportedWAL: return true
+        case .sourceChanged, .unsafeFile, .duplicateDestination, .database, .unsupportedWAL, .oracleRetention: return true
         case .cancelled, .unsafeDestination: return false
         }
     }
@@ -96,97 +91,25 @@ enum DebugStateBootstrap {
         // If the handler cannot be installed, SIGTERM keeps its default (immediate) behavior.
         let termination = TerminationRequest.install()
         defer { termination?.finish() }
-        // The short startup lock protects concurrent seeds; an already-running
-        // debug app must also be absent, because its ordinary stores are live.
         guard !NSRunningApplication.runningApplications(withBundleIdentifier: AppProfileLocations.current.preferencesDomain)
             .contains(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier })
         else {
             throw DebugStateSnapshot.Failure.unsafeDestination
         }
-        let preparation = try prepare(
-            mode: mode, locations: .current, defaults: .standard,
+        let start = Date()
+        let preparation = try prepareProfile(
+            mode: mode,
+            locations: .current,
+            defaults: .standard,
+            preferencesDomain: AppProfileLocations.current.preferencesDomain,
             cancellation: termination.map { request in .init { request.isRequested } }
         )
         appProfileLease = preparation.lease
         succeeded = true
         if let receipt = preparation.receipt {
-            print("[DebugStateSeed] mode=\(mode) schema=\(receipt.version) clean=\(receipt.cleanSlate) files=\(receipt.copiedFiles) bytes=\(receipt.copiedBytes) captureSeconds=\(receipt.seconds)")
+            print("[DebugStateSeed] action=\(preparation.action.rawValue) schema=\(receipt.version) clean=\(receipt.cleanSlate) files=\(receipt.copiedFiles) bytes=\(receipt.copiedBytes) captureSeconds=\(receipt.seconds) totalSeconds=\(Date().timeIntervalSince(start))")
         } else {
-            print("[DebugStateSeed] mode=reuse (existing debug files and preferences preserved)")
-        }
-    }
-
-    /// Testable pre-store boundary. Reuse does only fixed-path checks: no production
-    /// access, receipt/corpus scan, profile publication, or stale preference replay.
-    static func prepare(
-        mode: Mode, locations: AppProfileLocations, defaults: UserDefaults,
-        preferencesDomain: String? = nil,
-        synchronize: (UserDefaults) -> Bool = { $0.synchronize() },
-        cancellation: DebugStateSnapshot.Cancellation? = nil
-    ) throws -> Preparation {
-        let domain = preferencesDomain ?? locations.preferencesDomain
-        let lease = try DebugProfileAccessLease.acquire(locations: locations, exclusive: true)
-        if mode == .reuse {
-            try installPendingPreferences(locations: locations, defaults: defaults, domain: domain, synchronize: synchronize)
-            try lease.allowWriters()
-            return Preparation(lease: lease, receipt: nil)
-        }
-        let release = AppProfileLocations(identity: .repoPromptCE(.release), homeDirectory: locations.homeDirectory)
-        let prior = defaults.persistentDomain(forName: domain) ?? [:]
-        let clean = mode == .clean
-        let preferenceDirectory = release.homeDirectory.appendingPathComponent("Library/Preferences")
-        let sourcePreferencesURL = preferenceDirectory.appendingPathComponent(release.preferencesDomain + ".plist")
-        let priorPreferencesURL = preferenceDirectory.appendingPathComponent(domain + ".plist")
-        try locations.validateMetadataFile(priorPreferencesURL)
-        if fm.fileExists(atPath: priorPreferencesURL.path),
-           try ((fm.attributesOfItem(atPath: priorPreferencesURL.path)[.referenceCount] as? NSNumber)?.intValue ?? 1) != 1
-        {
-            throw DebugStateSnapshot.Failure.unsafeDestination
-        }
-        let receipt = try seed(
-            locations: locations,
-            cleanSlate: clean,
-            releasePreferences: nil,
-            previousPreferences: prior,
-            preferenceSourceURL: clean ? nil : sourcePreferencesURL,
-            previousPreferenceFileURL: priorPreferencesURL,
-            profileLease: lease,
-            cancellation: cancellation
-        )
-        try installPendingPreferences(locations: locations, defaults: defaults, domain: domain, synchronize: synchronize)
-        try lease.allowWriters()
-        return Preparation(lease: lease, receipt: receipt)
-    }
-
-    /// Publication stages this fence atomically with the files. A crash after the
-    /// swap is repaired once, before stores open; legacy seedPreferences without a
-    /// fence are never reapplied over the user's current debug preferences.
-    private static func installPendingPreferences(
-        locations: AppProfileLocations, defaults: UserDefaults, domain: String,
-        synchronize: (UserDefaults) -> Bool
-    ) throws {
-        let marker = locations.applicationSupportRoot.appendingPathComponent(DebugStateSnapshot.pendingPreferencesMarkerName)
-        var info = stat()
-        guard lstat(marker.path, &info) == 0 else {
-            if errno == ENOENT { return }
-            throw PendingPreferencesFailure(underlyingDescription: "Could not inspect the pending-preferences marker.")
-        }
-        do {
-            _ = try DebugStateSnapshot.stamp(marker)
-            let url = locations.applicationSupportRoot.appendingPathComponent(DebugStateSnapshot.seedPreferencesFileName)
-            _ = try DebugStateSnapshot.stamp(url)
-            guard let preferences = try PropertyListSerialization.propertyList(from: Data(contentsOf: url), format: nil) as? [String: Any] else {
-                throw PendingPreferencesFailure(underlyingDescription: "The staged preferences are not a property-list dictionary.")
-            }
-            defaults.setPersistentDomain(preferences, forName: domain)
-            guard synchronize(defaults) else {
-                throw PendingPreferencesFailure(underlyingDescription: "Preference synchronization did not complete.")
-            }
-            try fm.removeItem(at: marker)
-        } catch let error as PendingPreferencesFailure {
-            throw error
-        } catch {
-            throw PendingPreferencesFailure(underlyingDescription: error.localizedDescription)
+            print("[DebugStateSeed] action=\(preparation.action.rawValue) totalSeconds=\(Date().timeIntervalSince(start))")
         }
     }
 
@@ -290,7 +213,9 @@ enum DebugStateBootstrap {
             let windows = root.appendingPathComponent("windowSessions.json")
             if fm.fileExists(atPath: windows.path) { try plan.add(windows, as: "windowSessions.json") }
             try addWorkspaces()
-            try addTree(root.appendingPathComponent(runtimePath + "/oracle"), relative: runtimePath + "/oracle")
+            // Baseline-only seeds copy journals verbatim for normal store recovery.
+            // Continuity retention below instead recovers captured stores before merging.
+            try addTree(root.appendingPathComponent(runtimePath + "/oracle"), relative: DomainPersistenceCoordinator.runtimeDirectoryName(profileIdentifier: locations.profileIdentifier) + "/oracle")
             // Cross-profile grants are evidence, not authority. Preserve their
             // exact snapshot separately; #1376 opens only its new debug-owned DB.
             for name in ["agentSessionOversightLinks.json", "delegationScopes.json", "delegationWorktreeOwnership.json"] {

@@ -512,15 +512,33 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         case unknown
     }
 
-    /// Upper bound on the `assistant_text` characters published by `asObject()`.
+    /// Upper bound on the `assistant_text` content characters (extended grapheme clusters)
+    /// published by `asObject()`; a truncated preview carries the marker in addition.
     ///
     /// Wait/poll/steer responses carry the child's last assistant reply only — never raw tool
     /// output — and this cap keeps that report bounded for the supervising session. Longer
     /// replies are truncated and flagged with `assistant_text_truncated`; the full transcript
     /// stays reachable through explicit log operations (`agent_manage get_log`).
+    ///
+    /// These limits bound the decoded text value, not its JSON encoding (escaping can expand
+    /// it) or the whole response, which also carries metadata, bindings, and interactions.
     package static let assistantTextCharacterLimit = 16_000
 
+    /// UTF-8 ceiling on the published `assistant_text`, truncation marker included. Characters
+    /// are grapheme clusters of unbounded byte length, so a character cap alone is not a size cap.
+    /// `assistant_text_characters` reports the original length in grapheme clusters, so it can
+    /// be smaller than the published text (an oversized single grapheme reports `1`).
+    package static let assistantTextUTF8ByteLimit = 64 * 1024
+
     package static let assistantTextTruncationMarker = "\n… [assistant_text truncated; read the full transcript with agent_manage get_log]"
+
+    /// Upper bounds on the published `status_text`: up to `statusTextCharacterLimit` content
+    /// characters plus the marker, with the byte ceiling covering both. Status text is a short
+    /// label; producers keep full diagnostics in their own logs and classify failures from the
+    /// untruncated text before publishing.
+    package static let statusTextCharacterLimit = 2000
+    package static let statusTextUTF8ByteLimit = 8 * 1024
+    package static let statusTextTruncationMarker = " … [status_text truncated]"
 
     package static let unboundChildOfBoundParentWarning =
         "This child session is not bound to a worktree although its parent session is. It reads the logical root checkout, " +
@@ -539,6 +557,12 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
     package let status: Status
     package let statusText: String?
     package let latestAssistantPreview: String?
+    /// Internal-only truncation state of `latestAssistantPreview`: non-nil means the preview is
+    /// an already-bounded projection (decoded from a published payload) of a reply with this
+    /// many characters. It is republished through the existing `assistant_text_truncated` /
+    /// `assistant_text_characters` keys. `nil` (the default) means the preview is the producer's
+    /// own text, which `asObject()` bounds itself.
+    package let latestAssistantPreviewTotalCharacters: Int?
     package let interaction: Interaction?
     package let hookGate: HookGate?
     package let transcriptItemCount: Int
@@ -565,6 +589,7 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         status: Status,
         statusText: String?,
         latestAssistantPreview: String?,
+        latestAssistantPreviewTotalCharacters: Int? = nil,
         interaction: Interaction?,
         hookGate: HookGate? = nil,
         transcriptItemCount: Int,
@@ -588,6 +613,7 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         self.status = status
         self.statusText = statusText
         self.latestAssistantPreview = latestAssistantPreview
+        self.latestAssistantPreviewTotalCharacters = latestAssistantPreviewTotalCharacters
         self.interaction = interaction
         self.hookGate = hookGate
         self.transcriptItemCount = transcriptItemCount
@@ -607,16 +633,91 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
     }
 
     /// Bounded `assistant_text` payload: the preview capped at `assistantTextCharacterLimit`
-    /// characters plus whether truncation happened and the original length.
+    /// characters and `assistantTextUTF8ByteLimit` bytes, plus whether it is truncated and the
+    /// original length.
+    ///
+    /// `knownTotalCharacters` is the explicit truncation state of an already-bounded preview
+    /// (see `latestAssistantPreviewTotalCharacters`). A non-nil value always reports
+    /// truncation with that original count — even when the preview is short, as after
+    /// byte-only truncation or an oversized single grapheme — and republishing such a
+    /// preview leaves its text unchanged.
     package static func boundedAssistantText(
-        _ text: String
+        _ text: String,
+        knownTotalCharacters: Int? = nil
     ) -> (text: String, truncated: Bool, totalCharacters: Int) {
-        let totalCharacters = text.count
-        guard totalCharacters > assistantTextCharacterLimit else {
-            return (text, false, totalCharacters)
+        let bounded = boundedText(
+            text,
+            characterLimit: assistantTextCharacterLimit,
+            utf8ByteLimit: assistantTextUTF8ByteLimit,
+            marker: assistantTextTruncationMarker
+        )
+        if let knownTotalCharacters {
+            return (bounded.text, true, knownTotalCharacters)
         }
-        let head = String(text.prefix(assistantTextCharacterLimit))
-        return (head + assistantTextTruncationMarker, true, totalCharacters)
+        return (bounded.text, bounded.truncated, bounded.characterCount)
+    }
+
+    /// Bounded `status_text`: capped at `statusTextCharacterLimit` characters and
+    /// `statusTextUTF8ByteLimit` bytes; truncation is signalled by the trailing marker.
+    package static func boundedStatusText(_ text: String) -> String {
+        boundedText(
+            text,
+            characterLimit: statusTextCharacterLimit,
+            utf8ByteLimit: statusTextUTF8ByteLimit,
+            marker: statusTextTruncationMarker
+        ).text
+    }
+
+    /// Keeps up to `characterLimit` content characters (extended grapheme clusters) plus
+    /// `marker` when it truncates; the `utf8ByteLimit` ceiling covers content and marker
+    /// together. Truncation stops before a grapheme that would cross either limit, even when
+    /// that leaves an empty prefix. `characterCount` is the input's grapheme count.
+    ///
+    /// Idempotent: text that is already `<bounded head> + marker` is returned verbatim with
+    /// `truncated == false`, so decode-and-republish round-trips never re-truncate or stack
+    /// markers. Truncation state therefore has to travel separately (see
+    /// `latestAssistantPreviewTotalCharacters`).
+    package static func boundedText(
+        _ text: String,
+        characterLimit: Int,
+        utf8ByteLimit: Int,
+        marker: String
+    ) -> (text: String, truncated: Bool, characterCount: Int) {
+        // Grapheme counting is O(n); count once and hand it back to callers.
+        let characterCount = text.count
+        let utf8Count = text.utf8.count
+        if utf8Count <= utf8ByteLimit, characterCount <= characterLimit {
+            return (text, false, characterCount)
+        }
+        let markerBytes = marker.utf8.count
+        let headByteBudget = max(0, utf8ByteLimit - markerBytes)
+        if utf8Count >= markerBytes, text.utf8.suffix(markerBytes).elementsEqual(marker.utf8) {
+            let headBytes = utf8Count - markerBytes
+            if headBytes <= headByteBudget,
+               String(decoding: text.utf8.prefix(headBytes), as: UTF8.self).count <= characterLimit
+            {
+                return (text, false, characterCount)
+            }
+        }
+        var head = ""
+        var headBytes = 0
+        var headCharacters = 0
+        for character in text {
+            let characterBytes = character.utf8.count
+            guard headCharacters < characterLimit, headBytes + characterBytes <= headByteBudget else { break }
+            head.append(character)
+            headBytes += characterBytes
+            headCharacters += 1
+        }
+        return (head + marker, true, characterCount)
+    }
+
+    /// Removes `assistant_text` together with its truncation metadata from a published object,
+    /// for decorations that intentionally suppress the preview.
+    package static func removeAssistantText(from object: inout [String: Value]) {
+        object.removeValue(forKey: "assistant_text")
+        object.removeValue(forKey: "assistant_text_truncated")
+        object.removeValue(forKey: "assistant_text_characters")
     }
 
     package var isActionableForMCPWait: Bool {
@@ -638,10 +739,13 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
             object["run_id"] = .string(runID.uuidString)
         }
         if let statusText, !statusText.isEmpty {
-            object["status_text"] = .string(statusText)
+            object["status_text"] = .string(Self.boundedStatusText(statusText))
         }
         if let latestAssistantPreview, !latestAssistantPreview.isEmpty {
-            let bounded = Self.boundedAssistantText(latestAssistantPreview)
+            let bounded = Self.boundedAssistantText(
+                latestAssistantPreview,
+                knownTotalCharacters: latestAssistantPreviewTotalCharacters
+            )
             object["assistant_text"] = .string(bounded.text)
             if bounded.truncated {
                 object["assistant_text_truncated"] = .bool(true)
