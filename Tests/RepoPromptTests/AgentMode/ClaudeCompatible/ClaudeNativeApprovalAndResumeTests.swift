@@ -3534,11 +3534,6 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
                     deliveries[text, default: 0] += 1
                 }
             }
-            let started = ContinuousClock.now
-            try await feed(assistant("first-live"), f.controller)
-            await until("hold the adoption gap") { resume != nil }
-            let busy = await f.harness.host.preparedOversightRuntimeIsBusy()
-            XCTAssertTrue(busy)
             var frames: [[String: Any]] = []
             for i in 0 ..< 998 {
                 frames.append(["type": "system", "subtype": "task_progress", "description": "progress-\(i)"])
@@ -3549,7 +3544,16 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
             }
             frames.append(result("second-terminal"))
             XCTAssertEqual(frames.count + 1, 2000)
-            let bytes = try frames.map { try JSONSerialization.data(withJSONObject: $0) + Data([10]) }.reduce(Data(), +)
+            var bytes = Data()
+            for frame in frames {
+                try bytes.append(JSONSerialization.data(withJSONObject: frame))
+                bytes.append(10)
+            }
+            let started = ContinuousClock.now
+            try await feed(assistant("first-live"), f.controller)
+            await until("hold the adoption gap") { resume != nil }
+            let busy = await f.harness.host.preparedOversightRuntimeIsBusy()
+            XCTAssertTrue(busy)
             await f.controller.test_handleConfigurationStdoutChunk(bytes)
             await until("the whole burst is parked") { receivedCompletions == 2 }
             XCTAssertGreaterThan(f.listener.test_handoffCount, 1996, "One input burst is retained losslessly, not count-capped")
