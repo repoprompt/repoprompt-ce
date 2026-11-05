@@ -596,51 +596,36 @@ final class AgentMonitorPillPropsTests: XCTestCase {
             tooltip.contains("always attached"),
             "the user must learn that turning this off does not turn updates off"
         )
-        XCTAssertTrue(tooltip.contains("one follow-up turn"))
+        XCTAssertTrue(tooltip.contains("a follow-up turn"))
         XCTAssertTrue(tooltip.contains("already-accepted work first"))
         XCTAssertFalse(
             tooltip.contains("never chain"),
             "the anti-chain guarantee was deleted from the transport; the copy must not still promise it"
         )
-        XCTAssertTrue(
-            tooltip.contains("follow-ups can continue"),
-            "a chain is now a real outcome of turning this on, so the control has to say so"
-        )
-        XCTAssertTrue(
-            tooltip.contains("oversee each other can keep waking"),
-            "reciprocal grants are the case a user is most likely to create by accident"
-        )
-        XCTAssertTrue(tooltip.contains("one oversight link can sustain a feedback loop"))
+        XCTAssertTrue(tooltip.contains("feedback loops"))
+        XCTAssertTrue(tooltip.contains("waiting for its own user"))
         XCTAssertTrue(tooltip.contains("explicit attention request"))
         XCTAssertTrue(tooltip.contains("can bypass this master switch"))
-        XCTAssertTrue(tooltip.contains("its own lane toggle"))
-        XCTAssertTrue(tooltip.contains("status Auto-wake snooze without changing any of them"))
-        XCTAssertTrue(tooltip.contains("Admission for routine status and overflow remains governed by selection and snooze"))
+        XCTAssertTrue(tooltip.contains("that lane’s toggle"))
+        XCTAssertTrue(tooltip.contains("status Auto-wake snooze without changing them"))
+        XCTAssertTrue(tooltip.contains("Routine status and overflow admission remains governed by selection and snooze"))
         XCTAssertTrue(tooltip.contains("To stop those routine wakes"))
-        XCTAssertTrue(tooltip.contains("To prevent purposeful attention from that link"))
-        XCTAssertTrue(tooltip.contains("unlink it"))
-        XCTAssertTrue(tooltip.contains("revocation and all other safety and admission gates still apply"))
+        XCTAssertTrue(tooltip.contains("Unlink to prevent further wakes from that link"))
+        XCTAssertTrue(tooltip.contains("all other safety and admission gates still apply"))
         XCTAssertFalse(tooltip.contains("can bypass only that snooze"))
         XCTAssertFalse(tooltip.contains("selected, either by this master switch or by its own lane toggle"))
         XCTAssertTrue(
             tooltip.contains("this session"),
             "the scope is the observer session, not a link and not a global preference"
         )
-        XCTAssertTrue(
-            tooltip.contains("On by default"),
-            "the default has to be visible where the control is — and it is enabled by default"
-        )
         let accessibilityHint = AgentMonitorAutoWakeCopy.accessibilityHint
-        XCTAssertTrue(
-            accessibilityHint.contains("either way"),
-            "VoiceOver users must get the same contract, not just the label"
-        )
-        XCTAssertTrue(accessibilityHint.contains("Explicit attention requests"))
-        XCTAssertTrue(accessibilityHint.contains("can bypass this master switch"))
-        XCTAssertTrue(accessibilityHint.contains("their lane toggle"))
-        XCTAssertTrue(accessibilityHint.contains("their exact lane’s snooze without changing them"))
-        XCTAssertTrue(accessibilityHint.contains("Unlink revokes attention"))
-        XCTAssertTrue(accessibilityHint.contains("all other safety and admission gates still apply"))
+        XCTAssertTrue(accessibilityHint.contains("Attention requests"))
+        XCTAssertTrue(accessibilityHint.contains("waiting for its own user"))
+        XCTAssertTrue(accessibilityHint.contains("that lane’s toggle and snooze"))
+        XCTAssertTrue(accessibilityHint.contains("unlink prevents further wakes"))
+        XCTAssertEqual(AgentMonitorAutoWakeCopy.label, "Auto-wake on overseen lane updates")
+        XCTAssertEqual(AgentMonitorRoutineWakeCopy.noDelayLabel, "No delay")
+        XCTAssertEqual(AgentMonitorPeriodicWakeCopy.label, "Wake after being idle for:")
     }
 
     func testOverlayStillDisablesAddWhenLiveStateSaysSo() {
@@ -1276,11 +1261,11 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         }
         XCTAssertTrue(
             AgentMonitorAutoWakeSnoozeCopy.accessibilityHint
-                .contains("Unlink prevents further attention from this link")
+                .contains("Unlink prevents further wakes from this link")
         )
         XCTAssertTrue(
             AgentMonitorAutoWakeSnoozeCopy.accessibilityHint
-                .contains("all other safety and admission gates still apply")
+                .contains("other admission gates still apply")
         )
 
         XCTAssertFalse(
@@ -1356,8 +1341,8 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         XCTAssertEqual(
             AgentMonitorAutoWakeSnoozeCopy.currentDispatchAlreadyStarted,
             "Current Auto-wake already started. This snooze applies only to later routine status "
-                + "and overflow wakes; explicit attention requests can bypass this snooze and "
-                + "routine selection without changing either."
+                + "and overflow wakes; explicit attention requests and this session’s transition to waiting for its own user can "
+                + "bypass this snooze and routine selection without changing either."
         )
         let notice = AgentMonitorRowFeedback.notice(
             AgentMonitorAutoWakeSnoozeCopy.currentDispatchAlreadyStarted

@@ -216,7 +216,7 @@ enum AgentMonitorPassiveNoticeOutcome: Equatable {
 /// what this switch adds, and — load-bearing — the bound on what it can create. A user who reads
 /// "auto-wake" and imagines an autonomous background agent has been mis-sold the feature.
 enum AgentMonitorAutoWakeCopy {
-    static let label = "Auto-wake on all updates"
+    static let label = "Auto-wake on overseen lane updates"
     static let laneLabel = "Auto-wake"
     static let selectAll = "Select all"
     static let deselectAll = "Deselect all"
@@ -231,24 +231,22 @@ enum AgentMonitorAutoWakeCopy {
     /// setting.
     static let tooltip = """
     Status updates for these sessions are always attached to this agent’s next turn. Turning this on \
-    additionally lets RepoPrompt start one follow-up turn for a routine status update or overflow \
-    summary: a busy agent finishes its current and already-accepted work first. A follow-up turn can \
-    create another update or attention request, so follow-ups can continue; one oversight link can \
-    sustain a feedback loop, and sessions that oversee each other can keep waking one another. An \
-    explicit attention request from an exactly linked session can bypass this master switch, its own \
-    lane toggle, and that lane’s status Auto-wake snooze without changing any of them. Admission for \
-    routine status and overflow remains governed by selection and snooze. To stop those routine wakes, \
-    switch off and deselect or snooze the lane. To prevent purposeful attention from that link, \
-    unlink it; revocation and all other safety and admission gates still apply. The setting applies \
-    to this session rather than to individual links. On by default, and saved with this session even \
-    when it oversees nothing.
+    additionally lets RepoPrompt start a follow-up turn for a routine status update or overflow \
+    summary after any selected delay. A busy agent finishes its current and already-accepted work \
+    first. Follow-ups can create further updates or attention requests, including feedback loops \
+    between sessions. An explicit attention request or a linked session’s transition to waiting for \
+    its own user can bypass this master switch, that lane’s toggle, and its status Auto-wake snooze \
+    without changing them. Routine status and overflow admission remains governed by selection and \
+    snooze. To stop those routine wakes, switch off and deselect or snooze the lane. Unlink to \
+    prevent further wakes from that link; all other safety and admission gates still apply. This \
+    setting is saved with this session.
     """
-    static let accessibilityLabel = "Auto-wake on all updates"
+    static let accessibilityLabel = "Auto-wake on overseen lane updates"
     static let accessibilityHint = """
-    Controls follow-up turns for selected linked sessions’ routine status and overflow updates. \
-    Explicit attention requests can bypass this master switch, their lane toggle, and their exact \
-    lane’s snooze without changing them; status updates are attached to your own next turn either \
-    way. Unlink revokes attention, and all other safety and admission gates still apply
+    Controls routine update follow-up turns. Attention requests and a linked session’s transition to \
+    waiting for its own user can bypass this switch, that lane’s toggle and snooze without changing \
+    them. Updates still accompany your next turn; unlink prevents further wakes from that link. Other \
+    admission gates still apply.
     """
     static let unavailableMessage = "That Agent session is no longer active."
     static let loadingReason = "This Agent session is still loading."
@@ -446,7 +444,7 @@ struct AgentMonitorPendingUpdates: Equatable {
 }
 
 enum AgentMonitorPeriodicWakeCopy {
-    static let label = "Wake when idle for"
+    static let label = "Wake after being idle for:"
     static let intervalLabel = "Periodic wake interval"
     static let tooltip = """
     While overseeing another session, wake after this much idle time, even without updates. \
@@ -460,16 +458,16 @@ enum AgentMonitorPeriodicWakeCopy {
 
 /// Pure routine-interval formatting; the coordinator decides whether a countdown is truthful.
 enum AgentMonitorRoutineWakeCopy {
-    static let limitLabel = "Routine wake-ups no more often than"
-    static let intervalLabel = "Minimum interval"
+    static let limitLabel = "No more often than:"
+    static let intervalLabel = "No more often than"
+    static let noDelayLabel = "No delay"
     static let tooltip = """
     Applies across every session this observer oversees, and counts from the last oversight wake \
-    rather than from a fixed schedule. Explicit attention requests and Wake now bypass it without \
-    changing it. Nothing is dropped or acknowledged: deferred updates stay queued and still ride \
+    rather than from a fixed schedule. Explicit attention requests, a linked session’s transition to \
+    waiting for its own user, and Wake now bypass it without changing it. Nothing is dropped or acknowledged: deferred updates stay queued and still ride \
     along on this agent’s own next turn.
     """
-    static let accessibilityLabel = "Limit routine wake-ups"
-    static let intervalAccessibilityLabel = "Minimum interval between routine wake-ups"
+    static let intervalAccessibilityLabel = "Minimum delay between routine update wake-ups"
 
     static func optionLabel(seconds: Int) -> String {
         seconds < 60 ? "\(seconds) sec" : "\(seconds / 60) min"
@@ -607,8 +605,8 @@ enum AgentMonitorAutoWakeSnoozeCopy {
     /// The one informational — not failed — outcome a set or extension can report.
     static let currentDispatchAlreadyStarted = """
     Current Auto-wake already started. This snooze applies only to later routine status and overflow \
-    wakes; explicit attention requests can bypass this snooze and routine selection without changing \
-    either.
+    wakes; explicit attention requests and this session’s transition to waiting for its own user can \
+    bypass this snooze and routine selection without changing either.
     """
 
     static let unavailableMessage = "That oversight link is no longer active."
@@ -636,17 +634,18 @@ enum AgentMonitorAutoWakeSnoozeCopy {
     static let menuTooltip = """
     Stops this session\u{2019}s routine status and overflow updates from starting an automatic \
     follow-up turn for a while. Status stays coalesced into the pending summary and still rides along \
-    with your next turn. An explicit attention request can bypass this snooze, the master switch, and \
-    this lane\u{2019}s toggle without changing any of them. Admission for routine status and overflow \
-    remains governed by selection and snooze. To prevent further attention from this link, unlink it. \
-    Clearing or expiry only lets RepoPrompt re-evaluate \u{2014} it never forces a turn.
+    with your next turn. An explicit attention request or this session’s transition to waiting for \
+    its own user can bypass this snooze, the master switch, and this lane’s toggle without changing \
+    any of them. Routine status and overflow admission remains governed by selection and snooze. \
+    Unlink to prevent further wakes from this link. Clearing or expiry only lets RepoPrompt \
+    re-evaluate — it never forces a turn.
     """
 
     static let accessibilityHint = """
-    Pauses routine status and overflow wakes only. An explicit attention request can bypass this \
-    snooze, the master switch, and this lane\u{2019}s toggle without changing them. Admission for \
-    routine status and overflow remains governed by selection and snooze. Unlink prevents further \
-    attention from this link; all other safety and admission gates still apply.
+    Pauses routine status and overflow wakes only. An explicit attention request or this session’s \
+    transition to waiting for its own user can bypass this snooze, the master switch, and this \
+    lane’s toggle without changing them. Routine status and overflow admission remains governed by \
+    selection and snooze. Unlink prevents further wakes from this link; other admission gates still apply.
     """
 
     /// Who set the current deadline, phrased for the row rather than for the wire.
