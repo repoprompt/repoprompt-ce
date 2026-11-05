@@ -268,7 +268,6 @@ extension AgentModeViewModel {
         case .none: return AgentSessionLinkSendFailure.targetNotIdle.message
         }
     }
-
 }
 
 extension AgentModeViewModel {

@@ -524,7 +524,7 @@ extension AgentModeViewModel {
 
     static func providerSwitchIsInFlightOnActiveRun(_ session: TabSession) -> Bool {
         session.pendingHandoff.providerSwitchDelivery == .sending
-            && session.runState.isActive && Self.providerSwitchHasOwnedCarryingAttempt(session)
+            && session.runState.isActive && providerSwitchHasOwnedCarryingAttempt(session)
             && session.pendingHandoff.providerSwitchDispatch?.dispatchID != nil
     }
 

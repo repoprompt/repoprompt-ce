@@ -4387,7 +4387,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     let probe = try XCTUnwrap(fixture.viewModel.providerSwitchExactOwnerProbe)
                     XCTAssertTrue(probe(fixture.sourceSession))
                     let replacement = AgentTabSession(tabID: fixture.sourceTabID)
-                    replacement.testInstallPersistentSessionBinding(sessionID: try XCTUnwrap(fixture.sourceSession.activeAgentSessionID))
+                    try replacement.testInstallPersistentSessionBinding(sessionID: XCTUnwrap(fixture.sourceSession.activeAgentSessionID))
                     XCTAssertEqual(replacement.activeAgentSessionID, fixture.sourceSession.activeAgentSessionID)
                     XCTAssertFalse(probe(replacement))
                     XCTAssertFalse(probe(AgentTabSession(tabID: UUID())))
