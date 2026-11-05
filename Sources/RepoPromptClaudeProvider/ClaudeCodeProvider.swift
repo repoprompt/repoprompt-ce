@@ -462,10 +462,9 @@ package final class ClaudeCodeProvider: AIProvider {
         return prompt
     }
 
+    /// Compatible backends may already report inclusive input counts, so they keep raw usage.
+    /// The injected model policy rejects non-Claude models exactly like the app's CLI selection.
     package func completionUsageMode(for model: AIModel) throws -> CompletionUsageMode {
-        guard model.providerType == .claudeCode else {
-            throw AIProviderError.invalidModel
-        }
         if compatibleDescriptor(model) != nil {
             return .raw
         }

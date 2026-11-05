@@ -894,6 +894,7 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
         }
     }
 }
+
 private final class OwnerWrittenLines: @unchecked Sendable {
     private let lock = NSLock()
     private var lines: [Data] = []

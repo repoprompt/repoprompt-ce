@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptAgentProviderContracts
+import RepoPromptClaudeProvider
 import RepoPromptDomainRuntime
 import RepoPromptProcess
 import RepoPromptProviderQuota

@@ -26,6 +26,7 @@ extension CodexAppServerClient {
         },
         launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot = CodexRuntimeAuthority.currentLaunchSnapshot(),
         provisionsRepoPromptMCPOnStart: Bool = true,
+        optOutNotificationMethods: [String] = [],
         processExitObserverFactory: @escaping @Sendable (pid_t) -> ChildProcessExitObserver = {
             ChildProcessExitObserver.observe(pid: $0)
         },
@@ -43,6 +44,7 @@ extension CodexAppServerClient {
             livenessProbe: livenessProbe,
             processSpawnPreparation: processSpawnPreparation,
             provisionsRepoPromptMCPOnStart: provisionsRepoPromptMCPOnStart,
+            optOutNotificationMethods: optOutNotificationMethods,
             processExitObserverFactory: processExitObserverFactory,
             expectedAgentPIDRegistrar: expectedAgentPIDRegistrar,
             faultInjection: faultInjection

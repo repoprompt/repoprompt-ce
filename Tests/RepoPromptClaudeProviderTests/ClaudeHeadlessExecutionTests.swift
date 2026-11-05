@@ -51,7 +51,15 @@ final class ClaudeHeadlessExecutionTests: XCTestCase {
         XCTAssertEqual(events.last?.providerSessionID, "session")
         XCTAssertEqual(events.last?.promptTokens, 2)
         XCTAssertEqual(events.last?.completionTokens, 3)
-        let entries = await journal.entries
+        // The runner's detached finalizer is the sole cleanup owner; it clears the
+        // expected PID only after reaping and draining the child, which settles
+        // asynchronously after dispose. Await the committed effect, bounded.
+        var entries = await journal.entries
+        let clearDeadline = Date().addingTimeInterval(30)
+        while !entries.contains("clear"), Date() < clearDeadline {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            entries = await journal.entries
+        }
         XCTAssertEqual(entries.first, "resolve")
         let preparationCount = await service.preparationCount
         XCTAssertEqual(preparationCount, 1)

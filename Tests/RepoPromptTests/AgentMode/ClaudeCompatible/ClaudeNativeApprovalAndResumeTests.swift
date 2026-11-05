@@ -1514,7 +1514,11 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         session.runState = .completed
         let runID = UUID()
         session.installRunID(runID)
-        let controller = ClaudeNativeProcessSessionController(runID: runID, tabID: session.tabID, windowID: 1, workspacePath: nil, config: .discovery(commandName: "/usr/bin/false"))
+        let controller = ClaudeNativeProcessSessionController(
+            host: ClaudeNativeSessionAppHost(),
+            runID: runID, tabID: session.tabID, windowID: 1, workspacePath: nil,
+            config: .discovery(commandName: "/usr/bin/false")
+        )
         await controller.test_installConfigurationTransport(write: write)
         session.claudeController = controller
         if mcp {

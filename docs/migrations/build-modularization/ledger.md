@@ -1319,3 +1319,78 @@ separately owned reliability source was modified.
 
 
 **2026-10-13 upstream validation reconciliation.** Unmodified upstream `39b496ab26a39002cdabe90fce8794d9c2355107` contains 333 files with the exact App-test import counted by the ratchet, against a recorded limit of 332. The Ultrafast contribution adds coverage to existing suites and introduces no new App-importing test file. Align only `tests_testable_import_app_files` to the existing 333-file tree; counts above 333 still fail, and every other baseline and policy stays unchanged. Update the stale sidebar builder and self-compact reservation test calls to the current interfaces without removing assertions. These prerequisite repairs are kept separate from the Ultrafast implementation for review.
+
+## PR 8 (M8) — AI contracts and provider families to their own targets (2026-11-06)
+
+Delivers completion-plan milestone 8 (wave E: E1 contracts + E2 providers). Six new
+library targets in the root package, none of which depends on `RepoPromptApp`, UI
+pickers, or `AgentModeViewModel`:
+
+- **`RepoPromptAIContracts`** (~3.1k lines) — E1: provider-neutral `AIModel`
+  identity and raw values, `AIProviderType`, `AgentModelOption`/effort variants,
+  `AgentProviderKind` and task-label kinds (`explore` etc. stay typed, not
+  positional strings), reasoning-effort values, Claude/Codex/ACP model-identity
+  normalization, `CodexModelSpecifier`, `CodexServiceTierVariantCatalog`,
+  `ModelCatalogSemantics`, `CodexDynamicModelMapper`, and `AIProviderError`.
+- **`RepoPromptAgentProviderContracts`** (~0.5k) — the native runtime seam:
+  `NativeAgentRuntimeControlling` plus its event/status/error/session values
+  (`NativeAgentRuntimeEvent`, `…RuntimeInitStatus`, `…TurnStatus`,
+  `…InterruptOutcome`, `…ControllerError`, `…EventStreamHandle`) and
+  `AgentCLIToolContext`.
+- **Provider families (E2):** `RepoPromptClaudeProvider` (~5.1k:
+  `ClaudeCodeProvider`, `ClaudeCodeAgentProvider`, `ClaudeNativeProcessSessionController`,
+  turn correlation, CLI stream decoding, the package-facing half of the
+  compatible-provider bridge), `RepoPromptCodexProvider` (~4.1k:
+  `CodexAppServerClient`, the injected `AgentCodexModelRegistry`, Codex exec
+  contracts), `RepoPromptACPProviders` (~14.1k: ACP session controller and
+  headless bridge, Grok/Devin/Antigravity/Cursor/OpenCode providers, launch
+  resolvers and model polling), and `RepoPromptHTTPProviders` (~4.0k: OpenAI,
+  Anthropic and custom HTTP engines plus shared liveness).
+
+Each target has an owning test target (~8.2k test lines total) that builds and
+runs without the app. `RepoPromptDomainRuntime` gained only a downward
+`RepoPromptAIContracts` dependency; nothing moved out of it and it still has no
+app dependency. `ProviderContent` and `Diffing` are reused in place.
+
+**Retired machinery.** The registry singletons (`AgentACPModelRegistry.shared`,
+`AgentCodexModelRegistry.shared`) and direct advertised-catalog access are gone;
+the one application-owned `AgentModelCatalogRuntime` (2026-10-29 entry above) is
+the only composition point, and registries are constructed with injected storage,
+option policy, and invalidation. App-local nested controller types and capability
+projections (`ClaudeNativeProcessSessionController.{TurnStatus,RuntimeInitStatus,Event,SessionRef,InterruptOutcome,ControllerError}`)
+are replaced by the contract values; the Claude/Codex/ACP/HTTP providers take
+app policy (model selection, prompt delivery, environment filtering, launch
+hosts, approval overlays) through package initializers instead of reaching into
+app state, separating construction from consumption. No second model catalog was
+introduced; provider-specific persistence destinations (`CodexDynamicModelStore`,
+`ACPDynamicModelStore`, backend stores) remain app-owned and behavior-identical.
+
+**Reconciliation with main (53 commits since the integration branch's base).**
+The extraction was rebuilt on current main and the following upstream semantics
+were preserved inside the moved code: one-snapshot Codex catalog projection
+(#1590 — the records snapshot now threads through the registry dependencies,
+`AgentCodexModelPolicy`, mapper, and `AIModel` wrappers; cache keyed by records,
+remote/stored inputs with identical canonical records share one entry);
+provider-initiated turn tracking (#1565/#1611 — `providerTurnStarted`, provider
+output ownership, event-stream generations and the `eventStreamSnapshot`
+protocol requirement); the auto-compact window (#1594/#1620 —
+`autoCompactWindowTokens` on the contract init status); native Claude terminal
+usage normalization (#1582 — `CompletionUsageMode` is provider-owned and decided
+by the injected compatible-backend/model-selection policy); the unified
+`CLIProcessRunner` output-drain hook API (#1580) over the branch's split
+streaming/non-streaming hooks, keeping the DispatchIO-owned bounded drain; Codex
+`optOutNotificationMethods` and exact response usage (#1601). Correlation tests
+moved to `RepoPromptClaudeProviderTests` were refreshed from main's updated
+versions; the registry ownership tests now assert the single-snapshot contract
+instead of the retired remote/stored cache split.
+
+**Aggregate effect vs `main`.** 606 files, +22,730/−12,639. App-target Swift
+lines 675,919 → 645,048 (−30,871); index wrong-way file edges 1,048 → 947; app
+files over 2,000 lines 47 → 43 (both ratchets lowered in this PR); shared
+accessor uses 1,444 → 1,427; largest cycle 67 → 66; `Infrastructure/AI` source
+files 156 → 120. `modules.json` carries the six new target rows and placement
+rules; the import-check matrix and per-target guardrails cover them.
+
+**Receipts.** Recorded in the PR body: coordinated `swift-build --product all`
+(ticket `m8-merge-build-7`), full root test suite, `RepoPromptAgentProviders`
+package tests, `make guardrails`, format/lint.

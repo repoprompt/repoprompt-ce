@@ -457,7 +457,7 @@ package actor CodexAppServerClient {
     private let writeFrameHandler: @Sendable (Int32, Data) throws -> Void
     private let livenessProbe: @Sendable (SpawnedProcess) -> Bool
     private let processSpawnPreparation: @Sendable () async throws -> Void
-    let optOutNotificationMethods: [String]
+    package let optOutNotificationMethods: [String]
     private let launchHost: any CodexAppServerLaunchHost
     private let provisionsRepoPromptMCPOnStart: Bool
     private let processExitObserverFactory: @Sendable (pid_t) -> ChildProcessExitObserver
