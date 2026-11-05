@@ -190,9 +190,10 @@ Ordinary user cancellation is not reversed.
 
 This is deliberately a bounded capacity improvement, not a global scheduler.
 Different stages, PRs, releases and other repositories can still contend for the
-account's available Mac slots. A single root worker also trades fewer allocations
-and downloads for coarser retry cost: retrying that worker reruns its four logical
-shards. No unmeasured end-to-end speedup is claimed.
+account's available Mac slots. At this stage of the investigation, the single root
+worker traded fewer allocations/downloads for coarser retry cost: retrying it reran
+all four shards. This topology is superseded by the selective rollback below.
+No unmeasured end-to-end speedup is claimed.
 
 ### 4. Recover recognized infrastructure failures within a fixed budget
 
@@ -510,6 +511,55 @@ interrupted portable/Xcode validation did not produce a completed passing receip
 Neither is acceptance evidence. Further build and test acceptance is delegated to
 the exact pushed PR head on GitHub Actions; no local build result substitutes for it.
 Commit/push secret-scanning and repository safety preflights remain mandatory.
+
+## Selective rollback of unproven worker consolidation
+
+The maintainer requested reverting changes without demonstrated value, not deleting
+checks to make CI green. This follow-up reverts the scheduling part of
+[#1623](https://github.com/repoprompt/repoprompt-ce/pull/1623)
+(`f715d128c391377b4624dcb7c97680fe3918f338`): four parallel-eligible matrix workers
+replace the serial worker. The 140-minute serial envelope is removed. Each worker
+keeps the same 1,800-second execution deadline and 32-minute step limit, with a
+40-minute job bound for checkout/transfer/cleanup. Shard-specific concurrency groups
+prevent the matrix from serializing or evicting itself. Exact per-shard artifact
+outputs preserve producer-bound partial retries; Style still verifies all four
+receipts and the complete union. Recovery recognizes both new matrix names and
+already-created serial jobs. No root build, coverage, security or publication gate
+is removed.
+
+### Change/value audit
+
+| Change | Decision and evidence |
+| --- | --- |
+| #1623 single-worker consolidation | **Revert.** Allocation count fell but latency benefit was unproven; serialization removes available overlap. The current serial run's first three shard steps took 6m00s, 15m59s and 11m17s, with shard 4 still pending completion at the snapshot. These are not a completed before/after benchmark. |
+| Build-once products and no-build shards (#1127) | **Keep.** Already present in the October 26 reference; removing this would restore duplicate compilation, not restore the old performance. |
+| Root import/type-check/warning ratchets, module parity and coverage receipts | **Keep.** They enforce distinct correctness boundaries. Root compilation was 19m27s on the reference versus 19m44s on the repaired current build; these are not the dominant new critical-path cost. No budget changes. |
+| ARM restoration and explicit toolchain | **Keep.** Current hosted Build and Static Gates passed at `29591bf33`; Intel's prior enforcing-ratchet failure was reproduced and documented above. |
+| Early portable checks, diagnostics, producer-bound retries and bounded recovery | **Keep.** They address reproduced contract/visibility/rerun failures. Matrix adapters retain exact evidence rather than wildcard/latest-artifact selection. Full hosted retry behavior remains a validation obligation, not a local-test claim. |
+| Separation of universal release qualification from ordinary integration (#1622) | **Keep.** Avoids repeating release-only builds for every PR while preserving artifact qualification before publication. |
+| CI timing reporter and lightweight preflights | **Keep.** They distinguish queue/execution and catch workflow-contract failures before expensive builds. No change to contributor secret-scanning requirements. |
+| Sentry/privacy placement | **Uncertain scheduling value; unchanged.** Its configuration/privacy coverage is distinct and retained. Running it after all root tests extends the critical path; changing that ordering needs a capacity-versus-latency decision, not deletion of privacy coverage. |
+| Support-cache policy | **Uncertain net benefit; unchanged.** The current support miss accompanies 8m57s dependency resolution versus 56s on the reference. A miss alone does not establish that reverting to multi-GB compiled-product transfers is worthwhile, especially when the enforcing build cleans those products. |
+| Main-stage coalescing and broader Tip selection/tooling changes | **Not established as valueless; unchanged and flagged.** They are separate capacity/publication policies, with hosted behavior and tooling provenance still requiring review. This rollback neither endorses their production readiness nor silently changes release authority. |
+
+Evidence: [October 26 reference](https://github.com/repoprompt/repoprompt-ce/actions/runs/40274262216)
+and [current serial run](https://github.com/repoprompt/repoprompt-ce/actions/runs/41950587192).
+Parallelism can increase queueing when the pool is saturated, so the restored run
+must be measured through final Style before claiming a speedup. Four workers mean
+four transfers again; this is an explicit tradeoff, not free capacity.
+
+**Maintainer-guidance check:** the user impact is avoidable serial feedback latency;
+the invariant is complete exact-producer validation. Workflow history confirms the
+serialization, but its net benefit is unproven. The workflow and artifact verifier
+remain authoritative. No user-state, secret, required-check or production changes
+are made. Concurrent artifacts/outputs and partial-retry lineage are the main risks;
+regression tests cover missing/wrong-shard/stale receipts and recovery names. Hosted
+CI, not a local build, remains the acceptance boundary. The 112 Python workflow
+contract tests passed, including the modularization contracts and controller-level
+matrix log-fetch recovery witnesses. Changed-workflow actionlint passed with
+ShellCheck disabled and the known unsupported concurrency `queue` key excluded.
+No local Swift build was run for this rollback. Actual matrix output retention on
+a partial hosted retry must still be verified; missing evidence fails closed.
 
 ## Rollback and operating boundaries
 

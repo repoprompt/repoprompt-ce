@@ -373,7 +373,7 @@ class CatalogTests(unittest.TestCase):
         self.assertIn('needs: [candidate, workflow-contracts, build-test-bundles, build-and-test, secret-scan, integration-products]', final)
         self.assertIn('if: always()', final)
         self.assertIn('ci_test_coverage.py', final)
-        self.assertEqual(ci.count('runs-on: macos-26\n'), 2)  # shared root build + one worker (four logical shards)
+        self.assertEqual(ci.count('runs-on: macos-26\n'), 2)  # shared root build + four-worker matrix template
         products = (SCRIPT_DIR.parent / '.github/workflows/ci-integration-products.yml').read_text()
         self.assertEqual(products.count('runs-on: macos-26\n'), 1)  # Sentry/privacy only
         self.assertIn('SentryTelemetryPrivacyTests', products)
@@ -381,12 +381,12 @@ class CatalogTests(unittest.TestCase):
         self.assertNotIn('macos-compatibility.yml', products)
         self.assertNotIn('continue-on-error', products)
         worker = ci.split('\n  build-and-test:\n', 1)[1].split('\n  style:\n', 1)[0]
-        self.assertNotIn('matrix:', worker)
-        for shard in range(1, 5):
-            self.assertIn(f'--shard-count 4 --shard-index {shard} --timeout 1800', worker)
+        self.assertIn('shard: [1, 2, 3, 4]', worker)
+        self.assertIn('fail-fast: false', worker)
+        self.assertIn('--shard-count 4 --shard-index ${{ matrix.shard }} --timeout 1800', worker)
         self.assertNotIn('continue-on-error', ci)
         for line in ci.splitlines():
-            if line.startswith('    name:'):
+            if line.startswith('    name:') and line != '    name: Test Root Shard (No Build) (${{ matrix.shard }})':
                 self.assertNotIn('${{', line)
 
     def test_partial_reruns_select_successful_producer_outputs_after_prerequisite_report(self) -> None:
@@ -402,7 +402,9 @@ class CatalogTests(unittest.TestCase):
         final = ci.split('\n  style:\n', 1)[1].split('\n  secret-scan:\n', 1)[0]
         self.assertLess(final.index('ci_job_diagnostics.py prerequisites'), final.index('ci_admission.py select'))
         self.assertIn('steps.selected.outputs.coverage_artifact', final)
-        self.assertIn('needs.build-and-test.outputs.receipt_artifact', final)
+        self.assertIn('toJSON(needs.build-and-test.outputs)', final)
+        for shard in range(1, 5):
+            self.assertIn(f'steps.selected.outputs.receipt_artifact_{shard}', final)
         self.assertNotIn('pattern:', final)
         contracts = ci.split('\n  workflow-contracts:\n', 1)[1].split('\n  integration-products:\n', 1)[0]
         self.assertIn('make ci-portable-selftest', contracts)

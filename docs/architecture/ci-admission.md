@@ -162,50 +162,44 @@ counts in the step summary. Compilation success is not static-gate success.
 Malformed/missing measurements do not infer success or replace the original
 nonzero build exit status; the full log and timing artifact remain available.
 
-Integration requests three macOS jobs: one producer, one root-test worker running
-all four logical shards sequentially, and Sentry/privacy. The earlier reduction
-removed universal packaging and compatibility from nine jobs to six; consolidating
-the shard workers removes another three allocations and artifact downloads. Universal packaging and its two artifact checks are demanded
-only by actual release flows or an explicit diagnostic. This removes the largest
-per-candidate workload amplifier; it does not reserve capacity or promise a latency
-SLO. GitHub account limits and hosted image availability remain separate constraints.
-The [capacity audit](ci-capacity-2026-11-04.md) separates measured queue/execution time
-from expected impact. There is no measured hosted before/after result yet.
+Integration requests six macOS jobs: one producer, four independent root-test
+workers, and Sentry/privacy. The #1623 single-worker experiment is reverted: it
+reduced allocations, but its end-to-end benefit was not demonstrated and it removed
+available shard overlap. The build-once producer predates that experiment and is
+retained; no worker recompiles. Universal packaging and its two artifact checks
+remain release-only. See the [rollback decision](ci-reliability-2026-11-05.md#selective-rollback-of-unproven-worker-consolidation).
 
 Sentry still waits for root gates to reject bad candidates before allocating a VM.
-Four logical root shards keep exact full coverage. A single worker downloads and
-verifies the producer once, then runs each shard with a fresh per-suite sandbox
-through conductor. Ordinary shard failure does not suppress later shards; failed
-setup and workflow cancellation do. No `continue-on-error` masks a failure.
-Each shard has a 1,800-second conductor execution limit (owned process cleanup),
-a 32-minute step envelope, and unchanged individual-suite/test assertion budgets.
-The 140-minute job envelope covers four sequential steps plus setup/uploads;
-it is not a relaxed individual-test timeout. All four run/attempt-bound receipts
-are uploaded together and the existing Style verifier still requires their exact
-union. Missing or failed shards cannot pass. This does not change the profile's
-correctness obligations. Producer-bound partial reruns are described below.
+The four-shard matrix uses `fail-fast: false` and a separate concurrency group per
+shard, so a sibling cannot serialize or evict another sibling. Each worker verifies
+the same root producer, retains the 1,800-second conductor execution deadline and
+32-minute step envelope, and has a 40-minute job envelope for setup and uploads.
+No test assertion or coverage requirement is relaxed. Setup failures do not start
+tests, and ordinary shard failures do not cancel siblings.
 
-This trades idle-capacity parallel speed for fewer allocations under contention.
-It does not reduce the number of tests or the clean build/Sentry workload. Compare
-end-to-end latency and summed macOS execution minutes for successful runs, separating
-queue time from execution. Keep failed/cancelled attempts visible but out of the
-successful-run timing comparison. Revert the worker consolidation if queue savings
-do not offset sequential execution or state isolation regresses; do not weaken
-coverage, deadlines, secret scans, or publication gates. Hosted benefit is unproven
-until the new workflow runs. Existing suite isolation is unchanged, but one VM is
-now reused across shards; hosted validation must specifically check this boundary.
- Do not increase
-parallelism or switch images assuming that creates account capacity. Preserve the
-Ubuntu Tip eligibility job so obsolete candidates do not wait for a Mac just to skip.
+Each matrix worker emits uniquely keyed artifact and diagnostic outputs. Style
+requires all four exact shard/run/attempt artifact names, including successful
+ancestors of partial retries, and verifies every receipt against the same root
+producer plus the exact test union. It never discovers evidence by a wildcard or
+chooses the newest artifact. Missing outputs or failed/stale receipts cannot pass.
+
+Parallel scheduling restores overlap when capacity is available; it does not
+create capacity. Four transfers and allocations cost more than one. Compare
+complete passing runs, including queue time, summed execution and time to Style;
+no speedup is claimed before hosted evidence. Preserve the Ubuntu Tip eligibility
+job so obsolete candidates do not wait for a Mac just to skip.
 Main workflows remain run-scoped so every introduced-commit-range secret scan can
 finish. First-attempt main **Mac stages** use separate concurrency groups: one
-running and one pending build, test worker, and Sentry job. Running work finishes;
+running and one pending build, each individual shard, and Sentry job. Running work finishes;
 the newest queued request replaces the previous pending request. PR previews,
 merge-group candidates and explicit reruns do not share these main groups.
 GitHub orders pending replacement by arrival, not commit ancestry. If an old
 request arrives late and evicts the current main candidate, the bounded recovery
 controller recognizes the exact system annotation and retries that job under its
-run-specific retry group. Ordinary user cancellation is not reversed.
+run-specific retry group. Ordinary user cancellation is not reversed. Per-shard
+coalescing is not atomic: a superseded candidate can execute some shards while
+others are evicted. Its completed work cannot pass incomplete coverage and may
+consume capacity; include that wasted work in the hosted capacity comparison.
 
 ### Read-only queue and execution report
 
@@ -226,9 +220,9 @@ time includes any approval or concurrency wait, not only runner-capacity pressur
 Compare successful runs on the same profile and similar workload/queue pressure.
 Use run links and per-job timestamps; summed runner seconds are not wall-clock latency
 or billing. Do not compare a cancelled/partial run's short duration to a passing run.
-For worker consolidation, record test-worker queue time, execution, total macOS
-execution, exact coverage success, and overall time to Style. Keep a rollback available
-if serialized execution outweighs queue/setup savings. No automated cancellation,
+For worker scheduling, record each shard's queue time, stage wall time, total macOS
+execution, exact coverage success, and overall time to Style. Compare restored
+parallel execution against the recorded serial baseline, not job count alone. No automated cancellation,
 rerun, secret access, or workflow mutation is provided by this command.
 
 Reporter regression tests run with `python3 Scripts/test_ci_admission.py` and the
@@ -239,8 +233,9 @@ existing `make ci-app-test-runner-selftest` lane.
 For runs created with `integration-v3`, normal **Re-run failed jobs** and
 individual-job reruns are supported. Successful ancestors are reused only through
 their exact producer outputs; the consumer's newer attempt number must not be used
-to invent a build artifact name. A worker rerun re-executes all four shards, while a
-Sentry-only rerun need not rebuild the successful root tests. Style-only retries
+to invent a build artifact name. A matrix-worker rerun re-executes that shard only;
+successful siblings retain their own artifact outputs. A Sentry-only rerun need not
+rebuild the successful root tests. Style-only retries
 still require all prerequisites and independently verify the original evidence.
 
 | Failure | Recovery |

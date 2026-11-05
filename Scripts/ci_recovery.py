@@ -15,18 +15,24 @@ WORKFLOW = '.github/workflows/ci.yml'
 PRODUCT_WORKFLOW = '.github/workflows/ci-integration-products.yml'
 MAX_ATTEMPTS = 3
 ROOT = 'Build and Static Gates'
-WORKER = 'Test Root Shards (No Build)'
+WORKER = 'Test Root Shards (No Build)'  # Already-created serial runs can still recover.
+SHARD_WORKERS = {f'Test Root Shard (No Build) ({shard})': shard for shard in range(1, 5)}
+WORKERS = {WORKER, *SHARD_WORKERS}
 AGGREGATE_STEPS = {'Report prerequisites and release eligibility', 'Fail if a prerequisite failed or was skipped'}
 DOWNLOADS = {
     (WORKER, 'Download the single root build'): 'root-build',
     ('Style', 'Download expected coverage'): 'expected-coverage',
     ('Style', 'Download all shard execution receipts'): 'shard-execution-all',
+    **{(name, 'Download the single root build'): 'root-build' for name in SHARD_WORKERS},
+    **{('Style', f'Download shard {shard} execution receipt'): f'shard-execution-{shard}'
+       for shard in range(1, 5)},
 }
 EVICTION = re.compile(r"cancel(?:ing|ling) since a higher priority waiting request for (?P<quote>['\"]?)"
-                     r"(?P<stage>ci-build-main|ci-tests-main|ci-sentry-main)(?P=quote) exists", re.I)
+                     r"(?P<stage>ci-build-main|ci-tests-main(?:-[1-4])?|ci-sentry-main)(?P=quote) exists", re.I)
 STAGE_GROUPS = {ROOT: 'ci-build-main', WORKER: 'ci-tests-main',
                 'integration-products': 'ci-sentry-main',
-                'integration-products / Sentry Build and Privacy': 'ci-sentry-main'}
+                'integration-products / Sentry Build and Privacy': 'ci-sentry-main',
+                **{name: f'ci-tests-main-{shard}' for name, shard in SHARD_WORKERS.items()}}
 STARTUP = re.compile(r'the job was not acquired by runner of type hosted even after multiple attempts'
                      r'|failed to provision (?:a |the )?hosted runner', re.I)
 NON_TRANSIENT = re.compile(r'manually cancel|cancelled by|canceled by|spending limit|payments? (?:have )?failed'
@@ -105,7 +111,7 @@ def classify_job(job: dict, evidence: str, run: dict, artifacts: list[dict]) -> 
     if job.get('conclusion') != 'failure':
         return None
     steps = failed_steps(job)
-    if (job.get('name') == WORKER
+    if (job.get('name') in WORKERS
             and steps == {'Select the successful root producer and verify toolchain'}
             and any(message in evidence for message in DRIFT_MESSAGES)):
         return 'rebuild'
@@ -152,7 +158,7 @@ def plan(run: dict, jobs: list[dict], diagnostics: dict[int, str], artifacts: li
     if run.get('conclusion') == 'cancelled' and any(cause != 'evicted' for _, cause in causes):
         return Decision('none', 'Cancelled workflows are not retried without exact current-main concurrency-eviction evidence.')
     if any(cause == 'rebuild' for _, cause in causes):
-        if any(job.get('name') not in (WORKER, 'Style') for job, _ in causes):
+        if any(job.get('name') not in WORKERS | {'Style'} for job, _ in causes):
             return Decision('none', 'Independent failures also block recovery; inspect them before rebuilding the root and dependents.')
         roots = [job for job in jobs if job.get('name') == ROOT and job.get('conclusion') == 'success']
         executions = {(job.get('started_at'), job.get('completed_at')) for job in history
@@ -166,6 +172,8 @@ def plan(run: dict, jobs: list[dict], diagnostics: dict[int, str], artifacts: li
                         positive(roots[0]['id']))
     if any(cause == 'evicted' for _, cause in causes):
         if len(causes) != 1:
+            if all(cause == 'evicted' and job.get('name') in SHARD_WORKERS for job, cause in causes):
+                return Decision('retry_failed', 'Only positively identified current-main shard evictions remain; retain successful siblings.')
             return Decision('none', 'More than one independent failure prevents an isolated concurrency recovery.')
         return Decision('retry_job', 'The current main candidate was evicted from a pending CI stage; retry uses its own run group.',
                         positive(causes[0][0]['id']))
@@ -264,7 +272,7 @@ def collect_diagnostics(api: GitHub, run: dict, jobs: list[dict]) -> dict[int, s
             annotations = api.pages(f'check-runs/{positive(check[1])}/annotations')
             result[job_id] = '\n'.join(str(item.get('message', '')) for item in annotations
                                        if item.get('annotation_level') == 'failure')
-        elif (job.get('name') in (WORKER, 'Style')
+        elif (job.get('name') in WORKERS | {'Style'}
               and (failed_steps(job) == {'Select the successful root producer and verify toolchain'}
                    or any((job.get('name'), step) in DOWNLOADS for step in failed_steps(job)))):
             result[job_id] = api.request(f'actions/jobs/{job_id}/logs', raw=True)

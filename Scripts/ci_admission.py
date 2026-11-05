@@ -120,10 +120,19 @@ def artifact_names(producer: dict) -> dict:
     return {'build_artifact': 'root-build-' + suffix, 'coverage_artifact': 'expected-coverage-' + suffix}
 
 
-def verify_receipt_artifact(name: str, run_id: str, attempt: str, build_attempt: str = '1') -> None:
-    match = re.fullmatch(r'shard-execution-all-([1-9][0-9]*)-([1-9][0-9]*)', name)
-    if not match or match[1] != run_id or not positive(build_attempt) <= positive(match[2]) <= positive(attempt):
-        raise ValueError('missing or wrong run/attempt shard artifact output')
+def select_receipt_artifacts(outputs: dict, run_id: str, attempt: str, build_attempt: str) -> dict:
+    """Require one explicit successful-worker output per shard, never newest-by-name."""
+    if not isinstance(outputs, dict):
+        raise ValueError('missing shard job outputs')
+    selected = {}
+    for shard in range(1, 5):
+        key = f'receipt_artifact_{shard}'
+        name = outputs.get(key, '')
+        match = re.fullmatch(rf'shard-execution-{shard}-([1-9][0-9]*)-([1-9][0-9]*)', name)
+        if not match or match[1] != run_id or not positive(build_attempt) <= positive(match[2]) <= positive(attempt):
+            raise ValueError(f'missing or wrong shard/run/attempt artifact output for shard {shard}')
+        selected[key] = name
+    return selected
 
 
 def write_outputs(path: Path, values: dict) -> None:
@@ -169,7 +178,7 @@ def main() -> int:
     parser.add_argument('--root', type=Path, default=Path.cwd())
     parser.add_argument('--context', help='explicit immutable candidate JSON; never read GITHUB_* inside conductor')
     parser.add_argument('--producer-context', help='successful root producer job output')
-    parser.add_argument('--receipt-artifact', help='successful worker job output (required by the final gate)')
+    parser.add_argument('--shard-outputs', help='all successful matrix job outputs as JSON (required by the final gate)')
     parser.add_argument('--check-toolchain', action='store_true')
     parser.add_argument('--event-path', type=Path)
     parser.add_argument('--event-name')
@@ -218,9 +227,9 @@ def main() -> int:
                     path.write_text(json.dumps({'producer': 'build-test-bundles', 'context': producer}, sort_keys=True) + '\n')
                 else:
                     outputs = artifact_names(producer)
-                    if args.receipt_artifact is not None:
-                        verify_receipt_artifact(args.receipt_artifact, args.run_id, args.attempt, producer['attempt'])
-                        outputs['receipt_artifact'] = args.receipt_artifact
+                    if args.shard_outputs is not None:
+                        outputs.update(select_receipt_artifacts(json.loads(args.shard_outputs), args.run_id,
+                                                                args.attempt, producer['attempt']))
                     write_outputs(args.output, outputs)
                     print(f"Selected root build attempt {producer['attempt']} for consumer attempt {args.attempt}; exact candidate/run and producer-bound receipts required.")
     except CandidateMismatch as error:

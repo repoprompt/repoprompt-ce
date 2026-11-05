@@ -27,6 +27,27 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertIn('rerunning the same code is not a fix', text)
         self.assertNotIn('flaky', text)
 
+    def test_matrix_diagnostics_keep_each_shards_failure_output(self):
+        needs = self.needs()
+        with tempfile.TemporaryDirectory() as directory:
+            for shard in range(1, 5):
+                output = Path(directory) / f'output-{shard}'
+                env = {'SHARD_INDEX': str(shard), 'GITHUB_OUTPUT': str(output),
+                       'GITHUB_STEP_SUMMARY': str(Path(directory) / 'summary'),
+                       'STEPS_CONTEXT': json.dumps({'run-root-test-shard-without-compiling': {'outcome': 'failure'}}),
+                       'GITHUB_SERVER_URL': 'https://github.com', 'GITHUB_REPOSITORY': 'owner/repo',
+                       'GITHUB_RUN_ID': '42', 'GITHUB_RUN_ATTEMPT': '2'}
+                with mock.patch.dict(os.environ, env), mock.patch('sys.stdout', new_callable=io.StringIO):
+                    self.assertEqual(diagnostics.run('job'), 0)
+                key, value = output.read_text().strip().split('=', 1)
+                self.assertEqual(key, f'failure_{shard}')
+                needs['build-and-test']['outputs'][key] = value
+        needs['build-and-test']['result'] = 'failure'
+        text, passed = diagnostics.prerequisite_report(needs, 'pull_request')
+        self.assertFalse(passed)
+        for shard in range(1, 5):
+            self.assertIn(f'shard {shard}: run-root-test-shard-without-compiling', text)
+
     def test_missing_candidate_output_does_not_hide_real_prerequisite_failure(self):
         needs = self.needs()
         needs['workflow-contracts'] = {'result': 'failure', 'outputs': {'failure': 'test-workflow-contracts'}}

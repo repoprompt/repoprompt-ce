@@ -380,10 +380,10 @@ jobs:
           fi
 
   build-and-test:
-    name: Test Root Shards (No Build)
+    name: Test Root Shard (No Build) (${{ matrix.shard }})
     needs: [candidate, build-test-bundles]
     concurrency:
-      group: ci-tests-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == '1' && 'main' || github.run_id }}
+      group: ci-tests-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == '1' && 'main' || github.run_id }}-${{ matrix.shard }}
       cancel-in-progress: false
     env:
       ADMISSION_CONTEXT: ${{ needs.build-test-bundles.outputs.context }}
@@ -391,12 +391,22 @@ jobs:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
     # Keep native ARM coverage and the original enforcing measurement platform.
     runs-on: macos-26
-    # One allocation/transfer, four logical shards. Each keeps its own deadline.
-    # 4 * 32 minutes plus setup/receipt upload; not a larger per-suite budget.
-    timeout-minutes: 140
+    # Restore four independent workers; one failure must not cancel other shards.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    # Original 30-minute execution deadline plus setup and cleanup/upload room.
+    timeout-minutes: 40
     outputs:
-      failure: ${{ steps.diagnostics.outputs.failure }}
-      receipt_artifact: ${{ steps.execution.outputs.artifact }}
+      failure_1: ${{ steps.diagnostics.outputs.failure_1 }}
+      failure_2: ${{ steps.diagnostics.outputs.failure_2 }}
+      failure_3: ${{ steps.diagnostics.outputs.failure_3 }}
+      failure_4: ${{ steps.diagnostics.outputs.failure_4 }}
+      receipt_artifact_1: ${{ steps.execution.outputs.artifact_1 }}
+      receipt_artifact_2: ${{ steps.execution.outputs.artifact_2 }}
+      receipt_artifact_3: ${{ steps.execution.outputs.artifact_3 }}
+      receipt_artifact_4: ${{ steps.execution.outputs.artifact_4 }}
     steps:
       - name: Check out repository
         id: check-out-repository
@@ -426,41 +436,22 @@ jobs:
 
       - name: Declare this execution artifact
         id: execution
-        run: echo "artifact=shard-execution-all-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+        run: echo "artifact_$SHARD_INDEX=shard-execution-$SHARD_INDEX-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
 
-      # A failed shard must not suppress the remaining coverage. A failed setup
-      # or cancellation must not start tests. Never mask failures; Style must fail.
-      - name: Run root test shard 1 without compiling
-        id: run-root-test-shard-1-without-compiling
-        if: ${{ !cancelled() && steps.verified-build.outcome == 'success' }}
+      - name: Run root test shard without compiling
+        id: run-root-test-shard-without-compiling
         timeout-minutes: 32
-        run: ./conductor ci-shard --shard-count 4 --shard-index 1 --timeout 1800 --full-log
-
-      - name: Run root test shard 2 without compiling
-        id: run-root-test-shard-2-without-compiling
-        if: ${{ !cancelled() && steps.verified-build.outcome == 'success' }}
-        timeout-minutes: 32
-        run: ./conductor ci-shard --shard-count 4 --shard-index 2 --timeout 1800 --full-log
-
-      - name: Run root test shard 3 without compiling
-        id: run-root-test-shard-3-without-compiling
-        if: ${{ !cancelled() && steps.verified-build.outcome == 'success' }}
-        timeout-minutes: 32
-        run: ./conductor ci-shard --shard-count 4 --shard-index 3 --timeout 1800 --full-log
-
-      - name: Run root test shard 4 without compiling
-        id: run-root-test-shard-4-without-compiling
-        if: ${{ !cancelled() && steps.verified-build.outcome == 'success' }}
-        timeout-minutes: 32
-        run: ./conductor ci-shard --shard-count 4 --shard-index 4 --timeout 1800 --full-log
+        run: ./conductor ci-shard --shard-count 4 --shard-index ${{ matrix.shard }} --timeout 1800 --full-log
 
       - name: Retain execution receipts and full shard logs
         id: retain-execution-receipts-and-full-shard-logs
         if: ${{ always() && steps.execution.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.execution.outputs.artifact }}
-          path: .build/ci-test-results/shard-*
+          name: ${{ steps.execution.outputs[format('artifact_{0}', matrix.shard)] }}
+          path: .build/ci-test-results/shard-${{ matrix.shard }}*
           if-no-files-found: error
           retention-days: 7
 
@@ -468,6 +459,7 @@ jobs:
         id: diagnostics
         if: always()
         env:
+          SHARD_INDEX: ${{ matrix.shard }}
           STEPS_CONTEXT: ${{ toJSON(steps) }}
         run: |
           if [[ -f Scripts/ci_job_diagnostics.py ]]; then
@@ -485,7 +477,7 @@ jobs:
     env:
       ADMISSION_CONTEXT: ${{ needs.build-test-bundles.outputs.context }}
       CANDIDATE_CONTEXT: ${{ needs.candidate.outputs.context }}
-      RECEIPT_ARTIFACT: ${{ needs.build-and-test.outputs.receipt_artifact }}
+      SHARD_OUTPUTS: ${{ toJSON(needs.build-and-test.outputs) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -514,7 +506,7 @@ jobs:
 
       - name: Select exact successful producer evidence
         id: selected
-        run: python3 Scripts/ci_admission.py select --context "$CANDIDATE_CONTEXT" --producer-context "$ADMISSION_CONTEXT" --receipt-artifact "$RECEIPT_ARTIFACT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --output "$GITHUB_OUTPUT"
+        run: python3 Scripts/ci_admission.py select --context "$CANDIDATE_CONTEXT" --producer-context "$ADMISSION_CONTEXT" --shard-outputs "$SHARD_OUTPUTS" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --output "$GITHUB_OUTPUT"
 
       - name: Download expected coverage
         id: download-expected-coverage
@@ -523,11 +515,34 @@ jobs:
           name: ${{ steps.selected.outputs.coverage_artifact }}
           path: expected-coverage
 
-      - name: Download all shard execution receipts
-        id: download-all-shard-execution-receipts
+      # Unique matrix outputs retain the exact artifact for each successful shard,
+      # including ancestors of a partial retry. Never select artifacts by recency.
+      - name: Download shard 1 execution receipt
+        id: download-shard-1-execution-receipt
         uses: actions/download-artifact@v4
         with:
-          name: ${{ steps.selected.outputs.receipt_artifact }}
+          name: ${{ steps.selected.outputs.receipt_artifact_1 }}
+          path: shard-execution
+
+      - name: Download shard 2 execution receipt
+        id: download-shard-2-execution-receipt
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.selected.outputs.receipt_artifact_2 }}
+          path: shard-execution
+
+      - name: Download shard 3 execution receipt
+        id: download-shard-3-execution-receipt
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.selected.outputs.receipt_artifact_3 }}
+          path: shard-execution
+
+      - name: Download shard 4 execution receipt
+        id: download-shard-4-execution-receipt
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.selected.outputs.receipt_artifact_4 }}
           path: shard-execution
 
       - name: Prove exact union and every test target

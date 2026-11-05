@@ -65,19 +65,58 @@ class PlannerTests(unittest.TestCase):
         for identity, body in jobs.items():
             header = body.split('    steps:\n', 1)[0]
             name = re.search(r'^    name: (.+)$', header, re.M)
-            named[name[1] if name else identity] = body
+            template = name[1] if name else identity
+            if '${{ matrix.shard }}' in template:
+                for shard in range(1, 5):
+                    named[template.replace('${{ matrix.shard }}', str(shard))] = body
+            else:
+                named[template] = body
         self.assertIn(recovery.ROOT, named)
-        self.assertIn(recovery.WORKER, named)
         for job_name, step in recovery.DOWNLOADS:
+            # Keep recovery for already-created serial runs, but attest new names.
+            if job_name == recovery.WORKER or step == 'Download all shard execution receipts':
+                continue
             self.assertIn(f'      - name: {step}\n', named[job_name])
-        self.assertIn(f'      - name: {SELECT}\n', named[recovery.WORKER])
+        for job_name in recovery.SHARD_WORKERS:
+            self.assertIn(f'      - name: {SELECT}\n', named[job_name])
         self.assertIn('      - name: Report prerequisites and release eligibility\n', named['Style'])
         products = (root / recovery.PRODUCT_WORKFLOW).read_text()
         for job_name, group in recovery.STAGE_GROUPS.items():
+            if job_name == recovery.WORKER:
+                continue
             caller, _, callee = job_name.partition(' / ')
-            self.assertIn('group: ' + group.removesuffix('main') + '${{', named[caller])
+            if job_name in recovery.SHARD_WORKERS:
+                self.assertIn('group: ci-tests-${{', named[caller])
+                self.assertIn('|| github.run_id }}-${{ matrix.shard }}', named[caller])
+            else:
+                self.assertIn('group: ' + group.removesuffix('main') + '${{', named[caller])
             if callee:
                 self.assertIn(f'    name: {callee}\n', products)
+
+    def test_matrix_siblings_recover_only_infrastructure_not_test_failures(self):
+        for name, shard in recovery.SHARD_WORKERS.items():
+            for step, evidence, expected in (
+                    ('Download the single root build', 'Artifact not found for name: root-build-101-1', 'rebuild'),
+                    (SELECT, DRIFT, 'rebuild'),
+                    ('Run root test shard without compiling', STARTUP, 'none')):
+                with self.subTest(shard=shard, step=step):
+                    jobs = [job(recovery.ROOT, 10), job(name, 20, 'failure', step), aggregate()]
+                    self.assertEqual(recovery.plan(source(), jobs, {20: evidence}, [], jobs).action, expected)
+            step = f'Download shard {shard} execution receipt'
+            jobs = [job(recovery.ROOT, 10), job('Style', 40, 'failure', step)]
+            evidence = f'Artifact not found for name: shard-execution-{shard}-101-1'
+            self.assertEqual(recovery.plan(source(), jobs, {40: evidence}, [], jobs).action, 'rebuild')
+            wrong = f'Artifact not found for name: shard-execution-{shard % 4 + 1}-101-1'
+            self.assertEqual(recovery.plan(source(), jobs, {40: wrong}, [], jobs).action, 'none')
+
+    def test_multiple_evicted_shards_recover_but_wrong_group_or_manual_cancellation_do_not(self):
+        jobs = [job(name, shard + 20, 'cancelled', assigned=False)
+                for name, shard in recovery.SHARD_WORKERS.items()]
+        texts = {shard + 20: f'Canceling since a higher priority waiting request for ci-tests-main-{shard} exists'
+                 for shard in range(1, 5)}
+        self.assertEqual(recovery.plan(source(conclusion='cancelled'), jobs, texts, [], jobs).action, 'retry_failed')
+        for bad in ('Cancelled by user', 'Canceling since a higher priority waiting request for ci-tests-main-2 exists'):
+            self.assertEqual(recovery.plan(source(), jobs, {**texts, 21: bad}, [], jobs).action, 'none')
 
     def test_startup_failure_retries_failed_jobs_and_retains_successes(self):
         jobs = [job(recovery.ROOT, 10, 'cancelled', assigned=False), aggregate()]
@@ -398,6 +437,22 @@ class ControllerTests(unittest.TestCase):
         api.log = DRIFT
         self.assertEqual(recovery.recover(api, event(api.run), True)[0].action, 'rebuild')
         self.assertEqual(api.writes, ['actions/jobs/10/rerun'])
+
+    def test_matrix_worker_recovery_collects_logs_before_submitting(self):
+        for name in recovery.SHARD_WORKERS:
+            for step, text, action, endpoint in (
+                    (SELECT, DRIFT, 'rebuild', 'actions/jobs/10/rerun'),
+                    ('Download the single root build', 'Artifact not found for name: root-build-101-1',
+                     'rebuild', 'actions/jobs/10/rerun'),
+                    ('Download the single root build', 'Artifact download failed after 5 retries.',
+                     'retry_failed', 'actions/runs/101/rerun-failed-jobs'),
+                    ('Run root test shard without compiling', DRIFT, 'none', None)):
+                with self.subTest(worker=name, step=step, action=action):
+                    api = FakeGitHub(jobs=[job(recovery.ROOT, 10), job(name, 20, 'failure', step), aggregate()])
+                    api.log = text
+                    self.assertEqual(recovery.recover(api, event(api.run), True)[0].action, action)
+                    self.assertEqual(api.writes, [endpoint] if endpoint else [])
+                    self.assertEqual('actions/jobs/20/logs' in api.reads, endpoint is not None)
 
     def test_current_main_eviction_can_recover_cancelled_run(self):
         api = FakeGitHub(source(conclusion='cancelled'))

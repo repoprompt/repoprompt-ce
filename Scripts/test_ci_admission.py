@@ -18,30 +18,31 @@ import modularization_ci_artifact as artifact
 
 
 class WorkerSchedulingTests(unittest.TestCase):
-    def test_one_worker_retains_four_fail_closed_logical_shards(self):
+    def test_four_workers_retain_independent_scheduling_outputs_and_exact_coverage(self):
         workflow = (Path(__file__).resolve().parent.parent / '.github/workflows/ci.yml').read_text()
         worker = workflow.split('\n  build-and-test:\n', 1)[1].split('\n  style:\n', 1)[0]
-        self.assertNotIn('matrix:', worker)
+        self.assertIn('shard: [1, 2, 3, 4]', worker)
+        self.assertIn('fail-fast: false', worker)
+        self.assertNotIn('max-parallel:', worker)
         self.assertNotIn('continue-on-error:', worker)
-        self.assertEqual(worker.count('uses: actions/download-artifact@'), 1)
-        self.assertIn('id: verified-build', worker)
-        commands = []
-        for step in worker.split('      - name: ')[1:]:
-            if not step.startswith('Run root test shard '):
-                continue
-            self.assertIn("if: ${{ !cancelled() && steps.verified-build.outcome == 'success' }}", step)
-            self.assertIn('timeout-minutes: 32', step)
-            commands.append(step.split('run: ', 1)[1].strip())
-        self.assertEqual(commands, [
-            f'./conductor ci-shard --shard-count 4 --shard-index {i} --timeout 1800 --full-log'
-            for i in range(1, 5)])
-        self.assertIn('artifact=shard-execution-all-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT', worker)
-        self.assertIn('name: ${{ steps.execution.outputs.artifact }}', worker)
-        self.assertIn('path: .build/ci-test-results/shard-*', worker)
+        group = next(line for line in worker.splitlines() if 'group: ci-tests-' in line)
+        self.assertTrue(group.endswith('-${{ matrix.shard }}'))
+        self.assertIn('timeout-minutes: 40', worker)
+        self.assertIn('timeout-minutes: 32', worker)
+        self.assertEqual(worker.count('./conductor ci-shard'), 1)
+        self.assertIn('--shard-count 4 --shard-index ${{ matrix.shard }} --timeout 1800', worker)
+        self.assertIn('artifact_$SHARD_INDEX=shard-execution-$SHARD_INDEX-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT', worker)
+        self.assertIn('path: .build/ci-test-results/shard-${{ matrix.shard }}*', worker)
         self.assertIn("if: ${{ always() && steps.execution.outcome == 'success' }}", worker)
         aggregate = workflow.split('\n  style:\n', 1)[1].split('\n  secret-scan:\n', 1)[0]
         self.assertIn('toJSON(needs)', aggregate)
-        self.assertIn('name: ${{ steps.selected.outputs.receipt_artifact }}', aggregate)
+        self.assertIn('SHARD_OUTPUTS: ${{ toJSON(needs.build-and-test.outputs) }}', aggregate)
+        self.assertIn('--shard-outputs "$SHARD_OUTPUTS"', aggregate)
+        self.assertNotIn('pattern:', aggregate)
+        for shard in range(1, 5):
+            self.assertIn(f'receipt_artifact_{shard}: ${{{{ steps.execution.outputs.artifact_{shard} }}}}', worker)
+            self.assertIn(f'failure_{shard}: ${{{{ steps.diagnostics.outputs.failure_{shard} }}}}', worker)
+            self.assertIn(f'name: ${{{{ steps.selected.outputs.receipt_artifact_{shard} }}}}', aggregate)
         self.assertIn('--shard-count 4 --admission-context', aggregate)
 
     def test_all_integration_producers_and_consumers_retain_native_arm_validation(self):
@@ -198,12 +199,14 @@ class CheckoutTests(unittest.TestCase):
         self.assertEqual(self.command('verify', '2', context=json.dumps(first)).returncode, 0)
         producer = self.producer(first)
         output = self.root / 'selection'
-        for attempt, receipt in [('2', 'shard-execution-all-42-2'), ('10', 'shard-execution-all-42-2')]:
+        receipts = {f'receipt_artifact_{i}': f'shard-execution-{i}-42-{2 if i == 2 else 1}' for i in range(1, 5)}
+        for attempt in ('2', '10'):
             result = self.command('select', attempt, context=json.dumps(first), producer_context=json.dumps(producer),
-                                  receipt_artifact=receipt, output=output)
+                                  shard_outputs=json.dumps({**receipts, 'failure_2': ''}), output=output)
             self.assertEqual(result.returncode, 0, result.stderr)
             outputs = dict(line.split('=', 1) for line in output.read_text().splitlines())
-            self.assertEqual(outputs, {'build_artifact': 'root-build-42-1', 'coverage_artifact': 'expected-coverage-42-1', 'receipt_artifact': receipt})
+            self.assertEqual(outputs, {'build_artifact': 'root-build-42-1',
+                                       'coverage_artifact': 'expected-coverage-42-1', **receipts})
         # A new producer is distinct even on the same candidate. Old receipts
         # cannot be relabelled as evidence for a rebuild.
         second = self.producer(first, '2')
@@ -222,9 +225,9 @@ class CheckoutTests(unittest.TestCase):
         tests = [f'CoreTests.Suite{index}/testOne' for index in range(4)]
         (metadata / 'ci-test-list.txt').write_text('\n'.join(tests) + '\n')
         (metadata / 'test-targets.json').write_text(json.dumps({'targets': ['CoreTests']}))
-        # Worker attempt 2 consumes the successful attempt-1 build. Style attempt
-        # 3 may in turn consume these exact receipts; consumer attempt is not authority.
-        receipts = self.root / 'shard-execution-all-42-2'
+        # Retried workers and successful ancestors consume the same attempt-1
+        # build. Style accepts the combined exact receipts, not a consumer attempt.
+        receipts = self.root / 'shard-execution'
         receipts.mkdir()
         suites = parse_suite_methods('\n'.join(tests))
         shards, _ = assign_suites_to_shards({suite: len(methods) for suite, methods in suites.items()}, 4)
@@ -260,15 +263,21 @@ class CheckoutTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('Re-run all jobs', result.stderr)
                 self.assertFalse(output.exists())
-        for bad in ('', 'shard-execution-all-43-1', 'shard-execution-all-42-3', 'latest', '../root-build-42-1'):
+        receipts = {f'receipt_artifact_{i}': f'shard-execution-{i}-42-1' for i in range(1, 5)}
+        for bad in ('', 'shard-execution-1-43-1', 'shard-execution-1-42-3', 'shard-execution-2-42-1',
+                    'shard-execution-all-42-1', 'latest', '../root-build-42-1', None):
             with self.subTest(artifact=bad):
                 output = self.root / 'selection'
                 result = self.command('select', '2', context=json.dumps(context), producer_context=json.dumps(producer),
-                                      receipt_artifact=bad, output=output)
+                                      shard_outputs=json.dumps({**receipts, 'receipt_artifact_1': bad}), output=output)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(output.exists())
+        for shard in range(1, 5):
+            missing = {key: value for key, value in receipts.items() if key != f'receipt_artifact_{shard}'}
+            with self.subTest(missing=shard), self.assertRaises(ValueError):
+                admission.select_receipt_artifacts(missing, '42', '2', '1')
         with self.assertRaises(ValueError):
-            admission.verify_receipt_artifact('shard-execution-all-42-1', '42', '3', build_attempt='2')
+            admission.select_receipt_artifacts(receipts, '42', '3', '2')
 
     def test_toolchain_drift_blocks_reuse_with_rebuild_instructions(self):
         context = self.context()

@@ -55,7 +55,13 @@ def prerequisite_report(needs: dict, event: str) -> tuple[str, bool]:
         if result not in ('success', 'failure', 'cancelled', 'skipped'):
             result = 'missing'
         passed &= result == 'success'
-        failure = safe_ids(job.get('outputs', {}).get('failure', '')) if result == 'failure' else '—'
+        outputs = job.get('outputs', {})
+        if key == 'build-and-test' and result == 'failure':
+            failure = '; '.join(f'shard {shard}: {safe_ids(outputs[f"failure_{shard}"])}'
+                                for shard in range(1, 5) if outputs.get(f'failure_{shard}'))
+            failure = failure or safe_ids(outputs.get('failure', ''))
+        else:
+            failure = safe_ids(outputs.get('failure', '')) if result == 'failure' else '—'
         text += f'| {label} | {result} | {failure} |\n'
     text += '\n**Prerequisites are not the final verdict:** exact build identity and complete test receipts must also pass below.\n'
     if event == 'push':
@@ -111,8 +117,12 @@ def run(mode: str, timing_report: Path | None = None) -> int:
         text, failure = job_report(json.loads(os.environ['STEPS_CONTEXT']))
         output = os.environ.get('GITHUB_OUTPUT')
         if output:
+            shard = os.environ.get('SHARD_INDEX')
+            if shard is not None and shard not in ('1', '2', '3', '4'):
+                raise ValueError('invalid diagnostic shard')
+            key = 'failure_' + shard if shard else 'failure'
             with Path(output).open('a') as stream:
-                stream.write('failure=' + failure + '\n')
+                stream.write(key + '=' + failure + '\n')
         passed = True  # Do not mask the original failed step with the reporter.
     else:
         text, passed = prerequisite_report(json.loads(os.environ['NEEDS_CONTEXT']), os.environ.get('GITHUB_EVENT_NAME', ''))
