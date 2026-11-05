@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""Bounded, read-only CI explanations. Evidence checks, not this report, grant success."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+
+JOBS = {
+    'candidate': 'Candidate declaration',
+    'workflow-contracts': 'Portable checks',
+    'build-test-bundles': 'Build and Static Gates',
+    'build-and-test': 'Root test shards',
+    'secret-scan': 'Secret Scan',
+    'integration-products': 'Sentry build / privacy',
+}
+RECOVERY = '''### Recovery (no gate bypass)
+- Open the failed job/step above. Skipped dependents are consequences, not root causes.
+- Code, assertion, lint or coverage failure: fix the source and update the PR; rerunning the same code is not a fix.
+- See **CI Recovery** for automatic recovery of verified runner startup failures and missing build evidence. Automatic recovery is bounded to three total attempts and never retries an assertion, lint, compiler or coverage failure.
+- Confirmed transient runner/network failure outside automatic recovery: **Re-run failed jobs** or the failed job and its dependents. Successful ancestors remain bound to their original candidate and build.
+- Wrong runner architecture or unavailable pinned Xcode: repair the platform configuration; rebuilding the same configuration is not recovery.
+- Missing/expired artifact or Swift/Xcode drift on the admitted architecture: recovery rebuilds the successful root producer once when the failure is positively identified. If recovery is exhausted or producer output is missing, **Re-run Build and Static Gates** and dependents. Evidence artifacts expire after 7 days.
+- An obsolete pending main job may be superseded to preserve capacity. Its secret scan still runs. The current candidate is recovered if an out-of-order old request evicts it; ordinary user cancellation is respected.
+- A rerun uses the original SHA/base, not today's main. Update the PR branch to test new integration code. Runs created before integration-v3 still require Re-run all jobs.
+- Cancellation/runner loss may prevent a job report. Inspect the run timeline; absence of a report or a skipped job is never passing evidence.
+'''
+
+
+def safe_ids(value: str) -> str:
+    # Outputs/step IDs are untrusted display data, never shell or Markdown.
+    return ', '.join(re.findall(r'[A-Za-z0-9_-]{1,80}', str(value))[:12]) or 'not reported; inspect job log'
+
+
+def job_report(steps: dict) -> tuple[str, str]:
+    failed = [name for name, step in steps.items() if step.get('outcome') in ('failure', 'cancelled')]
+    failure = safe_ids(' '.join(failed)) if failed else ''
+    text = '## Job diagnostics\n\n'
+    text += f'Failed/cancelled step IDs: **{failure}**.\n\n' if failed else 'No failed steps were reported to this reporter; the job result and final evidence gate remain authoritative.\n\n'
+    if failed:
+        text += RECOVERY
+    return text, failure
+
+
+def prerequisite_report(needs: dict, event: str) -> tuple[str, bool]:
+    text = '## CI prerequisite results\n\n| Gate | Result | Failed step IDs |\n|---|---|---|\n'
+    passed = set(needs) == set(JOBS)
+    if not passed:
+        text += '| Dependency contract | missing/unexpected job | inspect workflow dependency list |\n'
+    for key, label in JOBS.items():
+        job = needs.get(key, {})
+        result = job.get('result', 'missing')
+        if result not in ('success', 'failure', 'cancelled', 'skipped'):
+            result = 'missing'
+        passed &= result == 'success'
+        outputs = job.get('outputs', {})
+        if key == 'build-and-test' and result == 'failure':
+            failure = '; '.join(f'shard {shard}: {safe_ids(outputs[f"failure_{shard}"])}'
+                                for shard in range(1, 5) if outputs.get(f'failure_{shard}'))
+            failure = failure or safe_ids(outputs.get('failure', ''))
+        else:
+            failure = safe_ids(outputs.get('failure', '')) if result == 'failure' else '—'
+        text += f'| {label} | {result} | {failure} |\n'
+    text += '\n**Prerequisites are not the final verdict:** exact build identity and complete test receipts must also pass below.\n'
+    if event == 'push':
+        text += '\n**Automatic Tip release is blocked unless main CI succeeds.** Tip selects the newest successful main-push CI source still on protected main, so a newer untested commit cannot strand an already qualified source. It then runs signed-artifact qualification. Stable/manual releases have separate gates.\n'
+    else:
+        text += '\nThis PR/queue run is integration evidence, not authority to publish a release.\n'
+    return text + '\n' + RECOVERY, passed
+
+
+def build_report(report: dict) -> str:
+    """Describe fresh build measurements without granting or changing any gate result."""
+    if report['schema'] != 1 or report['policy'] not in ('clean-enforcing', 'incremental-report-only'):
+        raise ValueError('unknown measurement protocol')
+    code = report['build_exit_code']
+    if type(code) is not int:
+        raise ValueError('invalid compiler exit code')
+    counts, budget = report['counts'], report['budget']
+    rows = [('Function bodies >=1000ms', counts['function_body'], budget['function_bodies_1000ms']),
+            ('Expressions >=500ms', counts['expression'], budget['expressions_500ms'])]
+    warnings = report.get('first_party_warnings')
+    if warnings is not None:
+        rows.append(('Unique first-party warnings', warnings['unique'], warnings['budget']['first_party_unique']))
+    if any(type(value) is not int or value < 0 for _, count, ceiling in rows for value in (count, ceiling)):
+        raise ValueError('invalid measurement count/budget')
+    text = f'## Root build failure measurements\n\nCompiler/build exit code: **{code}**.\n\n'
+    text += '| Gate | Measured | Limit |\n|---|---:|---:|\n'
+    text += ''.join(f'| {label} | {count} | {ceiling} |\n' for label, count, ceiling in rows)
+    if code:
+        text += '\n**Compiler/build process failed.** Counts from an incomplete build cannot establish a ratchet verdict.\n'
+    elif report['policy'] == 'incremental-report-only':
+        text += '\nThese measurements are report-only; they do not explain a failed enforcing gate.\n'
+    else:
+        failures = []
+        if any(count > ceiling for _, count, ceiling in rows[:2]):
+            failures.append('Type-check ratchet exceeded')
+        if warnings is not None and rows[2][1] > rows[2][2]:
+            failures.append('Warning ratchet exceeded')
+        text += ('\n**' + '; '.join(failures) + '.** Compilation succeeded, but the static gate did not.\n'
+                 if failures else '\nRecorded measurements do not explain this failure; inspect the retained build log.\n')
+    return text + '\nFull compiler output and failing locations are retained in the root-build-tests-failure and typecheck-timing artifacts. No budget or exit status was changed.\n'
+
+
+def run(mode: str, timing_report: Path | None = None) -> int:
+    if mode == 'build':
+        # Only invoked after a failed build. Invalidation before compilation keeps
+        # an earlier producer's measurements from masquerading as this attempt.
+        text = build_report(json.loads(timing_report.read_text()))
+        with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as stream:
+            stream.write(text)
+        print(text)
+        return 0
+    if mode == 'job':
+        text, failure = job_report(json.loads(os.environ['STEPS_CONTEXT']))
+        output = os.environ.get('GITHUB_OUTPUT')
+        if output:
+            shard = os.environ.get('SHARD_INDEX')
+            if shard is not None and shard not in ('1', '2', '3', '4'):
+                raise ValueError('invalid diagnostic shard')
+            key = 'failure_' + shard if shard else 'failure'
+            with Path(output).open('a') as stream:
+                stream.write(key + '=' + failure + '\n')
+        passed = True  # Do not mask the original failed step with the reporter.
+    else:
+        text, passed = prerequisite_report(json.loads(os.environ['NEEDS_CONTEXT']), os.environ.get('GITHUB_EVENT_NAME', ''))
+    run = (os.environ['GITHUB_SERVER_URL'] + '/' + os.environ['GITHUB_REPOSITORY']
+           + '/actions/runs/' + os.environ['GITHUB_RUN_ID'] + '/attempts/' + os.environ['GITHUB_RUN_ATTEMPT'])
+    text += f'\n[Run attempt and job logs]({run})\n'
+    with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as stream:
+        stream.write(text)
+    print(text)
+    if not passed:
+        print('::error::CI prerequisite failed/cancelled/skipped. See the prerequisite table and failed step IDs; Style is the aggregate, not the original cause.')
+    return 0 if passed else 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('mode', choices=('job', 'prerequisites', 'build'))
+    parser.add_argument('--timing-report', type=Path)
+    args = parser.parse_args()
+    try:
+        return run(args.mode, args.timing_report)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        # Do not print input JSON/environment in an error; it is not trusted data.
+        if args.mode in ('job', 'build'):
+            print('::warning::Job diagnostics unavailable; inspect the original job result/log. No success is inferred.')
+            return 0
+        print('::error::Prerequisite diagnostics invalid/unavailable; refusing evidence acceptance.')
+        return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

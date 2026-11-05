@@ -3,10 +3,10 @@
 ## Authority and scope
 
 `CI / Style` is the final fail-closed **integration** check, not a formatting-only
-row and not permission to publish a release. The `integration-v2` profile is
+row and not permission to publish a release. The `integration-v3` profile is
 implemented by the existing CI DAG, artifact verifier, and exact-test-coverage
 verifier. `Scripts/ci_admission.py` carries immutable identity/policy, **not** a
-second success registry. Version 1 receipts are rejected rather than relabelled
+second success registry. Version 1/2 receipts are rejected rather than relabelled
 under the changed guarantee.
 
 The same profile runs for PRs targeting `main`, merge queue `checks_requested`,
@@ -29,8 +29,14 @@ every integration candidate. This deliberately permits a release-only regression
 to merge; it must still prevent publication. A green Style is **not** evidence that
 release packaging, notarization, older macOS, or Computer Use works.
 
-- **Automatic Tip:** successful exact-main CI triggers `Publish Tip`. Its current-main
-  eligibility, trusted tooling/source identity, secret-free clean universal staging,
+- **Automatic Tip:** successful main-push CI triggers `Publish Tip`. When its rolling
+  queue starts, it selects the newest passing source from the authenticated
+  triggering event and at most 300 recent successful CI runs, ordered by pinned
+  protected-main first-parent ancestry. The event closes a list-API visibility race.
+  A newer untested main commit does not suppress that qualified ancestor. The exact
+  source CI run/attempt and the separately pinned main tooling SHA are recorded.
+  Already-published or newer-published sources skip before Mac allocation. Its
+  source authorization, secret-free clean universal staging,
   signing/notarization, exact packaged-helper smoke, and macOS 15 ARM64/Intel artifact
   checks remain intact. Publication waits for smoke and compatibility.
 - **Stable:** `Publish Release` builds a reviewed source draft and checks its signed
@@ -70,13 +76,30 @@ GitHub documents the [merge-group SHA/ref event contract](https://docs.github.co
 the [Octokit payload example](https://github.com/octokit/webhooks/blob/main/payload-examples/api.github.com/merge_group/checks_requested.payload.json)
 shows the fully-qualified head/base refs used here.
 
-The profile binds commit, tree, base, ref, event, run ID, and attempt. Every job
-verifies the checked-out commit/tree and current run/attempt explicitly before
-work. Conductor does not need to forward `GITHUB_*` or churn manifest environments.
-The root build packs the binding alongside its existing gate metadata. Each shard
-extends its existing execution receipt with that binding and producer identity;
-Style verifies those against independently downloaded expected coverage. Artifacts
-are named by run **and attempt**. No cross-run/event promotion is supported.
+The immutable candidate binds commit, tree, base, ref, event, run ID and policy,
+including `root_architecture: arm64` for the clean-enforcing timing protocol.
+It deliberately has no consumer-attempt field. Every executing job verifies its
+checkout and current run. The root producer declares a separate identity before
+running tests: candidate + build attempt + architecture + Swift/Xcode versions. It binds that
+identity to the archive only after its gates succeed. Job outputs identify the
+successful producer, not a lookup for the latest available artifact.
+
+Workers verify the producer against the candidate, reject future attempts and
+architecture/Swift/Xcode drift, then download that producer's exact run/attempt-named archive.
+Each shard receipt carries the same root producer identity. The worker exports its
+own run/execution-attempt-named receipt artifact. Style first requires all job
+results to be successful, then selects the successful root and worker outputs and
+checks expected metadata and the exact four-shard union against the root identity.
+A new root build plus old worker receipts fails, even for the same commit.
+
+Evidence uploads are immutable (no overwrite), fail if absent, and retained seven
+days. Downloads stay in this workflow run, with exact names and no cross-run token,
+run selector or wildcard search. Missing outputs/artifacts fail closed with rebuild
+instructions. Conductor does not need `GITHUB_*` in its manifest environment.
+
+This is correctness/provenance enforcement, not a security boundary against a PR
+that edits its own workflows/scripts. Trusted-base review, required checks and
+repository policy remain essential; diagnostics never grant merge authority.
 
 Caches are acceleration, not evidence. The root cache contains dependency checkouts
 and provider-package intermediates, not the root products that the enforcing
@@ -106,43 +129,77 @@ build, test, or publication evidence.
 
 ## Runner capacity and scheduling
 
-Integration requests three macOS jobs: one producer, one root-test worker running
-all four logical shards sequentially, and Sentry/privacy. The earlier reduction
-removed universal packaging and compatibility from nine jobs to six; consolidating
-the shard workers removes another three allocations and artifact downloads. Universal packaging and its two artifact checks are demanded
-only by actual release flows or an explicit diagnostic. This removes the largest
-per-candidate workload amplifier; it does not reserve capacity or promise a latency
-SLO. GitHub account limits and hosted image availability remain separate constraints.
-The [capacity audit](ci-capacity-2026-11-04.md) separates measured queue/execution time
-from expected impact. There is no measured hosted before/after result yet.
+Integration retains the standard `macos-26` ARM pool used before PR #1628.
+The root producer and worker must run on the same architecture, recorded in the
+producer identity and checked before downloading/executing its archive.
+Dependency/cache keys already include architecture. Sentry and Xcode workspace
+validation also retain ARM. These jobs explicitly select
+`/Applications/Xcode_26.6.app/Contents/Developer`, the toolchain in the last accepted
+hosted ARM control, rather than silently following a runner image's new default.
+Root producer admission rejects a different architecture before dependency work
+or compilation, emits its architecture/Swift/Xcode identity, and does not suggest
+rerunning a platform-policy mismatch. A future platform/toolchain change needs
+reviewed timing and native-coverage evidence; missing pinned Xcode fails rather
+than falling back. No automatic architecture fallback duplicates work or accepts
+another architecture's compiled evidence. Universal release builds and both
+ARM/Intel older-runtime publication checks remain unchanged.
+
+PR #1628 experimented with `macos-26-intel` after confirmed ARM allocation
+failures. The latest inspected Intel build at head `a3b9d1053` compiled successfully,
+but failed the unchanged clean-enforcing type-check gate: 20 slow function bodies
+against a limit of 10 and 7 slow expressions against 6
+([run 41920460399](https://github.com/repoprompt/repoprompt-ce/actions/runs/41920460399)).
+The experiment has been rolled back rather than raising limits or accepting the
+loss of ARM-native integration coverage without a passing replacement. This is
+not proof that architecture caused every timing difference, that ARM will pass,
+or that ARM capacity has recovered. A fresh hosted pass and recovery exercise
+remain required. Account concurrency and provider availability are still external
+constraints; changing a label does not create capacity.
+
+A failed root build now prints the retained log tail, including non-compiler gate
+errors, and summarizes fresh compiler exit status, timing counts and warning
+counts in the step summary. Compilation success is not static-gate success.
+Malformed/missing measurements do not infer success or replace the original
+nonzero build exit status; the full log and timing artifact remain available.
+
+Integration requests six macOS jobs: one producer, four independent root-test
+workers, and Sentry/privacy. The #1623 single-worker experiment is reverted: it
+reduced allocations, but its end-to-end benefit was not demonstrated and it removed
+available shard overlap. The build-once producer predates that experiment and is
+retained; no worker recompiles. Universal packaging and its two artifact checks
+remain release-only. See the [rollback decision](ci-reliability-2026-11-05.md#selective-rollback-of-unproven-worker-consolidation).
 
 Sentry still waits for root gates to reject bad candidates before allocating a VM.
-Four logical root shards keep exact full coverage. A single worker downloads and
-verifies the producer once, then runs each shard with a fresh per-suite sandbox
-through conductor. Ordinary shard failure does not suppress later shards; failed
-setup and workflow cancellation do. No `continue-on-error` masks a failure.
-Each shard has a 1,800-second conductor execution limit (owned process cleanup),
-a 32-minute step envelope, and unchanged individual-suite/test assertion budgets.
-The 140-minute job envelope covers four sequential steps plus setup/uploads;
-it is not a relaxed individual-test timeout. All four run/attempt-bound receipts
-are uploaded together and the existing Style verifier still requires their exact
-union. Missing or failed shards cannot pass. This does not change the profile's
-correctness obligations or permit partial reruns.
+The four-shard matrix uses `fail-fast: false` and a separate concurrency group per
+shard, so a sibling cannot serialize or evict another sibling. Each worker verifies
+the same root producer, retains the 1,800-second conductor execution deadline and
+32-minute step envelope, and has a 40-minute job envelope for setup and uploads.
+No test assertion or coverage requirement is relaxed. Setup failures do not start
+tests, and ordinary shard failures do not cancel siblings.
 
-This trades idle-capacity parallel speed for fewer allocations under contention.
-It does not reduce the number of tests or the clean build/Sentry workload. Compare
-end-to-end latency and summed macOS execution minutes for successful runs, separating
-queue time from execution. Keep failed/cancelled attempts visible but out of the
-successful-run timing comparison. Revert the worker consolidation if queue savings
-do not offset sequential execution or state isolation regresses; do not weaken
-coverage, deadlines, secret scans, or publication gates. Hosted benefit is unproven
-until the new workflow runs. Existing suite isolation is unchanged, but one VM is
-now reused across shards; hosted validation must specifically check this boundary.
- Do not increase
-parallelism or switch images assuming that creates account capacity. Preserve the
-Ubuntu Tip eligibility job so obsolete candidates do not wait for a Mac just to skip.
-Main pushes remain run-scoped: coalescing the whole workflow would discard introduced
-commit-range secret scans. Do not add cancellation without addressing that obligation.
+Each matrix worker emits uniquely keyed artifact and diagnostic outputs. Style
+requires all four exact shard/run/attempt artifact names, including successful
+ancestors of partial retries, and verifies every receipt against the same root
+producer plus the exact test union. It never discovers evidence by a wildcard or
+chooses the newest artifact. Missing outputs or failed/stale receipts cannot pass.
+
+Parallel scheduling restores overlap when capacity is available; it does not
+create capacity. Four transfers and allocations cost more than one. Compare
+complete passing runs, including queue time, summed execution and time to Style;
+no speedup is claimed before hosted evidence. Preserve the Ubuntu Tip eligibility
+job so obsolete candidates do not wait for a Mac just to skip.
+Main workflows remain run-scoped so every introduced-commit-range secret scan can
+finish. First-attempt main **Mac stages** use separate concurrency groups: one
+running and one pending build, each individual shard, and Sentry job. Running work finishes;
+the newest queued request replaces the previous pending request. PR previews,
+merge-group candidates and explicit reruns do not share these main groups.
+GitHub orders pending replacement by arrival, not commit ancestry. If an old
+request arrives late and evicts the current main candidate, the bounded recovery
+controller recognizes the exact system annotation and retries that job under its
+run-specific retry group. Ordinary user cancellation is not reversed. Per-shard
+coalescing is not atomic: a superseded candidate can execute some shards while
+others are evicted. Its completed work cannot pass incomplete coverage and may
+consume capacity; include that wasted work in the hosted capacity comparison.
 
 ### Read-only queue and execution report
 
@@ -163,9 +220,9 @@ time includes any approval or concurrency wait, not only runner-capacity pressur
 Compare successful runs on the same profile and similar workload/queue pressure.
 Use run links and per-job timestamps; summed runner seconds are not wall-clock latency
 or billing. Do not compare a cancelled/partial run's short duration to a passing run.
-For worker consolidation, record test-worker queue time, execution, total macOS
-execution, exact coverage success, and overall time to Style. Keep a rollback available
-if serialized execution outweighs queue/setup savings. No automated cancellation,
+For worker scheduling, record each shard's queue time, stage wall time, total macOS
+execution, exact coverage success, and overall time to Style. Compare restored
+parallel execution against the recorded serial baseline, not job count alone. No automated cancellation,
 rerun, secret access, or workflow mutation is provided by this command.
 
 Reporter regression tests run with `python3 Scripts/test_ci_admission.py` and the
@@ -173,18 +230,58 @@ existing `make ci-app-test-runner-selftest` lane.
 
 ### Reruns and cancellation
 
-Use **Re-run all jobs**. Failed-jobs-only and individually rerun jobs are deliberately
-unsupported in v1: they retain an earlier candidate declaration and fail with a
-`Re-run all jobs` instruction. The final aggregate independently checks the attempt,
-so successful prerequisites from another attempt cannot silently satisfy it. This
-is a bounded, explicit whole-profile policy, not unverified earlier-producer reuse.
+For runs created with `integration-v3`, normal **Re-run failed jobs** and
+individual-job reruns are supported. Successful ancestors are reused only through
+their exact producer outputs; the consumer's newer attempt number must not be used
+to invent a build artifact name. A matrix-worker rerun re-executes that shard only;
+successful siblings retain their own artifact outputs. A Sentry-only rerun need not
+rebuild the successful root tests. Style-only retries
+still require all prerequisites and independently verify the original evidence.
 
-Mac job admission rejects stale-attempt declarations before allocating a runner;
-Style retains an explicit full-profile error instead of accepting skipped work.
+| Failure | Recovery |
+|---|---|
+| Source/lint/assertion/coverage failure | Fix the source; update the PR and inspect the new exact integration candidate. Repetition is not a fix. |
+| Recognized hosted-runner startup or artifact-transport failure | CI Recovery retries failed jobs within its attempt budget, retaining successful jobs. Unrecognized failures need diagnosis. |
+| Wrong runner architecture or unavailable pinned Xcode | Repair the platform configuration. Admission fails before expensive work; an unchanged rebuild cannot fix this policy mismatch. |
+| Missing/expired archive or Swift/Xcode drift on the admitted architecture | CI Recovery rebuilds the successful root producer and dependents once when exact diagnostics and artifact history prove this cause. |
+| Dropped producer output or exhausted automatic recovery | Re-run **Build and Static Gates** and dependents after inspecting the cause. |
+| Current main evicted from a pending Mac stage | CI Recovery retries the specific stage only when a system annotation identifies the matching main concurrency group. Obsolete main work stays superseded. |
+| Wrong/stale producer receipt | Rebuild and rerun dependents; mixed-build evidence must remain rejected. |
+| Outdated PR base/head or unavailable synthetic merge | Update the PR branch; a rerun uses the original SHA/ref, not current main. |
+| Old `integration-v1/v2` run | Re-run all jobs uses that commit's old policy. To obtain v3 behavior, update the branch and trigger fresh CI. |
 
-Only obsolete first-attempt PR previews supersede one another. Queue/main runs and
-explicit reruns remain run-scoped; newer pushes do not cancel their evidence.
-Whole-main-run coalescing would skip push-range secret scans and is not used.
+GitHub [supports whole/failed/specific-job reruns](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs?tool=cli)
+for 30 days (up to 50 attempts), but our seven-day evidence retention can require a
+rebuild sooner. `CI Recovery` handles recognized infrastructure/evidence failures
+after completion, with a cap of **three total source-run attempts and one successful
+root-producer rebuild**. A controller API error, ambiguous evidence, exhausted
+budget or unconfirmed rerun submission produces an explicit summary. There is no
+success registry and no assertion/lint/compiler/coverage retry policy.
+
+The controller runs only trusted default-branch code with `contents: read`,
+`actions: write`, `checks: read` and `pull-requests: read`. It verifies the workflow
+ID/path, repository, event, source attempt, latest branch CI and current main or
+open same-repository PR. For PRs it checks the immutable local reusable-workflow
+merge SHA and its actual parents against the current PR base/head; nested PR refs
+in a workflow-run response are mutable and cannot establish original provenance.
+It rechecks freshness immediately before submitting a rerun. Forks and merge-group
+runs remain outside automatic recovery; their ordinary native reruns still work.
+Job IDs are not check-run IDs: startup annotations are read using the validated
+same-repository `check_run_url`. Zero steps alone never establish a transient error.
+
+Each job records failed step IDs and recovery guidance in its **job summary**. The
+final **Style** summary lists every prerequisite before interpreting admission
+outputs, so a missing declaration cannot hide a real upstream failure. Main CI
+explains that unsuccessful integration blocks automatic Tip eligibility; a green
+Style still does not certify a release. These reports use workflow step outcomes,
+not guesses from exit codes about flakiness. Log links lead to the actual assertion,
+compiler, download or infrastructure error. Missing reports (checkout failure,
+runner loss, cancellation) are explicitly unknown, not proof of success. A cancelled
+workflow can prevent even `always()` diagnostics; GitHub's timeline remains needed.
+
+Obsolete first-attempt PR previews supersede one another. Main coalescing is
+restricted to pending Mac stages; independent push scans and already running work
+remain intact. Queue runs and explicit reruns remain run-scoped.
 Any failed, cancelled, skipped, or missing required obligation prevents Style success.
 A removed/replaced queue candidate cannot authorize a different candidate.
 
@@ -217,9 +314,11 @@ evidence-led policy decision. The 200001-file test contract is unchanged here.
    landed main head/tree; compare trees (`git rev-parse <sha>^{tree}`), since commit
    IDs may differ. Confirm both have the full profile's results. Exercise a replaced
    candidate and confirm its old success does not authorize the replacement.
-5. Verify a full-profile rerun succeeds only with the new attempt's products and
-   receipts; a failed-jobs-only rerun must fail explicitly. Confirm a failed/skipped
-   Sentry lane or missing/wrong-attempt receipt cannot produce a green Style.
+5. On a non-production PR, verify a full rerun creates new producer evidence;
+   retry the root worker, Sentry and Style individually and confirm their successful
+   ancestors remain reusable. Retain run/job/attempt/artifact receipts. Confirm a
+   failed/skipped Sentry lane or missing/mixed-build receipt cannot produce green Style.
+   This hosted exercise is required before calling native rerun recovery proven.
 
 [GitHub's queue documentation](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue)
 requires workflow support for `merge_group` before queue admission can work. If the
@@ -231,11 +330,30 @@ removing the queue/check requirement is not a transparent implementation rollbac
 
 ## Validation
 
-`make ci-app-test-runner-selftest` covers event normalization, wrong tree/run/attempt,
-explicit partial-rerun rejection, stale-cache invalidation, required hosted identity,
+`make ci-portable-selftest` runs portable conductor, CI and release tooling tests
+once in the Ubuntu **Portable Checks** job before Mac allocation, followed by the
+pinned Codex schema contract. `make ci-workflow-selftest` covers admission,
+recovery, diagnostics and cross-workflow contracts and remains part of
+`make check-fast` and the path-selected CI lane. Secret Scan depends only on the
+candidate declaration; portable failures cannot suppress an introduced-range scan.
+Both cheap gates must pass before the Mac producer starts.
+
+Compiler-dependent guardrails, native process supervision, Apple `plutil`/ICU
+tests, the real unsigned-archive rejection test and native IndexStore binding stay
+on macOS (`make guardrails`, `make ci-macos-selftest`). Moving a decorated native
+test to Linux must not silently replace its execution with a skip.
+`make ci-app-test-runner-selftest` additionally covers the
+runner/coverage/dependency harness: event normalization, wrong tree/run/producer,
+partial-rerun reuse and mixed-build rejection, stale-cache invalidation, required hosted identity,
 clean/enforcing timing and retained outcomes, and receipt provenance/coverage.
 `make conductor-selftest`, `make guardrails`, and actionlint cover the affected local
 boundaries. The contribution preflight selects the hosted-runner suite for these
 workflow/profile/artifact paths. Real GitHub queue/rerun behavior, universal packaging,
 Sentry linking, and release-workflow macOS packaged smoke still require hosted proof; local Python
 success alone is not equivalent to those checks.
+
+See the [reliability incident and recovery validation](ci-capacity-2026-11-04.md#reliability-incident-and-recovery)
+for the confirmed tooling regression, old partial-rerun dead end and remaining limits.
+The [November 5 diagnosis and repair](ci-reliability-2026-11-05.md) records the
+larger historical sample, release liveness fixes, automatic recovery boundaries,
+and required hosted acceptance.
