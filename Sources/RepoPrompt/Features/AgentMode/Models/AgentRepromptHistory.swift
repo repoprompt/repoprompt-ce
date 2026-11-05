@@ -5,7 +5,6 @@ enum AgentRepromptHistory {
     private static let maximumAssistantBytes = 1536
     private static let maximumEncodedBytes = 8 * 1024
     private static let minimumBoundedUserBytes = 256
-    private static let maximumTitleBytes = 256
 
     struct Turn: Codable, Equatable {
         let user: String
@@ -31,13 +30,6 @@ enum AgentRepromptHistory {
     /// keeps no terminal state, so `isCompleted` is the proof here, not `terminalState == .completed`.
     static func closedRequestIDs(in transcript: AgentTranscript) -> Set<UUID> {
         Set(transcript.turns.filter(\.isCompleted).compactMap { $0.request?.id })
-    }
-
-    /// A real title gives the rewriter a topic; a placeholder ("New Chat", "T3") would only add noise.
-    static func sessionTitle(_ name: String?) -> String? {
-        guard let name = ChatSession.displayableName(name), name != "Agent Session",
-              name.range(of: "^[Tt][0-9]+$", options: .regularExpression) == nil else { return nil }
-        return trimmed(name, bytes: maximumTitleBytes)
     }
 
     static func make(items: [AgentChatItem], compactedAt: Date?, hasActiveTurn: Bool, completedUserItemIDs: Set<UUID>? = nil) -> [Turn] {

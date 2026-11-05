@@ -2,6 +2,17 @@ import Combine
 import Foundation
 import RepoPromptSettingsCore
 
+extension AgentRepromptHistory {
+    private static let maximumTitleBytes = 256
+
+    /// A real title gives the rewriter a topic; a placeholder ("New Chat", "T3") would only add noise.
+    static func sessionTitle(_ name: String?) -> String? {
+        guard let name = ChatSession.displayableName(name), name != "Agent Session",
+              name.range(of: "^[Tt][0-9]+$", options: .regularExpression) == nil else { return nil }
+        return trimmed(name, bytes: maximumTitleBytes)
+    }
+}
+
 extension AgentModeViewModel {
     static func automationJudgingText(original: String, reprompted: String?) -> String {
         guard let reprompted, reprompted.count <= 4000 else { return original }
