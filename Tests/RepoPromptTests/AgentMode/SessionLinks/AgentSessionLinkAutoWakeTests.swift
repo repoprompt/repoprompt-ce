@@ -6185,6 +6185,15 @@ extension AgentSessionLinkAutoWakeTests {
             runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date(timeIntervalSince1970: 0)
         ))
         let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { _ in })
+        var managedProofCalls = 0
+        observer.viewModel.test_agentSessionLinkManagedMetadataProof = { endpoint, requirements in
+            managedProofCalls += 1
+            XCTAssertFalse(requirements.isEmpty)
+            let proof = await bridge.proveManagedMetadata(observer: endpoint, requirements: requirements)
+            XCTAssertNotNil(proof, "the isolated bridge owns the exact live grant")
+            return proof
+        }
+        defer { observer.viewModel.test_agentSessionLinkManagedMetadataProof = nil }
         guard case .added = await bridge.addMonitorLink(observerSessionID: observer.sessionID, rawTargetSessionID: target.sessionID.uuidString) else {
             return XCTFail("grant failed")
         }
@@ -6277,6 +6286,8 @@ extension AgentSessionLinkAutoWakeTests {
         let physical = await observer.nativeController.sentMessages
         XCTAssertEqual(physical.count, 1)
         XCTAssertTrue(try XCTUnwrap(physical.first).contains("ordinary successor finished"))
+        XCTAssertTrue(try XCTUnwrap(physical.first).contains("run_outcome=\"completed\""))
+        XCTAssertEqual(managedProofCalls, 1, "physical delivery uses the isolated authority, not an approval bypass")
         XCTAssertEqual(claim.passive?.receipt.deliveredStatuses.first?.settledThrough, 2)
         try bridge.applyPassiveMonitorNoticeReceipt(XCTUnwrap(claim.passive?.receipt), observerEndpoint: observerEndpoint)
         XCTAssertTrue(try XCTUnwrap(observer.viewModel.agentSessionLinkPassiveNoticesBySessionID[observer.sessionID]).entries.isEmpty)
@@ -6582,7 +6593,16 @@ extension AgentSessionLinkAutoWakeTests {
         let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: .distantPast))
         let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { _ in })
         let terminal = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, replayTranscript: true)
+        defer {
+            a.viewModel.test_agentSessionLinkManagedMetadataProof = nil
+            b.viewModel.test_agentSessionLinkManagedMetadataProof = nil
+        }
         for (observer, target) in [(a, b), (b, a)] {
+            observer.viewModel.test_agentSessionLinkManagedMetadataProof = { endpoint, requirements in
+                let proof = await bridge.proveManagedMetadata(observer: endpoint, requirements: requirements)
+                XCTAssertNotNil(proof, "the ring's isolated authority must authorize its physical handoff")
+                return proof
+            }
             guard case .added = await bridge.addMonitorLink(observerSessionID: observer.sessionID, rawTargetSessionID: target.sessionID.uuidString) else { return XCTFail("ring grant failed") }
             observer.session.isPreparingInitialWorktree = true
             observer.session.oversight.autoWakeOnUpdates = false

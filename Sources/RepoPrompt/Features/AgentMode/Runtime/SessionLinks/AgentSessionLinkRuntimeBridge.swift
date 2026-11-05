@@ -5208,7 +5208,8 @@ final class AgentSessionLinkRuntimeBridge {
                     idleSince: observation.idleSince,
                     waitingOn: observation.waitingOn,
                     latestVisibleAssistantPreview: observation.latestVisibleAssistantPreview,
-                    runFacts: envelope.runFacts
+                    runFacts: envelope.runFacts,
+                    managedMetadata: item.capabilities.contains(.manage) ? .init(observation) : nil
                 ))
             }
             outbound.append(AgentMonitorPillProps.Outbound(
@@ -6325,6 +6326,22 @@ final class AgentSessionLinkRuntimeBridge {
                 })
             }
         }
+    }
+
+    /// Use the same live consent/elevation owner as other managed handoffs.
+    func reconcileManagedMetadataAuthority() {
+        delegationScopes.reconcileGlobalAutoApprove()
+    }
+
+    func proveManagedMetadata(
+        observer: DomainAgentSessionLinkEndpointIdentity,
+        requirements: [DomainAgentSessionManagedObservationRequirement]
+    ) async -> [DomainAgentSessionLinkCommitAuthorization]? {
+        reconcileManagedMetadataAuthority()
+        guard !isFrozenForTermination, let host,
+              let candidate = host.agentSessionLinkCandidate(for: observer, includeLocation: false),
+              Self.passiveDeliveryIsPermitted(for: candidate) else { return nil }
+        return await authority.managedObservationAuthorizations(observer: observer, requirements: requirements)
     }
 
     func proveLocalInputRead(_ decoration: AgentSessionLinkLocalInputDecoration, observer: DomainAgentSessionLinkEndpointIdentity) async -> Bool {

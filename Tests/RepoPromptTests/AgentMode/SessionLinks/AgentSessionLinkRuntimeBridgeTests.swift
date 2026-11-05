@@ -9594,6 +9594,47 @@ private extension Result {
 }
 
 extension AgentSessionLinkRuntimeBridgeTests {
+    func testWatchOnlyPassiveSampleOmitsManagedMetadataFromAcceptedObservation() async throws {
+        let fixture = makeFixture()
+        guard case let .reserved(reservation, _) = await fixture.authority.reserveLink(
+            observer: fixture.observer.domainEndpoint, target: fixture.target.domainEndpoint, capabilities: [.poll]
+        ), case .activated = await fixture.authority.activateLink(
+            reservation: reservation, initialSnapshot: quietSnapshot(fixture, status: .idle), sourcePublicationSequence: 1
+        ) else { return XCTFail("watch-only activation failed") }
+        var samples: [AgentSessionLinkPassiveStatusNotices.Sample] = []
+        fixture.bridge.test_onPassiveSample = { samples.append($0) }
+        await fixture.bridge.test_refreshStatus(sessionIDs: [fixture.observer.sessionID])
+        fixture.bridge.test_onPassiveSample = nil
+        let sample = try XCTUnwrap(samples.last)
+        XCTAssertNil(sample.managedMetadata)
+    }
+
+    func testManagedPassiveSampleUsesAcceptedCachedObservationWithoutExtraTargetReads() async throws {
+        let fixture = makeFixture()
+        let observation = DomainAgentSessionObservationSnapshot(
+            sessionID: fixture.target.sessionID, displayName: "Worker", providerDisplayName: nil, status: .idle,
+            board: .init(runOutcome: .cancelled, failureReason: .cancelled, sendBlockers: [], subagentRunning: 0, subagentFinished: 1, subagentCountsKnown: true),
+            idleForSend: false, pendingInteractionKind: .approval, latestVisibleAssistantPreview: nil,
+            visibleRowCount: 0, lastActivityAt: Date(timeIntervalSince1970: 1000),
+            context: .init(usedTokens: 75, windowTokens: 100, confidence: .bestEffort)
+        )
+        fixture.host.snapshotOverrides[fixture.target.sessionID] = observation
+        guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
+        await fixture.bridge.test_settleProjections()
+        let reads = fixture.host.observationSnapshotCalls[fixture.target.sessionID, default: 0]
+        var samples: [AgentSessionLinkPassiveStatusNotices.Sample] = []
+        fixture.bridge.test_onPassiveSample = { samples.append($0) }
+        await fixture.bridge.test_refreshStatus(sessionIDs: [fixture.observer.sessionID])
+        fixture.bridge.test_onPassiveSample = nil
+        let metadata = try XCTUnwrap(samples.last?.managedMetadata)
+        XCTAssertEqual(metadata.contextUsedPercent, 75)
+        XCTAssertEqual(metadata.contextCountConfidence, .bestEffort)
+        XCTAssertEqual(metadata.runOutcome, .cancelled)
+        XCTAssertTrue(metadata.hasPendingInteraction)
+        XCTAssertEqual(metadata.directRunningHelperCount, 0)
+        XCTAssertEqual(fixture.host.observationSnapshotCalls[fixture.target.sessionID, default: 0], reads)
+    }
+
     func testFactsOnlyPublicationPairsWithoutPublicSequenceOrReadinessActivityAndDeduplicates() async throws {
         let fixture = makeFixture()
         fixture.host.runFacts[fixture.target.sessionID] = .init(settledThrough: 8, ordinaryThrough: 8)

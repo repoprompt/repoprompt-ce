@@ -261,19 +261,28 @@ package struct DomainAgentSessionLaneBoard: Hashable, Sendable {
     package let sendBlockers: [String]
     package let subagentRunning: Int
     package let subagentFinished: Int
+    /// Process-local availability of the cached census; unknown must not look like zero.
+    /// Not part of the poll wire format.
+    package let subagentCountsKnown: Bool
+
+    package var directRunningHelperCount: Int? {
+        subagentCountsKnown && subagentRunning >= 0 ? subagentRunning : nil
+    }
 
     package init(
         runOutcome: RunOutcome,
         failureReason: FailureReason?,
         sendBlockers: [String],
         subagentRunning: Int,
-        subagentFinished: Int
+        subagentFinished: Int,
+        subagentCountsKnown: Bool = false
     ) {
         self.runOutcome = runOutcome
         self.failureReason = failureReason
         self.sendBlockers = sendBlockers
         self.subagentRunning = subagentRunning
         self.subagentFinished = subagentFinished
+        self.subagentCountsKnown = subagentCountsKnown
     }
 
     /// Explicit quiet board for fixtures; snapshot construction itself has no default.
@@ -346,6 +355,18 @@ package struct DomainAgentSessionObservationSnapshot: Hashable, Sendable {
         self.visibleRowCount = max(0, visibleRowCount)
         self.lastActivityAt = lastActivityAt
         self.context = context
+    }
+}
+
+/// Exact live Manage requirement for cached metadata actually rendered in a provider-bound batch.
+/// Process-local only; never encoded into the prompt or persisted.
+package struct DomainAgentSessionManagedObservationRequirement: Hashable, Sendable {
+    package let reference: DomainAgentSessionLinkReference
+    package let target: DomainAgentSessionLinkEndpointIdentity
+
+    package init(reference: DomainAgentSessionLinkReference, target: DomainAgentSessionLinkEndpointIdentity) {
+        self.reference = reference
+        self.target = target
     }
 }
 

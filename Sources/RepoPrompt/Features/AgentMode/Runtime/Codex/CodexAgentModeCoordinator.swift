@@ -6092,6 +6092,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 ?? replayTurn.monitoringClaim?.dispatchID
             let monitoring: AgentSessionLinkDecoratedProviderText?
             let replayText: String
+            var acceptedReplayClaim: AgentSessionLinkOutboundPromptClaim?
             if replayTurn.monitoringDispatchContext?.isPeriodic == true {
                 guard let endpoint = viewModel?.agentSessionLinkObserverEndpoint(tabID: session.tabID),
                       viewModel?.agentSessionLinkPeriodicWakeIsEligible(session, endpoint: endpoint) == true else { return false }
@@ -6110,6 +6111,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     guard viewModel?.agentSessionLinkCanReuseAcceptedPromptClaim(
                         claim, for: session, dispatchID: claim.dispatchID
                     ) == true else { return false }
+                    acceptedReplayClaim = claim
                     replayText = AgentSessionLinkPromptComposer.decorated(replayTurn.text, with: claim)
                 } else {
                     replayText = replayTurn.text
@@ -6131,6 +6133,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     return false
                 }
                 monitoring = nil
+                acceptedReplayClaim = acknowledged
                 replayText = AgentSessionLinkPromptComposer.decorated(replayTurn.text, with: acknowledged)
             } else {
                 monitoring = nil
@@ -6142,17 +6145,29 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     )
                     return false
                 }
-                replayText = if let acknowledged = replayTurn.monitoringClaim,
-                                viewModel?.agentSessionLinkCanReuseAcceptedPromptClaim(
-                                    acknowledged,
-                                    for: session,
-                                    dispatchID: replayDispatchID
-                                ) == true
+                if let acknowledged = replayTurn.monitoringClaim,
+                   viewModel?.agentSessionLinkCanReuseAcceptedPromptClaim(
+                       acknowledged,
+                       for: session,
+                       dispatchID: replayDispatchID
+                   ) == true
                 {
-                    AgentSessionLinkPromptComposer.decorated(replayTurn.text, with: acknowledged)
+                    acceptedReplayClaim = acknowledged
+                    replayText = AgentSessionLinkPromptComposer.decorated(replayTurn.text, with: acknowledged)
                 } else {
-                    replayTurn.text
+                    replayText = replayTurn.text
                 }
+            }
+            let replayClaim = acceptedReplayClaim
+            let replayProof: AgentSessionLinkProviderInputRelease.Proof?
+            if let replayClaim, !replayClaim.managedMetadataRequirements.isEmpty, let viewModel {
+                replayProof = await viewModel.agentSessionLinkProveProviderInput(for: session, claim: replayClaim)
+                guard !Task.isCancelled, session.runState.isActive,
+                      computerUseRecoveryStopFence.permitsStart(of: session), session.runID == runID,
+                      session.activeRunAttemptID == computerUseRecoveryAttemptID,
+                      session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(controller) else { return false }
+            } else {
+                replayProof = nil
             }
             // Ordinary auth replay may compose against an existing dispatching wake. Its local
             // wrapper must retain that cohort through acceptance just like the native send path.
@@ -6189,8 +6204,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                           session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(controller),
                           viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) == true else { throw CancellationError() }
                 }
+                var finalReplayText = replayText
+                if let replayClaim {
+                    let requiresLaneBatch = replayTurn.monitoringDispatchContext?.isPeriodic != true
+                        && originalMonitoringDispatchID?.isAutoWakeFamily == true
+                    guard let released = viewModel?.agentSessionLinkHandoffAcceptedReplay(
+                        for: session, claim: replayClaim, proof: replayProof, requiresLaneBatch: requiresLaneBatch
+                    ), !released.mustAbortDispatch else { throw CancellationError() }
+                    finalReplayText = released.text(replayTurn.text)
+                }
                 let receipt = try await controller.startUserTurn(
-                    text: replayText,
+                    text: finalReplayText,
                     attachments: replayTurn.attachments,
                     model: replayTurn.model,
                     reasoningEffort: replayTurn.reasoningEffort,

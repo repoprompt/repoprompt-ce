@@ -1534,6 +1534,30 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         )
     }
 
+    func testAuthRecoveryReplayRefusesAcceptedManagedMetadataWithoutLiveGrant() async throws {
+        let fixture = try makeFixture()
+        await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+        _ = try prepareAutoWake(fixture)
+        fixture.session.beginRunAttempt(source: "test.codex.auth.managed-metadata")
+        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "", attachments: [])
+        XCTAssertEqual(fixture.startedTurns.count, 1)
+        var retry = try XCTUnwrap(fixture.session.codexPendingAuthRetryTurn)
+        var claim = try XCTUnwrap(retry.monitoringClaim)
+        let delivered = try XCTUnwrap(claim.passive?.receipt.deliveredStatuses.first)
+        // The adapter fixture publishes presentation only, not a live authority grant. Attach the
+        // exact rendered row requirement to distinguish the real replay fence from epoch-only reuse.
+        claim.managedMetadataRequirements = [.init(reference: delivered.reference, target: delivered.targetEndpoint)]
+        retry.monitoringClaim = claim
+        fixture.session.codexPendingAuthRetryTurn = retry
+        await fixture.coordinator.test_handleCodexNativeEvent(
+            .errorNotification(.init(message: "external auth is active", willRetry: false, threadID: nil, turnID: nil, itemID: nil)),
+            session: fixture.session, sourceController: fixture.controller
+        )
+        let refreshed = await fixture.authRecovery.didRefresh
+        XCTAssertTrue(refreshed)
+        XCTAssertEqual(fixture.startedTurns.count, 1, "accepted managed bytes still need live Manage at auth replay")
+    }
+
     func testAuthRecoveryReplayOfSettledAutoWakeRefusesWhenPromptContextIsWithheld() async throws {
         let fixture = try makeFixture()
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
