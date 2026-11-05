@@ -9,6 +9,7 @@ import RepoPromptSettingsCore
 //
 
 import AppKit
+import Combine
 import RepoPromptInstrumentation
 import SwiftUI
 import UniformTypeIdentifiers
@@ -308,6 +309,69 @@ struct AgentComposerView: View, Equatable {
 
     @FocusState var isFocused: Bool
 
+    /// A session taking focus goes to its pending question if it has one, otherwise the composer,
+    /// including when an approval is pending. Only a user-started switch may end typing in
+    /// another field.
+    private func routeActivationFocus(tabID: UUID?, overridesLiveText: Bool) {
+        lastActivationRoutedTabID = tabID
+        pendingInteractionHandoffTask?.cancel()
+        guard let tabID else { return }
+        let overridable = overridesLiveText ? nativeComposerEditor.currentTextEntry : nil
+        guard let repromptViewModel else {
+            composerFocusActivationRequest = .init(overridableTextEntry: overridable)
+            return
+        }
+        let store = repromptViewModel.ui.runInteraction
+        store.clearPendingCardFocus()
+        guard repromptViewModel.hasPendingQuestionForFocus(tabID: tabID) else {
+            composerFocusActivationRequest = .init(overridableTextEntry: overridable)
+            return
+        }
+        composerFocusActivationRequest = nil
+        // The composer is reused across sessions, so an automated switch must also count it as
+        // live: moving someone typing there onto a card would interrupt them.
+        store.requestPendingCardFocus(tabID: tabID, mayDeliver: { [editor = nativeComposerEditor] in
+            !editor.isTextEntryActive(includingEditor: true, excepting: overridable)
+        })
+    }
+
+    /// Answering a card hands focus on: to the next pending card, or back to the composer. Both
+    /// are polite, so resolving a card never pulls focus from something else the user moved to.
+    private func handlePendingInteractionChange(_ snapshot: AgentRunInteractionUISnapshot) {
+        let previous = lastPendingInteractions
+        let keys = snapshot.pendingInteractionFocusKeys
+        lastPendingInteractions = (snapshot.currentTabID, keys)
+        guard previous.tabID == snapshot.currentTabID, let tabID = snapshot.currentTabID, tabID == currentTabID,
+              previous.keys != keys else { return }
+        // A focus request for a card that has since changed must not fire later on another card.
+        let store = repromptViewModel?.ui.runInteraction
+        store?.clearPendingCardFocus()
+        pendingInteractionHandoffTask?.cancel()
+        let handoff = AgentPendingInteractionFocusHandoff.evaluate(previousKeys: previous.keys, keys: keys)
+        guard handoff != .none else { return }
+        let editor = nativeComposerEditor
+        pendingInteractionHandoffTask = Task { @MainActor in
+            // The answered card's own field may still be attached; a field the user moved to
+            // instead is a different entry and is left alone below.
+            await editor.waitForOtherTextEntryToDepart()
+            guard !Task.isCancelled else { return }
+            switch handoff {
+            case .none:
+                break
+            case .returnToComposer:
+                composerFocusRestoreRequest = UUID()
+            case .focusNextCard:
+                store?.requestPendingCardFocus(tabID: tabID, mayDeliver: {
+                    !editor.isTextEntryActive(includingEditor: true)
+                })
+            }
+        }
+    }
+
+    private var pendingInteractionSnapshots: AnyPublisher<AgentRunInteractionUISnapshot, Never> {
+        repromptViewModel?.ui.runInteraction.$snapshot.eraseToAnyPublisher() ?? Empty().eraseToAnyPublisher()
+    }
+
     private func flushDraftOnDeparture(tabID: UUID) {
         guard AgentRepromptUIStore.shouldFlushDraftOnDeparture(
             tabID: tabID, presentation: repromptStore.presentations[tabID], publication: repromptStore.draftUpdate,
@@ -324,6 +388,10 @@ struct AgentComposerView: View, Equatable {
     @State private var acknowledgedRepromptPublicationsByTab: [UUID: AgentRepromptUIStore.PublicationIdentity] = [:]
     @State private var repromptStripHeight: CGFloat = 0
     @State private var composerFocusRestoreRequest: UUID?
+    @State private var composerFocusActivationRequest: TextFieldFocusActivationRequest?
+    @State private var lastActivationRoutedTabID: UUID?
+    @State private var pendingInteractionHandoffTask: Task<Void, Never>?
+    @State private var lastPendingInteractions: (tabID: UUID?, keys: [String]) = (nil, [])
     @State private var editorTextFieldHeight: CGFloat = ResizableTextField.height(forPresetIndex: 0, preset: .normal)
     @State private var isInputEmpty: Bool = true
     @State private var chromeOcclusion: CGFloat = 0
@@ -598,12 +666,14 @@ struct AgentComposerView: View, Equatable {
             if let tabID = currentTabID {
                 loadDraftFromSession(for: tabID)
             }
+            routeActivationFocus(tabID: currentTabID, overridesLiveText: false)
         }
         .onDisappear {
             // Store draft when leaving
             if let tabID = currentTabID {
                 flushDraftOnDeparture(tabID: tabID)
             }
+            pendingInteractionHandoffTask?.cancel()
             steeringUnsupportedDismissTask?.cancel()
             steeringUnsupportedDismissTask = nil
             modelMenuSnapshotReleaseTask?.cancel()
@@ -619,7 +689,17 @@ struct AgentComposerView: View, Equatable {
             if let newTabID {
                 loadDraftFromSession(for: newTabID)
             }
+            if lastActivationRoutedTabID != newTabID {
+                routeActivationFocus(tabID: newTabID, overridesLiveText: false)
+            }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .composerActivationRequested)) { notification in
+            // Delivered synchronously with the tab write, ahead of the tab-change handler above.
+            guard notification.userInfo?["windowID"] as? Int == windowID,
+                  let tabID = notification.userInfo?["tabID"] as? UUID else { return }
+            routeActivationFocus(tabID: tabID, overridesLiveText: true)
+        }
+        .onReceive(pendingInteractionSnapshots) { handlePendingInteractionChange($0) }
         .onChange(of: localInputText) { _, newValue in
             isInputEmpty = newValue.isEmpty
             guard let tabID = currentTabID, !isSyncingDraftFromSession else { return }
@@ -825,6 +905,7 @@ struct AgentComposerView: View, Equatable {
                 onCommandReturn: repromptViewModel == nil ? nil : repromptAgain,
                 commandReturnMatcher: { LocalKeyboardShortcut.matches($0, .repromptDraft) },
                 focusRestoreRequest: composerFocusRestoreRequest,
+                focusActivationRequest: composerFocusActivationRequest,
                 nativeEditor: nativeComposerEditor,
                 nativeEditorIdentity: currentTabID.map { AnyHashable($0) },
                 onHeightChange: { newHeight in
