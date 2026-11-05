@@ -171,3 +171,78 @@ final class CodexManagedAuthTransitionTests: XCTestCase {
         collector.cancel()
     }
 }
+
+// MARK: - Passive managed-account checks (#479)
+
+/// Regression coverage for #479: connection/status checks must read the managed account
+/// passively, while genuine authentication recovery keeps its forced token refresh.
+final class CodexManagedAuthPassiveCheckTests: XCTestCase {
+    private static let signedInAccount: [String: Any] = [
+        "account": ["type": "chatgpt", "email": "passive@example.com", "planType": "plus"],
+        "requiresOpenaiAuth": true
+    ]
+
+    func testPassiveAccountCheckDoesNotRefreshToken() async {
+        let client = RecordingCodexManagedAuthClient(accountReadResponse: Self.signedInAccount)
+        let service = CodexManagedAuthRecoveryService(clientFactory: { client })
+
+        let result = await service.checkManagedAccount()
+
+        guard case let .recovered(account) = result else {
+            return XCTFail("A signed-in passive check must recover the account, got \(result)")
+        }
+        XCTAssertEqual(account?.email, "passive@example.com")
+        XCTAssertEqual(account?.planType, "plus")
+        XCTAssertEqual(account?.accountType, "chatgpt")
+        XCTAssertEqual(client.accountReadRefreshFlags(), [false], "A status check must not force a token refresh")
+        let snapshotEmail = await service.managedAccountSnapshot()?.email
+        XCTAssertEqual(snapshotEmail, "passive@example.com")
+    }
+
+    func testRecoveryRefreshStillForcesTokenRefresh() async {
+        let client = RecordingCodexManagedAuthClient(accountReadResponse: Self.signedInAccount)
+        let service = CodexManagedAuthRecoveryService(clientFactory: { client })
+
+        _ = await service.refreshManagedAccount()
+
+        XCTAssertEqual(client.accountReadRefreshFlags(), [true], "Genuine recovery keeps its forced refresh")
+    }
+}
+
+/// Answers `account/read` with a fixed payload and records each request's `refreshToken` flag.
+private final class RecordingCodexManagedAuthClient: CodexManagedAuthRPCClient, @unchecked Sendable {
+    private let lock = NSLock()
+    private let accountReadResponse: [String: Any]
+    private var refreshFlags: [Bool] = []
+    private let notifications: AsyncStream<CodexAppServerClient.Notification>
+
+    init(accountReadResponse: [String: Any]) {
+        self.accountReadResponse = accountReadResponse
+        notifications = AsyncStream { $0.finish() }
+    }
+
+    func accountReadRefreshFlags() -> [Bool] {
+        lock.lock()
+        defer { lock.unlock() }
+        return refreshFlags
+    }
+
+    func updateDefaultRequestTimeout(_: TimeInterval?) async {}
+    func startIfNeeded() async throws {}
+    func stop() async {}
+
+    func request(method: String, params: [String: Any]?, timeout _: TimeInterval?) async throws -> [String: Any] {
+        guard method == "account/read" else {
+            XCTFail("Unexpected managed-auth request: \(method)")
+            return [:]
+        }
+        lock.lock()
+        refreshFlags.append(params?["refreshToken"] as? Bool ?? true)
+        lock.unlock()
+        return accountReadResponse
+    }
+
+    func subscribeNotifications() async -> AsyncStream<CodexAppServerClient.Notification> {
+        notifications
+    }
+}
