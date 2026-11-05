@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 from pathlib import Path
 import re
@@ -12,6 +13,9 @@ import subprocess
 # v3 separates the immutable event from the attempt that produced its build.
 # A partial rerun may consume a successful ancestor, never a different build.
 PROFILE = 'integration-v3'
+# The enforcing wall-clock ratchet is measured on native ARM, not interchangeable
+# runner pools. A platform change needs an explicit policy/evidence review.
+ROOT_ARCHITECTURE = 'arm64'
 METADATA = Path('.build/modularization/admission.json')
 SHA = re.compile(r'^[0-9a-f]{40}$')
 POSITIVE = re.compile(r'^[1-9][0-9]*$')
@@ -58,7 +62,8 @@ def candidate(event_name: str, event: dict, sha: str, ref: str,
         raise ValueError('admission requires a real base commit; no unbounded scan fallback')
     return {'schema': 2, 'profile': PROFILE, 'event': event_name, 'head': sha, 'base': base,
             'ref': ref, 'tree': tree, 'run_id': run_id,
-            'timing_policy': 'clean-enforcing', 'products': 'sentry-privacy'}
+            'timing_policy': 'clean-enforcing', 'root_architecture': ROOT_ARCHITECTURE,
+            'products': 'sentry-privacy'}
 
 
 def verify(context: dict, root: Path, run_id: str, attempt: str) -> None:
@@ -68,15 +73,22 @@ def verify(context: dict, root: Path, run_id: str, attempt: str) -> None:
         raise CandidateMismatch('unknown admission profile')
     if context.get('run_id') != run_id or 'attempt' in context:
         raise CandidateMismatch('candidate run identity mismatch')
-    if context.get('timing_policy') != 'clean-enforcing' or context.get('products') != 'sentry-privacy':
-        raise CandidateMismatch('incomplete admission policy')
+    if (context.get('timing_policy') != 'clean-enforcing' or context.get('products') != 'sentry-privacy'
+            or context.get('root_architecture') != ROOT_ARCHITECTURE):
+        raise CandidateMismatch('incomplete admission policy or wrong root measurement architecture')
     if git(root, 'rev-parse', 'HEAD') != context['head'] or git(root, 'rev-parse', 'HEAD^{tree}') != context['tree']:
         raise CandidateMismatch('admission candidate commit/tree does not match checkout')
 
 
 def toolchain(root: Path) -> dict:
-    versions = {name: subprocess.check_output(command, cwd=root, text=True).strip()
-                for name, command in (('swift', ['swift', '--version']), ('xcode', ['xcodebuild', '-version']))}
+    try:
+        versions = {name: subprocess.check_output(command, cwd=root, text=True).strip()
+                    for name, command in (('swift', ['swift', '--version']), ('xcode', ['xcodebuild', '-version']))}
+    except (OSError, subprocess.CalledProcessError) as error:
+        selected = os.environ.get('DEVELOPER_DIR', '<system default>')
+        raise CandidateMismatch(
+            f'cannot inspect the selected Swift/Xcode toolchain (DEVELOPER_DIR={selected!r}). '
+            'Check the installed reviewed pin and runner image; do not rerun unchanged configuration') from error
     return {**versions, 'architecture': platform.machine()}
 
 
@@ -96,8 +108,11 @@ def verify_producer(producer: dict, context: dict, current_attempt: str) -> None
     if (not isinstance(versions, dict) or set(versions) != {'swift', 'xcode', 'architecture'}
             or any(not isinstance(v, str) or not v.strip() for v in versions.values())):
         raise ValueError('missing root producer toolchain')
-    if versions['architecture'] not in ('arm64', 'x86_64'):
-        raise ValueError('unsupported root producer architecture')
+    if (context.get('root_architecture') != ROOT_ARCHITECTURE
+            or versions['architecture'] != ROOT_ARCHITECTURE):
+        raise CandidateMismatch(
+            f'root build requires the {ROOT_ARCHITECTURE} measurement platform; '
+            f'observed {versions["architecture"]!r}. Restore the intended runner; do not raise timing budgets')
 
 
 def artifact_names(producer: dict) -> dict:
@@ -180,13 +195,21 @@ def main() -> int:
             if args.command == 'invalidate':
                 invalidate_build_identity(args.root)
             if args.command == 'produce':
-                producer = producer_context(context, args.attempt, toolchain(args.root))
+                installed = toolchain(args.root)
+                print(json.dumps({'root_measurement_toolchain': installed}, sort_keys=True))
+                producer = producer_context(context, args.attempt, installed)
                 write_outputs(args.output, {'context': producer, **artifact_names(producer)})
             if args.command in ('bind', 'select'):
                 producer = json.loads(args.producer_context)
                 verify_producer(producer, context, args.attempt)
-                if args.check_toolchain and producer['toolchain'] != toolchain(args.root):
-                    raise ValueError('toolchain-drift: worker architecture/Swift/Xcode differs from the root build')
+                if args.check_toolchain:
+                    installed = toolchain(args.root)
+                    if installed['architecture'] != ROOT_ARCHITECTURE:
+                        raise CandidateMismatch(
+                            f'worker architecture {installed["architecture"]!r} violates the declared '
+                            f'{ROOT_ARCHITECTURE} platform; restore the intended runner, not the root build')
+                    if producer['toolchain'] != installed:
+                        raise ValueError('toolchain-drift: worker Swift/Xcode differs from the root build')
                 if args.command == 'bind':
                     if producer['attempt'] != args.attempt:
                         raise ValueError('cannot bind an earlier producer as a new build')

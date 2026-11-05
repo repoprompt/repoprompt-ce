@@ -212,6 +212,15 @@ https://docs.github.com/en/actions/concepts/workflows-and-actions/concurrency.
 
 ## Reliability incident and recovery
 
+**Historical scope:** this section describes the initial #1628 repair. Later
+commits also changed production workflow definitions in the PR: automatic Tip
+can select a passing main ancestor, uses separately pinned protected-main tooling,
+and has a final publication-result job; CI also gained bounded automatic recovery.
+The exact-current-main-only and no-production-workflow-change statements below
+are superseded, not descriptions of the current PR. See
+[the follow-up review and outstanding acceptance](ci-reliability-2026-11-05.md#follow-up-review-of-head-a3b9d1053)
+and [current admission policy](ci-admission.md).
+
 ### Observed failure, not a capacity hypothesis
 
 Baseline inspected: main `26ccf4fa8bbe41b9b7cfb95bb8aa9a1afeb6ee83`,

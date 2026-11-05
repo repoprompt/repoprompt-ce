@@ -21,7 +21,8 @@ RECOVERY = '''### Recovery (no gate bypass)
 - Code, assertion, lint or coverage failure: fix the source and update the PR; rerunning the same code is not a fix.
 - See **CI Recovery** for automatic recovery of verified runner startup failures and missing build evidence. Automatic recovery is bounded to three total attempts and never retries an assertion, lint, compiler or coverage failure.
 - Confirmed transient runner/network failure outside automatic recovery: **Re-run failed jobs** or the failed job and its dependents. Successful ancestors remain bound to their original candidate and build.
-- Missing/expired artifact or Swift/Xcode drift: recovery rebuilds the successful root producer once when the failure is positively identified. If recovery is exhausted or producer output is missing, **Re-run Build and Static Gates** and dependents. Evidence artifacts expire after 7 days.
+- Wrong runner architecture or unavailable pinned Xcode: repair the platform configuration; rebuilding the same configuration is not recovery.
+- Missing/expired artifact or Swift/Xcode drift on the admitted architecture: recovery rebuilds the successful root producer once when the failure is positively identified. If recovery is exhausted or producer output is missing, **Re-run Build and Static Gates** and dependents. Evidence artifacts expire after 7 days.
 - An obsolete pending main job may be superseded to preserve capacity. Its secret scan still runs. The current candidate is recovered if an out-of-order old request evicts it; ordinary user cancellation is respected.
 - A rerun uses the original SHA/base, not today's main. Update the PR branch to test new integration code. Runs created before integration-v3 still require Re-run all jobs.
 - Cancellation/runner loss may prevent a job report. Inspect the run timeline; absence of a report or a skipped job is never passing evidence.
@@ -64,7 +65,48 @@ def prerequisite_report(needs: dict, event: str) -> tuple[str, bool]:
     return text + '\n' + RECOVERY, passed
 
 
-def run(mode: str) -> int:
+def build_report(report: dict) -> str:
+    """Describe fresh build measurements without granting or changing any gate result."""
+    if report['schema'] != 1 or report['policy'] not in ('clean-enforcing', 'incremental-report-only'):
+        raise ValueError('unknown measurement protocol')
+    code = report['build_exit_code']
+    if type(code) is not int:
+        raise ValueError('invalid compiler exit code')
+    counts, budget = report['counts'], report['budget']
+    rows = [('Function bodies >=1000ms', counts['function_body'], budget['function_bodies_1000ms']),
+            ('Expressions >=500ms', counts['expression'], budget['expressions_500ms'])]
+    warnings = report.get('first_party_warnings')
+    if warnings is not None:
+        rows.append(('Unique first-party warnings', warnings['unique'], warnings['budget']['first_party_unique']))
+    if any(type(value) is not int or value < 0 for _, count, ceiling in rows for value in (count, ceiling)):
+        raise ValueError('invalid measurement count/budget')
+    text = f'## Root build failure measurements\n\nCompiler/build exit code: **{code}**.\n\n'
+    text += '| Gate | Measured | Limit |\n|---|---:|---:|\n'
+    text += ''.join(f'| {label} | {count} | {ceiling} |\n' for label, count, ceiling in rows)
+    if code:
+        text += '\n**Compiler/build process failed.** Counts from an incomplete build cannot establish a ratchet verdict.\n'
+    elif report['policy'] == 'incremental-report-only':
+        text += '\nThese measurements are report-only; they do not explain a failed enforcing gate.\n'
+    else:
+        failures = []
+        if any(count > ceiling for _, count, ceiling in rows[:2]):
+            failures.append('Type-check ratchet exceeded')
+        if warnings is not None and rows[2][1] > rows[2][2]:
+            failures.append('Warning ratchet exceeded')
+        text += ('\n**' + '; '.join(failures) + '.** Compilation succeeded, but the static gate did not.\n'
+                 if failures else '\nRecorded measurements do not explain this failure; inspect the retained build log.\n')
+    return text + '\nFull compiler output and failing locations are retained in the root-build-tests-failure and typecheck-timing artifacts. No budget or exit status was changed.\n'
+
+
+def run(mode: str, timing_report: Path | None = None) -> int:
+    if mode == 'build':
+        # Only invoked after a failed build. Invalidation before compilation keeps
+        # an earlier producer's measurements from masquerading as this attempt.
+        text = build_report(json.loads(timing_report.read_text()))
+        with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as stream:
+            stream.write(text)
+        print(text)
+        return 0
     if mode == 'job':
         text, failure = job_report(json.loads(os.environ['STEPS_CONTEXT']))
         output = os.environ.get('GITHUB_OUTPUT')
@@ -87,13 +129,14 @@ def run(mode: str) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('job', 'prerequisites'))
+    parser.add_argument('mode', choices=('job', 'prerequisites', 'build'))
+    parser.add_argument('--timing-report', type=Path)
     args = parser.parse_args()
     try:
-        return run(args.mode)
+        return run(args.mode, args.timing_report)
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         # Do not print input JSON/environment in an error; it is not trusted data.
-        if args.mode == 'job':
+        if args.mode in ('job', 'build'):
             print('::warning::Job diagnostics unavailable; inspect the original job result/log. No success is inferred.')
             return 0
         print('::error::Prerequisite diagnostics invalid/unavailable; refusing evidence acceptance.')

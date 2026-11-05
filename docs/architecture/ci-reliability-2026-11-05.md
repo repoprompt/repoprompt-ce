@@ -375,6 +375,142 @@ Do not use an old successful main run as a casual retry canary: a successful
 main CI rerun can trigger Tip qualification. Old commits retain their old workflow
 policy; affected branches need the repaired source and a fresh run.
 
+## Follow-up review of head `a3b9d1053`
+
+[CI run 41920460399](https://github.com/repoprompt/repoprompt-ce/actions/runs/41920460399)
+completed with a failed Build and Static Gates job on `macos-26-intel`.
+Its retained `typecheck-timing.json` records compiler exit **0**, function-body
+count **20/10**, expression count **7/6**, and first-party warnings **417/430**.
+This was a type-check ratchet failure, not a compiler failure or unassigned runner.
+The workflow printed only lines matching `error:|FAIL`, hiding the actual
+`type-check ratchet regressed` message from its visible build output.
+
+The follow-up restores the pre-PR `macos-26` ARM labels for integration and Xcode
+validation, preserving native coverage and the original measurement platform.
+No budget, test assertion or execution deadline is raised. The Intel run does not
+prove architecture is the only cause of the excess timings, and this rollback
+does not claim ARM capacity has recovered or that a fresh ARM build will pass.
+
+Failure reporting now includes a bounded compiler-error excerpt, the full log's
+tail and a step-summary table of fresh compiler status, timing counts and warnings.
+A shell-level regression test executes the actual workflow step and checks that
+early compiler errors survive more than 80 trailing lines, ratchet failures are
+visible, and valid/malformed/missing measurements or a failed log copy cannot
+replace the original build exit status. The real timing producer's regression
+also exercises the reporter, and the downloaded Intel report parses correctly.
+Producer-bound receipt comparisons remain enforced; candidate policy additionally
+requires `root_architecture: arm64`, checked before root-build work.
+
+Additional review repairs:
+
+- The portable suite reproduced four failing SHA-rejection subcases on macOS's
+  Bash 3.2: `set -e` did not stop after a false compound `[[ ... && ... ]]` guard.
+  Stable prepare/promote now exit explicitly before emitting either output for
+  malformed source/tooling identities. Tests also cover malformed tooling SHAs.
+- The reusable compatibility workflow still checked a top-level candidate attempt,
+  which v3 intentionally removed. That condition could silently skip a caller
+  supplying v3 admission. It is removed; optional immutable-candidate verification
+  remains a failing step, and release callers still require an exact artifact.
+- A source-contract test now checks recovery's exact job/step/concurrency names
+  against the real workflows, rather than only matching self-consistent fixtures.
+
+**Outstanding release-policy decision:** automatic Tip selects a CI-qualified
+source but pins tooling to then-current main, which may not have passing CI.
+A queued workflow can therefore combine older workflow YAML with newer scripts.
+Protected-main trust is not proof of CI qualification or YAML/script compatibility.
+The follow-up does not silently change this policy: maintainer approval is needed
+before choosing a coherent qualified source/tooling policy. This remains a review
+concern, not a claim that a bad release has been observed.
+
+Before the subsequent platform-policy/pin edits, local validation on macOS passed
+**535 tests across 33 portable suites** with no reported skips, plus
+`make guardrails` and `git diff --check`. That count does not validate the later
+architecture checks; their final results are recorded separately below. The earlier
+sandboxed attempts could not inspect child processes or run Swift manifest
+sandboxing; both final commands completed outside that sandbox, without app
+launches. Focused workflow/release recovery tests also passed. Logs are retained
+locally at `/private/tmp/pr1628-review-portable-final.log` and
+`/private/tmp/pr1628-review-guardrails-final.log`.
+
+Actionlint passed all eight relevant workflows with ShellCheck disabled and only
+its unsupported `concurrency.queue` schema error excluded. GitHub's current
+[concurrency documentation](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency)
+confirms that pre-existing `queue: max` property. This is not an unqualified
+ShellCheck pass. The full Swift suite, hosted ARM build, live app smoke, signing,
+publication and automatic retry lifecycle were not run by this follow-up.
+
+Maintainer-guidance check: the user impact is blocked CI with hidden causes;
+reporting and guard defects are confirmed, while architecture causality is not.
+GitHub job outcomes and producer-bound receipts remain authoritative. No user
+state, credentials or gate budgets change. Broad release-tooling policy stays a
+separate decision; queue capacity and hosted recovery remain unproven boundaries.
+
+The earlier validation and Intel-status paragraphs above are historical receipts,
+not acceptance of the follow-up. Complete hosted CI, actual partial-rerun recovery
+and publication acceptance remain outstanding.
+
+## Detailed root-cause follow-up for job `126892428117`
+
+The [failing job](https://github.com/repoprompt/repoprompt-ce/actions/runs/41920460399/job/126892428117)
+actually received an Intel runner and ran from **21:56:59 to 23:03:49 UTC** on
+November 4. It did not time out or fail to allocate a runner. Dependency resolution
+completed in 10m21s, Swift style lint in 12m58s, and provider tests in 51s. The
+failed root-build step ran for **38m25s**. The compiler returned zero; the wrapper
+returned one because the unchanged timing ceilings were exceeded. Ordinary
+warnings were below their ceiling. The later compiler-index, module-parity and
+root-execution gates never ran, so this run establishes no failure in those gates.
+
+| Evidence | ARM control | Failing Intel job |
+| --- | --- | --- |
+| Source | `65405c7117ea` | PR head `a3b9d1053`, synthetic merge `e877887c8b86` |
+| Hosted run / job | [41782038296 / 126420663736](https://github.com/repoprompt/repoprompt-ce/actions/runs/41782038296/job/126420663736) | [41920460399 / 126892428117](https://github.com/repoprompt/repoprompt-ce/actions/runs/41920460399/job/126892428117) |
+| Runner label | `macos-26` (ARM) | `macos-26-intel` |
+| Image | `macos-26-arm64/20261026.0455` | `macos-26/20260824.0517` |
+| Default Xcode per exact image manifest | 26.6 / 17F113 | 26.6 / 17F113 |
+| Slow bodies / ceiling | 7 / 10 | 20 / 10 |
+| Slow expressions / ceiling | 4 / 6 | 7 / 6 |
+| Ordinary warnings / ceiling | 417 / 430 | 417 / 430 |
+
+The exact [ARM image manifest](https://github.com/actions/runner-images/blob/macos-26-arm64/20261026.0455/images/macos/macos-26-arm64-Readme.md)
+and [Intel image manifest](https://github.com/actions/runner-images/blob/macos-26/20260824.0517/images/macos/macos-26-Readme.md)
+both list Xcode 26.6 build 17F113 and `/Applications/Xcode_26.6.app`.
+The failed producer's own output independently records x86_64, Xcode 26.6 and
+Swift 6.3.3. Of the Intel report's 27 slow locations, 25 are in files byte-unchanged
+from the ARM control. For example, the unchanged changelog expression measured
+2,155ms versus 10,477ms, and the unchanged session-row body 2,555ms versus 8,768ms.
+
+This strongly supports a platform/timing-protocol regression introduced by moving
+an enforcing wall-clock gate to a different pool. It is not a controlled same-SHA,
+equal-hardware benchmark, so it does not prove that architecture alone explains
+every millisecond. Rewriting unrelated unchanged UI or raising ceilings would not
+establish a comparable validation protocol.
+
+The repair therefore restores ARM and explicitly pins the accepted Xcode 26.6
+path for root build, root execution, Sentry and generated-workspace validation.
+The immutable candidate now records its root-architecture obligation, and producer
+admission rejects another architecture before guardrails, downloads or compilation.
+Worker architecture and missing-toolchain errors are configuration failures, not
+instructions to rebuild unchanged configuration. Toolchain identity is logged even
+when an inspected producer is rejected. Conductor's environment propagation is
+covered through its real operation registry for build, shard, test and provider
+commands, so the compiler receives the same `DEVELOPER_DIR` as admission.
+
+No assertion, count ceiling, test coverage requirement or execution deadline is
+relaxed. A reviewed future toolchain/platform update still needs new measurement
+and coverage evidence. Hosted capacity failures remain a separate infrastructure
+problem; the architecture correction does not manufacture ARM availability.
+
+## Follow-up validation boundary
+
+The focused CI workflow selftests and changed-workflow actionlint passed after
+these platform/diagnostic edits. Actionlint excluded ShellCheck and its known
+unsupported concurrency `queue` key; this is not a claim of full ShellCheck coverage.
+The auxiliary local clean build was canceled at the maintainer's direction, and
+interrupted portable/Xcode validation did not produce a completed passing receipt.
+Neither is acceptance evidence. Further build and test acceptance is delegated to
+the exact pushed PR head on GitHub Actions; no local build result substitutes for it.
+Commit/push secret-scanning and repository safety preflights remain mandatory.
+
 ## Rollback and operating boundaries
 
 If automatic recovery misclassifies evidence, disable/revert its workflow through
@@ -383,7 +519,7 @@ If pending-stage coalescing misbehaves, revert those three stage groups while
 retaining independent scans and early portable gates. If Tip selection needs
 rollback, preserve its exact producer artifacts and final status reporting.
 
-The existing Intel routing commit is independently reversible. No automatic
+The Intel routing experiment is rolled back by this follow-up. No automatic
 architecture fallback is introduced: compiled artifacts remain bound to their
 producer architecture/toolchain. Do not increase account concurrency, buy larger
 runners, weaken performance limits, skip secret scanning or remove Style as a

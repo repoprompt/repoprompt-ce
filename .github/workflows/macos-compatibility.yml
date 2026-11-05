@@ -12,7 +12,7 @@ on:
         type: string
         required: true
       admission:
-        description: CI candidate identity; empty for independently validated release workflows
+        description: Immutable CI candidate identity; empty for independently validated release workflows
         type: string
         default: ''
 
@@ -22,7 +22,6 @@ permissions:
 jobs:
   smoke:
     name: macOS 15 ${{ matrix.architecture }} artifact smoke
-    if: ${{ inputs.admission == '' || fromJSON(inputs.admission).attempt == github.run_attempt }}
     strategy:
       fail-fast: false
       matrix:
@@ -41,7 +40,7 @@ jobs:
           path: tooling
           persist-credentials: false
 
-      - name: Verify CI candidate and attempt identity
+      - name: Verify immutable CI candidate identity
         if: inputs.admission != ''
         working-directory: tooling
         env:

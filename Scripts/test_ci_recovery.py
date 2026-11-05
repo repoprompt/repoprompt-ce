@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -55,6 +56,29 @@ def worker_failure(step):
 
 
 class PlannerTests(unittest.TestCase):
+    def test_classifier_names_match_the_actual_workflow(self):
+        root = Path(__file__).resolve().parent.parent
+        workflow = (root / recovery.WORKFLOW).read_text()
+        sections = re.split(r'^  ([\w-]+):\n', workflow.split('\njobs:\n', 1)[1], flags=re.M)
+        jobs = dict(zip(sections[1::2], sections[2::2]))
+        named = {}
+        for identity, body in jobs.items():
+            header = body.split('    steps:\n', 1)[0]
+            name = re.search(r'^    name: (.+)$', header, re.M)
+            named[name[1] if name else identity] = body
+        self.assertIn(recovery.ROOT, named)
+        self.assertIn(recovery.WORKER, named)
+        for job_name, step in recovery.DOWNLOADS:
+            self.assertIn(f'      - name: {step}\n', named[job_name])
+        self.assertIn(f'      - name: {SELECT}\n', named[recovery.WORKER])
+        self.assertIn('      - name: Report prerequisites and release eligibility\n', named['Style'])
+        products = (root / recovery.PRODUCT_WORKFLOW).read_text()
+        for job_name, group in recovery.STAGE_GROUPS.items():
+            caller, _, callee = job_name.partition(' / ')
+            self.assertIn('group: ' + group.removesuffix('main') + '${{', named[caller])
+            if callee:
+                self.assertIn(f'    name: {callee}\n', products)
+
     def test_startup_failure_retries_failed_jobs_and_retains_successes(self):
         jobs = [job(recovery.ROOT, 10, 'cancelled', assigned=False), aggregate()]
         self.assertEqual(recovery.plan(source(), jobs, {10: STARTUP}, [], jobs).action, 'retry_failed')

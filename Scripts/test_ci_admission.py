@@ -12,6 +12,7 @@ import io
 import contextlib
 
 import ci_admission as admission
+import ci_job_diagnostics as diagnostics
 import modularization_ci_build as ci_build
 import modularization_ci_artifact as artifact
 
@@ -43,13 +44,17 @@ class WorkerSchedulingTests(unittest.TestCase):
         self.assertIn('name: ${{ steps.selected.outputs.receipt_artifact }}', aggregate)
         self.assertIn('--shard-count 4 --admission-context', aggregate)
 
-    def test_all_integration_producers_and_consumers_use_the_same_standard_intel_pool(self):
+    def test_all_integration_producers_and_consumers_retain_native_arm_validation(self):
         root = Path(__file__).resolve().parent.parent
         for name, count in [('ci.yml', 2), ('ci-integration-products.yml', 1), ('xcode-workspace.yml', 1)]:
             text = (root / '.github/workflows' / name).read_text()
             mac_labels = [line.strip().split(': ', 1)[1] for line in text.splitlines()
                           if line.strip().startswith('runs-on: macos')]
-            self.assertEqual(mac_labels, ['macos-26-intel'] * count, name)
+            self.assertEqual(mac_labels, ['macos-26'] * count, name)
+            self.assertEqual(text.count('DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer'), count, name)
+        producer = (root / '.github/workflows/ci.yml').read_text().split('\n  build-test-bundles:\n', 1)[1].split('\n  build-and-test:\n', 1)[0]
+        self.assertLess(producer.index('ci_admission.py produce'), producer.index('Run compiler-dependent repository guardrails'))
+        self.assertLess(producer.index('ci_admission.py produce'), producer.index('Resolve dependency downloads'))
         # Publication retains native ARM builds and both oldest-runtime architectures.
         compatibility = (root / '.github/workflows/macos-compatibility.yml').read_text()
         self.assertIn('runner: macos-15\n', compatibility)
@@ -136,6 +141,56 @@ class CheckoutTests(unittest.TestCase):
     def producer(self, context, attempt='1'):
         return admission.producer_context(context, attempt, {'swift': 'Swift fixture', 'xcode': 'Xcode fixture', 'architecture': 'arm64'})
 
+    def test_root_producer_rejects_uncalibrated_architecture_before_emitting_evidence(self):
+        context = self.context()
+        self.assertEqual(context['root_architecture'], 'arm64')
+        output = self.root / 'producer-output'
+        argv = ['admission', 'produce', '--root', str(self.root), '--run-id', '42', '--attempt', '1',
+                '--context', json.dumps(context), '--output', str(output)]
+        for architecture in ('x86_64', 'arm64'):
+            output.unlink(missing_ok=True)
+            versions = {'swift': 'Swift fixture', 'xcode': 'Xcode fixture', 'architecture': architecture}
+            with self.subTest(architecture=architecture), mock.patch('sys.argv', argv), \
+                    mock.patch.object(admission, 'toolchain', return_value=versions), \
+                    mock.patch('sys.stderr', new_callable=io.StringIO) as errors, \
+                    mock.patch('sys.stdout', new_callable=io.StringIO) as logs:
+                if architecture != 'arm64':
+                    with self.assertRaises(SystemExit) as failed:
+                        admission.main()
+                    self.assertEqual(failed.exception.code, 1)
+                    self.assertIn('Restore the intended runner; do not raise timing budgets', errors.getvalue())
+                    self.assertNotIn('Re-run all jobs', errors.getvalue())
+                    self.assertFalse(output.exists())
+                    self.assertIn('root_measurement_toolchain', logs.getvalue())
+                    self.assertIn('Swift fixture', logs.getvalue())
+                else:
+                    self.assertEqual(admission.main(), 0)
+                    self.assertIn('root_measurement_toolchain', logs.getvalue())
+                    self.assertIn('root-build-42-1', output.read_text())
+        wrong = {**self.producer(context), 'toolchain': {**versions, 'architecture': 'x86_64'}}
+        with self.assertRaises(admission.CandidateMismatch):
+            admission.verify_producer(wrong, context, '2')
+
+    def test_unavailable_pinned_toolchain_is_a_configuration_failure_not_a_rebuild_hint(self):
+        context = self.context()
+        output = self.root / 'producer-output'
+        argv = ['admission', 'produce', '--root', str(self.root), '--run-id', '42', '--attempt', '1',
+                '--context', json.dumps(context), '--output', str(output)]
+        for error in (FileNotFoundError('xcodebuild'), subprocess.CalledProcessError(1, ['xcodebuild', '-version'])):
+            with self.subTest(error=type(error).__name__), mock.patch('sys.argv', argv), \
+                    mock.patch.dict('os.environ', {'DEVELOPER_DIR': '/Applications/MissingXcode.app/Contents/Developer'}), \
+                    mock.patch('sys.stderr', new_callable=io.StringIO) as errors:
+                # Isolate toolchain discovery; checkout validation has separate executable tests.
+                with mock.patch.object(admission, 'verify'), \
+                        mock.patch.object(admission.subprocess, 'check_output', side_effect=error), \
+                        self.assertRaises(SystemExit) as failed:
+                    admission.main()
+                self.assertEqual(failed.exception.code, 1)
+                self.assertIn('MissingXcode.app', errors.getvalue())
+                self.assertIn('do not rerun unchanged configuration', errors.getvalue())
+                self.assertNotIn('Re-run Build and Static Gates', errors.getvalue())
+                self.assertFalse(output.exists())
+
     def test_native_partial_rerun_keeps_candidate_but_selects_actual_producer_attempt(self):
         first = self.context()
         self.assertNotIn('attempt', first)
@@ -221,7 +276,7 @@ class CheckoutTests(unittest.TestCase):
         argv = ['admission', 'select', '--root', str(self.root), '--run-id', '42', '--attempt', '2',
                 '--context', json.dumps(context), '--producer-context', json.dumps(producer),
                 '--check-toolchain', '--output', str(self.root / 'selection')]
-        with mock.patch('sys.argv', argv), mock.patch.object(admission, 'toolchain', return_value={'swift': 'new', 'xcode': 'new'}), \
+        with mock.patch('sys.argv', argv), mock.patch.object(admission, 'toolchain', return_value={'swift': 'new', 'xcode': 'new', 'architecture': 'arm64'}), \
                 mock.patch('sys.stderr', new_callable=io.StringIO) as errors, self.assertRaises(SystemExit):
             admission.main()
         self.assertIn('toolchain-drift', errors.getvalue())
@@ -245,7 +300,9 @@ class CheckoutTests(unittest.TestCase):
                     with self.assertRaises(SystemExit) as failure:
                         admission.main()
                     self.assertEqual(failure.exception.code, expected)
-                    self.assertIn('worker architecture/Swift/Xcode differs', errors.getvalue())
+                    self.assertIn('violates the declared arm64 platform', errors.getvalue())
+                    self.assertNotIn('toolchain-drift', errors.getvalue())
+                    self.assertNotIn('Re-run Build and Static Gates', errors.getvalue())
                     self.assertFalse(output.exists())
                 else:
                     self.assertEqual(admission.main(), 0)
@@ -261,6 +318,8 @@ class CheckoutTests(unittest.TestCase):
             {'profile': 'integration-v2', 'schema': 1},
             {'products': 'sentry-privacy-and-release-smoke'},
             {'products': ''},
+            {'root_architecture': None},
+            {'root_architecture': 'x86_64'},
         ):
             with self.subTest(fields=fields):
                 result = self.command('verify', context=json.dumps({**context, **fields}))
@@ -370,6 +429,16 @@ class TimingProtocolTests(unittest.TestCase):
                 self.assertEqual(report['build_exit_code'], build_status)
                 self.assertEqual(report['budget']['expressions_500ms'], budget)
                 self.assertEqual(report['counts'], {'expression': 1, 'function_body': 0})
+                # Exercise the reporter against the real producer's schema, not only hand-written JSON.
+                summary = diagnostics.build_report(report)
+                self.assertIn(f'| Expressions >=500ms | 1 | {budget} |', summary)
+                if build_status:
+                    self.assertIn('Compiler/build process failed', summary)
+                    self.assertNotIn('Type-check ratchet exceeded', summary)
+                elif budget == 0:
+                    self.assertIn('Type-check ratchet exceeded', summary)
+                else:
+                    self.assertIn('Recorded measurements do not explain this failure', summary)
                 self.assertEqual(report['locations'], [{
                     'path': 'Sources/RepoPrompt/App/X.swift', 'line': 3, 'column': 4,
                     'kind': 'expression', 'duration_ms': 502}])

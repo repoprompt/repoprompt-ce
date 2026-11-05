@@ -197,16 +197,23 @@ class CatalogTests(unittest.TestCase):
             self.assertEqual(affected.select(root, ['Sources/Core/Core.swift'], catalog), ['CoreTests'])
             self.assertEqual(affected.select(root, ['Package.swift'], catalog), ['CoreTests'])
 
-    def test_conductor_passes_timing_policy_to_ci_child(self) -> None:
+    def test_conductor_passes_timing_policy_and_pinned_toolchain_to_ci_children(self) -> None:
         registry = conductor.OperationRegistry(SCRIPT_DIR.parent)
-        with mock.patch.dict('os.environ', {'TYPECHECK_RATCHET_ENFORCE': '0'}):
+        pin = '/Applications/Xcode_26.6.app/Contents/Developer'
+        with mock.patch.dict('os.environ', {'TYPECHECK_RATCHET_ENFORCE': '0', 'DEVELOPER_DIR': pin}):
             snapshot = registry.client_env_snapshot()
         self.assertEqual(snapshot['TYPECHECK_RATCHET_ENFORCE'], '0')
-        argv, _, _, env, _ = registry.prepare({
-            'operation': 'ci-build-tests', 'args': {}, 'env': snapshot,
-        })
-        self.assertEqual(Path(argv[1]).name, 'modularization_ci_build.py')
-        self.assertEqual(env['TYPECHECK_RATCHET_ENFORCE'], '0')
+        self.assertEqual(snapshot['DEVELOPER_DIR'], pin)
+        for operation, args in (('ci-build-tests', {}), ('ci-shard', {'shardCount': 4, 'shardIndex': 1}),
+                                ('swift-build', {'product': 'RepoPrompt'}), ('test', {}), ('provider-test', {})):
+            with self.subTest(operation=operation):
+                argv, _, _, env, _ = registry.prepare({
+                    'operation': operation, 'args': args, 'env': snapshot,
+                })
+                if operation == 'ci-build-tests':
+                    self.assertEqual(Path(argv[1]).name, 'modularization_ci_build.py')
+                self.assertEqual(env['TYPECHECK_RATCHET_ENFORCE'], '0')
+                self.assertEqual(env['DEVELOPER_DIR'], pin)
 
     def test_conductor_transports_execution_location_ui_smoke_env(self) -> None:
         registry = conductor.OperationRegistry(SCRIPT_DIR.parent)
@@ -366,9 +373,9 @@ class CatalogTests(unittest.TestCase):
         self.assertIn('needs: [candidate, workflow-contracts, build-test-bundles, build-and-test, secret-scan, integration-products]', final)
         self.assertIn('if: always()', final)
         self.assertIn('ci_test_coverage.py', final)
-        self.assertEqual(ci.count('runs-on: macos-26-intel\n'), 2)  # shared root build + one worker (four logical shards)
+        self.assertEqual(ci.count('runs-on: macos-26\n'), 2)  # shared root build + one worker (four logical shards)
         products = (SCRIPT_DIR.parent / '.github/workflows/ci-integration-products.yml').read_text()
-        self.assertEqual(products.count('runs-on: macos-26-intel\n'), 1)  # Sentry/privacy only
+        self.assertEqual(products.count('runs-on: macos-26\n'), 1)  # Sentry/privacy only
         self.assertIn('SentryTelemetryPrivacyTests', products)
         self.assertNotIn('release artifact', products)
         self.assertNotIn('macos-compatibility.yml', products)

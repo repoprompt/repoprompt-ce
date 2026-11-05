@@ -76,7 +76,8 @@ GitHub documents the [merge-group SHA/ref event contract](https://docs.github.co
 the [Octokit payload example](https://github.com/octokit/webhooks/blob/main/payload-examples/api.github.com/merge_group/checks_requested.payload.json)
 shows the fully-qualified head/base refs used here.
 
-The immutable candidate binds commit, tree, base, ref, event, run ID and policy.
+The immutable candidate binds commit, tree, base, ref, event, run ID and policy,
+including `root_architecture: arm64` for the clean-enforcing timing protocol.
 It deliberately has no consumer-attempt field. Every executing job verifies its
 checkout and current run. The root producer declares a separate identity before
 running tests: candidate + build attempt + architecture + Swift/Xcode versions. It binds that
@@ -128,27 +129,38 @@ build, test, or publication evidence.
 
 ## Runner capacity and scheduling
 
-Integration uses the standard `macos-26-intel` pool (not the paid `-large`
-labels). The root producer and worker must run on the same architecture, recorded
-in the producer identity and checked before downloading/executing its archive.
+Integration retains the standard `macos-26` ARM pool used before PR #1628.
+The root producer and worker must run on the same architecture, recorded in the
+producer identity and checked before downloading/executing its archive.
 Dependency/cache keys already include architecture. Sentry and Xcode workspace
-validation also use Intel; no automatic retry or fallback duplicates work on ARM.
-This runs the full integration suite natively on x86_64 rather than arm64. It is
-not ARM-native test evidence. Universal release builds and both ARM/Intel
-older-runtime publication checks remain unchanged. No typecheck budget, test
-assertion, coverage requirement or execution deadline is relaxed for Intel.
+validation also retain ARM. These jobs explicitly select
+`/Applications/Xcode_26.6.app/Contents/Developer`, the toolchain in the last accepted
+hosted ARM control, rather than silently following a runner image's new default.
+Root producer admission rejects a different architecture before dependency work
+or compilation, emits its architecture/Swift/Xcode identity, and does not suggest
+rerunning a platform-policy mismatch. A future platform/toolchain change needs
+reviewed timing and native-coverage evidence; missing pinned Xcode fails rather
+than falling back. No automatic architecture fallback duplicates work or accepts
+another architecture's compiled evidence. Universal release builds and both
+ARM/Intel older-runtime publication checks remain unchanged.
 
-This change responds to confirmed ARM runner allocation failures, not a product
-failure. GitHub documents Intel macOS 26 as a standard free public-repository
-runner: [hosted runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
-Intel capacity and performance must still be measured on hosted runs; switching
-pools does not increase account concurrency or guarantee availability. The label
-change is isolated in a revertible commit in PR #1628. Before leaving draft,
-maintainers must accept the loss of ARM-native PR test execution explicitly and
-require an exact-head Intel pass without budget/assertion changes. Reconsider the
-pool choice when ARM allocation recovers; if Intel cannot complete the unchanged
-gates, revert the label commit rather than weakening them. Publication's ARM smoke
-is not equivalent to the full ARM-native suite (including vendored native code).
+PR #1628 experimented with `macos-26-intel` after confirmed ARM allocation
+failures. The latest inspected Intel build at head `a3b9d1053` compiled successfully,
+but failed the unchanged clean-enforcing type-check gate: 20 slow function bodies
+against a limit of 10 and 7 slow expressions against 6
+([run 41920460399](https://github.com/repoprompt/repoprompt-ce/actions/runs/41920460399)).
+The experiment has been rolled back rather than raising limits or accepting the
+loss of ARM-native integration coverage without a passing replacement. This is
+not proof that architecture caused every timing difference, that ARM will pass,
+or that ARM capacity has recovered. A fresh hosted pass and recovery exercise
+remain required. Account concurrency and provider availability are still external
+constraints; changing a label does not create capacity.
+
+A failed root build now prints the retained log tail, including non-compiler gate
+errors, and summarizes fresh compiler exit status, timing counts and warning
+counts in the step summary. Compilation success is not static-gate success.
+Malformed/missing measurements do not infer success or replace the original
+nonzero build exit status; the full log and timing artifact remain available.
 
 Integration requests three macOS jobs: one producer, one root-test worker running
 all four logical shards sequentially, and Sentry/privacy. The earlier reduction
@@ -235,7 +247,8 @@ still require all prerequisites and independently verify the original evidence.
 |---|---|
 | Source/lint/assertion/coverage failure | Fix the source; update the PR and inspect the new exact integration candidate. Repetition is not a fix. |
 | Recognized hosted-runner startup or artifact-transport failure | CI Recovery retries failed jobs within its attempt budget, retaining successful jobs. Unrecognized failures need diagnosis. |
-| Missing/expired archive or architecture/Swift/Xcode drift | CI Recovery rebuilds the successful root producer and dependents once when exact diagnostics and artifact history prove this cause. |
+| Wrong runner architecture or unavailable pinned Xcode | Repair the platform configuration. Admission fails before expensive work; an unchanged rebuild cannot fix this policy mismatch. |
+| Missing/expired archive or Swift/Xcode drift on the admitted architecture | CI Recovery rebuilds the successful root producer and dependents once when exact diagnostics and artifact history prove this cause. |
 | Dropped producer output or exhausted automatic recovery | Re-run **Build and Static Gates** and dependents after inspecting the cause. |
 | Current main evicted from a pending Mac stage | CI Recovery retries the specific stage only when a system annotation identifies the matching main concurrency group. Obsolete main work stays superseded. |
 | Wrong/stale producer receipt | Rebuild and rerun dependents; mixed-build evidence must remain rejected. |

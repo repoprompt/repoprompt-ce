@@ -1095,7 +1095,8 @@ class ReleaseWorkflowRecoveryTests(unittest.TestCase):
                 job = self.job(filename, "validate-ref")
                 self.assertIn("runs-on: ubuntu-latest", job)
                 script = textwrap.dedent(job.split("        run: |\n", 1)[1])
-                for override in ({"VERIFY_STATUS": "1"}, {"VERIFY_SHA": ""}, {"VERIFY_SHA": "not-a-sha"}, {"GIT_STATUS": "2"}, {}):
+                for override in ({"VERIFY_STATUS": "1"}, {"VERIFY_SHA": ""}, {"VERIFY_SHA": "not-a-sha"},
+                                 {"TOOLING_SHA": ""}, {"TOOLING_SHA": "not-a-sha"}, {"GIT_STATUS": "2"}, {}):
                     with self.subTest(workflow=filename, override=override):
                         output.write_text("")
                         result = subprocess.run(
@@ -1131,6 +1132,14 @@ class ReleaseWorkflowRecoveryTests(unittest.TestCase):
                     if field == "name":
                         self.assertIn(f"PRODUCER_ARTIFACT: ${{{{ needs.{producer}.outputs.artifact-name }}}}", section)
                         self.assertIn('run: test -n "$PRODUCER_ARTIFACT"', section)
+
+    def test_compatibility_does_not_skip_immutable_candidates_without_attempt(self):
+        compatibility = self.job("macos-compatibility.yml", "smoke")
+        header = compatibility.split("    steps:\n", 1)[0]
+        self.assertNotIn("    if:", header)
+        self.assertIn("if: inputs.admission != ''", compatibility)
+        self.assertIn('Scripts/ci_admission.py verify --context "$ADMISSION_CONTEXT"', compatibility)
+        self.assertNotIn("fromJSON(inputs.admission).attempt", compatibility)
 
     def test_empty_producer_output_cannot_download_all_artifacts(self):
         compatibility = self.job("macos-compatibility.yml", "smoke")

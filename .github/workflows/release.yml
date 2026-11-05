@@ -48,7 +48,10 @@ jobs:
           set -euo pipefail
           commit="$(./Scripts/verify_release_ref.sh "$RELEASE_TAG")"
           tooling_commit="$(git rev-parse HEAD)"
-          [[ "$commit" =~ ^[0-9a-f]{40}$ && "$tooling_commit" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$commit" =~ ^[0-9a-f]{40}$ && "$tooling_commit" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "Release source and tooling must resolve to full lowercase commit SHAs" >&2
+            exit 1
+          }
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
           echo "tooling-commit=$tooling_commit" >> "$GITHUB_OUTPUT"
 

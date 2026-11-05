@@ -116,9 +116,11 @@ jobs:
       cancel-in-progress: false
     env:
       ADMISSION_CONTEXT: ${{ needs.candidate.outputs.context }}
+      # Keep timing measurements on the last accepted toolchain, not image defaults.
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
     name: Build and Static Gates
-    # Standard/free Intel pool; ARM64 allocation failures must not strand integration.
-    runs-on: macos-26-intel
+    # Keep native ARM coverage and the original enforcing measurement platform.
+    runs-on: macos-26
     timeout-minutes: 75
     outputs:
       failure: ${{ steps.diagnostics.outputs.failure }}
@@ -218,14 +220,21 @@ jobs:
           build_status=${PIPESTATUS[0]}
           set -e
           if (( build_status != 0 )); then
-            log_path="$(sed -n 's/^Log:[[:space:]]*//p' "$RUNNER_TEMP/ci-build-tests-conductor.txt" | tail -n 1)"
-            if [[ -n "$log_path" && -f "$log_path" ]]; then
-              cp "$log_path" "$RUNNER_TEMP/ci-build-tests.log"
-              echo 'Compiler errors and test failures from the full conductor log:'
-              grep -E 'error:|FAIL' "$RUNNER_TEMP/ci-build-tests.log" || true
-            else
-              echo "Conductor full log was unavailable: $log_path" >&2
-            fi
+            # Every diagnostic operation is best-effort; preserve the build status.
+            (
+              log_path="$(sed -n 's/^Log:[[:space:]]*//p' "$RUNNER_TEMP/ci-build-tests-conductor.txt" | tail -n 1)"
+              if [[ -n "$log_path" && -f "$log_path" ]]; then
+                cp "$log_path" "$RUNNER_TEMP/ci-build-tests.log"
+                echo 'Compiler errors and test failures (last 200 matching lines):'
+                grep -E 'error:|FAIL' "$log_path" | tail -n 200 || true
+                echo 'Final build output (includes non-compiler gate failures):'
+                tail -n 80 "$log_path"
+              else
+                echo "Conductor full log was unavailable: $log_path" >&2
+              fi
+              python3 Scripts/ci_job_diagnostics.py build \
+                --timing-report .build/modularization/typecheck-timing.json
+            ) || true
           fi
           exit "$build_status"
 
@@ -379,8 +388,9 @@ jobs:
     env:
       ADMISSION_CONTEXT: ${{ needs.build-test-bundles.outputs.context }}
       CANDIDATE_CONTEXT: ${{ needs.candidate.outputs.context }}
-    # Standard/free Intel pool; ARM64 allocation failures must not strand integration.
-    runs-on: macos-26-intel
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    # Keep native ARM coverage and the original enforcing measurement platform.
+    runs-on: macos-26
     # One allocation/transfer, four logical shards. Each keeps its own deadline.
     # 4 * 32 minutes plus setup/receipt upload; not a larger per-suite budget.
     timeout-minutes: 140
