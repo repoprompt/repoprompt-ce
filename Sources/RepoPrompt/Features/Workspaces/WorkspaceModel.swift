@@ -546,7 +546,16 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
         composeTabs = decodedComposeTabs.tabs
         composeTabsDroppedDuringDecode = decodedComposeTabs.droppedCount
         activeComposeTabID = (try? c.decode(UUID.self, forKey: .activeComposeTabID))
-        stashedTabs = (try? c.decode([StashedTab].self, forKey: .stashedTabs)) ?? []
+        if let decodedStash = try? c.decode([StashedTab].self, forKey: .stashedTabs) {
+            stashedTabs = decodedStash
+        } else {
+            stashedTabs = []
+            // An unreadable stash is replaced by `[]` on the next save just like an unreadable
+            // compose tab, so it counts as a lossy decode (#335).
+            if c.contains(.stashedTabs), (try? c.decodeNil(forKey: .stashedTabs)) != true {
+                composeTabsDroppedDuringDecode += 1
+            }
+        }
         normalizationRequiresSave = false
         normalizeComposeTabInvariants()
     }
