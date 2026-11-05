@@ -309,9 +309,9 @@ struct AgentComposerView: View, Equatable {
 
     @FocusState var isFocused: Bool
 
-    /// The most urgent item takes focus when a session becomes active: its pending question or
-    /// approval if it has one, otherwise the composer. Only a user-started switch may end typing
-    /// in another field.
+    /// A session taking focus goes to its pending question if it has one, otherwise the composer,
+    /// including when an approval is pending. Only a user-started switch may end typing in
+    /// another field.
     private func routeActivationFocus(tabID: UUID?, overridesLiveText: Bool) {
         lastActivationRoutedTabID = tabID
         pendingInteractionHandoffTask?.cancel()
@@ -323,13 +323,13 @@ struct AgentComposerView: View, Equatable {
         }
         let store = repromptViewModel.ui.runInteraction
         store.clearPendingCardFocus()
-        guard repromptViewModel.hasPendingInteractionForFocus(tabID: tabID) else {
+        guard repromptViewModel.hasPendingQuestionForFocus(tabID: tabID) else {
             composerFocusActivationRequest = .init(overridableTextEntry: overridable)
             return
         }
         composerFocusActivationRequest = nil
         // The composer is reused across sessions, so an automated switch must also count it as
-        // live: moving someone typing there onto a card would let Return approve a command.
+        // live: moving someone typing there onto a card would interrupt them.
         store.requestPendingCardFocus(tabID: tabID, mayDeliver: { [editor = nativeComposerEditor] in
             !editor.isTextEntryActive(includingEditor: true, excepting: overridable)
         })

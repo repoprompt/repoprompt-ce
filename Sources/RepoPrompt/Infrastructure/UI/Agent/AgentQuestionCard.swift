@@ -378,7 +378,7 @@ struct AgentRequestUserInputCard: View {
             RoundedRectangle(cornerRadius: 8)
                 .stroke(Color.blue.opacity(0.3), lineWidth: 1)
         )
-        .agentPendingCardFocus(store: pendingFocusStore, tabID: pendingFocusTabID, focusTarget: firstNoteFocusTarget)
+        .agentPendingCardFocus(store: pendingFocusStore, tabID: pendingFocusTabID, focusTarget: focusFirstNote)
         .onChange(of: request.id) { _, _ in
             draftsByQuestionID = Self.makeDrafts(for: request)
         }
@@ -389,10 +389,10 @@ struct AgentRequestUserInputCard: View {
         allowsRememberedDecision || !question.isLegacyMCPToolApproval
     }
 
-    /// Answers are typed, so the first note field is the natural target when there is one.
-    private var firstNoteFocusTarget: (() -> Void)? {
-        guard let question = request.questions.first, showsNoteField(for: question) else { return nil }
-        return { focusedNoteQuestionID = question.id }
+    /// Answers are typed, so the first note field is the natural target.
+    private func focusFirstNote() {
+        guard let question = request.questions.first, showsNoteField(for: question) else { return }
+        focusedNoteQuestionID = question.id
     }
 
     private var headerSection: some View {

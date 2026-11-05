@@ -2373,12 +2373,7 @@ struct AgentModeChatDetailView: View {
             windowID: windowID,
             tabID: currentTabID,
             sessionID: currentTabID.flatMap { agentModeVM.sessions[$0]?.activeAgentSessionID },
-            runtime: AgentSessionLinkRuntimeBridge.shared.delegationScopes,
-            pendingFocusStore: runInteractionUI,
-            onResolved: { tabID in
-                guard runInteractionSnapshot.pendingInteractionFocusKey == nil else { return }
-                agentModeVM.repromptUIStore.requestComposerFocus(tabID: tabID)
-            }
+            runtime: AgentSessionLinkRuntimeBridge.shared.delegationScopes
         )
         if let request = runInteractionSnapshot.pendingCodexHookReview {
             CodexHookReviewCard(
@@ -2395,7 +2390,6 @@ struct AgentModeChatDetailView: View {
                     )
                 }
             )
-            .agentPendingCardFocus(store: runInteractionUI, tabID: currentTabID)
             .id("pendingCodexHookReview")
             .transition(.opacity)
         } else if let review = runInteractionSnapshot.pendingApplyEditsReview {
@@ -2418,7 +2412,6 @@ struct AgentModeChatDetailView: View {
                     )
                 }
             )
-            .agentPendingCardFocus(store: runInteractionUI, tabID: currentTabID)
             .id("pendingApplyEditsReview")
             .transition(.opacity)
         } else if let mergeReview = runInteractionSnapshot.pendingWorktreeMergeReview {
@@ -2441,7 +2434,6 @@ struct AgentModeChatDetailView: View {
                     )
                 }
             )
-            .agentPendingCardFocus(store: runInteractionUI, tabID: currentTabID)
             .id("pendingWorktreeMergeReview")
             .transition(.opacity)
         } else if let approval = runInteractionSnapshot.pendingApproval {
@@ -2453,7 +2445,6 @@ struct AgentModeChatDetailView: View {
                     agentModeVM.submitApprovalDecision(tabID: tabID, requestID: approval.id, decision: decision)
                 }
             )
-            .agentPendingCardFocus(store: runInteractionUI, tabID: currentTabID)
             .id("pendingApproval")
             .transition(.opacity)
         } else if let request = runInteractionSnapshot.pendingPermissionsRequest {
@@ -2461,7 +2452,6 @@ struct AgentModeChatDetailView: View {
                 guard let tabID = currentTabID else { return }
                 agentModeVM.submitPermissionsDecision(tabID: tabID, requestID: request.id, decision: decision)
             })
-            .agentPendingCardFocus(store: runInteractionUI, tabID: currentTabID)
             .id("pendingPermissions")
             .transition(.opacity)
         } else if let request = runInteractionSnapshot.pendingMCPElicitationRequest {
@@ -2472,7 +2462,6 @@ struct AgentModeChatDetailView: View {
                     agentModeVM.submitMCPElicitationResponse(tabID: tabID, requestID: request.id, response: response)
                 }
             )
-            .agentPendingCardFocus(store: runInteractionUI, tabID: currentTabID)
             .id("pendingMCPElicitation")
             .transition(.opacity)
         } else if let request = runInteractionSnapshot.pendingUserInputRequest {

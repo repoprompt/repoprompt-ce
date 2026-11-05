@@ -31,14 +31,10 @@ extension AgentModeViewModel {
         )
     }
 
-    /// Whether activating `tabID` should focus a pending question or approval, not the composer.
-    func hasPendingInteractionForFocus(tabID: UUID) -> Bool {
+    /// Whether activating `tabID` should focus its pending question instead of the composer.
+    func hasPendingQuestionForFocus(tabID: UUID) -> Bool {
         let snapshot = makeRunInteractionUISnapshot()
-        if snapshot.currentTabID == tabID, snapshot.pendingInteractionFocusKey != nil { return true }
-        let sessionID = sessions[tabID]?.activeAgentSessionID
-        let scopes = AgentSessionLinkRuntimeBridge.shared.delegationScopes
-        if !scopes.pendingRequests(forTab: tabID, sessionID: sessionID).isEmpty { return true }
-        return sessionID.map { !scopes.confirmations.pendingConfirmations(forTab: tabID, sessionID: $0).isEmpty } ?? false
+        return snapshot.currentTabID == tabID && snapshot.pendingQuestionFocusKey != nil
     }
 
     func syncRunInteractionUIState() {

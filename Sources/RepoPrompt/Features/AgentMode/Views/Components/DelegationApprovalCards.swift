@@ -22,19 +22,8 @@ struct DelegationApprovalSlot: View {
     let sessionID: UUID?
     @ObservedObject var runtime: DelegationScopeRuntime
     @ObservedObject var confirmations: BatchConfirmationCoordinator
-    private let pendingFocusStore: AgentRunInteractionUIStore
-    private let onResolved: (UUID) -> Void
 
-    init(
-        windowID: Int,
-        tabID: UUID?,
-        sessionID: UUID?,
-        runtime: DelegationScopeRuntime,
-        pendingFocusStore: AgentRunInteractionUIStore = .inertFocusSource,
-        onResolved: @escaping (UUID) -> Void = { _ in }
-    ) {
-        self.pendingFocusStore = pendingFocusStore
-        self.onResolved = onResolved
+    init(windowID: Int, tabID: UUID?, sessionID: UUID?, runtime: DelegationScopeRuntime) {
         self.windowID = windowID
         self.tabID = tabID
         self.sessionID = sessionID
@@ -118,8 +107,6 @@ struct DelegationApprovalSlot: View {
                     )
                 }
             }
-            .agentPendingCardFocus(store: pendingFocusStore, tabID: tabID)
-            .onDisappear { onResolved(tabID) }
         }
     }
 

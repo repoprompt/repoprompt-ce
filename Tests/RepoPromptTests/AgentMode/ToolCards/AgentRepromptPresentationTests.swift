@@ -612,6 +612,20 @@ private final class FocusActionCounts {
     var composerReturns = 0
 }
 
+private struct FocusTestQuestionCard: View {
+    let store: AgentRunInteractionUIStore
+    let tabID: UUID
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button("Answer") {}
+            .focusable()
+            .focused($isFocused)
+            .frame(height: 40)
+            .agentPendingCardFocus(store: store, tabID: tabID, focusTarget: { isFocused = true })
+    }
+}
+
 private struct CardHost: View {
     let store: AgentRunInteractionUIStore
     let tabID: UUID
@@ -622,14 +636,17 @@ private struct CardHost: View {
     let identity: UUID
     var counts = FocusActionCounts()
     var nativeEditor: TextFieldNativeEditor?
+    var showsApproval = false
 
     var body: some View {
         VStack {
             if showsCard {
+                FocusTestQuestionCard(store: store, tabID: tabID)
+            }
+            if showsApproval {
                 Button("Approve") { counts.approvals += 1 }
                     .keyboardShortcut(.return, modifiers: [])
                     .frame(height: 40)
-                    .agentPendingCardFocus(store: store, tabID: tabID)
             }
             CustomTextField(
                 text: .constant(draft),
@@ -717,7 +734,7 @@ final class AgentSessionActivationFocusTests: XCTestCase {
         return CardHost(
             store: root.store, tabID: root.tabID, showsCard: changes.showsCard, activation: changes.activation,
             restore: changes.restore, draft: changes.draft, identity: changes.identity,
-            counts: root.counts, nativeEditor: root.nativeEditor
+            counts: root.counts, nativeEditor: root.nativeEditor, showsApproval: root.showsApproval
         )
     }
 
@@ -904,14 +921,19 @@ final class AgentSessionActivationFocusTests: XCTestCase {
     func testFocusMovesOnOnlyWhenTheTopCardWasAnswered() {
         typealias Handoff = AgentPendingInteractionFocusHandoff
         XCTAssertEqual(Handoff.evaluate(previousKeys: ["approval:1"], keys: []), .returnToComposer)
-        XCTAssertEqual(Handoff.evaluate(previousKeys: ["approval:1"], keys: ["approval:2"]), .focusNextCard)
+        XCTAssertEqual(Handoff.evaluate(previousKeys: ["askUser:1"], keys: []), .returnToComposer)
+        XCTAssertEqual(Handoff.evaluate(previousKeys: ["input:1"], keys: ["input:2"]), .focusNextCard)
+        XCTAssertEqual(Handoff.evaluate(previousKeys: ["approval:1", "askUser:2"], keys: ["askUser:2"]), .focusNextCard)
+        XCTAssertEqual(Handoff.evaluate(previousKeys: ["approval:1"], keys: ["approval:2"]), .returnToComposer, "An approval must never take focus")
+        XCTAssertEqual(Handoff.evaluate(previousKeys: ["askUser:1"], keys: ["approval:2"]), .returnToComposer, "An approval must never take focus")
         XCTAssertEqual(
             Handoff.evaluate(previousKeys: ["askUser:1"], keys: ["approval:2", "askUser:1"]),
-            .none,
-            "A more urgent card pre-empting a question must not take focus"
+            .returnToComposer,
+            "An approval replacing a focused question must not leave Return free to approve it"
         )
+        XCTAssertEqual(Handoff.evaluate(previousKeys: ["approval:1"], keys: ["hook:2", "approval:1"]), .none)
         XCTAssertEqual(Handoff.evaluate(previousKeys: [], keys: ["approval:1"]), .none, "A card arriving mid-session must not take focus")
-        XCTAssertEqual(Handoff.evaluate(previousKeys: ["approval:1", "askUser:2"], keys: ["askUser:2"]), .focusNextCard)
+        XCTAssertEqual(Handoff.evaluate(previousKeys: [], keys: ["askUser:1"]), .none, "A card arriving mid-session must not take focus")
     }
 
     func testHandoffWaitsOnlyForTheDepartingField() async throws {
@@ -962,6 +984,26 @@ final class AgentSessionActivationFocusTests: XCTestCase {
         XCTAssertTrue(fixture.window.firstResponder === fixture.editor, "A refused delivery must leave the user's field alone")
     }
 
+    func testReusedCardTakesFocusWhenRequestAndTabChangeInOneUpdate() async throws {
+        let fixture = try makeFixture(showsCard: true)
+        XCTAssertTrue(fixture.window.makeFirstResponder(fixture.editor))
+
+        // Switching between sessions with the same kind of card reuses the view.
+        let nextTabID = UUID()
+        let root = fixture.host.rootView
+        fixture.store.requestPendingCardFocus(tabID: nextTabID)
+        fixture.host.rootView = CardHost(
+            store: root.store, tabID: nextTabID, showsCard: true, activation: nil, restore: nil,
+            draft: root.draft, identity: root.identity, counts: root.counts, nativeEditor: root.nativeEditor
+        )
+        fixture.host.layoutSubtreeIfNeeded()
+
+        try await AsyncTestWait.waitUntil("reused card took focus", timeout: 3) {
+            fixture.host.layoutSubtreeIfNeeded()
+            return fixture.window.firstResponder !== fixture.editor
+        }
+    }
+
     func testWithdrawnRequestDoesNotDeliver() async throws {
         let fixture = try makeFixture(showsCard: true)
         XCTAssertTrue(fixture.window.makeFirstResponder(fixture.editor))
@@ -992,12 +1034,6 @@ final class AgentSessionActivationFocusTests: XCTestCase {
         let counts = fixture.host.rootView.counts
         try sendReturn(fixture)
         XCTAssertEqual(counts.composerReturns, 0, "Return must not send a message while the card holds focus")
-        _ = try fixture.window.performKeyEquivalent(with: XCTUnwrap(NSEvent.keyEvent(
-            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 31,
-            windowNumber: fixture.window.windowNumber, context: nil,
-            characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36
-        )))
-        XCTAssertGreaterThanOrEqual(counts.approvals, 1, "Return must reach the card's default action")
 
         let restore = UUID()
         fixture.host.rootView = updated(fixture) {
@@ -1010,6 +1046,25 @@ final class AgentSessionActivationFocusTests: XCTestCase {
         }
         await fixture.coordinator.focusRestorationTask?.value
         XCTAssertTrue(fixture.window.firstResponder === fixture.editor, "Answering the card must return focus to the composer")
+    }
+
+    func testReturnInComposerDoesNotApproveAPendingApproval() async throws {
+        let fixture = try makeFixture()
+        let root = fixture.host.rootView
+        fixture.host.rootView = CardHost(
+            store: root.store, tabID: root.tabID, showsCard: false, activation: nil, restore: nil,
+            draft: root.draft, identity: root.identity, counts: root.counts, nativeEditor: root.nativeEditor,
+            showsApproval: true
+        )
+        fixture.host.layoutSubtreeIfNeeded()
+        XCTAssertTrue(try fixture.window.makeFirstResponder(view("readOnly", in: fixture)))
+
+        try await sendActivation(fixture, overridableTextEntry: nil)
+        XCTAssertTrue(fixture.window.firstResponder === fixture.editor, "With only an approval pending, activation focuses the composer")
+
+        try sendReturn(fixture)
+        XCTAssertEqual(root.counts.composerReturns, 1)
+        XCTAssertEqual(root.counts.approvals, 0, "Return in the composer must not approve")
     }
 
     func testCardArrivingMidSessionDoesNotTakeFocus() async throws {
@@ -1037,8 +1092,12 @@ final class AgentSessionActivationFocusTests: XCTestCase {
         XCTAssertNil(store.takePendingCardFocus(tabID: tabID))
     }
 
-    func testPendingApprovalClaimsFocusAndEachRequestHasItsOwnKey() {
-        XCTAssertNil(AgentRunInteractionUISnapshot.empty.pendingInteractionFocusKey)
+    func testOnlyQuestionsClaimFocusAndEachApprovalHasItsOwnKey() {
+        XCTAssertNil(AgentRunInteractionUISnapshot.empty.pendingQuestionFocusKey)
+        XCTAssertTrue(AgentRunInteractionUISnapshot.isQuestionFocusKey("askUser:1"))
+        XCTAssertTrue(AgentRunInteractionUISnapshot.isQuestionFocusKey("input:1"))
+        XCTAssertFalse(AgentRunInteractionUISnapshot.isQuestionFocusKey("approvalInput:1"))
+        XCTAssertFalse(AgentRunInteractionUISnapshot.isQuestionFocusKey("approval:1"))
         func approval(_ requestID: Int) -> AgentApprovalRequest {
             AgentApprovalRequest(
                 requestID: .codex(.int(requestID)),
@@ -1057,7 +1116,8 @@ final class AgentSessionActivationFocusTests: XCTestCase {
         first.pendingApproval = approval(1)
         var second = AgentRunInteractionUISnapshot.empty
         second.pendingApproval = approval(2)
-        XCTAssertNotNil(first.pendingInteractionFocusKey)
-        XCTAssertNotEqual(first.pendingInteractionFocusKey, second.pendingInteractionFocusKey)
+        XCTAssertNil(first.pendingQuestionFocusKey, "An approval must not claim focus")
+        XCTAssertEqual(first.pendingInteractionFocusKeys.count, 1)
+        XCTAssertNotEqual(first.pendingInteractionFocusKeys, second.pendingInteractionFocusKeys)
     }
 }

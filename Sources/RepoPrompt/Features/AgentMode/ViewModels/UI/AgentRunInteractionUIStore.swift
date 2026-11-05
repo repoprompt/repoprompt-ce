@@ -33,14 +33,19 @@ struct AgentRunInteractionUISnapshot: Equatable {
         runState == .running
     }
 
-    /// Identifies the question or approval that should hold focus, following the card order in
-    /// `messageRowsContent`. A merge conflict is excluded: it can stay open for a long time, and
-    /// the composer is how the user asks the agent to help resolve it.
-    var pendingInteractionFocusKey: String? {
-        pendingInteractionFocusKeys.first
+    /// The visible card, when it is a question. Only questions take focus: an approval's action
+    /// is bound to Return, so focusing it could approve by accident.
+    var pendingQuestionFocusKey: String? {
+        pendingInteractionFocusKeys.first.flatMap { Self.isQuestionFocusKey($0) ? $0 : nil }
     }
 
-    /// Every pending question or approval, most urgent first.
+    static func isQuestionFocusKey(_ key: String) -> Bool {
+        key.hasPrefix("input:") || key.hasPrefix("askUser:")
+    }
+
+    /// Every pending question or approval, most urgent first, following the card order in
+    /// `messageRowsContent`. A merge conflict is excluded: it can stay open for a long time, and
+    /// the composer is how the user asks the agent to help resolve it.
     var pendingInteractionFocusKeys: [String] {
         [
             pendingCodexHookReview.map { "hook:\($0.id)" },
@@ -49,7 +54,10 @@ struct AgentRunInteractionUISnapshot: Equatable {
             pendingApproval.map { "approval:\($0.id)" },
             pendingPermissionsRequest.map { "permissions:\($0.id)" },
             pendingMCPElicitationRequest.map { "elicitation:\($0.id)" },
-            pendingUserInputRequest.map { "input:\($0.id)" },
+            // Legacy MCP tool approvals are approvals shown as question cards.
+            pendingUserInputRequest.map { request in
+                request.questions.contains(where: \.isLegacyMCPToolApproval) ? "approvalInput:\(request.id)" : "input:\(request.id)"
+            },
             pendingAskUser.map { "askUser:\($0.id)" }
         ].compactMap(\.self)
     }
@@ -104,11 +112,15 @@ enum AgentPendingInteractionFocusHandoff: Equatable {
     case returnToComposer
     case focusNextCard
 
-    /// Focus moves on only when the card that held the top spot was answered. A more urgent card
-    /// pre-empting it must not take focus: Return meant for the question would approve a command.
+    /// Focus moves on when the visible card was answered, or when an approval replaced a question
+    /// that may have held focus. Focus goes to the next card only if it is a question, so that
+    /// Return can never reach an approval because focus was abandoned.
     static func evaluate(previousKeys: [String], keys: [String]) -> Self {
-        guard let previousTop = previousKeys.first, !keys.contains(previousTop) else { return .none }
-        return keys.isEmpty ? .returnToComposer : .focusNextCard
+        typealias Snapshot = AgentRunInteractionUISnapshot
+        guard let previousTop = previousKeys.first, keys.first != previousTop,
+              !keys.contains(previousTop) || Snapshot.isQuestionFocusKey(previousTop) else { return .none }
+        if let top = keys.first, Snapshot.isQuestionFocusKey(top) { return .focusNextCard }
+        return .returnToComposer
     }
 }
 
@@ -117,8 +129,8 @@ final class AgentRunInteractionUIStore: ObservableObject {
     var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     @Published private(set) var snapshot: AgentRunInteractionUISnapshot = .empty
 
-    /// One-shot request for a tab's pending card to take focus. A card that merely appears does
-    /// not take focus: a stray Return while typing would otherwise approve a command.
+    /// One-shot request for a tab's pending question to take focus. A card that merely appears
+    /// does not take focus, so it cannot interrupt typing.
     struct PendingCardFocusRequest: Equatable {
         let id = UUID()
         let tabID: UUID
