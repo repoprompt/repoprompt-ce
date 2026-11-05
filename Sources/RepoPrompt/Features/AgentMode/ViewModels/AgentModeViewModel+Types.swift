@@ -71,6 +71,9 @@ enum AgentSidebarThreadKey: Hashable, Equatable {
     /// An overseer's group in the Overseers tab, by tab ID. A separate namespace, so folding a group
     /// there never folds anything in the other tabs.
     case overseerGroup(UUID)
+    /// A thread folded inside the Pinned or Active tab, by tab ID. These tabs list matches, so they
+    /// start unfolded: folds made on All (and default folds) must never hide a match here.
+    case filteredThread(tab: AgentSidebarTab, tabID: UUID)
 
     static func key(sessionID: UUID?, tabID: UUID) -> AgentSidebarThreadKey {
         if let sessionID {

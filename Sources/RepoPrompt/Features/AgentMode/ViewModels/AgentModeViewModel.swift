@@ -730,6 +730,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var test_agentSessionLinkLocalInputDecoration: ((AgentSessionLinkPromptRenderResult) -> AgentSessionLinkLocalInputDecoration?)?
         /// Gates only the Read proof, retaining the production claim and synchronous handoff owners.
         var test_agentSessionLinkLocalInputReadProof: ((AgentSessionLinkLocalInputDecoration) async -> Bool)?
+        /// Routes isolated native fixtures to their real authority; final Manage fences remain production-owned.
+        var test_agentSessionLinkManagedMetadataProof: ((DomainAgentSessionLinkEndpointIdentity, [DomainAgentSessionManagedObservationRequirement]) async -> [DomainAgentSessionLinkCommitAuthorization]?)?
     #endif
 
     /// Endpoints whose prompt inventory is fenced while one or more membership writes that will change

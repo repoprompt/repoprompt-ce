@@ -51,56 +51,11 @@ struct AgentModeSessionsSidebarView: View {
     let apiSettingsVM: APISettingsViewModel
     let currentTabID: UUID?
     let onManageWorkspaces: () -> Void
+    let onNewSession: () -> Void
 
     /// Remembered per window; mirrored into the sidebar store, which owns filtering.
     @SceneStorage("agentModeSidebarTab") private var storedSidebarTab = AgentSidebarTab.all.rawValue
-    @State private var isCollapseAllThreadsButtonHovered = false
-    @State private var isCollapseAllThreadsButtonFlashing = false
-    @State private var collapseAllThreadsButtonClickTick = 0
     @ObservedObject private var fontScale = FontScaleManager.shared
-    private var fontPreset: FontScalePreset {
-        fontScale.preset
-    }
-
-    private var searchHorizontalPadding: CGFloat {
-        fontPreset.scaledClamped(8, max: 12)
-    }
-
-    private var searchVerticalPadding: CGFloat {
-        fontPreset.scaledClamped(6, max: 9)
-    }
-
-    private var searchCornerRadius: CGFloat {
-        fontPreset.scaledClamped(16, max: 20)
-    }
-
-    private var searchControlHeight: CGFloat {
-        fontPreset.scaledClamped(30, min: 30, max: 40)
-    }
-
-    private var searchIconSize: CGFloat {
-        fontPreset.scaledClamped(14, max: 18)
-    }
-
-    private var searchClearIconSize: CGFloat {
-        fontPreset.scaledClamped(12, max: 16)
-    }
-
-    private var topBarSpacing: CGFloat {
-        fontPreset.scaledClamped(4, max: 6)
-    }
-
-    private var topBarHorizontalPadding: CGFloat {
-        fontPreset.scaledClamped(8, max: 12)
-    }
-
-    private var topBarVerticalPadding: CGFloat {
-        fontPreset.scaledClamped(8, max: 11)
-    }
-
-    private var collapseButtonHitSize: CGFloat {
-        min(max(24, searchControlHeight), 32)
-    }
 
     /// Worktree indicators for the active session, keyed by logical
     /// workspace-root path. Drives the `WT <label>` capsules on bound root
@@ -123,25 +78,7 @@ struct AgentModeSessionsSidebarView: View {
             let _ = recordBodyMetric()
         #endif
         VStack(spacing: 0) {
-            // Search box at top
-            HStack(spacing: topBarSpacing) {
-                sessionSearchBox
-                    .frame(maxWidth: .infinity)
-                collapseAllThreadsButton
-            }
-            .padding(.horizontal, topBarHorizontalPadding)
-            .padding(.top, topBarVerticalPadding)
-            .padding(.bottom, topBarSpacing)
-            .animation(.easeInOut(duration: 0.15), value: agentModeVM.sidebarCollapseAllState(
-                for: promptManager.currentComposeTabs,
-                currentTabID: currentTabID,
-                searchText: sidebarUI.snapshot.searchText,
-                diagnosticSource: "sidebarTopBar.animation"
-            ))
-
-            sidebarTabPicker
-                .padding(.horizontal, topBarHorizontalPadding)
-                .padding(.bottom, topBarVerticalPadding)
+            sidebarHeader
 
             AgentModeSessionsListView(
                 agentModeVM: agentModeVM,
@@ -184,93 +121,28 @@ struct AgentModeSessionsSidebarView: View {
                 )
             )
         }
+        // The titlebar accessory owns the toggle, beside the traffic lights.
+        .toolbar(removing: .sidebarToggle)
+        .toolbar { titlebarActions }
     }
 
-    @ViewBuilder
-    private var collapseAllThreadsButton: some View {
-        let tabs = promptManager.currentComposeTabs
-        let search = sidebarUI.snapshot.searchText
-        let state = agentModeVM.sidebarCollapseAllState(
-            for: tabs,
-            currentTabID: currentTabID,
-            searchText: search,
-            diagnosticSource: "collapseAllButton.body"
-        )
-        if state != .hidden, sidebarUI.snapshot.sidebarTab != .overseers {
-            let tooltip = state == .canCollapse ? "Collapse all sub-agent threads" : "Expand all sub-agent threads"
-            Button {
-                collapseAllThreadsButtonClickTick &+= 1
-                isCollapseAllThreadsButtonFlashing = true
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                    isCollapseAllThreadsButtonFlashing = false
-                }
-                withAnimation(.easeInOut(duration: 0.15)) {
-                    switch agentModeVM.sidebarCollapseAllState(
-                        for: tabs,
-                        currentTabID: currentTabID,
-                        searchText: sidebarUI.snapshot.searchText,
-                        diagnosticSource: "collapseAllButton.action"
-                    ) {
-                    case .canCollapse:
-                        agentModeVM.collapseAllSidebarThreads(for: tabs, currentTabID: currentTabID)
-                    case .canExpand:
-                        agentModeVM.expandAllSidebarThreads(for: tabs, currentTabID: currentTabID)
-                    case .hidden:
-                        break
-                    }
-                }
-            } label: {
-                Image(systemName: state == .canCollapse ? "rectangle.compress.vertical" : "rectangle.expand.vertical")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(collapseAllThreadsButtonColor)
-                    .contentTransition(.symbolEffect(.replace.downUp))
-                    .symbolEffect(.bounce.down, value: collapseAllThreadsButtonClickTick)
-                    .frame(width: collapseButtonHitSize, height: collapseButtonHitSize)
-                    .contentShape(Rectangle())
+    /// Tabs choose the dataset; search, directly above the results, narrows it.
+    private var sidebarHeader: some View {
+        let metrics = AgentSidebarMetrics(preset: fontScale.preset)
+        return VStack(spacing: metrics.controlSpacing) {
+            AgentSidebarTabStrip(selection: sidebarUI.snapshot.sidebarTab, metrics: metrics) { selected in
+                storedSidebarTab = selected.rawValue
+                agentModeVM.setSidebarTab(selected)
             }
-            .buttonStyle(.plain)
-            .onHover { isCollapseAllThreadsButtonHovered = $0 }
-            .hoverTooltip(tooltip)
-            .accessibilityLabel(tooltip)
-            .accessibilityHint("Double tap to toggle whether sub-agent chats are shown inline or collapsed under their parent.")
-            .accessibilityAddTraits(.isButton)
-            .transition(.opacity.combined(with: .scale(scale: 0.9)))
+            AgentSidebarSearchField(
+                text: agentModeVM.sidebarSearchBinding(),
+                placeholder: sidebarUI.snapshot.sidebarTab.searchPlaceholder,
+                metrics: metrics
+            )
         }
-    }
-
-    #if DEBUG
-        private func recordBodyMetric() {
-            perfRecorder.increment("ui.body.agentSessionsSidebar")
-        }
-    #endif
-
-    private var collapseAllThreadsButtonColor: Color {
-        if isCollapseAllThreadsButtonFlashing {
-            return .accentColor
-        }
-        if isCollapseAllThreadsButtonHovered {
-            return Color(NSColor.labelColor).opacity(0.85)
-        }
-        return Color(NSColor.secondaryLabelColor).opacity(0.6)
-    }
-
-    /// All · Pinned · Active · Overseers. All is the unchanged sidebar; the others filter it.
-    private var sidebarTabPicker: some View {
-        Picker("Show", selection: Binding(
-            get: { sidebarUI.snapshot.sidebarTab },
-            set: { tab in
-                storedSidebarTab = tab.rawValue
-                agentModeVM.setSidebarTab(tab)
-            }
-        )) {
-            ForEach(AgentSidebarTab.allCases) { tab in
-                Text(tab.title).tag(tab)
-            }
-        }
-        .pickerStyle(.segmented)
-        .labelsHidden()
-        .controlSize(.small)
-        .accessibilityLabel("Show sessions")
+        .padding(.horizontal, metrics.gutter)
+        .padding(.top, metrics.topInset)
+        .padding(.bottom, metrics.bottomInset)
         .onAppear {
             let tab = AgentSidebarTab(rawValue: storedSidebarTab) ?? .all
             if tab != sidebarUI.snapshot.sidebarTab {
@@ -279,44 +151,60 @@ struct AgentModeSessionsSidebarView: View {
         }
     }
 
-    /// Search box for filtering sessions.
-    private var sessionSearchBox: some View {
-        HStack(spacing: fontPreset.scaledClamped(6, max: 8)) {
-            Image(systemName: "magnifyingglass")
-                .foregroundColor(Color(NSColor.labelColor).opacity(0.6))
-                .font(.system(size: searchIconSize))
+    /// The sidebar column's trailing titlebar cluster: list actions, then compose.
+    @ToolbarContentBuilder
+    private var titlebarActions: some ToolbarContent {
+        if #available(macOS 26.0, *) {
+            titlebarActionsGroup
+                .sharedBackgroundVisibility(.hidden)
+        } else {
+            titlebarActionsGroup
+        }
+    }
 
-            TextField("Search", text: agentModeVM.sidebarSearchBinding())
-                .textFieldStyle(PlainTextFieldStyle())
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 13))
-                .foregroundColor(Color(NSColor.labelColor))
-                .onKeyPress(.escape) {
-                    if !sidebarUI.snapshot.searchText.isEmpty {
-                        agentModeVM.clearSessionSidebarSearchText()
-                        return .handled
-                    }
-                    return .ignored
-                }
+    @ToolbarContentBuilder
+    private var titlebarActionsGroup: some ToolbarContent {
+        ToolbarItemGroup(placement: .primaryAction) {
+            let searchText = sidebarUI.snapshot.searchText
+            AgentSidebarCollapseAllButton(
+                state: agentModeVM.sidebarCollapseAllState(
+                    for: promptManager.currentComposeTabs,
+                    currentTabID: currentTabID,
+                    searchText: searchText,
+                    diagnosticSource: "collapseAllButton.body"
+                ),
+                tab: sidebarUI.snapshot.sidebarTab,
+                isSearching: !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                action: toggleAllThreads
+            )
+            AgentModeTitlebarNewSessionButton(action: onNewSession)
+        }
+    }
 
-            if !sidebarUI.snapshot.searchText.isEmpty {
-                Button(action: { agentModeVM.clearSessionSidebarSearchText() }) {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundColor(.secondary)
-                        .font(.system(size: searchClearIconSize))
-                }
-                .buttonStyle(PlainButtonStyle())
+    private func toggleAllThreads() {
+        let tabs = promptManager.currentComposeTabs
+        withAnimation(.easeInOut(duration: 0.15)) {
+            switch agentModeVM.sidebarCollapseAllState(
+                for: tabs,
+                currentTabID: currentTabID,
+                searchText: sidebarUI.snapshot.searchText,
+                diagnosticSource: "collapseAllButton.action"
+            ) {
+            case .canCollapse:
+                agentModeVM.collapseAllSidebarThreads(for: tabs, currentTabID: currentTabID)
+            case .canExpand:
+                agentModeVM.expandAllSidebarThreads(for: tabs, currentTabID: currentTabID)
+            case .unavailable:
+                break
             }
         }
-        .padding(.horizontal, searchHorizontalPadding)
-        .padding(.vertical, searchVerticalPadding)
-        .frame(minHeight: searchControlHeight)
-        .background(Color.clear)
-        .cornerRadius(searchCornerRadius)
-        .overlay(
-            RoundedRectangle(cornerRadius: searchCornerRadius)
-                .stroke(Color(NSColor.systemGray).opacity(0.75), lineWidth: 0.5)
-        )
     }
+
+    #if DEBUG
+        private func recordBodyMetric() {
+            perfRecorder.increment("ui.body.agentSessionsSidebar")
+        }
+    #endif
 }
 
 // MARK: - Sessions List
@@ -530,8 +418,17 @@ struct AgentModeSessionsListView: View, Equatable {
         fontPreset.scaledClamped(2, max: 3)
     }
 
+    /// The shared gutter: row backgrounds line up with the tab track and search field.
     private var listHorizontalPadding: CGFloat {
-        fontPreset.scaledClamped(8, max: 12)
+        AgentSidebarMetrics(preset: fontPreset).gutter
+    }
+
+    private var listMessageTextInset: CGFloat {
+        AgentSidebarMetrics(preset: fontPreset).rowTextInset
+    }
+
+    private var listMessageTrailingPadding: CGFloat {
+        AgentSidebarMetrics(preset: fontPreset).rowHorizontalPadding
     }
 
     private var showMoreHorizontalPadding: CGFloat {
@@ -683,7 +580,8 @@ struct AgentModeSessionsListView: View, Equatable {
                                 .foregroundStyle(.secondary)
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, listHorizontalPadding)
+                        .padding(.leading, listMessageTextInset)
+                        .padding(.trailing, listMessageTrailingPadding)
                         .padding(.vertical, 6)
                         .accessibilityElement(children: .combine)
                     }
@@ -693,7 +591,8 @@ struct AgentModeSessionsListView: View, Equatable {
                             .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, listHorizontalPadding)
+                            .padding(.leading, listMessageTextInset)
+                            .padding(.trailing, listMessageTrailingPadding)
                             .padding(.vertical, 8)
                     }
                     AgentSidebarKeyedRowList(
@@ -1145,12 +1044,12 @@ private struct AgentSidebarDateSectionHeader: View {
         fontScale.preset
     }
 
-    private var horizontalPadding: CGFloat {
-        fontPreset.scaledClamped(10, max: 14)
+    private var metrics: AgentSidebarMetrics {
+        AgentSidebarMetrics(preset: fontPreset)
     }
 
     private var topPadding: CGFloat {
-        isFirst ? fontPreset.scaledClamped(2, max: 3) : fontPreset.scaledClamped(14, max: 20)
+        isFirst ? metrics.firstSectionHeaderTopPadding : fontPreset.scaledClamped(14, max: 20)
     }
 
     private var bottomPadding: CGFloat {
@@ -1165,7 +1064,8 @@ private struct AgentSidebarDateSectionHeader: View {
                 .textCase(nil)
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, horizontalPadding)
+        .padding(.leading, metrics.rowTextInset)
+        .padding(.trailing, metrics.rowHorizontalPadding)
         .padding(.top, topPadding)
         .padding(.bottom, bottomPadding)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1582,6 +1482,25 @@ struct ArchivedSessionsList: View {
 
 // MARK: - Stashed Row Metrics
 
+extension AgentSidebarMetrics {
+    /// The sidebar owns the App-layer font managers; the header controls file stays free of them.
+    init(preset: FontScalePreset) {
+        gutter = preset.scaledClamped(10, max: 14)
+        rowHorizontalPadding = preset.scaledClamped(10, max: 14)
+        rowSpacing = preset.scaledClamped(8, max: 11)
+        firstSectionHeaderTopPadding = preset.scaledClamped(2, max: 3)
+        searchHeight = preset.scaledClamped(28, min: 28, max: 38)
+        trackHeight = preset.scaledClamped(26, min: 26, max: 34)
+        trackInset = preset.scaledClamped(2, min: 2, max: 3)
+        controlSpacing = preset.scaledClamped(8, max: 11)
+        titlebarToTabsGap = preset.scaledClamped(8, max: 11)
+        searchToFirstHeaderGap = preset.scaledClamped(16, max: 22)
+        searchIconSize = preset.scaledClamped(12, max: 16)
+        searchFont = preset.swiftUIFont(sizeAtNormal: 13)
+        tabFont = preset.swiftUIFont(sizeAtNormal: 12, weight: .medium)
+    }
+}
+
 extension AgentStashedSessionRowMetrics {
     /// The sidebar owns the App-layer font managers; the row file itself stays free of them.
     init(fontPreset: FontScalePreset) {
@@ -1593,6 +1512,7 @@ extension AgentStashedSessionRowMetrics {
         titlePinSpacing = fontPreset.scaledClamped(6, max: 8)
         titleVStackSpacing = fontPreset.scaledClamped(2, max: 3)
         leadingIconSize = fontPreset.scaledClamped(12, max: 15)
+        leadingIconSlotWidth = AgentSidebarMetrics.statusPlateSize
         pinIconSize = fontPreset.scaledClamped(10, max: 13)
         titleFont = fontPreset.swiftUIFont(sizeAtNormal: 13)
     }

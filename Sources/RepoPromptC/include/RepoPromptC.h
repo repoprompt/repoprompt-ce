@@ -19,6 +19,7 @@
 #include "session_catalog_sqlite.h"
 #include "startup_termination_signal.h"
 #include "string_extensions_wrapper.h"
+#include "unicode_bidi_class.h"
 #include "wildmatch.h"
 
 #endif /* REPO_PROMPT_C_H */

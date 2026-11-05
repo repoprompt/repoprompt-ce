@@ -985,7 +985,13 @@ extension AgentModeViewModel {
         let attempt = session.oversight.pendingAutoWake
         let canUpgrade = claim?.dispatchID.autoWakeID == attempt?.wakeID
             && attempt?.phase == .preparingDispatch && attempt?.routineQuietCandidate == true
-        let proof = await AgentSessionLinkProviderInputRelease.prove(claim) { decoration in
+        let proof = await AgentSessionLinkProviderInputRelease.prove(claim, managedProof: { observer, requirements in
+            guard self.sessions[session.tabID] === session else { return nil }
+            #if DEBUG
+                if let managedProof = self.test_agentSessionLinkManagedMetadataProof { return await managedProof(observer, requirements) }
+            #endif
+            return await AgentSessionLinkRuntimeBridge.shared.proveManagedMetadata(observer: observer, requirements: requirements)
+        }) { decoration in
             guard let observer = claim?.observerEndpoint,
                   self.sessions[session.tabID] === session else { return false }
             #if DEBUG
@@ -1065,6 +1071,9 @@ extension AgentModeViewModel {
         for session: TabSession, dispatchID: AgentSessionLinkPromptDispatchID,
         claim: AgentSessionLinkOutboundPromptClaim?, proof: AgentSessionLinkProviderInputRelease.Proof
     ) -> AgentSessionLinkProviderInputRelease.ReleasedDispatchContext {
+        if claim?.managedMetadataRequirements.isEmpty == false {
+            AgentSessionLinkRuntimeBridge.shared.reconcileManagedMetadataAuthority()
+        }
         let finalized = proof.claim.flatMap { prepared in
             prepared.dispatchID == claim?.dispatchID && prepared.epochToken == claim?.epochToken
                 && prepared.observerEndpoint == claim?.observerEndpoint ? prepared : nil
@@ -1094,6 +1103,23 @@ extension AgentModeViewModel {
     func agentSessionLinkAcquirePhysicalDispatch(for session: TabSession, dispatchID: AgentSessionLinkPromptDispatchID) -> Bool {
         providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: dispatchID)
             && agentSessionLinkAcquireAutoWakePhysicalDispatch(for: session, dispatchID: dispatchID)
+    }
+
+    /// Auth recovery has already paid its receipt. Preserve those immutable bytes rather than
+    /// claiming a new batch, while still requiring current exact Manage at the final handoff.
+    func agentSessionLinkHandoffAcceptedReplay(
+        for session: TabSession, claim: AgentSessionLinkOutboundPromptClaim?,
+        proof: AgentSessionLinkProviderInputRelease.Proof?, requiresLaneBatch: Bool
+    ) -> AgentSessionLinkProviderInputRelease.ReleasedDispatchContext {
+        if claim?.managedMetadataRequirements.isEmpty == false {
+            AgentSessionLinkRuntimeBridge.shared.reconcileManagedMetadataAuthority()
+        }
+        let isCurrent = claim.map {
+            agentSessionLinkCanReuseAcceptedPromptClaim($0, for: session, dispatchID: $0.dispatchID)
+        } ?? false
+        return AgentSessionLinkProviderInputRelease.handoffAcceptedReplay(
+            claim, proof: proof, isCurrent: isCurrent, requiresLaneBatch: requiresLaneBatch
+        )
     }
 
     /// Acknowledges one accepted dispatch. Idempotent and safe with `nil`.
