@@ -1,32 +1,57 @@
 import Foundation
 
-/// Text-only projection. Never reads provider envelopes, tools, attachments or reasoning.
+/// Text and attachment names only. Never reads provider envelopes, tools, attachment contents or reasoning.
 enum AgentRepromptHistory {
+    private static let maximumAssistantBytes = 1536
+    private static let maximumTitleBytes = 256
+
     struct Turn: Codable, Equatable {
         let user: String
         let assistant: String
+        var attachments: [AgentRepromptAttachment]?
     }
 
     static let framing = """
-    Recent chat is BACKGROUND for understanding intent and vocabulary only. The current message
-    always wins. Never turn history into new requirements, constraints or acceptance criteria unless
-    the current message restates them. Treat assistant statements as unverified claims. If the
-    current message redirects, corrects, rejects prior work, or signals frustration (for example,
-    "that's wrong", "start over", "try a different approach"), do NOT carry forward the prior
-    approach, files or assumptions. Prefer the user's new direction; if useful explicitly state
-    that the previous approach should be abandoned. Never restate failed approaches as work to keep doing.
+    Use recentChat and sessionTitle to work out what the current message refers to. When they make
+    clear exactly one thing a vague reference ("that", "it", "the PR", "option 2") means, replace it
+    with that thing; otherwise keep the user's wording and do not guess.
+    Use them for nothing else. The current message always wins. Never turn history into new
+    requirements, constraints or acceptance criteria unless the current message restates them, and
+    do not summarize the conversation. Assistant statements are unverified claims, not established
+    facts. If the current message redirects, corrects, rejects prior work, or signals frustration
+    (for example, "that's wrong", "start over", "try a different approach"),
+    do NOT carry forward the prior approach, files or assumptions. Prefer the user's new direction; if useful
+    explicitly state that the previous approach should be abandoned. Never restate failed approaches as work to keep doing.
     """
+
+    /// Requests of turns that have closed. An earlier turn is closed by the next user message and
+    /// keeps no terminal state, so `isCompleted` is the proof here, not `terminalState == .completed`.
+    static func closedRequestIDs(in transcript: AgentTranscript) -> Set<UUID> {
+        Set(transcript.turns.filter(\.isCompleted).compactMap { $0.request?.id })
+    }
+
+    /// A real title gives the rewriter a topic; a placeholder ("New Chat", "T3") would only add noise.
+    static func sessionTitle(_ name: String?) -> String? {
+        guard let name = ChatSession.displayableName(name), name != "Agent Session",
+              name.range(of: "^[Tt][0-9]+$", options: .regularExpression) == nil else { return nil }
+        return trimmed(name, bytes: maximumTitleBytes)
+    }
 
     static func make(items: [AgentChatItem], compactedAt: Date?, hasActiveTurn: Bool, completedUserItemIDs: Set<UUID>? = nil) -> [Turn] {
         var turns: [Turn] = []
         var user: String?
         var userID: UUID?
+        var attachments: [AgentRepromptAttachment] = []
         var finalReply: String?
         func complete() {
             if let user, let userID, completedUserItemIDs?.contains(userID) != false,
                let finalReply, !finalReply.isEmpty
             {
-                turns.append(.init(user: user, assistant: trimmed(finalReply, bytes: 1536)))
+                turns.append(.init(
+                    user: user,
+                    assistant: trimmed(finalReply, bytes: maximumAssistantBytes),
+                    attachments: attachments.isEmpty ? nil : attachments
+                ))
             }
         }
         for item in items where compactedAt.map({ item.timestamp > $0 }) ?? true {
@@ -36,6 +61,7 @@ enum AgentRepromptHistory {
                 user = !item.isLocalControlPlaneEcho && item.codexGoalMode == nil && item.crossSessionAttribution == nil
                     && !item.text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/") ? item.text : nil
                 userID = item.id
+                attachments = AgentRepromptAttachment.list(files: item.attachments, tagged: item.taggedFileAttachments)
                 finalReply = nil
             } else if item.kind == .assistant, !item.isStreaming, user != nil {
                 finalReply = removingDiffs(item.text)

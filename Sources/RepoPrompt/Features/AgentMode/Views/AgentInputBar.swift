@@ -310,7 +310,7 @@ struct AgentComposerView: View, Equatable {
 
     private func flushDraftOnDeparture(tabID: UUID) {
         guard AgentRepromptUIStore.shouldFlushDraftOnDeparture(
-            tabID: tabID, presentation: repromptStore.presentation, publication: repromptStore.draftUpdate,
+            tabID: tabID, presentation: repromptStore.presentations[tabID], publication: repromptStore.draftUpdate,
             acknowledged: acknowledgedRepromptPublicationsByTab[tabID]
         ) else { return }
         actions.storeDraft(tabID, localInputText, acknowledgedDraftRestorationSequenceByTab[tabID] ?? 0)
@@ -409,7 +409,15 @@ struct AgentComposerView: View, Equatable {
     }
 
     private var repromptPresentation: AgentRepromptUIStore.Presentation? {
-        repromptStore.presentation.flatMap { $0.sourceTabID == currentTabID ? $0 : nil }
+        currentTabID.flatMap { repromptStore.presentations[$0] }
+    }
+
+    /// Set once the visible composer shows the text to auto-send. A rewrite that finished in a
+    /// session not on screen waits here until its composer is back and has loaded that text.
+    private var repromptAutoSendReadyID: UUID? {
+        guard let request = currentTabID.flatMap({ repromptStore.autoSendRequests[$0] }),
+              request.text == localInputText else { return nil }
+        return request.operationID
     }
 
     private var repromptUndoRecovery: AgentRepromptUIStore.Recovery? {
@@ -631,13 +639,12 @@ struct AgentComposerView: View, Equatable {
             // @Published delivers before the stored property changes; acknowledge the incoming revision.
             acknowledgedRepromptPublicationsByTab[update.tabID] = update.identity
         }
-        .task(id: repromptStore.autoSendRequest?.operationID) { @MainActor in
+        .task(id: repromptAutoSendReadyID) { @MainActor in
             // Submit after publication commits, never reentrantly inside @Published.willSet.
             // Automatic mode sends the operation-owned draft, not a possibly older native
             // streaming chunk. Native edits already revoke the operation before mutation.
             await Task.yield()
-            guard !Task.isCancelled, let request = repromptStore.autoSendRequest,
-                  request.tabID == currentTabID,
+            guard !Task.isCancelled, let tabID = currentTabID, let request = repromptStore.autoSendRequests[tabID],
                   let viewModel = repromptViewModel,
                   viewModel.consumeRepromptAutoSend(
                       request, tabID: currentTabID, visibleDraft: localInputText,

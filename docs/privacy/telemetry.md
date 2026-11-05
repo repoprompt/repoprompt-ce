@@ -79,8 +79,10 @@ Claude run-event telemetry remains separate and cannot authorize usage collectio
 ## Agent Mode Re-prompt (model requests, not telemetry)
 
 Re-prompt v2 is off by default and enabled separately in each window. With consent, the first Send
-sends eligible local composer text, rewrite guidance and a bounded manifest (root names and selected
-relative paths) to the resolved **Re-prompt model**, independently of the primary Oracle. Default resolution
+sends eligible local composer text, rewrite guidance and the names and kinds of files attached to the
+draft (up to 20: attachment file names and tagged relative paths) to the resolved **Re-prompt model**,
+independently of the primary Oracle. No repository manifest is collected: workspace root names and untagged
+selected paths are not added to the request, though your text, the session title and tagged paths may contain such names. Default resolution
 prefers connected native Claude Code / Codex subscriptions, matching the current agent's provider
 when possible, then the other subscription, then configured fast API tiers (Sonnet 5.5,
 GPT-6.1 Sol Low, Gemini 3 Flash), then none. No arbitrary catalog-first or primary Oracle fallback
@@ -91,22 +93,23 @@ billing routes. Explicit models never fall back. A call freezes its billing rout
 and billing terms apply; do not send secrets you do not want that recipient to receive.
 
 **Include recent chat context** is on by default and persisted in the selected Agent Models
-profile (available in Settings and the pill's right-click menu). Only sessions with at least two prior completed user turns may send excerpts:
-the last up to three prior user bubble texts (the rewritten text when applicable) and each turn's
-final assistant reply, trimmed to approximately 1.5 KiB retaining start and end. The serialized
-excerpt budget is 8 KiB; oldest turns are dropped first. Only post-compaction turns qualify.
-Tool calls/results, thinking, diffs, attachment payloads and system/workflow envelopes are excluded.
+profile (available in Settings and the pill's right-click menu). Only sessions with at least two prior closed user turns may send excerpts:
+the last up to three prior user bubble texts (the rewritten text when applicable), the names and kinds
+of files sent in each, and each turn's final assistant reply, trimmed to approximately 1.5 KiB retaining start and end. The serialized excerpt budget is 8 KiB;
+oldest turns are dropped first. Only post-compaction turns qualify. The same setting sends the session
+title, unless it is still an automatic placeholder.
+Tool calls/results, thinking, diffs, attachment contents and system/workflow envelopes are excluded.
 The strip says **with chat context** when excerpts are actually used. Fixed, non-editable framing
-makes history background for vocabulary/intent only: the current message always wins, assistant
+limits history to resolving what the current message refers to: the current message always wins, assistant
 claims are unverified, and corrections/redirections must abandon rather than perpetuate failed
 approaches. Turn history never creates new requirements unless the current message restates them.
 
 Calls are stateless and tool-less: **no Oracle consults, Context Builder, repository file contents,
-git review packaging or selection mutations**. Composer attachments/tagged files are preserved
-locally but their payloads are not sent to the rewriter. Transient Before sending questions are not
+git review packaging or selection mutations**. Attachment and tagged-file contents are not sent to
+the rewriter, only their names and kinds. Transient Before sending questions are not
 provider-history rows. Substantive answers may cause one refinement from original text plus answers;
-skipping questions does not refine. Versioned disclosure receipts cover the recipient and recent-
-chat exposure. First enable shows a concise recipient, payload, retention/billing and automation summary;
+skipping questions does not refine. Versioned disclosure receipts cover the recipient, attachment
+names and recent-chat exposure. First enable shows a concise recipient, payload, retention/billing and automation summary;
 operating instructions are expandable rather than a blocking wall of text.
 
 The brief streams into the existing composer, read-only during preparation. **Review before
@@ -120,7 +123,9 @@ one-shot when the pill is off), using current edited text or the first original 
 The header retains that first original inline. Esc cancels streaming or reverts a completed draft;
 the edited rewrite stays available through undo/recovery. Send original is available immediately as an explicit second Send action through
 fresh-claim admission. Cancel/Esc restores the original; Undo preserves the edited brief in the local
-recovery banner. Invalidation (tab/target/settings changes or Stop) also restores the original when
+recovery banner. Switching sessions does not interrupt a rewrite: each session has its own preparation,
+which keeps streaming into its own draft, and Send automatically waits to dispatch until you return to
+that session. Invalidation (target/settings changes, closing the session or Stop) restores the original when
 the composer is still operation-owned. New edits stay intact with explicit Restore original / Keep
 rewrite choices, rather than silently starting another rewrite from generated output. Truncated output
 is recoverable but cannot be sent as a successful preparation.
