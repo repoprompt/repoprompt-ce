@@ -26,7 +26,7 @@ struct CodexComputerUseSetupStatusView: View {
                         .controlSize(.small)
                 }
                 Button(isRechecking ? "Checking…" : "Re-check") {
-                    Task { await recheck() }
+                    Task { await recheck(forceRefresh: true) }
                 }
                 .controlSize(.small)
                 .disabled(isRechecking)
@@ -35,7 +35,7 @@ struct CodexComputerUseSetupStatusView: View {
         .padding(10)
         .background(Color.secondary.opacity(0.06))
         .cornerRadius(6)
-        .task { await recheck() }
+        .task { await recheck(forceRefresh: false) }
     }
 
     private func checkRow(_ check: CodexComputerUseSetupStatus.Check) -> some View {
@@ -70,14 +70,14 @@ struct CodexComputerUseSetupStatusView: View {
     }
 
     @MainActor
-    private func recheck() async {
+    private func recheck(forceRefresh: Bool) async {
         isRechecking = true
         defer { isRechecking = false }
         status = .evaluate(
             companionPath: CodexNativeSessionController.computerUseClientPath(),
             runtimeMessage: CodexComputerUseWorkflow.checkingRuntimeMessage
         )
-        let runtimeMessage = await CodexComputerUseWorkflow.checkConfiguredRuntimeRequirement()
+        let runtimeMessage = await CodexComputerUseWorkflow.checkConfiguredRuntimeRequirement(forceRefresh: forceRefresh)
         status = .evaluate(
             companionPath: CodexNativeSessionController.computerUseClientPath(),
             runtimeMessage: runtimeMessage

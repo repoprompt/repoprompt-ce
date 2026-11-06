@@ -162,8 +162,8 @@ enum CodexComputerUseWorkflow {
     }
 
     @MainActor
-    static func checkConfiguredRuntimeRequirement() async -> String? {
-        await admissionPreflight.check()
+    static func checkConfiguredRuntimeRequirement(forceRefresh: Bool = false) async -> String? {
+        await admissionPreflight.check(forceRefresh: forceRefresh)
     }
 
     @MainActor
@@ -189,7 +189,8 @@ enum CodexComputerUseWorkflow {
     }
 
     /// Cache successful admission for the immutable launch selection. Failed checks
-    /// retry only on explicit arming; synchronous UI reads never probe or hash files.
+    /// retry on arming or setup loading; explicit setup re-checks also refresh success.
+    /// Synchronous UI reads never probe or hash files.
     /// Spawn independently revalidates the executable even after cached admission.
     @MainActor
     final class RuntimeAdmissionPreflight {
@@ -211,8 +212,10 @@ enum CodexComputerUseWorkflow {
             _ = beginCheck()
         }
 
-        func check() async -> String? {
-            if hasResult, message == nil { return nil }
+        func check(forceRefresh: Bool = false) async -> String? {
+            // Join an active refresh before considering the previous successful result.
+            if let pending { return await pending.value }
+            if !forceRefresh, hasResult, message == nil { return nil }
             return await beginCheck().value
         }
 

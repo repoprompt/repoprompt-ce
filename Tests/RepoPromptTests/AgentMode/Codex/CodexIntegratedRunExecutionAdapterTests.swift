@@ -151,6 +151,79 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
         XCTAssertEqual(loads, 2, "Successful admission must not repeatedly resolve or hash the runtime")
     }
 
+    func testSetupRecheckRefreshesSuccessfulAdmissionAndPublishesRuntimeChanges() async {
+        var loads = 0
+        var runtimeMessage: String?
+        let probe = CodexComputerUseWorkflow.RuntimeAdmissionPreflight {
+            loads += 1
+            return runtimeMessage
+        }
+        let initial = await probe.check()
+        XCTAssertNil(initial)
+
+        // The selected executable can be removed or re-signed without changing its path.
+        runtimeMessage = CodexComputerUseWorkflow.runtimeRequirementMessage
+        let cached = await probe.check()
+        XCTAssertNil(cached)
+        XCTAssertEqual(loads, 1, "Ordinary admission should still reuse successful checks")
+
+        let changed = await probe.check(forceRefresh: true)
+        XCTAssertEqual(changed, runtimeMessage)
+        XCTAssertEqual(probe.cachedMessage, runtimeMessage)
+        XCTAssertEqual(loads, 2, "Setup re-check must not reuse cached success")
+        probe.startIfNeeded()
+        XCTAssertEqual(loads, 2, "Synchronous UI reads must not trigger another probe")
+
+        runtimeMessage = nil
+        let repaired = await probe.check(forceRefresh: true)
+        XCTAssertNil(repaired)
+        XCTAssertNil(probe.cachedMessage)
+        let admitted = await probe.check()
+        XCTAssertNil(admitted)
+        XCTAssertEqual(loads, 3, "A repaired runtime should be cached again")
+    }
+
+    func testSetupRechecksAndAdmissionSharePendingRefreshInsteadOfCachedSuccess() async throws {
+        var loads = 0
+        var release: CheckedContinuation<String?, Never>?
+        let probe = CodexComputerUseWorkflow.RuntimeAdmissionPreflight {
+            loads += 1
+            if loads == 1 { return nil }
+            return await withCheckedContinuation { release = $0 }
+        }
+        let initial = await probe.check()
+        XCTAssertNil(initial)
+        let refresh = Task { await probe.check(forceRefresh: true) }
+        defer { release?.resume(returning: nil) }
+        try await AsyncTestWait.waitUntil("setup refresh reaches suspended load", timeout: 3) { release != nil }
+
+        var refreshCallerEntered = false
+        let coalesced = Task {
+            refreshCallerEntered = true
+            return await probe.check(forceRefresh: true)
+        }
+        var admissionCallerEntered = false
+        let admission = Task {
+            admissionCallerEntered = true
+            return await probe.check()
+        }
+        try await AsyncTestWait.waitUntil("both callers join the pending refresh", timeout: 3) {
+            refreshCallerEntered && admissionCallerEntered
+        }
+        XCTAssertEqual(loads, 2, "Concurrent requests must share one signature probe")
+        release?.resume(returning: CodexComputerUseWorkflow.runtimeRequirementMessage)
+        release = nil
+
+        let refreshed = await refresh.value
+        let coalescedResult = await coalesced.value
+        let admissionResult = await admission.value
+        XCTAssertEqual(refreshed, CodexComputerUseWorkflow.runtimeRequirementMessage)
+        XCTAssertEqual(coalescedResult, refreshed)
+        XCTAssertEqual(admissionResult, refreshed, "Admission must not bypass an active refresh with stale success")
+        XCTAssertEqual(probe.cachedMessage, refreshed)
+        XCTAssertEqual(loads, 2)
+    }
+
     func testPreflightUsesCapturedInterpreterEnvironmentAndChecksSignatureOffMain() async throws {
         let bin = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
