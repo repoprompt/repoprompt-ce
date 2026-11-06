@@ -1166,7 +1166,7 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
             resolveSpawnParentSourceTabID: { _ in nil },
             resolveSpawnParentSessionID: { _, _ in nil },
             withHeartbeat: { _, _, _, _, operation in try await operation() },
-            startRun: { target, message, metadata, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, _, _, _, _, _ in
+            startRun: { target, message, metadata, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, _, _, _, _, _, expiry in
                 if let resumeValueBeforeStartFailure {
                     // Exercise the production control activation/configuration path. A newer
                     // resume is accepted while the old start is waiting to dispatch its prompt.
@@ -1185,7 +1185,8 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
                                 "model_parameters": self.request([("effort", resumeValueBeforeStartFailure)])
                             ])
                             throw MCPError.internalError("Injected provider start failure.")
-                        }
+                        },
+                        startExpiry: expiry
                     )
                 }
                 try beforeStartFailure?(agentModeVM, target.tabID)
