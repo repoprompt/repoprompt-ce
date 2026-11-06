@@ -1,7 +1,7 @@
 import Foundation
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 @testable import RepoPromptApp
-import RepoPromptClaudeProvider
 import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptFoundation
@@ -650,7 +650,7 @@ final class ClaudeContextWindowCapLifecycleTests: XCTestCase {
         XCTAssertTrue(estimator.finalizeTurn(promptTokens: used, completionTokens: 10, contextUsedTokens: nil, session: session))
     }
 
-    private func runtimeInit(cap: Int?) -> ClaudeNativeProcessSessionController.Event {
+    private func runtimeInit(cap: Int?) -> NativeAgentRuntimeEvent {
         .runtimeInit(.init(sessionID: nil, tools: [], mcpServerStatuses: [:], initializeResponse: nil, autoCompactWindowTokens: cap))
     }
 

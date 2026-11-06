@@ -1,6 +1,5 @@
 import Foundation
 import RepoPromptAgentProviderContracts
-import RepoPromptClaudeProvider
 import RepoPromptDomainRuntime
 import RepoPromptProcess
 import RepoPromptProviderQuota
@@ -540,14 +539,14 @@ final class ClaudeIntegratedAgentModeRunner {
             }
         }
 
-        func strongest(_ current: ClaudeNativeProcessSessionController.TurnStatus, _ next: ClaudeNativeProcessSessionController.TurnStatus) -> ClaudeNativeProcessSessionController.TurnStatus {
+        func strongest(_ current: NativeAgentRuntimeTurnStatus, _ next: NativeAgentRuntimeTurnStatus) -> NativeAgentRuntimeTurnStatus {
             switch (current, next) {
             case (.failed, _), (_, .failed): .failed
             case (.cancelled, _), (_, .cancelled): .cancelled
             default: .completed
             }
         }
-        var completedProtectedStatuses: [UUID: ClaudeNativeProcessSessionController.TurnStatus] = [:]
+        var completedProtectedStatuses: [UUID: NativeAgentRuntimeTurnStatus] = [:]
         var abandonedProtectedIDs: Set<UUID> = []
         eventLoop: while let item = await next() {
             guard session.runID == runID,

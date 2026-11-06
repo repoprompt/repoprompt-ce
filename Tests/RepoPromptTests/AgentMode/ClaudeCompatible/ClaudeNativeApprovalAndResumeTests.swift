@@ -1416,7 +1416,7 @@ final class ClaudeNativeRunnerSettlementTests: XCTestCase {
 
     @MainActor
     func testRunnerRetainsStrongestUnprotectedOutcomeAcrossCompletionOrders() async throws {
-        typealias Status = ClaudeNativeProcessSessionController.TurnStatus
+        typealias Status = NativeAgentRuntimeTurnStatus
         let cases: [(Status, Status, Status)] = [
             (.failed, .completed, .failed), (.completed, .failed, .failed),
             (.cancelled, .completed, .cancelled), (.completed, .cancelled, .cancelled),
@@ -1447,7 +1447,7 @@ final class ClaudeNativeRunnerSettlementTests: XCTestCase {
 
     @MainActor
     func testRunnerExcludesProtectedPredecessorOutcomesFromAggregate() async throws {
-        let predecessorStatuses: [ClaudeNativeProcessSessionController.TurnStatus] = [.failed, .cancelled]
+        let predecessorStatuses: [NativeAgentRuntimeTurnStatus] = [.failed, .cancelled]
         for explicitlyProtected in [true, false] {
             for predecessorStatus in predecessorStatuses {
                 let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })

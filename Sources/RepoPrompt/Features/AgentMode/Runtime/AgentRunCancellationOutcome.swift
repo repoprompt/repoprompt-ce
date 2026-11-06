@@ -14,6 +14,10 @@ struct AgentRunStopState {
     private(set) var managedStopCleanupStarted = false
     private(set) var managedStopClaimedAt: Date?
 
+    /// The single managed-stop bound: a claimed stop whose teardown outlives this deadline is
+    /// retired. Provider-switch forcing waits on the same source, never a second number.
+    static let managedStopDeadlineSeconds: TimeInterval = 30
+
     mutating func invalidateScheduledStarts() {
         cancellationGeneration = UUID()
         cancellationCount &+= 1
@@ -68,7 +72,7 @@ struct AgentRunStopState {
         binding: AgentPersistentSessionBindingIdentity?,
         runIsTerminal: Bool = false,
         now: Date = Date(),
-        deadlineSeconds: TimeInterval = 30
+        deadlineSeconds: TimeInterval = managedStopDeadlineSeconds
     ) -> Bool {
         guard activeManagedStopID != nil, activeManagedStopBinding == binding else { return false }
         let startedTeardownTimedOut = runIsTerminal && managedStopCleanupStarted

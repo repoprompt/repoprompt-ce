@@ -1098,6 +1098,14 @@ extension AgentModeViewModel {
         return released
     }
 
+    /// Shared physical boundary used by native Codex (including fallback/auth replay), Claude,
+    /// ACP and headless callers. Keep switch proof before the existing wake acquisition.
+    @discardableResult
+    func agentSessionLinkAcquirePhysicalDispatch(for session: TabSession, dispatchID: AgentSessionLinkPromptDispatchID) -> Bool {
+        providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: dispatchID)
+            && agentSessionLinkAcquireAutoWakePhysicalDispatch(for: session, dispatchID: dispatchID)
+    }
+
     /// Auth recovery has already paid its receipt. Preserve those immutable bytes rather than
     /// claiming a new batch, while still requiring current exact Manage at the final handoff.
     func agentSessionLinkHandoffAcceptedReplay(
@@ -1132,6 +1140,7 @@ extension AgentModeViewModel {
         context: AgentSessionLinkDispatchContext?,
         claim: AgentSessionLinkOutboundPromptClaim?
     ) {
+        providerSwitchRecordPhysicalAcceptance(session: session, context: context)
         guard context?.isPeriodic == true else {
             acceptAgentSessionLinkPromptClaim(claim)
             return

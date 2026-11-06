@@ -512,9 +512,12 @@ final class WorkspaceCodemapGraphIncrementalIndexTests: XCTestCase {
         }
         let rootURL = try repository.makeRepository(named: "root", files: repositoryFiles)
         addTeardownBlock { repository.cleanup() }
+        let authorityRejections = CodemapLockedValues<String>()
         let service = WorkspaceCodemapRootCapabilityService(
             namespaceSalt: Data(repeating: 0x6C, count: GitBlobRepositoryNamespace.saltByteCount),
-            hooks: .none
+            hooks: WorkspaceCodemapRootCapabilityServiceHooks(sourceAuthorityRejected: {
+                authorityRejections.append(String(describing: $0))
+            })
         )
         let request = WorkspaceCodemapRootCapabilityRequest(
             rootID: UUID(),
@@ -560,7 +563,10 @@ final class WorkspaceCodemapGraphIncrementalIndexTests: XCTestCase {
                 )
                 for (index, path) in livePaths.enumerated() {
                     let identity = try harness.makeIdentity(fileID: harness.fileID(index, lane: 0x50), path: path)
-                    let authority = try XCTUnwrap(authorities[index])
+                    let authority = try XCTUnwrap(
+                        authorities[index],
+                        "Source authority rejected for mode=\(mode), liveCount=\(seededLiveCount), index=\(index): \(authorityRejections.values)"
+                    )
                     let expectation = try XCTUnwrap(WorkspaceCodemapSourceExpectation.cleanGitBlob(
                         bindingIdentity: identity,
                         locatorIdentity: locator,
@@ -698,6 +704,8 @@ final class WorkspaceCodemapGraphIncrementalIndexTests: XCTestCase {
         // The gate never opens on its own: a pause ends only through a flush or cancellation.
         let gate = CodemapGraphIndexGate()
         await gate.close()
+        let followingPages = CodemapGraphIndexGate()
+        await followingPages.close()
         let pauses = CodemapLockedValues<UInt64>()
         let fixture = try CodemapStoreFixture(
             name: #function,
@@ -705,6 +713,18 @@ final class WorkspaceCodemapGraphIncrementalIndexTests: XCTestCase {
                 maximumGraphIndexCatalogPageEntryCount: 1,
                 maximumGraphIndexBatchCandidateCount: 1
             ),
+            catalogTransform: { client in
+                WorkspaceCodemapBindingCatalogClient(
+                    client.resolveManifestBinding,
+                    readGraphIndexCatalogPage: { request in
+                        if request.cursor != nil { await followingPages.pass() }
+                        return await client.readGraphIndexCatalogPage(request)
+                    },
+                    revalidateGraphIndexCatalogToken: client.revalidateGraphIndexCatalogToken,
+                    publishMarkerReadiness: client.publishMarkerReadiness,
+                    reportRootAuthorityInvalidated: client.reportRootAuthorityInvalidated
+                )
+            },
             graphPullPause: WorkspaceCodemapGraphPullPause { applyNanoseconds in
                 pauses.append(applyNanoseconds)
                 await gate.pass()
@@ -713,6 +733,7 @@ final class WorkspaceCodemapGraphIncrementalIndexTests: XCTestCase {
         let store = fixture.makeStore()
         addTeardownBlock {
             await gate.open()
+            await followingPages.open()
             await fixture.shutdown()
             repository.cleanup()
         }
@@ -722,13 +743,9 @@ final class WorkspaceCodemapGraphIncrementalIndexTests: XCTestCase {
         let engine = try fixture.runtime().bindingEngine()
         let rootEpoch = try await waitForGraphIndexRoot(engine: engine, rootID: loaded.id)
 
-        // Hold further pages until the pull loop has committed and entered the gated pause, so
-        // the completing publication provably arrives while the loop is paused.
-        let hold = await engine.debugAcquireGraphIndexAdmissionHold(
-            rootEpoch: rootEpoch,
-            expiresAfterMilliseconds: 600_000
-        )
-        let holdID = try XCTUnwrap(hold?.holdID)
+        // Admit the first page before holding later pages. A root-wide admission hold here
+        // can prevent the first publication itself, leaving this test waiting for a pause
+        // that cannot occur until the hold is released. The catalog gate fixes that order.
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .seconds(30))
         while pauses.values.isEmpty, clock.now < deadline {
@@ -737,8 +754,8 @@ final class WorkspaceCodemapGraphIncrementalIndexTests: XCTestCase {
         XCTAssertFalse(pauses.values.isEmpty, "The pull loop must be paused before indexing completes")
         let completedBeforePause = await engine.accounting().graphIndexRoots
             .first { $0.rootEpoch == rootEpoch }?.phase == .complete
-        XCTAssertFalse(completedBeforePause, "The admission hold must keep indexing incomplete")
-        _ = await engine.debugReleaseGraphIndexAdmissionHold(holdID, rootEpoch: rootEpoch)
+        XCTAssertFalse(completedBeforePause, "The following-page gate must keep indexing incomplete")
+        await followingPages.open()
 
         let completed = try await waitForGraphCompletion(engine: engine, rootID: loaded.id)
         XCTAssertEqual(completed.progress.counts.processedCandidateCount, UInt64(fileCount))
@@ -756,7 +773,9 @@ final class WorkspaceCodemapGraphIncrementalIndexTests: XCTestCase {
 
     private func waitForGraphIndexRoot(
         engine: WorkspaceCodemapBindingEngine,
-        rootID: UUID
+        rootID: UUID,
+        file: StaticString = #filePath,
+        line: UInt = #line
     ) async throws -> WorkspaceCodemapRootEpoch {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .seconds(30))
@@ -767,13 +786,17 @@ final class WorkspaceCodemapGraphIncrementalIndexTests: XCTestCase {
             }
             try await Task.sleep(for: .milliseconds(5))
         }
+        let roots = await engine.accounting().graphIndexRoots
+        XCTFail("CODEMAP-INDEX-ROOT-TIMEOUT rootID=\(rootID) roots=\(roots)", file: file, line: line)
         throw CodemapGraphIndexHarnessError.timedOut
     }
 
     private func waitForGraphCompletion(
         engine: WorkspaceCodemapBindingEngine,
         rootID: UUID,
-        excluding excludedRootEpoch: WorkspaceCodemapRootEpoch? = nil
+        excluding excludedRootEpoch: WorkspaceCodemapRootEpoch? = nil,
+        file: StaticString = #filePath,
+        line: UInt = #line
     ) async throws -> WorkspaceCodemapBindingEngineGraphIndexRootAccounting {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .seconds(30))
@@ -788,6 +811,8 @@ final class WorkspaceCodemapGraphIncrementalIndexTests: XCTestCase {
             }
             try await Task.sleep(for: .milliseconds(25))
         }
+        let roots = await engine.accounting().graphIndexRoots
+        XCTFail("CODEMAP-INDEX-COMPLETION-TIMEOUT rootID=\(rootID) excluded=\(String(describing: excludedRootEpoch)) roots=\(roots)", file: file, line: line)
         throw CodemapGraphIndexHarnessError.timedOut
     }
 

@@ -1384,13 +1384,65 @@ moved to `RepoPromptClaudeProviderTests` were refreshed from main's updated
 versions; the registry ownership tests now assert the single-snapshot contract
 instead of the retired remote/stored cache split.
 
-**Aggregate effect vs `main`.** 606 files, +22,730/−12,639. App-target Swift
-lines 675,919 → 645,048 (−30,871); index wrong-way file edges 1,048 → 947; app
-files over 2,000 lines 47 → 43 (both ratchets lowered in this PR); shared
-accessor uses 1,444 → 1,427; largest cycle 67 → 66; `Infrastructure/AI` source
-files 156 → 120. `modules.json` carries the six new target rows and placement
-rules; the import-check matrix and per-target guardrails cover them.
+**Aggregate effect against merged main `3fd8a9027`.** The integration snapshot
+is parent `b9500dea0` plus main `3fd8a9027` and the review remediation described
+here (final publication SHA and receipts are in PR #1642): 616 files,
++23,202/−12,706; net +10,496 lines. App-target Swift lines
+681,246 → 650,378 (−30,868). This is relocation out of the app target, not a
+net reduction in aggregate implementation. `modules.json` carries six new target
+rows and placement rules; the import-check matrix and per-target guards cover them.
 
-**Receipts.** Recorded in the PR body: coordinated `swift-build --product all`
-(ticket `m8-merge-build-7`), full root test suite, `RepoPromptAgentProviders`
-package tests, `make guardrails`, format/lint.
+**Separate lexical and compiler-index evidence.** The earlier 1,048 → 947
+wrong-way-file-edge comparison is a lexical/source-layout metric, **not** a
+compiler-index result. At head `b9500dea0`, CI run `42233157014`, build job
+`127945262805`, recorded **1,268 measured wrong-way edges (ceiling 1,360)** and
+**largest cycle 63 measured components (ceiling 66)**. This is not a before/after
+comparison. This older receipt does not validate the subsequent `3fd8a9027` merge
+plus review fixes; final-head results are recorded separately in PR #1642.
+A stale or freshness-unproven graph is not a pass.
+The 47 → 43 large-file threshold and 89 → 87 shared-declaration threshold are
+separate source ratchets. No compiler-index ceiling was raised.
+
+**Not only a move: shared process I/O.** `CLIProcessRunner` also contains a real
+nonstreaming I/O rewrite: concurrent `ShellOutputCapture` output readers,
+DispatchIO-owned stdin, a bounded post-exit drain, and coordinated cancellation
+cleanup replace the previous blocking-file-handle path. The streaming hook API
+was reconciled with #1580. At M8 head `b9500dea0`, the file was byte-identical to #1415 head
+`e8a86685c` (blob `8faa24a4e74ca2e634a70781d0d6bb93c1570f61`). Shared presence
+in two PRs is neither a pure-move claim nor evidence of unchanged runtime behavior.
+
+**Validation boundaries.** Detailed command/ticket/head receipts and failure
+attribution are recorded in draft PR #1642. At `b9500dea0`, hosted CI and Xcode
+passed, while the complete local suite had 8,338 passes, one source-authority
+failure, and 16 skips. Its focused CodeMap follow-up had 10 passes and a different
+graph-completion timeout. At revision `b9500dea0`, these failures are
+`WorkspaceCodemapGraphIncrementalIndexTests.testPathScopedReconcileWorkIsIndependentOfLiveLayerSize`
+(line 563) and `testGraphIndexCompletionImpliesGraphCoverageWhilePullLoopIsPaused`
+(the `waitForGraphCompletion` throw at line 791). They are not failures in
+`CodemapAutomaticSelectionGraphNativeTests`; #1415's cited synchronization repair
+does not modify these tests. Hosted root shards executed the class; Xcode validation
+is not a test result. Hosted green does not clear the local failures. Their causes
+remain unresolved for those historical observations. The review diagnostic run
+(`4f12794b`, 242 passed / 1 failed) exposed a separate setup-ordering
+problem in the completion test's setup: its root-wide admission hold can prevent
+the first graph publication, yet the test waits for that publication's pull pause
+before releasing the hold. The test now admits page one and gates following catalog
+pages until the pause is observed, preserving the coverage assertions and deadlines.
+This repairs that observed setup ordering; it does not establish the cause of the
+historical completion timeout or nil token. The revised class passed all 11 tests
+(ticket `f4a526a0`; completion 5.123s, token issuance 6.204s). Failure records now
+retain the authority rejection reason and timed-out root state for future attribution.
+
+**Missing milestone performance evidence.** A matched before/after focused-build
+comparison has **not** been performed. Existing conductor durations span different
+source/cache states and shared-host load, so they are not a valid comparison and
+support no speedup claim. Acceptance remains open until an identical focused
+product/target workload is measured on the pre-extraction and extracted trees with
+matched toolchain, cache policy and host conditions. This repair does not substitute
+unmatched timings or queue time for that experiment.
+
+**Unperformed assembled/live validation.** No visible app launch/relaunch,
+credentialed live-provider journey, or local release/packaged-provider smoke was
+performed. Module/focused tests and hosted Sentry packaging do not establish those
+assembled runtime behaviors. They require separate approval and matching artifact
+receipts; #1404 acceptance remains pending.
