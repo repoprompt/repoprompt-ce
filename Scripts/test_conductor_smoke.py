@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -25,6 +26,30 @@ BLOCKED_BY_STALE = (
     'Workspace switch to "repoprompt-ce" is blocked by a stale switch to "other" '
     "(reason: restore, phase: restoring state, total age: 61.0s, phase age: 60.0s).\n"
 )
+
+
+class LaunchProfileEnvironmentTests(unittest.TestCase):
+    def test_fixed_home_is_forwarded_only_when_the_caller_sets_it(self) -> None:
+        registry = conductor.OperationRegistry(SCRIPT_DIR.parent)
+        for fixed_home in [None, "/tmp/conductor-isolated-profile"]:
+            with self.subTest(fixed_home=fixed_home):
+                caller_environment = {"HOME": "/tmp/conductor-home"}
+                if fixed_home is not None:
+                    caller_environment["CFFIXED_USER_HOME"] = fixed_home
+                with mock.patch.dict(os.environ, caller_environment, clear=True):
+                    request_environment = registry.client_env_snapshot()
+                # The daemon's inherited value must not fill an omitted caller key.
+                with mock.patch.dict(os.environ, {"CFFIXED_USER_HOME": "/tmp/daemon-home"}, clear=True):
+                    _argv, lanes, _cwd, environment, _timeout = registry.prepare({
+                        "operation": "app",
+                        "args": {"subcommand": "launch-existing", "appArgs": []},
+                        "env": request_environment,
+                    })
+                expected = {"HOME": "/tmp/conductor-home"}
+                if fixed_home is not None:
+                    expected["CFFIXED_USER_HOME"] = fixed_home
+                self.assertEqual(environment, expected)
+                self.assertEqual(lanes, ["liveApp"])
 
 
 class WorkspaceSwitchBlockedDetectionTests(unittest.TestCase):
