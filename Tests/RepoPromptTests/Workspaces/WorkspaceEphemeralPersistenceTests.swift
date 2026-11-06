@@ -2526,14 +2526,38 @@ import XCTest
 
     /// The custom-storage preference read seam: the value a test process inherited from a killed run
     /// never pins this run's workspace store, while values the run's own fixtures set and every product
-    /// launch are unchanged. Test defaults use a volatile domain, so nothing is persisted.
+    /// launch are unchanged. Read-only test defaults never publish fixture paths process-wide.
     final class WorkspaceStoragePreferenceTests: XCTestCase {
+        private final class StorageDefaults: UserDefaults, @unchecked Sendable {
+            private let storedPath: String?
+
+            init(path: String?) {
+                storedPath = path
+                super.init(suiteName: "workspace-storage-preference-\(UUID().uuidString)")!
+            }
+
+            override func string(forKey defaultName: String) -> String? {
+                defaultName == WorkspaceStoragePreference.key ? storedPath : super.string(forKey: defaultName)
+            }
+        }
+
         private func defaults(storing path: String?) -> UserDefaults {
-            let defaults = UserDefaults(suiteName: "workspace-storage-preference-\(UUID().uuidString)")!
-            defaults.setVolatileDomain(
-                path.map { [WorkspaceStoragePreference.key: $0] } ?? [:], forName: UserDefaults.argumentDomain
-            )
-            return defaults
+            // NSArgumentDomain is shared even by named suites. Publishing synthetic storage paths
+            // there can redirect unrelated live workspace tasks while this fixture is alive.
+            StorageDefaults(path: path)
+        }
+
+        func testFixtureDefaultsDoNotChangeArgumentDomain() {
+            let original = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain) as NSDictionary
+            for path in [stale, nil] {
+                withExtendedLifetime(defaults(storing: path)) {
+                    XCTAssertEqual(
+                        UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain) as NSDictionary,
+                        original,
+                        "Fixture defaults must not replace or clear the process-wide argument domain"
+                    )
+                }
+            }
         }
 
         private let stale = "/var/folders/x/T/rpce-local-tests-gone/25bf8e1a2393f110/new-window-selection-1/Workspaces"

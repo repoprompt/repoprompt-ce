@@ -59,10 +59,13 @@ final class AgentModelCatalogRuntimeOwnershipTests: XCTestCase {
         XCTAssertEqual(recorder.installCount, 0)
     }
 
-    @MainActor
-    func testConcurrentActivationWaitsForRegistrationWithoutHoldingRuntimeLocks() async {
+    func testConcurrentActivationWaitsForRegistrationWithoutHoldingRuntimeLocks() {
         let entered = expectation(description: "registration entered")
+        let firstCompleted = expectation(description: "first caller completed")
+        let secondCompleted = expectation(description: "second caller completed")
+        let notificationCompleted = expectation(description: "notification completed")
         let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
         let recorder = CatalogRuntimeRegistrationRecorder()
         var runtime: TestCatalogRuntime!
         runtime = TestCatalogRuntime(registerBackendChanges: { handler in
@@ -70,32 +73,33 @@ final class AgentModelCatalogRuntimeOwnershipTests: XCTestCase {
             _ = runtime.acpRegistry.resolvedSnapshot(for: .cursor)
             recorder.install(handler)
             entered.fulfill()
-            _ = release.wait(timeout: .now() + 20)
+            release.wait()
         })
-        let first = Task.detached { [runtime = runtime!] in runtime.productionGeneration(for: .cursor) }
-        await fulfillment(of: [entered], timeout: 5)
+        // These synchronous calls deliberately block. Keep them off Swift's cooperative pool,
+        // and let only the test release registration rather than a wall-clock escape hatch.
+        DispatchQueue(label: "catalog-test.first").async { [runtime = runtime!] in
+            XCTAssertEqual(runtime.productionGeneration(for: .cursor), 0)
+            firstCompleted.fulfill()
+        }
+        wait(for: [entered], timeout: 5)
         let secondDone = DispatchSemaphore(value: 0)
         let notificationDone = DispatchSemaphore(value: 0)
-        let second = Task.detached { [runtime = runtime!] in
-            defer { secondDone.signal() }
-            return runtime.productionGeneration(for: .cursor)
+        DispatchQueue(label: "catalog-test.second").async { [runtime = runtime!] in
+            XCTAssertEqual(runtime.productionGeneration(for: .cursor), 0)
+            secondDone.signal()
+            secondCompleted.fulfill()
         }
-        let notification = Task.detached {
-            defer { notificationDone.signal() }
+        DispatchQueue(label: "catalog-test.notification").async {
             recorder.notify()
+            notificationDone.signal()
+            notificationCompleted.fulfill()
         }
-        let bothWaiting = await Task.detached { [runtime = runtime!] in
-            runtime.test_waitForActivationWaiter() && runtime.test_waitForActivationWaiter()
-        }.value
+        let bothWaiting = runtime.test_waitForActivationWaiter() && runtime.test_waitForActivationWaiter()
         XCTAssertTrue(bothWaiting, "Both callers must reach the activation wait before registration completes")
         XCTAssertEqual(secondDone.wait(timeout: .now()), .timedOut)
         XCTAssertEqual(notificationDone.wait(timeout: .now()), .timedOut)
         release.signal()
-        let firstGeneration = await first.value
-        let secondGeneration = await second.value
-        await notification.value
-        XCTAssertEqual(firstGeneration, 0)
-        XCTAssertEqual(secondGeneration, 0)
+        wait(for: [firstCompleted, secondCompleted, notificationCompleted], timeout: 5)
         XCTAssertEqual(runtime.productionGeneration(for: .claudeCodeGLM), 1)
         XCTAssertEqual(recorder.installCount, 1)
     }
