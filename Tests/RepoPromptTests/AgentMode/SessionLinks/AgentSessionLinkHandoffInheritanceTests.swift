@@ -4513,8 +4513,9 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook { id in await reads.record(id) }
             var fixtures: [Fixture] = []
             do {
+                // Keep repository indexing independent of the 300 real saved-session writes.
                 for _ in 0 ..< 3 {
-                    try await fixtures.append(makeFixture())
+                    try await fixtures.append(makeFixture(isolatedRepository: true))
                 }
                 for fixture in fixtures {
                     await fixture.window.workspaceManager.awaitWorkspaceReloadForTesting()
