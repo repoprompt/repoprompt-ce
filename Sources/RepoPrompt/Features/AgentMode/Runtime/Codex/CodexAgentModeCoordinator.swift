@@ -6161,6 +6161,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     replayText = replayTurn.text
                 }
             }
+            // Capture this replay's exact dispatch before transport, independently of whether
+            // supplement monitoring exists. Never reconstruct it from a later pending slot.
+            let replayDispatchContext = replayTurn.monitoringDispatchContext
+                ?? AgentSessionLinkDispatchContext(session: session, dispatchID: replayDispatchID)
             let replayClaim = acceptedReplayClaim
             let replayProof: AgentSessionLinkProviderInputRelease.Proof?
             if let replayClaim, !replayClaim.managedMetadataRequirements.isEmpty, let viewModel {
@@ -6236,7 +6240,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 return receipt
             }
             dispatched = true
-            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: nil)
+            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext ?? replayDispatchContext, claim: nil)
             await applySuccessfulCodexNativeSend(
                 for: session,
                 runID: runID,
@@ -7116,7 +7120,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         }
                     }
                     logCodex("[AgentModeVM] Event task: events stream ended")
-                    cancelCodexTransportClosedFallback(for: session.tabID)
 
                     // --- Stream ended without an explicit terminal event ---
                     // If the task was cancelled (intentional teardown) or run has moved on, do nothing.
@@ -7130,6 +7133,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         return
                     }
 
+                    cancelCodexTransportClosedFallback(for: session.tabID)
                     guard session.runState.isActive else {
                         guard invalidateCodexControllerForReconnect(
                             session: session,
@@ -8351,6 +8355,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             viewModel?.scheduleSave(for: session.tabID)
                         }
                         guard await computerUsePhysicalDispatchIsCurrent() else { throw CancellationError() }
+                        // Bind switch evidence before optional Read proof can suspend. Upstream's
+                        // finalized dispatch acquisition remains after Read, with a switch recheck.
+                        guard viewModel?.providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: promptDispatchID)
+                            ?? (session.pendingHandoff.providerSwitchDelivery == nil)
+                        else { throw CancellationError() }
                         let proof = await viewModel?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
                         guard !Task.isCancelled, effectiveStopFence.permitsStart(of: session),
                               session.runID == sendRunID, session.activeRunAttemptID == sendRunAttemptIDAtEntry,
@@ -8359,6 +8368,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                               computerUseActivationID != nil || session.codexControllerFeatureState?.computerUseEnabled != true,
                               computerUseActivationID == nil || (session.codexControllerFeatureState?.computerUseEnabled == true && computerUseAdmissionMessage(session: session) == nil),
                               isSelfNote || viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
+                        else { throw CancellationError() }
+                        // Read proof can suspend after acquisition. Assert the same frozen switch
+                        // evidence again at this final synchronous release fence, never re-fit it.
+                        guard viewModel?.providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: promptDispatchID)
+                            ?? (session.pendingHandoff.providerSwitchDelivery == nil)
                         else { throw CancellationError() }
                         guard acquireFinalizedAgentSessionLinkDispatch() else { throw CancellationError() }
                         // A parked note remains unattempted throughout optional Read proof.
@@ -11378,6 +11392,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     }
 
     #if DEBUG
+        func test_installTransportClosedFallback(_ task: Task<Void, Never>, tabID: UUID) {
+            codexTransportClosedFallbackTasksByTabID.set(tabID, task: task)
+        }
+
         @_spi(TestSupport)
         public func test_dispatchCodexFallbackHead(
             session: AgentTabSession,

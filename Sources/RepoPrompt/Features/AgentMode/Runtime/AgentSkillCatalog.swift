@@ -76,6 +76,10 @@ extension AgentSkillDefinition.Source {
 
 @MainActor
 final class AgentSkillCatalog {
+    #if DEBUG
+        var test_beforePublish: (@MainActor () async -> Void)?
+    #endif
+
     // MARK: - Internal types
 
     /// How files are laid out inside a skill root directory.
@@ -159,18 +163,20 @@ final class AgentSkillCatalog {
     /// Perform a full skill rescan.
     ///
     /// When `generation` is supplied (scheduled/async refreshes), results are only
-    /// applied if no newer refresh has been requested in the meantime. When `nil`
-    /// (synchronous / `refreshIfNeeded` callers), results are always applied.
-    func refresh(workspacePaths: [String], agentKind: AgentProviderKind, generation: UInt64? = nil) async {
+    /// applied if no newer refresh has been requested in the meantime. Publication also
+    /// requires `shouldPublish()` (default true); nil-generation refreshes are otherwise always applied.
+    func refresh(workspacePaths: [String], agentKind: AgentProviderKind, generation: UInt64? = nil, shouldPublish: @MainActor () -> Bool = { true }) async {
         let canonicalPaths = workspacePaths.compactMap { Self.canonicalWorkspacePath($0) }
         let discovered = await discoverSkills(workspacePaths: canonicalPaths, agentKind: agentKind)
 
-        // Guard against out-of-order application: if a newer generation was
-        // requested while we were scanning, discard these (now-stale) results.
+        #if DEBUG
+            await test_beforePublish?()
+        #endif
+        // Check both publication guards after the last suspension.
         if let generation, generation != refreshGeneration {
             return
         }
-
+        guard shouldPublish() else { return }
         orderedSkills = discovered
         skillsByName = Dictionary(uniqueKeysWithValues: discovered.map { ($0.name.lowercased(), $0) })
         loadedWorkspacePaths = canonicalPaths
@@ -190,7 +196,7 @@ final class AgentSkillCatalog {
         #endif
     }
 
-    func refreshIfNeeded(workspacePaths: [String], agentKind: AgentProviderKind) async {
+    func refreshIfNeeded(workspacePaths: [String], agentKind: AgentProviderKind, shouldPublish: @MainActor () -> Bool = { true }) async {
         let canonicalPaths = workspacePaths.compactMap { Self.canonicalWorkspacePath($0) }
         if hasLoaded,
            loadedWorkspacePaths == canonicalPaths,
@@ -199,7 +205,7 @@ final class AgentSkillCatalog {
         {
             return
         }
-        await refresh(workspacePaths: canonicalPaths, agentKind: agentKind)
+        await refresh(workspacePaths: canonicalPaths, agentKind: agentKind, shouldPublish: shouldPublish)
     }
 
     func resolve(name: String) -> AgentSkillDefinition? {
