@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspaceContext
 
 /// Sendable read-file slicing and reply projection used by the MainActor provider.
 enum MCPReadFileToolProjection {

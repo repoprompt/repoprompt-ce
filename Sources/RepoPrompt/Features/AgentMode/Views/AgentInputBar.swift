@@ -1,4 +1,5 @@
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 
 //
 //  AgentInputBar.swift

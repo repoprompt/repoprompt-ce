@@ -2,6 +2,7 @@ import Foundation
 import MCP // <- required for `Value`
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 
 // MARK: - MCP Tool helpers (moved from MCPServerViewModel)
 

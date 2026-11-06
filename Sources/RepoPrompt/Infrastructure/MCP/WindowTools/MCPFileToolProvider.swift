@@ -7,6 +7,7 @@ import RepoPromptFileSystem
 import RepoPromptInstrumentation
 import RepoPromptRegexCore
 import RepoPromptShared
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 @MainActor
@@ -353,7 +354,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                     size: size,
                     includesSignatures: includesSignatures
                 )
-                let request = MCPServerViewModel.CodeStructureRequest(
+                let request = WorkspaceCodemapStructureRequest(
                     direction: direction,
                     maximumDepth: direction == nil ? 0 : suppliedDepth,
                     includesSignatures: includesSignatures,

@@ -1,5 +1,6 @@
 import RepoPromptFileSystem
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 
 // MARK: - DEBUG MCP Read/Search Latency Diagnostics
 
