@@ -66,6 +66,39 @@ launch_app() {
     fi
 }
 
+launch_cached_app() {
+    local extra_args=()
+    if [[ "${1:-}" == "fresh" ]]; then
+        extra_args=(--fresh-profile)
+        echo
+        echo "Importing production into the isolated debug profile (this can take minutes)."
+        echo "The previous debug profile is archived in RepoPrompt CE Debug Recovery; only the three newest recognized snapshots are retained."
+    fi
+    echo
+    echo "Launching the packaged RepoPrompt CE debug app without rebuilding..."
+    local result
+    if (( ${#extra_args[@]} > 0 && ${#APP_ARGS[@]} > 0 )); then
+        "$CONDUCTOR" app launch-existing --require-current -- "${extra_args[@]}" "${APP_ARGS[@]}"
+        result=$?
+    elif (( ${#extra_args[@]} > 0 )); then
+        "$CONDUCTOR" app launch-existing --require-current -- "${extra_args[@]}"
+        result=$?
+    elif (( ${#APP_ARGS[@]} > 0 )); then
+        "$CONDUCTOR" app launch-existing --require-current -- "${APP_ARGS[@]}"
+        result=$?
+    else
+        "$CONDUCTOR" app launch-existing --require-current
+        result=$?
+    fi
+    if (( result == 0 )); then
+        echo "RepoPrompt CE debug process launched. Window/workspace readiness may follow later."
+    else
+        echo "The packaged debug app could not be launched."
+        echo "If missing, foreign, stale, or predating profile reuse, press r to rebuild and relaunch."
+        echo "Uncommitted source edits are not included until you rebuild."
+    fi
+}
+
 show_status() {
     echo
     echo "Current RepoPrompt CE app status:"
@@ -126,22 +159,23 @@ clear 2>/dev/null || true
 echo "RepoPrompt CE — local debug launcher"
 echo
 echo "Project: $ROOT_DIR"
-echo "Mode:    coordinated (builds and launches run through the dev daemon)"
+echo "Mode:    coordinated (reuse packaged app and existing debug profile; r rebuilds)"
 echo "Xcode:   $DEVELOPER_DIR"
 
 cd "$ROOT_DIR" || exit 1
-launch_app
+launch_cached_app
 
 while true; do
     echo
     echo "Choose an action:"
     echo "  r  Rebuild and relaunch RepoPrompt CE"
+    echo "  f  Launch packaged app with a fresh production-profile snapshot"
     echo "  s  Show app status and pending daemon jobs"
     echo "  x  Stop the app (also cancels older build/launch jobs)"
     echo "  q  Close this launcher tab only (leaves the app running)"
     echo
 
-    if ! IFS= read -r -n 1 -p "Action [r/s/x/q]: " choice; then
+    if ! IFS= read -r -n 1 -p "Action [r/f/s/x/q]: " choice; then
         echo
         echo "Closing this launcher. The app keeps running and no jobs are canceled."
         exit 0
@@ -151,6 +185,9 @@ while true; do
     case "$choice" in
         r | R)
             launch_app
+            ;;
+        f | F)
+            launch_cached_app fresh
             ;;
         s | S)
             show_status
@@ -166,7 +203,7 @@ while true; do
             ;;
         *)
             echo
-            echo "Please choose r, s, x, or q."
+            echo "Please choose r, f, s, x, or q."
             ;;
     esac
 done
