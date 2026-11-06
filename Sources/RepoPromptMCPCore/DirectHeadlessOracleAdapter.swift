@@ -123,6 +123,10 @@ actor DirectHeadlessOracleAdapter {
         groupRuntime = OracleGroupRuntime(store: store, claimManager: claimManager)
     }
 
+    func configuredRoster() async throws -> OracleRoster {
+        try await rosterResolver.resolveRoster(for: OracleRosterResolutionRequest(newChat: true))
+    }
+
     func resolveChildLaunchPlan(
         toolName: String,
         arguments: [String: Value],

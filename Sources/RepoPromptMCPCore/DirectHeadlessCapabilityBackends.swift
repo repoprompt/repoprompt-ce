@@ -737,11 +737,23 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
     func accessOracleUtilities(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
         let args = try request.mcpArguments()
         let op = args["op"]?.stringValue ?? "models"
-        let providers = await providerCoordinator.providerCatalog().map(\.value)
+        let providers = await providerCoordinator.providerCatalog()
+        let roster = try await oracleAdapter.configuredRoster()
+        let models: [Value] = roster.orderedModels.enumerated().map { index, model in
+            let provider = providers.first { $0.id == model.providerID }
+            return .object([
+                "id": .string(model.modelID),
+                "name": .string(OracleRosterContract.displayLabel(laneIndex: index)),
+                "role": .string(index == 0 ? "primary" : "additional"),
+                "provider_id": model.providerID.map(Value.string) ?? .null,
+                "available": .bool(provider?.executable != nil),
+                "reason": provider?.unavailableReason.map(Value.string) ?? .null
+            ])
+        }
         return try .object([
             "op": .string(op),
-            "models": .array(providers),
-            "providers": .array(providers),
+            "models": .array(models),
+            "providers": .array(providers.map(\.value)),
             "backend": .string("headless")
         ])
     }

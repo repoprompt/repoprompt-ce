@@ -1138,7 +1138,7 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         XCTAssertEqual(try fixture.calls().count, 2)
     }
 
-    func testFilteredStartPersistsRosterForContinuationAndRawContextBuilderGate() async throws {
+    func testModelDiscoverySelectsFilteredRosterForContinuationAndRawContextBuilderGate() async throws {
         let fixture = try Fixture(name: "gates")
         defer { fixture.cleanup() }
         let service = fixture.service()
@@ -1164,11 +1164,22 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         XCTAssertEqual(try fixture.calls().count, 0)
 
         try await Self.setRoster(prepared, primary: "lane-0", additional: ["lane-1", "lane-2"])
+        let discovery = try await backend.accessOracleUtilities(DomainPhysicalToolRequest(
+            argumentsJSON: JSONEncoder().encode(["op": Value.string("models")]),
+            securityContext: securityContext(prepared)
+        ))
+        let discovered = try XCTUnwrap(JSONSerialization.jsonObject(with: discovery.json) as? [String: Any])
+        let models = try XCTUnwrap(discovered["models"] as? [[String: Any]])
+        XCTAssertEqual(models.compactMap { $0["id"] as? String }, ["lane-0", "lane-1", "lane-2"])
+        XCTAssertEqual(models.compactMap { $0["role"] as? String }, ["primary", "additional", "additional"])
+        XCTAssertTrue(models.allSatisfy { $0["available"] as? Bool == true })
+        XCTAssertEqual(try fixture.calls().count, 0)
+        let selectedModel = try XCTUnwrap(models.last?["id"] as? String)
         let started = try await invoke(
             prepared: prepared,
             backend: backend,
             toolName: "ask_oracle",
-            arguments: ["message": .string("start"), "additional_oracles": .array([.string("lane-2")])]
+            arguments: ["message": .string("start"), "additional_oracles": .array([.string(selectedModel)])]
         )
         let chatID = try XCTUnwrap(started["chat_id"] as? String)
         let owner = try OracleConversationOwner(kind: "direct-headless", identifier: fixture.profileName)
