@@ -217,6 +217,9 @@ actor DomainWorkspaceContextAuthority {
         case applied
         case recoveryPending
         case failed
+        /// A recovery backup was required and could not be made (#335). Health stays writable;
+        /// the typed code reaches the caller through `persistenceFailureOutcome`.
+        case recoveryBackupRequired(DomainPersistenceError)
     }
 
     private struct WorkspaceRecord {
@@ -1245,7 +1248,7 @@ actor DomainWorkspaceContextAuthority {
                 ) {
                 case .applied:
                     changed = true
-                case .recoveryPending, .failed:
+                case .recoveryPending, .failed, .recoveryBackupRequired:
                     recoveryPending = true
                 }
             }
@@ -1406,6 +1409,8 @@ actor DomainWorkspaceContextAuthority {
                     return .recoveryPending
                 case .externalDocumentConflict, .cancelled:
                     return .recoveryPending
+                case .recoveryBackupRequired:
+                    return .recoveryBackupRequired(error)
                 default:
                     if var current = records[workspaceID] {
                         current.health = .degradedReadOnly(
@@ -1521,6 +1526,7 @@ actor DomainWorkspaceContextAuthority {
                 return .recoveryPending
             }
             if case .cancelled = error { return .recoveryPending }
+            if case .recoveryBackupRequired = error { return .recoveryBackupRequired(error) }
             if var current = records[workspaceID] {
                 current.health = .degradedReadOnly(
                     reason: "workspace_persistence_replay_failed"
@@ -1639,6 +1645,8 @@ actor DomainWorkspaceContextAuthority {
                     return .recoveryPending
                 case .cancelled:
                     return .recoveryPending
+                case .recoveryBackupRequired:
+                    return .recoveryBackupRequired(error)
                 default:
                     if var current = records[workspaceID] {
                         current.health = .degradedReadOnly(
@@ -2408,6 +2416,8 @@ actor DomainWorkspaceContextAuthority {
                         record: records[workspaceID] ?? record,
                         diagnostic: "durable_save_revision_replay_pending"
                     )
+                case let .recoveryBackupRequired(error):
+                    return persistenceFailureOutcome(envelope, record: records[workspaceID] ?? record, error: error)
                 case .failed:
                     return healthRejectionOutcome(
                         envelope,
@@ -2473,6 +2483,8 @@ actor DomainWorkspaceContextAuthority {
                         record: records[workspaceID] ?? record,
                         diagnostic: "external_document_rebase_pending"
                     )
+                case let .recoveryBackupRequired(error):
+                    return persistenceFailureOutcome(envelope, record: records[workspaceID] ?? record, error: error)
                 case .failed:
                     return healthRejectionOutcome(
                         envelope,
@@ -3025,7 +3037,12 @@ actor DomainWorkspaceContextAuthority {
         let code: DomainCommandErrorCode = switch error {
         case DomainPersistenceError.lockTimedOut: .lockTimedOut
         case DomainPersistenceError.cancelled: .cancelled
+        case DomainPersistenceError.recoveryBackupRequired(_, _): .recoveryBackupRequired
         default: .persistenceFailure
+        }
+        var location: DomainDurableReplacement.Location?
+        if case let DomainPersistenceError.recoveryBackupRequired(rawLocation, _) = error {
+            location = DomainDurableReplacement.Location(rawValue: rawLocation)
         }
         return DomainCommandOutcome(
             operationID: envelope.operationID,
@@ -3036,7 +3053,8 @@ actor DomainWorkspaceContextAuthority {
             resultingDigest: record?.document.contentDigest,
             errorCode: code,
             diagnostic: String(describing: error),
-            workspace: record.map(makeSnapshot)
+            workspace: record.map(makeSnapshot),
+            recoveryBackupLocation: location
         )
     }
 

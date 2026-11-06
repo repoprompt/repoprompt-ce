@@ -43,15 +43,21 @@ final class AgentModeNavigationController: ObservableObject {
             return
         }
 
-        windowState.setAgentTitlebarAccessoryVisible(true) { [weak agentModeVM] in
-            Task {
-                guard let agentModeVM else { return }
-                let activeTabID = await MainActor.run { agentModeVM.currentTabID }
-                if await MainActor.run(body: { agentModeVM.shouldSwallowNewSessionClick(for: activeTabID) }) {
-                    return
-                }
-                await agentModeVM.createAndActivateSessionTab()
+        windowState.setAgentTitlebarAccessoryVisible(true) { [weak self, weak agentModeVM] in
+            guard let agentModeVM else { return }
+            self?.requestNewSession(agentModeVM: agentModeVM)
+        }
+    }
+
+    /// Shared by the compose buttons in the sidebar's titlebar cluster and the titlebar accessory.
+    func requestNewSession(agentModeVM: AgentModeViewModel) {
+        Task { [weak agentModeVM] in
+            guard let agentModeVM else { return }
+            let activeTabID = await MainActor.run { agentModeVM.currentTabID }
+            if await MainActor.run(body: { agentModeVM.shouldSwallowNewSessionClick(for: activeTabID) }) {
+                return
             }
+            await agentModeVM.createAndActivateSessionTab()
         }
     }
 }

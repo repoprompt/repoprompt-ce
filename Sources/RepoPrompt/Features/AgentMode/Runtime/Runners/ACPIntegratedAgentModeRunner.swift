@@ -721,10 +721,11 @@ final class ACPIntegratedAgentModeRunner {
                 return false
             }
             inputProof = await hooks.providerInput.proveAgentSessionLinkProviderInput(session, decorated.claim)
-            if decorated.claim?.localInput != nil {
-                guard !Task.isCancelled, session.runID == runID,
-                      session.activeRunAttemptID == runAttemptID, session.acpController === controller
-                else { return false }
+            guard !Task.isCancelled, session.runID == runID,
+                  session.activeRunAttemptID == runAttemptID, session.acpController === controller
+            else {
+                hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, oversightDispatch)
+                return false
             }
             guard hooks.providerInput.acquireAgentSessionLinkPhysicalDispatch(
                 session,
@@ -1222,10 +1223,11 @@ final class ACPIntegratedAgentModeRunner {
                 return .cancelled
             }
             inputProof = await hooks.providerInput.proveAgentSessionLinkProviderInput(session, decorated.claim)
-            if decorated.claim?.localInput != nil {
-                guard !Task.isCancelled, session.runID == runID,
-                      session.activeRunAttemptID == runAttemptID, session.acpController === controller
-                else { return .cancelled }
+            guard !Task.isCancelled, session.runID == runID,
+                  session.activeRunAttemptID == runAttemptID, session.acpController === controller
+            else {
+                hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, oversightDispatch)
+                return .cancelled
             }
             guard hooks.providerInput.acquireAgentSessionLinkPhysicalDispatch(
                 session,
