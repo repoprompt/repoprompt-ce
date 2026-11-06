@@ -461,6 +461,10 @@ actor DirectHeadlessProviderCoordinator {
         ])
     }
 
+    func conversationReference(id: UUID) -> ConversationReference? {
+        conversations[id].map { ConversationReference(id: $0.id, updatedAt: $0.updatedAt) }
+    }
+
     func latestConversationReference() -> ConversationReference? {
         latestConversation().map { ConversationReference(id: $0.id, updatedAt: $0.updatedAt) }
     }
