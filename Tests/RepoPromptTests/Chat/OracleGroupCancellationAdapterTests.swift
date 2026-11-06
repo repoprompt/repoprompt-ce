@@ -29,6 +29,90 @@ private final class OracleFoundationGate {
 
 @MainActor
 final class OracleGroupCancellationAdapterTests: XCTestCase {
+    func testWorkspaceDeletionClosesBackgroundOwnersAcrossWindowsWithoutActiveChat() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("OracleDeletion-\(UUID().uuidString)")
+        let runtime = MCPDomainRuntime(configuration: .init(
+            mode: .app, profileIdentifier: "oracle-deletion-\(UUID().uuidString)",
+            storageDirectory: root.appendingPathComponent("runtime"), workspaceStorageDirectory: root.appendingPathComponent("workspaces"),
+            eventDirectory: root.appendingPathComponent("events"), temporaryDirectory: root.appendingPathComponent("tmp"), externalReloadInterval: nil
+        ))
+        try await runtime.start()
+        addTeardownBlock {
+            _ = await runtime.shutdown()
+            try? FileManager.default.removeItem(at: root)
+        }
+        let windows = [-9330, -9331].map { id in
+            WindowStateCompositionFactory.make(
+                windowID: id, deferredInitialAgentSystemWorkspaceRefresh: true, sharedMCPService: MCPService(),
+                domainRuntime: runtime, loadStoredAPISettingsDataOnInit: false, automaticProviderModelDiscoveryEnabled: false
+            )
+        }
+        for window in windows {
+            await window.workspaceManager.awaitInitialized()
+        }
+        defer { windows.forEach { $0.workspaceManager.prepareForWindowClose() } }
+        let creation = try windows[0].workspaceManager.createPersistentWorkspace(name: "Oracle deletion", repoPaths: [])
+        let workspace = try await creation.publishedWorkspace()
+        for window in windows {
+            let result = await window.workspaceManager.switchWorkspace(to: workspace, saveState: false)
+            XCTAssertTrue(result.didSwitch)
+        }
+        let registry = OracleBackgroundInvocationRegistry.shared
+        let owners = windows.map { _ in OracleBackgroundInvocationRegistry.Owner(workspaceID: workspace.id, binding: .init(tabID: UUID(), sessionID: UUID())) }
+        let cleanupStarted = expectation(description: "both workers begin cleanup before workspace deletion")
+        cleanupStarted.expectedFulfillmentCount = 2
+        let cleanupGate = OracleFoundationGate()
+        var streams: [AsyncThrowingStream<Int, Error>.Continuation] = []
+        defer { streams.forEach { $0.finish() }
+            cleanupGate.release()
+        }
+        for (window, owner) in zip(windows, owners) {
+            let session = AgentTabSession(tabID: owner.binding.tabID)
+            session.installPersistentSessionBinding(owner.binding)
+            session.oracleBackgroundOwner = owner
+            window.agentModeViewModel.test_installLiveSession(session)
+            await AgentModeWorkspaceSwitchSessionProvider(agentModeViewModel: window.agentModeViewModel)
+                .cancelSwitchSessions(for: WorkspaceDeletionCancellationToken(workspaceID: UUID()))
+            XCTAssertFalse(registry.admissionIsClosed(for: owner), "A deletion token for another workspace must not close this window's owner")
+            let controlled = AsyncThrowingStream<Int, Error>.makeStream()
+            streams.append(controlled.continuation)
+            _ = try await registry.start(owner: owner, runID: UUID(), invocationID: UUID(), admissionIsCurrent: { true }) { job in
+                try await job.prepared(self.registryPrepared(job))
+                do { for try await _ in controlled.stream {} } catch {}
+                cleanupStarted.fulfill()
+                await cleanupGate.wait()
+            }
+            addTeardownBlock { @MainActor in
+                await registry.close(owner).value
+                try registry.remove(owner)
+            }
+        }
+        XCTAssertTrue(windows[0].workspaceManager.tabsWithActiveChat.isEmpty)
+        XCTAssertFalse(windows[0].workspaceManager.isChatBusy)
+        windows[1].workspaceManager.isChatBusy = true
+        let deletion = Task { @MainActor in
+            await windows[0].workspaceManager.deleteWorkspacesAsync(workspaceIDs: [workspace.id], closeOpenWorkspaces: true)
+        }
+        await fulfillment(of: [cleanupStarted], timeout: 3)
+        for owner in owners {
+            XCTAssertTrue(registry.admissionIsClosed(for: owner))
+            XCTAssertFalse(registry.isDrained(owner), "Deletion must wait for accepted worker cleanup")
+        }
+        let beforeDrain = await runtime.workspaceStore.snapshot()
+        XCTAssertTrue(beforeDrain.workspaces.contains { $0.document.workspaceID == workspace.id }, "Deletion must retain the workspace until cleanup drains")
+        cleanupGate.release()
+        let result = await deletion.value
+        XCTAssertEqual(result.deletedWorkspaceIDs, [workspace.id], "\(result)")
+        for owner in owners {
+            XCTAssertTrue(registry.isDrained(owner))
+        }
+        for window in windows {
+            XCTAssertNotEqual(window.workspaceManager.activeWorkspaceID, workspace.id)
+        }
+        let snapshot = await runtime.workspaceStore.snapshot()
+        XCTAssertFalse(snapshot.workspaces.contains { $0.document.workspaceID == workspace.id })
+    }
+
     func testBackgroundRegistrySharesProcessIdentityAcrossProductionAccessPaths() async {
         let composition = WindowStateCompositionFactory.make(
             windowID: -9326,
