@@ -1,5 +1,6 @@
 @testable import RepoPromptApp
 import RepoPromptSettingsCore
+@testable import RepoPromptWorkspaceContext
 
 @MainActor
 enum WorkspaceRootLoadTestSupport {

@@ -3,6 +3,7 @@ import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptPersistence
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 
 extension CodeMapArtifactRuntime {
     static let processWideProvider: CodeMapArtifactRuntimeProvider = {

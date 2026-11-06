@@ -1,12 +1,129 @@
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptShared
 import XCTest
 
 #if DEBUG
     @MainActor
     final class MCPConnectionRemovalCompletionTests: XCTestCase {
+        func testProgressHandleInheritanceAndExplicitOverrideUseCanonicalHost() async throws {
+            let host = AppDomainRuntimeComposition.shared.runtime.domainHost
+            let firstID = UUID()
+            let otherID = UUID()
+            let firstCandidate = await host.beginRequestProgress(
+                connectionID: firstID, connectionGeneration: 1, invocationID: UUID(), token: .unique()
+            )
+            let first = try XCTUnwrap(firstCandidate)
+            let secondCandidate = await host.beginRequestProgress(
+                connectionID: firstID, connectionGeneration: 1, invocationID: UUID(), token: .unique()
+            )
+            let second = try XCTUnwrap(secondCandidate)
+            await ServerNetworkManager.withConnectionID(firstID, progressHandle: first) {
+                XCTAssertEqual(ServerNetworkManager.currentProgressState, first)
+                await ServerNetworkManager.withConnectionID(firstID) {
+                    XCTAssertEqual(ServerNetworkManager.currentProgressState, first)
+                    await ServerNetworkManager.withConnectionID(firstID, progressHandle: second) {
+                        XCTAssertEqual(ServerNetworkManager.currentProgressState, second)
+                    }
+                    XCTAssertEqual(ServerNetworkManager.currentProgressState, first)
+                }
+                await ServerNetworkManager.withConnectionID(otherID) {
+                    XCTAssertNil(ServerNetworkManager.currentProgressState)
+                }
+                XCTAssertEqual(ServerNetworkManager.currentProgressState, first)
+            }
+            XCTAssertNil(ServerNetworkManager.currentProgressState)
+            await host.finishRequestProgress(first)
+            await host.finishRequestProgress(second)
+        }
+
+        func testSettledAndTerminalGenerationHandlesCannotDeliverProgress() async throws {
+            let host = AppDomainRuntimeComposition.shared.runtime.domainHost
+            let id = UUID()
+            let beforeCancel = expectation(description: "live generation one progress delivered")
+            let afterCancel = expectation(description: "live generation two progress delivered")
+            let connection = RemovalTestConnection(onProgress: { message in
+                if message == "before-cancel" {
+                    beforeCancel.fulfill()
+                }
+                if message == "live" {
+                    afterCancel.fulfill()
+                }
+            })
+            let settledCandidate = await host.beginRequestProgress(
+                connectionID: id, connectionGeneration: 1, invocationID: UUID(), token: .unique()
+            )
+            let settled = try XCTUnwrap(settledCandidate)
+            let staleCandidate = await host.beginRequestProgress(
+                connectionID: id, connectionGeneration: 1, invocationID: UUID(), token: .unique()
+            )
+            let stale = try XCTUnwrap(staleCandidate)
+            let settledStateCandidate = await host.debugRequestProgressStateForTesting(settled)
+            let settledState = try XCTUnwrap(settledStateCandidate)
+            let staleStateCandidate = await host.debugRequestProgressStateForTesting(stale)
+            let staleState = try XCTUnwrap(staleStateCandidate)
+            let forged = MCPDomainRequestProgressHandle(
+                stateID: settled.stateID, connectionID: UUID(), invocationID: settled.invocationID
+            )
+            let forgedState = await host.debugRequestProgressStateForTesting(forged)
+            XCTAssertNil(forgedState)
+            await host.finishRequestProgress(settled)
+            await host.sendRequestProgress(settled, through: connection, message: "settled")
+            await settledState.waitUntilQuiescent()
+            await host.sendRequestProgress(stale, through: connection, message: "before-cancel")
+            await fulfillment(of: [beforeCancel], timeout: 5)
+            let beforeMessages = await connection.progressMessages()
+            XCTAssertEqual(beforeMessages, ["before-cancel"])
+            await host.cancelInvocations(connectionID: id, connectionGeneration: 1)
+            await host.sendRequestProgress(stale, through: connection, message: "stale")
+            await staleState.waitUntilQuiescent()
+            let liveCandidate = await host.beginRequestProgress(
+                connectionID: id, connectionGeneration: 2, invocationID: UUID(), token: .unique()
+            )
+            let live = try XCTUnwrap(liveCandidate)
+            await host.sendRequestProgress(live, through: connection, message: "live")
+            await fulfillment(of: [afterCancel], timeout: 5)
+            let messages = await connection.progressMessages()
+            XCTAssertEqual(messages, ["before-cancel", "live"])
+            await host.finishRequestProgress(live)
+        }
+
+        func testManagerRoutesCanonicalProgressAndControlFallback() async throws {
+            let host = AppDomainRuntimeComposition.shared.runtime.domainHost
+            let manager = ServerNetworkManager(domainHost: host)
+            let id = UUID()
+            let otherID = UUID()
+            let delivered = expectation(description: "standard progress delivered")
+            let connection = RemovalTestConnection(onProgress: { _ in delivered.fulfill() })
+            await manager.debugInstallDirectAdmissionConnectionForTesting(
+                connectionID: id, connection: connection, pendingClientID: "RepoPrompt CLI test"
+            )
+            let candidate = await host.beginRequestProgress(
+                connectionID: id, connectionGeneration: 1, invocationID: UUID(), token: .unique()
+            )
+            let handle = try XCTUnwrap(candidate)
+            await ServerNetworkManager.withConnectionID(id, progressHandle: handle) {
+                await ServerNetworkManager.withConnectionID(id) {
+                    await manager.sendProgress(for: id, tool: "tool", kind: .stage, stage: "nested", message: "ok")
+                }
+            }
+            await fulfillment(of: [delivered], timeout: 5)
+            let standardMessages = await connection.progressMessages()
+            XCTAssertEqual(standardMessages, ["tool [nested]: ok"])
+            let controlBefore = await connection.controlMessages()
+            XCTAssertTrue(controlBefore.isEmpty)
+
+            await ServerNetworkManager.withConnectionID(otherID) {
+                await manager.sendProgress(for: id, tool: "tool", kind: .stage, stage: "fallback", message: "ok")
+            }
+            let controlAfter = await connection.controlMessages()
+            XCTAssertEqual(controlAfter, ["tool [fallback]: ok"])
+            await host.finishRequestProgress(handle)
+            await manager.debugRemoveConnection(id)
+        }
+
         func testTerminationRevokesApprovalLivenessBeforeTransportCloseCompletes() async {
             let manager = ServerNetworkManager(domainHost: AppDomainRuntimeComposition.shared.runtime.domainHost)
             let id = UUID()
@@ -182,9 +299,31 @@ import XCTest
 
     private actor RemovalTestConnection: MCPServerConnection {
         private let onTerminate: (@MainActor @Sendable () async -> Void)?
+        private let onProgress: (@Sendable (String?) -> Void)?
+        private var messages: [String] = []
+        private var controls: [String] = []
 
-        init(onTerminate: (@MainActor @Sendable () async -> Void)? = nil) {
+        init(
+            onTerminate: (@MainActor @Sendable () async -> Void)? = nil,
+            onProgress: (@Sendable (String?) -> Void)? = nil
+        ) {
             self.onTerminate = onTerminate
+            self.onProgress = onProgress
+        }
+
+        func progressMessages() -> [String] {
+            messages
+        }
+
+        func controlMessages() -> [String] {
+            controls
+        }
+
+        func sendMCPProgress(token _: ProgressToken, progress _: Double, message: String?) async {
+            if let message {
+                messages.append(message)
+            }
+            onProgress?(message)
         }
 
         nonisolated var isFilesystemBacked: Bool {
@@ -223,7 +362,9 @@ import XCTest
             await onTerminate?()
         }
 
-        func sendProgress(tool _: String, kind _: RepoPromptProgressKind, stage _: String, message _: String) async {}
+        func sendProgress(tool: String, kind _: RepoPromptProgressKind, stage: String, message: String) async {
+            controls.append("\(tool) [\(stage)]: \(message)")
+        }
     }
 
     @MainActor

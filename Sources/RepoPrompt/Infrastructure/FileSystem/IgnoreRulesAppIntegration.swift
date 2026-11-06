@@ -122,20 +122,6 @@ extension IgnoreRulesManager {
     static let shared = FileSystemAppIntegration.makeIgnoreRulesManager()
 }
 
-extension WorkspaceRootCatalogPolicyIdentity {
-    static let canonicalDefaults = WorkspaceRootCatalogPolicyIdentity(
-        schemaVersion: currentSchemaVersion,
-        mandatoryIgnorePolicyIdentity: WorkspaceGitignorePolicyIdentity.current.rawValue,
-        globalIgnoreDefaultsDigest: IgnoreRulesManager.globalIgnoreDefaultsDigest(
-            for: IgnoreSettingsDefaults.canonicalGlobalIgnoreDefaults
-        ),
-        respectRepoIgnore: true,
-        respectCursorignore: true,
-        enableHierarchicalIgnores: true,
-        skipSymlinks: true
-    )
-}
-
 extension WorkspaceRootByteExactPathKey {
     static func rootRelativePath(repositoryRelativePath: String, prefix: GitRepositoryRelativeRootPrefix) -> String? {
         let pathBytes = Array(repositoryRelativePath.utf8)

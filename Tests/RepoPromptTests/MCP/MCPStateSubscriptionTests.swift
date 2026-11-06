@@ -5,6 +5,7 @@ import MCP
 import RepoPromptProcess
 import RepoPromptSecureStorage
 import RepoPromptShared
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 /// Regression coverage for per-subscriber MCP state streams.

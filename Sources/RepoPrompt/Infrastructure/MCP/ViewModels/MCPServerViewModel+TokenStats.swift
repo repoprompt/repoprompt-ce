@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 
 extension MCPServerViewModel {
     nonisolated static func makeTokenStats(

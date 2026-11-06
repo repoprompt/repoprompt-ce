@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptShared
+import RepoPromptWorkspaceContext
 
 /// Summary-only readiness telemetry. Its value surface cannot carry paths or arbitrary errors.
 struct ContextBuilderWorkspaceReadinessDiagnosticEvent: Equatable, CustomStringConvertible {

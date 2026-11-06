@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 
 enum ContextBuilderRunOrigin: Equatable {
     case ui
