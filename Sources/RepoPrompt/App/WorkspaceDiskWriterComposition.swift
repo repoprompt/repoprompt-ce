@@ -8,13 +8,13 @@ enum WorkspaceDiskWriterComposition {
     static let processWriter = WorkspaceDiskWriter(
         policy: WorkspaceAppDiskWritePolicy(),
         backend: WorkspaceDiskWriteBackend(
+            // Both paths refuse to discard an unreadable original without a verified recovery
+            // backup (#335); the typed refusal reaches the caller through the write receipt.
             queuedAtomicWrite: { data, url in
-                try AppProfileLocations.current.validateMetadataFile(url)
-                try data.write(to: url, options: .atomic)
+                try WorkspaceUnreadableDocumentBackup.replaceDocument(data, at: url)
             },
             normalizationAtomicWrite: { data, url in
-                try AppProfileLocations.current.validateMetadataFile(url)
-                try data.write(to: url, options: .atomic)
+                try WorkspaceUnreadableDocumentBackup.replaceDocument(data, at: url)
             }
         )
     )

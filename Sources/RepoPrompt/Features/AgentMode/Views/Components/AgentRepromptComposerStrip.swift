@@ -27,7 +27,7 @@ struct AgentRepromptComposerStrip: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
-            if let presentation = store.presentation, presentation.sourceTabID == tabID {
+            if let presentation = tabID.flatMap({ store.presentations[$0] }) {
                 let operation = viewModel.repromptOperation.flatMap { $0.id == presentation.id ? $0 : nil }
                 TimelineView(.periodic(from: presentation.startedAt, by: 1)) { context in
                     HStack(spacing: 6) {
@@ -155,7 +155,7 @@ struct AgentRepromptComposerStrip: View {
             .padding(24)
             .frame(minWidth: 680, idealWidth: 800, maxWidth: .infinity, minHeight: 440, idealHeight: 600, maxHeight: .infinity)
         }
-        .onChange(of: store.presentation?.id) { _, _ in
+        .onChange(of: tabID.flatMap { store.presentations[$0]?.id }) { _, _ in
             showingOriginal = false
             showingRewrite = false
         }
@@ -197,8 +197,8 @@ struct AgentRepromptQuestionsView: View {
     @State private var contentHeight: CGFloat = 80
 
     var body: some View {
-        if store.presentation?.sourceTabID == tabID, store.presentation?.phase == .clarifying,
-           let pending = store.pendingQuestions, let question = pending.currentQuestion
+        if let tabID, store.presentations[tabID]?.phase == .clarifying,
+           let pending = store.pendingQuestionsByTab[tabID], let question = pending.currentQuestion
         {
             let operation = viewModel.repromptOperation
             let draft = pending.draftsByQuestionID[question.id] ?? AgentAskUserDraft()
@@ -251,7 +251,7 @@ struct AgentRepromptQuestionsView: View {
 
     private func completeQuestions(_ operation: AgentRepromptOperation?, skipAll: Bool = false) {
         guard let operation, viewModel.currentTabID == tabID,
-              store.presentation?.id == operation.id else { return }
+              store.presentations[operation.sourceTabID]?.id == operation.id else { return }
         operation.completeQuestions(skipAll: skipAll)
         guard operation.phase != .clarifying else { return }
         Task { @MainActor in

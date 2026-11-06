@@ -536,21 +536,43 @@ extension AgentModeViewModel {
         return rows
     }
 
+    /// Keys the collapse control folds in the selected tab, in that tab's own namespace.
     func collapsibleSidebarThreadKeys(
         for tabs: [ComposeTabState],
-        currentTabID _: UUID?,
+        currentTabID: UUID?,
         searchText: String,
         diagnosticSource _: String? = nil
     ) -> [AgentSidebarThreadKey] {
         guard searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
-        let rows = sidebarSessions(for: tabs)
-        guard !rows.isEmpty else { return [] }
+        let canonicalRows = sidebarSessions(for: tabs)
+        guard !canonicalRows.isEmpty else { return [] }
+        let tab = ui.sessionSidebar.snapshot.sidebarTab
+        if tab == .overseers {
+            return sidebarOverseerPresentation(
+                canonicalRows,
+                liveRelations: sidebarLiveOverseerRelations(),
+                searchText: "",
+                currentTabID: currentTabID
+            ).renderedRows.compactMap { $0.session.hasThreadChildren ? $0.session.threadKey : nil }
+        }
+        let rows = sidebarRows(canonicalRows, in: tab)
         return rows.indices.compactMap { index in
             let nextIndex = rows.index(after: index)
             guard nextIndex < rows.endIndex,
                   rows[nextIndex].depth > rows[index].depth
             else { return nil }
-            return AgentSidebarThreadKey.key(sessionID: rows[index].sessionID, tabID: rows[index].tabID)
+            return sidebarThreadKey(for: rows[index], in: tab)
+        }
+    }
+
+    /// A row's fold key in `tab`. All uses the shared thread namespace; the filter tabs fold
+    /// independently so a thread folded on All cannot hide a match.
+    private func sidebarThreadKey(for row: SidebarSession, in tab: AgentSidebarTab) -> AgentSidebarThreadKey {
+        switch tab {
+        case .pinned, .active:
+            .filteredThread(tab: tab, tabID: row.tabID)
+        case .all, .overseers:
+            .key(sessionID: row.sessionID, tabID: row.tabID)
         }
     }
 
@@ -665,9 +687,10 @@ extension AgentModeViewModel {
             visibleSessionCount: sidebarSnapshot.visibleSessionCount
         )
         // Owner pending exposes no archived rows, headings or navigation targets either (§5.3).
-        // The Overseers tab shows relationships only; archived sessions stay in the other tabs.
+        // Archived sessions belong to All. Archived work is never active and has no oversight groups,
+        // and each filter tab, and its "Search pinned…" style field, promises only its own sessions.
         let archivedSessionTabs = archivedSessionTabsForSidebarSnapshot(
-            key.restorePresentation.isOwnerPending || isOverseersTab ? [] : stashedTabs,
+            key.restorePresentation.isOwnerPending || sidebarSnapshot.sidebarTab != .all ? [] : stashedTabs,
             searchText: sidebarSnapshot.searchText,
             prepareSortedRows: archivedSessionsExpanded
         )
@@ -940,7 +963,11 @@ extension AgentModeViewModel {
     /// does). `.all` returns `rows` unchanged.
     func sidebarRows(_ rows: [SidebarSession], in tab: AgentSidebarTab) -> [SidebarSession] {
         guard tab != .all else { return rows }
-        let attention = Set(ui.sessionSidebar.snapshot.attentionRunStateByTabID.keys)
+        let needsUser: Set<UUID> = tab == .active
+            ? Set(ui.sessionSidebar.snapshot.attentionRunStateByTabID.compactMap { tabID, state in
+                AgentSessionSidebarUIStore.needsUser(state) ? tabID : nil
+            })
+            : []
         let overseers: Set<UUID> = tab == .overseers
             ? Set(
                 sidebarOverseerRelations(for: rows, liveRelations: sidebarLiveOverseerRelations())
@@ -950,7 +977,7 @@ extension AgentModeViewModel {
         return Self.sidebarRows(
             rows,
             in: tab,
-            attentionTabIDs: attention,
+            needsUserTabIDs: needsUser,
             overseerSessionIDs: overseers,
             liveRunStateByTabID: tab == .active ? sessions.mapValues(\.runState) : [:]
         )
@@ -965,7 +992,7 @@ extension AgentModeViewModel {
     static func sidebarRows(
         _ rows: [SidebarSession],
         in tab: AgentSidebarTab,
-        attentionTabIDs: Set<UUID>,
+        needsUserTabIDs: Set<UUID>,
         overseerSessionIDs: Set<UUID>,
         liveRunStateByTabID: [UUID: AgentSessionRunState] = [:]
     ) -> [SidebarSession] {
@@ -975,7 +1002,7 @@ extension AgentModeViewModel {
             case .pinned: row.isPinned
             case .active:
                 (liveRunStateByTabID[row.tabID] ?? row.searchFieldSource.runState)?.isActive == true
-                    || attentionTabIDs.contains(row.tabID)
+                    || needsUserTabIDs.contains(row.tabID)
             case .overseers: row.sessionID.map(overseerSessionIDs.contains) ?? false
             }
         }
@@ -1020,9 +1047,8 @@ extension AgentModeViewModel {
         #if DEBUG
             let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
-        // A filter tab, like search, shows matches in context: collapsed parents must not hide them.
         let isSearching = !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            || ui.sessionSidebar.snapshot.sidebarTab != .all
+        let sidebarTab = ui.sessionSidebar.snapshot.sidebarTab
         let source = diagnosticSource.isEmpty ? "unknown" : diagnosticSource
         let collapsedThreadKeys = effectiveCollapsedSidebarThreadKeys(in: rows, searchText: searchText)
         guard !rows.isEmpty else {
@@ -1092,7 +1118,7 @@ extension AgentModeViewModel {
 
         for index in rows.indices {
             guard !hiddenByCollapsedAncestor[index] else { continue }
-            let key = AgentSidebarThreadKey.key(sessionID: rows[index].sessionID, tabID: rows[index].tabID)
+            let key = sidebarThreadKey(for: rows[index], in: sidebarTab)
             let rowIsActive = currentTabID.map { rows[index].tabID == $0 } ?? false
             let descendantContainsActiveTab = subtreeContainsActiveTab[index] && !rowIsActive
             let shouldCollapse = hasChildren[index]

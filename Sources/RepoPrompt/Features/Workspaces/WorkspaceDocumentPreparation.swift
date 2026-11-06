@@ -1,6 +1,33 @@
 import Foundation
 import RepoPromptDomainRuntime
 
+private enum DomainWorkspaceModelEncoder {
+    static func encode(_ workspace: WorkspaceModel) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        return try encoder.encode(workspace)
+    }
+}
+
+/// App-model encoding and its lossless-recovery verdict belong to workspace preparation, not
+/// the generic domain authority transport. These synchronous helpers also serve digest receipts.
+extension DomainWorkspaceAuthorityClient {
+    /// The exact digest used by document submission, shared with presentation write receipts.
+    static func documentDigest(for workspace: WorkspaceModel) throws -> String {
+        try DomainContentDigest.sha256(DomainWorkspaceModelEncoder.encode(workspace))
+    }
+
+    static func document(for workspace: WorkspaceModel, fileURL: URL) throws -> DomainWorkspaceDocument {
+        let bytes = try DomainWorkspaceModelEncoder.encode(workspace)
+        let document = try DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: fileURL)
+        // Bytes the app encodes from a model always decode back without loss; recording that here,
+        // outside every domain lock, spares the recovery guard a full decode when they are later
+        // discarded (#335).
+        WorkspaceUnreadableDocumentBackup.recordAppEncodedDocument(bytes)
+        return document
+    }
+}
+
 /// CPU preparation only, never a persistence or presentation authority. Serializing work here
 /// keeps several window subscriptions from concurrently decoding the same large document; the
 /// existing digest cache remains the sole decode cache. No live view model is read or published here.

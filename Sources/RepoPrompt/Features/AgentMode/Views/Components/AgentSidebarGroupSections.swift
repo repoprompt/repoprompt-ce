@@ -89,16 +89,23 @@ struct AgentSidebarGroupSectionHeader: View {
         fontScale.preset
     }
 
+    private var metrics: AgentSidebarMetrics {
+        AgentSidebarMetrics(preset: fontPreset)
+    }
+
     var body: some View {
         Button(action: onToggle) {
             HStack(spacing: 4) {
-                Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold))
-                    .foregroundStyle(.tertiary)
-                Text(title)
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                HStack(spacing: metrics.rowSpacing) {
+                    Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                        .frame(width: AgentSidebarMetrics.statusPlateSize)
+                    Text(title)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
                 Text("\(rowCount)")
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .regular))
                     .foregroundStyle(.tertiary)
@@ -107,8 +114,8 @@ struct AgentSidebarGroupSectionHeader: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .padding(.horizontal, fontPreset.scaledClamped(10, max: 14))
-        .padding(.top, isFirst ? fontPreset.scaledClamped(2, max: 3) : fontPreset.scaledClamped(14, max: 20))
+        .padding(.horizontal, metrics.rowHorizontalPadding)
+        .padding(.top, isFirst ? metrics.firstSectionHeaderTopPadding : fontPreset.scaledClamped(14, max: 20))
         .padding(.bottom, fontPreset.scaledClamped(4, max: 6))
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityAddTraits(.isHeader)

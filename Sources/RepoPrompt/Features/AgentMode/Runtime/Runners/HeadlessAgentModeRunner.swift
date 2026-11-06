@@ -215,8 +215,9 @@ final class HeadlessAgentModeRunner {
                 throw CancellationError()
             }
             let proof = await hooks.providerInput.proveAgentSessionLinkProviderInput(session, monitoring.claim)
-            if monitoring.claim?.localInput != nil {
-                guard !Task.isCancelled, session.isCurrentRunAttempt(ownership, expectedRunID: runID) else { throw CancellationError() }
+            guard !Task.isCancelled, session.isCurrentRunAttempt(ownership, expectedRunID: runID) else {
+                hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, .headlessRun(runID: runID))
+                throw CancellationError()
             }
             guard hooks.providerInput.acquireAgentSessionLinkPhysicalDispatch(
                 session,

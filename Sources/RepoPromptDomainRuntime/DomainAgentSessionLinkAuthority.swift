@@ -1144,6 +1144,32 @@ package actor DomainAgentSessionLinkAuthority {
         }
     }
 
+    /// Pins only the exact managed rows actually rendered, using the existing revocation/consent
+    /// fence. The caller rechecks these authorizations synchronously at physical handoff.
+    package func managedObservationAuthorizations(
+        observer: DomainAgentSessionLinkEndpointIdentity,
+        requirements: [DomainAgentSessionManagedObservationRequirement]
+    ) -> [DomainAgentSessionLinkCommitAuthorization]? {
+        guard !isDraining, !isShutDown, requirements.count <= 32 else { return nil }
+        var authorizations: [DomainAgentSessionLinkCommitAuthorization] = []
+        for requirement in requirements {
+            guard let record = links[requirement.reference.linkID],
+                  record.grant.generation == requirement.reference.generation,
+                  record.grant.observer == observer, record.grant.target == requirement.target,
+                  hasSourceConsent(record.grant), effectiveCapabilities(of: record.grant).contains(.manage)
+            else { return nil }
+            let lease = DomainAgentSessionLinkLease(
+                leaseID: UUID(), runtimeID: runtimeID, runtimeGeneration: runtimeGeneration,
+                linkID: record.grant.id, linkGeneration: record.grant.generation, capability: .manage,
+                observer: observer, target: requirement.target, issuedAt: now(),
+                sourceScopeID: record.grant.sourceScopeID
+            )
+            guard let authorization = commitAuthorization(for: lease) else { return nil }
+            authorizations.append(authorization)
+        }
+        return authorizations
+    }
+
     /// Fences an observer-local batch before pending prompt disclosure. Every observation lease
     /// must still be exact; only grants with Manage may reveal a prompt body. A revoked member
     /// denies the whole batch rather than releasing a surviving sibling's prompt.
@@ -1184,11 +1210,13 @@ package actor DomainAgentSessionLinkAuthority {
         // Nil is an accepted producer value too. Update it before public equality can return.
         record.runFacts = runFacts
         let canonical = canonicalSnapshot(snapshot, previous: record.snapshot)
-        guard canonical != record.snapshot else {
+        let publishedStateChanged = !canonical.hasSamePublishedState(as: record.snapshot)
+        // Accept private availability as well as run facts/high-water without creating public debt.
+        record.snapshot = canonical
+        guard publishedStateChanged else {
             targets[endpoint.sessionID] = record
             return .unchanged(changeSequence: record.changeSequence)
         }
-        record.snapshot = canonical
         record.changeSequence = allocateChangeSequence(for: endpoint.sessionID)
         targets[endpoint.sessionID] = record
 

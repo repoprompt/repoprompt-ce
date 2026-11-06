@@ -705,6 +705,8 @@ struct AgentSessionLinkOutboundPromptClaim: Hashable {
     let inventoryGuidanceRevision: UInt64?
     let fragment: String
     var localInput: AgentSessionLinkLocalInputDecoration?
+    /// Exact rendered subset only; deferred rows impose no disclosure requirement.
+    var managedMetadataRequirements: [DomainAgentSessionManagedObservationRequirement] = []
 
     /// Internal recovery is baseline-only even when the original handoff disclosed optional data.
     var baselineOnly: Self {
@@ -1313,6 +1315,15 @@ final class AgentSessionLinkOutboundPromptClaimStore {
             state.recordPossibleDelivery(of: reserved)
             return .claimed(reserved)
         }
+        if let batch = rendered.passiveBatch {
+            var seen: Set<DomainAgentSessionManagedObservationRequirement> = []
+            let offered = batch.entries.filter { $0.managedMetadata != nil }.map {
+                DomainAgentSessionManagedObservationRequirement(reference: $0.reference, target: $0.targetEndpoint)
+            } + batch.attentionRequests.filter { $0.managedMetadata != nil }.map {
+                DomainAgentSessionManagedObservationRequirement(reference: $0.reference, target: $0.targetEndpoint)
+            }
+            claim.managedMetadataRequirements = offered.filter { seen.insert($0).inserted }
+        }
         claim.localInput = decorateLocalInputs(rendered)
         state.setPending(claim)
         // Recorded at hand-off, not at dispatch: the store never learns whether the caller's transport
@@ -1424,6 +1435,14 @@ final class AgentSessionLinkOutboundPromptClaimStore {
               !inventory.isEmpty,
               snapshot.linkSetRevision == inventory.linkSetRevision
         else { return nil }
+        /// A stale managed-bearing snapshot cannot ride a downgraded grant even before proof.
+        func permitsMetadata(_ metadata: AgentSessionLinkPassiveStatusNotices.ManagedMetadata?, reference: DomainAgentSessionLinkReference, sessionID: UUID) -> Bool {
+            metadata == nil || inventory.items.contains {
+                $0.reference == reference && $0.targetSessionID == sessionID && $0.capabilityNames.contains("manage")
+            }
+        }
+        guard snapshot.entries.allSatisfy({ permitsMetadata($0.managedMetadata, reference: $0.reference, sessionID: $0.targetSessionID) }),
+              snapshot.attentionRequests.allSatisfy({ permitsMetadata($0.managedMetadata, reference: $0.reference, sessionID: $0.targetSessionID) }) else { return nil }
         let granted = Set(inventory.items.map(\.targetSessionID))
         guard snapshot.entries.allSatisfy({ granted.contains($0.targetSessionID) }) else { return nil }
         guard snapshot.attentionRequests.allSatisfy({ request in

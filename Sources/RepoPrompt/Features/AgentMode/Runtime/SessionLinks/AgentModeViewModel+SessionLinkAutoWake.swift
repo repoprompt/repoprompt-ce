@@ -1307,16 +1307,14 @@ extension AgentModeViewModel {
             return
         }
         let proof = await agentSessionLinkProveProviderInput(for: session, claim: claim)
-        if claim.localInput != nil {
-            guard agentSessionLinkAutoWakeSession(for: endpoint) === session,
-                  session.oversight.pendingAutoWake?.wakeID == wakeID,
-                  agentSessionLinkAutoWakeRoute(session) == .waitingContinuation else { return }
-            guard !Task.isCancelled else {
-                // Retire preparation through its existing owner. A bare return leaves the
-                // cancelled task waiting for a physical attempt that must never happen.
-                cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
-                return
-            }
+        guard agentSessionLinkAutoWakeSession(for: endpoint) === session,
+              session.oversight.pendingAutoWake?.wakeID == wakeID,
+              agentSessionLinkAutoWakeRoute(session) == .waitingContinuation else { return }
+        guard !Task.isCancelled else {
+            // Retire preparation through its existing owner. A bare return leaves the
+            // cancelled task waiting for a physical attempt that must never happen.
+            cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
+            return
         }
         guard agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: claim.dispatchID) else {
             return

@@ -173,6 +173,28 @@ final class AgentRepromptRoutingIntegrationTests: XCTestCase {
     }
 }
 
+/// Single-session tests read preparation state without naming the tab that owns it.
+extension AgentRepromptUIStore {
+    var presentation: Presentation? {
+        get { presentations.values.first }
+        set {
+            if let newValue {
+                presentations[newValue.sourceTabID] = newValue
+            } else {
+                presentations.removeAll()
+            }
+        }
+    }
+
+    var pendingQuestions: AgentAskUserPendingState? {
+        pendingQuestionsByTab.values.first
+    }
+
+    var autoSendRequest: AutoSendRequest? {
+        autoSendRequests.values.first
+    }
+}
+
 @MainActor
 final class AgentRepromptTestFixture {
     let root: URL

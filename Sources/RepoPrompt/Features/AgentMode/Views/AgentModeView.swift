@@ -81,6 +81,9 @@ struct AgentModeView: View {
                             object: nil,
                             userInfo: ["windowID": windowState.windowID]
                         )
+                    },
+                    onNewSession: {
+                        navigationController.requestNewSession(agentModeVM: agentModeVM)
                     }
                 )
                 .navigationSplitViewColumnWidth(
@@ -135,6 +138,9 @@ struct AgentModeView: View {
         }
         .onDisappear {
             navigationController.onDisappear(windowState: windowState, agentModeVM: agentModeVM)
+        }
+        .onChange(of: navigationController.columnVisibility, initial: true) { _, visibility in
+            windowState.setAgentSidebarCollapsed(visibility == .detailOnly)
         }
         .onChange(of: isSystemWorkspaceMode) { _, isSystem in
             navigationController.onWorkspaceModeChanged(
@@ -2469,6 +2475,8 @@ struct AgentModeChatDetailView: View {
             AgentRequestUserInputCard(
                 request: request,
                 allowsRememberedDecision: agentModeVM.codexRememberedApprovalAllowed(for: currentTabID),
+                pendingFocusStore: runInteractionUI,
+                pendingFocusTabID: currentTabID,
                 onSubmit: { response in
                     guard let tabID = currentTabID else { return }
                     agentModeVM.submitUserInputResponse(tabID: tabID, requestID: request.requestID, response: response)
@@ -2513,7 +2521,9 @@ struct AgentModeChatDetailView: View {
                 onUserActivity: {
                     guard let tabID = currentTabID else { return }
                     agentModeVM.noteAskUserCardActivity(tabID: tabID, interactionID: pendingAskUser.interaction.id)
-                }
+                },
+                pendingFocusStore: runInteractionUI,
+                pendingFocusTabID: currentTabID
             )
             .id("pendingAskUser")
             .transition(.opacity)
