@@ -5,6 +5,7 @@ import Ontology
 import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptShared
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 import SwiftUI
 

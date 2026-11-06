@@ -4,6 +4,7 @@ import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptSettingsCore
 import RepoPromptShared
+@testable import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 import XCTest
 
