@@ -87,6 +87,9 @@ class M8ProviderGuardTests(unittest.TestCase):
                  for target in targets]
         cases += [(path, f"import {target}", 1) for path in consumers
                   for target in (*targets[2:], "RepoPromptClaudeCompatibleProvider")]
+        cases += [(path, source, 1) for path in consumers
+                  for source in ("import struct RepoPromptClaudeCompatibleProvider.ClaudeCompatibleRuntimeConfig",
+                                 "import RepoPromptClaudeCompatibleProvider;")]
         cases += [(path, "import RepoPromptAgentProviderContracts", 0) for path in consumers]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

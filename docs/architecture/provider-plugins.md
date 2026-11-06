@@ -93,7 +93,8 @@ The provider package lives in-repo at `Packages/RepoPromptAgentProviders/` and i
 // Package.swift (root)
 .package(path: "Packages/RepoPromptAgentProviders"),
 
-// RepoPrompt executable target dependencies
+// RepoPromptClaudeProvider and RepoPromptApp target dependencies
+// The RepoPrompt executable shell depends only on RepoPromptApp.
 .product(name: "RepoPromptClaudeCompatibleProvider", package: "RepoPromptAgentProviders"),
 ```
 
@@ -210,12 +211,12 @@ This app extension and `Sources/RepoPromptClaudeProvider/ClaudeCompatibleProvide
 
 Files that depend on this bridge (illustrative):
 
-- `Infrastructure/AI/Providers/ClaudeCode/SDK/ClaudeSDKNDJSONTranslator.swift` (stream mapping)
+- `Sources/RepoPromptClaudeProvider/ClaudeSDKNDJSONTranslator.swift` (stream mapping)
 - `Infrastructure/AI/Providers/ClaudeCode/ClaudeCodeLaunchEnvironmentResolver.swift` (model normalization, slot mapping, launch resolution)
 - `Infrastructure/AI/Providers/ClaudeCode/ClaudeCodeCompatibleBackendStore.swift` (env builder)
 - `Infrastructure/AI/Providers/ClaudeCode/ClaudeCodePromptDelivery.swift` (decorated user message)
 - `Infrastructure/AI/Providers/ClaudeCode/ClaudeAgentToolPreferences.swift` (prompt delivery rules)
-- `Infrastructure/AI/Providers/ClaudeCodeAgentProvider.swift` (headless arguments, user-message decoration)
+- `Sources/RepoPromptClaudeProvider/ClaudeCodeAgentProvider.swift` (headless arguments, user-message decoration)
 
 ### `ClaudeCompatiblePluginBridge` (Agent Mode feature facade)
 
@@ -352,7 +353,7 @@ The recommended pattern when adding (for example) a hypothetical `acmeAgent` fam
 
 1. **Decide the runtime shape.**
    - Interactive native CLI: implement `NativeAgentRuntimeControlling` for the new family, building an adapter analogous to `ClaudeCompatibleNativeSessionAdapter`.
-   - Headless-only CLI: build a `HeadlessAgentProvider` and (optionally) wrap it in a per-family adapter for parity.
+   - Headless-only CLI: build a `HeadlessAgentProvider` and return it directly from composition.
    - ACP-based: follow `Sources/RepoPromptACPProviders/ACPAgentProvider.swift` instead — ACP runtimes do not yet flow through the Claude-compatible plugin seam.
 
 2. **Add (or reuse) a provider package.**
