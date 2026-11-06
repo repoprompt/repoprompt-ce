@@ -1,4 +1,5 @@
 import Foundation
+import JSONSchema
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
@@ -288,6 +289,91 @@ final class OracleExecutionResolverTests: XCTestCase {
         XCTAssertEqual(changedMode.promptConfiguration.chatPresetID, ChatPreset.BuiltIn.plan.id)
         XCTAssertEqual(sameMode.selection, .conversation)
         XCTAssertEqual(changedMode.selection, .conversation)
+    }
+
+    func testAdditionalOraclesFiltersResolvedRostersPreservingOrderAndDuplicateLanes() throws {
+        let mirroredSchema = try JSONSerialization.jsonObject(with: JSONEncoder().encode(MCPOracleToolProvider.additionalOraclesSchema)) as? NSDictionary
+        let canonicalSchema = try JSONSerialization.jsonObject(with: JSONEncoder().encode(OracleAdditionalOraclesContract.schemaProperty())) as? NSDictionary
+        XCTAssertEqual(mirroredSchema, canonicalSchema)
+        let typedSchema = try JSONDecoder().decode(JSONSchema.self, from: JSONEncoder().encode(MCPOracleToolProvider.additionalOraclesSchema))
+        let tool = Tool(name: "ask_oracle", description: "", inputSchema: .object(properties: [OracleAdditionalOraclesContract.argumentName: typedSchema]), returnsValue: { _ in .null })
+        guard case let .object(publishedSchema) = try tool.domainBinding().definition.inputSchema,
+              case let .object(properties)? = publishedSchema["properties"]
+        else { return XCTFail("Expected published Oracle schema") }
+        XCTAssertEqual(properties[OracleAdditionalOraclesContract.argumentName], OracleAdditionalOraclesContract.schemaProperty())
+        let primary = AIModel.gpt54.rawValue
+        let mini = AIModel.gpt54Mini.rawValue
+        let sonnet = AIModel.claude4Sonnet.rawValue
+        let identifiers = [primary, mini, sonnet, mini]
+        let preset = try ModelPreset(name: "Subset", modelStrings: identifiers)
+        let profile = AgentModelsSettingsProfile(planningModelRaw: primary, additionalOracleModelRaws: Array(identifiers.dropFirst()))
+        let resolver = makeResolver()
+        let cases: [(OracleStartChoice, OracleSelectionSnapshot)] = [
+            (.automatic, makeSnapshot(presets: [], profile: profile)),
+            (.oracleSend(primary), makeSnapshot(presets: [], profile: profile)),
+            (.oracleSend("current_chat_model"), makeSnapshot(presets: [], profile: profile)),
+            (.oracleSend(preset.id.uuidString), makeSnapshot(presets: [preset])),
+            (.automatic, makeSnapshot(presets: [preset]))
+        ]
+        for (choice, snapshot) in cases {
+            let all = try resolver.resolve(choice: choice, mode: "chat", snapshot: snapshot)
+            XCTAssertEqual(all.roster.orderedModels.map(\.modelID), identifiers)
+            let subset = try resolver.resolve(choice: choice, mode: "chat", snapshot: snapshot, additionalOracles: [" \(sonnet) ", mini])
+            XCTAssertEqual(subset.roster.orderedModels.map(\.modelID), identifiers)
+            let duplicates = try resolver.resolve(choice: choice, mode: "chat", snapshot: snapshot, additionalOracles: [mini])
+            XCTAssertEqual(duplicates.models, [.gpt54, .gpt54Mini, .gpt54Mini])
+            let single = try resolver.resolve(choice: choice, mode: "chat", snapshot: snapshot, additionalOracles: [])
+            XCTAssertEqual(single.roster.count, 1)
+            XCTAssertEqual(single.models, [.gpt54])
+        }
+        let limited = makeResolver(available: [.gpt54, .gpt54Mini])
+        for excluded in [sonnet, "unknown-model"] {
+            let unavailablePreset = try ModelPreset(name: "Explicit subset", modelStrings: [primary, mini, excluded])
+            let unavailableProfile = AgentModelsSettingsProfile(planningModelRaw: primary, additionalOracleModelRaws: [mini, excluded])
+            let unavailableCases: [(OracleStartChoice, OracleSelectionSnapshot)] = [
+                (.automatic, makeSnapshot(presets: [], profile: unavailableProfile)),
+                (.oracleSend(primary), makeSnapshot(presets: [], profile: unavailableProfile)),
+                (.oracleSend("current_chat_model"), makeSnapshot(presets: [], profile: unavailableProfile)),
+                (.oracleSend(unavailablePreset.id.uuidString), makeSnapshot(presets: [unavailablePreset]))
+            ]
+            for (choice, snapshot) in unavailableCases {
+                XCTAssertThrowsError(try limited.resolve(choice: choice, mode: "chat", snapshot: snapshot))
+                let single = try limited.resolve(choice: choice, mode: "chat", snapshot: snapshot, additionalOracles: [])
+                XCTAssertEqual(single.models, [.gpt54])
+                let subset = try limited.resolve(choice: choice, mode: "chat", snapshot: snapshot, additionalOracles: [mini])
+                XCTAssertEqual(subset.models, [.gpt54, .gpt54Mini])
+                XCTAssertThrowsError(try limited.resolve(choice: choice, mode: "chat", snapshot: snapshot, additionalOracles: [excluded]))
+            }
+        }
+        let ineligible = try ModelPreset(name: "Unavailable", modelStrings: [primary, sonnet])
+        let eligible = try ModelPreset(name: "Available", model: .gpt54Mini)
+        let automaticSnapshot = makeSnapshot(presets: [ineligible, eligible])
+        let baseline = try limited.resolve(choice: .automatic, mode: "chat", snapshot: automaticSnapshot)
+        let filtered = try limited.resolve(choice: .automatic, mode: "chat", snapshot: automaticSnapshot, additionalOracles: [])
+        XCTAssertEqual(filtered.selection, baseline.selection)
+        XCTAssertEqual(filtered.models, [.gpt54Mini])
+    }
+
+    func testAdditionalOraclesRejectsUnmatchedAndPrimaryOnlyIdentifiers() throws {
+        let primary = AIModel.gpt54.rawValue
+        let mini = AIModel.gpt54Mini.rawValue
+        let snapshot = makeSnapshot(presets: [], profile: AgentModelsSettingsProfile(planningModelRaw: primary, additionalOracleModelRaws: [mini]))
+        let first = try ModelPreset(name: "First", modelStrings: [primary, mini])
+        let second = try ModelPreset(name: "Second", modelStrings: [mini, AIModel.claude4Sonnet.rawValue])
+        XCTAssertThrowsError(try makeResolver().resolve(
+            choice: .automatic, mode: "chat", snapshot: makeSnapshot(presets: [first, second]),
+            additionalOracles: [AIModel.claude4Sonnet.rawValue]
+        )) { error in
+            XCTAssertTrue(error.localizedDescription.contains("Selectable identifiers: [\(mini)]"))
+        }
+        for identifier in ["unknown", mini.uppercased(), primary] {
+            XCTAssertThrowsError(try makeResolver().resolve(choice: .automatic, mode: "chat", snapshot: snapshot, additionalOracles: [identifier])) { error in
+                let message = error.localizedDescription
+                XCTAssertTrue(message.contains("Unmatched additional_oracles: \(identifier)"), message)
+                XCTAssertTrue(message.contains("Selectable identifiers: [\(mini)]"), message)
+                XCTAssertEqual(message.contains("The primary is always included; set it with model."), identifier == primary)
+            }
+        }
     }
 
     private var defaults: [ChatPresetMode: ChatPreset] {
