@@ -1430,7 +1430,9 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
         }
 
         func testIdleAutoWakeOwnsSendingPreparationUntilUnacceptedTerminalSettlement() async throws {
-            try await withFixture { fixture in
+            // Keep approval-store startup snapshots from changing an unrelated preference
+            // while this test deliberately suspends the required sending save.
+            try await withFixture(sourceAutoEditEnabled: ApplyEditsApprovalStore.globalDefaultAutoEditEnabled()) { fixture in
                 let vm = fixture.viewModel
                 let session = fixture.sourceSession
                 session.selectedAgent = .openCode
@@ -4743,8 +4745,8 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
         }
     #endif
 
-    private func withFixture(computerUseReady: Bool = false, _ body: (Fixture) async throws -> Void) async throws {
-        let fixture = try await makeFixture(computerUseReady: computerUseReady)
+    private func withFixture(computerUseReady: Bool = false, sourceAutoEditEnabled: Bool = false, _ body: (Fixture) async throws -> Void) async throws {
+        let fixture = try await makeFixture(computerUseReady: computerUseReady, sourceAutoEditEnabled: sourceAutoEditEnabled)
         do {
             try await body(fixture)
         } catch {
@@ -4754,7 +4756,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
         await cleanup(fixture)
     }
 
-    private func makeFixture(computerUseReady: Bool = false, pickerProviderConstruction: (() -> Void)? = nil) async throws -> Fixture {
+    private func makeFixture(computerUseReady: Bool = false, pickerProviderConstruction: (() -> Void)? = nil, sourceAutoEditEnabled: Bool = false) async throws -> Fixture {
         let rootURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("AgentSessionLinkHandoffInheritanceTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
@@ -4827,7 +4829,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     AgentChatItemPersist(from: .user("Source user", sequenceIndex: 0)),
                     AgentChatItemPersist(from: .assistant("Source assistant", sequenceIndex: 1))
                 ],
-                autoEditEnabled: false
+                autoEditEnabled: sourceAutoEditEnabled
             )
             _ = try await AgentSessionDataService.shared.saveAgentSession(
                 persistedSource, for: window.workspaceManager.workspaces[workspaceIndex]
