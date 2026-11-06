@@ -4512,6 +4512,9 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 for _ in 0 ..< 3 {
                     try await fixtures.append(makeFixture())
                 }
+                for fixture in fixtures {
+                    await fixture.window.workspaceManager.awaitWorkspaceReloadForTesting()
+                }
                 // Each real window fixture owns an explicit private catalog. Reinstall those
                 // captured catalogs after construction notifications settle; this is not coverage
                 // of the still-open #1422 new-window canonical-selection change.
@@ -4522,7 +4525,6 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 let first = fixtures[0]
                 let manager = first.window.workspaceManager
                 let workspaceID = try XCTUnwrap(manager.activeWorkspaceID)
-                let workspaceIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == workspaceID })
                 var preparedIDs: [UUID] = []
                 var preparedTabs: [UUID] = []
                 for index in 0 ..< 297 {
@@ -4541,7 +4543,9 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         createdByOverseerSessionID: index < 7 ? first.sourceSession.activeAgentSessionID : nil,
                         isMCPOriginated: index < 7
                     )
-                    _ = try await AgentSessionDataService.shared.saveAgentSession(saved, for: manager.workspaces[workspaceIndex])
+                    let workspace = try XCTUnwrap(manager.workspace(withID: workspaceID))
+                    _ = try await AgentSessionDataService.shared.saveAgentSession(saved, for: workspace)
+                    let workspaceIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == workspaceID })
                     manager.workspaces[workspaceIndex].composeTabs.append(.init(id: tab, name: "Saved \(index)", activeAgentSessionID: id))
                     if index < 7 { preparedIDs.append(id)
                         preparedTabs.append(tab)
@@ -4557,7 +4561,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     XCTAssertTrue(prepared)
                 }
                 // An agreeing recovered catalog replica does not become a second payload writer.
-                fixtures[2].window.workspaceManager.workspaces.append(manager.workspaces[workspaceIndex])
+                try fixtures[2].window.workspaceManager.workspaces.append(XCTUnwrap(manager.workspace(withID: workspaceID)))
                 let sourceID = try XCTUnwrap(first.sourceSession.activeAgentSessionID)
                 let replica = AgentSessionCarrierResolver.capture(windows: fixtures.map(\.window), sessionIDs: [sourceID], includeRuntimeOwners: true)
                 XCTAssertFalse(replica.ambiguousSessionIDs.contains(sourceID))
@@ -4572,8 +4576,11 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 let nodes = fixtures.map { ($0.viewModel, $0.sourceSession) }
                     + preparedTabs.compactMap { tab in first.viewModel.sessions[tab].map { (first.viewModel, $0) } }
                 XCTAssertEqual(nodes.count, 10)
-                for node in nodes.prefix(2) {
-                    let endpoint = try XCTUnwrap(node.0.agentSessionLinkObserverEndpoint(tabID: node.1.tabID))
+                for (index, node) in nodes.prefix(2).enumerated() {
+                    let endpoint = try XCTUnwrap(
+                        node.0.agentSessionLinkObserverEndpoint(tabID: node.1.tabID),
+                        "Node \(index) lost its endpoint: runtime matches=\(node.0.sessions[node.1.tabID] === node.1), session=\(String(describing: node.1.activeAgentSessionID)), active workspace=\(String(describing: fixtures[index].window.workspaceManager.activeWorkspaceID))"
+                    )
                     let activation = await bridge.becomeOverseer(endpoint: endpoint, isEnabled: { true }, revalidateRoute: { true }, commitIfCurrent: { $0() })
                     XCTAssertNotNil(activation)
                 }
