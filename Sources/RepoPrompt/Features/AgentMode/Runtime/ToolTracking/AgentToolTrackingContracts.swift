@@ -131,6 +131,7 @@ struct AgentToolTrackingHooks {
 
     /// Account for tool output tokens from result payload.
     let addToolOutputTokens: @MainActor @Sendable (_ payload: String?, _ session: AgentTabSession) -> Void
+    var nativeCommandResult: @MainActor @Sendable (AgentNativeCommandCompletion, AgentTabSession) -> Void = { _, _ in }
 }
 
 // MARK: - Tool Tracking Support Utilities

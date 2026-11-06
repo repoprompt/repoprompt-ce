@@ -20,6 +20,11 @@ func agentSessionRowOversightMarkIsInteractive(role _: AgentSessionOversightRole
 
 struct AgentSessionRow: View {
     let title: String
+    var titleMetadata: AgentSessionTitleMetadata?
+    var activeTask: String?
+    var unreportedPullRequestNotice: String?
+    var onEditTitle: (() -> Void)?
+    var onManagePullRequests: (() -> Void)?
     let isActive: Bool
     /// Role model: the row's own group slot when it oversees, plus its overseers in
     /// link-creation order. Drives the inline role mark; `.none` renders nothing.
@@ -421,6 +426,9 @@ struct AgentSessionRow: View {
                 items.append(.separator)
                 items.append(.action(pinActionLabel) { onTogglePin() })
                 items.append(.action(renameActionLabel) { beginRename() })
+                if let onManagePullRequests {
+                    items.append(.action("Manage pull request associations…") { onManagePullRequests() })
+                }
             }
 
             if onCopySessionID != nil {
@@ -835,7 +843,10 @@ struct AgentSessionRow: View {
 
     private func beginRename() {
         guard allowsDirectMutations else { return }
-        renameText = title
+        if let onEditTitle { onEditTitle()
+            return
+        }
+        renameText = titleMetadata?.state?.baseTitle ?? title
         showRenameAlert = true
     }
 
@@ -1020,7 +1031,7 @@ struct AgentSessionRow: View {
                         )
                     }
 
-                    Text(title)
+                    AgentSessionTitleLabel(title: title, metadata: titleMetadata)
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: isActive ? .semibold : .regular))
                         .lineLimit(1)
                         .truncationMode(.tail)
@@ -1041,6 +1052,20 @@ struct AgentSessionRow: View {
                     }
                 }
 
+                if let activeTask, runState.isActive {
+                    Text(activeTask)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .regular))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .accessibilityLabel("Current task: " + activeTask)
+                }
+                if let unreportedPullRequestNotice {
+                    Button(unreportedPullRequestNotice) { onManagePullRequests?() }
+                        .buttonStyle(.plain)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .regular))
+                        .foregroundStyle(.orange)
+                        .lineLimit(1)
+                }
                 sidebarOversightFailureLine
             }
 

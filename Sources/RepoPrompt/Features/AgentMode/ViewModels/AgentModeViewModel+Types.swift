@@ -360,6 +360,7 @@ extension AgentModeViewModel {
         let tabID: UUID
         let order: Int
         let normalizedName: String
+        var titleMetadata: AgentSessionTitleMetadata?
         let activeAgentSessionID: UUID?
         let isPinned: Bool
         let pinnedOrder: Int?
@@ -391,6 +392,10 @@ extension AgentModeViewModel {
         let runState: AgentSessionRunState
         let lastActivityAt: Date
         let lastUserMessageAt: Date?
+        var titleMetadata: AgentSessionTitleMetadata?
+        var activeTask: String?
+        var unreportedPullRequestNotice: String?
+        var titleBindingToken: AgentSessionRestorationBindingToken?
         /// The row builder prefers live bindings and merge operations over the index entry, so a
         /// live change must refresh rows even when no index entry exists to carry it.
         var worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary] = []
@@ -1003,6 +1008,10 @@ extension AgentModeViewModel {
         let id: UUID
         let tabID: UUID
         let title: String
+        let titleMetadata: AgentSessionTitleMetadata?
+        let titleBindingToken: AgentSessionRestorationBindingToken?
+        let activeTask: String?
+        let unreportedPullRequestNotice: String?
         let lastUserMessageAt: Date?
         let activityDate: Date
         let isPinned: Bool
@@ -1044,6 +1053,10 @@ extension AgentModeViewModel {
             id: UUID,
             tabID: UUID,
             title: String,
+            titleMetadata: AgentSessionTitleMetadata? = nil,
+            titleBindingToken: AgentSessionRestorationBindingToken? = nil,
+            activeTask: String? = nil,
+            unreportedPullRequestNotice: String? = nil,
             lastUserMessageAt: Date?,
             activityDate: Date,
             isPinned: Bool,
@@ -1067,6 +1080,10 @@ extension AgentModeViewModel {
             self.id = id
             self.tabID = tabID
             self.title = title
+            self.titleMetadata = titleMetadata
+            self.titleBindingToken = titleBindingToken
+            self.activeTask = activeTask
+            self.unreportedPullRequestNotice = unreportedPullRequestNotice
             self.lastUserMessageAt = lastUserMessageAt
             self.activityDate = activityDate
             self.isPinned = isPinned

@@ -243,7 +243,8 @@ struct AgentModeSidebarSessionBuilder {
         AgentSessionIndexEntry(
             id: entry.id,
             tabID: tabID,
-            name: tabName.map(normalizedSessionTitle) ?? normalizedSessionTitle(entry.name),
+            name: entry.titleMetadata?.state?.displayName ?? tabName.map(normalizedSessionTitle) ?? normalizedSessionTitle(entry.name),
+            titleMetadata: entry.titleMetadata,
             lastUserMessageAt: entry.lastUserMessageAt,
             savedAt: entry.savedAt,
             lastRunStateRaw: entry.lastRunStateRaw,
@@ -277,7 +278,7 @@ struct AgentModeSidebarSessionBuilder {
         let resolvedEntries = entries.lazy.compactMap { entry -> AgentSessionIndexEntry? in
             guard entry.tabID == tabID else { return nil }
             var resolved = entry
-            resolved.name = preferredName ?? normalizedSessionTitle(entry.name)
+            resolved.name = entry.titleMetadata?.state?.displayName ?? preferredName ?? normalizedSessionTitle(entry.name)
             return resolved
         }
 
@@ -301,7 +302,8 @@ struct AgentModeSidebarSessionBuilder {
             ? boundLiveSession
             : nil
         let entry = context.bestEntryByTabID[tab.id]
-        let title = sidebarRowTitle(
+        let titleMetadata = boundLiveSession?.titleMetadata ?? tab.agentTitleProjection?.titleMetadata ?? entry?.titleMetadata
+        let title = titleMetadata?.state?.displayName ?? sidebarRowTitle(
             for: tab,
             liveSession: boundLiveSession,
             entry: entry,
@@ -330,6 +332,8 @@ struct AgentModeSidebarSessionBuilder {
             sessionID: resolvedSessionID,
             tabID: tab.id
         )
+        searchFieldSource.pullRequestURLs = titleMetadata?.state?.pullRequests.map(\.identity.url) ?? []
+        searchFieldSource.baseTitle = titleMetadata?.state?.baseTitle
         searchFieldSource.isPinned = tab.isPinned
         searchFieldSource.sidebarGroup = tab.sidebarGroup
         searchFieldSource.sidebarGroupOrder = tab.sidebarGroupOrder
@@ -338,6 +342,10 @@ struct AgentModeSidebarSessionBuilder {
             id: tab.id,
             tabID: tab.id,
             title: title,
+            titleMetadata: titleMetadata,
+            titleBindingToken: boundLiveSession?.currentRestorationBindingToken,
+            activeTask: boundLiveSession?.runState.isActive == true && boundLiveSession?.activeTask != nil ? boundLiveSession?.displayedRunningStatusText : nil,
+            unreportedPullRequestNotice: boundLiveSession?.unreportedPullRequestNotice,
             lastUserMessageAt: lastUserMessageAt,
             activityDate: activityDate,
             isPinned: tab.isPinned,
@@ -493,6 +501,8 @@ struct AgentModeSidebarSessionBuilder {
     ) -> AgentSessionSearchFieldSource {
         AgentSessionSearchFieldSource(
             title: title,
+            pullRequestURLs: entry?.titleMetadata?.state?.pullRequests.map(\.identity.url) ?? [],
+            baseTitle: entry?.titleMetadata?.state?.baseTitle,
             runState: runState,
             isMCPControlled: isMCPControlled,
             worktree: worktree,
@@ -563,7 +573,8 @@ struct AgentModeSidebarSessionBuilder {
                 source.isMCPControlled ? "MCP controlled" : nil,
                 source.autoEditEnabled ? "auto edit" : nil,
                 source.hasUnknownConversationContent ? "unknown content" : nil,
-                source.entryParentSessionID == nil ? nil : "sub-agent"
+                source.entryParentSessionID == nil ? nil : "sub-agent",
+                source.baseTitle
             ],
             path: [
                 worktree?.logicalRootPath,
@@ -578,7 +589,7 @@ struct AgentModeSidebarSessionBuilder {
                 source.sessionID?.uuidString,
                 source.tabID?.uuidString,
                 source.entryID?.uuidString
-            ]
+            ] + source.pullRequestURLs.map(Optional.some)
         )
         return fields.withFacets(isPinned: source.isPinned, group: source.sidebarGroup)
     }
@@ -822,6 +833,10 @@ struct AgentModeSidebarSessionBuilder {
             id: session.id,
             tabID: session.tabID,
             title: session.title,
+            titleMetadata: session.titleMetadata,
+            titleBindingToken: session.titleBindingToken,
+            activeTask: session.activeTask,
+            unreportedPullRequestNotice: session.unreportedPullRequestNotice,
             lastUserMessageAt: session.lastUserMessageAt,
             activityDate: session.activityDate,
             isPinned: session.isPinned,

@@ -214,7 +214,23 @@ struct ComposeTabState: Codable, Identifiable, Equatable {
     /// Order of `sidebarGroup` among the workspace's groups, mirrored on every tab in the group.
     var sidebarGroupOrder: Int?
     var activeChatSessionID: UUID?
-    var activeAgentSessionID: UUID?
+    var activeAgentSessionID: UUID? {
+        didSet {
+            if var projection = agentTitleProjection, projection.sessionID != activeAgentSessionID {
+                if oldValue == nil, projection.sessionID == nil,
+                   projection.titleMetadata.state?.source == "human",
+                   projection.titleMetadata.state?.pullRequests.isEmpty == true
+                {
+                    // Promote a human title staged on this same sessionless tab to its first UUID.
+                    // Existing UUIDs/forks never inherit the prior conversation's metadata.
+                    projection.sessionID = activeAgentSessionID
+                    agentTitleProjection = projection
+                } else { agentTitleProjection = nil }
+            }
+        }
+    }
+
+    var agentTitleProjection: AgentSessionTitleProjection?
 
     var selection: StoredSelection
     var expandedFolders: [String]
@@ -246,6 +262,7 @@ struct ComposeTabState: Codable, Identifiable, Equatable {
         sidebarGroupOrder: Int? = nil,
         activeChatSessionID: UUID? = nil,
         activeAgentSessionID: UUID? = nil,
+        agentTitleProjection: AgentSessionTitleProjection? = nil,
         selection: StoredSelection = .init(),
         expandedFolders: [String] = [],
         promptText: String = "",
@@ -263,6 +280,7 @@ struct ComposeTabState: Codable, Identifiable, Equatable {
         self.sidebarGroupOrder = sidebarGroupOrder
         self.activeChatSessionID = activeChatSessionID
         self.activeAgentSessionID = activeAgentSessionID
+        self.agentTitleProjection = agentTitleProjection
         self.selection = selection
         self.expandedFolders = expandedFolders
         self.promptText = promptText
@@ -286,6 +304,8 @@ struct ComposeTabState: Codable, Identifiable, Equatable {
         sidebarGroupOrder = sidebarGroup == nil ? nil : try? c.decode(Int.self, forKey: .sidebarGroupOrder)
         activeChatSessionID = try c.decodeIfPresent(UUID.self, forKey: .activeChatSessionID)
         activeAgentSessionID = try c.decodeIfPresent(UUID.self, forKey: .activeAgentSessionID)
+        agentTitleProjection = try c.decodeIfPresent(AgentSessionTitleProjection.self, forKey: .agentTitleProjection)
+        if agentTitleProjection?.sessionID != activeAgentSessionID { agentTitleProjection = nil }
         selection = (try? c.decodeIfPresent(StoredSelection.self, forKey: .selection)) ?? .init()
         expandedFolders = try c.decodeIfPresent([String].self, forKey: .expandedFolders) ?? []
         promptText = try c.decodeIfPresent(String.self, forKey: .promptText) ?? ""
@@ -306,6 +326,7 @@ struct ComposeTabState: Codable, Identifiable, Equatable {
         try c.encodeIfPresent(sidebarGroupOrder, forKey: .sidebarGroupOrder)
         try c.encodeIfPresent(activeChatSessionID, forKey: .activeChatSessionID)
         try c.encodeIfPresent(activeAgentSessionID, forKey: .activeAgentSessionID)
+        try c.encodeIfPresent(agentTitleProjection, forKey: .agentTitleProjection)
         try c.encode(selection, forKey: .selection)
         try c.encode(expandedFolders, forKey: .expandedFolders)
         try c.encode(promptText, forKey: .promptText)
@@ -325,6 +346,7 @@ struct ComposeTabState: Codable, Identifiable, Equatable {
         case sidebarGroupOrder
         case activeChatSessionID
         case activeAgentSessionID
+        case agentTitleProjection
         case selection
         case expandedFolders
         case promptText

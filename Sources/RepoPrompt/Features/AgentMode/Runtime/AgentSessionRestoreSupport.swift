@@ -341,7 +341,8 @@ enum AgentSessionRestoreSupport {
         AgentSessionIndexEntry(
             id: session.id,
             tabID: tabID,
-            name: normalizedSessionTitle(name),
+            name: session.titleMetadata?.state?.displayName ?? normalizedSessionTitle(name),
+            titleMetadata: session.titleMetadata,
             lastUserMessageAt: lastUserMessageAt ?? session.lastUserMessageAt,
             savedAt: session.savedAt,
             lastRunStateRaw: session.lastRunState,

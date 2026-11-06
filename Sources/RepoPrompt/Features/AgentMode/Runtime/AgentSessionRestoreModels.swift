@@ -5,6 +5,7 @@ struct AgentSessionIndexEntry: Identifiable, Equatable {
     let id: UUID
     let tabID: UUID
     var name: String
+    var titleMetadata: AgentSessionTitleMetadata?
     var lastUserMessageAt: Date?
     var savedAt: Date
     var lastRunStateRaw: String?

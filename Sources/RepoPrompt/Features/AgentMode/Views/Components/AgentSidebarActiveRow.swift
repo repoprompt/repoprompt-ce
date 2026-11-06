@@ -302,8 +302,24 @@ struct AgentSidebarActiveRow: View, Equatable {
             return agentModeVM.resolveSidebarTargetCandidate(rawSessionID: raw, observerEndpoint: endpoint)
         }
 
+        let openTitleEditor: () -> Void = {
+            guard let workspaceID = model.workspaceID, let agentModeVM = actions.agentModeVM,
+                  agentModeVM.canPerformDirectSidebarCommand(workspaceID: workspaceID) else { return }
+            AgentSessionPullRequestEditorPresenter.present(
+                viewModel: agentModeVM,
+                tabID: session.tabID,
+                sessionID: session.sessionID,
+                workspaceID: workspaceID,
+                expectedBinding: session.titleBindingToken
+            )
+        }
         AgentSessionRow(
             title: session.title,
+            titleMetadata: session.titleMetadata,
+            activeTask: session.activeTask,
+            unreportedPullRequestNotice: session.unreportedPullRequestNotice,
+            onEditTitle: openTitleEditor,
+            onManagePullRequests: hasAgentSession ? openTitleEditor : nil,
             isActive: model.isActive,
             oversightRole: model.oversight.role,
             creatorSessionID: creatorSessionID,

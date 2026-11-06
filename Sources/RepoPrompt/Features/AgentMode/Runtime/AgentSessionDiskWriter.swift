@@ -22,14 +22,19 @@ actor AgentSessionDiskWriter {
     private var pendingByURL: [URL: PendingWrite] = [:]
     private var idleWaitersByURL: [URL: [CheckedContinuation<Void, Never>]] = [:]
     private var sequence: UInt64 = 0
+    private var latestPreparationByURL: [URL: UInt64] = [:]
 
     #if DEBUG
         private var beforeWriteHook: (@Sendable (URL) async -> Void)?
     #endif
 
     /// Only the last actually committed submission receives publication authority; coalesced callers get nil.
-    func enqueueAndWait(data: Data, url: URL) async throws -> Receipt? {
+    func enqueueAndWait(data: Data, url: URL, preparationSequence: UInt64? = nil) async throws -> Receipt? {
         let url = url.standardizedFileURL
+        if let preparationSequence {
+            guard preparationSequence > (latestPreparationByURL[url] ?? 0) else { return nil }
+            latestPreparationByURL[url] = preparationSequence
+        }
         sequence += 1
         let write = Write(sequence: sequence, data: data)
         return try await withCheckedThrowingContinuation { continuation in

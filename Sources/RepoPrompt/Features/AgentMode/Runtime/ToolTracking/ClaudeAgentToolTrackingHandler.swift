@@ -255,6 +255,16 @@ final class ClaudeAgentToolTrackingHandler {
     ) -> Bool {
         let toolName = result.toolName
         let outputJSON = result.resultJSON
+        // Only this provider-native path, not RepoPrompt tracker completions or MCP-prefixed tools.
+        if session.selectedAgent.usesClaudeNativeRuntime, toolName == "Bash", let invocationID = result.invocationID {
+            let originalArgs = session.indexedToolItemIndices(invocationID: invocationID).last.map { session.items[$0].toolArgsJSON } ?? nil
+            hooks.nativeCommandResult(.decode(
+                invocationID: invocationID,
+                argsJSON: result.argsJSON ?? originalArgs,
+                resultJSON: outputJSON,
+                isError: result.isError
+            ), session)
+        }
 
         recordExplicitProviderToolResultAckIfNeeded(
             toolName: toolName,

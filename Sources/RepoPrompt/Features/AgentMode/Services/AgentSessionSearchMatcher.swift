@@ -199,6 +199,8 @@ struct AgentSessionSearchFieldSource: Equatable {
     static let empty = AgentSessionSearchFieldSource()
 
     var title: String = ""
+    var pullRequestURLs: [String] = []
+    var baseTitle: String?
     var runState: AgentSessionRunState?
     var isMCPControlled: Bool = false
     var worktree: AgentWorktreeIndicator?
