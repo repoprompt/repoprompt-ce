@@ -4159,7 +4159,9 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
         func testNativeComputerUseInterviewPreviewMatchesActualAdmittedSubmission() async throws {
             CodexComputerUseWorkflow.setEnabledForTesting(true)
             defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
-            try await withFixture(computerUseReady: true) { fixture in
+            // Keep session/settings persistence outside the repository so preview and admission
+            // compose the same file map while asynchronous filesystem discovery finishes.
+            try await withFixture(computerUseReady: true, isolatedRepository: true) { fixture in
                 let vm = fixture.viewModel
                 let session = fixture.sourceSession
                 fixture.window.promptManager.apiSettingsViewModel?.isCodexConnected = true
@@ -4745,8 +4747,8 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
         }
     #endif
 
-    private func withFixture(computerUseReady: Bool = false, sourceAutoEditEnabled: Bool = false, _ body: (Fixture) async throws -> Void) async throws {
-        let fixture = try await makeFixture(computerUseReady: computerUseReady, sourceAutoEditEnabled: sourceAutoEditEnabled)
+    private func withFixture(computerUseReady: Bool = false, sourceAutoEditEnabled: Bool = false, isolatedRepository: Bool = false, _ body: (Fixture) async throws -> Void) async throws {
+        let fixture = try await makeFixture(computerUseReady: computerUseReady, sourceAutoEditEnabled: sourceAutoEditEnabled, isolatedRepository: isolatedRepository)
         do {
             try await body(fixture)
         } catch {
@@ -4756,10 +4758,14 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
         await cleanup(fixture)
     }
 
-    private func makeFixture(computerUseReady: Bool = false, pickerProviderConstruction: (() -> Void)? = nil, sourceAutoEditEnabled: Bool = false) async throws -> Fixture {
+    private func makeFixture(computerUseReady: Bool = false, pickerProviderConstruction: (() -> Void)? = nil, sourceAutoEditEnabled: Bool = false, isolatedRepository: Bool = false) async throws -> Fixture {
         let rootURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("AgentSessionLinkHandoffInheritanceTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        let repositoryURL = isolatedRepository ? rootURL.appendingPathComponent("repository", isDirectory: true) : rootURL
+        if isolatedRepository {
+            try FileManager.default.createDirectory(at: repositoryURL, withIntermediateDirectories: true)
+        }
 
         let previousAutoStart = pickerProviderConstruction == nil ? GlobalSettingsStore.shared.mcpAutoStart() : nil
         if previousAutoStart != nil { GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false) }
@@ -4799,7 +4805,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
         do {
             let workspace = window.workspaceManager.createWorkspace(
                 name: "Handoff inheritance \(UUID().uuidString.prefix(8))",
-                repoPaths: [rootURL.path],
+                repoPaths: [repositoryURL.path],
                 ephemeral: true
             )
             await window.workspaceManager.switchWorkspace(
