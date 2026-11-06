@@ -583,12 +583,14 @@ final class AgentMonitorPillPropsTests: XCTestCase {
     func testAutoWakeCopyStatesDeliveryAndPurposefulAttentionException() {
         XCTAssertEqual(
             AgentMonitorAutoWakeCopy.tooltip,
-            "When on, updates from the selected lanes can start a turn for this agent, no more often than the "
-                + "limit below. When off, updates wait for its next turn. A lane that asks for attention wakes it either way."
+            "When on, updates from every lane can start a turn for this agent, no more often than the limit "
+                + "below. When off, only lanes you select individually can; other updates wait for its next turn. "
+                + "A lane that asks for attention wakes it either way."
         )
         XCTAssertEqual(
             AgentMonitorAutoWakeCopy.accessibilityHint,
-            "Lets updates from selected lanes start turns for this agent. Attention requests wake it either way."
+            "Lets updates from every lane start turns for this agent; when off, only individually selected lanes "
+                + "can. Attention requests wake it either way."
         )
         XCTAssertEqual(AgentMonitorAutoWakeCopy.label, "Auto-wake on overseen lane updates")
         XCTAssertEqual(AgentMonitorRoutineWakeCopy.noDelayLabel, "No delay")
