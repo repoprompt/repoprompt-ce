@@ -979,9 +979,7 @@ final class TipHistoryDownloaderTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: record.path))
     }
 
-    func testVerifiedAcquisitionCommitsAQuarantinedAppWithoutExecutingIt() async throws {
-        let destination = try temporaryDirectory()
-        let registry = TipHistoryStagingRegistry(directory: destination.appendingPathComponent("registry"))
+    private func verifiedArchive() throws -> (entry: TipHistoryEntry, bytes: Data, key: Curve25519.Signing.PrivateKey) {
         let identity = OfficialApplicationIdentity.legacy
         // Matches TipHistoryTestFixture.entry(5): marketing 1.6.0, macOS 14.0, universal.
         let info = try PropertyListSerialization.data(fromPropertyList: validInfo(identity), format: .xml, options: 0)
@@ -998,13 +996,19 @@ final class TipHistoryDownloaderTests: XCTestCase {
         metadata["sha256"] = TipHistorySignatureVerifier.sha256(bytes)
         metadata["edSignature"] = try key.signature(for: bytes).base64EncodedString()
         raw["download"] = metadata
-        let entry = try TipHistoryTestFixture.page([raw]).entries[0]
+        return try (TipHistoryTestFixture.page([raw]).entries[0], bytes, key)
+    }
+
+    func testVerifiedAcquisitionCommitsAQuarantinedAppWithoutExecutingIt() async throws {
+        let destination = try temporaryDirectory()
+        let registry = TipHistoryStagingRegistry(directory: destination.appendingPathComponent("registry"))
+        let (entry, bytes, key) = try verifiedArchive()
         let services = TipHistoryAcquisitionServices(download: { _, target, _, _ in
             try bytes.write(to: target)
         }, run: TipHistoryAcquisitionServices.live.run, validatesCode: { _, selected in
-            selected == identity
-        }, assess: { _, _ in })
-        // Only identity/assessment are test doubles: real ditto must preserve
+            selected == .legacy
+        }, assess: { _, _ in }, availableCapacity: { _ in Int64.max })
+        // Identity/assessment and capacity are test doubles: real ditto must preserve
         // quarantine and the worker must complete layout/hash/signature checks.
         let result = try await TipHistoryDownloader(services: services, registry: registry).obtain(entry, destination: destination, publicKey: key.publicKey.rawRepresentation.base64EncodedString(), progress: { _ in }, commit: { payload in
             try TipHistoryOwnedStaging.commit(payload: payload, destination: destination, build: entry.buildNumber, shortSHA: entry.shortSHA)
@@ -1035,13 +1039,111 @@ final class TipHistoryDownloaderTests: XCTestCase {
         let registry = TipHistoryStagingRegistry(directory: destination.appendingPathComponent("registry"))
         let services = TipHistoryAcquisitionServices(download: { _, target, _, _ in
             try FileManager.default.copyItem(at: source, to: target)
-        }, run: TipHistoryAcquisitionServices.live.run, validatesCode: TipHistoryAcquisitionServices.live.validatesCode, assess: TipHistoryAcquisitionServices.live.assess)
+        }, run: TipHistoryAcquisitionServices.live.run, validatesCode: TipHistoryAcquisitionServices.live.validatesCode, assess: TipHistoryAcquisitionServices.live.assess, availableCapacity: TipHistoryAcquisitionServices.live.availableCapacity)
         let result = try await TipHistoryDownloader(services: services, registry: registry).obtain(entry, destination: destination, publicKey: SparkleUpdaterManager.pinnedPublicEdKey, progress: { _ in }, commit: { payload in
             try TipHistoryOwnedStaging.commit(payload: payload, destination: destination, build: entry.buildNumber, shortSHA: entry.shortSHA)
         })
         let app = result.appendingPathComponent("RepoPrompt CE.app")
         XCTAssertTrue(FileManager.default.fileExists(atPath: app.path))
         XCTAssertGreaterThan(getxattr(app.path, "com.apple.quarantine", nil, 0, 0, 0), 0)
+    }
+
+    func testUnknownAndLowCapacityRejectBeforeTransport() async throws {
+        let entry = try TipHistoryTestFixture.page([TipHistoryTestFixture.entry(5)]).entries[0]
+        let key = Curve25519.Signing.PrivateKey().publicKey.rawRepresentation.base64EncodedString()
+        // The first query protects the destination; the second protects temporary downloads.
+        for rejectedQuery in [0, 1] {
+            for capacity in [nil, 0] as [Int64?] {
+                let destination = try temporaryDirectory()
+                let registry = TipHistoryStagingRegistry(directory: destination.appendingPathComponent("registry"))
+                let queries = OSAllocatedUnfairLock(initialState: [String]())
+                let services = TipHistoryAcquisitionServices(download: { _, _, _, _ in
+                    XCTFail("insufficient capacity reached transport")
+                }, run: { _, _, _ in XCTFail("insufficient capacity reached extraction") }, validatesCode: { _, _ in
+                    XCTFail("insufficient capacity reached code validation")
+                    return false
+                }, assess: { _, _ in XCTFail("insufficient capacity reached assessment") }, availableCapacity: { path in
+                    queries.withLock { paths in
+                        let index = paths.count
+                        paths.append(path.path)
+                        return index == rejectedQuery ? capacity : Int64.max
+                    }
+                })
+                do {
+                    _ = try await TipHistoryDownloader(services: services, registry: registry).obtain(entry, destination: destination, publicKey: key, progress: { _ in }, commit: { _ in
+                        XCTFail("insufficient capacity reached commit")
+                        throw TipHistoryDownloadError.fileSystem
+                    })
+                    XCTFail("insufficient capacity was admitted")
+                } catch {
+                    XCTAssertEqual(error as? TipHistoryDownloadError, .insufficientDiskSpace)
+                }
+                let expectedPaths = [destination.resolvingSymlinksInPath().path, FileManager.default.temporaryDirectory.path]
+                XCTAssertEqual(queries.withLock { $0 }, Array(expectedPaths.prefix(rejectedQuery + 1)))
+                XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: destination.path).isEmpty)
+            }
+        }
+    }
+
+    func testLaterCapacityLossRejectsAndRemovesOwnedStaging() async throws {
+        let (entry, bytes, key) = try verifiedArchive()
+        let download = try XCTUnwrap(entry.download)
+        let withoutHeadroom = download.size + download.expandedSize * 2 + 64 * 1024 * 1024
+        // Query 2 must include entry-allocation headroom; query 3 must recheck before commit.
+        let cases: [(Int, Int64?)] = [(2, nil), (2, 0), (2, withoutHeadroom), (3, nil), (3, 0)]
+        for (rejectedQuery, capacity) in cases {
+            let destination = try temporaryDirectory()
+            let registry = TipHistoryStagingRegistry(directory: destination.appendingPathComponent("registry"))
+            let queries = OSAllocatedUnfairLock(initialState: [String]())
+            let stages = OSAllocatedUnfairLock(initialState: [URL]())
+            let phases = OSAllocatedUnfairLock(initialState: [String]())
+            let services = TipHistoryAcquisitionServices(download: { _, target, _, _ in
+                stages.withLock { $0.append(target.deletingLastPathComponent()) }
+                try bytes.write(to: target)
+            }, run: { command, args, directory in
+                phases.withLock { $0.append("extract") }
+                try await TipHistoryAcquisitionServices.live.run(command, args, directory)
+            }, validatesCode: { _, identity in
+                phases.withLock { $0.append("validate") }
+                return identity == .legacy
+            }, assess: { _, _ in
+                phases.withLock { $0.append("assess") }
+            }, availableCapacity: { path in
+                queries.withLock { paths in
+                    let index = paths.count
+                    paths.append(path.path)
+                    return index == rejectedQuery ? capacity : Int64.max
+                }
+            })
+            do {
+                _ = try await TipHistoryDownloader(services: services, registry: registry).obtain(entry, destination: destination, publicKey: key.publicKey.rawRepresentation.base64EncodedString(), progress: { _ in }, commit: { _ in
+                    XCTFail("insufficient capacity reached commit")
+                    throw TipHistoryDownloadError.fileSystem
+                })
+                XCTFail("insufficient capacity was admitted")
+            } catch {
+                XCTAssertEqual(error as? TipHistoryDownloadError, .insufficientDiskSpace)
+            }
+            let expectedPaths = [destination.resolvingSymlinksInPath().path, FileManager.default.temporaryDirectory.path, destination.resolvingSymlinksInPath().path, destination.resolvingSymlinksInPath().path]
+            XCTAssertEqual(queries.withLock { $0 }, Array(expectedPaths.prefix(rejectedQuery + 1)))
+            XCTAssertEqual(phases.withLock { $0 }, rejectedQuery == 2 ? [] : ["extract", "validate", "assess"])
+            let ownedStages = stages.withLock { $0 }
+            XCTAssertEqual(ownedStages.count, 1)
+            for path in ownedStages {
+                XCTAssertFalse(FileManager.default.fileExists(atPath: path.path))
+            }
+        }
+    }
+
+    func testCapacityAccountingIncludesExpansionAndAllocationHeadroom() throws {
+        let destination = try temporaryDirectory()
+        let download = try XCTUnwrap(TipHistoryTestFixture.page([TipHistoryTestFixture.entry(5)]).entries[0].download)
+        let headroom: Int64 = 16384
+        let required = download.size + download.expandedSize * 2 + headroom + 64 * 1024 * 1024
+        XCTAssertThrowsError(try TipHistoryOwnedStaging.requireCapacity(at: destination, download: download, allocationHeadroom: headroom, availableCapacity: { _ in required - 1 })) {
+            XCTAssertEqual($0 as? TipHistoryDownloadError, .insufficientDiskSpace)
+        }
+        XCTAssertNoThrow(try TipHistoryOwnedStaging.requireCapacity(at: destination, download: download, allocationHeadroom: headroom, availableCapacity: { _ in required }))
     }
 
     func testCancellationWaitsForTransportExitBeforeRemovingItsStaging() async throws {
@@ -1061,7 +1163,7 @@ final class TipHistoryDownloaderTests: XCTestCase {
                 }
                 throw CancellationError()
             }
-        }, run: { _, _, _ in XCTFail("cancelled transfer reached extraction") }, validatesCode: { _, _ in false }, assess: { _, _ in XCTFail("cancelled transfer reached assessment") })
+        }, run: { _, _, _ in XCTFail("cancelled transfer reached extraction") }, validatesCode: { _, _ in false }, assess: { _, _ in XCTFail("cancelled transfer reached assessment") }, availableCapacity: { _ in Int64.max })
         let worker = TipHistoryDownloader(services: services, registry: registry)
         let key = Curve25519.Signing.PrivateKey().publicKey.rawRepresentation.base64EncodedString()
         let task = Task {
@@ -1103,7 +1205,7 @@ final class TipHistoryDownloaderTests: XCTestCase {
                 try bytes.write(to: target)
             }, run: { _, _, _ in XCTFail("unverified bytes reached extraction") }, validatesCode: { _, _ in XCTFail("unverified bytes reached code validation")
                 return false
-            }, assess: { _, _ in XCTFail("unverified bytes reached Gatekeeper") })
+            }, assess: { _, _ in XCTFail("unverified bytes reached Gatekeeper") }, availableCapacity: { _ in Int64.max })
             let worker = TipHistoryDownloader(services: services, registry: registry)
             do {
                 _ = try await worker.obtain(entry, destination: destination, publicKey: key.publicKey.rawRepresentation.base64EncodedString(), progress: { _ in }, commit: { _ in XCTFail("unverified bytes reached commit")
