@@ -180,8 +180,8 @@ private final class CatalogRuntimeRegistrationRecorder: @unchecked Sendable {
     }
 
     func notify() {
-        let handler = lock.withLock { handler }
-        handler?()
+        let installedHandler = lock.withLock { handler }
+        installedHandler?()
     }
 }
 
