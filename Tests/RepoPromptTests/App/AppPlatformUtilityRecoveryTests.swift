@@ -2302,3 +2302,139 @@ extension TipHistoryStoreTests {
         await store.shutdown()
     }
 }
+
+/// Throttle decision behind the activation-triggered passive appcast re-check (#110).
+final class SparkleActivationUpdateCheckTests: XCTestCase {
+    private let now = Date(timeIntervalSince1970: 1_000_000)
+
+    func testMinimumIntervalIsAboutHourlyAndWellBelowPeriodicTimer() {
+        XCTAssertEqual(SparkleUpdaterManager.activationCheckMinimumInterval, 60 * 60)
+    }
+
+    func testNeverCheckedAndNeverAttemptedChecksImmediately() {
+        XCTAssertTrue(SparkleUpdaterManager.shouldPerformActivationCheck(
+            lastSuccessfulCheckTimestamp: 0,
+            lastAttempt: nil,
+            now: now
+        ))
+    }
+
+    func testRecentAttemptThrottlesEvenWithoutSuccessfulCheck() {
+        // A failing feed must not be hammered on every focus change.
+        XCTAssertFalse(SparkleUpdaterManager.shouldPerformActivationCheck(
+            lastSuccessfulCheckTimestamp: 0,
+            lastAttempt: now.addingTimeInterval(-10 * 60),
+            now: now
+        ))
+    }
+
+    func testRecentSuccessfulCheckThrottlesWithoutInMemoryAttempt() {
+        XCTAssertFalse(SparkleUpdaterManager.shouldPerformActivationCheck(
+            lastSuccessfulCheckTimestamp: now.addingTimeInterval(-30 * 60).timeIntervalSince1970,
+            lastAttempt: nil,
+            now: now
+        ))
+    }
+
+    func testStaleCheckAndStaleAttemptAllowRecheck() {
+        XCTAssertTrue(SparkleUpdaterManager.shouldPerformActivationCheck(
+            lastSuccessfulCheckTimestamp: now.addingTimeInterval(-2 * 60 * 60).timeIntervalSince1970,
+            lastAttempt: now.addingTimeInterval(-2 * 60 * 60),
+            now: now
+        ))
+    }
+
+    func testExactMinimumIntervalBoundaryAllowsRecheck() {
+        let interval: TimeInterval = 600
+        XCTAssertTrue(SparkleUpdaterManager.shouldPerformActivationCheck(
+            lastSuccessfulCheckTimestamp: now.addingTimeInterval(-interval).timeIntervalSince1970,
+            lastAttempt: now.addingTimeInterval(-interval),
+            now: now,
+            minimumInterval: interval
+        ))
+        XCTAssertFalse(SparkleUpdaterManager.shouldPerformActivationCheck(
+            lastSuccessfulCheckTimestamp: now.addingTimeInterval(-interval + 1).timeIntervalSince1970,
+            lastAttempt: nil,
+            now: now,
+            minimumInterval: interval
+        ))
+    }
+
+    // MARK: - Admission and dispatch (production coordinator)
+
+    @MainActor
+    private final class EnqueueCounter {
+        var count = 0
+    }
+
+    @MainActor
+    private func makeCoordinator(
+        interval: TimeInterval = SparkleUpdaterManager.activationCheckMinimumInterval
+    ) -> (SparkleActivationCheckCoordinator, @MainActor () -> Int) {
+        let counter = EnqueueCounter()
+        let coordinator = SparkleActivationCheckCoordinator(minimumInterval: interval) { counter.count += 1 }
+        return (coordinator, { counter.count })
+    }
+
+    private func eligible(
+        inFlight: Bool = false,
+        enabled: Bool = true,
+        lastSuccess: TimeInterval = 0
+    ) -> SparkleActivationCheckCoordinator.Eligibility {
+        .init(passiveChecksEnabled: enabled, checkInFlight: inFlight, lastSuccessfulCheckTimestamp: lastSuccess)
+    }
+
+    @MainActor
+    func testTwoActivationsInOneTurnEnqueueExactlyOneCheck() {
+        let (coordinator, enqueued) = makeCoordinator()
+        // Neither the in-flight state nor the persisted timestamp changes between these calls,
+        // exactly as when the enqueued check task has not started yet.
+        XCTAssertTrue(coordinator.activationDidOccur(now: now, eligibility: eligible()))
+        XCTAssertFalse(coordinator.activationDidOccur(now: now, eligibility: eligible()))
+        XCTAssertEqual(enqueued(), 1)
+        XCTAssertEqual(coordinator.lastAttempt, now, "Admission is reserved before the check runs")
+    }
+
+    @MainActor
+    func testFailedAttemptStillThrottlesUntilTheIntervalElapses() {
+        let interval: TimeInterval = 600
+        let (coordinator, enqueued) = makeCoordinator(interval: interval)
+        XCTAssertTrue(coordinator.activationDidOccur(now: now, eligibility: eligible()))
+        // The check failed: no persisted success timestamp.
+        XCTAssertFalse(coordinator.activationDidOccur(now: now.addingTimeInterval(interval - 1), eligibility: eligible()))
+        XCTAssertTrue(coordinator.activationDidOccur(now: now.addingTimeInterval(interval), eligibility: eligible()))
+        XCTAssertEqual(enqueued(), 2)
+    }
+
+    @MainActor
+    func testLaunchAndTimerAttemptsAnchorTheActivationThrottle() {
+        let interval: TimeInterval = 600
+        let (coordinator, enqueued) = makeCoordinator(interval: interval)
+        coordinator.recordPassiveAttempt(at: now)
+        XCTAssertFalse(coordinator.activationDidOccur(now: now.addingTimeInterval(60), eligibility: eligible()))
+        coordinator.recordPassiveAttempt(at: now.addingTimeInterval(interval))
+        XCTAssertFalse(coordinator.activationDidOccur(now: now.addingTimeInterval(interval + 60), eligibility: eligible()))
+        XCTAssertEqual(enqueued(), 0)
+    }
+
+    @MainActor
+    func testInFlightOrDisabledChecksAreRefusedWithoutConsumingAdmission() {
+        let (coordinator, enqueued) = makeCoordinator()
+        XCTAssertFalse(coordinator.activationDidOccur(now: now, eligibility: eligible(inFlight: true)))
+        XCTAssertFalse(coordinator.activationDidOccur(now: now, eligibility: eligible(enabled: false)))
+        XCTAssertNil(coordinator.lastAttempt, "A refused request must not anchor the throttle")
+        XCTAssertEqual(enqueued(), 0)
+        // Once the manual/in-flight check is gone, activation is admitted again.
+        XCTAssertTrue(coordinator.activationDidOccur(now: now, eligibility: eligible()))
+        XCTAssertEqual(enqueued(), 1)
+    }
+
+    @MainActor
+    func testRecentPersistedSuccessRefusesActivationWithoutAnchoring() {
+        let (coordinator, enqueued) = makeCoordinator()
+        let recentSuccess = now.addingTimeInterval(-30 * 60).timeIntervalSince1970
+        XCTAssertFalse(coordinator.activationDidOccur(now: now, eligibility: eligible(lastSuccess: recentSuccess)))
+        XCTAssertNil(coordinator.lastAttempt)
+        XCTAssertEqual(enqueued(), 0)
+    }
+}

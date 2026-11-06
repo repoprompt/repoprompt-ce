@@ -99,7 +99,12 @@ final class AgentRunCoordinator {
 
         let lease = MCPBootstrapLease(spec: leaseSpec, perfRecorder: perfRecorderBox.snapshot())
         let acquired = await lease.acquire()
-        guard acquired else { throw CancellationError() }
+        guard acquired else {
+            if await lease.lastAcquireWasTimeout {
+                throw HeadlessAgentConnectionAcquireTimeoutError()
+            }
+            throw CancellationError()
+        }
         return lease
     }
 

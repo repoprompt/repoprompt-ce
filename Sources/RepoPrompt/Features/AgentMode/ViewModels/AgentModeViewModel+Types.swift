@@ -68,12 +68,43 @@ struct AgentSessionPresentationRecord: Equatable {
 enum AgentSidebarThreadKey: Hashable, Equatable {
     case session(UUID)
     case tab(UUID)
+    /// An overseer's group in the Overseers tab, by tab ID. A separate namespace, so folding a group
+    /// there never folds anything in the other tabs.
+    case overseerGroup(UUID)
+    /// A thread folded inside the Pinned or Active tab, by tab ID. These tabs list matches, so they
+    /// start unfolded: folds made on All (and default folds) must never hide a match here.
+    case filteredThread(tab: AgentSidebarTab, tabID: UUID)
 
     static func key(sessionID: UUID?, tabID: UUID) -> AgentSidebarThreadKey {
         if let sessionID {
             return .session(sessionID)
         }
         return .tab(tabID)
+    }
+}
+
+/// One visible active row.
+///
+/// `id` is `SidebarSession.id`. The builder sets that to `ComposeTabState.id`
+/// and copies it when a snapshot rebuilds depth or thread metadata. It has to
+/// stay the same across those rebuilds, re-parenting, and metadata refreshes.
+/// A new id destroys the SwiftUI row and cancels an in-flight tap.
+struct AgentSidebarRenderedActiveRow: Identifiable {
+    let session: AgentModeViewModel.SidebarSession
+    let showsHeader: Bool
+    let isFirstHeader: Bool
+    let headerTitle: String
+    /// Set on the first row of a sidebar group section; its header is collapsible.
+    var groupName: String?
+    var isGroupCollapsed = false
+    var groupRowCount = 0
+    /// A collapsed group's first row carries only the header.
+    var hidesRow = false
+    /// Set only when a session can render more than once (Overseers tab).
+    var occurrenceID: AgentSidebarActiveOccurrenceID?
+
+    var id: AgentSidebarActiveOccurrenceID {
+        occurrenceID ?? .canonical(session.id)
     }
 }
 
@@ -252,6 +283,11 @@ extension AgentModeViewModel {
         let archivedSessionsExpanded: Bool
         let showComposeTabsWithoutAgentSessions: Bool
         let restorePresentation: SidebarRestorePresentationKey
+        /// Live oversight pairs; non-empty only while the Overseers tab is selected, so link changes
+        /// (including a retarget that keeps the same overseers) rebuild that tab and no other.
+        var liveOverseerRelations: Set<AgentSidebarOverseerRelation> = []
+        /// Live running/waiting tabs; non-empty only while the Active tab is selected.
+        var liveActiveTabIDs: Set<UUID> = []
     }
 
     struct SidebarListProjection {
@@ -268,6 +304,9 @@ extension AgentModeViewModel {
         let defaultCollapseSeedKeys: [AgentSidebarThreadKey]
         let existingSelectionIdentities: Set<AgentSidebarSelectionIdentity>
         let renderedSelectionOrder: [AgentSidebarSelectionIdentity]
+        /// Overseers tab only: prebuilt occurrences (a session may appear under several overseers).
+        /// Nil for every other tab, which renders through the ordinary group/date sections.
+        var overseerRenderedRows: [AgentSidebarRenderedActiveRow]?
 
         var hasMoreSessions: Bool {
             filteredSessions.count > effectiveVisibleSessionCount

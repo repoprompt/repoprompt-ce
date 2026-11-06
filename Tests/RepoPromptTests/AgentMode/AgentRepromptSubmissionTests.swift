@@ -359,8 +359,8 @@ final class AgentRepromptSubmissionTests: XCTestCase {
         let generated = "# Ready\n\n" + String(repeating: "Final rewrite. ", count: 80) + "Done."
         vm.repromptService = .init(transport: { _, _, publish in try await publish(generated) })
         var sawPublication = false
-        let observation = vm.repromptUIStore.$autoSendRequest.sink { request in
-            guard let request else { return }
+        let observation = vm.repromptUIStore.$autoSendRequests.sink { requests in
+            guard let request = requests[tabID] else { return }
             sawPublication = true
             XCTAssertFalse(
                 vm.consumeRepromptAutoSend(request, tabID: tabID, visibleDraft: generated, hasMarkedText: false),
@@ -711,7 +711,7 @@ final class AgentRepromptSubmissionTests: XCTestCase {
     }
 
     func testInvalidationRestoresOriginalOrRequiresExplicitEditedDraftChoice() async throws {
-        for change in ["tab-stream", "tab-review", "run-review", "stop-stream", "managed-review", "edited-review"] {
+        for change in ["run-review", "stop-stream", "managed-review", "edited-review"] {
             let fixture = try await AgentRepromptTestFixture()
             defer { fixture.cleanUp() }
             _ = fixture.viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: fixture.session)
@@ -734,8 +734,7 @@ final class AgentRepromptSubmissionTests: XCTestCase {
             if change == "edited-review" {
                 fixture.viewModel.storeDraftText(for: fixture.session.tabID, "User's edited rewrite")
             }
-            if change.hasPrefix("tab") { fixture.viewModel.test_setCurrentTabIDOverride(UUID()) }
-            else if change == "stop-stream" { await fixture.viewModel.cancelAgentRun(tabID: fixture.session.tabID) }
+            if change == "stop-stream" { await fixture.viewModel.cancelAgentRun(tabID: fixture.session.tabID) }
             else if change == "managed-review" { fixture.session.installRunID(UUID()) }
             else { fixture.session.runState = .completed }
             fixture.viewModel.invalidateRepromptIfNeeded()
@@ -745,7 +744,6 @@ final class AgentRepromptSubmissionTests: XCTestCase {
             let recovery = try XCTUnwrap(fixture.viewModel.repromptUIStore.recoveries[fixture.session.tabID], change)
             XCTAssertEqual(recovery.originalDraft, "First original", change)
             XCTAssertEqual(fixture.session.draftText, change == "edited-review" ? "User's edited rewrite" : "First original", change)
-            fixture.viewModel.test_setCurrentTabIDOverride(fixture.session.tabID)
             if change == "edited-review" {
                 XCTAssertTrue(recovery.requiresDecision)
                 XCTAssertTrue(try fixture.begin(text: fixture.session.draftText), "Return must wait for a decision, not rewrite edited output")
@@ -761,6 +759,184 @@ final class AgentRepromptSubmissionTests: XCTestCase {
                 XCTAssertFalse(try fixture.begin(text: fixture.session.draftText), "A recovered rewrite sends directly rather than compounding rewrites")
             }
             await gate.release()
+        }
+    }
+
+    func testSwitchingSessionsDoesNotInterruptARewrite() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.enableReprompt()
+        let vm = fixture.viewModel
+        let tabID = fixture.session.tabID
+        let gate = AgentRepromptStartGate()
+        defer { Task { await gate.release() } }
+        vm.repromptService = .init(transport: { _, _, publish in
+            try await publish("Partial")
+            _ = await gate.wait()
+            try await publish(" rewrite")
+        })
+        XCTAssertTrue(try fixture.begin(text: "Original"))
+        try await AsyncTestWait.waitUntil("partial rewrite", timeout: 5) { fixture.session.draftText == "Partial" }
+        let operation = try XCTUnwrap(vm.repromptOperation)
+
+        let other = UUID()
+        _ = vm.session(for: other)
+        vm.test_setCurrentTabIDOverride(other)
+        vm.invalidateRepromptIfNeeded()
+        operation.scheduleValidation()
+        await Task.yield()
+        XCTAssertTrue(vm.repromptOperations[tabID] === operation, "A switch must not invalidate the rewrite")
+        XCTAssertEqual(operation.phase, .generating)
+        XCTAssertNil(vm.repromptUIStore.recoveries[tabID])
+        XCTAssertNil(vm.repromptOperation, "The visible composer does not own the other session's rewrite")
+        XCTAssertFalse(vm.repromptUIStore.hasPreparedDraft(tabID: other, text: "Unrelated"))
+        XCTAssertFalse(vm.repromptUIStore.allowsAttachmentMutation(tabID: tabID, currentTabID: tabID), "Its attachments stay locked while it runs")
+        XCTAssertTrue(vm.repromptUIStore.allowsAttachmentMutation(tabID: other, currentTabID: other))
+        vm.syncStatusPillsUIState()
+        XCTAssertFalse(vm.ui.statusPills.snapshot.reprompt.isPreparing, "The other session's pill must not spin")
+
+        await gate.release()
+        try await AsyncTestWait.waitUntil("background completion", timeout: 5) { operation.phase == .completed }
+        XCTAssertEqual(fixture.session.draftText, "Partial rewrite", "The rewrite streams into its own session")
+        XCTAssertEqual(vm.retrieveDraftText(for: other), "")
+
+        vm.test_setCurrentTabIDOverride(tabID)
+        XCTAssertTrue(vm.repromptOperation === operation)
+        XCTAssertFalse(try fixture.begin(text: fixture.session.draftText), "Return sends the finished rewrite rather than rewriting it again")
+        let claim = try fixture.claim(text: fixture.session.draftText, local: true)
+        defer { vm.releaseComposerSubmitClaim(claim) }
+        XCTAssertEqual(vm.repromptDispatchTexts[claim.attempt.id], "Partial rewrite")
+        XCTAssertEqual(vm.repromptDispatchOriginals[claim.attempt.id], "Original")
+    }
+
+    func testSessionsPrepareRewritesIndependently() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.enableReprompt()
+        let vm = fixture.viewModel
+        let tabID = fixture.session.tabID
+        let firstGate = AgentRepromptStartGate(), secondGate = AgentRepromptStartGate()
+        defer { Task {
+            await firstGate.release()
+            await secondGate.release()
+        } }
+        vm.repromptService = .init(transport: { message, _, publish in
+            let isFirst = message.conversationMessages[0].content.contains("Draft A")
+            try await publish(isFirst ? "Partial A" : "Partial B")
+            _ = await (isFirst ? firstGate : secondGate).wait()
+            try await publish(" done")
+        })
+        XCTAssertTrue(try fixture.begin(text: "Draft A"))
+        try await AsyncTestWait.waitUntil("first partial", timeout: 5) { fixture.session.draftText == "Partial A" }
+
+        let other = UUID()
+        let second = vm.session(for: other)
+        second.selectedAgent = .claudeCode
+        vm.test_setCurrentTabIDOverride(other)
+        vm.storeDraftText(for: other, "Draft B")
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: other, session: second))
+        XCTAssertTrue(vm.beginComposerReprompt(target: target, text: "Draft B"), "Another session's rewrite must not block this one")
+        try await AsyncTestWait.waitUntil("second partial", timeout: 5) { second.draftText == "Partial B" }
+        XCTAssertEqual(vm.repromptOperations.count, 2, "Starting a second rewrite must not cancel the first")
+        XCTAssertNil(vm.repromptUIStore.recoveries[tabID])
+        XCTAssertEqual(fixture.session.draftText, "Partial A")
+
+        await secondGate.release()
+        try await AsyncTestWait.waitUntil("second completion", timeout: 5) { vm.repromptOperations[other]?.phase == .completed }
+        XCTAssertEqual(second.draftText, "Partial B done")
+        XCTAssertEqual(vm.repromptOperations[tabID]?.phase, .generating, "Each session has its own phase")
+
+        await firstGate.release()
+        try await AsyncTestWait.waitUntil("first completion", timeout: 5) { vm.repromptOperations[tabID]?.phase == .completed }
+        XCTAssertEqual(fixture.session.draftText, "Partial A done")
+        XCTAssertEqual(second.draftText, "Partial B done")
+    }
+
+    func testAutomaticModeWaitsForItsSessionBeforeSending() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.enableReprompt()
+        fixture.viewModel.setRepromptMode(.sendAutomatically)
+        let vm = fixture.viewModel
+        let tabID = fixture.session.tabID
+        let gate = AgentRepromptStartGate()
+        defer { Task { await gate.release() } }
+        vm.repromptService = .init(transport: { _, _, publish in
+            _ = await gate.wait()
+            try await publish("Finished brief")
+        })
+        XCTAssertTrue(try fixture.begin(text: "Original"))
+        let other = UUID()
+        _ = vm.session(for: other)
+        vm.test_setCurrentTabIDOverride(other)
+        await gate.release()
+        try await AsyncTestWait.waitUntil("parked send", timeout: 5) { vm.repromptUIStore.autoSendRequests[tabID] != nil }
+        let request = try XCTUnwrap(vm.repromptUIStore.autoSendRequests[tabID])
+        XCTAssertFalse(vm.consumeRepromptAutoSend(request, tabID: other, visibleDraft: request.text, hasMarkedText: false), "Another session's composer must not send it")
+        XCTAssertTrue(fixture.session.items.isEmpty)
+
+        vm.test_setCurrentTabIDOverride(tabID)
+        XCTAssertFalse(vm.consumeRepromptAutoSend(request, tabID: tabID, visibleDraft: "Still loading", hasMarkedText: false), "Waits for the composer to show the text")
+        XCTAssertTrue(vm.consumeRepromptAutoSend(request, tabID: tabID, visibleDraft: request.text, hasMarkedText: false), "Returning to the session sends it")
+        XCTAssertFalse(vm.consumeRepromptAutoSend(request, tabID: tabID, visibleDraft: request.text, hasMarkedText: false), "Exactly once")
+    }
+
+    func testAutoSendIsNotSpentUntilItCanDispatch() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.enableReprompt()
+        fixture.viewModel.setRepromptMode(.sendAutomatically)
+        let vm = fixture.viewModel
+        let store = vm.repromptUIStore
+        let tabID = fixture.session.tabID
+        vm.repromptService = .init(transport: { _, _, publish in try await publish("Finished brief") })
+        XCTAssertTrue(try fixture.begin(text: "Original"))
+        try await AsyncTestWait.waitUntil("parked send", timeout: 5) { store.autoSendRequests[tabID] != nil }
+        let request = try XCTUnwrap(store.autoSendRequests[tabID])
+
+        XCTAssertNil(store.autoSendReadyID(tabID: tabID, visibleDraft: request.text, canSubmit: false), "A stale or missing target must not trigger consumption")
+        XCTAssertNil(store.autoSendReadyID(tabID: tabID, visibleDraft: "Previous chunk", canSubmit: true))
+        XCTAssertNil(store.autoSendReadyID(tabID: UUID(), visibleDraft: request.text, canSubmit: true))
+        XCTAssertNil(store.autoSendReadyID(tabID: nil, visibleDraft: request.text, canSubmit: true))
+        XCTAssertEqual(store.autoSendReadyID(tabID: tabID, visibleDraft: request.text, canSubmit: true), request.operationID, "Becoming dispatchable fires it")
+
+        // The request survives the wait, and consuming it leads to a real claim of the rewrite.
+        XCTAssertTrue(vm.consumeRepromptAutoSend(request, tabID: tabID, visibleDraft: request.text, hasMarkedText: false))
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: fixture.session))
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: request.text)
+        guard case let .claimed(claim) = vm.claimComposerSubmitForImmediatePresentation(attempt) else {
+            return XCTFail("A consumed request must be able to dispatch")
+        }
+        defer { vm.finishPresentedComposerSubmitAttempt(claim, result: .blocked(message: "test cleanup")) }
+        XCTAssertEqual(vm.ui.composer.pendingSubmissions[attempt.id]?.text, "Finished brief")
+    }
+
+    func testBackgroundRewriteStillStopsForStopSettingsAndTurningOff() async throws {
+        for change in ["stop", "settings", "off"] {
+            let fixture = try await AgentRepromptTestFixture()
+            defer { fixture.cleanUp() }
+            fixture.enableReprompt()
+            let vm = fixture.viewModel
+            let tabID = fixture.session.tabID
+            let gate = AgentRepromptStartGate()
+            defer { Task { await gate.release() } }
+            vm.repromptService = .init(transport: { _, _, publish in
+                try await publish("Partial")
+                _ = await gate.wait()
+            })
+            XCTAssertTrue(try fixture.begin(text: "Original"), change)
+            try await AsyncTestWait.waitUntil("partial", timeout: 5) { fixture.session.draftText == "Partial" }
+            let other = UUID()
+            _ = vm.session(for: other)
+            vm.test_setCurrentTabIDOverride(other)
+            switch change {
+            case "stop": await vm.cancelAgentRun(tabID: tabID)
+            case "settings": vm.setRepromptMode(.sendAutomatically)
+            default: vm.setRepromptEnabled(false)
+            }
+            XCTAssertNil(vm.repromptOperations[tabID], change)
+            XCTAssertNil(vm.repromptUIStore.presentations[tabID], change)
+            XCTAssertEqual(fixture.session.draftText, "Original", change)
         }
     }
 

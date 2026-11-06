@@ -467,6 +467,7 @@ struct AgentOraclePill: View {
                                         Circle()
                                             .fill(laneDotColor(for: member))
                                             .frame(width: 6, height: 6)
+                                            .accessibilityHidden(true)
                                         Text("\(label) · \(provider) · \(status.status.rawValue)")
                                             .lineLimit(1)
                                     }
@@ -506,7 +507,10 @@ struct AgentOraclePill: View {
                 showsScrollControls: true,
                 autoScrollOnAppear: true,
                 sessionIDOverride: presentation.sessionID,
-                actionPolicy: presentation.actionPolicy
+                actionPolicy: presentation.actionPolicy,
+                oracleResult: presentedSession(for: presentation).flatMap { session in
+                    AgentOraclePillLogic.canCopyAll(session) ? oracleViewModel.oracleMemberPresentation(for: session) : nil
+                }
             )
             .frame(minHeight: transcriptMinHeight, idealHeight: transcriptIdealHeight, maxHeight: transcriptMaxHeight)
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))

@@ -1,4 +1,4 @@
-.PHONY: help doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status codex-acquire codex-status codex-update-candidate resolve build run test guardrails codex-schema-check conductor-selftest new-module ci-app-test-runner-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production xcode xcode-open xcode-generate xcode-check xcode-validate xcode-clean dev-status dev-build dev-swift-build dev-run dev-launch-existing dev-codex-schema-check dev-test dev-provider-test dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop clean
+.PHONY: ci-workflow-selftest check-fast help doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status codex-acquire codex-status codex-update-candidate resolve build run test guardrails codex-schema-check conductor-selftest new-module ci-app-test-runner-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production xcode xcode-open xcode-generate xcode-check xcode-validate xcode-clean dev-status dev-build dev-swift-build dev-run dev-launch-existing dev-codex-schema-check dev-test dev-provider-test dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop clean
 
 PRODUCT ?= all
 CODEX_ARCH ?= all
@@ -11,6 +11,7 @@ help:
 	@printf '  %-30s %s\n' 'build' 'Build and package the debug app'
 	@printf '  %-30s %s\n' 'run' 'Build, package, and launch the debug app'
 	@printf '  %-30s %s\n' 'test' 'Run the Swift test suite'
+	@printf '  %-30s %s\n' 'check-fast' 'Local whitespace, guardrails and CI harness checks; no Swift build or app launch'
 	@printf '  %-30s %s\n' 'guardrails' 'Run source layout and repository guardrails'
 	@printf '  %-30s %s\n' 'codex-schema-check' 'Validate bounded app-server assumptions against generated Codex schemas'
 	@printf '  %-30s %s\n' 'clean' 'Remove .build'
@@ -128,6 +129,15 @@ run:
 test:
 	swift test
 
+# Deliberately serial even under make -j: fail before starting the next phase.
+# This is an iteration check, not a replacement for preflight or full CI.
+check-fast:
+	git diff --check
+	git diff --cached --check
+	$(MAKE) guardrails
+	$(MAKE) ci-app-test-runner-selftest
+	@printf '%s\n' 'Fast checks passed. Swift lint/tests/builds, secret scans and release qualification were NOT run.'
+
 guardrails:
 	./Scripts/guardrails.sh
 
@@ -137,16 +147,18 @@ codex-schema-check:
 new-module:
 	python3 Scripts/modularization_new_module.py --name "$(NAME)" --family "$(FAMILY)"
 
+.PHONY: conductor-portable-selftest release-portable-selftest ci-macos-selftest
 conductor-selftest:
-	python3 Scripts/test_ci_test_coverage.py
-	python3 Scripts/test_ci_resolve_packages.py
+	$(MAKE) conductor-portable-selftest
+	python3 Scripts/test_local_production_installer.py
+
+conductor-portable-selftest:
+	$(MAKE) ci-app-test-runner-selftest
 	python3 Scripts/test_codex_app_server_schema.py
 	python3 Scripts/test_debug_app_process.py
-	python3 Scripts/test_ci_app_test_runner.py
 	python3 Scripts/test_conductor_diagnostics.py
 	python3 Scripts/test_contribution_preflight.py
 	python3 Scripts/test_modularization_metrics.py
-	python3 Scripts/test_modularization_tooling.py
 	python3 Scripts/test_modularization_t0.py
 	python3 Scripts/test_source_layout_resource_guard.py
 	python3 Scripts/test_modularization_index_graph.py
@@ -154,23 +166,47 @@ conductor-selftest:
 	python3 Scripts/test_conductor_job_phases.py
 	python3 Scripts/test_conductor_cache_retry.py
 	python3 Scripts/test_conductor_heavy_admission.py
-	python3 Scripts/test_local_production_installer.py
 	python3 Scripts/test_security_inventory.py
 
-ci-app-test-runner-selftest:
+.PHONY: ci-portable-selftest
+ci-portable-selftest:
+	$(MAKE) conductor-portable-selftest
+	$(MAKE) release-portable-selftest
+
+ci-macos-selftest:
+	python3 Scripts/test_ci_app_test_runner.py
+	python3 Scripts/test_local_production_installer.py
+	python3 -B Scripts/test_tip_history.py
+	python3 Scripts/test_tip_history_seed.py ArchiveTests.test_real_ditto_and_codesign_reject_unsigned_fixture_without_running_it
+	python3 Scripts/test_modularization_index_graph.py LibraryBindingTests
+
+ci-workflow-selftest:
 	python3 Scripts/test_ci_admission.py
+	python3 Scripts/test_ci_recovery.py
+	python3 Scripts/test_ci_job_diagnostics.py
+	python3 Scripts/test_modularization_tooling.py
+	python3 Scripts/test_fast_check.py
+
+ci-app-test-runner-selftest:
+	$(MAKE) ci-workflow-selftest
 	python3 Scripts/test_ci_app_test_runner.py
 	python3 Scripts/test_ci_test_coverage.py
 	python3 Scripts/test_ci_resolve_packages.py
 
 release-selftest:
+	$(MAKE) release-portable-selftest
 	python3 -B Scripts/test_tip_history.py
+
+release-portable-selftest:
+	python3 Scripts/test_tip_ci_selection.py
+	python3 Scripts/test_ci_release_cache.py
 	python3 -B Scripts/test_tip_history_admission.py
 	python3 -B Scripts/test_tip_history_seed.py
 	python3 -B Scripts/test_tip_release_history_hooks.py
 	python3 -B Scripts/tip_history.py lint-fragments --root .
 	python3 Scripts/test_release_tooling.py
 	python3 Scripts/test_macos_runtime_symbols.py
+	python3 Scripts/test_macos_compatibility.py
 	python3 Scripts/test_publish_tip_release.py
 	python3 Scripts/test_codex_runtime_artifact.py
 	python3 Scripts/test_codex_update_candidate.py

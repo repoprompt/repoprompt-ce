@@ -86,28 +86,23 @@ final class AgentSelfCompactTerminalSchedulerTests: XCTestCase {
         }
     }
 
-    private func drain() async {
-        for _ in 0 ..< 20 {
-            await Task.yield()
-        }
-    }
-
     func testAcceptedCommitDispatchesOnlyFromWorkerAndDuplicateDoesNotDispatchTwice() async {
         let fake = Fake()
         fake.arm()
         let scheduler = fake.scheduler()
-        scheduler.terminalSettled(
+        let worker = scheduler.terminalSettled(
             runID: fake.runID, runAttemptID: fake.attemptID,
             terminalState: .completed, publication: .accepted(successorEpoch: nil),
             successorClaimed: false, teardownSettled: { fake.teardownIsSettled }
         )
         XCTAssertEqual(fake.dispatched, 0, "terminal hook must not call provider inline")
-        scheduler.terminalSettled(
+        let duplicate = scheduler.terminalSettled(
             runID: fake.runID, runAttemptID: fake.attemptID,
             terminalState: .completed, publication: .accepted(successorEpoch: nil),
             successorClaimed: false, teardownSettled: { fake.teardownIsSettled }
         )
-        await drain()
+        XCTAssertNil(duplicate)
+        await worker?.value
         XCTAssertEqual(fake.dispatched, 1)
         XCTAssertEqual(fake.state.active?.phase, .awaitingCompactTurn)
     }
@@ -121,7 +116,7 @@ final class AgentSelfCompactTerminalSchedulerTests: XCTestCase {
             let fake = Fake()
             fake.arm()
             let scheduler = fake.scheduler()
-            scheduler.terminalSettled(
+            let worker = scheduler.terminalSettled(
                 runID: fake.runID,
                 runAttemptID: publication == .accepted(successorEpoch: nil) ? UUID() : fake.attemptID,
                 terminalState: .completed,
@@ -129,18 +124,18 @@ final class AgentSelfCompactTerminalSchedulerTests: XCTestCase {
                 successorClaimed: false,
                 teardownSettled: { true }
             )
-            await drain()
+            await worker?.value
             XCTAssertEqual(fake.dispatched, 0)
         }
         let fake = Fake()
         fake.arm()
         let scheduler = fake.scheduler()
-        scheduler.terminalSettled(
+        let worker = scheduler.terminalSettled(
             runID: fake.runID, runAttemptID: fake.attemptID,
             terminalState: .completed, publication: .accepted(successorEpoch: nil),
             successorClaimed: true, teardownSettled: { true }
         )
-        await drain()
+        await worker?.value
         XCTAssertEqual(fake.dispatched, 0)
         XCTAssertEqual(fake.state.latest?.outcome, .cancelled)
     }
@@ -149,19 +144,20 @@ final class AgentSelfCompactTerminalSchedulerTests: XCTestCase {
         let fake = Fake()
         fake.arm()
         let scheduler = fake.scheduler()
-        scheduler.terminalSettled(
+        let rejected = scheduler.terminalSettled(
             runID: fake.runID, runAttemptID: fake.attemptID,
             terminalState: .completed, publication: .rejected(reason: "transient"),
             successorClaimed: false, teardownSettled: { true }
         )
         XCTAssertEqual(fake.state.active?.phase, .scheduled)
         XCTAssertEqual(fake.dispatched, 0)
-        scheduler.terminalSettled(
+        let worker = scheduler.terminalSettled(
             runID: fake.runID, runAttemptID: fake.attemptID,
             terminalState: .completed, publication: .accepted(successorEpoch: nil),
             successorClaimed: false, teardownSettled: { true }
         )
-        await drain()
+        await worker?.value
+        await rejected?.value
         XCTAssertEqual(fake.dispatched, 1)
 
         let stale = Fake()
@@ -176,14 +172,12 @@ final class AgentSelfCompactTerminalSchedulerTests: XCTestCase {
 
         let abandoned = Fake()
         abandoned.arm()
-        abandoned.scheduler().terminalSettled(
+        let abandonedWorker = abandoned.scheduler().terminalSettled(
             runID: abandoned.runID, runAttemptID: abandoned.attemptID,
             terminalState: .completed, publication: .rejected(reason: "never retried"),
             successorClaimed: false, teardownSettled: { true }
         )
-        for _ in 0 ..< 120 {
-            await Task.yield()
-        }
+        await abandonedWorker?.value
         XCTAssertNil(abandoned.state.active)
         XCTAssertEqual(abandoned.state.latest?.outcome, .failed)
         XCTAssertEqual(abandoned.dispatched, 0)
@@ -203,12 +197,12 @@ final class AgentSelfCompactTerminalSchedulerTests: XCTestCase {
                 }
             }
             let scheduler = fake.scheduler()
-            scheduler.terminalSettled(
+            let worker = scheduler.terminalSettled(
                 runID: fake.runID, runAttemptID: fake.attemptID,
                 terminalState: .completed, publication: .accepted(successorEpoch: nil),
                 successorClaimed: false, teardownSettled: { fake.teardownIsSettled }
             )
-            await drain()
+            await worker?.value
             XCTAssertEqual(fake.dispatched, 0)
             XCTAssertNil(fake.state.active)
             XCTAssertEqual(fake.state.latest?.outcome, invalidateEndpoint ? .cancelled : .failed)
@@ -220,14 +214,14 @@ final class AgentSelfCompactTerminalSchedulerTests: XCTestCase {
         fake.arm()
         fake.teardownIsSettled = false
         let scheduler = fake.scheduler()
-        scheduler.terminalSettled(
+        let worker = scheduler.terminalSettled(
             runID: fake.runID, runAttemptID: fake.attemptID,
             terminalState: .completed, publication: .accepted(successorEpoch: nil),
             successorClaimed: false, teardownSettled: { fake.teardownIsSettled }
         )
         scheduler.cancelForAcceptedLocalInput()
         fake.teardownIsSettled = true
-        await drain()
+        await worker?.value
         XCTAssertEqual(fake.dispatched, 0)
         XCTAssertEqual(fake.state.latest?.outcome, .cancelled)
 
@@ -235,12 +229,12 @@ final class AgentSelfCompactTerminalSchedulerTests: XCTestCase {
         changed.arm()
         changed.support = .codex
         let other = changed.scheduler()
-        other.terminalSettled(
+        let changedWorker = other.terminalSettled(
             runID: changed.runID, runAttemptID: changed.attemptID,
             terminalState: .completed, publication: .accepted(successorEpoch: nil),
             successorClaimed: false, teardownSettled: { true }
         )
-        await drain()
+        await changedWorker?.value
         XCTAssertEqual(changed.dispatched, 0)
         XCTAssertEqual(changed.state.latest?.outcome, .failed)
     }
@@ -268,12 +262,12 @@ final class AgentSelfCompactTerminalSchedulerTests: XCTestCase {
             )
         }
         await gate.waitUntilEntered()
-        fake.scheduler().terminalSettled(
+        let worker = fake.scheduler().terminalSettled(
             runID: fake.runID, runAttemptID: fake.attemptID,
             terminalState: .completed, publication: .accepted(successorEpoch: nil),
             successorClaimed: false, teardownSettled: { true }
         )
-        await drain()
+        await worker?.value
         XCTAssertEqual(fake.dispatched, 1)
         XCTAssertEqual(fake.state.active?.phase, .awaitingCompactTurn)
         gate.release()
@@ -289,12 +283,12 @@ final class AgentSelfCompactTerminalSchedulerTests: XCTestCase {
         fake.arm()
         fake.state.active?.admittedSupport = .acpAdvertisedCommand
         fake.support = .acpAdvertisedCommand
-        fake.scheduler().terminalSettled(
+        let worker = fake.scheduler().terminalSettled(
             runID: fake.runID, runAttemptID: fake.attemptID,
             terminalState: .completed, publication: .accepted(successorEpoch: nil),
             successorClaimed: false, teardownSettled: { true }
         )
-        await drain()
+        await worker?.value
         XCTAssertEqual(fake.dispatched, 1)
         XCTAssertEqual(fake.state.active?.phase, .awaitingCompactTurn)
         XCTAssertNil(fake.state.latest)
@@ -305,14 +299,12 @@ final class AgentSelfCompactTerminalSchedulerTests: XCTestCase {
         fake.arm()
         fake.toolsAreDrained = false
         let scheduler = fake.scheduler()
-        scheduler.terminalSettled(
+        let worker = scheduler.terminalSettled(
             runID: fake.runID, runAttemptID: fake.attemptID,
             terminalState: .completed, publication: .accepted(successorEpoch: nil),
             successorClaimed: false, teardownSettled: { true }
         )
-        for _ in 0 ..< 100 {
-            await Task.yield()
-        }
+        await worker?.value
         XCTAssertEqual(fake.dispatched, 0)
         XCTAssertNil(fake.state.active)
         XCTAssertEqual(fake.state.latest?.outcome, .failed)
@@ -322,14 +314,12 @@ final class AgentSelfCompactTerminalSchedulerTests: XCTestCase {
         let teardown = Fake()
         teardown.arm()
         teardown.teardownIsSettled = false
-        teardown.scheduler().terminalSettled(
+        let teardownWorker = teardown.scheduler().terminalSettled(
             runID: teardown.runID, runAttemptID: teardown.attemptID,
             terminalState: .completed, publication: .accepted(successorEpoch: nil),
             successorClaimed: false, teardownSettled: { teardown.teardownIsSettled }
         )
-        for _ in 0 ..< 100 {
-            await Task.yield()
-        }
+        await teardownWorker?.value
         XCTAssertNil(teardown.state.active)
         XCTAssertEqual(teardown.dispatched, 0)
         XCTAssertLessThanOrEqual(teardown.polls, 50)

@@ -174,6 +174,32 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
         let observed = viewModel.agentSessionLinkObservationSnapshot(for: candidate(tabID: UUID()))
         XCTAssertFalse(observed.idleForSend)
         XCTAssertEqual(observed.board.sendBlockers, [AgentModeViewModel.SendBlocker.sessionUnavailable.rawValue])
+        XCTAssertNil(observed.board.directRunningHelperCount)
+    }
+
+    func testCachedCensusDistinguishesUnavailableFromKnownZeroWithoutChangingPollWire() throws {
+        let tabID = UUID()
+        let viewModel = AgentModeViewModel(testWorkspacePath: FileManager.default.currentDirectoryPath, codexControllerFactory: { _, _, _, _, _, _ in
+            preconditionFailure("Census tests must not start a provider")
+        })
+        let workspaceManager = AgentSessionLinkEndpointTestSupport.installWorkspace(on: viewModel, tabID: tabID, name: "Census availability")
+        defer { withExtendedLifetime(workspaceManager) {} }
+        let session = viewModel.session(for: tabID)
+        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        let target = try candidate(tabID: tabID, sessionID: sessionID, workspaceID: XCTUnwrap(workspaceManager.activeWorkspace?.id))
+        viewModel.agentSessionLinkCensusWorkspaceID = nil
+        let unknown = viewModel.agentSessionLinkObservationSnapshot(for: target)
+        XCTAssertNil(unknown.board.directRunningHelperCount)
+        var changedParents: Set<UUID> = []
+        let subscription = viewModel.agentSessionLinkSubagentCensusChanged.sink { changedParents.formUnion($0) }
+        defer { subscription.cancel() }
+        viewModel.rebuildAgentSessionLinkSubagentCensus()
+        let known = viewModel.agentSessionLinkObservationSnapshot(for: target)
+        XCTAssertEqual(known.board.directRunningHelperCount, 0)
+        XCTAssertTrue(changedParents.isEmpty, "availability decorates the next existing observation; it creates no new notification")
+        XCTAssertEqual(AgentSessionLinkResponseRenderer.laneBoardValue(unknown.board), AgentSessionLinkResponseRenderer.laneBoardValue(known.board))
+        let wrongWorkspace = candidate(tabID: tabID, sessionID: sessionID, workspaceID: UUID())
+        XCTAssertNil(viewModel.agentSessionLinkObservationSnapshot(for: wrongWorkspace).board.directRunningHelperCount)
     }
 
     func testPublishedBlockersAndIdleForSendShareTheSameEvaluation() {
@@ -575,5 +601,359 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
         XCTAssertTrue(indexFileExists())
         let cached = await viewModel.agentSessionLinkPersistedSubagentMetaLoader(workspace)
         XCTAssertEqual(cached?.count, 0, "an existing index is served, not reported unavailable")
+    }
+}
+
+@MainActor
+final class AgentSessionLinkManagedMetadataTests: XCTestCase {
+    private typealias Notices = AgentSessionLinkPassiveStatusNotices
+    private let at = Date(timeIntervalSince1970: 1000)
+
+    private func endpoint(_ number: Int) -> DomainAgentSessionLinkEndpointIdentity {
+        AgentSessionLinkIdentityTestSupport.endpoint(sessionID: id(number))
+    }
+
+    private func id(_ number: Int) -> UUID {
+        UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", number))!
+    }
+
+    private func reference(_ number: Int = 1) -> DomainAgentSessionLinkReference {
+        .init(linkID: id(number + 100), generation: 1)
+    }
+
+    private func observation(
+        context: DomainAgentSessionContextLoad? = nil,
+        outcome: DomainAgentSessionLaneBoard.RunOutcome = .completed,
+        pending: Bool = false,
+        helpers: Int? = nil
+    ) -> DomainAgentSessionObservationSnapshot {
+        .init(
+            sessionID: id(1), displayName: "Worker", providerDisplayName: nil, status: .idle,
+            board: .init(runOutcome: outcome, failureReason: nil, sendBlockers: [], subagentRunning: helpers ?? 0, subagentFinished: 0, subagentCountsKnown: helpers != nil),
+            idleForSend: false, pendingInteractionKind: pending ? .question : nil,
+            latestVisibleAssistantPreview: nil, visibleRowCount: 0, lastActivityAt: at, context: context
+        )
+    }
+
+    private func sample(_ status: Notices.Status, metadata: Notices.ManagedMetadata?, number: Int = 1, preview: String? = nil) -> Notices.Sample {
+        .init(reference: reference(number), targetEndpoint: endpoint(number), targetSessionID: id(number), displayName: "Worker", status: status, latestVisibleAssistantPreview: preview, managedMetadata: metadata)
+    }
+
+    private func notices(metadata: Notices.ManagedMetadata?, count: Int = 1, preview: String? = nil) -> Notices {
+        var result = Notices(observerEndpoint: endpoint(0))
+        result.enable(samples: (1 ... count).map { sample(.running, metadata: metadata, number: $0, preview: preview) }, linkSetRevision: 1, observedAt: at)
+        result.reconcile(samples: (1 ... count).map { sample(.idle, metadata: metadata, number: $0, preview: preview) }, linkSetRevision: 1, deliverable: true, observedAt: at)
+        for number in 1 ... count {
+            XCTAssertEqual(result.requestAttention(reference: reference(number), targetEndpoint: endpoint(number), targetSessionID: id(number), linkSetRevision: 1, requestedAt: at), .accepted)
+        }
+        return result
+    }
+
+    private func inventory(count: Int = 1, managed: Bool = true) -> AgentSessionLinkPromptInventory {
+        .init(observerSessionID: id(0), linkSetRevision: 1, items: (1 ... count).map {
+            .init(targetSessionID: id($0), displayName: "Worker", capabilityNames: managed ? ["manage", "poll"] : ["poll"], reference: reference($0))
+        })
+    }
+
+    func testBothRowKindsRenderCachedFactsAndIndependentUnknowns() {
+        let contexts: [(DomainAgentSessionContextLoad?, String, String)] = [
+            (nil, "unknown", "unknown"),
+            (.init(usedTokens: nil, windowTokens: 100, confidence: .exact), "unknown", "unknown"),
+            (.init(usedTokens: 50, windowTokens: nil, confidence: .inferred), "unknown", "inferred"),
+            (.init(usedTokens: 125, windowTokens: 100, confidence: .bestEffort), "125.0", "best_effort"),
+            (.init(usedTokens: 0, windowTokens: 100, confidence: .exact), "0.0", "exact")
+        ]
+        for (context, percent, confidence) in contexts {
+            for outcome in [DomainAgentSessionLaneBoard.RunOutcome.completed, .cancelled, .failed] {
+                for helpers in [nil, 0, 2] as [Int?] {
+                    let metadata = Notices.ManagedMetadata(observation(context: context, outcome: outcome, pending: true, helpers: helpers))
+                    let snapshot = notices(metadata: metadata).snapshot
+                    let rendered = AgentSessionLinkPrompts.rendered(.init(membershipKind: nil, inventory: inventory(), passiveNotices: snapshot, laneGuidanceMode: .reminder))
+                    for attribute in [
+                        "context_used_percent=\"\(percent)\"", "context_count_confidence=\"\(confidence)\"",
+                        "run_outcome=\"\(outcome.rawValue)\"", "has_pending_interaction=\"true\"",
+                        "direct_running_helpers=\"\(helpers.map(String.init) ?? "unknown")\""
+                    ] {
+                        XCTAssertEqual(rendered.fragment.components(separatedBy: attribute).count - 1, 2, attribute)
+                    }
+                    XCTAssertFalse(rendered.fragment.contains("pending_interaction_kind"))
+                    XCTAssertFalse(rendered.fragment.contains("interaction_id"))
+                    XCTAssertEqual(rendered.passiveBatch?.entries.count, 1)
+                    XCTAssertEqual(rendered.passiveBatch?.attentionRequests.count, 1)
+                }
+            }
+        }
+        let unmanaged = AgentSessionLinkPrompts.rendered(.init(membershipKind: nil, inventory: inventory(managed: false), passiveNotices: notices(metadata: nil).snapshot))
+        XCTAssertFalse(unmanaged.fragment.contains("context_used_percent="))
+        XCTAssertFalse(unmanaged.fragment.contains("run_outcome="))
+        XCTAssertFalse(unmanaged.fragment.contains("has_pending_interaction="))
+        XCTAssertFalse(unmanaged.fragment.contains("direct_running_helpers="))
+        XCTAssertFalse(unmanaged.fragment.contains("Managed metadata"))
+    }
+
+    func testSupplementalRefreshPreservesWakeIdentityAndFrozenReceipt() throws {
+        let initial = Notices.ManagedMetadata(observation())
+        let updated = Notices.ManagedMetadata(observation(context: .init(usedTokens: 90, windowTokens: 100, confidence: .exact), outcome: .failed, pending: true, helpers: 2))
+        var reducer = notices(metadata: initial)
+        let before = reducer.snapshot
+        let receipt = Notices.Receipt(snapshot: before)
+        for metadata in [updated, nil] {
+            reducer.reconcile(samples: [sample(.idle, metadata: metadata)], linkSetRevision: 1, deliverable: true, observedAt: at.addingTimeInterval(20))
+            let after = reducer.snapshot
+            XCTAssertEqual(after.entries.first?.managedMetadata, metadata)
+            XCTAssertEqual(after.attentionRequests.first?.managedMetadata, metadata)
+            XCTAssertEqual(after.entries.first?.changeSequence, before.entries.first?.changeSequence)
+            XCTAssertEqual(after.entries.first?.edgeSequence, before.entries.first?.edgeSequence)
+            XCTAssertEqual(after.entries.first?.observedAt, at)
+            XCTAssertEqual(after.attentionRequests.first?.observedAt, at)
+            XCTAssertEqual(after.attentionRequests.first?.occurrence, before.attentionRequests.first?.occurrence)
+            XCTAssertEqual(after.attentionRequests.first?.requestedAt, at)
+            XCTAssertEqual(after.wakeEligibilityFingerprint, before.wakeEligibilityFingerprint)
+            XCTAssertTrue(try XCTUnwrap(after.entries.first).isRoutineWakeEligible)
+        }
+        reducer.apply(receipt)
+        XCTAssertTrue(reducer.snapshot.entries.isEmpty)
+        XCTAssertTrue(reducer.snapshot.attentionRequests.isEmpty)
+        let revision = reducer.snapshot.queueRevision
+        reducer.reconcile(samples: [sample(.idle, metadata: updated)], linkSetRevision: 1, deliverable: true)
+        XCTAssertEqual(reducer.snapshot.queueRevision, revision)
+        XCTAssertFalse(reducer.snapshot.hasDeliverableContent, "metadata is not independently owed")
+        XCTAssertEqual(reducer.snapshot.unacknowledgedOverflowCount, 0)
+        XCTAssertEqual(reducer.requestAttention(reference: reference(), targetEndpoint: endpoint(1), targetSessionID: id(1), linkSetRevision: 1, requestedAt: at), .accepted)
+        XCTAssertEqual(reducer.snapshot.attentionRequests.first?.managedMetadata, updated, "standalone attention uses the newest cached sample")
+    }
+
+    func testAvailabilityOnlyPublicationRefreshesCacheWithoutReleasingParkedChangeWait() async throws {
+        let authority = DomainAgentSessionLinkAuthority(identity: .init(runtimeID: id(500), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: at))
+        let observer = endpoint(0)
+        let target = endpoint(1)
+        guard case let .reserved(reservation, _) = await authority.reserveLink(observer: observer, target: target),
+              case .activated = await authority.activateLink(reservation: reservation, initialSnapshot: observation(), sourcePublicationSequence: 1) else { return XCTFail("activation failed") }
+        let lease = try await authority.authorize(operation: .monitorWait, observerEndpoint: observer, targetSessionID: target.sessionID).get()
+        let initialState = await authority.targetState(for: lease)
+        let initial = try XCTUnwrap(initialState)
+        let initialRevision = await authority.snapshot().authorityRevision
+        let waiter = Task { await authority.wait(requests: [.init(lease: lease, cursor: initial.waitCursor)], until: .change, timeoutSeconds: 30) }
+        defer { waiter.cancel() }
+        try await AsyncTestWait.waitUntil("availability regression's change waiter is parked") {
+            await authority.snapshot().parkedWaiterCount == 1
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let encoded = try encoder.encode(AgentSessionLinkResponseRenderer.laneBoardValue(initial.snapshot.board))
+        var previous = observation()
+        for (sequence, helpers) in [(UInt64(2), Optional(0)), (UInt64(3), nil)] {
+            let incoming = observation(helpers: helpers)
+            XCTAssertNotEqual(incoming, previous, "internal equality must retain availability")
+            XCTAssertEqual(try encoder.encode(AgentSessionLinkResponseRenderer.laneBoardValue(incoming.board)), encoded)
+            let result = await authority.publishTargetSnapshot(endpoint: target, snapshot: incoming, sourcePublicationSequence: sequence, runFacts: .init(settledThrough: sequence, ordinaryThrough: sequence))
+            XCTAssertEqual(result, .unchanged(changeSequence: initial.changeSequence))
+            let cached = await authority.observationSnapshot(forTargetEndpoint: target)
+            XCTAssertEqual(cached?.snapshot.board.directRunningHelperCount, helpers)
+            XCTAssertEqual(cached?.sourcePublicationSequence, sequence)
+            XCTAssertEqual(cached?.runFacts?.settledThrough, sequence)
+            let state = await authority.targetState(for: lease)
+            XCTAssertEqual(state?.changeSequence, initial.changeSequence)
+            let diagnostics = await authority.snapshot()
+            XCTAssertEqual(diagnostics.authorityRevision, initialRevision)
+            XCTAssertEqual(diagnostics.parkedWaiterCount, 1, "private availability cannot release a public change waiter")
+            previous = incoming
+        }
+        let stale = await authority.publishTargetSnapshot(endpoint: target, snapshot: observation(helpers: 0), sourcePublicationSequence: 2)
+        XCTAssertEqual(stale, .stale(currentSourcePublicationSequence: 3))
+        let stillUnknown = await authority.observationSnapshot(forTargetEndpoint: target)
+        XCTAssertNil(stillUnknown?.snapshot.board.directRunningHelperCount)
+        let changed = await authority.publishTargetSnapshot(endpoint: target, snapshot: observation(helpers: 1), sourcePublicationSequence: 4)
+        XCTAssertEqual(changed, .accepted(changeSequence: initial.changeSequence + 1))
+        let completed = await waiter.value
+        XCTAssertEqual(completed.outcome, .changed(sessionID: target.sessionID))
+        XCTAssertEqual(completed.targets.first?.snapshot.board.directRunningHelperCount, 1)
+    }
+
+    func testManagedProofSuspensionRevalidatesMixedWatchMembershipBeforeOrdinaryRelease() async throws {
+        let observer = endpoint(0)
+        let authority = DomainAgentSessionLinkAuthority(identity: .init(runtimeID: id(500), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: at))
+        var grants: [DomainAgentSessionLinkGrant] = []
+        for number in 1 ... 2 {
+            guard case let .reserved(reservation, _) = await authority.reserveLink(observer: observer, target: endpoint(number), capabilities: number == 1 ? [.poll, .manage] : [.poll]),
+                  case let .activated(activation) = await authority.activateLink(reservation: reservation, initialSnapshot: .init(sessionID: id(number), displayName: "Worker", providerDisplayName: nil, status: .idle, board: .empty, idleForSend: false, pendingInteractionKind: nil, latestVisibleAssistantPreview: nil, visibleRowCount: 0, lastActivityAt: at), sourcePublicationSequence: 1) else { return XCTFail("activation failed") }
+            grants.append(activation.grant)
+        }
+        func samples(_ status: Notices.Status, includeWatch: Bool) -> [Notices.Sample] {
+            grants.prefix(includeWatch ? 2 : 1).enumerated().map { index, grant in
+                .init(reference: .init(linkID: grant.id, generation: grant.generation), targetEndpoint: grant.target, targetSessionID: grant.target.sessionID, displayName: index == 0 ? "MANAGED-A" : "WATCH-B", status: status, managedMetadata: index == 0 ? .init(observation()) : nil)
+            }
+        }
+        func liveInventory(_ revision: UInt64, includeWatch: Bool) -> AgentSessionLinkPromptInventory {
+            .init(observerSessionID: observer.sessionID, linkSetRevision: revision, items: grants.prefix(includeWatch ? 2 : 1).enumerated().map { index, grant in
+                .init(targetSessionID: grant.target.sessionID, displayName: index == 0 ? "MANAGED-A" : "WATCH-B", capabilityNames: index == 0 ? ["poll", "manage"] : ["poll"], reference: .init(linkID: grant.id, generation: grant.generation))
+            })
+        }
+        var reducer = Notices(observerEndpoint: observer)
+        reducer.enable(samples: samples(.running, includeWatch: true), linkSetRevision: 1, observedAt: at)
+        reducer.reconcile(samples: samples(.idle, includeWatch: true), linkSetRevision: 1, deliverable: true, observedAt: at)
+        let store = AgentSessionLinkOutboundPromptClaimStore()
+        let epoch = AgentSessionLinkPromptEpoch(endpoint: observer, allowsSupplement: true, providerContext: .codexExec)
+        let dispatch = AgentSessionLinkPromptDispatchID.headlessRun(runID: id(200))
+        let original = try XCTUnwrap(store.claim(dispatchID: dispatch, epoch: epoch, inventory: liveInventory(1, includeWatch: true), passiveNotices: reducer.snapshot, render: AgentSessionLinkPrompts.rendered))
+        XCTAssertEqual(original.managedMetadataRequirements.count, 1)
+        XCTAssertTrue(original.fragment.contains("WATCH-B"))
+        let gate = TestReleaseFence(name: "managed proof with mixed watch membership")
+        let proving = Task { await AgentSessionLinkProviderInputRelease.prove(original, managedProof: { observer, requirements in
+            await gate.enterAndWait()
+            return await authority.managedObservationAuthorizations(observer: observer, requirements: requirements)
+        }) { _ in XCTFail("no local input")
+            return false
+        } }
+        defer { gate.release()
+            proving.cancel()
+        }
+        guard await gate.waitUntilEntered() else { return XCTFail("proof did not suspend") }
+        _ = await authority.revoke(linkID: grants[1].id, generation: grants[1].generation, reason: .userRequested)
+        reducer.reconcile(samples: samples(.idle, includeWatch: false), linkSetRevision: 2, deliverable: true, observedAt: at)
+        XCTAssertTrue(store.isPending(original), "pending status alone does not revalidate membership")
+        gate.release()
+        let proof = await proving.value
+        var reclaimCalls = 0
+        let released = AgentSessionLinkProviderInputRelease.handoff(original: original, proof: proof, current: {
+            reclaimCalls += 1
+            return store.claimOutcome(dispatchID: dispatch, epoch: epoch, inventory: liveInventory(2, includeWatch: false), passiveNotices: reducer.snapshot, render: AgentSessionLinkPrompts.rendered)
+        }, isPending: store.isPending, consume: { _ in false })
+        XCTAssertEqual(reclaimCalls, 1)
+        XCTAssertFalse(released.mustAbortDispatch)
+        XCTAssertFalse(try XCTUnwrap(released.fragment).contains("WATCH-B"))
+        XCTAssertTrue(try XCTUnwrap(released.fragment).contains("MANAGED-A"))
+        XCTAssertEqual(released.claim?.passive?.receipt.deliveredStatuses.map(\.targetEndpoint), [grants[0].target])
+        XCTAssertTrue(try store.isPending(XCTUnwrap(released.claim)), "handoff does not pay the receipt")
+    }
+
+    func testMetadataIsExcludedFromSampleIdentityAndNondeliverableRevision() {
+        let old = sample(.idle, metadata: .init(observation()))
+        let new = sample(.idle, metadata: .init(observation(outcome: .failed, helpers: 0)))
+        XCTAssertEqual(old, new)
+        XCTAssertEqual(Set([old, new]).count, 1)
+        var reducer = Notices(observerEndpoint: endpoint(0))
+        reducer.enable(samples: [old], linkSetRevision: 1, deliverable: false, observedAt: at)
+        let revision = reducer.snapshot.queueRevision
+        reducer.reconcile(samples: [new], linkSetRevision: 1, deliverable: false, observedAt: at.addingTimeInterval(1))
+        XCTAssertEqual(reducer.snapshot.queueRevision, revision)
+        XCTAssertFalse(reducer.snapshot.hasDeliverableContent)
+    }
+
+    private func authorization(_ requirement: DomainAgentSessionManagedObservationRequirement, observer: DomainAgentSessionLinkEndpointIdentity, fence: DomainAgentSessionLinkRevocationFence) -> DomainAgentSessionLinkCommitAuthorization {
+        let grant = DomainAgentSessionLinkGrant(id: requirement.reference.linkID, generation: requirement.reference.generation, observer: observer, target: requirement.target, createdAt: at, capabilities: [.manage])
+        let lease = DomainAgentSessionLinkLease(leaseID: id(600), runtimeID: id(601), runtimeGeneration: 1, linkID: grant.id, linkGeneration: grant.generation, capability: .manage, observer: observer, target: requirement.target, issuedAt: at)
+        return .init(lease: lease, fence: fence, grant: grant, consent: nil, elevation: nil, now: { Date(timeIntervalSince1970: 1000) })
+    }
+
+    func testAcceptedReplayKeepsFrozenBytesAfterReceiptAndStillChecksRevocation() async throws {
+        var reducer = notices(metadata: .init(observation(helpers: 0)))
+        let store = AgentSessionLinkOutboundPromptClaimStore()
+        let epoch = AgentSessionLinkPromptEpoch(endpoint: endpoint(0), allowsSupplement: true, providerContext: .codexExec)
+        let dispatch = AgentSessionLinkPromptDispatchID.headlessRun(runID: id(200))
+        let claim = try XCTUnwrap(store.claim(dispatchID: dispatch, epoch: epoch, inventory: inventory(), passiveNotices: reducer.snapshot, render: AgentSessionLinkPrompts.rendered))
+        XCTAssertEqual(claim.managedMetadataRequirements.count, 1, "both rendered row kinds deduplicate the same exact requirement")
+        XCTAssertEqual(claim.passive?.receipt.deliveredStatuses.count, 1)
+        XCTAssertEqual(claim.passive?.receipt.deliveredAttentionOccurrences.count, 1)
+        store.accept(claim)
+        try reducer.apply(XCTUnwrap(claim.passive?.receipt))
+        XCTAssertFalse(reducer.snapshot.hasDeliverableContent)
+        XCTAssertNil(store.claim(dispatchID: dispatch, epoch: epoch, inventory: inventory(), passiveNotices: reducer.snapshot, render: AgentSessionLinkPrompts.rendered))
+        let fence = DomainAgentSessionLinkRevocationFence()
+        let proof = await AgentSessionLinkProviderInputRelease.prove(claim.baselineOnly, managedProof: { observer, requirements in
+            requirements.map { self.authorization($0, observer: observer, fence: fence) }
+        }) { _ in false }
+        let current = store.canReuseAcceptedClaim(claim, dispatchID: dispatch, epoch: epoch, inventory: inventory())
+        XCTAssertTrue(current)
+        let replay = AgentSessionLinkProviderInputRelease.handoffAcceptedReplay(claim.baselineOnly, proof: proof, isCurrent: current, requiresLaneBatch: false)
+        XCTAssertEqual(replay.fragment, claim.fragment)
+        XCTAssertEqual(replay.claim?.passive?.receipt, claim.passive?.receipt)
+        fence.revoke()
+        let refused = AgentSessionLinkProviderInputRelease.handoffAcceptedReplay(claim.baselineOnly, proof: proof, isCurrent: current, requiresLaneBatch: true)
+        XCTAssertTrue(refused.mustAbortDispatch)
+        XCTAssertNil(refused.fragment)
+    }
+
+    func testReclaimCanReorderOrRemoveProvenRequirementsButCannotAddOne() async throws {
+        let store = AgentSessionLinkOutboundPromptClaimStore()
+        let claim = try XCTUnwrap(store.claim(dispatchID: .autoWake(wakeID: id(200)), epoch: .init(endpoint: endpoint(0), allowsSupplement: true, providerContext: .codexExec), inventory: inventory(count: 2), passiveNotices: notices(metadata: .init(observation()), count: 2).snapshot, render: AgentSessionLinkPrompts.rendered))
+        XCTAssertEqual(claim.managedMetadataRequirements.count, 2)
+        let proof = await AgentSessionLinkProviderInputRelease.prove(claim, managedProof: { observer, requirements in
+            requirements.map { self.authorization($0, observer: observer, fence: .init()) }
+        }) { _ in false }
+        var replacement = claim
+        replacement.managedMetadataRequirements.reverse()
+        for requirements in [replacement.managedMetadataRequirements, Array(replacement.managedMetadataRequirements.prefix(1))] {
+            replacement.managedMetadataRequirements = requirements
+            let released = AgentSessionLinkProviderInputRelease.handoff(original: claim, proof: proof, current: { .claimed(replacement) }, isPending: { _ in false }, consume: { _ in false })
+            XCTAssertEqual(released.claim, replacement)
+            XCTAssertFalse(released.mustAbortDispatch)
+        }
+        replacement.managedMetadataRequirements.append(.init(reference: reference(3), target: endpoint(3)))
+        let refused = AgentSessionLinkProviderInputRelease.handoff(original: claim, proof: proof, current: { .claimed(replacement) }, isPending: { _ in false }, consume: { _ in false })
+        XCTAssertTrue(refused.mustAbortDispatch)
+        XCTAssertNil(refused.claim)
+    }
+
+    func testRenderedBudgetAndClaimsFenceOnlyTheRenderedManagedSubset() throws {
+        let metadata = Notices.ManagedMetadata(observation(helpers: 0))
+        let snapshot = notices(metadata: metadata, count: 16, preview: String(repeating: "<&\"", count: 500)).snapshot
+        let store = AgentSessionLinkOutboundPromptClaimStore()
+        let live = inventory(count: 16)
+        let epoch = AgentSessionLinkPromptEpoch(endpoint: endpoint(0), allowsSupplement: true, providerContext: .codexExec)
+        let claim = try XCTUnwrap(store.claim(dispatchID: .autoWake(wakeID: id(200)), epoch: epoch, inventory: live, passiveNotices: snapshot, render: AgentSessionLinkPrompts.rendered))
+        XCTAssertLessThanOrEqual(claim.fragment.utf8.count, AgentSessionLinkPrompts.maximumRenderedBytes)
+        let receipt = try XCTUnwrap(claim.passive?.receipt)
+        let renderedReferences = Set(receipt.deliveredStatuses.map(\.reference) + receipt.deliveredAttentionOccurrences.map(\.reference))
+        XCTAssertEqual(Set(claim.managedMetadataRequirements.map(\.reference)), renderedReferences)
+        XCTAssertEqual(claim.managedMetadataRequirements.count, renderedReferences.count, "status and attention share one exact requirement")
+        XCTAssertLessThan(receipt.deliveredStatuses.count + receipt.deliveredAttentionOccurrences.count, 32, "worst-case rows must defer under the shared cap")
+        // A real receipt is queue-qualified; use the source queue to verify subset removal separately.
+        var reducer = notices(metadata: metadata, count: 16, preview: String(repeating: "<&\"", count: 500))
+        let rendered = AgentSessionLinkPrompts.rendered(.init(membershipKind: nil, inventory: live, passiveNotices: reducer.snapshot))
+        let batch = try XCTUnwrap(rendered.passiveBatch)
+        reducer.apply(.init(queueEpoch: reducer.snapshot.queueEpoch, queueRevision: reducer.snapshot.queueRevision, deliveredStatuses: batch.entries.map(Notices.DeliveredStatus.init), deliveredAttentionOccurrences: batch.attentionRequests.map(\.occurrence), overflowProducedThrough: batch.overflowProducedThrough))
+        XCTAssertEqual(reducer.snapshot.entries.count, 16 - batch.entries.count)
+        XCTAssertEqual(reducer.snapshot.attentionRequests.count, 16 - batch.attentionRequests.count)
+    }
+
+    func testStaleManagedSnapshotCannotBeClaimedAgainstWatchOnlyInventory() {
+        let store = AgentSessionLinkOutboundPromptClaimStore()
+        let outcome = store.claimOutcome(dispatchID: .autoWake(wakeID: id(200)), epoch: .init(endpoint: endpoint(0), allowsSupplement: true, providerContext: .codexExec), inventory: inventory(managed: false), passiveNotices: notices(metadata: .init(observation())).snapshot, render: AgentSessionLinkPrompts.rendered)
+        XCTAssertTrue(outcome.mustAbortDispatch)
+        XCTAssertNil(outcome.claim)
+    }
+
+    func testPhysicalHandoffRejectsManageWithdrawalAfterProofWithoutAcknowledging() async {
+        let observer = endpoint(0)
+        let target = endpoint(1)
+        let authority = DomainAgentSessionLinkAuthority(identity: .init(runtimeID: id(500), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: at))
+        let elevation = DomainAgentSessionLinkCapabilityElevation()
+        await authority.installCapabilityElevation(elevation)
+        guard case let .reserved(reservation, _) = await authority.reserveLink(observer: observer, target: target, capabilities: [.poll]),
+              case let .activated(activation) = await authority.activateLink(reservation: reservation, initialSnapshot: observation(), sourcePublicationSequence: 1) else { return XCTFail("fixture activation failed") }
+        let requirement = DomainAgentSessionManagedObservationRequirement(reference: .init(linkID: activation.grant.id, generation: activation.grant.generation), target: target)
+        let denied = await authority.managedObservationAuthorizations(observer: observer, requirements: [requirement])
+        XCTAssertNil(denied)
+        for automatic in [false, true] {
+            elevation.elevate(observer: observer.sessionID)
+            var claim = AgentSessionLinkOutboundPromptClaim(observerSessionID: observer.sessionID, dispatchID: automatic ? .autoWake(wakeID: id(200)) : .headlessRun(runID: id(201)), epochToken: .init(), fragment: "managed cached metadata", observerEndpoint: observer)
+            claim.managedMetadataRequirements = [requirement]
+            let proof = await AgentSessionLinkProviderInputRelease.prove(claim, managedProof: { observer, requirements in
+                await authority.managedObservationAuthorizations(observer: observer, requirements: requirements)
+            }) { _ in XCTFail("no local-input read requested")
+                return false
+            }
+            let allowed = AgentSessionLinkProviderInputRelease.handoff(original: claim, proof: proof, current: { .claimed(claim) }, isPending: { _ in true }, consume: { _ in false })
+            XCTAssertEqual(allowed.fragment, claim.fragment)
+            elevation.revokeAll()
+            let revoked = AgentSessionLinkProviderInputRelease.handoff(original: claim, proof: proof, current: { XCTFail("must reject before reclaim")
+                return .claimed(claim)
+            }, isPending: { _ in true }, consume: { _ in false })
+            XCTAssertNil(revoked.fragment)
+            XCTAssertNil(revoked.claim, "no receipt can be applied for refused content")
+            XCTAssertEqual(revoked.mustAbortDispatch, automatic)
+            XCTAssertEqual(revoked.text("user text"), "user text")
+        }
     }
 }

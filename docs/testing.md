@@ -2,6 +2,51 @@
 
 Use this guide for contributor-facing XCTest changes. Follow `AGENTS.md` for coordinated daemon use, style checks, and lifecycle approvals. Use `$rpce-test-quality` when deciding whether coverage is worth adding, retaining, consolidating, or removing.
 
+## Fast local feedback and CI escalation
+
+Start with `make check-fast` while iterating. It checks unstaged/staged whitespace,
+repository guardrails, and CI workflow-contract/admission/diagnostic/runner/coverage/dependency
+selftests, serially and fail-fast. Guardrails evaluate Swift package manifests, so
+the configured Swift toolchain is still required. It does not resolve Swift packages, build or launch
+the app, install tools, or claim complete validation. Untracked-file whitespace and
+secret scans are not covered; mandatory commit/push preflight still applies.
+
+Then choose the narrowest relevant coordinated check (`make dev-test FILTER=<Suite>`,
+`make dev-provider-test FILTER=<Suite>`, `make dev-lint`). Check nonzero executed test
+counts. Use the contribution skill's `pr-ready` lane for the outgoing-range-selected
+broader pass. Use `make dev-release-preflight` and an explicitly requested manual
+`Release Candidate` workflow for packaging changes. Live app lifecycle requires approval.
+
+**Style means integration passed, not release-ready.** It still requires all root,
+provider, module, static, secret and Sentry/privacy obligations. Tip/stable qualify
+the exact artifact they publish, including older-runtime compatibility. See
+[integration admission](architecture/ci-admission.md) for the full boundary.
+
+For hosted failures, open **Style's prerequisite table** and the original failing
+job/step, then inspect **CI Recovery** for a bounded automatic recovery decision.
+Recognized startup/transport failures are retried at most to source attempt 3;
+missing evidence or toolchain drift can rebuild the successful producer once.
+Source, assertion, style, coverage and security failures require a code fix.
+On `integration-v3`, use **Re-run failed
+jobs** (or a specific failed job/dependents) only for an evidenced transient failure.
+Successful build evidence is bound to its producer, not the consumer's new attempt.
+For missing/expired artifacts or toolchain drift, rerun **Build and Static Gates**
+and dependents, or **Re-run all jobs**. Old v1/v2 runs still require all-jobs reruns;
+new policy requires new code, not retrying an old commit. A rerun cannot refresh the
+PR base. See the [recovery table](architecture/ci-admission.md#reruns-and-cancellation).
+
+Hosted **Portable Checks** runs `make ci-portable-selftest` and the pinned Codex
+schema contract on Ubuntu before Mac allocation. `make ci-macos-selftest` retains
+Apple-only tooling/native tests and process-supervisor platform coverage; repository
+guardrails also stay on Mac because they inspect manifests/imports with Swift.
+The full local `conductor-selftest` and `release-selftest` commands still include
+their native checks. A Linux pass cannot stand in for those Mac results.
+
+Do not issue cosmetic pushes or duplicate runs to escape a queue. Job creation-to-start
+is pending time; execution starts only after runner assignment. Cancelled/unassigned
+jobs and inherited retry results can have misleading API timestamps. Locally, reuse
+the conductor ticket / `job wait` / request key rather than bypassing shared admission.
+
 ## Claude status-line compatibility experiment (debug only)
 
 This is an explicit one-process probe, not a replacement quota source or persistent usage cache. It tests whether the installed Claude CLI invokes its documented status-line command during RepoPrompt's native headless run. It makes no independent account HTTP requests and reads no credentials.

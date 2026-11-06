@@ -1,8 +1,13 @@
-name: Secret-free Integration Products
+name: Secret-free Integration Checks
 
-# Shared implementation for admission; credentialed publication stays independent.
+# Sentry build/privacy is an integration obligation. Universal packaging and
+# older-runtime artifact checks belong to the release workflows, not every PR.
 on:
   workflow_call:
+    outputs:
+      failure:
+        description: Failed Sentry step IDs (diagnostic only)
+        value: ${{ jobs.sentry.outputs.failure }}
     inputs:
       admission:
         type: string
@@ -14,22 +19,29 @@ permissions:
 jobs:
   sentry:
     name: Sentry Build and Privacy
+    # Keep native ARM coverage and the original enforcing measurement platform.
     runs-on: macos-26
     timeout-minutes: 60
     env:
       ADMISSION_CONTEXT: ${{ inputs.admission }}
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    outputs:
+      failure: ${{ steps.diagnostics.outputs.failure }}
     steps:
       - uses: actions/checkout@v6
+        id: actions-checkout-v6
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
 
-      - name: Verify exact candidate and full-profile attempt
+      - name: Verify immutable candidate
+        id: verify-immutable-candidate
         run: python3 Scripts/ci_admission.py verify --context "$ADMISSION_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
 
       # Never restore compiled products/gate metadata here: this lane must build
       # the declared checkout with Sentry enabled, not consume a cached success.
       - name: Restore checksum-verified dependency binaries only
+        id: restore-checksum-verified-dependency-binaries-only
         uses: actions/cache/restore@v6
         with:
           path: |
@@ -40,66 +52,32 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-binaries-v1-${{ hashFiles('Package.resolved', 'Packages/RepoPromptAgentProviders/Package.resolved') }}
 
       - name: Resolve Sentry dependencies
+        id: resolve-sentry-dependencies
         env:
           REPOPROMPT_ENABLE_SENTRY: "1"
         run: python3 Scripts/ci_resolve_packages.py
 
       - name: Build app with Sentry linked
+        id: build-app-with-sentry-linked
         env:
           REPOPROMPT_ENABLE_SENTRY: "1"
         run: ./conductor swift-build --product RepoPrompt --full-log
 
       - name: Test serialized Sentry privacy boundary
+        id: test-serialized-sentry-privacy-boundary
         env:
           REPOPROMPT_ENABLE_SENTRY: "1"
         run: ./conductor test --filter SentryTelemetryPrivacyTests --full-log
 
-  package:
-    name: Release-mode Package and MCP Smoke
-    runs-on: macos-26
-    # Conductor bounds universal artifact construction at four hours. Let that
-    # deadline report failure and leave time for smoke/diagnostic upload instead
-    # of cancelling a still-valid build at the former two-hour job limit.
-    timeout-minutes: 270
-    env:
-      ADMISSION_CONTEXT: ${{ inputs.admission }}
-      PYTHONUNBUFFERED: "1"
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-
-      - name: Verify exact candidate and full-profile attempt
-        run: python3 Scripts/ci_admission.py verify --context "$ADMISSION_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
-
-      - name: Configure retained package diagnostics
-        run: echo "REPOPROMPT_DEV_DAEMON_STATE_DIR=$RUNNER_TEMP/admission-conductor" >> "$GITHUB_ENV"
-
-      - name: Run release preflight
-        run: ./conductor release preflight --full-log
-
-      - name: Package secret-free universal ad-hoc release candidate
-        timeout-minutes: 245
-        run: ./conductor release artifact --full-log
-
-      - name: Smoke exact release-mode packaged MCP helper
-        env:
-          REPOPROMPT_PACKAGED_SMOKE_DIAGNOSTICS_DIR: ${{ runner.temp }}/packaged-smoke
-        run: |
-          ./Scripts/smoke_packaged_mcp_roundtrip.sh \
-            ".build/release/RepoPrompt.app" \
-            "Admission release-mode package" \
-            ".build/release/RepoPrompt-artifact-manifest.json"
-
-      - name: Retain package manifest and failure diagnostics
+      - name: Broadcast failed steps and recovery
+        id: diagnostics
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: admission-package-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            .build/release/RepoPrompt-artifact-manifest.json
-            ${{ runner.temp }}/packaged-smoke
-            ${{ runner.temp }}/admission-conductor/jobs/*.log
-          if-no-files-found: warn
-          retention-days: 7
+        env:
+          STEPS_CONTEXT: ${{ toJSON(steps) }}
+        run: |
+          if [[ -f Scripts/ci_job_diagnostics.py ]]; then
+            python3 Scripts/ci_job_diagnostics.py job
+          else
+            echo '::error::Checkout unavailable; inspect checkout/runner failure. No CI evidence was accepted.'
+            echo 'Checkout unavailable: inspect checkout/runner failure; no evidence accepted.' >> "$GITHUB_STEP_SUMMARY"
+          fi

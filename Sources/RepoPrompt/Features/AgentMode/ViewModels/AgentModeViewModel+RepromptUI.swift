@@ -1,10 +1,10 @@
 import Foundation
 import RepoPromptSettingsCore
 
-/// V3 acknowledges one rewrite billing route plus the optional recent-chat exposure.
-/// Receipts from the removed consult flow cannot authorize this disclosure.
+/// V4 acknowledges one rewrite billing route, attachment names, and the optional recent-chat exposure.
+/// Earlier receipts did not cover attachment names and cannot authorize this disclosure.
 enum AgentRepromptDisclosure {
-    static let key = "agentReprompt.rewriteRecipient.v3."
+    static let key = "agentReprompt.rewriteRecipient.v4."
     static func isAcknowledged(providerID: String?, defaults: UserDefaults) -> Bool {
         guard let providerID else { return false }
         return defaults.bool(forKey: key + providerID)
@@ -16,9 +16,11 @@ enum AgentRepromptDisclosure {
 
     /// Essential informed-consent facts, kept short enough to read before enabling.
     static func summary(modelName: String, routeName: String, includesRecentChat: Bool) -> [String] {
-        let history = includesRecentChat ? ", recent chat excerpts" : ""
+        let payload = includesRecentChat
+            ? "your message, guidance, attachment names, the session title and recent chat excerpts"
+            : "your message, guidance and attachment names"
         return [
-            "Sends your message, guidance, root names and selected paths\(history) to \(modelName) via \(routeName). Never file contents, attachments, git or tool output.",
+            "Sends \(payload) to \(modelName) via \(routeName). Never file contents, git or tool output.",
             "\(routeName) billing and retention apply. Avoid secrets.",
             "Model Router or Auto Effort, if on, may judge the draft before you send."
         ]
@@ -182,12 +184,17 @@ extension AgentModeViewModel {
                 AgentRepromptDisclosure.acknowledge(providerID: providerID, defaults: .standard)
             }
             guard AgentRepromptDisclosure.isAcknowledged(providerID: providerID, defaults: .standard) else { return }
-        } else if repromptOperation?.phase.isBusy == true { cancelReprompt() }
+        } else {
+            // Turning Re-prompt off stops every rewrite, including those in sessions not on screen.
+            for operation in Array(repromptOperations.values) where operation.phase.isBusy {
+                operation.cancel()
+            }
+        }
         repromptEnabled = enabled
         if enabled {
             // Freeze the consented route synchronously, with no await since recipient validation.
             _ = repromptModelResolution(pinningDefault: true)
-        } else if repromptOperation == nil {
+        } else if repromptOperations.isEmpty {
             repromptDefaultModel = nil
         }
         syncStatusPillsUIState()

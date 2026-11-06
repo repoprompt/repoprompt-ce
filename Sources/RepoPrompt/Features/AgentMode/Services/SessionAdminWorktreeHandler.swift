@@ -35,6 +35,9 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         case applied(worktreeID: String)
         case revoked
         case failed(subreason: String, detail: String, retryable: Bool, worktree: String, repoRoot: String?)
+        /// The binding was published, then completion (for example its required save) failed. The
+        /// effect is committed, so the bind is settled rather than retried.
+        case committedIncomplete(worktreeIDs: [String], detail: String)
     }
 
     private let context: SessionAdminHandlerContext
@@ -329,10 +332,17 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         if mode == .nextBoundary, !host.isIdleForWorktreeTransition(sessionID: target) {
             return enqueueDeferredBind(lease: lease, scope: scope, caller: caller, worktree: worktree, repoRoot: repoRoot)
         }
-        var committed = false
+        var committedIDs: Set<String>?
         do {
-            let info = try await bindWithAdmission(lease: lease, scope: scope, worktree: worktree, repoRoot: repoRoot, onCommitted: { committed = true })
+            let info = try await bindWithAdmission(lease: lease, scope: scope, worktree: worktree, repoRoot: repoRoot, onCommitted: { committedIDs = $0 })
             return SessionAdminItemResult(sessionID: target, result: "bound", fields: ["worktree": info.value])
+        } catch where committedIDs != nil {
+            // A published binding outranks every later error classification: it is neither a
+            // refusal, a revocation, nor a busy target that may be queued or retried.
+            return Self.committedCompletionFailure(
+                target: target, verb: "bind", code: "bind_failed",
+                worktreeIDs: committedIDs ?? [], error: error, scopeID: scope.id
+            )
         } catch SessionAdminHostError.authorityEnded {
             return .revoked(target)
         } catch SessionAdminHostError.usageEvidenceUnavailable {
@@ -363,18 +373,49 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
             return SessionAdminItemResult(
                 sessionID: target, result: "not_applied", code: "bind_failed",
                 fields: [
-                    "detail": .string(error.localizedDescription + (
-                        committed
-                            ? " The binding committed, but completion failed. Inspect the current session before any further mutation."
-                            : " No binding commit was acknowledged. Inspect current session and scope state before choosing a recovery call."
-                    )),
-                    AgentSessionAdminRendering.committedChangesKey: .bool(committed),
+                    "detail": .string(
+                        error.localizedDescription
+                            + " No binding commit was acknowledged. Inspect current session and scope state before choosing a recovery call."
+                    ),
+                    AgentSessionAdminRendering.committedChangesKey: .bool(false),
                     "next_call": .object(["tool": .string("session_admin"), "arguments": .object([
                         "op": .string("get"), "scope_id": .string(scope.id.uuidString), "session_id": .string(target.uuidString)
                     ])])
                 ]
             )
         }
+    }
+
+    /// The single receipt for a binding transition that published its change and then failed to
+    /// complete (required save, post-save verification, cancellation, or any other late error). It
+    /// reports the committed IDs and `committed_changes`, which makes the batch `partial`, settles a
+    /// supplied approval as used, and makes a keyed direct call replay instead of re-running.
+    static func committedCompletionFailure(
+        target: UUID,
+        verb: String,
+        code: String,
+        worktreeIDs: Set<String>,
+        error: any Error,
+        scopeID: UUID? = nil
+    ) -> SessionAdminItemResult {
+        var arguments: [String: Value] = ["op": .string("get"), "session_id": .string(target.uuidString)]
+        if let scopeID { arguments["scope_id"] = .string(scopeID.uuidString) }
+        return SessionAdminItemResult(
+            sessionID: target, result: "not_applied", code: code,
+            fields: [
+                "subreason": .string("completion_failed"),
+                "detail": .string(committedCompletionDetail(verb: verb, error: error)),
+                "worktree_ids": .array(worktreeIDs.sorted().map(Value.string)),
+                AgentSessionAdminRendering.committedChangesKey: .bool(true),
+                "retryable": .bool(false),
+                "next_call": .object(["tool": .string("session_admin"), "arguments": .object(arguments)])
+            ]
+        )
+    }
+
+    static func committedCompletionDetail(verb: String, error: any Error) -> String {
+        "The \(verb) committed, but its completion failed or is unconfirmed: \(error.localizedDescription) "
+            + "Inspect the current session before any further mutation; do not repeat this call."
     }
 
     /// Resolving a selector and preparing roots may suspend. Admission runs only at the host's final
@@ -385,7 +426,7 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         scope: DomainDelegationScopeRecord,
         worktree: String,
         repoRoot: String?,
-        onCommitted: @escaping @MainActor () -> Void = {}
+        onCommitted: @escaping @MainActor (Set<String>) -> Void = { _ in }
     ) async throws -> SessionAdminWorktreeInfo {
         let context = context
         var reservations: [DelegationScopeReservation] = []
@@ -400,7 +441,7 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                 reservations = try self.reserveBinding(desiredIDs, target: lease.targetSessionID, scope: scope)
             },
             bindingsCommitted: { desiredIDs in
-                onCommitted()
+                onCommitted(desiredIDs)
                 for worktreeID in desiredIDs {
                     self.ownership.clearReleased(worktreeID: worktreeID)
                 }
@@ -462,11 +503,21 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
             guard isStillAuthorized() else {
                 return finishDeferredBind(pending, .revoked)
             }
+            var committedIDs: Set<String>?
             do {
                 let info = try await bindWithAdmission(
-                    lease: lease, scope: scope, worktree: pending.worktree, repoRoot: pending.repoRoot
+                    lease: lease, scope: scope, worktree: pending.worktree, repoRoot: pending.repoRoot,
+                    onCommitted: { committedIDs = $0 }
                 )
                 return finishDeferredBind(pending, .applied(worktreeID: info.worktreeID))
+            } catch where committedIDs != nil {
+                // Published, then completion failed: settle it. Retrying (including on a late
+                // not-idle or cancellation) would re-run an already committed bind. The pending
+                // identity fence in `finishDeferredBind` still drops a superseded request's outcome.
+                return finishDeferredBind(pending, .committedIncomplete(
+                    worktreeIDs: (committedIDs ?? []).sorted(),
+                    detail: Self.committedCompletionDetail(verb: "bind", error: error)
+                ))
             } catch SessionAdminHostError.authorityEnded {
                 return finishDeferredBind(pending, .revoked)
             } catch SessionAdminHostError.notIdle {
@@ -567,6 +618,7 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                 continue
             }
             var bindingChanged = false
+            var committedRemoved: Set<String>?
             do {
                 let context = context
                 let scope = batch.scope
@@ -574,19 +626,35 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                 // The host computes the remaining bindings before suspending too. Fence the whole
                 // starting set so a concurrent unrelated bind cannot be overwritten by that snapshot.
                 let approvedIDs = Set(allBound.map(\.worktreeID))
-                let removed = try await host.unbindWorktrees(sessionID: target, worktreeID: worktreeID) {
-                    guard context.isStillAuthorized(lease, scope: scope, operation: batch.request.operation) else { return false }
-                    bindingChanged = release && Set(host.boundWorktrees(sessionID: target).map(\.worktreeID)) != approvedIDs
-                    return !bindingChanged
-                }
-                if release {
-                    // The stale mark is recorded for whatever was actually unbound, even if authority
-                    // ended during the await: it only ever makes cleanup more visible.
-                    ownership.markReleased(bound.filter { removed.contains($0.worktreeID) }, bySessionID: caller, at: now())
-                }
+                let removed = try await host.unbindWorktrees(
+                    sessionID: target, worktreeID: worktreeID,
+                    isStillAuthorized: {
+                        guard context.isStillAuthorized(lease, scope: scope, operation: batch.request.operation) else { return false }
+                        bindingChanged = release && Set(host.boundWorktrees(sessionID: target).map(\.worktreeID)) != approvedIDs
+                        return !bindingChanged
+                    },
+                    bindingsRemoved: { removedIDs in
+                        committedRemoved = removedIDs
+                        // The stale mark is recorded synchronously at publication for exactly what
+                        // was removed. Marking after the required save would race a bind of the same
+                        // worktree elsewhere (which clears the mark) and re-mark an in-use tree.
+                        if release {
+                            self.ownership.markReleased(
+                                allBound.filter { removedIDs.contains($0.worktreeID) }, bySessionID: caller, at: self.now()
+                            )
+                        }
+                    }
+                )
                 items.append(SessionAdminItemResult(
                     sessionID: target, result: release ? "released" : "unbound",
                     fields: ["worktree_ids": .array(removed.map(Value.string))]
+                ))
+            } catch where committedRemoved != nil {
+                // Published, then completion failed. This outranks every refusal classification so
+                // the receipt (and the approval settlement it drives) reflects the committed effect.
+                items.append(Self.committedCompletionFailure(
+                    target: target, verb: release ? "release" : "unbind", code: "unbind_failed",
+                    worktreeIDs: committedRemoved ?? [], error: error
                 ))
             } catch SessionAdminHostError.authorityEnded {
                 items.append(
@@ -746,6 +814,17 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                         ].merging(repoRoot.map { ["repo_root": Value.string($0)] } ?? [:]) { current, _ in current })])
                         : .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])])
                     row["retryable"] = .bool(retryable)
+                case let .committedIncomplete(worktreeIDs, detail):
+                    row["result"] = .string("partial")
+                    row["code"] = .string("bind_failed")
+                    row["subreason"] = .string("completion_failed")
+                    row["detail"] = .string(detail)
+                    row["worktree_ids"] = .array(worktreeIDs.map(Value.string))
+                    row[AgentSessionAdminRendering.committedChangesKey] = .bool(true)
+                    row["next_call"] = .object(["tool": .string("session_admin"), "arguments": .object([
+                        "op": .string("get"), "session_id": .string(sessionID.uuidString)
+                    ])])
+                    row["retryable"] = .bool(false)
                 }
                 return .object(row)
             }
