@@ -165,9 +165,12 @@
             let mountedIDs = Set(recorder.natives.values.compactMap { $0.view?.window === fixture.window ? $0.rowID : nil })
             var base = fixture.store.snapshot
             var tail = try XCTUnwrap(base.presentation.visibleRows.first { $0.id == tailID })
-            guard tail.isStreaming else {
-                throw GateFailure(description: "production-projected tail has isStreaming=false; streaming baseline unavailable")
+            let runInteraction = fixture.state.agentModeViewModel.ui.runInteraction.snapshot
+            guard runInteraction.runState == .running else {
+                throw GateFailure(description: "canonical run interaction must be running")
             }
+            let tailBlockKinds = base.presentation.visibleBlocks.filter { $0.rows.contains { $0.id == tailID } }.map { String(describing: $0.kind) }
+            print("TAIL_ROUTE turns=\(turns) repeat=\(repeatIndex) runState=\(runInteraction.runState) projectedStreaming=\(tail.isStreaming) blockKinds=\(tailBlockKinds) cadence=\(tail.isStreaming ? "streamingCoalesced" : "immediate")")
             guard !MarkdownStreamingFreezeBoundaryResolver.shouldConsiderSegmentation(for: tail.text + String(repeating: "x", count: 9 * 128)) else {
                 throw GateFailure(description: "workload exceeds single native renderer boundary")
             }
@@ -221,7 +224,9 @@
                 }
                 let wallMS = (ProcessInfo.processInfo.systemUptime - start) * 1000
                 let cpuMS = try (mainThreadCPU()) - cpuBefore
-                guard acknowledged, publications == 1, fixture.store.snapshot == next else {
+                guard acknowledged, publications == 1, fixture.store.snapshot == next,
+                      fixture.state.agentModeViewModel.ui.runInteraction.snapshot == runInteraction
+                else {
                     throw GateFailure(description: "chunk=\(ordinal) marker/status/native/settle gate publications=\(publications) body=\(recorder.latestBody[tailID]?.hasSuffix(marker) == true) footer=\(recorder.footers[tailID] == status) native=\(recorder.attached(tailID, window: fixture.window).contains { $0.string.contains(marker) })")
                 }
                 if ordinal > 0 {
@@ -230,6 +235,10 @@
                         "repeat": repeatIndex,
                         "chunk": ordinal,
                         "revision": next.presentationRevision,
+                        "publications": publications,
+                        "runState": runInteraction.runState.rawValue,
+                        "projectedStreaming": tail.isStreaming,
+                        "tailBlockKinds": tailBlockKinds,
                         "mainDriveElapsedMS": driveMS,
                         "mainThreadCPUMS": cpuMS,
                         "settleWallMS": wallMS,
@@ -238,7 +247,7 @@
                         "presentedBlocks": base.presentation.visibleBlocks.count
                     ]
                     for (name, ids) in cohorts {
-                        var counters: [String: Int] = [:]
+                        var counters = Dictionary(uniqueKeysWithValues: ["make", "update", "replacement", "size", "ensureLayout", "draw"].map { ($0, 0) })
                         for id in ids {
                             for (key, value) in recorder.counts[id] ?? [:] {
                                 counters[key, default: 0] += value
@@ -409,11 +418,14 @@
             session.markCurrentBindingHydrated()
             session.isTranscriptWindowExpanded = true
             let source = Self.items(turns: turns)
+            session.runState = .running
             session.items = source
-            let transcript = AgentTranscriptIO.buildTranscript(from: source, terminalState: .running, nextSequenceIndex: source.count, compact: false)
-            _ = vm.applyTranscriptPresentation(transcript, sourceItems: source, to: session)
-            _ = vm.test_publishTranscriptPresentation(tabID: tab.id, forceRevision: true)
-            vm.syncTranscriptUIState()
+            session.nextSequenceIndex = source.count
+            vm.refreshDerivedTranscriptState(for: session, reason: .liveMutation)
+            vm.updateBindingsFromSession(session)
+            guard vm.ui.runInteraction.snapshot.runState == .running else {
+                throw GateFailure(description: "live fixture did not publish running interaction")
+            }
             recorder.allowedIDs.formUnion(vm.ui.transcript.snapshot.presentation.visibleRows.map(\.id))
 
             let parent = AgentModeDetailWithSidebarView(

@@ -107,3 +107,91 @@ SDKROOT="$(xcrun --sdk macosx --show-sdk-path)" DEVELOPER_DIR=/Applications/Xcod
 ```
 
 The local commit result and cumulative diff are reported in the handoff. No push or PR is authorized.
+
+## Active-run fixture correction (follow-up M0)
+
+Earlier failed attempts remain in the preceding execution record. An idle session was inconsistent with the requested active-run workload. The corrected fixture sets `session.runState = .running` before installing items, then calls the existing `refreshDerivedTranscriptState(for:reason: .liveMutation)` and `updateBindingsFromSession(_:)`. It requires the published run interaction to be running and unchanged throughout each chunk.
+
+The projected tail flag and block route are observations. In particular, the production conclusion route explicitly projects `isStreaming == false`; the benchmark preserves that value. A growing reply during an active run is the workload. No product routing, rendering cadence, or projected flag is forced. Each accepted chunk still requires consumption of its exact tail marker and footer status, the marker in attached native storage, exactly one publication, and all prior identity, native calibration and settling gates. The same 10/40/200 workload, three fresh-host repeats and eight measured chunks per repeat apply. Per-cohort native counters now print explicit zero entries after calibration.
+
+### Accepted baseline
+
+**72 valid measured chunks across 9 fresh hosts passed**: three repeats each at 10, 40 and 200 logical turns, in the planned interleaved order. All 9 native controls passed with 6 update callbacks and exactly 2 publications each, and all 9 warm-ups passed. Every measured chunk published exactly once, consumed its tail marker and footer status, exposed the marker in attached native storage, and retained the running interaction snapshot. Every fixture retained a streaming source tail while the production projection used `conclusion`, `isStreaming == false`, and Markdown cadence `immediate` throughout.
+
+Measurement source: `ac733c7e8f23c2bb801d701fef372d93aabaf916` plus this fixture-only follow-up. The production hooks are unchanged. Hardware, SDK, DEBUG configuration, normal font and unordered 1000 × 800 pt host match the environment above. The corrected live path applies production retention and materialization. Both 40 and 200 logical turns presented the same bounded population, so **render-tree scaling beyond that population remains unresolved**.
+
+| Logical turns | Presented blocks / rows | Older body IDs / mounted native rows | Active stable body IDs / mounted native rows | Tail body IDs / mounted native rows |
+| --- | --- | --- | --- | --- |
+| 10 | 40 / 46 | 41 / 27 | 4 / 2 | 1 / 1 |
+| 40 | 56 / 64 | 59 / 45 | 4 / 2 | 1 / 1 |
+| 200 | 56 / 64 | 59 / 45 | 4 / 2 | 1 / 1 |
+
+Body IDs are the distinct fixture bubble IDs evaluated before measurement. All of those older and active-stable IDs executed their bodies on **every measured chunk**. Counts below are mean per chunk with individual-chunk min–max in brackets, across 24 samples per size. All native `make` counts were zero after warm-up. Storage replacement and cache-miss `ensureLayout` counts matched in this run, so they share a column while remaining separate raw counters.
+
+| Turns / cohort | Body calls | Distinct bodies per chunk | Native updates | Storage replacements / ensureLayout | Native size requests | Native draws |
+| --- | --- | --- | --- | --- | --- | --- |
+| 10 older | 114.458 [82–123] | 41 | 75.375 [54–81] | 25.125 [18–27] | 276.375 [198–297] | 36 |
+| 10 active stable | 11.167 [8–12] | 4 | 5.583 [4–6] | 2.792 [2–3] | 16.750 [12–18] | 2 |
+| 10 tail | 2.792 [2–3] | 1 | 3.792 [3–4] | 3.792 [3–4] | 23.958 [20–25] | 2 |
+| 40 older | 164.708 [118–177] | 59 | 125.625 [90–135] | 53.042 [38–57] | 415.958 [298–447] | 52 |
+| 40 active stable | 11.167 [8–12] | 4 | 5.583 [4–6] | 2.792 [2–3] | 16.750 [12–18] | 2 |
+| 40 tail | 2.792 [2–3] | 1 | 3.792 [3–4] | 3.792 [3–4] | 23.958 [20–25] | 2 |
+| 200 older | 169.625 [118–177] | 59 | 129.375 [90–135] | 54.625 [38–57] | 428.375 [298–447] | 52 |
+| 200 active stable | 11.500 [8–12] | 4 | 5.750 [4–6] | 2.875 [2–3] | 17.250 [12–18] | 2 |
+| 200 tail | 2.875 [2–3] | 1 | 3.875 [3–4] | 3.875 [3–4] | 24.375 [20–25] | 2 |
+
+These observations establish stable-row body and native callback fan-out under the diagnostic. The cause of repeated storage replacement on unchanged stable inputs has not been isolated. Expected optimization savings remain unknown.
+
+### Repeat means and variance
+
+Each row below is the mean of that repeat's eight accepted chunks. Times are milliseconds. Layouts count actual host `layout()` entries per chunk. Body columns preserve the per-repeat variation in older, active-stable and tail calls.
+
+| Turns | Repeat | Older / active stable / tail body calls | Main drive ms | Main-thread CPU ms | Settle wall ms | Host layouts |
+| --- | --- | --- | --- | --- | --- | --- |
+| 10 | 1 | 112.750 / 11.000 / 2.750 | 63.045 | 325.396 | 404.466 | 5.500 |
+| 10 | 2 | 112.750 / 11.000 / 2.750 | 66.756 | 331.346 | 413.256 | 5.500 |
+| 10 | 3 | 117.875 / 11.500 / 2.875 | 56.144 | 355.404 | 403.952 | 5.500 |
+| 40 | 1 | 154.875 / 10.500 / 2.625 | 104.705 | 357.815 | 464.323 | 5.375 |
+| 40 | 2 | 162.250 / 11.000 / 2.750 | 97.611 | 402.420 | 486.008 | 5.625 |
+| 40 | 3 | 177.000 / 12.000 / 3.000 | 78.744 | 485.865 | 498.687 | 5.750 |
+| 200 | 1 | 169.625 / 11.500 / 2.875 | 87.821 | 444.684 | 490.699 | 5.625 |
+| 200 | 2 | 177.000 / 12.000 / 3.000 | 76.729 | 485.188 | 494.826 | 5.750 |
+| 200 | 3 | 162.250 / 11.000 / 2.750 | 102.491 | 416.092 | 492.664 | 5.375 |
+
+The next table gives the median of the three repeat means, followed by their min–max.
+
+| Turns | Main drive ms | Main-thread CPU ms | Settle wall ms | Host layouts |
+| --- | --- | --- | --- | --- |
+| 10 | 63.045 [56.144–66.756] | 331.346 [325.396–355.404] | 404.466 [403.952–413.256] | 5.500 [5.500–5.500] |
+| 40 | 97.611 [78.744–104.705] | 402.420 [357.815–485.865] | 486.008 [464.323–498.687] | 5.625 [5.375–5.750] |
+| 200 | 87.821 [76.729–102.491] | 444.684 [416.092–485.188] | 492.664 [490.699–494.826] | 5.625 [5.375–5.750] |
+
+Individual-chunk ranges were: 10 turns, main drive 48.567–110.265 ms, CPU 118.140–412.119 ms, wall 371.507–432.488 ms; 40 turns, main drive 73.073–160.251 ms, CPU 170.406–500.875 ms, wall 434.309–538.723 ms; 200 turns, main drive 73.686–167.783 ms, CPU 175.833–510.111 ms, wall 441.799–526.422 ms. Host layouts ranged from 5 to 8 at every size.
+
+The Mach clock ran on the main thread for all accepted epochs. CPU totals include framework callbacks and diagnostic polling between synchronous drive intervals. Wall times include the required 220 ms quiet window and scheduler servicing, so they are unsuitable as direct user-visible latency estimates. This baseline exercises the actual immediate conclusion route during an active run. Coverage of the segmented renderer and streaming-coalesced route remains unqualified. Visible scrolling, Release performance and larger rendered populations require separate measurements. M1 remains prohibited.
+
+### Follow-up validation and retained evidence
+
+Exact coordinated commands:
+
+```bash
+./conductor format --async --request-key transcript-tail-m0-active-format
+SDKROOT="$(xcrun --sdk macosx --show-sdk-path)" DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer RPCE_RUN_SCALE_TESTS=1 ./conductor test --filter RepoPromptTests.AgentTranscriptTailInvalidationDiagnostics/testStreamingTailInvalidationAcrossSessionSizes --async --request-key transcript-tail-m0-active-baseline
+./conductor lint --async --request-key transcript-tail-m0-active-lint
+```
+
+Each job was collected with `./conductor job wait --request-key <key>`.
+
+| Request key | Ticket | Result |
+| --- | --- | --- |
+| `transcript-tail-m0-active-format` | `7c00dc5f-8822-4561-8776-4cc6fea86377` | Passed, 0 files required formatter mutation, 3.9 s execution. |
+| `transcript-tail-m0-active-baseline` | `bfd5ec1e-e72a-45f4-acf4-1b764293ccfe` | Passed: 1 test, 0 failures, 69.105 s test duration. Conductor execution 1 m 37 s, queue 3.8 s, global wait 7 ms. |
+| `transcript-tail-m0-active-lint` | `069a6c3f-2598-427a-8ec3-6be89cced734` | Passed formatter check and strict SwiftLint, 4.2 s execution. |
+
+All 72 individual `TAIL_SAMPLE` JSON records and all 9 setup, native-control, route and warm-up records are retained in:
+
+```text
+/Users/cristian/Library/Application Support/RepoPrompt CE/Conductor/91950a7903f7c179c7f1f804cd19aa7540d0fc7d1b94c0512def5eb2f72c8da4/jobs/bfd5ec1e-e72a-45f4-acf4-1b764293ccfe.log
+```
+
+A read-only Python summary checked that the records contain exactly the Cartesian product of sizes 10/40/200, repeats 1/2/3 and chunks 1–8. It also checked that every record reports one publication, running interaction and projected streaming false. The tables use arithmetic means within each repeat, then median/min–max of the three means per size. No failed earlier attempt was included in the accepted statistics. Commit policy requires the same staged contribution preflight command recorded above, followed by a new local commit. Amending and pushing remain unauthorized.
