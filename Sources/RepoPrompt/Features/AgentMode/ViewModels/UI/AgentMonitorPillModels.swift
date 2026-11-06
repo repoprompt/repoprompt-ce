@@ -216,19 +216,19 @@ enum AgentMonitorPassiveNoticeOutcome: Equatable {
 /// what this switch adds, and — load-bearing — the bound on what it can create. A user who reads
 /// "auto-wake" and imagines an autonomous background agent has been mis-sold the feature.
 enum AgentMonitorAutoWakeCopy {
-    static let label = "Auto-wake on all overseen lane updates"
+    static let label = "Auto-wake on overseen lane updates"
     static let laneLabel = "Auto-wake"
     static let selectAll = "Select all"
     static let deselectAll = "Deselect all"
     static let tooltip = """
-    When on, updates from every overseen lane can start a turn, subject to the limit below; when off, \
-    only individually selected lanes can do so. Other updates join the next turn, and attention \
-    requests can wake this agent either way.
+    When on, updates from every lane can start a turn for this agent, no more often than the limit \
+    below. When off, only lanes you select individually can; other updates wait for its next turn. \
+    A lane that asks for attention wakes it either way.
     """
-    static let accessibilityLabel = "Auto-wake on all overseen lane updates"
+    static let accessibilityLabel = "Auto-wake on overseen lane updates"
     static let accessibilityHint = """
-    Enables routine wakes from every overseen lane; when off, individually selected lanes can still \
-    wake this agent. Other updates wait for its next turn; attention requests can wake it either way.
+    Lets updates from every lane start turns for this agent; when off, only individually selected lanes \
+    can. Attention requests wake it either way.
     """
     static let unavailableMessage = "That Agent session is no longer active."
     static let loadingReason = "This Agent session is still loading."
