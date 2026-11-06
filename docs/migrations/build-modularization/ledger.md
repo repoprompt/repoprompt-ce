@@ -1887,9 +1887,9 @@ durable effects and unchanged foreground tab/draft checks remain in the journey.
 Historical receipts under the old name remain historical; the rename does not
 create new executed evidence.
 
-**Scope disposition: #1402's without-selecting-a-workspace acceptance remains
-unsatisfied.** The demonstrated journey requires an already selected workspace
-and does not attach an NSWindow or change selection. These are distinct
+**Historical scope gap, superseded by the Round 3 no-selection test below.**
+At this checkpoint, the demonstrated journey required an already selected
+workspace and did not attach an NSWindow or change selection. These are distinct
 contracts. `AgentSessionLaneMCPToolService` enumerates active window workspaces;
 `WindowStatesManager+AgentSessionLanes` and
 `AgentModeViewModel+SessionLinkLanes` recheck that workspace before allocation
@@ -1901,8 +1901,9 @@ durable lane placement, discovery, authority and retirement coverage. It does
 not require completion of the entire separate #1408 campaign. This follow-up
 does not waive #1402's acceptance or close that issue.
 
-The following historical performance evidence from the PR description remains
-open, rather than being replaced by later passing checks:
+The following historical performance evidence is retained. Its current
+startup disposition is accepted unresolved risk, not a passing measurement;
+see the final Round 3 reconciliation below:
 
 - At `0c541c018`, the local 300-chat scale case recorded warm-refresh/menu p95
   of **67.141833/195.427625 ms**, each against **50 ms**. Its 4 restore reads,
@@ -1918,9 +1919,12 @@ open, rather than being replaced by later passing checks:
 - The `0c541c018` experiment verified bootstrap ownership but did not execute
   its MCP helper probe. The live pass at `3d03fe5f` remains pinned to that head.
 
-To close these gates, record the final candidate SHA and its integrated upstream
-baseline, then use the same macOS host/toolchain, configuration, architecture,
-profile and secure-storage policy. Finish builds before measurement, establish
+The planned follow-up protocol recorded the final candidate SHA and its
+integrated upstream baseline, using the same macOS host/toolchain, configuration,
+architecture, profile and secure-storage policy. The user later closed the
+incomplete experiment and accepted its unresolved startup risk, as recorded
+below; the remainder of this paragraph is the historical plan, not pending work.
+Finish builds before measurement, establish
 exclusive heavy-work admission for the measurement interval, and retain a
 predeclared balanced launch sequence (two warm-ups and twenty retained samples
 per head). Keep every valid slow sample; record invalid attempts and their
@@ -2036,12 +2040,12 @@ noted optional duplicate-test and test-hook deadline-order cleanups. Both were
 left unchanged to preserve upstream coverage and existing bounded-drain semantics.
 This is not the overseer's separate independent review or an approval to merge.
 
-Acceptance remains open. In particular, no selected-workspace fixture is relabeled
-as #1402's workspace-free lane-creation contract. The matched launch experiment
-still requires explicit lifecycle authorization: the incorporated baseline and
-final candidate, identical host/toolchain/profile/security policy, exclusive
-heavy-work interval, two warm-ups and twenty retained samples per head, with the
-unchanged 10% budget. No old slow sample or failure is discarded.
+At this historical checkpoint, no selected-workspace fixture was relabeled as
+#1402's workspace-free contract. Round 3 subsequently added the app-side
+no-selection witness. The matched launch experiment was authorized, partially
+executed, then closed by the user with startup risk accepted; it is not pending
+further lifecycle authorization or samples. The 10% budget and old slow samples
+remain unchanged; current disposition is recorded in the final reconciliation.
 
 #### M6 Round 2 baseline investigation (2026-11-06)
 
@@ -2077,7 +2081,8 @@ These failures are recorded, not attributed solely to machine load.
   0.310866708s. No native watcher callback was recorded before the assertion;
   the manually replayed invalidation completed in 0.0036605s. This contradicts
   a late native-watcher explanation for this observation. The pending graph
-  publication/demand ordering remains unresolved; no desired-symbol polling,
+  publication/demand ordering was unresolved at this checkpoint (the Round 3
+  held-index witness below resolves its classification); no desired-symbol polling,
   deadline increase or speculative production fix was substituted.
 - Candidate exact diagnostic `a6f45827-b3f7-4189-8988-e519241dfd8c` passed the
   original worktree method but failed the sibling test earlier, while initially
@@ -2126,7 +2131,8 @@ The benchmark source is byte-identical across these heads. Both baseline and
 candidate exceed the **50ms** menu p95 limit. Each recorded four restore reads,
 470 candidate visits and 35 publications. Different, heavily contended host
 intervals prevent attributing the difference to this PR or claiming improvement.
-All slow samples remain evidence; the acceptance limit is unchanged and open.
+All slow samples remain evidence; the acceptance limit is unchanged. The later
+matched non-quiet observations and final disposition appear below.
 
 **Workspace-free distinction:** the existing canonical two-lane tool contract
 omits the `workspace` argument but installs an active workspace and uses a
@@ -2138,13 +2144,17 @@ Allocation in `WindowStatesManager+AgentSessionLanes` and
 `AgentModeViewModel+SessionLinkLanes` rechecks that authority. A positive zero-owner
 proof needs an implemented durable placement/admission/discovery/retirement owner
 independent of active window selection, followed by a real route contract. Removing
-these guards or launching an app is not a substitute. This acceptance remains open.
+these guards or launching an app is not a substitute. By the user's final scope
+decision, zero-owner and standalone operation are deferred to #1408; #1402's
+app-side without-selecting-a-workspace contract is covered by the later
+no-selection test. No ownership guard was removed.
 
 Release Candidate run [42057513544](https://github.com/repoprompt/repoprompt-ce/actions/runs/42057513544)
 passed at exact source `4a53016c`: release package, embedded MCP roundtrip, and
 macOS 15 x86_64/arm64 artifact smokes. It is ancestor-head evidence after the next
 merge, not final-head CI, a real-provider journey, or the matched local launch
-experiment. Local visible-app lifecycle remains unauthorized and unperformed.
+experiment. At this checkpoint local visible-app lifecycle had not been
+authorized or performed; the later approved experiment is now closed.
 
 The late normal merge incorporates `5a3f112253508c972b0952a95ea9c56e90b909b0`
 (#1632 Re-prompt, #1619 verified recovery backups, #1634 input focus). Its sole
@@ -2201,19 +2211,20 @@ quiet interval cannot be established, report that limitation rather than label
 busy measurements quiet. No admission capacity or timeout is changed.
 
 The overseer relayed user approval for the matched visible-debug-app launch
-experiment, restricted to its needed coordinated lifecycle actions. Before any
-such action, retain this checkpoint and request the concrete lifecycle permission.
-Planned launch protocol remains two warm-ups per head then 20 retained samples
+experiment, restricted to its needed coordinated lifecycle actions; concrete
+lifecycle permission was obtained before execution. That approval is now
+withdrawn and the experiment closed. The historical plan was two warm-ups per
+head then 20 retained samples
 per head in balanced A/B/B/A blocks, same prebuilt Debug configuration and
 in-memory secure-storage policy, fresh isolated profile per sample. Retain
 Startup phase window-appearance/attachment elapsed values and sampled RSS
 (separately from true peak memory), compare the unchanged 10% median budget,
 and keep invalid attempts with their reason. No compilation overlaps measurement.
-Conductor currently forwards HOME but not CFFIXED_USER_HOME; a local Foundation
-probe confirmed HOME alone still resolves the real user home. Fresh-profile
-launches therefore wait for the tooling-scope decision rather than touching the
-user's profile or changing launch semantics silently. Workspace-free scope is
-unchanged while independent review checks #1402/#1403 versus #1408.
+At this checkpoint conductor forwarded HOME but not CFFIXED_USER_HOME; a local
+Foundation probe confirmed HOME alone still resolved the real user home. The
+subsequent caller-only forwarding commit and actual app-held lease checks below
+resolved that isolation prerequisite. Final scope is #1402 app-side no-selection
+coverage, with zero-owner/standalone operation deferred to #1408 by user decision.
 
 Preparation completed: baseline ticket `94293ed0-e591-4f57-9665-34c93f9ec719`
 and candidate ticket `a0a90026-e4bb-49f0-a0fb-d80d4aab6709` each executed and
@@ -2224,8 +2235,8 @@ failed despite empty global heavy and M8 queues: first one-minute loads
 loads 15.59/11.50/9.40 with idle 59.57/45.70/62.25%. Read-only process inspection
 showed desktop/browser/backup activity, not another conductor job. No process
 was stopped to manufacture a quiet window. Raw gate observations are retained
-locally under ignored `build/m6-round3-receipts`; no retained sample or launch
-has yet occurred.
+locally under ignored `build/m6-round3-receipts`. These were pre-measurement
+checkpoints; later retained samples are reported below.
 
 Round 3 review follow-up: the user permits matched **non-quiet** measurements
 under recorded load if bounded quiet attempts continue to fail; unrelated desktop
@@ -2254,8 +2265,9 @@ action was performed by these mocked installer tests.
 Tooling-only commit `e832aeb0d1502564c138ae7e43de650827fffd78` adds that single
 forwarded key and the caller-present/caller-absent regression. Commit preflight
 passed. A Foundation probe with both HOME and CFFIXED_USER_HOME set resolves the
-isolated `/tmp/rpce-1415-home-probe`; HOME alone did not. This probe is not yet
-an actual packaged-app isolation receipt, and no launch sample is claimed.
+isolated `/tmp/rpce-1415-home-probe`; HOME alone did not. This probe alone was
+not packaged-app isolation evidence; subsequent pilots and valid retained
+samples verified the actual app-held lease inside each isolated home.
 
 Focused ticket `3d850405-4de1-4320-bcc2-6ad42a27c017` executed **2/2**, zero failures:
 - `AgentSessionLinkLiveDiscoveryTests.testActivatedTwoLaneContractWithoutSelectingWorkspaceUsesProductionAdmissionAndReturnedCalls`
@@ -2278,8 +2290,8 @@ Focused ticket `3d850405-4de1-4320-bcc2-6ad42a27c017` executed **2/2**, zero fai
   `WorkspaceCodemapPresentationCoordinator.release` →
   `cancelCodemapArtifactDemand` → `finishCancelledCodemapArtifactDemand` →
   `revokeReadyArtifact`, independent of background index completion. The old
-  generation fence did not join that independent work. Main replay is still
-  pending; do not yet classify the inherited status as runtime-proven.
+  generation fence did not join that independent work. The subsequent main replay
+  below establishes the inherited invalid-test-synchronization classification.
 
 Two more quiet gates encountered priority M8 tickets `3143054f...` and
 `62f10727...`; both were awaited. Matching Debug packages were then queued for
@@ -2306,7 +2318,8 @@ harness hardening: abort before mutating a non-System or leftover-fixture
 workspace; catch each session deletion failure separately so restoration still
 runs; read back restored tabs and confirm each known fixture session is absent;
 record returned lane IDs immediately for cleanup; and recheck sibling builds
-post-index. These changes are applied, with final family validation pending.
+post-index. These changes were applied and the final family validation below
+passed 51 cases with four opt-in skips.
 The serialized contract uses **production socket admission with fixture-seeded
 run state**, a seeded observer/chat/model catalog and controlled provider replies.
 “No workspace argument” applies to lane creation, not subsequent explicit
@@ -2318,10 +2331,10 @@ test lease and restores content, not the original revision counter.
 
 Baseline isolated app package `1f7f6162-eca7-4c51-ab66-4f3ad1d4089b` completed
 successfully, including signing/layout/embedded-helper checks; it did not launch
-an app. The candidate package remains to be completed. Actual packaged home
-isolation will be checked through the app-held `.repoprompt-ce-debug-seed.lock`
-whose path is derived from `AppProfileLocations.current.homeDirectory`; no
-retained launch measurement will be accepted before that check succeeds.
+an app. Candidate package `e6e1a87f...` subsequently completed. Actual packaged
+home isolation was verified through the app-held `.repoprompt-ce-debug-seed.lock`
+whose path derives from `AppProfileLocations.current.homeDirectory`, before
+accepting each valid retained launch measurement.
 
 Final test readback uses the existing canonical snapshot decoder and compares
 saved bytes with that snapshot, restored composed/stashed tabs and active tab,
@@ -2343,16 +2356,252 @@ M8 ticket `5148c134-1080-4e59-99b4-139a80024e23` finished at its one-hour timeou
 no heavy holder initially, loads **6.14/5.78/5.31** and CPU idle
 **41.52/61.13/36.89%**, so it failed. M8 started another suite
 `71fa80d3-2069-4500-8300-82a50dbee3f8` during the third observation. The
-predeclared six-run A/B/B/A/A/B menu batch now waits on that suite and will label
-its measurements **non-quiet** with recorded load; no retained sample has run.
+predeclared six-run A/B/B/A/A/B menu batch waited on that suite; subsequent
+**non-quiet** measurements, contamination exclusions and replacements are
+reported below.
 The overseer has coordinated no further M8 heavy submissions until the matched
 menu and launch batch finishes. Subsequent ticket waits are bounded to at most
 ten minutes per call and repeated while needed, never interpreted as passes.
 
-The user-delegated publication instruction is to push these validated commits
-and this ledger now so hosted CI and independent review can proceed while M8
-finishes; merge current main only if GitHub reports a conflict. The already-created
-main bundle is retained, and the candidate bundle will be prepared after menu
-measurements to avoid another concurrent packaging admission. No visible app has
-yet been stopped or launched. Performance acceptance remains open; publication
-is not readiness, and the PR remains Draft for manual user merging only.
+The checkpoint publication pushed these validated commits and the ledger so
+hosted CI and fresh-session review could proceed while M8 finished. No main
+merge was needed. The candidate bundle was later prepared after menu
+measurements. The approved launch experiment was partially executed and then
+closed by the user; its unresolved startup risk is accepted, not passed.
+Publication is not readiness, and the PR remains Draft for manual user merging
+only. Under the final docs-only instruction, report any conflict rather than
+merging main.
+
+### Round 3 follow-up: exact-head CI and corroborating receipts (2026-11-06)
+
+Published head is `bc235c22c82aba5511f09a88cc408bf133d4dc87`; it remains
+Draft and mergeable. Independent follow-up review reported no new P1/P2 code
+defect and accepted the scoped no-selection and CodeMap witnesses. No code has
+changed since that review.
+
+CI run `42154839579`, attempt 1, failed its Build and Static Gates job
+`127687369398` during checkout, before immutable-candidate verification or any
+build/static gate. The actual check-run annotation says: **"GitHub Actions has
+encountered an internal error when running your job."** The separate notice
+reports macOS arm64 capacity constraints. `gh run view --log-failed` returned
+`log not found: 127687369398`; missing logs alone were not the classification.
+Job JSON shows setup succeeded, checkout left in progress, and every later step
+pending. Raw job, annotations, and log-fetch error are retained under
+`build/m6-round3-receipts/ci-bc235c22c/`. This is an evidenced infrastructure
+failure eligible for the integration-v3 failed-job rerun, not a source pass.
+Generated Xcode Workspace, Portable Checks, Secret Scan, and Declare Integration
+Candidate succeeded on this head. Required root validation was incomplete at
+this checkpoint; the final readback below confirms all 11 checks passed.
+After a successful clean-tree push safety preflight (raw
+`ci-bc235c22c/rerun-preflight-clean.txt`), `gh run rerun 42154839579 --failed`
+was accepted. On attempt 2, Build and Static Gates job `127701183715`
+subsequently **passed**; four root shards were then queued. This is not yet an
+overall CI pass. The ledger addition was preserved
+as an exact patch, temporarily removed for that clean-tree gate, and restored
+unchanged afterward; no code or commit changed. The initial sandboxed preflight
+could not evaluate Swift package metadata, and a second gate correctly refused
+my in-progress ledger edit; neither failure was bypassed.
+
+The earlier smoke and Foundation statements had only transcript output, not
+reviewer-accessible raw receipts. They were rerun at this exact published head:
+
+- `python3 Scripts/test_conductor_smoke.py`: **8 tests, 0.008s, OK**, exit 0.
+  Raw `build/m6-round3-receipts/conductor-smoke-bc235c22c.txt`, SHA256
+  `fc23540c8545d4075fe2f0420accd022e74e5566176c3bd4c597964ff02c2e14`.
+  This is a manually invoked Python suite, not a claim that hosted CI enrolls it.
+- `/usr/bin/osascript -l JavaScript -e 'ObjC.import("Foundation"); $.NSHomeDirectory().js'`
+  with both `HOME` and `CFFIXED_USER_HOME` set to a fresh owned
+  `build/foundation-vqotwqyu` directory returned that exact absolute directory,
+  exit 0. Raw JSON includes command, environment values, output, timestamp, and
+  comparison in `build/m6-round3-receipts/foundation-home-bc235c22c.json`, SHA256
+  `f024b6a2e125f8286fdf3770031b152dbc9db04a80e50f7e30627f822af6b5e5`.
+  The isolated directory was removed afterward. This probe itself launched no
+  app and did not prove LaunchServices forwarding. Subsequent pilots and valid
+  retained launches verified the app-held seed-lock/profile path inside fresh
+  isolated homes. Omitted, empty, and real-home values never count.
+
+The full local conductor selftest remains **failed**, not superseded by these
+focused passes or the later hosted CI success. Its retained unsandboxed log is
+`build/m6-round3-receipts/conductor-selftest-unsandboxed.txt` (SHA256
+`325be001ac4a9d52ac4e78b5961a09068213d0e93432f7f2304706d91d72ad2e`).
+Its installer fixture
+`LocalProductionInstallerTests.test_two_consecutive_installs_keep_fingerprint_generation_and_designated_requirement`
+exceeded the existing 15-second subprocess timeout; 17 other installer cases
+passed. The exact historical slow subprocess phase was not retained, so the
+latency cause is **unlocalized**, not asserted to be machine load.
+
+Source causality is narrower and established: this fixture copies only
+`install_local_production.sh`, `local_signing_identity.py`, and
+`resolve_full_xcode_developer_dir.sh` into a temporary fake repository, supplies
+fake packaging/security/signing commands, and invokes the installer with
+`subprocess.run(["bash", ...], timeout=15)` directly. It never invokes conductor
+or its changed environment snapshot/prepare path. Those three files and the
+fixture itself are byte-identical to incorporated main `5a3f1122535`; hashes are
+retained in `build/m6-round3-receipts/installer-source-identity.json`. Therefore
+this fixture timeout is not caused by the new conductor forwarding line. An
+unchanged focused rerun passed **1/1 in 10.578s** on the PR and **1/1 in 7.085s**
+on main; these are corroborating executions, not an explanation of the timeout
+or a full-selftest pass. Their raw outputs and command manifest are retained as
+`installer-focused-bc235c22c.txt`, `installer-focused-main.txt`, and
+`receipt-manifest-bc235c22c.json` in the same receipts directory.
+
+M8 `71fa80d3...` was the priority heavy job at this checkpoint. The bounded batch
+waited on active M8 tickets and required an idle heavy queue before sampling.
+Subsequent results and the user's closure of the incomplete launch experiment
+are recorded below. These ledger-only follow-up notes do not change either
+measured code head.
+
+The first post-M8 sampling attempt at 05:56 UTC was refused **before submitting
+any benchmark**: M8 was idle, but the machine-wide queue contained `d922ee5a...`
+(fix-1646) and `fab2d377...` (PR1539 review). Recorded load1 was **84.77** on
+8 CPUs and CPU idle **1.58%**; raw precheck is in `a1-console.txt`. No menu
+observations were discarded or counted as passes. The batch now waits on all
+machine-wide heavy tickets as well as M8, with waits bounded to 600 seconds;
+`a1r` denotes the first actual sampling submission after this refused precheck.
+The fix-1646 job later returned cancellation (130) by another actor; this lane
+did not cancel it. CI attempt 2 subsequently passed root shards 1, 2, and 4;
+shard 3 was still queued at that checkpoint. Subsequent exact-head readback
+confirmed **CI run 42154839579 attempt 2 completed SUCCESS**: all four root
+shards, Build and Static Gates, Style, Portable Checks, Secret Scan, Declare
+Integration Candidate, and Sentry Build and Privacy succeeded. Raw state is
+retained in `ci-bc235c22c/attempt2-progress.json`.
+
+The sandbox denied `top` on the next precheck (`a1r-console.txt`), again before
+submission. With approved observation access, load fell below 50 and baseline
+run `a1s` / `df8807f1-d459-42a8-894f-7a7ce7413ff3` executed. Its 20 observations
+are retained, but **excluded from the matched comparison due to competing heavy
+execution**, not due to their values: fix-1646 ticket `26261ca4...` acquired slots
+at 07:11:14 UTC, while this test's first-test receipt was 07:11:39 UTC. The guard
+had observed an empty queue before submission. The batch paused for that ticket,
+and an additional uncontended baseline invocation is required; the contaminated
+run remains visible in the final report. App launches occurred only in the
+subsequently authorized experiment, now closed.
+
+#### Matched menu observations and pre-launch checkpoint
+
+The bounded high-load gate waited until load1 fell below 50; it did not exhaust
+its 30-minute allowance. Samples remain **non-quiet**, not idle-machine proof.
+Both builds are Debug on the same machine/toolchain, main `5a3f1122535` versus
+PR `bc235c22c`. The benchmark and direct menu path are unchanged. Each invocation
+retained 20 observations after its built-in warmup, with counters **4 reads,
+470 visits, 35 publications**. Full values, raw conductor tickets/status/log
+paths, CPU snapshots, and 1-second heavy/load monitoring are retained under
+`build/m6-round3-receipts/`; `menu-summary.json` consolidates them.
+
+| Head / invocation | Ticket | Median ms | p95 ms | Observed test-window load1 |
+| --- | --- | ---: | ---: | ---: |
+| main a2 | `2a869e09-51f6-4147-987c-dda4dd2b8d1d` | 23.1043 | **58.0227** | 29.83–31.73 |
+| main a3 | `b686dc76-62d8-467e-9a03-13e00d633215` | 15.8069 | 41.5140 | 17.04 |
+| main a4 replacement | `20b465d6-d309-4648-ad2d-957cc62539d9` | 19.5990 | 23.8392 | 17.63 |
+| PR b1 | `629b518a-f5a5-4368-91bb-d632f02850d5` | 15.1009 | 16.3803 | 20.10–21.33 |
+| PR b3 | `cbc6ba13-5686-4311-8d65-9503134943f1` | 23.8636 | 28.6993 | 21.18–21.63 |
+| PR b4 replacement | `366d1443-d70e-490a-9d51-f5ac9f4c3aac` | 24.8884 | 30.4739 | 12.94–13.55 |
+
+Pooled **60 observations/head**, nearest-rank p95: main **41.513958 ms**,
+PR **30.197458 ms**, both below the unchanged **50 ms** limit. Main range
+**14.981666–481.325333 ms**, median **21.7637295 ms**; PR range
+**14.838–31.6045 ms**, median **23.124979 ms**. The PR median is about 6.25%
+higher, while its p95 is lower; non-quiet runs with materially varying load do
+not isolate causation or establish median equivalence. There is no observed
+p95 regression requiring a production fix. Main invocation a2 individually
+fails the 50 ms p95 budget; it was retained, not retried away. Pre-run CPU idle
+was only 3.70–45.28% across accepted runs.
+
+Two invocations remain separately visible but are excluded from matched pools
+because another heavy holder was observed during the recorded test window:
+main a1s p95 **27.816833 ms**, PR b2 (`7b85de08...`) p95 **32.359958 ms**.
+Replacements were selected for this scheduling reason, not their timing values.
+Other jobs that appeared only outside the test window are recorded, not hidden.
+The window is conservative `firstTestStarted..processFinished`, based on daemon
+output receipt timestamps; monitoring is sampled at 1 second, not a claim of
+continuous scheduler instrumentation. Accepted order after exclusions is
+B/A/A/B/A/B rather than the originally planned A/B/B/A/A/B; all raw runs remain
+available. No quiet-machine claim or threshold change is made.
+
+Candidate package ticket `e6e1a87f-cdb1-4500-a4cf-add748ae2f80` completed after
+the heavy queue became empty. Its provenance records commit `bc235c22c` and
+`dirty: true`; dirty contents were not captured, so it is not a clean exact-tree
+artifact attestation. Main's prebuilt bundle records clean `5a3f1122535`.
+The actual app-held profile lease and Foundation probe matched each fresh owned
+home for both pilots and all 20 valid retained launches. The experiment is now
+closed and incomplete, with accepted unresolved startup risk as detailed below.
+
+### M6 final evidence reconciliation and accepted startup risk (2026-11-06)
+
+**Disposition: the user accepted the unresolved startup risk. It is not a
+pre-merge blocker, but it is not a passing startup result. A 10% regression is
+not excluded.** Reopen on a reproducible matched slowdown over the unchanged
+10% budget or evidence of added startup work. The experiment is closed: the
+user withdrew launch/stop approval and requested documentation only. No more
+benchmarks, heavy jobs or app lifecycle actions are authorized by this task.
+Required review remains open; the PR remains Draft, with manual user merging
+only. The reviews were fresh **Astra sessions**, not a different model and not
+a human review; fresh-session findings do not satisfy that outstanding review
+requirement by themselves.
+
+**CI verified at `bc235c22c82aba5511f09a88cc408bf133d4dc87`: all 11 checks passed.**
+[CI run 42154839579](https://github.com/repoprompt/repoprompt-ce/actions/runs/42154839579)
+completed successfully on attempt 2, after the evidenced GitHub internal
+checkout error and policy-supported failed-job rerun documented above.
+[Xcode run 42154839532](https://github.com/repoprompt/repoprompt-ce/actions/runs/42154839532)
+also passed. [Release Candidate 42112251102](https://github.com/repoprompt/repoprompt-ce/actions/runs/42112251102)
+passed at ancestor `5b1fc7aa83b8490ff7a2747f71a303feb3767c6a`.
+`git diff 5b1fc7aa8..bc235c22c -- Sources` is empty: application source is unchanged
+since that Release Candidate; conductor tooling and tests did change. This is
+ancestor release evidence, not a release run on the later head. Publishing this
+documentation commit creates a **new head with separate CI**; the 11 green checks
+must not be relabeled as checks on that new commit.
+
+**Actual launch receipts, not the planned sample count:**
+`build/m6-round3-receipts/launch-retained-01-a.json` through
+`launch-retained-20-a.json` record five balanced A/B/B/A blocks, **10 retained
+launches per head**. Main is incorporated `5a3f112253508c972b0952a95ea9c56e90b909b0`;
+the candidate bundle's provenance names `bc235c22c`, **dirty**, and does not
+capture dirty contents. The user stopped the batch at `launch-retained-21-a` of
+40 planned retained samples. Sample 21 has `valid: false`, no retained timing,
+and is excluded. Its profile cleanup is not certified by the incomplete receipt;
+all 20 valid retained receipts explicitly record isolated-profile removal after
+coordinated stops. The launch driver is no longer running. Pilots and warmups
+are separate and are not counted in the following results.
+
+| Window-appearance elapsed | Main | PR | PR change |
+| --- | ---: | ---: | ---: |
+| Median | 2,320.5 ms | 2,327 ms | **+0.28%** |
+| Mean | 2,230.9 ms | 2,345.7 ms | **+5.15%** |
+
+Raw retained values (milliseconds, per-head execution order):
+- Main: `2429, 2225, 1998, 2321, 2355, 1860, 2574, 2388, 1839, 2320`.
+- PR: `2336, 2639, 2318, 2417, 2163, 2239, 2915, 2731, 1464, 2235`.
+
+The same Debug configuration, signing mode and alternate-in-memory secure
+storage were used, with a new isolated profile per launch. Actual app-held
+seed-lock paths and Foundation probes were inside those profiles. Execution was
+**non-quiet under changing load** (sampled retained-window load1 **14.19–70.63**
+on 8 CPUs), not a stationary controlled experiment. Enumerating all 5^5
+resamples of the five ABBA blocks and recomputing the per-head median ratio
+reproduces an approximate **-4.3% to +14.4%** central block-resampling range.
+This is **not a confidence interval**, and the incomplete experiment is **not an
+equivalence result**. A small observed median difference cannot exclude the
+unchanged 10% regression budget.
+
+The investigation lane's review at `bc235c22c` found the same **55 linked
+dependencies**, executable size **+0.38%**, no added eager initializer section,
+and no concrete added startup work. Read-only inspection during this docs
+reconciliation corroborated 55 dependencies per bundle, sizes
+398,662,672 / 400,185,072 bytes (+0.3819%), and no eager initializer section added.
+The investigation reported **no early-exit or fault difference in the 20 valid
+retained samples**; that statement does not cover pilots, warmups or sample 21,
+and is not a general absence-of-fault guarantee. These are bounded inspection
+findings, not proof that a 10% startup regression is impossible.
+
+Historical **+10.68%** compared different upstream baselines (`35d141ad9` versus
+candidate `0c541c018` incorporating `76998e93`) under overlapping heavy work.
+It remains a recorded observation, **not an established M6 regression**. Neither
+that historical result nor the new partial experiment is rewritten as passed.
+
+**Workspace-free scope, by user decision:** #1402's app-side contract is covered
+by `testActivatedTwoLaneContractWithoutSelectingWorkspaceUsesProductionAdmissionAndReturnedCalls`:
+ordinary initialization supplies the System/Default owner without the user
+selecting a workspace. Zero-owner and standalone operation are deferred to
+#1408. No established destination, placement, admission or retirement ownership
+guards were removed. This does not claim completion of the broader #1408 work.
