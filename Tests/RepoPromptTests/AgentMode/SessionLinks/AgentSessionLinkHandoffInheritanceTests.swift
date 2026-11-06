@@ -4527,6 +4527,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 let workspaceID = try XCTUnwrap(manager.activeWorkspaceID)
                 var preparedIDs: [UUID] = []
                 var preparedTabs: [UUID] = []
+                var savedTabs: [ComposeTabState] = []
                 for index in 0 ..< 297 {
                     let id = UUID()
                     let tab = UUID()
@@ -4545,12 +4546,14 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     )
                     let workspace = try XCTUnwrap(manager.workspace(withID: workspaceID))
                     _ = try await AgentSessionDataService.shared.saveAgentSession(saved, for: workspace)
-                    let workspaceIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == workspaceID })
-                    manager.workspaces[workspaceIndex].composeTabs.append(.init(id: tab, name: "Saved \(index)", activeAgentSessionID: id))
+                    savedTabs.append(.init(id: tab, name: "Saved \(index)", activeAgentSessionID: id))
                     if index < 7 { preparedIDs.append(id)
                         preparedTabs.append(tab)
                     }
                 }
+                // Publish the completed fixture once; intermediate catalog growth is not under test.
+                let workspaceIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == workspaceID })
+                manager.workspaces[workspaceIndex].composeTabs.append(contentsOf: savedTabs)
                 for (id, tab) in zip(preparedIDs, preparedTabs) {
                     let prepared = await first.viewModel.prepareSavedOversightSession(
                         tabID: tab,
