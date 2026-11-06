@@ -860,7 +860,7 @@
                     note("persistedCodexReplayPreservedSourceTab tab=\(String(preferredTabID.uuidString.prefix(8)))")
                 }
 
-                await promptManager.switchComposeTab(playbackTabID)
+                await promptManager.switchComposeTab(playbackTabID, focusIntent: .preservesLiveText)
                 note("persistedCodexReplaySwitchToPlaybackTab tab=\(String(playbackTabID.uuidString.prefix(8)))")
 
                 guard await waitForPersistedCodexReplayRestore(tabID: playbackTabID) else {
@@ -941,7 +941,7 @@
                     note("persistedAgentSessionFixturePreservedSourceTab tab=\(String(preferredTabID.uuidString.prefix(8)))")
                 }
 
-                await promptManager.switchComposeTab(playbackTabID)
+                await promptManager.switchComposeTab(playbackTabID, focusIntent: .preservesLiveText)
                 note("persistedAgentSessionFixtureSwitchToPlaybackTab tab=\(String(playbackTabID.uuidString.prefix(8)))")
 
                 guard await waitForPersistedAgentSessionFixtureRestore(

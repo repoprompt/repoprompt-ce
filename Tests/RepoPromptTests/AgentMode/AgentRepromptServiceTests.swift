@@ -8,7 +8,7 @@ final class AgentRepromptServiceTests: XCTestCase {
     static let questions = #"[{"id":"scope","question":"Which scope?","options":[{"label":"Small"},{"label":"Large"}]}]"#
 
     func testMessageContainsOnlyDeclaredInputsAndFixedHistoryFraming() throws {
-        let request = AgentRepromptRequest(originalText: "That's wrong. Start over with a different approach.", manifest: "Root: sample\nfile.swift", guidance: "My guidance", answers: [.init(question: "Which?", customText: "My answer")])
+        let request = AgentRepromptRequest(originalText: "That's wrong. Start over with a different approach.", guidance: "My guidance", answers: [.init(question: "Which?", customText: "My answer")])
         let message = try AgentRepromptService.message(for: request)
         XCTAssertTrue(message.systemPrompt.contains("prompt rewriter, not a coding agent"))
         XCTAssertTrue(message.systemPrompt.contains(AgentRepromptHistory.framing))
@@ -22,6 +22,37 @@ final class AgentRepromptServiceTests: XCTestCase {
         XCTAssertNil(object["contextRequests"])
         XCTAssertNil(object["consultResults"])
         XCTAssertNil(object["guidance"])
+        XCTAssertNil(object["manifest"])
+        XCTAssertNil(object["attachments"], "An absent attachment list must not suggest files to the model")
+        XCTAssertNil(object["sessionTitle"])
+    }
+
+    func testContractDescribesAttachmentsAndForbidsSpeculation() throws {
+        let contract = try AgentRepromptService.message(for: .init(originalText: "Hello")).systemPrompt
+        for required in ["attachments", "recentChat", "sessionTitle", "cannot see their contents", "candidate intents", "hedged guesses", "remarks about the draft", "near-identical", "exactly one thing", "do not guess"] {
+            XCTAssertTrue(contract.contains(required), required)
+        }
+        for removed in ["anifest", "vocabulary", "Leave incidental gaps", "unspecified"] {
+            XCTAssertFalse(contract.contains(removed), removed)
+        }
+    }
+
+    func testOnlyAnExplicitRequestAbandonsPriorWork() {
+        let framing = AgentRepromptHistory.framing
+        XCTAssertTrue(framing.contains("changes only what it"))
+        XCTAssertTrue(framing.contains("explicitly asks to abandon or redo"))
+        XCTAssertFalse(framing.contains("signals frustration"), "Frustration alone must not read as a scope change")
+        XCTAssertFalse(framing.contains("if useful"), "Abandonment language must not be optional colour on a correction")
+    }
+
+    func testAttachmentAndTitleInputsAreEncodedAndBounded() throws {
+        let request = AgentRepromptRequest(originalText: "See this", attachments: [.init(name: "shot.png", kind: "image")], sessionTitle: "CI gating")
+        let message = try AgentRepromptService.message(for: request)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(message.conversationMessages[0].content.utf8)) as? [String: Any])
+        XCTAssertEqual(object["attachments"] as? [[String: String]], [["name": "shot.png", "kind": "image"]])
+        XCTAssertEqual(object["sessionTitle"] as? String, "CI gating")
+        XCTAssertTrue(message.attachments.isEmpty, "Names only: no attachment payload reaches the rewriter")
+        XCTAssertThrowsError(try AgentRepromptService.message(for: .init(originalText: "x", sessionTitle: String(repeating: "x", count: 1025))))
     }
 
     func testPlainMarkdownAndDelimiterPrefixesAcrossEveryBoundary() throws {

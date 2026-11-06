@@ -549,8 +549,9 @@ extension FileSystemService {
 
     /// Removes an entire subtree for a given folder from visitedPaths. Returns .fileRemoved / .folderRemoved deltas.
     package func removeSubtree(for topRelPath: String) -> [FileSystemDelta] {
+        let subtreePrefix = topRelPath + "/"
         let oldSet = visitedPaths.filter {
-            $0 == topRelPath || $0.hasPrefix(topRelPath + "/")
+            $0 == topRelPath || $0.hasPrefix(subtreePrefix)
         }
         let sortedPaths = oldSet.sorted { $0.count > $1.count } // deeper items first
         var deltas: [FileSystemDelta] = []

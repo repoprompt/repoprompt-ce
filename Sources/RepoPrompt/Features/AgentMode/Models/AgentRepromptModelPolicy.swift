@@ -63,14 +63,4 @@ enum AgentRepromptModelPolicy {
         }
         return nil
     }
-
-    static func manifest(rootNames: [String], selectedPaths: [String]) -> String {
-        var lines: [String] = []
-        for line in rootNames.map({ "Root: \($0)" }) + selectedPaths.prefix(50) {
-            guard (lines + [line]).joined(separator: "\n").utf8.count <= 4 * 1024 - 64 else { break }
-            lines.append(line)
-        }
-        if selectedPaths.count > 50 { lines.append("+\(selectedPaths.count - 50) more") }
-        return lines.joined(separator: "\n")
-    }
 }

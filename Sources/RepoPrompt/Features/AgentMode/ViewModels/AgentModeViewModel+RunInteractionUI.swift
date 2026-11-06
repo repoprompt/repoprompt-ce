@@ -31,6 +31,12 @@ extension AgentModeViewModel {
         )
     }
 
+    /// Whether activating `tabID` should focus its pending question instead of the composer.
+    func hasPendingQuestionForFocus(tabID: UUID) -> Bool {
+        let snapshot = makeRunInteractionUISnapshot()
+        return snapshot.currentTabID == tabID && snapshot.pendingQuestionFocusKey != nil
+    }
+
     func syncRunInteractionUIState() {
         #if DEBUG
             test_syncRunInteractionCallCount += 1

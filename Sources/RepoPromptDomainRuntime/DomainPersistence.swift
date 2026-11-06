@@ -191,6 +191,7 @@ enum DomainPersistenceError: Error, Equatable {
     case writeFailed(String)
     case lockTimedOut
     case cancelled
+    case recoveryBackupRequired(location: String, reason: String)
 }
 
 package struct DomainPersistenceDataSnapshot: Sendable {
@@ -342,6 +343,36 @@ package struct DomainPersistenceCoordinator {
     private func withValidatedLock<T>(at url: URL, cancellation: DomainBlockingCancellation?, _ body: () throws -> T) throws -> T {
         try validateMetadata(url)
         return try DomainPersistenceLock.withLock(at: url, cancellation: cancellation, body)
+    }
+
+    /// Runs the host recovery-backup guard for bytes a durable replacement is about to discard.
+    /// Called inside the workspace locks and before any journal or document mutation, so a refusal
+    /// leaves every durable byte untouched.
+    private func protectDurableReplacement(
+        workspaceID: UUID,
+        documentURL: URL,
+        location: DomainDurableReplacement.Location,
+        discarding discarded: Data?,
+        replacement: Data
+    ) throws {
+        guard let durableReplacementGuard = configuration.durableReplacementGuard,
+              let discarded,
+              discarded != replacement
+        else { return }
+        do {
+            try durableReplacementGuard.protect(DomainDurableReplacement(
+                workspaceID: workspaceID,
+                documentURL: documentURL,
+                location: location,
+                discardedBytes: discarded,
+                replacementBytes: replacement
+            ))
+        } catch {
+            throw DomainPersistenceError.recoveryBackupRequired(
+                location: location.rawValue,
+                reason: String(describing: error)
+            )
+        }
     }
 
     private func atomicWrite(_ data: Data, to url: URL) throws {
@@ -1418,6 +1449,9 @@ package struct DomainPersistenceCoordinator {
     ) throws -> DomainPersistenceWorkingCommit {
         try ensureLazyMigration(now: now)
         return try withExistingWorkspaceLocks(document: document, now: now) { catalogRevision in
+            #if DEBUG
+                try DomainPersistenceRecoveryFaultsForTesting.check(.working)
+            #endif
             let durable = try readCurrentJournalOrSeed(document: document)
             guard durable.revisions.workingRevision == expectedRevision else {
                 throw DomainPersistenceError.stateConflict(
@@ -1432,12 +1466,22 @@ package struct DomainPersistenceCoordinator {
                     requiresMatchingSavedDigest: requiresMatchingSavedDigest
                 )
             }
+            let workingDocument = newRevision.dirtyRevision == nil ? nil : document.documentBytes
+            if durable.workingDocument != workingDocument {
+                try protectDurableReplacement(
+                    workspaceID: document.workspaceID,
+                    documentURL: document.fileURL,
+                    location: .workingDocument,
+                    discarding: durable.workingDocument,
+                    replacement: document.documentBytes
+                )
+            }
             let journal = DomainWorkingJournal(
                 workspaceID: document.workspaceID,
                 fileURL: document.fileURL,
                 revisions: newRevision,
                 savedDigest: durable.savedDigest,
-                workingDocument: newRevision.dirtyRevision == nil ? nil : document.documentBytes,
+                workingDocument: workingDocument,
                 contextRevisions: contextRevisions,
                 contextDigests: Dictionary(uniqueKeysWithValues: document.metadata.contexts.map {
                     ($0.identity.contextID, $0.contentDigest)
@@ -1499,12 +1543,44 @@ package struct DomainPersistenceCoordinator {
                     actual: durable.revisions.workingRevision
                 )
             }
-            if let diskBytes = try? Data(contentsOf: document.fileURL) {
+            // With a recovery guard, only a missing file counts as absent: an unreadable original
+            // (EACCES, EIO) must never be renamed over unprotected.
+            let diskBytes: Data?
+            if configuration.durableReplacementGuard != nil {
+                do {
+                    diskBytes = try DomainRecoveryBackup.existingBytes(at: document.fileURL)
+                } catch {
+                    throw DomainPersistenceError.recoveryBackupRequired(
+                        location: DomainDurableReplacement.Location.savedDocument.rawValue,
+                        reason: "saved_document_unreadable: \(error.localizedDescription)"
+                    )
+                }
+            } else {
+                diskBytes = try? Data(contentsOf: document.fileURL)
+            }
+            if let diskBytes {
                 let diskDigest = DomainContentDigest.sha256(diskBytes)
                 guard diskDigest == durable.savedDigest || diskDigest == document.contentDigest else {
                     throw DomainPersistenceError.externalDocumentConflict
                 }
             }
+            // Both originals this save discards are protected independently: the working copy the
+            // pending journal replaces, and the canonical document the save overwrites. A missing
+            // canonical document has nothing to protect.
+            try protectDurableReplacement(
+                workspaceID: document.workspaceID,
+                documentURL: document.fileURL,
+                location: .workingDocument,
+                discarding: durable.workingDocument,
+                replacement: document.documentBytes
+            )
+            try protectDurableReplacement(
+                workspaceID: document.workspaceID,
+                documentURL: document.fileURL,
+                location: .savedDocument,
+                discarding: diskBytes,
+                replacement: document.documentBytes
+            )
             let cleanRevisions = DomainRevisionState(
                 workingRevision: durable.revisions.workingRevision,
                 savedRevision: durable.revisions.workingRevision,
@@ -1585,6 +1661,9 @@ package struct DomainPersistenceCoordinator {
     ) throws -> DomainPersistenceSavedCommit {
         try ensureLazyMigration(now: now)
         return try withExistingWorkspaceLocks(document: document, now: now) { catalogRevision in
+            #if DEBUG
+                try DomainPersistenceRecoveryFaultsForTesting.check(.externalReload)
+            #endif
             let current = try readCurrentJournalOrSeed(document: document)
             guard current.revisions.workingRevision == expectedRevision else {
                 throw DomainPersistenceError.stateConflict(
@@ -1592,6 +1671,14 @@ package struct DomainPersistenceCoordinator {
                     actual: current.revisions.workingRevision
                 )
             }
+            // The external document becomes authoritative and the durable working copy is cleared.
+            try protectDurableReplacement(
+                workspaceID: document.workspaceID,
+                documentURL: document.fileURL,
+                location: .workingDocument,
+                discarding: current.workingDocument,
+                replacement: document.documentBytes
+            )
             let revisions = DomainRevisionState(
                 workingRevision: newRevision,
                 savedRevision: newRevision,
@@ -1646,6 +1733,9 @@ package struct DomainPersistenceCoordinator {
     ) throws -> DomainPersistenceWorkingCommit {
         try ensureLazyMigration(now: now)
         return try withExistingWorkspaceLocks(document: document, now: now) { catalogRevision in
+            #if DEBUG
+                try DomainPersistenceRecoveryFaultsForTesting.check(.conflictRebase)
+            #endif
             let current = try readCurrentJournalOrSeed(document: document)
             guard current.revisions == expectedRevisions else {
                 throw DomainPersistenceError.stateConflict(
@@ -1665,12 +1755,22 @@ package struct DomainPersistenceCoordinator {
             else {
                 throw DomainPersistenceError.externalDocumentConflict
             }
+            let workingDocument = newRevisions.dirtyRevision == nil ? nil : document.documentBytes
+            if current.workingDocument != workingDocument {
+                try protectDurableReplacement(
+                    workspaceID: document.workspaceID,
+                    documentURL: document.fileURL,
+                    location: .workingDocument,
+                    discarding: current.workingDocument,
+                    replacement: workingDocument ?? externalBytes
+                )
+            }
             let journal = DomainWorkingJournal(
                 workspaceID: document.workspaceID,
                 fileURL: document.fileURL,
                 revisions: newRevisions,
                 savedDigest: externalSavedDigest,
-                workingDocument: newRevisions.dirtyRevision == nil ? nil : document.documentBytes,
+                workingDocument: workingDocument,
                 contextRevisions: contextRevisions,
                 contextDigests: Dictionary(uniqueKeysWithValues: document.metadata.contexts.map {
                     ($0.identity.contextID, $0.contentDigest)
@@ -2254,3 +2354,29 @@ package enum DomainPersistenceLock {
         }
     }
 }
+
+#if DEBUG
+    /// Injects a recovery-backup refusal at a persistence entry point, so tests can exercise the
+    /// authority's handling on recovery sub-paths that rarely discard bytes in practice.
+    package enum DomainPersistenceRecoveryFaultsForTesting {
+        package enum Site: String, Sendable {
+            case working
+            case conflictRebase
+            case externalReload
+        }
+
+        private static let armed = OSAllocatedUnfairLock<Set<Site>>(initialState: [])
+
+        package static func arm(_ sites: Set<Site>) {
+            armed.withLock { $0 = sites }
+        }
+
+        static func check(_ site: Site) throws {
+            guard armed.withLock({ $0.contains(site) }) else { return }
+            throw DomainPersistenceError.recoveryBackupRequired(
+                location: DomainDurableReplacement.Location.workingDocument.rawValue,
+                reason: "injected_\(site.rawValue)"
+            )
+        }
+    }
+#endif

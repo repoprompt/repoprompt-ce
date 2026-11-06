@@ -20,6 +20,87 @@ final class AgentRepromptHistoryTests: XCTestCase {
         XCTAssertEqual(AgentRepromptHistory.make(items: first + second, compactedAt: nil, hasActiveTurn: false, completedUserItemIDs: [first[0].id, second[0].id]).count, 2)
     }
 
+    /// An earlier turn is closed by the next user message and keeps no terminal state, so a
+    /// `terminalState == .completed` proof would silently discard all history but the last turn.
+    func testEveryClosedTurnOfARealTranscriptQualifiesAndAnActiveOneDoesNot() {
+        let items = sequenced(turn("one", "reply one") + turn("two", "reply two") + turn("three", "reply three"))
+        let closed = AgentTranscriptIO.buildTranscript(from: items, terminalState: .completed)
+        let ids = AgentRepromptHistory.closedRequestIDs(in: closed)
+        XCTAssertEqual(AgentRepromptHistory.make(items: items, compactedAt: nil, hasActiveTurn: false, completedUserItemIDs: ids).map(\.user), ["one", "two", "three"])
+        let running = AgentTranscriptIO.buildTranscript(from: items, terminalState: .running)
+        XCTAssertEqual(AgentRepromptHistory.closedRequestIDs(in: running), [items[0].id, items[2].id])
+    }
+
+    func testTurnsRecordAttachmentNamesWithoutLocations() throws {
+        let files: [AgentFileAttachment] = [
+            .init(source: .localFile(path: "/secret/legacy.png")),
+            .init(source: .localFile(path: "/secret/run.log"), kind: .text, fileName: "run.log", byteCount: 10)
+        ]
+        let tagged = [AgentTaggedFileAttachment(relativePath: "Sources/App.swift", displayName: "App.swift")]
+        let items: [AgentChatItem] = turn("one", "reply") + [.user("look", attachments: files, taggedFileAttachments: tagged), .assistant("seen")]
+        let history = AgentRepromptHistory.make(items: items, compactedAt: nil, hasActiveTurn: false)
+        XCTAssertNil(history.first?.attachments)
+        XCTAssertEqual(history.last?.attachments, [
+            .init(name: "legacy.png", kind: "image"), .init(name: "run.log", kind: "text"), .init(name: "Sources/App.swift", kind: "taggedFile")
+        ])
+        XCTAssertFalse(try String(decoding: JSONEncoder().encode(history), as: UTF8.self).contains("secret"))
+        let plain = AgentRepromptHistory.make(items: turn("one", "reply") + turn("two", "reply"), compactedAt: nil, hasActiveTurn: false)
+        XCTAssertEqual(plain.count, 2)
+        XCTAssertFalse(try String(decoding: JSONEncoder().encode(plain), as: UTF8.self).contains("attachments"))
+    }
+
+    func testAttachmentListIsBounded() {
+        let tagged = (0 ..< 30).map { AgentTaggedFileAttachment(relativePath: "file\($0).swift", displayName: "") }
+        XCTAssertEqual(AgentRepromptAttachment.list(files: [], tagged: tagged).count, AgentRepromptAttachment.limit)
+        let long = [AgentTaggedFileAttachment(relativePath: String(repeating: "é", count: 500), displayName: "")]
+        XCTAssertLessThanOrEqual(AgentRepromptAttachment.list(files: [], tagged: long)[0].name.utf8.count, 200)
+    }
+
+    func testWorstCaseEscapedNamesCostEntriesInsteadOfFailingTheRewrite() throws {
+        let quotes = String(repeating: "\"", count: 200)
+        let tagged = (0 ..< AgentRepromptAttachment.limit).map { AgentTaggedFileAttachment(relativePath: "\($0)" + quotes, displayName: "") }
+        let list = AgentRepromptAttachment.list(files: [], tagged: tagged)
+        XCTAssertGreaterThan(list.count, 0)
+        XCTAssertLessThan(list.count, AgentRepromptAttachment.limit)
+        XCTAssertLessThanOrEqual(try JSONEncoder().encode(list).count, AgentRepromptAttachment.maximumEncodedBytes)
+        XCTAssertNoThrow(try AgentRepromptService.message(for: .init(originalText: "See these", attachments: list)))
+    }
+
+    func testAttachmentNamesNeverCarryALocation() {
+        let files: [AgentFileAttachment] = [
+            .init(source: .url("https://host.example/private/report.pdf?token=SECRET"), kind: .pdf),
+            .init(source: .url("https://host.example/a%2Fsecret%2Fencoded.png")),
+            .init(source: .url("https://host.example")),
+            .init(source: .localFile(path: "/tmp/x.png"), fileName: "/Users/secret/recorded.png")
+        ]
+        let tagged = [
+            AgentTaggedFileAttachment(relativePath: "/Users/secret/absolute.swift", displayName: ""),
+            AgentTaggedFileAttachment(relativePath: "~/secret/home.swift", displayName: "")
+        ]
+        XCTAssertEqual(AgentRepromptAttachment.list(files: files, tagged: tagged).map(\.name), [
+            "report.pdf", "encoded.png", "attachment", "recorded.png", "absolute.swift", "home.swift"
+        ])
+    }
+
+    /// Fails closed: a receipt for the earlier payload cannot authorize attachment names.
+    func testEarlierDisclosureReceiptDoesNotCoverTheCurrentPayload() throws {
+        let suite = "AgentRepromptDisclosureMigration.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(true, forKey: "agentReprompt.rewriteRecipient.v3.route.recent-chat")
+        XCTAssertFalse(AgentRepromptDisclosure.isAcknowledged(providerID: "route.recent-chat", defaults: defaults))
+        AgentRepromptDisclosure.acknowledge(providerID: "route.recent-chat", defaults: defaults)
+        XCTAssertTrue(AgentRepromptDisclosure.isAcknowledged(providerID: "route.recent-chat", defaults: defaults))
+    }
+
+    func testSessionTitleOmitsPlaceholders() {
+        for placeholder in [nil, "", "  ", "New Chat", "untitled", "Agent Session", "T12"] {
+            XCTAssertNil(AgentRepromptHistory.sessionTitle(placeholder), String(describing: placeholder))
+        }
+        XCTAssertEqual(AgentRepromptHistory.sessionTitle(" CI gating "), "CI gating")
+        XCTAssertLessThanOrEqual(AgentRepromptHistory.sessionTitle(String(repeating: "x", count: 2000))?.utf8.count ?? .max, 256)
+    }
+
     func testMarkdownDiffFenceVariantsAreExcludedFromHistory() {
         for (opening, closing) in [("~~~diff", "~~~"), ("````patch", "````"), ("   ```diff", "   ```"), ("> ~~~~DIFF", "> ~~~~"), ("```patch", "")] {
             let reply = "Keep this summary.\n\(opening)\nSECRET DIFF CONTENT\n\(closing)"
@@ -50,6 +131,7 @@ final class AgentRepromptHistoryTests: XCTestCase {
         let history = AgentRepromptHistory.make(items: items, compactedAt: nil, hasActiveTurn: false)
         XCTAssertEqual(history.map(\.user), ["two", "three", "Approved rewritten words"])
         XCTAssertEqual(history.last?.assistant, "final reply")
+        XCTAssertEqual(history.last?.attachments, [.init(name: "image.png", kind: "image")])
         let serialized = String(decoding: (try? JSONEncoder().encode(history)) ?? Data(), as: UTF8.self)
         for excluded in ["secret", "SECRET", "commentary", "intermediate", "WRAPPER", "excluded reasoning"] {
             XCTAssertFalse(serialized.contains(excluded))
@@ -71,6 +153,19 @@ final class AgentRepromptHistoryTests: XCTestCase {
         XCTAssertTrue(history[0].user.hasPrefix("latest"))
     }
 
+    func testOversizedNewestExchangeIsTrimmedRatherThanLeavingNoContext() throws {
+        for fill in ["x", "\"", "é🙂"] {
+            let spec = "SPEC START " + String(repeating: fill, count: 20000) + " SPEC END"
+            let history = AgentRepromptHistory.make(items: turn("first", "reply one") + turn(spec, "reply two"), compactedAt: nil, hasActiveTurn: false)
+            XCTAssertEqual(history.count, 1, fill)
+            let kept = try XCTUnwrap(history.first)
+            XCTAssertTrue(kept.user.hasPrefix("SPEC START") && kept.user.hasSuffix("SPEC END"), fill)
+            XCTAssertEqual(kept.assistant, "reply two", fill)
+            XCTAssertLessThanOrEqual(try JSONEncoder().encode(history).count, 8 * 1024, fill)
+            XCTAssertNoThrow(try AgentRepromptService.message(for: .init(originalText: "Proceed with that", recentChat: history)), fill)
+        }
+    }
+
     func testCompactionBoundaryAndDiffsAreExcluded() {
         let boundary = Date(timeIntervalSince1970: 100)
         let before = turn("before", "before reply", at: boundary.addingTimeInterval(-10))
@@ -84,6 +179,12 @@ final class AgentRepromptHistoryTests: XCTestCase {
 
     private func turn(_ user: String, _ assistant: String, at date: Date = .now) -> [AgentChatItem] {
         [.init(timestamp: date, kind: .user, text: user), .init(timestamp: date.addingTimeInterval(0.001), kind: .assistant, text: assistant)]
+    }
+
+    private func sequenced(_ items: [AgentChatItem]) -> [AgentChatItem] {
+        items.enumerated().map { index, item in
+            .init(id: item.id, timestamp: item.timestamp, kind: item.kind, text: item.text, sequenceIndex: index)
+        }
     }
 }
 
@@ -188,10 +289,12 @@ final class AgentRepromptModelPolicyTests: XCTestCase {
         XCTAssertEqual(withoutChat.count, 3)
         let text = withChat.joined(separator: " ")
         XCTAssertLessThanOrEqual(text.split(separator: " ").count, 70, "The consent summary must not become a wall of text")
-        for fact in ["Sonnet Low", "Claude Code", "selected paths", "Never file contents", "billing", "retention", "secrets", "Auto Effort", "recent chat"] {
+        for fact in ["Sonnet Low", "Claude Code", "attachment names", "session title", "Never file contents", "billing", "retention", "secrets", "Auto Effort", "recent chat"] {
             XCTAssertTrue(text.contains(fact), "Missing consent fact: \(fact)")
         }
-        XCTAssertFalse(withoutChat.joined(separator: " ").contains("recent chat"), "Recent-chat exposure is disclosed only when enabled")
+        let bare = withoutChat.joined(separator: " ")
+        XCTAssertTrue(bare.contains("attachment names"))
+        XCTAssertFalse(bare.contains("recent chat") || bare.contains("session title"), "Conversation exposure is disclosed only when enabled")
     }
 
     func testRewriterUsesLowEffortWithoutSerialDecisionOrImplementingModelMutation() async throws {
@@ -224,11 +327,56 @@ final class AgentRepromptModelPolicyTests: XCTestCase {
         XCTAssertEqual(chosen.defaultReasoningEffort, "low")
     }
 
-    func testManifestIsCheapBoundedAndSideCallModelsExcludeAgentTransports() {
-        let manifest = AgentRepromptModelPolicy.manifest(rootNames: ["Project"], selectedPaths: (0 ..< 100).map { "file\($0).swift" })
-        XCTAssertTrue(manifest.contains("+50 more"))
-        XCTAssertLessThanOrEqual(manifest.utf8.count, 4096)
+    func testSideCallModelsIncludeDirectRoutes() {
         XCTAssertTrue(AgentRepromptModelPolicy.supportsSideCall(.gpt61SolLow))
         XCTAssertTrue(AgentRepromptModelPolicy.supportsSideCall(AgentRepromptModelPolicy.preferredClaude))
+    }
+
+    func testPreparationSendsDraftAttachmentsAndConversationButNoManifest() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.enableReprompt()
+        let body = try await preparedBody(fixture)
+        XCTAssertEqual(body["originalText"] as? String, "Look at this")
+        let attachments = try XCTUnwrap(body["attachments"] as? [[String: String]])
+        XCTAssertEqual(attachments, [["name": "shot.png", "kind": "image"], ["name": "Sources/App.swift", "kind": "taggedFile"]])
+        let chat = try XCTUnwrap(body["recentChat"] as? [[String: Any]])
+        XCTAssertEqual(chat.map { $0["user"] as? String }, ["first", "second"], "Every closed turn must reach the rewriter")
+        XCTAssertNil(body["manifest"])
+        XCTAssertEqual(fixture.viewModel.repromptUIStore.presentation?.usesChatContext, true)
+    }
+
+    func testRecentChatToggleWithholdsConversationButNotDraftAttachments() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.enableReprompt()
+        fixture.viewModel.setRepromptIncludesRecentChat(false)
+        let body = try await preparedBody(fixture)
+        XCTAssertNil(body["recentChat"])
+        XCTAssertNil(body["sessionTitle"])
+        XCTAssertNotNil(body["attachments"])
+    }
+
+    private func preparedBody(_ fixture: AgentRepromptTestFixture) async throws -> [String: Any] {
+        let items: [AgentChatItem] = [
+            .init(kind: .user, text: "first", sequenceIndex: 0), .init(kind: .assistant, text: "reply one", sequenceIndex: 1),
+            .init(kind: .user, text: "second", sequenceIndex: 2), .init(kind: .assistant, text: "reply two", sequenceIndex: 3)
+        ]
+        let session = fixture.session
+        session.items = items
+        session.transcript = AgentTranscriptIO.buildTranscript(from: items, terminalState: .completed)
+        session.pendingFileAttachments = [.init(source: .localFile(path: "/secret/shot.png"), fileName: "shot.png")]
+        session.pendingTaggedFileAttachments = [.init(relativePath: "Sources/App.swift", displayName: "App.swift")]
+        let probe = AgentRepromptStreamProbe()
+        fixture.viewModel.repromptService = .init(transport: { message, _, publish in
+            await probe.append(message.conversationMessages[0].content)
+            try await publish(AgentRepromptServiceTests.valid)
+        })
+        XCTAssertTrue(try fixture.begin(text: "Look at this"))
+        try await AsyncTestWait.waitUntil("completed preparation", timeout: 5) { fixture.viewModel.repromptOperation?.phase == .completed }
+        let values = await probe.values
+        let content = try XCTUnwrap(values.first)
+        XCTAssertFalse(content.contains("secret"), "A local path must not reach the rewriter")
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(content.utf8)) as? [String: Any])
     }
 }

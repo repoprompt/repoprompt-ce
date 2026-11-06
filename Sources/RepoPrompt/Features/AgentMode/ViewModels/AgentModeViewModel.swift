@@ -2504,7 +2504,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     var unscopedRepromptEnabled = false
     var repromptDispatchTexts: [UUID: String] = [:]
     var repromptDispatchOriginals: [UUID: String] = [:]
-    var repromptOperation: AgentRepromptOperation?
+    /// One preparation per composer tab, so a rewrite outlives a switch to another session.
+    var repromptOperations: [UUID: AgentRepromptOperation] = [:]
+    /// The preparation owned by the visible composer.
+    var repromptOperation: AgentRepromptOperation? {
+        currentTabID.flatMap { repromptOperations[$0] }
+    }
+
     var repromptSpeculations: [UUID: RepromptSpeculation] = [:]
     var repromptAudits: [UUID: AgentAutomationTurnAudit.Reprompt] = [:]
     var repromptAvailability: ((AIModel) -> Bool)?
@@ -8636,6 +8642,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // An accepted epoch belongs to this binding even if Stop won during the actor hop.
         // Retain it unconsumed for the next start; never leave the store ahead of its owner.
         guard stopFence.permitsStart(of: session), !Task.isCancelled else { return }
+        session.mcpFollowUpRunPendingUpdatedAt = Date()
         if !session.mcpFollowUpRunPending {
             session.mcpFollowUpRunPending = true
             handleObservedMCPStateChange(for: session)
@@ -8734,6 +8741,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let supersedingMaskIsStale = session.pendingSupersedingTurnCompletions > 0
                 && session.pendingSupersedingTurnCompletionsUpdatedAt.map { now.timeIntervalSince($0) > 15 } == true
             if let terminalStatus,
+               context.currentEpoch != nil,
                followUpMaskIsStale || supersedingMaskIsStale,
                session.agentTask == nil,
                session.pendingInstructions.isEmpty,
@@ -11868,6 +11876,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 )
             }
         }
+        try requireActivationOwner()
         // A new control activation owns a new launch lifecycle. Never retain review state from a
         // prior activation, including direct/source-equals-target starts that do not stage anew.
         mcpRemoveAgentRunOracleReviewContexts(sessionID: sessionID)
@@ -19231,7 +19240,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             removePendingUIRefresh(for: tabID)
         }
         if let reactivateSourceTabID, sessions[reactivateSourceTabID] != nil {
-            await promptManager?.switchComposeTab(reactivateSourceTabID)
+            await promptManager?.switchComposeTab(reactivateSourceTabID, focusIntent: .preservesLiveText)
         }
     }
 
@@ -23118,7 +23127,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         origin: AgentModeRunService.CancellationOrigin = .explicitStop
     ) async {
         guard let session = sessions[tabID] else { return }
-        if let operation = repromptOperation, operation.sourceTabID == tabID {
+        if let operation = repromptOperations[tabID] {
             operation.invalidate(reason: "The run was stopped.")
             if !session.runState.isActive {
                 return
@@ -23276,8 +23285,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         requireActiveTabOwnership: Bool
     ) -> AgentComposerSubmitClaimResult {
         let target = attempt.target
-        if requireActiveTabOwnership, let operation = repromptOperation,
-           operation.sourceTabID == target.tabID, operation.phase != .completed
+        if requireActiveTabOwnership, let operation = repromptOperations[target.tabID],
+           operation.phase != .completed
         {
             return .rejected(.activeAttemptExists(activeAttemptID: operation.id))
         }
@@ -25170,6 +25179,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     func requireSessionConfigurationAdmission(
         _ session: TabSession, creationHandle: AgentSessionCreationHandle?
     ) throws {
+        try Task.checkCancellation()
         if let creationHandle {
             guard creationHandle.session === session else { throw PersistentBindingMutationError.staleTransition }
             try requireCurrentCreationPreparation(creationHandle)
@@ -25305,6 +25315,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // synchronization and selected immediately; existing rows keep their positions (§5.4).
         if currentTabID == createdTab.id {
             updateBindingsFromSession(creation.session)
+            promptManager.requestUserComposerActivation(tabID: createdTab.id)
         }
         return createdTab.id
     }

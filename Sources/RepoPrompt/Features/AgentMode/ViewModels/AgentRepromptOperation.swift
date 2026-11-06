@@ -41,7 +41,22 @@ final class AgentRepromptOperation {
     var onClose: (() -> Void)?
     var onEdit: (() -> Void)?
     var phase: AgentRepromptUIStore.Phase {
-        store.presentation?.phase ?? .failed
+        presentation?.phase ?? .failed
+    }
+
+    private var presentation: AgentRepromptUIStore.Presentation? {
+        get { store.presentations[sourceTabID] }
+        set { store.presentations[sourceTabID] = newValue }
+    }
+
+    private var pendingQuestions: AgentAskUserPendingState? {
+        get { store.pendingQuestionsByTab[sourceTabID] }
+        set { store.pendingQuestionsByTab[sourceTabID] = newValue }
+    }
+
+    private var autoSendRequest: AgentRepromptUIStore.AutoSendRequest? {
+        get { store.autoSendRequests[sourceTabID] }
+        set { store.autoSendRequests[sourceTabID] = newValue }
     }
 
     init(
@@ -69,8 +84,8 @@ final class AgentRepromptOperation {
     }
 
     func start() {
-        guard !isClosed, store.presentation == nil else { return }
-        store.presentation = .init(
+        guard !isClosed, presentation == nil else { return }
+        presentation = .init(
             id: id,
             sourceTabID: sourceTabID,
             original: rawDraft,
@@ -106,7 +121,7 @@ final class AgentRepromptOperation {
         let revision = callRevision &+ 1
         callRevision = revision
         setPhase(request.answers == nil ? .generating : .refining)
-        store.presentation?.error = nil
+        presentation?.error = nil
         task = Task { [self] in
             do {
                 if let initialError { throw initialError }
@@ -117,7 +132,7 @@ final class AgentRepromptOperation {
                     try await race.run(seconds: service.timeoutOverride ?? AgentRepromptService.timeout(for: model.providerType)) { @MainActor [self] in
                         let effectiveModel = await chooseEffort(model)
                         guard validate(), !Task.isCancelled, revision == callRevision else { throw CancellationError() }
-                        store.presentation?.modelName = effectiveModel.displayName
+                        presentation?.modelName = effectiveModel.displayName
                         return try await service.generate(request: request, model: effectiveModel) { [weak self] body in
                             try await self?.receive(body, callRevision: revision)
                         }
@@ -136,7 +151,7 @@ final class AgentRepromptOperation {
                     let interaction = AgentAskUserInteraction(title: "Before sending", questions: result.openQuestions.map {
                         .init(id: $0.id, question: $0.question, options: $0.options.map { .init(label: $0.label, description: $0.description) })
                     })
-                    store.pendingQuestions = .init(interaction: interaction)
+                    pendingQuestions = .init(interaction: interaction)
                     setPhase(.clarifying)
                 } else { complete() }
             } catch {
@@ -147,7 +162,7 @@ final class AgentRepromptOperation {
                 pendingBody = nil
                 task = nil
                 setPhase(.failed)
-                store.presentation?.error = (error as? AgentRepromptError)?.errorDescription ?? AgentRepromptError.provider.errorDescription
+                presentation?.error = (error as? AgentRepromptError)?.errorDescription ?? AgentRepromptError.provider.errorDescription
                 store.recover(
                     tabID: sourceTabID,
                     text: lastGeneratedText,
@@ -181,7 +196,7 @@ final class AgentRepromptOperation {
         guard let generation = applyDraft(text) else { return }
         expectedDraft = text
         expectedDraftGeneration = generation
-        store.presentation?.startsWithProviderCommand = Self.startsWithProviderCommand(text)
+        presentation?.startsWithProviderCommand = Self.startsWithProviderCommand(text)
         publicationRevision &+= 1
         store.draftUpdate = .init(operationID: id, tabID: sourceTabID, revision: publicationRevision, text: text)
     }
@@ -200,9 +215,15 @@ final class AgentRepromptOperation {
         publicationTask = nil
         pendingBody = nil
         autoSendConsumed = true
-        if store.pendingQuestions != nil { store.pendingQuestions = nil }
-        if store.autoSendRequest != nil { store.autoSendRequest = nil }
-        if store.presentation?.error != nil { store.presentation?.error = nil }
+        if pendingQuestions != nil {
+            pendingQuestions = nil
+        }
+        if autoSendRequest != nil {
+            autoSendRequest = nil
+        }
+        if presentation?.error != nil {
+            presentation?.error = nil
+        }
         if phase != .completed { setPhase(.completed) }
         onEdit?()
         return true
@@ -213,22 +234,22 @@ final class AgentRepromptOperation {
               text != expectedDraft || generation != expectedDraftGeneration else { return }
         expectedDraft = text
         expectedDraftGeneration = generation
-        store.presentation?.startsWithProviderCommand = Self.startsWithProviderCommand(text)
+        presentation?.startsWithProviderCommand = Self.startsWithProviderCommand(text)
         _ = beginUserEditing()
     }
 
     func updateDraft(questionID: String, draft: AgentAskUserDraft) {
         guard validate(), phase == .clarifying else { return }
-        store.pendingQuestions?.draftsByQuestionID[questionID] = draft
+        pendingQuestions?.draftsByQuestionID[questionID] = draft
     }
 
     func setQuestionIndex(_ index: Int) {
-        guard validate(), let pending = store.pendingQuestions, pending.interaction.questions.indices.contains(index) else { return }
-        store.pendingQuestions?.currentQuestionIndex = index
+        guard validate(), let pending = pendingQuestions, pending.interaction.questions.indices.contains(index) else { return }
+        pendingQuestions?.currentQuestionIndex = index
     }
 
     func completeQuestions(skipAll: Bool = false) {
-        guard validate(), task == nil, let firstResult, let pending = store.pendingQuestions else { return }
+        guard validate(), task == nil, let firstResult, let pending = pendingQuestions else { return }
         let response = skipAll ? pending.interaction.buildSkippedResponse(elapsedSeconds: 0)
             : try? pending.interaction.buildSubmittedResponse(drafts: pending.draftsByQuestionID, elapsedSeconds: 0)
         guard let response else { return }
@@ -241,7 +262,7 @@ final class AgentRepromptOperation {
                 skipped: answer?.skipped ?? true
             )
         }
-        store.pendingQuestions = nil
+        pendingQuestions = nil
         if answers.contains(where: { !$0.skipped && ($0.selectedOption != nil || $0.customText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false) }) {
             request.answers = answers
             retry()
@@ -252,7 +273,7 @@ final class AgentRepromptOperation {
     }
 
     private func setPhase(_ phase: AgentRepromptUIStore.Phase) {
-        store.presentation?.phase = phase
+        presentation?.phase = phase
         onStateChange?()
     }
 
@@ -275,7 +296,7 @@ final class AgentRepromptOperation {
         setPhase(.completed)
         onComplete?(expectedDraft)
         if mode == .sendAutomatically, !hadQuestions, !Self.startsWithProviderCommand(expectedDraft), !isClosed {
-            store.autoSendRequest = .init(operationID: id, tabID: sourceTabID, text: expectedDraft, generation: expectedDraftGeneration)
+            autoSendRequest = .init(operationID: id, tabID: sourceTabID, text: expectedDraft, generation: expectedDraftGeneration)
         }
     }
 
@@ -291,8 +312,8 @@ final class AgentRepromptOperation {
         publicationTask?.cancel()
         publicationTask = nil
         pendingBody = nil
-        store.pendingQuestions = nil
-        store.autoSendRequest = nil
+        pendingQuestions = nil
+        autoSendRequest = nil
         usedOriginal = text == rawDraft
         install(text)
         setPhase(.completed)
@@ -314,7 +335,7 @@ final class AgentRepromptOperation {
         publicationTask?.cancel()
         publicationTask = nil
         pendingBody = nil
-        store.pendingQuestions = nil
+        pendingQuestions = nil
         usedOriginal = true
         install(rawDraft)
         setPhase(.completed)
@@ -344,9 +365,9 @@ final class AgentRepromptOperation {
         if recover { store.rememberCancelledDraft(tabID: sourceTabID, text: currentDraft()) }
         task = nil
         observations.removeAll()
-        store.pendingQuestions = nil
-        store.autoSendRequest = nil
-        store.presentation = nil
+        pendingQuestions = nil
+        autoSendRequest = nil
+        presentation = nil
         onClose?()
     }
 

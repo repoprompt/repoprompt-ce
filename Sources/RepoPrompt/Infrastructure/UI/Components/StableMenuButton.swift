@@ -484,8 +484,9 @@ final class StableMenuContextView: NSView {
     /// Returns `nil` (consuming the event) after scheduling presentation, or the
     /// event unchanged so normal dispatch continues.
     ///
-    /// Presentation is deferred one turn so the blocking `popUp` does not run inside
-    /// an event-monitor callback.
+    /// Presentation is deferred one run-loop pass so the blocking `popUp` does not
+    /// run inside an event-monitor callback. The deferral deliberately bypasses the
+    /// main dispatch queue — see `StableMenuDeferredPresentation`.
     private func handleContextClick(_ event: NSEvent) -> NSEvent? {
         let isContextClick = event.type == .rightMouseDown
             || (event.type == .leftMouseDown && event.modifierFlags.contains(.control))
@@ -503,10 +504,8 @@ final class StableMenuContextView: NSView {
         let items = itemsProvider()
         guard !items.isEmpty else { return event }
         let windowPoint = event.locationInWindow
-        DispatchQueue.main.async { [weak self] in
-            MainActor.assumeIsolated {
-                self?.present(items, at: windowPoint)
-            }
+        StableMenuDeferredPresentation.schedule { [weak self] in
+            self?.present(items, at: windowPoint)
         }
         return nil
     }
@@ -536,6 +535,29 @@ final class StableMenuContextView: NSView {
             atScreenPoint: screenPoint,
             in: window
         )
+    }
+}
+
+/// Defers a menu presentation to the next main run-loop pass **without** going
+/// through the main dispatch queue.
+///
+/// `NSMenu.popUp` runs a nested tracking run loop until the menu closes. libdispatch's
+/// main-queue drain is not re-entrant, so a popup started from a
+/// `DispatchQueue.main.async` block starves every other main-queue block — MainActor
+/// jobs, timers that hop through the queue, Sentry's hang probe — for as long as the
+/// menu stays open, which surfaced as the REPOPROMPT-16N "App Hanging" group. A
+/// `CFRunLoopPerformBlock` callback carries no such guard: the nested tracking loop
+/// keeps servicing the main queue while the menu is up.
+enum StableMenuDeferredPresentation {
+    @MainActor
+    static func schedule(_ block: @escaping @MainActor () -> Void) {
+        RunLoop.main.perform(inModes: [.common]) {
+            MainActor.assumeIsolated {
+                block()
+            }
+        }
+        // Scheduling a block does not itself wake the loop; this call does.
+        CFRunLoopWakeUp(CFRunLoopGetMain())
     }
 }
 

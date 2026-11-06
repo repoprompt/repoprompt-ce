@@ -2607,7 +2607,7 @@ class OracleViewModel: ObservableObject {
            promptViewModel.activeComposeTabID != targetTabID
         {
             isSwitchingTabsForSession = true
-            await promptViewModel.switchComposeTab(targetTabID)
+            await promptViewModel.switchComposeTab(targetTabID, focusIntent: .preservesLiveText)
             isSwitchingTabsForSession = false
         }
         guard sessionSwitchGeneration == switchGeneration else { return }
