@@ -567,6 +567,12 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             }
         }
 
+        func testActivatedTwoLaneContractWithoutSelectingWorkspaceUsesProductionAdmissionAndReturnedCalls() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                try await self.exerciseLiveDiscovery(activate: true, contractJourney: true, withoutSelectingWorkspace: true)
+            }
+        }
+
         func testBecomeOverseerRefreshesExactAgentRouteWithoutGrantDuringHeldTurn() async throws {
             try await MCPSharedServerTestLease.shared.withLease { _ in
                 try await self.exerciseLiveDiscovery(activate: true)
@@ -821,8 +827,9 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
 
         /// Serialized app ingress and native event consumption with controlled providers.
         /// Socket approval/full-access inputs are explicit test grants, never inferred from a reply.
-        private func exerciseTwoLaneContractInSelectedWorkspace(
+        private func exerciseTwoLaneContractInRoutedWorkspace(
             connection: PersistentMCPTestEndpoint, window: WindowState, observerID: UUID, workspaceID: UUID,
+            laneCreated: @MainActor (UUID) -> Void,
             controllers: @escaping @MainActor () -> [UUID: MonitorFakeNativeController]
         ) async throws {
             let settings = GlobalSettingsStore.shared
@@ -853,7 +860,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 return try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any], response.rawJSON)
             }
             let vm = window.agentModeViewModel
-            XCTAssertEqual(window.workspaceManager.activeWorkspaceID, workspaceID, "This contract requires its routed workspace to be selected")
+            XCTAssertEqual(window.workspaceManager.activeWorkspaceID, workspaceID, "This contract preserves its ordinary app-owned workspace placement")
             XCTAssertEqual(window.workspaceManager.activeWorkspace?.id, workspaceID)
             let foregroundTab = window.promptManager.activeComposeTabID
             let foregroundDraft = window.promptManager.promptText
@@ -872,6 +879,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 XCTAssertTrue(["delivered", "queued"].contains(created["first_task"] as? String ?? ""))
                 let id = try XCTUnwrap(created["session_id"] as? String)
                 let sessionID = try XCTUnwrap(UUID(uuidString: id))
+                laneCreated(sessionID)
                 let tab = try XCTUnwrap(window.workspaceManager.activeWorkspace?.composeTabs.first { $0.activeAgentSessionID == sessionID })
                 laneIDs.append(id)
                 laneTabs.append(tab.id)
@@ -982,7 +990,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
 
         private func exerciseLiveDiscovery(
             activate: Bool = false, inbound: Bool = false, originalQualificationFamilyABA: Bool = false,
-            proofMutation: ProofMutation? = nil, contractJourney: Bool = false, w0fProvider: AgentProviderKind? = nil,
+            proofMutation: ProofMutation? = nil, contractJourney: Bool = false, withoutSelectingWorkspace: Bool = false,
+            w0fProvider: AgentProviderKind? = nil,
             w2Probe: W2Probe? = nil, w3Ring: Bool = false, w3Reprompt: Bool = false, w4Display: Bool = false
         ) async throws {
             let originalFullAccess = OverseerGlobalAutoApprove.isEnabled
@@ -1039,6 +1048,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             var delayedCatalog: Task<Set<String>, Error>?
             var contractWorkspaceID: UUID?
             var contractStorageDirectory: URL?
+            var initialSystemWorkspace: WorkspaceModel?
+            var initialSystemFixtureSessions: [UUID] = []
             let registration = try await AppDomainRuntimeComposition.shared.register(window.mcpServer.windowMCPToolCatalogService)
             let cleanup: @MainActor () async -> Void = {
                 await manager.debugSetReturnedCatalogToolsForTesting(nil)
@@ -1074,6 +1085,33 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 await manager.clearClientConnectionPolicy(for: clientName, windowID: window.windowID, runID: runID)
                 await manager.cleanupRunRoutingState(for: runID, windowID: window.windowID)
                 await window.tearDown()
+                if let initialSystemWorkspace {
+                    let client = DomainWorkspaceAuthorityClient(store: AppDomainRuntimeComposition.shared.runtime.workspaceStore, windowID: window.windowID)
+                    for sessionID in initialSystemFixtureSessions {
+                        do {
+                            try await AgentSessionDataService.shared.deleteAgentSession(id: sessionID, for: initialSystemWorkspace)
+                            let remaining = try await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: initialSystemWorkspace)
+                            XCTAssertNil(remaining, "Fixture session must be removed from storage")
+                        } catch {
+                            XCTFail("Fixture session cleanup failed: \(error)")
+                        }
+                    }
+                    do {
+                        let fileURL = window.workspaceManager.workspaceFileURL(for: initialSystemWorkspace)
+                        let restored = try await client.save(initialSystemWorkspace, fileURL: fileURL, expectedWorkspaceRevision: nil, expectedContentDigest: nil)
+                        XCTAssertEqual(restored.disposition, .applied, "Restore only the pre-existing system workspace document; never delete its directory")
+                        let maybeRestoredSnapshot = await client.canonicalWorkspaceSnapshot(initialSystemWorkspace.id)
+                        let restoredSnapshot = try XCTUnwrap(maybeRestoredSnapshot)
+                        XCTAssertEqual(try Data(contentsOf: fileURL), restoredSnapshot.document.documentBytes)
+                        let decoded = try await WorkspaceFileDecodeCache.shared.documentPreparation.decode([restoredSnapshot])
+                        let restoredWorkspace = try XCTUnwrap(decoded.models[initialSystemWorkspace.id])
+                        XCTAssertEqual(restoredWorkspace.composeTabs, initialSystemWorkspace.composeTabs)
+                        XCTAssertEqual(restoredWorkspace.stashedTabs, initialSystemWorkspace.stashedTabs)
+                        XCTAssertEqual(restoredWorkspace.activeComposeTabID, initialSystemWorkspace.activeComposeTabID)
+                    } catch {
+                        XCTFail("System-workspace fixture cleanup failed: \(error)")
+                    }
+                }
                 if let contractWorkspaceID {
                     let client = DomainWorkspaceAuthorityClient(store: AppDomainRuntimeComposition.shared.runtime.workspaceStore, windowID: window.windowID)
                     let deleted = await client.delete(workspaceID: contractWorkspaceID, expectedCatalogRevision: nil, expectedWorkspaceRevision: nil)
@@ -1095,15 +1133,32 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 let targetTab = UUID()
                 let observerID = UUID()
                 let targetID = UUID()
-                var workspace = WorkspaceModel(name: "Live discovery", repoPaths: [])
-                workspace.isEphemeral = !contractJourney
-                if contractJourney {
+                var workspace: WorkspaceModel
+                if withoutSelectingWorkspace {
+                    // Use the workspace chosen by ordinary app initialization. No fixture create,
+                    // switch, activeWorkspace assignment, or workspace argument on lane creation.
+                    // Observer/chat placement is fixture-seeded in that ordinary owner.
+                    workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+                    let fixtureNames: Set = ["User-created planning chat", "Harmless idle target", "Unopened contract sentinel"]
+                    guard workspace.isSystemWorkspace,
+                          !workspace.composeTabs.contains(where: { fixtureNames.contains($0.name) }),
+                          !workspace.stashedTabs.contains(where: { fixtureNames.contains($0.tab.name) })
+                    else {
+                        throw MCPError.internalError("Expected an initialized System workspace without leftover contract fixture tabs")
+                    }
+                    initialSystemWorkspace = workspace
+                } else {
+                    workspace = WorkspaceModel(name: "Live discovery", repoPaths: [])
+                    workspace.isEphemeral = !contractJourney
+                }
+                if contractJourney, !withoutSelectingWorkspace {
                     contractStorageDirectory = window.workspaceManager.workspaceFileURL(for: workspace).deletingLastPathComponent()
                 }
-                workspace.composeTabs = [
+                let fixtureTabs = [
                     ComposeTabState(id: observerTab, name: "User-created planning chat", activeAgentSessionID: observerID),
                     ComposeTabState(id: targetTab, name: "Harmless idle target", activeAgentSessionID: targetID)
                 ]
+                workspace.composeTabs = withoutSelectingWorkspace ? workspace.composeTabs + fixtureTabs : fixtureTabs
                 if contractJourney {
                     workspace.composeTabs.append(ComposeTabState(
                         name: "Unopened contract sentinel", activeAgentSessionID: UUID(),
@@ -1113,7 +1168,11 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 workspace.activeComposeTabID = observerTab
                 // Restoration must earn both runtime readiness and owner-valid placement metadata.
                 // A fabricated loaded latch has no index row until an unrelated debounced save wins.
-                for tab in workspace.composeTabs {
+                let ownedTabs = workspace.composeTabs.filter { tab in
+                    initialSystemWorkspace?.composeTabs.contains(where: { $0.id == tab.id }) != true
+                }
+                if withoutSelectingWorkspace { initialSystemFixtureSessions = ownedTabs.compactMap(\.activeAgentSessionID) }
+                for tab in ownedTabs {
                     let payload = try AgentSession(
                         id: XCTUnwrap(tab.activeAgentSessionID), workspaceID: workspace.id,
                         composeTabID: tab.id, name: tab.name, agentKind: w0fKind.rawValue,
@@ -1123,20 +1182,26 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 }
                 if contractJourney {
                     let client = DomainWorkspaceAuthorityClient(store: AppDomainRuntimeComposition.shared.runtime.workspaceStore, windowID: window.windowID)
-                    let created = try await client.create(workspace, fileURL: window.workspaceManager.workspaceFileURL(for: workspace))
+                    let created = if withoutSelectingWorkspace {
+                        try await client.save(workspace, fileURL: window.workspaceManager.workspaceFileURL(for: workspace), expectedWorkspaceRevision: nil, expectedContentDigest: nil)
+                    } else {
+                        try await client.create(workspace, fileURL: window.workspaceManager.workspaceFileURL(for: workspace))
+                    }
                     guard created.disposition == .applied else {
                         throw MCPError.internalError("Contract workspace creation failed: \(created)")
                     }
-                    contractWorkspaceID = workspace.id
+                    if !withoutSelectingWorkspace { contractWorkspaceID = workspace.id }
                     let presentation = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
                     let refreshed = await presentation.refreshForAgentAdmission()
                     XCTAssertTrue(refreshed)
                 } else {
                     window.workspaceManager.workspaces.append(workspace)
                 }
-                let switched = await window.workspaceManager.switchWorkspace(to: workspace, saveState: false)
-                guard switched.didSwitch else {
-                    throw MCPError.internalError("Contract workspace switch failed")
+                if !withoutSelectingWorkspace {
+                    let switched = await window.workspaceManager.switchWorkspace(to: workspace, saveState: false)
+                    guard switched.didSwitch else {
+                        throw MCPError.internalError("Contract workspace switch failed")
+                    }
                 }
                 window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
                 let vm = window.agentModeViewModel
@@ -1144,7 +1209,10 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 let initialTabID = window.promptManager.activeComposeTabID
                 let initialDraft = window.promptManager.promptText
                 if contractJourney {
-                    XCTAssertEqual(initialWorkspaceID, workspace.id, "Fixture setup explicitly selects the contract workspace")
+                    XCTAssertEqual(initialWorkspaceID, workspace.id)
+                    if withoutSelectingWorkspace {
+                        XCTAssertEqual(initialWorkspaceID, initialSystemWorkspace?.id, "No workspace selection is required after ordinary app initialization")
+                    }
                     XCTAssertEqual(window.workspaceManager.activeWorkspace?.id, workspace.id)
                     XCTAssertNil(window.nsWindow, "Fixture setup routes a workspace without attaching an NSWindow")
                     // The observer represents an already-active Agent Mode session. Enter through
@@ -1255,8 +1323,9 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     XCTAssertTrue(noLinks.items.isEmpty, "Bootstrap grants no target authority")
                     let refreshed = try await provider.listTools()
                     XCTAssertTrue(refreshed.contains(MCPWindowToolName.agentSessionLink))
-                    try await exerciseTwoLaneContractInSelectedWorkspace(
+                    try await exerciseTwoLaneContractInRoutedWorkspace(
                         connection: connection, window: window, observerID: observerID, workspaceID: workspace.id,
+                        laneCreated: { if withoutSelectingWorkspace { initialSystemFixtureSessions.append($0) } },
                         controllers: { laneControllers }
                     )
                     XCTAssertEqual(window.workspaceManager.activeWorkspaceID, initialWorkspaceID)
