@@ -2173,3 +2173,186 @@ passed at **1,304/1,360 wrong-way file edges** and **54/66 cycle components**.
 This is build/index evidence, not packaging or visible-app proof. Mandatory
 staged-index commit and outgoing-range push preflights are publication gates;
 final-head hosted status is reported on the PR, not inferred from these receipts.
+
+#### M6 Round 3 measurement checkpoint (2026-11-06; in progress)
+
+Source candidate is `5b1fc7aa83b8490ff7a2747f71a303feb3767c6a`; the comparable
+incorporated-main baseline is now `5a3f112253508c972b0952a95ea9c56e90b909b0`,
+not Round 2's older main. Both checkouts were clean before this documentation
+checkpoint. The benchmark source is byte-identical. At the initial observation,
+load averages were 72.56/75.75/72.01 and M8 owned heavy test ticket
+`2d3b90d6-4c26-4d3c-9913-474ba3b4ce86`; no competing measurement was started.
+M8 has priority and is awaited, never cancelled. Exact-head normal CI, Xcode
+validation and Release Candidate `42112251102` have all completed successfully;
+this does not close the unresolved acceptance gates above.
+
+Predeclared menu protocol: ordinary arm64 Debug test builds with the same
+host/toolchain and unchanged benchmark. Finish preparation on both heads first.
+Run three independent invocations per head in A/B/B/A/A/B order (A=main,
+B=candidate); each existing test discards its own first warm-up and retains
+20 menu samples at 300 chats. Preserve all 60 retained samples per head, report
+per-run and pooled nearest-rank p95 plus median/range, against unchanged 50ms.
+Record system load/CPU and global heavy-holder observations before and during
+measurement. Admit measurement only after no other active/queued heavy jobs
+(including M8), one-minute load no greater than logical CPU count and CPU idle
+at least 80% across three observations 20 seconds apart. A new competing job
+marks that interval contaminated, not passing or quietly discarded. If a valid
+quiet interval cannot be established, report that limitation rather than label
+busy measurements quiet. No admission capacity or timeout is changed.
+
+The overseer relayed user approval for the matched visible-debug-app launch
+experiment, restricted to its needed coordinated lifecycle actions. Before any
+such action, retain this checkpoint and request the concrete lifecycle permission.
+Planned launch protocol remains two warm-ups per head then 20 retained samples
+per head in balanced A/B/B/A blocks, same prebuilt Debug configuration and
+in-memory secure-storage policy, fresh isolated profile per sample. Retain
+Startup phase window-appearance/attachment elapsed values and sampled RSS
+(separately from true peak memory), compare the unchanged 10% median budget,
+and keep invalid attempts with their reason. No compilation overlaps measurement.
+Conductor currently forwards HOME but not CFFIXED_USER_HOME; a local Foundation
+probe confirmed HOME alone still resolves the real user home. Fresh-profile
+launches therefore wait for the tooling-scope decision rather than touching the
+user's profile or changing launch semantics silently. Workspace-free scope is
+unchanged while independent review checks #1402/#1403 versus #1408.
+
+Preparation completed: baseline ticket `94293ed0-e591-4f57-9665-34c93f9ec719`
+and candidate ticket `a0a90026-e4bb-49f0-a0fb-d80d4aab6709` each executed and
+passed the one intended benchmark method. These are preparation/warm-up runs,
+not retained quiet measurements. Two subsequent three-observation quiet gates
+failed despite empty global heavy and M8 queues: first one-minute loads
+14.17/10.66/31.43 with CPU idle 24.75/61.12/11.29%; after a five-minute cooldown,
+loads 15.59/11.50/9.40 with idle 59.57/45.70/62.25%. Read-only process inspection
+showed desktop/browser/backup activity, not another conductor job. No process
+was stopped to manufacture a quiet window. Raw gate observations are retained
+locally under ignored `build/m6-round3-receipts`; no retained sample or launch
+has yet occurred.
+
+Round 3 review follow-up: the user permits matched **non-quiet** measurements
+under recorded load if bounded quiet attempts continue to fail; unrelated desktop
+and backup processes are not touched. Workspace-free app-side lane creation remains
+in #1415 under #1402, not deferred to #1408. Caller-only `CFFIXED_USER_HOME`
+forwarding and its focused regression are approved as a separate tooling commit;
+actual isolated Foundation home resolution remains a prerequisite for launches.
+
+Verified the actual archived log for exact-head CI `42112245223`, root shard 1:
+20 retained 300-chat menu samples have nearest-rank p95 **25.016875ms**, median
+**16.989354ms**, with the same **4 reads / 470 visits / 35 publications**.
+The benchmark, `AgentSessionLinkRuntimeBridge.swift`, and
+`AgentSidebarOversightMenuModels.swift` have no diff from incorporated main
+`5a3f1122`. This is passing hosted evidence against 50ms, not a claim that the
+contended local runs passed or that every transitive dependency is unchanged.
+
+The complete `Scripts/test_conductor_smoke.py` suite passes **8/8** (including the
+new caller-only home regression). The unsandboxed `make conductor-selftest` run
+passed all portable phases but failed its final local-production-installer suite:
+`test_two_consecutive_installs_keep_fingerprint_generation_and_designated_requirement`
+hit its existing 15-second fixture subprocess timeout (17 other cases passed).
+The earlier sandboxed attempt additionally lacked process-inventory permission.
+Neither complete selftest attempt is reported as passing; no real app lifecycle
+action was performed by these mocked installer tests.
+
+Tooling-only commit `e832aeb0d1502564c138ae7e43de650827fffd78` adds that single
+forwarded key and the caller-present/caller-absent regression. Commit preflight
+passed. A Foundation probe with both HOME and CFFIXED_USER_HOME set resolves the
+isolated `/tmp/rpce-1415-home-probe`; HOME alone did not. This probe is not yet
+an actual packaged-app isolation receipt, and no launch sample is claimed.
+
+Focused ticket `3d850405-4de1-4320-bcc2-6ad42a27c017` executed **2/2**, zero failures:
+- `AgentSessionLinkLiveDiscoveryTests.testActivatedTwoLaneContractWithoutSelectingWorkspaceUsesProductionAdmissionAndReturnedCalls`
+  passed in 13.463s. Ordinary app initialization supplies its System/Default
+  workspace; the variant never creates/selects/switches a workspace or assigns
+  activeWorkspace. It sets up an observer chat in that existing owner, then uses
+  serialized production MCP admission, explicitly authorized Overseer activation,
+  two `create_lane` calls with no workspace argument, controlled-provider
+  `LANE_OK` replies through the real runner, actual bare cursors and successor
+  replay, returned group-order recovery, and retirement. This is app-side
+  no-user-workspace-selection evidence, not a zero-workspace standalone backend
+  or a packaged/live-provider run. No production ownership guard changed.
+- `CodemapAutomaticSelectionGraphNativeTests.testFilesystemSiblingRootsRemainIsolatedAfterWatcherEdit`
+  passed in 1.708s with a causal gate. Hold only the edited root's background
+  graph-index catalog read. Exact presentation still returns its fresh symbol.
+  Once presentation releases its operation-owned demand, the graph generation
+  barrier returns an empty, incomplete replacement snapshot. Release the index
+  read and join its completion: the replacement symbol is present, with sibling
+  isolation and no sibling rebuild intact. The competing transition is
+  `WorkspaceCodemapPresentationCoordinator.release` →
+  `cancelCodemapArtifactDemand` → `finishCancelledCodemapArtifactDemand` →
+  `revokeReadyArtifact`, independent of background index completion. The old
+  generation fence did not join that independent work. Main replay is still
+  pending; do not yet classify the inherited status as runtime-proven.
+
+Two more quiet gates encountered priority M8 tickets `3143054f...` and
+`62f10727...`; both were awaited. Matching Debug packages were then queued for
+owned bundle paths with the same alternate-in-memory secure storage. The shared
+scheduler admitted both; at load 307.73 another M8 ticket `c3f8892f...` was waiting.
+Candidate package `df992bda...` was deliberately cancelled (exit 130, not a pass)
+to free its slots for M8. No capacity setting was changed, no M8 job cancelled,
+and none of this interval is measurement evidence.
+
+Main replay `afaa2910-fee8-422a-a5ca-bda122198bcd` executed the same held-index
+sibling-root witness against incorporated main `5a3f1122`: **1/1 passed, 1.128s**.
+Only the test patch was applied; main production code was untouched, and that
+patch was reversed afterward (clean baseline). This establishes an **inherited
+invalid test synchronization**, not an extraction-owned production regression:
+the old helper waited for an applied overlay generation, which can be the demand
+revocation, not for the independent index's replacement publication. It does not
+prove a particular native watcher scheduling order in the historical run.
+The corrected witness also asserts the held index is not already complete and
+checks the sibling build count again after index completion. No retry, timeout
+increase, or production behavior change is used as the fix.
+
+The bounded Oracle delta review found no production defect but identified test
+harness hardening: abort before mutating a non-System or leftover-fixture
+workspace; catch each session deletion failure separately so restoration still
+runs; read back restored tabs and confirm each known fixture session is absent;
+record returned lane IDs immediately for cleanup; and recheck sibling builds
+post-index. These changes are applied, with final family validation pending.
+The serialized contract uses **production socket admission with fixture-seeded
+run state**, a seeded observer/chat/model catalog and controlled provider replies.
+“No workspace argument” applies to lane creation, not subsequent explicit
+workspace administration. “Only returned cursors” describes the positive wait
+path; the separate expired-cursor adversarial probe deliberately invents a handle.
+A lost create response could leave an unrecorded lane; this fixture does not claim
+to prove crash/lost-response cleanup. Restoration occurs under the serial MCP
+test lease and restores content, not the original revision counter.
+
+Baseline isolated app package `1f7f6162-eca7-4c51-ab66-4f3ad1d4089b` completed
+successfully, including signing/layout/embedded-helper checks; it did not launch
+an app. The candidate package remains to be completed. Actual packaged home
+isolation will be checked through the app-held `.repoprompt-ce-debug-seed.lock`
+whose path is derived from `AppProfileLocations.current.homeDirectory`; no
+retained launch measurement will be accepted before that check succeeds.
+
+Final test readback uses the existing canonical snapshot decoder and compares
+saved bytes with that snapshot, restored composed/stashed tabs and active tab,
+and absence of all recorded fixture sessions. An intermediate ticket
+`627fed71...` failed compilation because the initial assertion used a private
+cache API; it ran no tests. Corrected ticket
+`124b2f9c-b491-46ff-9520-46047c9bcdd6` executed **55 cases: 51 passed, 4 opt-in
+skips, zero failures** (36 LiveDiscovery cases including skips, 19 CodeMap cases).
+The no-selection journey passed in **12.079s**, selected-workspace journey in
+**12.007s**, and held-index sibling-root witness in **0.094s**. Final lint ticket
+`698b8811-6303-4439-8844-9d9847982106` passed: **0/1946 format drift** plus strict
+SwiftLint. The main replay patch was byte-identical to the final CodeMap patch
+(SHA256 `c1104bb2d6de36200948b5cce6eb00d97d95e3130e8a99042a2224787bbc3ca6`).
+The test-only changes are commit `37744852d7eda2494308543f67229ac3f46649a6`,
+after a passing staged-index preflight. Together with tooling commit `e832aeb0d`,
+these are the new code/test commits requiring review beyond published `5b1fc7aa8`.
+M8 ticket `5148c134-1080-4e59-99b4-139a80024e23` finished at its one-hour timeout
+(exit 124); that is not our validation pass. A final bounded quiet gate observed
+no heavy holder initially, loads **6.14/5.78/5.31** and CPU idle
+**41.52/61.13/36.89%**, so it failed. M8 started another suite
+`71fa80d3-2069-4500-8300-82a50dbee3f8` during the third observation. The
+predeclared six-run A/B/B/A/A/B menu batch now waits on that suite and will label
+its measurements **non-quiet** with recorded load; no retained sample has run.
+The overseer has coordinated no further M8 heavy submissions until the matched
+menu and launch batch finishes. Subsequent ticket waits are bounded to at most
+ten minutes per call and repeated while needed, never interpreted as passes.
+
+The user-delegated publication instruction is to push these validated commits
+and this ledger now so hosted CI and independent review can proceed while M8
+finishes; merge current main only if GitHub reports a conflict. The already-created
+main bundle is retained, and the candidate bundle will be prepared after menu
+measurements to avoid another concurrent packaging admission. No visible app has
+yet been stopped or launched. Performance acceptance remains open; publication
+is not readiness, and the PR remains Draft for manual user merging only.
