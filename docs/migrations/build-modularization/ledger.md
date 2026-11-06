@@ -2605,3 +2605,76 @@ ordinary initialization supplies the System/Default owner without the user
 selecting a workspace. Zero-owner and standalone operation are deferred to
 #1408. No established destination, placement, admission or retirement ownership
 guards were removed. This does not claim completion of the broader #1408 work.
+
+### M6 semantic integration repair after main advanced (2026-11-06)
+
+The later docs-head CI run `42191967668` at `e5c48df82` exposed a **real compile
+failure in the PR-plus-current-main build**, not infrastructure: #1636 introduced
+`WorkspaceAppliedIndexFolderOrdering.swift` after the previous incorporated
+baseline and its unqualified `WorkspaceFolderRecord` no longer resolved after
+M6's extraction. Style failed as the integration aggregate. This does not
+invalidate the 11 green checks on the earlier pinned integration state, nor does
+that earlier green validate this newer base.
+
+A normal merge incorporates nine commits from main, advancing the baseline from
+`5a3f112253508c972b0952a95ea9c56e90b909b0` to
+`ba7dc2b7edd5a71a48f9f038f25fe82a8abcee1a`. It applied without textual conflicts;
+33 incoming files changed. The sole extra production repair is
+`import RepoPromptWorkspaceContext` in the new folder-ordering helper. Its sole
+production caller orders applied folder records before constructing/updating
+app `FolderViewModel`s; retaining this internal app adapter avoids adding a new
+package API to WorkspaceContext. The record and its fields already have package
+visibility. No access, authority guard, timeout or ratchet is widened.
+
+Incoming-boundary audit:
+
+| Main change | Ownership/integration result |
+| --- | --- |
+| #1636 `f52988b19` | Folder-ordering adapter remains app-private; import repaired. View-model and test imports survived the merge. |
+| #1641 `c70e13541` | Canonical locator validation cache stays in Persistence; secure open/read/hash, quota accounting and private proof ownership retained. No new WorkspaceContext dependency. |
+| #1639 `2b93111c4` | Tool-result liveness scanning remains app Agent Mode transcript policy; no moved-record dependency or new workspace authority. |
+| #1626 `b5aac786c` | Subtree-prefix reuse remains in FileSystem with its owning tests; not moved back into the app. |
+| #1583 `4dc716e08` | Start budget/expiry and binding callbacks remain app MCP/session-admission machinery, not WorkspaceContext. Updated closure signatures and existing M6 imports retained; writable-workspace and activation-owner fences retained. Its new `StoredSelection` test reference also needed a plain WorkspaceContext import in `AgentRunMCPToolServiceSteerResumeTests`. |
+| #1640 `766547af2` | Main-run-loop menu scheduling remains AppKit/UI-owned. |
+| #1637 `ba7dc2b7e` | Cancellation-independent cleanup cadence remains in Process with unchanged escalation deadlines; app cleanup comment updated. |
+| #1635 `ef178ba0a` | Large-transcript deadline diagnostic stays test-only. |
+| #1643 `d617b63ae` | Upstream version metadata and CLI version both advance to 1.9.0/build 43. |
+
+The bounded local Oracle integration review endorsed the import and app-private
+placement. Its hypothetical Explore view-model split was checked against the
+actual provider: both lookups capture the same MCP server's immutable `windowID`;
+window IDs are monotonically allocated and each window's `agentModeViewModel`
+is a `let`. Closing the window makes lookup fail rather than retargeting another
+window. No production fix was justified by that hypothetical. This local static
+review is not the outstanding independent milestone review.
+
+Maintainer-guidance check: user impact is restoring merged-source compilation;
+root cause is confirmed missing module import, with WorkspaceContext retaining
+record authority and the app retaining projection/admission ownership. The repair
+adds no persistence/state mutation or scale mechanism. Scope is normal main
+integration plus two imports (one production, one test); validation covers both products, the changed
+boundaries and style. No visible app lifecycle or new performance experiment is
+performed. Startup risk acceptance and #1408 scope disposition remain unchanged;
+old launch/menu and Release Candidate receipts retain their original SHAs and
+are not relabeled as new-baseline validation.
+
+The first focused test ticket `56a9fda2-cb7f-41ca-880b-ec066e42124a` failed
+compilation at the upstream #1583 test's `StoredSelection` reference (line 1911);
+**zero tests ran**. The second plain import fixes that same extraction-boundary
+mismatch without changing test behavior. An incoming-file scan against extracted
+package type names found no other missing-import reference: the remaining hits
+were generic nested names (`Result`, `State`, `Candidate`, `Pending`, `Snapshot`)
+or source-path strings in the TaskLocal layout guard, not moved type usages.
+
+Merged-tree validation (raw receipts in `build/m6-main-sync-receipts/`):
+
+- Both products: `46b24ce8-30ec-4a64-a3a4-c4eb6978750b`, `swift-build --product all`, **passed** (RepoPrompt and repoprompt-mcp). The subsequent test-only import does not alter either product.
+- Focused boundaries: `bb83e7ed-8cc8-43cb-ac52-83a1609069b5`, **98 passed, four opt-in skips, zero failures**, all 12 selected suites executed. Counts: steer/resume 25; start budget 6; live discovery 32 passed + 4 skips; tool-result context 4; sanitation 15; applied-index hot path 1; removed-folder rebuild 3; stable-menu deferral 2; folder ordering 3; process cancellation 2; locator maintenance 4; subtree removal 1. A 600-second waiter timeout was not a job failure; the same ticket subsequently completed successfully.
+- Final formatting: `ebc3fdf7-0954-4377-947e-b027c650f241`, **passed**, 0/1,950 files changed. Final lint: `031164bb-ce17-4665-a78c-340f1a72124b`, **passed**, 0/1,950 drift and strict SwiftLint.
+- Fresh compiler-index ratchet after coordinated compilation: **passed**, wrong-way file edges **1,304/1,360**, largest cycle components **54/66**. An earlier check during the test build reported freshness unproven; it was not counted as a pass. Final receipt: `index-ratchets-final.txt`.
+- These are focused integration receipts, not a new full-suite, release-artifact, live-MCP or launch result. Compilation still reports existing future Swift-6 warnings; those are not test failures.
+
+Publication uses the mandatory commit and push preflights and a fast-forward
+push to `wt/1401-milestone-1`; the PR remains Draft. Exact-head hosted CI is a
+separate gate after publication, not implied by these local passes. Required
+independent review remains open, including this new integration delta.

@@ -2448,12 +2448,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         var topologyChanged = false
         var dirtyFolders: [UUID: FolderViewModel] = [:]
         var removedSubtrees: [RemovedFolderSubtree] = []
-        let sortedFolders = event.upsertedFolders.sorted { lhs, rhs in
-            let lhsDepth = lhs.standardizedRelativePath.split(separator: "/").count
-            let rhsDepth = rhs.standardizedRelativePath.split(separator: "/").count
-            if lhsDepth != rhsDepth { return lhsDepth < rhsDepth }
-            return lhs.standardizedRelativePath < rhs.standardizedRelativePath
-        }
+        let sortedFolders = WorkspaceAppliedIndexFolderOrdering.sorted(event.upsertedFolders)
         for folder in sortedFolders where folder.rootID == event.rootID && !folder.standardizedRelativePath.isEmpty {
             if let outcome = handleNewFolder(record: folder, onRootFolder: targetRootVM) {
                 topologyChanged = true
