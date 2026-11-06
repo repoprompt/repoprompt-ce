@@ -4,6 +4,7 @@ import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 import RepoPromptClaudeProvider
 import RepoPromptDomainRuntime
+import RepoPromptProcess
 import XCTest
 
 private struct OwnerResolver: ClaudeCodeLaunchEnvironmentResolving {
@@ -128,6 +129,121 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
         let suppressed = await controller.shouldSuppressUserFacingStreamResult(AIStreamResult(type: "error", text: "host-abort"))
         XCTAssertTrue(suppressed)
         await controller.shutdown()
+    }
+
+    func testShutdownDeniesUnconsumedPermissionsExactlyOnce() async throws {
+        let controller = await controller()
+        let writes = OwnerWrittenLines()
+        await controller.test_installConfigurationTransport(write: { writes.append($0) })
+        try await feed(initFrame, to: controller)
+        for id in ["resolved", "pending-a", "pending-b"] {
+            try await feed([
+                "type": "control_request", "request_id": id,
+                "request": ["subtype": "can_use_tool", "tool_name": "Bash", "input": ["command": "echo fixture"]]
+            ], to: controller)
+        }
+        await controller.respondToPermissionRequest(id: "resolved", decision: .accept)
+        XCTAssertEqual(writes.count, 1)
+
+        // No listener has consumed the approval events: controller retirement must not
+        // depend on an app-side snapshot of requests that made it through the stream.
+        let events = await finish(controller)
+        let approvals = events.compactMap { event -> String? in
+            guard case let .approvalRequest(request) = event,
+                  case let .claudeControl(id) = request.requestID else { return nil }
+            return id
+        }
+        XCTAssertEqual(approvals, ["resolved", "pending-a", "pending-b"])
+        XCTAssertEqual(writes.count, 3)
+        var decisions: [String: String] = [:]
+        for index in 0 ..< writes.count {
+            let frame = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(writes.line(at: index))) as? [String: Any])
+            XCTAssertEqual(frame["type"] as? String, "control_response")
+            let envelope = try XCTUnwrap(frame["response"] as? [String: Any])
+            let id = try XCTUnwrap(envelope["request_id"] as? String)
+            let response = try XCTUnwrap(envelope["response"] as? [String: Any])
+            XCTAssertNil(try decisions.updateValue(XCTUnwrap(response["behavior"] as? String), forKey: id))
+            if id != "resolved" { XCTAssertEqual(response["interrupt"] as? Bool, true) }
+        }
+        XCTAssertEqual(decisions, ["resolved": "allow", "pending-a": "deny", "pending-b": "deny"])
+        await controller.shutdown()
+        await controller.respondToPermissionRequest(id: "pending-a", decision: .accept)
+        XCTAssertEqual(writes.count, 3, "Retirement and late decisions cannot write duplicate responses")
+    }
+
+    func testShutdownFinishesWhenPendingPermissionDenialsCannotBeWritten() async throws {
+        let controller = await controller()
+        let writes = OwnerWrittenLines()
+        await controller.test_installConfigurationTransport(write: { line in
+            writes.append(line)
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(EPIPE))
+        })
+        try await feed(initFrame, to: controller)
+        for id in ["pending-a", "pending-b"] {
+            try await feed([
+                "type": "control_request", "request_id": id,
+                "request": ["subtype": "can_use_tool", "tool_name": "Bash", "input": ["command": "echo fixture"]]
+            ], to: controller)
+        }
+        let events = await finish(controller)
+        XCTAssertEqual(events.count(where: { if case .approvalRequest = $0 { return true }
+            return false
+        }), 2)
+        XCTAssertEqual(writes.count, 2, "Every pending denial is attempted even if the pipe is already closed")
+        await controller.shutdown()
+        await controller.respondToPermissionRequest(id: "pending-a", decision: .accept)
+        XCTAssertEqual(writes.count, 2)
+    }
+
+    func testRetirementWritesDoNotBlockOnFullOrClosedPipes() throws {
+        let pipe = Pipe()
+        let reader = pipe.fileHandleForReading
+        let writer = pipe.fileHandleForWriting
+        defer { try? reader.close()
+            try? writer.close()
+        }
+        let fd = writer.fileDescriptor
+        let frame = Data("denial\n".utf8)
+        try ClaudeNativeProcessSessionController.writeRetirementFrame(frame, to: fd)
+        XCTAssertEqual(try reader.read(upToCount: frame.count), frame)
+
+        let flags = fcntl(fd, F_GETFL)
+        XCTAssertNotEqual(flags & O_NONBLOCK, 0)
+        let buffer = Data(repeating: 0x61, count: 4096)
+        while buffer.withUnsafeBytes({ Darwin.write(fd, $0.baseAddress, $0.count) }) > 0 {}
+        XCTAssertEqual(errno, EAGAIN)
+        XCTAssertNotEqual(fcntl(fd, F_SETFL, flags & ~O_NONBLOCK), -1)
+        let finished = expectation(description: "Retirement does not wait for a child to drain stdin")
+        DispatchQueue.global().async {
+            do {
+                try ClaudeNativeProcessSessionController.writeRetirementFrame(frame, to: fd)
+                XCTFail("A full stdin pipe cannot accept a retirement frame")
+            } catch {
+                XCTAssertEqual(error as? FDWriteError, .system(errno: EAGAIN))
+            }
+            finished.fulfill()
+        }
+        wait(for: [finished], timeout: 2)
+
+        try reader.close()
+        XCTAssertThrowsError(try ClaudeNativeProcessSessionController.writeRetirementFrame(frame, to: fd)) {
+            XCTAssertEqual($0 as? FDWriteError, .brokenPipe(errno: EPIPE))
+        }
+    }
+
+    func testEOFDiscardsPermissionsBeforeLateDecisions() async throws {
+        let controller = await controller()
+        let writes = OwnerWrittenLines()
+        await controller.test_installConfigurationTransport(write: { writes.append($0) })
+        try await feed(initFrame, to: controller)
+        try await feed([
+            "type": "control_request", "request_id": "retired",
+            "request": ["subtype": "can_use_tool", "tool_name": "Bash", "input": ["command": "echo fixture"]]
+        ], to: controller)
+        await controller.test_handleStdoutEOF()
+        await controller.respondToPermissionRequest(id: "retired", decision: .accept)
+        await controller.shutdown()
+        XCTAssertEqual(writes.count, 0, "An EOF-retired request cannot authorize work or leak into a later process")
     }
 
     private func controller(fallback: TimeInterval = 1) async -> ClaudeNativeProcessSessionController {

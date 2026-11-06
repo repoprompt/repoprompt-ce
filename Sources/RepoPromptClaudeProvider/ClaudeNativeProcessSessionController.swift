@@ -76,6 +76,7 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
     #if DEBUG
         private var configurationTestControlRequest: (@Sendable ([String: Any]) async throws -> [String: Any])?
         private var configurationTestWrite: (@Sendable (Data) throws -> Void)?
+        private var configurationTestInputClosed = false
         private var configurationTestBeforeApplicationErrorReturn: (@Sendable () async -> Void)?
         private var configurationTestBeforeProofSend: (@Sendable () async -> Void)?
     #endif
@@ -205,6 +206,9 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
     }
 
     private func closeOutputChannelsAndInput() {
+        #if DEBUG
+            configurationTestInputClosed = true
+        #endif
         stdoutChunkChannel?.finish()
         stderrChunkChannel?.finish()
         stdoutConsumerTask?.cancel()
@@ -583,26 +587,25 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
     }
 
     package func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) async {
-        guard let pending = pendingPermissionRequests.removeValue(forKey: id) else {
-            return
-        }
         do {
-            let response = permissionResponsePayload(decision: decision, pendingRequest: pending.request)
-            writeRawEventLogRecord(kind: "approval.response.sent", payload: [
-                "requestID": id,
-                "decision": String(describing: decision),
-                "response": response
-            ] as [String: Any])
-            let encoded = try ClaudeSDKProtocolCodec.encodeControlResponseSuccess(
-                requestID: id,
-                response: response
-            )
-            try sendLine(encoded, shutdownOnFailure: false)
+            try sendPermissionResponse(id: id, decision: decision)
         } catch {
             await failProtocolAndShutdown(
                 message: "Failed to submit Claude approval decision: \(error.localizedDescription)"
             )
         }
+    }
+
+    private func sendPermissionResponse(id: String, decision: AgentApprovalDecision) throws {
+        guard let pending = pendingPermissionRequests.removeValue(forKey: id) else { return }
+        let response = permissionResponsePayload(decision: decision, pendingRequest: pending.request)
+        writeRawEventLogRecord(kind: "approval.response.sent", payload: [
+            "requestID": id,
+            "decision": String(describing: decision),
+            "response": response
+        ] as [String: Any])
+        let encoded = try ClaudeSDKProtocolCodec.encodeControlResponseSuccess(requestID: id, response: response)
+        try sendLine(encoded, shutdownOnFailure: false)
     }
 
     package func shutdown() async {
@@ -613,7 +616,13 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
         writeRawEventLogRecord(kind: "session.shutdown")
 
         failPendingControlRequests(with: ControllerError.processNotRunning)
-        pendingPermissionRequests.removeAll()
+        // The app listener may not have consumed an approval emitted just before
+        // retirement. Deny from the authoritative controller state before closing
+        // stdin, without suspending or relying on the listener's pending-ID snapshot.
+        // A broken transport must not prevent the remaining shutdown cleanup.
+        for id in Array(pendingPermissionRequests.keys) {
+            try? sendPermissionResponse(id: id, decision: .cancel)
+        }
         cancelAuthoritativeLifecycleState()
         clearTurnIDQueue()
 
@@ -628,6 +637,7 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
             )
         }
         await clearExpectedAgentPIDIfNeeded()
+        pendingPermissionRequests.removeAll()
         process = nil
         activeLaunchEnvironmentSignature = nil
         isInitialized = false
@@ -664,6 +674,7 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
         guard process == nil else { return }
         try ProviderProcessLaunchPolicy.check()
 
+        pendingPermissionRequests.removeAll()
         configurationLifetime = UUID()
         appliedConfigurationProof = nil
         latestFlagSettingsIntentGeneration = 0
@@ -983,6 +994,7 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
     private func sendLine(_ lineData: Data, shutdownOnFailure: Bool = true) throws {
         #if DEBUG
             if let configurationTestWrite {
+                guard !configurationTestInputClosed else { throw ControllerError.processNotRunning }
                 try configurationTestWrite(lineData)
                 return
             }
@@ -997,7 +1009,11 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
             // be split if the pipe reader consumes data between them.
             var frame = lineData
             frame.append(0x0A)
-            try process.stdin?.write(contentsOf: frame)
+            if isShuttingDown, let input = process.stdin {
+                try Self.writeRetirementFrame(frame, to: input.fileDescriptor)
+            } else {
+                try process.stdin?.write(contentsOf: frame)
+            }
         } catch {
             // Stdin is broken — the process is dead or dying. Schedule teardown so the
             // child process doesn't linger (mirrors Codex's terminateTransport behavior).
@@ -1009,6 +1025,17 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
             }
             throw ControllerError.inputWriteFailed(error.localizedDescription)
         }
+    }
+
+    /// Retirement is best effort: a child that stopped reading must not hold up
+    /// termination/reaping. The descriptor is closed immediately after these writes.
+    package nonisolated static func writeRetirementFrame(_ frame: Data, to fd: Int32) throws {
+        let flags = fcntl(fd, F_GETFL)
+        guard flags >= 0,
+              fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1,
+              fcntl(fd, F_SETNOSIGPIPE, 1) != -1
+        else { throw FDWriteError.system(errno: errno) }
+        try FDWriteSupport.writeAll(frame, to: fd)
     }
 
     private func startStdoutReader(handle: FileHandle) throws {
@@ -1937,6 +1964,8 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
             requestedConfiguration = nil
             initialFlagSettingsRequest = nil
             isShuttingDown = false
+            configurationTestInputClosed = false
+            pendingPermissionRequests.removeAll()
             clearTurnIDQueue()
             isInitialized = initialized
             hasCompletedInitialFlagSettings = initialized
@@ -2080,6 +2109,7 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
     }
 
     private func handleControlRequest(_ request: ClaudeSDKProtocolCodec.ControlRequest) {
+        guard !isShuttingDown else { return }
         // Tool/interaction intent remains activity even when existing policy auto-approves it,
         // cannot build a UI approval, or rejects an unknown subtype. Authority is unchanged.
         emitSemanticUncertainty("Provider control request")
@@ -2219,6 +2249,7 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
 
     private func handleStdoutEOF() async {
         guard !isShuttingDown else { return }
+        pendingPermissionRequests.removeAll()
         writeRawEventLogRecord(kind: "process.stdoutEOF")
         var remainingLines: [Data] = []
         stdoutFramer.flush { line in
