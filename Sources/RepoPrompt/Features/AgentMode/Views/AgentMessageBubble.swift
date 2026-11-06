@@ -238,6 +238,7 @@ struct AgentTranscriptRowInputs: Equatable {
 
 @MainActor
 struct AgentTranscriptRow: View, @MainActor Equatable {
+    @Environment(\.handoffOmittedImageCount) private var omittedHandoffImageCount
     let inputs: AgentTranscriptRowInputs
     let agentModeVM: AgentModeViewModel
     let promptManager: PromptViewModel
@@ -306,7 +307,9 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
                 guard let vm = agentModeVM else { return }
                 try await vm.prepareHandoffToNewTab(
                     upToItemID: itemID, destinationAgent: selection.agent,
-                    destinationModelRaw: selection.modelRaw, destinationReasoningEffortRaw: selection.reasoningEffortRaw
+                    destinationModelRaw: selection.modelRaw, destinationReasoningEffortRaw: selection.reasoningEffortRaw,
+                    missingImagePolicy: .omitMissingImagesForHumanHandoff,
+                    onImagesOmitted: { omittedHandoffImageCount.wrappedValue = $0 }
                 )
             }
         )
