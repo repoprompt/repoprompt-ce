@@ -950,7 +950,7 @@ print_matches "ambient UserDefaults.standard in an M8 provider or contract targe
     Sources/RepoPromptACPProviders Sources/RepoPromptHTTPProviders --include='*.swift'
 # These consumers use NativeAgentRuntimeControlling; construction stays elsewhere.
 print_matches "concrete provider import in a neutral native runtime consumer" \
-  grep -n -E 'import[[:space:]]+RepoPrompt(ClaudeProvider|CodexProvider|ACPProviders|HTTPProviders)([[:space:].]|$)' \
+  grep -n -E 'import[[:space:]]+RepoPrompt(ClaudeProvider|ClaudeCompatibleProvider|CodexProvider|ACPProviders|HTTPProviders)([[:space:].]|$)' \
     Sources/RepoPrompt/Features/AgentMode/Runtime/Runners/ClaudeIntegratedAgentModeRunner.swift \
     Sources/RepoPrompt/Features/AgentMode/Runtime/Claude/ClaudeControllerEventListener.swift
 

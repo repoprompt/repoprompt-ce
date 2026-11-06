@@ -86,7 +86,7 @@ class M8ProviderGuardTests(unittest.TestCase):
         cases = [(f"Sources/{target}/Policy.swift", "let defaults = UserDefaults.standard", 1)
                  for target in targets]
         cases += [(path, f"import {target}", 1) for path in consumers
-                  for target in targets[2:]]
+                  for target in (*targets[2:], "RepoPromptClaudeCompatibleProvider")]
         cases += [(path, "import RepoPromptAgentProviderContracts", 0) for path in consumers]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

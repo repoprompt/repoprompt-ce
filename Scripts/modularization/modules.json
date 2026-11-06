@@ -434,6 +434,64 @@
     }
   },
   "moved_families": {
+    "M8RetiredRepoPromptACPProviders": {
+      "owner": "RepoPromptACPProviders",
+      "former_app_files": [
+        "Sources/RepoPrompt/Features/AgentMode/Models/ModelSelection/AgentACPModelRegistry.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Antigravity/AntigravityACPAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Antigravity/AntigravityACPModelPollingService.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Cursor/CursorACPAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Cursor/CursorACPEventNormalizer.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Cursor/CursorACPHeadlessAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Cursor/CursorACPLaunchResolver.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Cursor/CursorACPModelPollingService.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Cursor/CursorAgentConfig.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Cursor/CursorCLIProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Devin/DevinACPAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Devin/DevinACPLaunchResolver.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Devin/DevinAgentConfig.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Devin/DevinModelCatalog.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuild/GrokBuildACPAgentProvider+DirectModels.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuild/GrokBuildACPAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuild/GrokBuildACPEventNormalizer.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuild/GrokBuildACPLaunchResolver.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuild/GrokBuildACPModelPollingService.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuild/GrokBuildAgentConfig.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuild/GrokBuildDirectEffortWireState.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenCode/OpenCodeACPHeadlessAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenCode/OpenCodeACPLaunchResolver.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenCode/OpenCodeACPModelPollingService.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenCode/OpenCodeAgentConfig.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenCode/OpenCodeCLIProvider.swift"
+      ]
+    },
+    "M8RetiredRepoPromptAIContracts": {
+      "owner": "RepoPromptAIContracts",
+      "former_app_files": [
+        "Sources/RepoPrompt/Features/AgentMode/Runtime/ProviderBindings/AgentProviderBindingID.swift"
+      ]
+    },
+    "M8RetiredRepoPromptAgentProviderContracts": {
+      "owner": "RepoPromptAgentProviderContracts",
+      "former_app_files": [
+        "Sources/RepoPrompt/Features/AgentMode/Providers/HeadlessAgentProvider.swift"
+      ]
+    },
+    "M8RetiredRepoPromptClaudeProvider": {
+      "owner": "RepoPromptClaudeProvider",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCLITextStreamDecoder.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCodeAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCodeProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeResultMessage.swift"
+      ]
+    },
+    "M8RetiredRepoPromptHTTPProviders": {
+      "owner": "RepoPromptHTTPProviders",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenAIResponseModeParameters.swift"
+      ]
+    },
     "GrokBuildAndDevinConsumerExecution": {
       "owner": "RepoPromptACPProviders",
       "former_app_files": [
