@@ -472,7 +472,15 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
         try await assertBackgroundCatalogChange(.workspaceSwitch)
     }
 
-    private enum BackgroundCatalogChange { case unrelatedChatDeletion, sameWorkspaceLoad, workspaceSwitch }
+    func testBackgroundWindowCleanupPreservesOtherWindowWithoutActiveChat() async throws {
+        try await assertBackgroundCatalogChange(.otherWindowWithoutChat)
+    }
+
+    func testBackgroundWindowCleanupPreservesOtherWindowWithActiveChat() async throws {
+        try await assertBackgroundCatalogChange(.otherWindowWithChat)
+    }
+
+    private enum BackgroundCatalogChange { case unrelatedChatDeletion, sameWorkspaceLoad, workspaceSwitch, otherWindowWithoutChat, otherWindowWithChat }
 
     private func assertBackgroundCatalogChange(_ change: BackgroundCatalogChange) async throws {
         let fixture = try await AgentRunMCPControlledSessionContext.make(
@@ -555,7 +563,7 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
         let queries = try XCTUnwrap(registry.snapshot(for: owner).invocations.first?.queries)
         XCTAssertEqual(queries.count, 2)
         if change == .workspaceSwitch {
-            let switchProvider = ChatWorkspaceSwitchSessionProvider(workspaceManager: window.workspaceManager, oracleViewModel: oracle)
+            let switchProvider = AgentModeWorkspaceSwitchSessionProvider(agentModeViewModel: window.agentModeViewModel)
             await switchProvider.cancelSwitchSessions()
             XCTAssertTrue(registry.admissionIsClosed(for: owner))
             XCTAssertTrue(registry.isDrained(owner), "Workspace cancellation must join the accepted group before replacing its catalog")
@@ -585,13 +593,59 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
             return
         }
         let generation = oracle.workspaceChatSessionLoadGenerationForTesting
-        if change == .unrelatedChatDeletion {
+        if change == .otherWindowWithoutChat || change == .otherWindowWithChat {
+            let departing = WindowStateCompositionFactory.make(
+                windowID: -9327, deferredInitialAgentSystemWorkspaceRefresh: true,
+                sharedMCPService: MCPService(), loadStoredAPISettingsDataOnInit: false,
+                automaticProviderModelDiscoveryEnabled: false
+            )
+            await departing.workspaceManager.awaitInitialized()
+            defer { departing.workspaceManager.prepareForWindowClose() }
+            departing.workspaceManager.activeWorkspace = window.workspaceManager.activeWorkspace
+            let departingOwner = OracleBackgroundInvocationRegistry.Owner(workspaceID: workspaceID, binding: .init(tabID: UUID(), sessionID: UUID()))
+            let departingSession = AgentTabSession(tabID: departingOwner.binding.tabID)
+            departingSession.installPersistentSessionBinding(departingOwner.binding)
+            departingSession.oracleBackgroundOwner = departingOwner
+            departing.agentModeViewModel.test_installLiveSession(departingSession)
+            let controlled = AsyncThrowingStream<Int, Error>.makeStream()
+            let cleanupGate = OracleFoundationGate()
+            let cleanupStarted = expectation(description: "departing worker cleanup started")
+            defer { controlled.continuation.finish()
+                cleanupGate.release()
+            }
+            let departingReference = try await registry.start(owner: departingOwner, runID: UUID(), invocationID: UUID(), admissionIsCurrent: { true }) { job in
+                try await job.prepared(self.registryPrepared(job))
+                do { for try await _ in controlled.stream {} } catch {}
+                cleanupStarted.fulfill()
+                await cleanupGate.wait()
+            }
+            addTeardownBlock { @MainActor in
+                await registry.close(departingOwner).value
+                try registry.remove(departingOwner)
+            }
+            if change == .otherWindowWithChat { departing.workspaceManager.isChatBusy = true }
+            var cleanupReturned = false
+            let cleanup = Task { @MainActor in
+                await departing.workspaceManager.cancelActiveSessions()
+                cleanupReturned = true
+            }
+            await fulfillment(of: [cleanupStarted], timeout: 3)
+            XCTAssertFalse(cleanupReturned, "Window cleanup must join the accepted worker, not only request cancellation")
+            cleanupGate.release()
+            await cleanup.value
+            XCTAssertTrue(registry.admissionIsClosed(for: departingOwner))
+            XCTAssertTrue(registry.isDrained(departingOwner), "Departing window must join its exact owner, even with an idle parent")
+            XCTAssertFalse(registry.admissionIsClosed(for: owner), "Another window's owner must remain open")
+            XCTAssertNotEqual(departingReference.groupID, reference.groupID)
+        } else if change == .unrelatedChatDeletion {
             await oracle.deleteSession(unrelated)
             XCTAssertFalse(oracle.sessions.contains { $0.id == unrelated.id })
         } else {
             await oracle.loadSessionsFromWorkspace()
         }
-        XCTAssertGreaterThan(oracle.workspaceChatSessionLoadGenerationForTesting, generation)
+        if change == .unrelatedChatDeletion || change == .sameWorkspaceLoad {
+            XCTAssertGreaterThan(oracle.workspaceChatSessionLoadGenerationForTesting, generation)
+        }
         for query in queries.values {
             XCTAssertEqual(oracle.activeQueryId(for: query.sessionID), query.queryID)
             XCTAssertTrue(oracle.backgroundOracleQueryIsCurrent(query), "Catalog refresh must not revoke an unrelated exact query")
