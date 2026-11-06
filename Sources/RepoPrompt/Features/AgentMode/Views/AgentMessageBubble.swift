@@ -206,6 +206,160 @@ struct CodexManagedLoginAction {
     let deviceCode: (@MainActor @escaping @Sendable (CodexManagedChatgptDeviceCode, Bool) -> Void) async throws -> Bool
 }
 
+/// Value inputs at the transcript row boundary. Actions are constructed from these values and
+/// the compared owners below, rather than passing incomparable render-time closures through equality.
+struct AgentTranscriptRowInputs: Equatable {
+    let item: AgentChatItem
+    let isMostRecentEditBubble: Bool
+    let windowID: Int
+    let workspaceID: UUID?
+    let tabID: UUID?
+    let suppressAskUserTranscriptUI: Bool
+    let activeContextBuilderCallID: UUID?
+    let activeContextBuilderResultID: UUID?
+    let rawToolResultPayload: String?
+    let rawToolResultPayloadRenderRevision: Int
+    let cancelRunID: UUID?
+    let runInteraction: AgentRunInteractionUISnapshot
+    let runtimeFooter: AgentMessageRuntimeFooter?
+    let autoExpandEnabled: Bool
+    let liveBashExecutionByItemID: [UUID: AgentModeViewModel.BashLiveExecutionState]
+    let recentAssistantItemIDs: Set<UUID>
+    let approvalVisible: Bool
+}
+
+@MainActor
+struct AgentTranscriptRow: View, @MainActor Equatable {
+    let inputs: AgentTranscriptRowInputs
+    let agentModeVM: AgentModeViewModel
+    let promptManager: PromptViewModel
+    let contextBuilderAgentVM: ContextBuilderAgentViewModel
+    let codexManagedLoginAction: CodexManagedLoginAction?
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.inputs == rhs.inputs
+            && lhs.agentModeVM === rhs.agentModeVM
+            && lhs.promptManager === rhs.promptManager
+            && lhs.contextBuilderAgentVM === rhs.contextBuilderAgentVM
+            // Login callbacks are opaque. Such rows always refresh, never compare callbacks away.
+            && lhs.codexManagedLoginAction == nil && rhs.codexManagedLoginAction == nil
+    }
+
+    var body: some View {
+        let cancelAction: (() -> Void)? = inputs.cancelRunID.map { runID in
+            { [weak agentModeVM] in agentModeVM?.cancelActiveToolsForRun(runID: runID, reason: "tool_card_header_cancel") }
+        }
+        AgentMessageBubble(
+            item: inputs.item,
+            isMostRecentEditBubble: inputs.isMostRecentEditBubble,
+            windowID: inputs.windowID,
+            currentWorkspaceID: inputs.workspaceID,
+            currentTabID: inputs.tabID,
+            suppressAskUserTranscriptUI: inputs.suppressAskUserTranscriptUI,
+            contextBuilderContext: .init(
+                tabID: inputs.tabID, contextBuilderAgentVM: contextBuilderAgentVM,
+                activeContextBuilderCallItemID: inputs.activeContextBuilderCallID,
+                activeContextBuilderResultItemID: inputs.activeContextBuilderResultID,
+                oracleOpenContext: .init(windowID: inputs.windowID, workspaceID: inputs.workspaceID, tabID: inputs.tabID),
+                showRunScopedToolCancel: inputs.cancelRunID != nil, cancelActiveToolsAction: cancelAction
+            ),
+            promptManager: promptManager,
+            handoffConfig: inputs.runInteraction.canForkCurrentSession ? handoffConfig : nil,
+            rawToolResultPayload: inputs.rawToolResultPayload,
+            rawToolResultPayloadRenderRevision: inputs.rawToolResultPayloadRenderRevision,
+            showRunScopedToolCancel: inputs.cancelRunID != nil,
+            cancelActiveToolsAction: cancelAction,
+            codexManagedLoginAction: codexManagedLoginAction,
+            recentAssistantItemIDs: inputs.recentAssistantItemIDs,
+            runtimeFooter: inputs.runtimeFooter
+        )
+        #if DEBUG
+        .environment(\.agentTranscriptProbeRowID, inputs.item.id)
+        #endif
+        .environment(\.markdownFileLinkOpener, MarkdownFileLinkOpener { target in
+            await promptManager.fileManager.openFileForMarkdownLink(target)
+        })
+        .environment(\.agentToolCardAutoExpandEnabled, inputs.autoExpandEnabled)
+        .environment(\.agentLiveBashExecutionByItemID, inputs.liveBashExecutionByItemID)
+        .environment(\.agentApprovalVisible, inputs.approvalVisible)
+    }
+
+    var handoffConfig: AgentHandoffConfig {
+        let itemID = inputs.item.id
+        return AgentHandoffConfig(
+            itemID: itemID,
+            defaultDestinationAgent: inputs.runInteraction.selectedAgent,
+            defaultModelRaw: inputs.runInteraction.selectedModelRaw,
+            defaultReasoningEffortRaw: inputs.runInteraction.selectedReasoningEffortRaw,
+            availableAgentsProvider: { [weak agentModeVM] in agentModeVM?.availableAgents ?? [] },
+            modelOptionsProvider: { [weak agentModeVM] agent in agentModeVM?.modelOptions(for: agent) ?? [] },
+            windowID: inputs.windowID,
+            buildPayloadForClipboard: { [weak agentModeVM] in await agentModeVM?.buildHandoffPayload(upToItemID: itemID) ?? "" },
+            performHandoff: { [weak agentModeVM] selection in
+                guard let vm = agentModeVM else { return }
+                try await vm.prepareHandoffToNewTab(
+                    upToItemID: itemID, destinationAgent: selection.agent,
+                    destinationModelRaw: selection.modelRaw, destinationReasoningEffortRaw: selection.reasoningEffortRaw
+                )
+            }
+        )
+    }
+}
+
+/// Reads the navigation callback only for attributed rows. Keeping this dynamic environment
+/// dependency at its consumer lets unchanged transcript bubbles remain behind row equality.
+@MainActor
+private struct AgentCrossSessionAttributionBadge: View {
+    let attribution: AgentCrossSessionAttribution
+    let fontPreset: FontScalePreset
+    @Environment(\.navigateToLoadedAgentSession) private var navigateToLoadedAgentSession
+    @State private var isOpeningAttributionSource = false
+
+    /// Marks a user row that another Agent session delivered through a user-granted oversight link.
+    ///
+    /// The name is the sender's name captured at delivery time, never re-resolved, so the badge stays
+    /// truthful after that session is renamed or closed. The full source UUID lives in the tooltip and
+    /// accessibility text rather than the label, which would otherwise dominate the bubble.
+    var body: some View {
+        let name = attribution.sourceName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayName = (name?.isEmpty == false)
+            ? name!
+            : AgentMonitorSessionIDFormatter.short(attribution.sourceSessionID)
+        let label = "From \(displayName)"
+        let detail = "Sent by overseeing session \(attribution.sourceSessionID.uuidString) through an oversight link."
+
+        Button {
+            guard !isOpeningAttributionSource else { return }
+            isOpeningAttributionSource = true
+            Task {
+                defer { isOpeningAttributionSource = false }
+                await navigateToLoadedAgentSession(attribution.sourceSessionID)
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "eye.fill")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                Text(label)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
+                    .lineLimit(1)
+            }
+            .foregroundColor(.purple)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(Color.purple.opacity(0.15))
+            .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            (hovering ? NSCursor.pointingHand : NSCursor.arrow).set()
+        }
+        .onDisappear { NSCursor.arrow.set() }
+        .hoverTooltip(detail)
+        .accessibilityLabel(Text(label))
+        .accessibilityHint(Text(detail))
+    }
+}
+
 /// A bubble view for displaying agent chat items (user, assistant, tool calls, etc.)
 @MainActor
 struct AgentMessageBubble: View {
@@ -223,12 +377,10 @@ struct AgentMessageBubble: View {
     let showRunScopedToolCancel: Bool
     let cancelActiveToolsAction: (() -> Void)?
     let codexManagedLoginAction: CodexManagedLoginAction?
-    @Environment(\.navigateToLoadedAgentSession) private var navigateToLoadedAgentSession
     @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.agentRecentAssistantItemIDs) private var recentAssistantItemIDs
-    @Environment(\.agentMessageRuntimeFooterByItemID) private var runtimeFooterByItemID
+    private let recentAssistantItemIDs: Set<UUID>
+    private let runtimeFooter: AgentMessageRuntimeFooter?
     @ObservedObject private var fontScale = FontScaleManager.shared
-    @State private var isOpeningAttributionSource = false
     @State private var activeCodexManagedLoginFlow: CodexManagedLoginFlow?
     @State private var codexManagedLoginOperationID: UUID?
     @State private var codexManagedLoginFeedback: String?
@@ -253,7 +405,9 @@ struct AgentMessageBubble: View {
         rawToolResultPayloadRenderRevision: Int = 0,
         showRunScopedToolCancel: Bool = false,
         cancelActiveToolsAction: (() -> Void)? = nil,
-        codexManagedLoginAction: CodexManagedLoginAction? = nil
+        codexManagedLoginAction: CodexManagedLoginAction? = nil,
+        recentAssistantItemIDs: Set<UUID> = [],
+        runtimeFooter: AgentMessageRuntimeFooter? = nil
     ) {
         self.item = item
         self.isMostRecentEditBubble = isMostRecentEditBubble
@@ -269,10 +423,8 @@ struct AgentMessageBubble: View {
         self.showRunScopedToolCancel = showRunScopedToolCancel
         self.cancelActiveToolsAction = cancelActiveToolsAction
         self.codexManagedLoginAction = codexManagedLoginAction
-    }
-
-    private var runtimeFooter: AgentMessageRuntimeFooter? {
-        runtimeFooterByItemID[item.id]
+        self.recentAssistantItemIDs = recentAssistantItemIDs
+        self.runtimeFooter = runtimeFooter
     }
 
     private var normalizedToolName: String? {
@@ -384,7 +536,7 @@ struct AgentMessageBubble: View {
                     if item.codexGoalMode != nil || item.workflow != nil || item.crossSessionAttribution != nil {
                         HStack(spacing: 6) {
                             if let attribution = item.crossSessionAttribution {
-                                crossSessionAttributionBadge(attribution)
+                                AgentCrossSessionAttributionBadge(attribution: attribution, fontPreset: fontPreset)
                             }
                             if let codexGoalMode = item.codexGoalMode {
                                 codexGoalModeBadge(codexGoalMode, hasWorkflow: item.workflow != nil)
@@ -450,50 +602,6 @@ struct AgentMessageBubble: View {
         .hoverTooltip(tooltip)
         .accessibilityLabel(Text(labelText))
         .accessibilityHint(Text(tooltip))
-    }
-
-    /// Marks a user row that another Agent session delivered through a user-granted oversight link.
-    ///
-    /// The name is the sender's name captured at delivery time, never re-resolved, so the badge stays
-    /// truthful after that session is renamed or closed. The full source UUID lives in the tooltip and
-    /// accessibility text rather than the label, which would otherwise dominate the bubble.
-    private func crossSessionAttributionBadge(_ attribution: AgentCrossSessionAttribution) -> some View {
-        let name = attribution.sourceName?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let displayName = (name?.isEmpty == false)
-            ? name!
-            : AgentMonitorSessionIDFormatter.short(attribution.sourceSessionID)
-        let label = "From \(displayName)"
-        let detail = "Sent by overseeing session \(attribution.sourceSessionID.uuidString) through an oversight link."
-
-        return Button {
-            guard !isOpeningAttributionSource else { return }
-            isOpeningAttributionSource = true
-            Task {
-                defer { isOpeningAttributionSource = false }
-                await navigateToLoadedAgentSession(attribution.sourceSessionID)
-            }
-        } label: {
-            HStack(spacing: 4) {
-                Image(systemName: "eye.fill")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
-                Text(label)
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
-                    .lineLimit(1)
-            }
-            .foregroundColor(.purple)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .background(Color.purple.opacity(0.15))
-            .clipShape(Capsule())
-        }
-        .buttonStyle(.plain)
-        .onHover { hovering in
-            (hovering ? NSCursor.pointingHand : NSCursor.arrow).set()
-        }
-        .onDisappear { NSCursor.arrow.set() }
-        .hoverTooltip(detail)
-        .accessibilityLabel(Text(label))
-        .accessibilityHint(Text(detail))
     }
 
     private func workflowBadge(_ workflow: AgentWorkflowDefinition) -> some View {
@@ -882,7 +990,7 @@ struct AgentMessageBubble: View {
             } else {
                 HStack(spacing: 6) {
                     if let attribution = item.crossSessionAttribution {
-                        crossSessionAttributionBadge(attribution)
+                        AgentCrossSessionAttributionBadge(attribution: attribution, fontPreset: fontPreset)
                     }
                     Text(verbatim: item.text)
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 12))

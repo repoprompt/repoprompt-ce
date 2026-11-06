@@ -94,8 +94,130 @@
             let description: String
         }
 
+        func testRowBoundaryKeepsNativeIdentitySelectionAndDeliversChangedInputs() async throws {
+            let oldAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            defer { GlobalSettingsStore.shared.setMCPAutoStart(oldAutoStart, commit: false)
+                AgentTranscriptTailRenderProbe.sink = nil
+            }
+            let recorder = Recorder()
+            recorder.allowedIDs = Set((0 ..< 50).map(Self.id))
+            AgentTranscriptTailRenderProbe.sink = { recorder.receive($0) }
+            let fixture = try await makeFixture(turns: 10, recorder: recorder)
+            defer { fixture.window.contentView = nil
+                fixture.window.close()
+            }
+            let userID = fixture.source[45].id
+            let openerID = fixture.source[46].id
+            let tailID = fixture.source[49].id
+            try await wait(fixture, seconds: 60, gate: "selection witness") { self.hasRichWitness(userID, in: fixture) }
+            try await calibrateNativeUpdate(fixture, rowID: userID)
+            var warmTail = try XCTUnwrap(fixture.store.snapshot.presentation.visibleRows.first { $0.id == tailID })
+            warmTail.text += " SELECTION_WARMUP"
+            var warm = replacing(warmTail, in: fixture.store.snapshot)
+            warm.runtimeFooterByItemID[tailID] = .init(itemID: tailID, anchorDate: warmTail.timestamp, completedDate: nil, statusText: "Warm-up status")
+            fixture.store.update(warm)
+            try await wait(fixture, seconds: 5, gate: "selection tail warm-up") {
+                recorder.footers[tailID] == "Warm-up status" && recorder.attached(tailID, window: fixture.window).contains { $0.string.contains("SELECTION_WARMUP") }
+            }
+            var lastSerial = recorder.serial
+            var quietSince = ProcessInfo.processInfo.systemUptime
+            try await wait(fixture, seconds: 5, gate: "selection setup quiet window") {
+                if lastSerial != recorder.serial {
+                    lastSerial = recorder.serial
+                    quietSince = ProcessInfo.processInfo.systemUptime
+                }
+                return ProcessInfo.processInfo.systemUptime - quietSince >= 0.22
+            }
+            let view = try XCTUnwrap(recorder.attached(userID, window: fixture.window).first)
+            let selection = NSRange(location: 8, length: 12)
+            view.setSelectedRange(selection)
+            let originalStorage = view.attributedString()
+            let anchors = fixture.store.snapshot.presentation.rowAnchorIndex
+            var tail = try XCTUnwrap(fixture.store.snapshot.presentation.visibleRows.first { $0.id == tailID })
+            tail.text += " SELECTION_TAIL"
+            var next = replacing(tail, in: fixture.store.snapshot)
+            next.runtimeFooterByItemID[tailID] = .init(itemID: tailID, anchorDate: tail.timestamp, completedDate: nil, statusText: "Selection status")
+            recorder.bodies = [:]
+            recorder.counts = [:]
+            fixture.store.update(next)
+            try await wait(fixture, seconds: 5, gate: "tail text and status") {
+                recorder.footers[tailID] == "Selection status" && recorder.attached(tailID, window: fixture.window).contains { $0.string.contains("SELECTION_TAIL") }
+            }
+            XCTAssertTrue(recorder.attached(userID, window: fixture.window).contains { $0 === view })
+            XCTAssertEqual(view.selectedRange(), selection)
+            XCTAssertTrue(view.attributedString().isEqual(to: originalStorage))
+            XCTAssertEqual(fixture.store.snapshot.presentation.rowAnchorIndex, anchors)
+            XCTAssertTrue(recorder.bodies.allSatisfy { $0.key == tailID || $0.value == 0 }, "Non-tail calls: \(recorder.bodies.filter { $0.key != tailID })")
+            XCTAssertEqual(recorder.counts[userID]?["update", default: 0] ?? 0, 0)
+            var user = try XCTUnwrap(next.presentation.visibleRows.first { $0.id == userID })
+            user.text += " CHANGED_USER_INPUT"
+            next = replacing(user, in: next)
+            fixture.store.update(next)
+            try await wait(fixture, seconds: 5, gate: "changed stable user input") {
+                recorder.attached(userID, window: fixture.window).contains { $0.string.contains("CHANGED_USER_INPUT") }
+            }
+            XCTAssertGreaterThan(recorder.bodies[userID, default: 0], 0)
+            next.presentationRevision += 1
+            next.runtimeFooterByItemID[openerID] = .init(itemID: openerID, anchorDate: user.timestamp, completedDate: nil, statusText: "Changed stable footer")
+            fixture.store.update(next)
+            try await wait(fixture, seconds: 5, gate: "changed stable footer") { recorder.footers[openerID] == "Changed stable footer" }
+            XCTAssertGreaterThan(recorder.bodies[openerID, default: 0], 0)
+        }
+
+        func testRowBoundaryAccountsForPayloadActionsAndOpaqueLoginCallbacks() async throws {
+            let oldAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            defer { GlobalSettingsStore.shared.setMCPAutoStart(oldAutoStart, commit: false) }
+            let fixture = try await makeFixture(turns: 10, recorder: Recorder())
+            defer { fixture.window.contentView = nil
+                fixture.window.close()
+            }
+            let vm = fixture.state.agentModeViewModel
+            func row(item: AgentChatItem, run: AgentRunInteractionUISnapshot, payload: String? = nil, revision: Int = 0) -> AgentTranscriptRow {
+                AgentTranscriptRow(
+                    inputs: .init(
+                        item: item, isMostRecentEditBubble: false, windowID: fixture.state.windowID,
+                        workspaceID: fixture.state.workspaceManager.activeWorkspaceID, tabID: fixture.tabID,
+                        suppressAskUserTranscriptUI: false, activeContextBuilderCallID: nil, activeContextBuilderResultID: nil,
+                        rawToolResultPayload: payload, rawToolResultPayloadRenderRevision: revision, cancelRunID: run.activeRunID,
+                        runInteraction: run, runtimeFooter: nil, autoExpandEnabled: true,
+                        liveBashExecutionByItemID: [:], recentAssistantItemIDs: [], approvalVisible: false
+                    ),
+                    agentModeVM: vm,
+                    promptManager: fixture.state.promptManager,
+                    contextBuilderAgentVM: fixture.state.contextBuilderAgentViewModel,
+                    codexManagedLoginAction: nil
+                )
+            }
+            let item = fixture.source[0]
+            let run = vm.ui.runInteraction.snapshot
+            let original = row(item: item, run: run)
+            XCTAssertEqual(original, row(item: item, run: run))
+            XCTAssertNotEqual(original, row(item: item, run: run, payload: "new raw result", revision: 1))
+            XCTAssertNotEqual(original, row(item: fixture.source[5], run: run))
+            var changedRun = run
+            changedRun.selectedModelRaw = "changed-model"
+            XCTAssertNotEqual(original, row(item: item, run: changedRun))
+            XCTAssertEqual(row(item: item, run: changedRun).handoffConfig.defaultModelRaw, "changed-model")
+            let config = original.handoffConfig
+            XCTAssertEqual(config.itemID, item.id)
+            XCTAssertEqual(config.windowID, fixture.state.windowID)
+            let payload = await config.buildPayloadForClipboard()
+            XCTAssertTrue(payload.contains("Turn 0 rich request"))
+            XCTAssertFalse(payload.contains("Turn 1 rich request"), "The handoff callback must retain the exact row cutoff")
+            let opaque = AgentTranscriptRow(
+                inputs: original.inputs,
+                agentModeVM: vm,
+                promptManager: fixture.state.promptManager,
+                contextBuilderAgentVM: fixture.state.contextBuilderAgentViewModel,
+                codexManagedLoginAction: .init(browser: { _ in throw Refused.providerLaunch }, deviceCode: { _ in throw Refused.providerLaunch })
+            )
+            XCTAssertFalse(opaque == opaque, "Opaque callbacks must never be silently excluded from equality")
+        }
+
         func testStreamingTailInvalidationAcrossSessionSizes() async throws {
-            try XCTSkipUnless(ProcessInfo.processInfo.environment["RPCE_RUN_SCALE_TESTS"] == "1", "Opt-in M0: prompt-exports/optimize-streaming-tail-runs.md")
+            try XCTSkipUnless(ProcessInfo.processInfo.environment["RPCE_RUN_SCALE_TESTS"] == "1", "Opt-in transcript diagnostic: docs/designs/optimize-streaming-tail-runs.md (local report)")
             let oldAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             let oldFont = FontScaleManager.shared.preset
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)

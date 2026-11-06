@@ -2597,7 +2597,6 @@ struct AgentModeChatDetailView: View {
                 ))
             #endif
         }
-        .environment(\.agentMessageRuntimeFooterByItemID, transcriptSnapshot.runtimeFooterByItemID)
         .messageTimestampEnvironment()
     }
 
@@ -2760,47 +2759,33 @@ struct AgentModeChatDetailView: View {
         runInteraction: AgentRunInteractionUISnapshot
     ) -> some View {
         let showCancel = showRunScopedToolCancel(for: item, in: block, runInteraction: runInteraction)
-        let cancelAction = showCancel ? cancelActiveToolsAction(runInteraction: runInteraction) : nil
         let ownerTabID = transcript.presentation.tabID ?? transcript.currentTabID ?? currentTabID
         let ownerWorkspaceID = oracleViewModel.workspaceManager.activeWorkspaceID
-        return AgentMessageBubble(
-            item: item,
-            isMostRecentEditBubble: item.id == renderContext.mostRecentEditID,
-            windowID: windowID,
-            currentWorkspaceID: ownerWorkspaceID,
-            currentTabID: ownerTabID,
-            suppressAskUserTranscriptUI: renderContext.isContextBuilderQuestionActive,
-            contextBuilderContext: .init(
-                tabID: ownerTabID,
-                contextBuilderAgentVM: contextBuilderAgentVM,
-                activeContextBuilderCallItemID: renderContext.activeContextBuilderCallID,
-                activeContextBuilderResultItemID: renderContext.activeContextBuilderResultID,
-                oracleOpenContext: .init(
-                    windowID: windowID,
-                    workspaceID: ownerWorkspaceID,
-                    tabID: ownerTabID
-                ),
-                showRunScopedToolCancel: showCancel,
-                cancelActiveToolsAction: cancelAction
+        return AgentTranscriptRow(
+            inputs: .init(
+                item: item,
+                isMostRecentEditBubble: item.id == renderContext.mostRecentEditID,
+                windowID: windowID, workspaceID: ownerWorkspaceID, tabID: ownerTabID,
+                suppressAskUserTranscriptUI: renderContext.isContextBuilderQuestionActive,
+                activeContextBuilderCallID: renderContext.activeContextBuilderCallID,
+                activeContextBuilderResultID: renderContext.activeContextBuilderResultID,
+                rawToolResultPayload: agentModeVM.rawToolResultPayloadForRendering(tabID: ownerTabID, itemID: item.id),
+                rawToolResultPayloadRenderRevision: transcript.presentation.rawToolResultPayloadRenderRevisionByItemID[item.id] ?? 0,
+                cancelRunID: showCancel ? runInteraction.activeRunID : nil,
+                runInteraction: runInteraction,
+                runtimeFooter: transcript.runtimeFooterByItemID[item.id],
+                autoExpandEnabled: autoExpandEnabled,
+                liveBashExecutionByItemID: transcript.activeBashLiveExecutionByItemID,
+                recentAssistantItemIDs: renderContext.recentAssistantItemIDs,
+                approvalVisible: renderContext.interactionBlockerVisible
             ),
+            agentModeVM: agentModeVM,
             promptManager: promptManager,
-            handoffConfig: runInteraction.canForkCurrentSession ? handoffConfig(for: item.id, runInteraction: runInteraction) : nil,
-            rawToolResultPayload: agentModeVM.rawToolResultPayloadForRendering(tabID: ownerTabID, itemID: item.id),
-            rawToolResultPayloadRenderRevision: transcript.presentation
-                .rawToolResultPayloadRenderRevisionByItemID[item.id] ?? 0,
-            showRunScopedToolCancel: showCancel,
-            cancelActiveToolsAction: cancelAction,
-            codexManagedLoginAction: codexManagedLoginAction
+            contextBuilderAgentVM: contextBuilderAgentVM,
+            codexManagedLoginAction: item.kind == .error ? codexManagedLoginAction : nil
         )
+        .equatable()
         .id(item.id)
-        #if DEBUG
-            .environment(\.agentTranscriptProbeRowID, item.id)
-        #endif
-            .environment(\.markdownFileLinkOpener, markdownFileLinkOpener)
-            .environment(\.agentToolCardAutoExpandEnabled, autoExpandEnabled)
-            .environment(\.agentLiveBashExecutionByItemID, transcript.activeBashLiveExecutionByItemID)
-            .environment(\.agentRecentAssistantItemIDs, renderContext.recentAssistantItemIDs)
-            .environment(\.agentApprovalVisible, renderContext.interactionBlockerVisible)
     }
 
     private func toolCardAutoExpandEnabled(for block: AgentTranscriptRenderBlock, lockTargetID: UUID?) -> Bool {
