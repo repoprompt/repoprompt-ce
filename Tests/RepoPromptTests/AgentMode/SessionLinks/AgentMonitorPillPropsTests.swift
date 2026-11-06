@@ -584,13 +584,11 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         XCTAssertEqual(
             AgentMonitorAutoWakeCopy.tooltip,
             "When on, updates from the selected lanes can start a turn for this agent, no more often than the "
-                + "limit below. When off, updates wait for its next turn. A lane that asks for attention or waits "
-                + "for your input wakes it either way."
+                + "limit below. When off, updates wait for its next turn. A lane that asks for attention wakes it either way."
         )
         XCTAssertEqual(
             AgentMonitorAutoWakeCopy.accessibilityHint,
-            "Lets updates from selected lanes start turns for this agent. Attention requests and lanes waiting "
-                + "for your input wake it either way."
+            "Lets updates from selected lanes start turns for this agent. Attention requests wake it either way."
         )
         XCTAssertEqual(AgentMonitorAutoWakeCopy.label, "Auto-wake on overseen lane updates")
         XCTAssertEqual(AgentMonitorRoutineWakeCopy.noDelayLabel, "No delay")
@@ -1212,12 +1210,11 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         XCTAssertEqual(
             AgentMonitorAutoWakeSnoozeCopy.menuTooltip,
             "Stops this lane’s updates from starting turns for a while. They still join this agent’s next turn, "
-                + "and an attention request or this lane waiting for your input still wakes it."
+                + "and an attention request still wakes it."
         )
         XCTAssertEqual(
             AgentMonitorAutoWakeSnoozeCopy.accessibilityHint,
-            "Pauses turns started by this lane’s updates. An attention request or this lane waiting for your "
-                + "input still wakes this agent."
+            "Pauses turns started by this lane’s updates. An attention request still wakes this agent."
         )
     }
 
@@ -1287,8 +1284,7 @@ final class AgentMonitorPillPropsTests: XCTestCase {
     func testRowFeedbackSeparatesTheTooLateNoticeFromRealFailures() {
         XCTAssertEqual(
             AgentMonitorAutoWakeSnoozeCopy.currentDispatchAlreadyStarted,
-            "A turn has already started, so the snooze applies to later updates. An attention request or this "
-                + "lane waiting for your input still wakes this agent."
+            "A turn has already started, so the snooze applies to later updates. An attention request still wakes this agent."
         )
         let notice = AgentMonitorRowFeedback.notice(
             AgentMonitorAutoWakeSnoozeCopy.currentDispatchAlreadyStarted

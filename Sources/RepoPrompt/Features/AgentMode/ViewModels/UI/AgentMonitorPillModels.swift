@@ -222,13 +222,11 @@ enum AgentMonitorAutoWakeCopy {
     static let deselectAll = "Deselect all"
     static let tooltip = """
     When on, updates from the selected lanes can start a turn for this agent, no more often than the \
-    limit below. When off, updates wait for its next turn. A lane that asks for attention or waits \
-    for your input wakes it either way.
+    limit below. When off, updates wait for its next turn. A lane that asks for attention wakes it either way.
     """
     static let accessibilityLabel = "Auto-wake on overseen lane updates"
     static let accessibilityHint = """
-    Lets updates from selected lanes start turns for this agent. Attention requests and lanes waiting \
-    for your input wake it either way.
+    Lets updates from selected lanes start turns for this agent. Attention requests wake it either way.
     """
     static let unavailableMessage = "That Agent session is no longer active."
     static let loadingReason = "This Agent session is still loading."
@@ -445,8 +443,7 @@ enum AgentMonitorRoutineWakeCopy {
     static let noDelayLabel = "No delay"
     static let tooltip = """
     Updates can start a turn at most this often, counted from the last wake and across all lanes. \
-    Updates that arrive in between join the next turn. Attention requests, lanes waiting for your \
-    input, and Wake now skip the limit.
+    Updates that arrive in between join the next turn. Attention requests and Wake now skip the limit.
     """
     static let intervalAccessibilityLabel = "Minimum delay between routine update wake-ups"
 
@@ -584,8 +581,7 @@ enum AgentMonitorAutoWakeSnoozeCopy {
 
     /// The one informational — not failed — outcome a set or extension can report.
     static let currentDispatchAlreadyStarted = """
-    A turn has already started, so the snooze applies to later updates. An attention request or this \
-    lane waiting for your input still wakes this agent.
+    A turn has already started, so the snooze applies to later updates. An attention request still wakes this agent.
     """
 
     static let unavailableMessage = "That oversight link is no longer active."
@@ -612,12 +608,11 @@ enum AgentMonitorAutoWakeSnoozeCopy {
     /// “Collected” reads as an exhaustive history the reducer has never kept.
     static let menuTooltip = """
     Stops this lane’s updates from starting turns for a while. They still join this agent’s next turn, \
-    and an attention request or this lane waiting for your input still wakes it.
+    and an attention request still wakes it.
     """
 
     static let accessibilityHint = """
-    Pauses turns started by this lane’s updates. An attention request or this lane waiting for your \
-    input still wakes this agent.
+    Pauses turns started by this lane’s updates. An attention request still wakes this agent.
     """
 
     /// Who set the current deadline, phrased for the row rather than for the wire.
