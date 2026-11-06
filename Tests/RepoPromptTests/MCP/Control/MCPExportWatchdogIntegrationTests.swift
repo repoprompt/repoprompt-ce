@@ -7,6 +7,7 @@ import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
 import RepoPromptShared
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 #if DEBUG

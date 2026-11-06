@@ -138,6 +138,105 @@ final class AgentSessionAttachmentStoreTests: XCTestCase {
         XCTAssertTrue(store.isRetainedPath(childPath, sessionID: childID))
     }
 
+    func testHumanHandoffOmitsOnlyMissingImagesAndCopiesRemainingBytesIndependently() throws {
+        let store = AgentSessionAttachmentStore(agentSessionsFolder: agentSessionsFolder)
+        let parentID = UUID()
+        let goodURL = temporaryRoot.appendingPathComponent("good.png")
+        let bytes = Data("independent".utf8)
+        try bytes.write(to: goodURL)
+        let good = AgentFileAttachment(source: .localFile(path: goodURL.path))
+        let missing = AgentFileAttachment(source: .localFile(path: temporaryRoot.appendingPathComponent("gone.png").path))
+        for attachments in [[missing, good], [missing]] {
+            let childID = UUID()
+            let copied = try store.copyForHandoff(
+                attachments, sourceSessionID: parentID, destinationSessionID: childID,
+                temporaryRoot: temporaryRoot, missingImagePolicy: .omitMissingImagesForHumanHandoff
+            )
+            XCTAssertNil(copied[missing.id])
+            XCTAssertEqual(copied.count, attachments.count - 1)
+            if let copy = copied[good.id], case let .localFile(path) = copy.source {
+                try FileManager.default.removeItem(at: goodURL)
+                XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), bytes)
+                try bytes.write(to: goodURL)
+            } else {
+                XCTAssertFalse(FileManager.default.fileExists(atPath: store.sessionFolderURL(sessionID: childID).path))
+            }
+        }
+        XCTAssertThrowsError(try store.copyForHandoff(
+            [missing], sourceSessionID: parentID, destinationSessionID: UUID(), temporaryRoot: temporaryRoot
+        ))
+    }
+
+    func testHumanOmissionDoesNotRelaxNonImageCapDestinationOrDuplicateFailures() throws {
+        let store = AgentSessionAttachmentStore(
+            agentSessionsFolder: agentSessionsFolder,
+            limits: .init(maxRetainedImageBytes: .max, downscaledLongEdgePixels: 4096, maxSessionFolderBytes: 1)
+        )
+        let source = temporaryRoot.appendingPathComponent("source.png")
+        try Data("too large".utf8).write(to: source)
+        let good = AgentFileAttachment(source: .localFile(path: source.path))
+        let missing = AgentFileAttachment(source: .localFile(path: temporaryRoot.appendingPathComponent("missing.pdf").path), kind: .pdf)
+        for attachments in [[missing], [good]] {
+            XCTAssertThrowsError(try store.copyForHandoff(
+                attachments, sourceSessionID: UUID(), destinationSessionID: UUID(), temporaryRoot: temporaryRoot,
+                missingImagePolicy: .omitMissingImagesForHumanHandoff
+            ))
+        }
+        let normal = AgentSessionAttachmentStore(agentSessionsFolder: agentSessionsFolder)
+        let childID = UUID()
+        try FileManager.default.createDirectory(at: normal.sessionFolderURL(sessionID: childID), withIntermediateDirectories: true)
+        XCTAssertThrowsError(try normal.copyForHandoff(
+            [missing], sourceSessionID: UUID(), destinationSessionID: childID, temporaryRoot: temporaryRoot,
+            missingImagePolicy: .omitMissingImagesForHumanHandoff
+        ))
+        XCTAssertThrowsError(try normal.copyForHandoff(
+            [good, AgentFileAttachment(id: good.id, source: missing.source)],
+            sourceSessionID: UUID(), destinationSessionID: UUID(), temporaryRoot: temporaryRoot,
+            missingImagePolicy: .omitMissingImagesForHumanHandoff
+        ))
+        XCTAssertEqual(try Data(contentsOf: source), Data("too large".utf8))
+    }
+
+    func testHumanHandoffRejectsUnsafeEntriesAndAmbiguousRetainedCopies() throws {
+        let store = AgentSessionAttachmentStore(agentSessionsFolder: agentSessionsFolder)
+        let parentID = UUID()
+        let missingURL = temporaryRoot.appendingPathComponent("gone.png")
+        let missing = AgentFileAttachment(source: .localFile(path: missingURL.path))
+        let folder = store.sessionFolderURL(sessionID: parentID)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let first = folder.appendingPathComponent("\(missing.id.uuidString).png")
+        let second = folder.appendingPathComponent("\(missing.id.uuidString).jpg")
+        try Data("one".utf8).write(to: first)
+        try Data("two".utf8).write(to: second)
+        func reject(_ attachment: AgentFileAttachment = missing) {
+            XCTAssertThrowsError(try store.copyForHandoff(
+                [attachment], sourceSessionID: parentID, destinationSessionID: UUID(),
+                temporaryRoot: temporaryRoot, missingImagePolicy: .omitMissingImagesForHumanHandoff
+            ))
+        }
+        reject()
+        try FileManager.default.removeItem(at: second)
+        let copied = try store.copyForHandoff(
+            [missing], sourceSessionID: parentID, destinationSessionID: UUID(),
+            temporaryRoot: temporaryRoot, missingImagePolicy: .omitMissingImagesForHumanHandoff
+        )
+        XCTAssertNotNil(copied[missing.id], "moved temporary images must resolve their retained bytes")
+        try FileManager.default.removeItem(at: first)
+        try FileManager.default.createSymbolicLink(at: first, withDestinationURL: baseURL.appendingPathComponent("absent"))
+        reject()
+        try FileManager.default.removeItem(at: first)
+        try FileManager.default.removeItem(at: folder)
+        try FileManager.default.createSymbolicLink(at: folder, withDestinationURL: baseURL.appendingPathComponent("absent-folder"))
+        reject()
+        try FileManager.default.removeItem(at: folder)
+        try FileManager.default.createSymbolicLink(at: missingURL, withDestinationURL: baseURL.appendingPathComponent("absent"))
+        reject()
+        reject(AgentFileAttachment(source: .localFile(path: baseURL.appendingPathComponent("foreign-missing.png").path)))
+        let foreign = baseURL.appendingPathComponent("foreign.png")
+        try Data("foreign".utf8).write(to: foreign)
+        reject(AgentFileAttachment(source: .localFile(path: foreign.path)))
+    }
+
     func testHandoffFailureDiscardsPartialCopiesWithoutTouchingSourcesOrExistingDestination() throws {
         let store = AgentSessionAttachmentStore(agentSessionsFolder: agentSessionsFolder)
         let source = temporaryRoot.appendingPathComponent("source.png")

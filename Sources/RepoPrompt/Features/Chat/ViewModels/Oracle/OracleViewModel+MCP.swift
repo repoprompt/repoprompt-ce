@@ -2,6 +2,7 @@ import Foundation
 import MCP // <- required for `Value`
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 
 // MARK: - MCP Tool helpers (moved from MCPServerViewModel)
 
@@ -151,14 +152,16 @@ extension OracleViewModel {
         modelParam: String?,
         profile: AgentModelsSettingsProfile,
         promptVM: PromptViewModel,
-        snapshotOverride: OracleSelectionSnapshot? = nil
+        snapshotOverride: OracleSelectionSnapshot? = nil,
+        additionalOracles: [String]? = nil
     ) throws -> ResolvedOracleExecution {
         let snapshot = snapshotOverride ?? .mcp(profile: profile)
         do {
             return try OracleExecutionResolver(promptViewModel: promptVM).resolve(
                 choice: modelParam.map(OracleStartChoice.oracleSend) ?? .automatic,
                 mode: mode,
-                snapshot: snapshot
+                snapshot: snapshot,
+                additionalOracles: additionalOracles
             )
         } catch {
             throw ChatToolError.invalidParams(error.localizedDescription)

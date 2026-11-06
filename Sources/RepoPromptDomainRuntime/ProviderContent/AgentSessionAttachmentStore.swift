@@ -48,6 +48,11 @@ package struct AgentSessionAttachmentStore {
         package var removedTemporaryFiles: [String]
     }
 
+    package enum HandoffMissingImagePolicy {
+        case strict
+        case omitMissingImagesForHumanHandoff
+    }
+
     package enum HandoffCopyError: LocalizedError {
         case sourceUnavailable(UUID)
         case destinationInUse
@@ -138,13 +143,14 @@ package struct AgentSessionAttachmentStore {
 
     /// A fork owns independent files: retaining or deleting the source can never invalidate them.
     /// Copy the complete set into private staging before publishing the fresh destination folder.
-    /// A missing image, storage limit, or cancellation fails the whole copy instead of silently
-    /// publishing transcript rows that depend on the parent or on already-consumed temporary files.
+    /// Strict callers fail on any unavailable image. Human handoff may omit genuinely absent
+    /// image bytes, preserving transcript metadata; every other failure remains transactional.
     package func copyForHandoff(
         _ attachments: [AgentFileAttachment],
         sourceSessionID: UUID?,
         destinationSessionID: UUID,
-        temporaryRoot: URL?
+        temporaryRoot: URL?,
+        missingImagePolicy: HandoffMissingImagePolicy = .strict
     ) throws -> [UUID: AgentFileAttachment] {
         let local = attachments.filter {
             if case .localFile = $0.source { true } else { false }
@@ -171,15 +177,34 @@ package struct AgentSessionAttachmentStore {
                 continue
             }
             sourcesByID[attachment.id] = attachment.source
-            let source = try handoffSource(for: attachment, sessionID: sourceSessionID, temporaryRoot: temporaryRoot)
-            let sourceAttributes = try fileManager.attributesOfItem(atPath: source.path)
-            let sourceSize = (sourceAttributes[.size] as? NSNumber)?.int64Value ?? 0
-            guard sourceSize <= limits.maxSessionFolderBytes - totalBytes else {
-                throw HandoffCopyError.sessionLimitExceeded
+            var stagedSource: URL?
+            // A turn-end move can race attribute lookup/copy. Retry resolution once, and only
+            // for ENOENT; storage, permissions, collisions and cancellation remain strict.
+            for attempt in 0 ... 1 {
+                guard let source = try handoffSource(
+                    for: attachment, sessionID: sourceSessionID, temporaryRoot: temporaryRoot,
+                    missingImagePolicy: missingImagePolicy
+                ) else { break }
+                do {
+                    let sourceAttributes = try fileManager.attributesOfItem(atPath: source.path)
+                    let sourceSize = (sourceAttributes[.size] as? NSNumber)?.int64Value ?? 0
+                    guard sourceSize <= limits.maxSessionFolderBytes - totalBytes else {
+                        throw HandoffCopyError.sessionLimitExceeded
+                    }
+                    let fileExtension = source.pathExtension.isEmpty ? "png" : source.pathExtension.lowercased()
+                    let stagedFile = staging.appendingPathComponent(attachment.id.uuidString).appendingPathExtension(fileExtension)
+                    try fileManager.copyItem(at: source, to: stagedFile)
+                    stagedSource = stagedFile
+                    break
+                } catch {
+                    let failure = error as NSError
+                    guard attempt == 0, failure.domain == NSCocoaErrorDomain,
+                          failure.code == NSFileNoSuchFileError || failure.code == NSFileReadNoSuchFileError
+                    else { throw error }
+                    try Task.checkCancellation()
+                }
             }
-            let fileExtension = source.pathExtension.isEmpty ? "png" : source.pathExtension.lowercased()
-            let stagedFile = staging.appendingPathComponent(attachment.id.uuidString).appendingPathExtension(fileExtension)
-            try fileManager.copyItem(at: source, to: stagedFile)
+            guard let stagedFile = stagedSource else { continue }
             // copyItem preserves symlinks. A source replaced during the copy must not publish a
             // link whose bytes still depend on the parent (or another folder).
             guard isRegularFile(stagedFile, directlyIn: staging) else {
@@ -202,6 +227,7 @@ package struct AgentSessionAttachmentStore {
             )
         }
         try Task.checkCancellation()
+        guard !copied.isEmpty else { return [:] }
         // moveItem refuses an existing destination. Never merge with or replace another owner.
         try fileManager.moveItem(at: staging, to: destinationFolder)
         do {
@@ -213,25 +239,64 @@ package struct AgentSessionAttachmentStore {
         return copied
     }
 
-    private func handoffSource(for attachment: AgentFileAttachment, sessionID: UUID?, temporaryRoot: URL?) throws -> URL {
+    private func handoffSource(
+        for attachment: AgentFileAttachment, sessionID: UUID?, temporaryRoot: URL?,
+        missingImagePolicy: HandoffMissingImagePolicy
+    ) throws -> URL? {
         guard case let .localFile(path) = attachment.source else {
             throw HandoffCopyError.sourceUnavailable(attachment.id)
         }
         let candidate = URL(fileURLWithPath: path).standardizedFileURL
-        if let sessionID, isRetainedPath(candidate.path, sessionID: sessionID) {
+        let parent = candidate.deletingLastPathComponent()
+        let ownedParent = parent.path == temporaryRoot?.standardizedFileURL.path
+            || sessionID.map { parent.path == sessionFolderURL(sessionID: $0).path } == true
+        guard ownedParent, !isSymbolicLink(rootURL), !isSymbolicLink(parent) else {
+            throw HandoffCopyError.sourceUnavailable(attachment.id)
+        }
+        // attributesOfItem does not follow the final symlink, including a dangling one.
+        if let attributes = try handoffAttributes(candidate) {
+            guard attributes[.type] as? FileAttributeType == .typeRegular,
+                  isRegularFile(candidate, directlyIn: parent)
+            else { throw HandoffCopyError.sourceUnavailable(attachment.id) }
             return candidate
         }
-        if let temporaryRoot, isRegularFile(candidate, directlyIn: temporaryRoot.standardizedFileURL) {
-            return candidate
+        // Absence alone is insufficient: an unreadable/unsafe retained folder or ambiguous ID
+        // must still fail. Do not use locateRetainedFile's lossy nil result for this decision.
+        if let sessionID {
+            let folder = sessionFolderURL(sessionID: sessionID)
+            if let attributes = try handoffAttributes(folder) {
+                guard !isSymbolicLink(rootURL), attributes[.type] as? FileAttributeType == .typeDirectory else {
+                    throw HandoffCopyError.sourceUnavailable(attachment.id)
+                }
+                let matches = try FileManager.default.contentsOfDirectory(atPath: folder.path).filter {
+                    ($0 as NSString).deletingPathExtension == attachment.id.uuidString
+                }
+                guard matches.count <= 1 else { throw HandoffCopyError.sourceUnavailable(attachment.id) }
+                if let name = matches.first {
+                    let retained = folder.appendingPathComponent(name)
+                    guard isRetainedPath(retained.path, sessionID: sessionID) else {
+                        throw HandoffCopyError.sourceUnavailable(attachment.id)
+                    }
+                    return retained
+                }
+            }
         }
-        // Turn-end retention may have moved the captured temporary path while Handoff prepared
-        // its payload. Resolve only the same attachment ID under the captured parent's authority.
-        if !FileManager.default.fileExists(atPath: candidate.path),
-           let sessionID, let retained = locateRetainedFile(attachmentID: attachment.id, sessionID: sessionID)
-        {
-            return retained
+        guard attachment.kind == .image, missingImagePolicy == .omitMissingImagesForHumanHandoff else {
+            throw HandoffCopyError.sourceUnavailable(attachment.id)
         }
-        throw HandoffCopyError.sourceUnavailable(attachment.id)
+        return nil
+    }
+
+    private func handoffAttributes(_ url: URL) throws -> [FileAttributeKey: Any]? {
+        do {
+            return try FileManager.default.attributesOfItem(atPath: url.path)
+        } catch {
+            let error = error as NSError
+            guard error.domain == NSCocoaErrorDomain,
+                  error.code == NSFileNoSuchFileError || error.code == NSFileReadNoSuchFileError
+            else { throw error }
+            return nil
+        }
     }
 
     /// Moves (falling back to copy) each temporary attachment into the session folder.

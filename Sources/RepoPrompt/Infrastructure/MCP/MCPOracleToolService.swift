@@ -2,6 +2,7 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 
 @MainActor
 struct MCPOracleToolService {
@@ -133,13 +134,15 @@ struct MCPOracleToolService {
         let chatID = args["chat_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedChatID = (chatID?.isEmpty == false) ? chatID : nil
         let requestedModelOverride = try parseOracleModelOverride(args["model"])
+        let additionalOracles = try OracleAdditionalOraclesContract.parseArguments(args)
         let route: OracleConversationRoute
         do {
             route = try OracleConversationRoute.resolve(
                 chatID: normalizedChatID,
                 newChat: newChat,
                 modelOverride: requestedModelOverride,
-                whenMissingChatID: .startNew
+                whenMissingChatID: .startNew,
+                additionalOracles: additionalOracles
             )
         } catch {
             throw MCPError.invalidParams(error.localizedDescription)
@@ -264,6 +267,9 @@ struct MCPOracleToolService {
         if let modelOverride {
             chatArgs["model"] = .string(modelOverride)
         }
+        if let additionalOracles {
+            chatArgs[OracleAdditionalOraclesContract.argumentName] = .array(additionalOracles.map(Value.string))
+        }
 
         await sendStageProgress(connectionID, askOracleToolName, "starting", "Starting Oracle...")
 
@@ -309,13 +315,15 @@ struct MCPOracleToolService {
         let chatID = args["chat_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedChatID = (chatID?.isEmpty == false) ? chatID : nil
         let requestedModelOverride = try parseOracleModelOverride(args["model"])
+        let additionalOracles = try OracleAdditionalOraclesContract.parseArguments(args)
         let route: OracleConversationRoute
         do {
             route = try OracleConversationRoute.resolve(
                 chatID: normalizedChatID,
                 newChat: newChat,
                 modelOverride: requestedModelOverride,
-                whenMissingChatID: .continueCurrent
+                whenMissingChatID: .continueCurrent,
+                additionalOracles: additionalOracles
             )
         } catch {
             throw MCPError.invalidParams(error.localizedDescription)
@@ -470,7 +478,7 @@ struct MCPOracleToolService {
     }
 
     private static let oracleArgumentNames = [
-        "message", "mode", "chat_id", "new_chat", "model", OracleAttachmentContract.argumentName, "export_response"
+        "message", "mode", "chat_id", "new_chat", "model", OracleAdditionalOraclesContract.argumentName, OracleAttachmentContract.argumentName, "export_response"
     ]
 
     /// The deprecated `images` alias is accepted but deliberately not listed, so the error steers
@@ -546,19 +554,24 @@ struct MCPOracleToolService {
     }
 
     private func executeOracleModelsUtility() async throws -> Value {
+        let window = try requireTargetWindow()
+        let primaryLabel = OracleRosterContract.displayLabel(laneIndex: 0)
         let settingsStore = GlobalSettingsStore.shared
         let exposesPresets = settingsStore.mcpShowModelPresets()
             && !settingsStore.mcpTemporarilyDisablePresets()
         let presets = exposesPresets ? ModelPresetsManager.shared.allPresets() : []
-        guard !presets.isEmpty else {
-            let model = try defaultCurrentChatModelInfo()
-            return .string(
-                "Available models:\n- \(model.id): \(model.name) — modes: [Chat, Plan, Review] — \(model.description ?? "MCP Oracle Model")"
-            )
+        var lines: [String] = []
+        if presets.isEmpty {
+            do {
+                let model = try defaultCurrentChatModelInfo()
+                lines.append("Available models:\n- \(model.id): \(model.name) — modes: [Chat, Plan, Review] — \(model.description ?? "MCP Oracle Model")")
+            } catch {
+                lines.append("- \(primaryLabel): \(error.localizedDescription)")
+            }
+        } else {
+            lines.append("Available Model Presets (automatic-selection priority order):")
         }
-
         let chatPresets = ChatPresetManager.shared.allPresets
-        var lines = ["Available Model Presets (automatic-selection priority order):"]
         for (priority, preset) in presets.enumerated() {
             lines.append("- \(priority + 1). \(preset.name) (\(preset.id.uuidString))")
             for (laneIndex, rawModel) in preset.modelStrings.enumerated() {
@@ -567,7 +580,7 @@ struct MCPOracleToolService {
                     let availability = promptVM.mcpOracleIsProviderConfigured(for: model)
                         ? "available"
                         : "unavailable"
-                    lines.append("  - \(label): \(model.displayName) — \(availability)")
+                    lines.append("  - \(label): \(model.displayName) (\(rawModel)) — \(availability)")
                 } else {
                     lines.append("  - \(label): \(rawModel) — unknown model")
                 }
@@ -589,6 +602,19 @@ struct MCPOracleToolService {
             if let description = preset.description, !description.isEmpty {
                 lines.append("  - \(description)")
             }
+        }
+        let workspaceID = window.workspaceManager.activeWorkspace?.id
+        let profile = settingsStore.effectiveAgentModelsProfile(workspaceID: workspaceID)
+        lines.append("Configured Oracle settings roster (not Model Presets):")
+        if profile.planningModelRaw == nil {
+            lines.append("- \(primaryLabel): not configured")
+        }
+        let roster: [(Int, String)] = profile.planningModelRaw.map { [(0, $0)] } ?? []
+        for (laneIndex, identifier) in roster + profile.additionalOracleModelRaws.enumerated().map({ ($0.offset + 1, $0.element) }) {
+            let availability = AIModel.fromModelName(identifier).map {
+                promptVM.mcpOracleIsProviderConfigured(for: $0) ? "available" : "unavailable"
+            } ?? "unknown model"
+            lines.append("- \(OracleRosterContract.displayLabel(laneIndex: laneIndex)): \(identifier) — \(availability)")
         }
         return .string(lines.joined(separator: "\n"))
     }

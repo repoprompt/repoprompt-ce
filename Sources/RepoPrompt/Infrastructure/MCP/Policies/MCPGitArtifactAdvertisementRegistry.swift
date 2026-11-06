@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 struct MCPGitArtifactAdvertisementCheckout: Hashable {

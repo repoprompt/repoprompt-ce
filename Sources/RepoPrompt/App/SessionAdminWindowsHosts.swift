@@ -2,6 +2,7 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 /// Production hosts over every open window. Each effect routes to the window that owns the target

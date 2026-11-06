@@ -2,6 +2,7 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 import RepoPromptShared
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 typealias MCPTabContextHint = RepoPromptShared.MCPTabContextHint

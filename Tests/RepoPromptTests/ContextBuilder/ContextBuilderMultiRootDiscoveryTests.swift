@@ -2,6 +2,7 @@ import Foundation
 import MCP
 @testable import RepoPromptApp
 import RepoPromptSettingsCore
+@testable import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 import XCTest
 

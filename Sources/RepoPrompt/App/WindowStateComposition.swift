@@ -3,6 +3,7 @@ import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptPersistence
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 
 extension CodeMapArtifactRuntime {
     static let processWideProvider: CodeMapArtifactRuntimeProvider = {
@@ -289,6 +290,16 @@ enum WindowStateCompositionFactory {
         )
         agentModeViewModel.repromptService = .live(keyManager: keyManager)
         agentModeViewModel.preparedSessionRuntimes = WindowStatesManager.shared
+        agentModeViewModel.providerSwitchExactOwnerProbe = { session in
+            guard let id = session.activeAgentSessionID else { return false }
+            let census = AgentSessionCarrierResolver.capture(
+                windows: WindowStatesManager.shared.allWindows,
+                sessionIDs: [id],
+                includeRuntimeOwners: true
+            )
+            return census.isCurrent() && !census.ambiguousSessionIDs.contains(id)
+                && !census.placementConflictSessionIDs.contains(id) && census.uniqueRuntimeOwners[id]?.session === session
+        }
         workspaceFilesViewModel.setSessionWorktreeBindingStatesProvider { [weak agentModeViewModel] sessionIDs in
             agentModeViewModel?.worktreeBindingStates(forAgentSessionIDs: sessionIDs) ?? [:]
         }

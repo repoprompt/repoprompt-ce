@@ -5,6 +5,7 @@ import RepoPromptFileSystem
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 import SwiftUI
 
 /// Errors that can occur when publishing git diff artifacts

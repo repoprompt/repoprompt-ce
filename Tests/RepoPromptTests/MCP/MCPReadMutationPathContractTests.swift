@@ -6,6 +6,7 @@ import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptSecureStorage
 import RepoPromptVCS
+@testable import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 import XCTest
 

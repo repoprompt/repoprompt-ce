@@ -27,7 +27,7 @@ final class AgentSessionLinkDeliveryReadinessTests: XCTestCase {
         XCTAssertTrue(Readiness.evaluate(snapshot: .ready).isReady)
         XCTAssertEqual(
             Set(Readiness.BlockReason.allCases),
-            [.endpointInvalidated, .targetLoading, .targetRestoreUnavailable, .targetCreationIncomplete, .targetNotIdle],
+            [.endpointInvalidated, .targetLoading, .targetRestoreUnavailable, .targetCreationIncomplete, .targetNotIdle, .providerSwitchUnconfirmed, .providerHandoverNeedsReview],
             "Only target lifecycle, creation, restoration, and busy state may refuse a send."
         )
     }

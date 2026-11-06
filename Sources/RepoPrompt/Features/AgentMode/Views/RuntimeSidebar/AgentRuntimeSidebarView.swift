@@ -1,4 +1,5 @@
 import RepoPromptFileSystem
+import RepoPromptWorkspaceContext
 import SwiftUI
 
 struct AgentRuntimeSidebarView: View {

@@ -531,7 +531,8 @@ final class AgentSessionDataServiceDeletionTests: XCTestCase {
     }
 
     func testDeletionDrainsHandoffCopyForBothSourceAndDestination() async throws {
-        for deleteParent in [true, false] {
+        let policies: [AgentSessionAttachmentStore.HandoffMissingImagePolicy] = [.strict, .omitMissingImagesForHumanHandoff]
+        for (deleteParent, policy) in policies.flatMap({ policy in [true, false].map { ($0, policy) } }) {
             let fixture = try makeFixture()
             let store = AgentSessionAttachmentStore(agentSessionsFolder: fixture.agentSessionsFolder)
             let childID = UUID()
@@ -554,7 +555,7 @@ final class AgentSessionDataServiceDeletionTests: XCTestCase {
             let copy = Task {
                 try await fixture.service.copyHandoffAttachments(
                     [attachment], sourceSessionID: fixture.sessionID, destinationSessionID: childID,
-                    store: store, temporaryRoot: nil
+                    store: store, temporaryRoot: nil, missingImagePolicy: policy
                 )
             }
             addTeardownBlock {
@@ -596,7 +597,7 @@ final class AgentSessionDataServiceDeletionTests: XCTestCase {
             do {
                 _ = try await fixture.service.copyHandoffAttachments(
                     [attachment], sourceSessionID: fixture.sessionID, destinationSessionID: childID,
-                    store: store, temporaryRoot: nil
+                    store: store, temporaryRoot: nil, missingImagePolicy: policy
                 )
                 XCTFail("A deleted source or destination must close copy admission")
             } catch let AgentSessionDataError.sessionDeleted(id) {
@@ -616,7 +617,8 @@ final class AgentSessionDataServiceDeletionTests: XCTestCase {
         let copy = Task {
             try await fixture.service.copyHandoffAttachments(
                 [attachment], sourceSessionID: fixture.sessionID, destinationSessionID: childID,
-                store: store, temporaryRoot: AgentAttachmentStore.managedStorageRootURL(for: fixture.storageURL)
+                store: store, temporaryRoot: AgentAttachmentStore.managedStorageRootURL(for: fixture.storageURL),
+                missingImagePolicy: .omitMissingImagesForHumanHandoff
             )
         }
         addTeardownBlock {

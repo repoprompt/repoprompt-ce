@@ -73,6 +73,7 @@ extension AgentModeViewModel {
             sourceTabID: source.tabID,
             activateDestination: false,
             inheritOversightLinks: false,
+            missingImagePolicy: .strict,
             isStillAuthorized: { [weak self] in
                 guard let self else { return false }
                 return isStillAuthorized()

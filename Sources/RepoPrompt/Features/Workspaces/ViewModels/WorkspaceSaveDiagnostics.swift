@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptInstrumentation
+import RepoPromptWorkspaceContext
 
 struct WorkspaceSaveSource: Equatable, Hashable, ExpressibleByStringLiteral, CustomStringConvertible {
     let rawValue: String

@@ -2,6 +2,7 @@ import Foundation
 @testable import RepoPromptApp
 import RepoPromptFileSystem
 import RepoPromptVCS
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 final class WorkspaceGitignorePolicyIdentityTests: XCTestCase {

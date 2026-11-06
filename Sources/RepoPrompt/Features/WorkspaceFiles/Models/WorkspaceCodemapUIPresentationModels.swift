@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspaceContext
 
 struct WorkspaceCodemapUIPresentationEntry: Equatable {
     let presentationID: UUID

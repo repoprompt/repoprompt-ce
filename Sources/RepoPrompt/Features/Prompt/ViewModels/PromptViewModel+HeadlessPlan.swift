@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptFileSystem
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 
 // MARK: - Headless Mode
 
