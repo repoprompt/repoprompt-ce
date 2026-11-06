@@ -437,6 +437,7 @@ enum AttributedTextMeasurementWidthResolver {
 }
 
 struct AttributedTextView: NSViewRepresentable {
+    @Environment(\.windowIsPresentationVisible) private var windowIsPresentationVisible
     let attributedString: NSAttributedString
     let isEditable: Bool
     let allowsTextSelection: Bool
@@ -476,10 +477,13 @@ struct AttributedTextView: NSViewRepresentable {
     }
 
     func updateNSView(_ textView: CodeBlockTextView, context: Context) {
-        context.coordinator.opener = linkOpener
+        updateTextView(textView, coordinator: context.coordinator, presentationVisible: windowIsPresentationVisible)
+    }
+
+    func updateTextView(_ textView: CodeBlockTextView, coordinator: Coordinator, presentationVisible: Bool) {
+        coordinator.opener = linkOpener
         // Detect attribute changes (not just the raw string).
-        let current = textView.attributedString()
-        if !current.isEqual(to: attributedString) {
+        if presentationVisible || isEditable, !textView.attributedString().isEqual(to: attributedString) {
             let wasFirstResponder = (textView.window?.firstResponder as? NSTextView) == textView
             let previousSelection = textView.selectedRange()
             let shouldScrollSelectionToVisible = TextViewSelectionRestorePolicy
@@ -497,16 +501,15 @@ struct AttributedTextView: NSViewRepresentable {
             textView.needsDisplay = true
         }
 
-        // Always sync interaction flags
-        textView.isEditable = isEditable
-        textView.isSelectable = allowsTextSelection
-        textView.delegate = context.coordinator
-        // Keep text-checking disabled on every update to guard re-renders.
-        textView.isContinuousSpellCheckingEnabled = false
-        textView.isGrammarCheckingEnabled = false
-        textView.isAutomaticSpellingCorrectionEnabled = false
-        textView.isAutomaticQuoteSubstitutionEnabled = false
-        textView.isAutomaticTextReplacementEnabled = false
+        // Refresh delegates and links, but avoid unchanged AppKit interaction setters.
+        if textView.isEditable != isEditable { textView.isEditable = isEditable }
+        if textView.isSelectable != allowsTextSelection { textView.isSelectable = allowsTextSelection }
+        textView.delegate = coordinator
+        if textView.isContinuousSpellCheckingEnabled { textView.isContinuousSpellCheckingEnabled = false }
+        if textView.isGrammarCheckingEnabled { textView.isGrammarCheckingEnabled = false }
+        if textView.isAutomaticSpellingCorrectionEnabled { textView.isAutomaticSpellingCorrectionEnabled = false }
+        if textView.isAutomaticQuoteSubstitutionEnabled { textView.isAutomaticQuoteSubstitutionEnabled = false }
+        if textView.isAutomaticTextReplacementEnabled { textView.isAutomaticTextReplacementEnabled = false }
         if textView.layoutManager?.allowsNonContiguousLayout != false {
             textView.layoutManager?.allowsNonContiguousLayout = false
         }

@@ -95,14 +95,20 @@ final class OracleBackgroundInvocationRegistry {
     static let inactiveSessionLimit = 64
     static let inactiveProcessLimit = 256
 
+    fileprivate struct SessionKey: Hashable {
+        let workspaceID: UUID
+        let tabID: UUID
+        let sessionID: UUID
+    }
+
     struct Owner: Hashable {
         let workspaceID: UUID
         /// A refused route attempt advances its transient transition counter without rebinding.
         /// Execution authority follows this persisted binding incarnation until a real rebind drains it.
         let binding: AgentPersistentSessionBindingIdentity
 
-        fileprivate var sessionKey: [UUID] {
-            [workspaceID, binding.tabID, binding.sessionID]
+        fileprivate var sessionKey: SessionKey {
+            SessionKey(workspaceID: workspaceID, tabID: binding.tabID, sessionID: binding.sessionID)
         }
     }
 
@@ -615,7 +621,7 @@ final class OracleBackgroundInvocationRegistry {
     }
 
     private func prune() {
-        var retained: [[UUID]: Int] = [:]
+        var retained: [SessionKey: Int] = [:]
         var total = 0
         for entry in entries.values.filter({ !$0.phase.isLive }).sorted(by: older).reversed() {
             let key = entry.job.owner.sessionKey

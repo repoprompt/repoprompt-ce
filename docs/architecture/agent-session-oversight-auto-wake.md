@@ -1210,10 +1210,12 @@ target, so opening an observer cannot overlap or masquerade as revocation.
 ## The routine wake interval is admission spacing, not a schedule
 
 An observer may require a minimum interval between *routine* automatic wakes. It is durable
-observer-session configuration (`routineWakeIntervalEnabled`, `routineWakeIntervalSeconds`), default
-off, retained while off, and normalized to one of 60/300/600/900/1800/3600/10800 seconds by
+observer-session configuration (`routineWakeIntervalEnabled`, `routineWakeIntervalSeconds`), enabled
+at 300 seconds for new sessions, retained while off, and normalized to one of
+60/180/300/600/900/1800/3600/10800 seconds by
 `AgentSessionLinkRoutineWakeInterval.normalized` — the one helper every decode, restore, and write
-path shares.
+path shares. Saved choices are preserved; legacy payloads without these fields retain their disabled
+default. The picker uses `No delay` to disable spacing while retaining the saved duration.
 
 Timing is measured from the **transport boundary**, not from a clock: the first successful transition
 to `.dispatching` in `agentSessionLinkAcquirePhysicalDispatch` records an endpoint-qualified monotonic
@@ -1271,8 +1273,8 @@ omitted rather than shown as zero once elapsed. `agent_session_link` is unchange
 
 Periodic waking is a separate, default-off observer-session preference, not notification admission
 spacing. It applies only while the session has at least one live outbound oversight relationship.
-The compact `Wake periodically when idle` checkbox and adjacent picker offer 10/30/60/120/360 minutes
-(default 30). The existing routine-limit checkbox likewise keeps its picker on the same row. The entire
+The `Wake after being idle for:` checkbox and adjacent picker offer 10/30/60/120/360 minutes
+(default 30). The separate routine-interval picker includes `No delay`. The entire
 wake-controls block is visible only with outbound oversight; inbound-only sessions do not show it.
 Hiding these controls does not clear the session's saved preferences.
 
