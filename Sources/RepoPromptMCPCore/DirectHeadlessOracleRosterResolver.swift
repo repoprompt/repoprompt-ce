@@ -34,10 +34,15 @@ struct DirectHeadlessOracleRosterResolver: OracleRosterResolver {
             throw MCPError.internalError("Additional Oracle model setting has an invalid value type.")
         }
 
-        return try OracleRoster(
+        let roster = try OracleRoster(
             primaryModelID: request.primaryModelOverride ?? configuredPrimary,
             additionalModelIDs: additional,
             providerID: Self.providerID
         )
+        do {
+            return try roster.selectingAdditional(request.additionalOracles)
+        } catch let error as OracleGroupContractError {
+            throw MCPError.invalidParams(error.localizedDescription)
+        }
     }
 }

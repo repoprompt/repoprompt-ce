@@ -72,6 +72,14 @@ struct AgentExploreMCPToolService {
         }
     }
 
+    @MainActor private final class StartProgress {
+        var sessionIDs: [UUID] = []
+    }
+
+    #if DEBUG
+        var testStartExpiryOverride: AgentRunStartExpiry?
+    #endif
+
     private func executeStart(args: [String: Value]) async throws -> Value {
         try validateAllowedKeys(args, op: "start", allowed: Self.startKeys)
         let startMessages = try parseStartMessages(args)
@@ -85,13 +93,49 @@ struct AgentExploreMCPToolService {
             capturedDefaultWaitSeconds: capturedDefaultWaitSeconds
         )
 
-        let metadata = await captureRequestMetadata()
-        let context = try await resolveStartContext(metadata: metadata)
-        let started = try await startExploreRuns(
-            messages: messages,
-            context: context,
-            worktreeRequest: worktreeStartRequest
-        )
+        let agentModeVM = try requireTargetWindow().agentModeViewModel
+        let defaultExpiry = AgentRunStartExpiry(toolName: toolName, budgetSeconds: AgentRunMCPToolService.startBudgetSeconds(
+            detach: detach, timeoutSeconds: timeoutSeconds, capturedDefaultWaitSeconds: capturedDefaultWaitSeconds
+        ))
+        #if DEBUG
+            let expiry = testStartExpiryOverride ?? defaultExpiry
+        #else
+            let expiry = defaultExpiry
+        #endif
+        let progress = StartProgress()
+        let setup = try await AgentRunStartBudget.run(expiry: expiry) {
+            let metadata = await captureRequestMetadata()
+            let context = try await resolveStartContext(metadata: metadata)
+            let started = try await startExploreRuns(
+                messages: messages, context: context, worktreeRequest: worktreeStartRequest,
+                expiry: expiry, progress: progress
+            )
+            return ExploreSetup(started: started, expiryValue: nil)
+        } onExpiry: {
+            var ids = progress.sessionIDs
+            if let pending = expiry.activatedSessionID, !ids.contains(pending) {
+                ids.append(pending)
+            }
+            guard !ids.isEmpty else { throw expiry.timeoutError }
+            if messages.count == 1, let sessionID = ids.first {
+                return ExploreSetup(started: [], expiryValue: AgentRunMCPToolService.startExpiryValue(sessionID: sessionID, agentModeVM: agentModeVM))
+            }
+            let snapshots = ids.map { id in
+                id == expiry.activatedSessionID
+                    ? AgentRunMCPToolService.startExpirySnapshot(sessionID: id, agentModeVM: agentModeVM)
+                    : agentModeVM.mcpSnapshot(sessionID: id) ?? .expired(sessionID: id)
+            }
+            var object = batchStartValue(sessionIDs: ids, result: "poll", snapshots: snapshots).objectValue ?? [:]
+            object["_meta"] = .object(["wait_result": .string(snapshots.contains(where: \.isStartupPendingForMCPWait) ? "startup_pending" : "timed_out")])
+            if ids.count < messages.count {
+                object["unstarted_message_indices"] = .array((ids.count ..< messages.count).map { .int($0) })
+            }
+            return ExploreSetup(started: [], expiryValue: .object(object))
+        }
+        if let value = setup.expiryValue {
+            return value
+        }
+        let started = setup.started
 
         guard startMessages.isBatch, started.count > 1 else {
             let run = started[0]
@@ -117,7 +161,7 @@ struct AgentExploreMCPToolService {
         return await batchStartValue(
             sessionIDs: sessionIDs,
             result: detach ? "detached" : "poll",
-            agentModeVM: context.agentModeVM
+            agentModeVM: agentModeVM
         )
     }
 
@@ -282,10 +326,16 @@ struct AgentExploreMCPToolService {
         }
     }
 
+    @MainActor private struct ExploreSetup {
+        let started: [StartedExploreRun]
+        let expiryValue: Value?
+    }
+
     private func startExploreRuns(
         messages: [String],
         context: ExploreStartContext,
-        worktreeRequest: AgentMCPStartWorktreeCoordinator.Request
+        worktreeRequest: AgentMCPStartWorktreeCoordinator.Request,
+        expiry: AgentRunStartExpiry, progress: StartProgress
     ) async throws -> [StartedExploreRun] {
         let targets = try await createFreshExploreTargets(
             count: messages.count,
@@ -297,6 +347,7 @@ struct AgentExploreMCPToolService {
         for (index, target) in targets.enumerated() {
             let message = messages[index]
             do {
+                try expiry.beginNextChild()
                 #if DEBUG
                     await testBeforeChildWorktreePreparation?(index, target)
                 #endif
@@ -312,20 +363,21 @@ struct AgentExploreMCPToolService {
                 )
                 let outcome: AgentExternalMCPRunStarter.StartOutcome
                 do {
-                    outcome = try await startExploreRun(target: target, message: message, context: context)
+                    outcome = try await startExploreRun(target: target, message: message, context: context, expiry: expiry)
                 } catch {
-                    throw startWorktreeCoordinator.providerStartError(
+                    throw error is AgentRunStartSetupTimeoutError ? error : startWorktreeCoordinator.providerStartError(
                         error,
                         targetSessionID: target.sessionID,
                         agentModeVM: context.agentModeVM
                     )
                 }
+                progress.sessionIDs.append(outcome.snapshot.sessionID)
                 started.append(StartedExploreRun(index: index, target: target, requestedMessage: message, outcome: outcome))
             } catch {
                 await context.agentModeVM.mcpDiscardSessionTarget(target)
                 let remainingTargets = Array(targets.dropFirst(index + 1))
                 await discardTargets(remainingTargets, agentModeVM: context.agentModeVM)
-                if error is CancellationError {
+                if error is CancellationError || error is AgentRunStartSetupTimeoutError {
                     throw error
                 }
                 guard !started.isEmpty else { throw error }
@@ -341,7 +393,8 @@ struct AgentExploreMCPToolService {
     private func startExploreRun(
         target: AgentModeViewModel.MCPSessionTarget,
         message: String,
-        context: ExploreStartContext
+        context: ExploreStartContext,
+        expiry: AgentRunStartExpiry
     ) async throws -> AgentExternalMCPRunStarter.StartOutcome {
         try await AgentRunMCPToolService.requireWritableWorkspaceAuthority(
             context.targetWindow.workspaceManager.domainAuthorityAdmissionIssue(
@@ -389,6 +442,7 @@ struct AgentExploreMCPToolService {
         // up from stored selections, exactly as `agent_run` start does. No rollback bookkeeping:
         // a failed explore start discards its target rather than restoring it. A role without a
         // pin resolves to an empty array, which stages nothing.
+        try expiry.throwIfExpired()
         _ = try context.agentModeVM.mcpStageModelParameterSelections(
             tabID: target.tabID,
             agentRaw: selection.agentRaw,
@@ -407,7 +461,8 @@ struct AgentExploreMCPToolService {
             nil,
             nil,
             nil,
-            routerSelectedTarget
+            routerSelectedTarget,
+            expiry
         )
         context.agentModeVM.mcpAcceptSessionTarget(target)
         return outcome
@@ -551,6 +606,10 @@ struct AgentExploreMCPToolService {
         agentModeVM: AgentModeViewModel
     ) async -> Value {
         let snapshots = await refreshedSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
+        return batchStartValue(sessionIDs: sessionIDs, result: result, snapshots: snapshots)
+    }
+
+    private func batchStartValue(sessionIDs: [UUID], result: String, snapshots: [AgentRunMCPSnapshot]) -> Value {
         let runningIDs = snapshots.filter { $0.status == .running }.map(\.sessionID)
         let terminalIDs = snapshots.filter(\.status.isTerminal).map(\.sessionID)
         let interestingIDs = snapshots.filter { $0.interaction != nil || $0.status.isTerminal }.map(\.sessionID)

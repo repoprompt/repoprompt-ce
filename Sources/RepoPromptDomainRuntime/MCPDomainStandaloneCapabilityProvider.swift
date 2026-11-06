@@ -292,13 +292,15 @@ package enum MCPDomainStandaloneToolInstaller {
                 if args["model"] != nil, args["model"]?.stringValue == nil {
                     throw MCPError.invalidParams("ask_oracle model must be a string")
                 }
+                let additionalOracles = try OracleAdditionalOraclesContract.parseArguments(args)
                 let route: OracleConversationRoute
                 do {
                     route = try OracleConversationRoute.resolve(
                         chatID: args["chat_id"]?.stringValue,
                         newChat: args["new_chat"]?.boolValue ?? false,
                         modelOverride: args["model"]?.stringValue,
-                        whenMissingChatID: .startNew
+                        whenMissingChatID: .startNew,
+                        additionalOracles: additionalOracles
                     )
                 } catch {
                     throw MCPError.invalidParams(error.localizedDescription)

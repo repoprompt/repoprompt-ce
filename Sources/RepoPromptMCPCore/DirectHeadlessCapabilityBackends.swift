@@ -737,11 +737,23 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
     func accessOracleUtilities(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
         let args = try request.mcpArguments()
         let op = args["op"]?.stringValue ?? "models"
-        let providers = await providerCoordinator.providerCatalog().map(\.value)
+        let providers = await providerCoordinator.providerCatalog()
+        let roster = try await oracleAdapter.configuredRoster()
+        let models: [Value] = roster.orderedModels.enumerated().map { index, model in
+            let provider = providers.first { $0.id == model.providerID }
+            return .object([
+                "id": .string(model.modelID),
+                "name": .string(OracleRosterContract.displayLabel(laneIndex: index)),
+                "role": .string(index == 0 ? "primary" : "additional"),
+                "provider_id": model.providerID.map(Value.string) ?? .null,
+                "available": .bool(provider?.executable != nil),
+                "reason": provider?.unavailableReason.map(Value.string) ?? .null
+            ])
+        }
         return try .object([
             "op": .string(op),
-            "models": .array(providers),
-            "providers": .array(providers),
+            "models": .array(models),
+            "providers": .array(providers.map(\.value)),
             "backend": .string("headless")
         ])
     }
@@ -754,18 +766,8 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
         switch try await oracleAdapter.consumePreparedRoute(request: request) {
         case .group:
             return try await .mcp(oracleAdapter.start(arguments: args, request: request))
-        case let .direct(modelID, _):
-            let (id, response) = try await providerCoordinator.createConversation(
-                providerID: args["provider"]?.stringValue,
-                message: message,
-                model: modelID,
-                request: request
-            )
-            return try .object([
-                "chat_id": .string(id.uuidString),
-                "response": .string(response),
-                "backend": .string("headless")
-            ])
+        case let .direct(modelID, conversationID):
+            return try await executeDirectConversation(modelID: modelID, conversationID: conversationID, message: message, request: request)
         }
     }
 
@@ -777,52 +779,35 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
         switch try await oracleAdapter.consumePreparedRoute(request: request) {
         case .group:
             return try await .mcp(oracleAdapter.continue(arguments: args, request: request))
-        case let .direct(modelID, implicitConversationID):
-            let result: (id: UUID, response: String)
-            if args["new_chat"]?.boolValue == true {
-                result = try await providerCoordinator.createConversation(
-                    providerID: nil,
-                    message: message,
-                    model: modelID,
-                    request: request
-                )
-            } else if let chatID = args["chat_id"]?.stringValue?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            {
-                guard let id = UUID(uuidString: chatID) else {
-                    throw MCPError.invalidParams("oracle_send requires a valid chat_id")
-                }
-                result = try await (
-                    id,
-                    providerCoordinator.continueConversation(
-                        id: id,
-                        message: message,
-                        request: request
-                    )
-                )
-            } else if let implicitConversationID {
-                result = try await (
-                    implicitConversationID,
-                    providerCoordinator.continueConversation(
-                        id: implicitConversationID,
-                        message: message,
-                        request: request
-                    )
-                )
-            } else {
-                result = try await providerCoordinator.createConversation(
-                    providerID: nil,
-                    message: message,
-                    model: modelID,
-                    request: request
-                )
-            }
-            return try .object([
-                "chat_id": .string(result.id.uuidString),
-                "response": .string(result.response),
-                "backend": .string("headless")
-            ])
+        case let .direct(modelID, conversationID):
+            return try await executeDirectConversation(modelID: modelID, conversationID: conversationID, message: message, request: request)
         }
+    }
+
+    private func executeDirectConversation(
+        modelID: String,
+        conversationID: UUID?,
+        message: String,
+        request: DomainPhysicalToolRequest
+    ) async throws -> DomainPhysicalToolResult {
+        let result: (id: UUID, response: String) = if let conversationID {
+            try await (
+                conversationID,
+                providerCoordinator.continueConversation(id: conversationID, message: message, request: request)
+            )
+        } else {
+            try await providerCoordinator.createConversation(
+                providerID: nil,
+                message: message,
+                model: modelID,
+                request: request
+            )
+        }
+        return try .object([
+            "chat_id": .string(result.id.uuidString),
+            "response": .string(result.response),
+            "backend": .string("headless")
+        ])
     }
 
     func readOracleLog(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {

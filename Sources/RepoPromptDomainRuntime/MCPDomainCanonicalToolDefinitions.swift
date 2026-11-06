@@ -1129,6 +1129,7 @@ package enum MCPDomainCanonicalToolDefinitions {
         return (canonicalize ? definitions.map(canonicalizeGlobalSemantics) : definitions)
             .map(advertiseModelParameters)
             .map(advertiseOracleAttachments)
+            .map(advertiseAdditionalOracles)
             .map(advertiseWorktreeListPagination)
             .map(advertiseDefaultRepositoryElection)
             .map(advertiseSessionDiscovery)
@@ -1255,6 +1256,24 @@ package enum MCPDomainCanonicalToolDefinitions {
             name: definition.name,
             description: definition.description
                 + "\n\n**Cursor parameters**: `\(operations)` accept `model_parameters` as exact `config_id` and `value` pairs for app-backed Cursor sessions. Discover choices in `agent_manage.list_agents`; catalog `current_value` is the catalog default, not a live session value. Selections are applied before prompting and returned in session snapshots. Standalone headless sessions reject parameter overrides.",
+            inputSchema: .object(schema),
+            annotations: definition.annotations,
+            isEnabledByDefault: definition.isEnabledByDefault
+        )
+    }
+
+    private static func advertiseAdditionalOracles(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        guard OracleAttachmentContract.oracleToolNames.contains(definition.name),
+              case var .object(schema) = definition.inputSchema,
+              case var .object(properties)? = schema["properties"]
+        else { return definition }
+        properties[OracleAdditionalOraclesContract.argumentName] = OracleAdditionalOraclesContract.schemaProperty()
+        schema["properties"] = .object(properties)
+        return MCPDomainToolDefinition(
+            name: definition.name,
+            description: definition.description,
             inputSchema: .object(schema),
             annotations: definition.annotations,
             isEnabledByDefault: definition.isEnabledByDefault
