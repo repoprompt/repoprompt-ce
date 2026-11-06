@@ -43,6 +43,24 @@ struct AgentSessionLinkPassiveStatusNotices {
         let isEffectivelySelected: Bool
     }
 
+    /// Supplemental cached facts, not an occurrence, proof of liveness, or independently owed data.
+    /// Nil on a row means unmanaged; nil fields inside this value mean explicitly unknown.
+    struct ManagedMetadata: Hashable {
+        let contextUsedPercent: Double?
+        let contextCountConfidence: DomainAgentSessionContextLoad.Confidence?
+        let runOutcome: DomainAgentSessionLaneBoard.RunOutcome
+        let hasPendingInteraction: Bool
+        let directRunningHelperCount: Int?
+
+        init(_ observation: DomainAgentSessionObservationSnapshot) {
+            contextUsedPercent = observation.context?.usedPercent
+            contextCountConfidence = observation.context?.confidence
+            runOutcome = observation.board.runOutcome
+            hasPendingInteraction = observation.hasPendingInteraction
+            directRunningHelperCount = observation.board.directRunningHelperCount
+        }
+    }
+
     struct Sample: Hashable {
         let reference: DomainAgentSessionLinkReference
         let targetEndpoint: DomainAgentSessionLinkEndpointIdentity
@@ -60,6 +78,30 @@ struct AgentSessionLinkPassiveStatusNotices {
         let latestVisibleAssistantPreview: String?
         /// Proof from this exact publication only; nil never means zero.
         var runFacts: AgentRunQuietFacts?
+        let managedMetadata: ManagedMetadata?
+
+        /// Supplemental values refresh presentation separately, never observation identity.
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.reference == rhs.reference && lhs.targetEndpoint == rhs.targetEndpoint
+                && lhs.targetSessionID == rhs.targetSessionID && lhs.displayName == rhs.displayName
+                && lhs.status == rhs.status && lhs.idleForSend == rhs.idleForSend
+                && lhs.idleSince == rhs.idleSince && lhs.waitingOn == rhs.waitingOn
+                && lhs.latestVisibleAssistantPreview == rhs.latestVisibleAssistantPreview
+                && lhs.runFacts == rhs.runFacts
+        }
+
+        func hash(into hasher: inout Hasher) {
+            hasher.combine(reference)
+            hasher.combine(targetEndpoint)
+            hasher.combine(targetSessionID)
+            hasher.combine(displayName)
+            hasher.combine(status)
+            hasher.combine(idleForSend)
+            hasher.combine(idleSince)
+            hasher.combine(waitingOn)
+            hasher.combine(latestVisibleAssistantPreview)
+            hasher.combine(runFacts)
+        }
 
         init(
             reference: DomainAgentSessionLinkReference,
@@ -71,8 +113,10 @@ struct AgentSessionLinkPassiveStatusNotices {
             idleSince: Date? = nil,
             waitingOn: DomainAgentSessionWaitingOn? = nil,
             latestVisibleAssistantPreview: String? = nil,
-            runFacts: AgentRunQuietFacts? = nil
+            runFacts: AgentRunQuietFacts? = nil,
+            managedMetadata: ManagedMetadata? = nil
         ) {
+            self.managedMetadata = managedMetadata
             self.runFacts = runFacts
             self.reference = reference
             self.targetEndpoint = targetEndpoint
@@ -111,6 +155,8 @@ struct AgentSessionLinkPassiveStatusNotices {
         let idleSince: Date?
         let waitingOn: DomainAgentSessionWaitingOn?
         let latestVisibleAssistantPreview: String?
+        /// Receipt-neutral decoration: refreshing it never advances either sequence or timestamp.
+        fileprivate(set) var managedMetadata: ManagedMetadata?
         let changeSequence: UInt64
         /// Identity of the *status edge* that created or last advanced this entry.
         ///
@@ -187,8 +233,10 @@ struct AgentSessionLinkPassiveStatusNotices {
             runFacts: AgentRunQuietFacts? = nil,
             receiptSettledThrough: UInt64? = nil,
             ordinaryThrough: UInt64? = nil,
-            openingSettledThrough: UInt64? = nil
+            openingSettledThrough: UInt64? = nil,
+            managedMetadata: ManagedMetadata? = nil
         ) {
+            self.managedMetadata = managedMetadata
             self.runFacts = runFacts
             self.receiptSettledThrough = receiptSettledThrough ?? runFacts?.settledThrough
             self.ordinaryThrough = ordinaryThrough ?? runFacts?.ordinaryThrough
@@ -245,6 +293,7 @@ struct AgentSessionLinkPassiveStatusNotices {
         let idleSince: Date?
         let waitingOn: DomainAgentSessionWaitingOn?
         let latestVisibleAssistantPreview: String?
+        fileprivate(set) var managedMetadata: ManagedMetadata?
 
         var reference: DomainAgentSessionLinkReference {
             occurrence.reference
@@ -261,8 +310,10 @@ struct AgentSessionLinkPassiveStatusNotices {
             idleForSend: Bool = false,
             idleSince: Date? = nil,
             waitingOn: DomainAgentSessionWaitingOn? = nil,
-            latestVisibleAssistantPreview: String? = nil
+            latestVisibleAssistantPreview: String? = nil,
+            managedMetadata: ManagedMetadata? = nil
         ) {
+            self.managedMetadata = managedMetadata
             self.occurrence = occurrence
             self.targetEndpoint = targetEndpoint
             self.targetSessionID = targetSessionID
@@ -288,7 +339,8 @@ struct AgentSessionLinkPassiveStatusNotices {
                 idleForSend: sample.idleForSend,
                 idleSince: sample.idleSince,
                 waitingOn: sample.waitingOn,
-                latestVisibleAssistantPreview: sample.latestVisibleAssistantPreview
+                latestVisibleAssistantPreview: sample.latestVisibleAssistantPreview,
+                managedMetadata: sample.managedMetadata
             )
         }
 
@@ -819,6 +871,12 @@ struct AgentSessionLinkPassiveStatusNotices {
             let priorStatus = preceding?.status == .unavailable ? sample.status : preceding?.status ?? sample.status
             let statusChanged = priorStatus != sample.status
             let immediateEdge = PendingEntry.isStatusEdge(from: priorStatus, to: sample.status)
+            // Decoration is not status debt. Preserve occurrence/receipt identity and the status
+            // timestamp even when a provider already holds a frozen claim with older cached facts.
+            if let entry = pendingByReference[reference], entry.managedMetadata != sample.managedMetadata {
+                pendingByReference[reference]?.managedMetadata = sample.managedMetadata
+                changed = true
+            }
             let oldEntry = pendingByReference[reference]
             let known = sample.runFacts ?? preceding?.lastKnownRunFacts
             // First proof baselines a fresh lane, never an already-observed unpaid status edge.
@@ -849,6 +907,9 @@ struct AgentSessionLinkPassiveStatusNotices {
             )
             if let attention = pendingAttentionByReference[reference], !attention.hasSameCurrentMetadata(as: sample) {
                 pendingAttentionByReference[reference] = attention.refreshed(from: sample, observedAt: observedAt)
+                changed = true
+            } else if let attention = pendingAttentionByReference[reference], attention.managedMetadata != sample.managedMetadata {
+                pendingAttentionByReference[reference]?.managedMetadata = sample.managedMetadata
                 changed = true
             }
             // A first observation is a silent baseline, but a surviving position returning from an
@@ -919,7 +980,8 @@ struct AgentSessionLinkPassiveStatusNotices {
                 changeSequence: preservesStatusReceipt ? oldEntry?.changeSequence ?? nextChangeSequence : nextChangeSequence,
                 edgeSequence: advancesEdge ? nextChangeSequence : oldEntry?.edgeSequence ?? nextChangeSequence,
                 runFacts: sample.runFacts, receiptSettledThrough: cutoff,
-                ordinaryThrough: ordinary, openingSettledThrough: opening
+                ordinaryThrough: ordinary, openingSettledThrough: opening,
+                managedMetadata: sample.managedMetadata
             )
             changed = true
         }
@@ -983,7 +1045,8 @@ struct AgentSessionLinkPassiveStatusNotices {
             idleForSend: observation.sample.idleForSend,
             idleSince: observation.sample.idleSince,
             waitingOn: observation.sample.waitingOn,
-            latestVisibleAssistantPreview: observation.sample.latestVisibleAssistantPreview
+            latestVisibleAssistantPreview: observation.sample.latestVisibleAssistantPreview,
+            managedMetadata: observation.sample.managedMetadata
         )
         advanceQueueRevision()
         return .accepted
@@ -1034,7 +1097,8 @@ struct AgentSessionLinkPassiveStatusNotices {
                     idleForSend: current.idleForSend, idleSince: current.idleSince, waitingOn: current.waitingOn,
                     latestVisibleAssistantPreview: current.latestVisibleAssistantPreview,
                     changeSequence: nextChangeSequence, edgeSequence: current.edgeSequence,
-                    ordinaryThrough: current.ordinaryThrough
+                    ordinaryThrough: current.ordinaryThrough,
+                    managedMetadata: current.managedMetadata
                 )
                 changed = true
             }

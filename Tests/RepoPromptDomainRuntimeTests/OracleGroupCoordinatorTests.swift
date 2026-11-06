@@ -1,8 +1,63 @@
 import Foundation
+import os
 @testable import RepoPromptDomainRuntime
 import XCTest
 
 final class OracleGroupCoordinatorTests: XCTestCase {
+    func testFinalLaneDurationsExcludeProgressAndFreezeBeforeFailureNormalization() async throws {
+        let clock = OSAllocatedUnfairLock(initialState: ContinuousClock.now)
+        let release = TimingEntryGate()
+        let replyID = UUID()
+        let fixture = try makeFixture(count: 2) { lane in
+            clock.withLock { $0 = $0.advanced(by: lane == 0 ? .milliseconds(1250) : .seconds(2)) }
+            if lane == 1 { throw OracleLaneFailure(message: "failure") }
+            return OracleLaneExecutionResponse(response: "silent success", assistantReplyID: replyID)
+        }
+        let result = try await OracleGroupCoordinator().execute(
+            group: fixture.group, turnID: OracleTurnID(), input: fixture.input,
+            plans: fixture.plans, elapsedNow: { clock.withLock { $0 } },
+            progress: { event in
+                if event.kind == .laneStarted, event.laneID?.index == 1 {
+                    await release.wait()
+                }
+                if event.kind == .laneSettled, event.laneID?.index == 0 {
+                    clock.withLock { $0 = $0.advanced(by: .seconds(10)) }
+                    await release.open()
+                }
+            }
+        )
+        XCTAssertEqual(result.oracleResults.map(\.elapsedSeconds), [1.25, 2])
+        XCTAssertEqual(result.oracleResults.map(\.assistantReplyID), [replyID, nil])
+        XCTAssertEqual(result.oracleResults.map(\.status), [.completed, .failed])
+    }
+
+    func testCancellationBeforeEntryHasNoElapsed() async throws {
+        let fixture = try makeFixture(count: 2) { _ in
+            XCTFail("Cancelled lane must not enter")
+            return OracleLaneExecutionResponse(response: "unexpected")
+        }
+        let enteredProgress = TimingEntryGate()
+        let release = TimingEntryGate()
+        let task = Task {
+            try await OracleGroupCoordinator().execute(
+                group: fixture.group, turnID: OracleTurnID(), input: fixture.input,
+                plans: fixture.plans,
+                progress: { event in
+                    if event.kind == .groupPrepared {
+                        await enteredProgress.open()
+                        await release.wait()
+                    }
+                }
+            )
+        }
+        await enteredProgress.wait()
+        task.cancel()
+        await release.open()
+        let result = try await task.value
+        XCTAssertEqual(result.oracleResults.map(\.elapsedSeconds), [nil, nil])
+        XCTAssertEqual(result.oracleResults.map(\.status), [.cancelled, .cancelled])
+    }
+
     func testRejectsNoncontiguousLanePlans() async throws {
         let fixture = try makeFixture(count: 2)
 
@@ -261,6 +316,22 @@ final class OracleGroupCoordinatorTests: XCTestCase {
             )
         }
         return (group, input, plans)
+    }
+}
+
+private actor TimingEntryGate {
+    private var opened = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if opened { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        opened = true
+        waiters.forEach { $0.resume() }
+        waiters.removeAll()
     }
 }
 

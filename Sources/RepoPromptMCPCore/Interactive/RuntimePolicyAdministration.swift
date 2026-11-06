@@ -173,7 +173,8 @@ package enum RuntimePolicyAdministration {
             eventDirectory: root.appendingPathComponent("Events", isDirectory: true),
             temporaryDirectory: MCPFilesystemIdentity.current.temporaryRootURL(),
             externalReloadInterval: nil,
-            metadataPathPolicy: pathPolicy
+            metadataPathPolicy: pathPolicy,
+            durableReplacementGuard: .composeTabLoss { try pathPolicy?.validate($0) }
         ))
     }
 

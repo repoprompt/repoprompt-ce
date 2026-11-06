@@ -318,6 +318,7 @@ class WindowState: ObservableObject {
     private var wantsAgentTitlebarAccessory: Bool = false
     /// Action to call when the "New Session" button is tapped
     private var agentNewSessionAction: (() -> Void)?
+    private var isAgentSidebarCollapsed = false
     /// Narrow titlebar state observed only by the principal toolbar title cluster.
     let agentChatTitleCluster = AgentChatTitleClusterModel(title: WindowTitleFormatter.defaultTitle)
 
@@ -328,6 +329,11 @@ class WindowState: ObservableObject {
     /// Durable restorable identity is separate from the fail-closed live routing pair. Never mix
     /// an incoming workspace's metadata with an outgoing assignment during publication/listener gaps.
     private var lastCoherentSessionEntry: WindowSessionEntry?
+
+    /// This window's MCP tools request as it stood when the app began terminating (#143). Quit
+    /// teardown (`stopAllServers`) clears the live request, which is not the user's choice, so
+    /// every capture after the termination fence records this value instead.
+    private var terminationMCPToolsPreference: Bool?
 
     /// The instance number for the current workspace; nil while the assignment belongs to another.
     var workspaceInstanceNumber: Int? {
@@ -860,6 +866,19 @@ class WindowState: ObservableObject {
         workspaceManager.onNonStartupWorkspaceActivationRequested = { [weak self] in
             self?.retirePendingRestoreEntry()
         }
+
+        // The per-window MCP tools switch is part of the saved window session (#143), so a change
+        // re-captures the session like a workspace switch does. This observes the requested
+        // intent that capture records, not registration state: a pending or failed registration
+        // must not hide the user's change. The subject only emits real changes (no initial value),
+        // synchronously on the main actor. Persistence stays gated during restore, so the
+        // auto-start seeding at launch cannot overwrite the saved snapshot, and quit teardown
+        // disabling every window's tools is not a user change worth persisting.
+        mcpServer.windowToolsRequestChanges
+            .sink { [weak self] _ in
+                self?.mcpToolsRequestDidChange()
+            }
+            .store(in: &cancellables)
 
         // Process any queued commands once the workspace is initialized
         workspaceManager.onceInitialized { [weak self] in
@@ -1703,6 +1722,13 @@ class WindowState: ObservableObject {
         }
     }
 
+    /// Tells the accessory the sidebar was hidden or shown: compose moves into it while hidden.
+    func setAgentSidebarCollapsed(_ collapsed: Bool) {
+        guard isAgentSidebarCollapsed != collapsed else { return }
+        isAgentSidebarCollapsed = collapsed
+        applyAgentTitlebarAccessoryIfPossible()
+    }
+
     /// Installs the titlebar accessory if conditions are met (Agent mode active + window attached)
     private func applyAgentTitlebarAccessoryIfPossible() {
         guard !shouldSuppressObservationSideEffects,
@@ -1713,13 +1739,29 @@ class WindowState: ObservableObject {
             return
         }
 
+        let windowID = windowID
+        let toggleSidebar = {
+            NotificationCenter.default.post(
+                name: .toggleRepoPromptNavigationSidebar,
+                object: nil,
+                userInfo: ["windowID": windowID]
+            )
+        }
         if let existing = agentTitlebarAccessory {
-            existing.update(onNewSession: action)
+            existing.update(
+                isSidebarCollapsed: isAgentSidebarCollapsed,
+                onToggleSidebar: toggleSidebar,
+                onNewSession: action
+            )
             if !window.titlebarAccessoryViewControllers.contains(where: { $0 === existing }) {
                 window.addTitlebarAccessoryViewController(existing)
             }
         } else {
-            let accessory = AgentModeTitlebarAccessoryViewController(onNewSession: action)
+            let accessory = AgentModeTitlebarAccessoryViewController(
+                isSidebarCollapsed: isAgentSidebarCollapsed,
+                onToggleSidebar: toggleSidebar,
+                onNewSession: action
+            )
             window.addTitlebarAccessoryViewController(accessory)
             agentTitlebarAccessory = accessory
         }
@@ -1863,7 +1905,22 @@ class WindowState: ObservableObject {
         windowStatesManager?.windowRestoreExecutionDidChange()
         displacedCompletion?()
         StartupPhaseLog.mark(.restoreEntryAssigned, window: windowID)
+        applyRestoredMCPToolsPreference(entry.mcpToolsEnabled)
         applyPendingRestoreEntryIfPossible()
+    }
+
+    /// A restored window keeps its own MCP tools switch (#143). The preference is independent of
+    /// the workspace the entry names, so it applies at acceptance rather than after the switch.
+    /// New windows keep seeding from the global default inside `MCPServerViewModel`; a `nil`
+    /// (legacy) preference leaves that seeding untouched, and the global default is never written.
+    private func applyRestoredMCPToolsPreference(_ preference: Bool?) {
+        guard let preference else { return }
+        // Compared inside the task so the view model's own auto-start seeding task, enqueued at
+        // composition, has already recorded its intent; a redundant transition is then skipped.
+        Task { [weak self] in
+            guard let self, preference != mcpServer.windowToolsAreRequested else { return }
+            _ = await mcpServer.setWindowToolsEnabled(preference)
+        }
     }
 
     /// Completes a not-yet-dispatched restore exactly once without dispatching it. Its protection
@@ -2020,8 +2077,31 @@ class WindowState: ObservableObject {
             isEphemeral: workspace.isEphemeral,
             primaryRepoPath: workspace.repoPaths.first.map { ($0 as NSString).expandingTildeInPath },
             lastFocused: isCurrentlyFocused,
-            workspaceInstanceNumber: workspaceInstanceNumber(for: workspace.id)
+            workspaceInstanceNumber: workspaceInstanceNumber(for: workspace.id),
+            mcpToolsEnabled: terminationMCPToolsPreference ?? mcpServer.windowToolsAreRequested
         )
+    }
+
+    private func mcpToolsRequestDidChange() {
+        guard !isClosing, !(windowStatesManager ?? WindowStatesManager.shared).isTerminating else { return }
+        #if DEBUG
+            mcpToolsPersistRequestObserverForTesting?(sessionCaptureCandidate().entry)
+        #endif
+        windowStatesManager?.persistWindowSession(reason: "mcpToolsEnabled:\(windowID)")
+    }
+
+    #if DEBUG
+        /// Receives the entry session capture would record each time an MCP tools intent change
+        /// requests persistence, so tests can write it through the real session writer.
+        var mcpToolsPersistRequestObserverForTesting: ((WindowSessionEntry?) -> Void)?
+    #endif
+
+    /// Pins the MCP tools request for every session capture from here on. Called synchronously by
+    /// `WindowStatesManager.signalTermination()` before `stopAllServers()` clears the live request;
+    /// idempotent, so the `applicationWillTerminate` fallback cannot re-pin a torn-down value.
+    func freezeMCPToolsPreferenceForTermination() {
+        guard terminationMCPToolsPreference == nil else { return }
+        terminationMCPToolsPreference = mcpServer.windowToolsAreRequested
     }
 
     /// Assignment installation captures immediately, even if no ordinary persist happened before
@@ -3099,8 +3179,9 @@ class WindowState: ObservableObject {
 
         _ = surface
 
+        // An agent asking a question reaches here automatically, so it must not end typing.
         if promptManager.activeComposeTabID != tabID {
-            await promptManager.switchComposeTab(tabID)
+            await promptManager.switchComposeTab(tabID, focusIntent: .preservesLiveText)
         }
 
         return true

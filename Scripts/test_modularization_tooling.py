@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -196,16 +197,23 @@ class CatalogTests(unittest.TestCase):
             self.assertEqual(affected.select(root, ['Sources/Core/Core.swift'], catalog), ['CoreTests'])
             self.assertEqual(affected.select(root, ['Package.swift'], catalog), ['CoreTests'])
 
-    def test_conductor_passes_timing_policy_to_ci_child(self) -> None:
+    def test_conductor_passes_timing_policy_and_pinned_toolchain_to_ci_children(self) -> None:
         registry = conductor.OperationRegistry(SCRIPT_DIR.parent)
-        with mock.patch.dict('os.environ', {'TYPECHECK_RATCHET_ENFORCE': '0'}):
+        pin = '/Applications/Xcode_26.6.app/Contents/Developer'
+        with mock.patch.dict('os.environ', {'TYPECHECK_RATCHET_ENFORCE': '0', 'DEVELOPER_DIR': pin}):
             snapshot = registry.client_env_snapshot()
         self.assertEqual(snapshot['TYPECHECK_RATCHET_ENFORCE'], '0')
-        argv, _, _, env, _ = registry.prepare({
-            'operation': 'ci-build-tests', 'args': {}, 'env': snapshot,
-        })
-        self.assertEqual(Path(argv[1]).name, 'modularization_ci_build.py')
-        self.assertEqual(env['TYPECHECK_RATCHET_ENFORCE'], '0')
+        self.assertEqual(snapshot['DEVELOPER_DIR'], pin)
+        for operation, args in (('ci-build-tests', {}), ('ci-shard', {'shardCount': 4, 'shardIndex': 1}),
+                                ('swift-build', {'product': 'RepoPrompt'}), ('test', {}), ('provider-test', {})):
+            with self.subTest(operation=operation):
+                argv, _, _, env, _ = registry.prepare({
+                    'operation': operation, 'args': args, 'env': snapshot,
+                })
+                if operation == 'ci-build-tests':
+                    self.assertEqual(Path(argv[1]).name, 'modularization_ci_build.py')
+                self.assertEqual(env['TYPECHECK_RATCHET_ENFORCE'], '0')
+                self.assertEqual(env['DEVELOPER_DIR'], pin)
 
     def test_conductor_transports_execution_location_ui_smoke_env(self) -> None:
         registry = conductor.OperationRegistry(SCRIPT_DIR.parent)
@@ -358,26 +366,105 @@ class CatalogTests(unittest.TestCase):
         self.assertNotIn('compression-level:', cache_save)
         self.assertNotIn('if-no-files-found:', cache_save)
 
-    def test_required_style_is_final_and_mac_job_budget_is_seven(self) -> None:
+    def test_required_style_retains_core_and_sentry_without_release_builds(self) -> None:
         ci = (SCRIPT_DIR.parent / '.github/workflows/ci.yml').read_text()
         final = ci.split('  style:', 1)[1].split('  secret-scan:', 1)[0]
         self.assertIn('name: Style', final)
-        self.assertIn('needs: [candidate, build-test-bundles, build-and-test, secret-scan, integration-products]', final)
+        self.assertIn('needs: [candidate, workflow-contracts, build-test-bundles, build-and-test, secret-scan, integration-products]', final)
         self.assertIn('if: always()', final)
         self.assertIn('ci_test_coverage.py', final)
-        self.assertEqual(ci.count('runs-on: macos-26'), 2)  # shared root build + 4 matrix children
+        self.assertEqual(ci.count('runs-on: macos-26\n'), 2)  # shared root build + four-worker matrix template
         products = (SCRIPT_DIR.parent / '.github/workflows/ci-integration-products.yml').read_text()
-        self.assertEqual(products.count('runs-on: macos-26'), 2)  # Sentry/privacy + release package/smoke
+        self.assertEqual(products.count('runs-on: macos-26\n'), 1)  # Sentry/privacy only
+        self.assertIn('SentryTelemetryPrivacyTests', products)
+        self.assertNotIn('release artifact', products)
+        self.assertNotIn('macos-compatibility.yml', products)
         self.assertNotIn('continue-on-error', products)
-        self.assertIn('shard: [1, 2, 3, 4]', ci)
+        worker = ci.split('\n  build-and-test:\n', 1)[1].split('\n  style:\n', 1)[0]
+        self.assertIn('shard: [1, 2, 3, 4]', worker)
+        self.assertIn('fail-fast: false', worker)
+        self.assertIn('--shard-count 4 --shard-index ${{ matrix.shard }} --timeout 1800', worker)
         self.assertNotIn('continue-on-error', ci)
         for line in ci.splitlines():
-            if line.startswith('    name:'):
+            if line.startswith('    name:') and line != '    name: Test Root Shard (No Build) (${{ matrix.shard }})':
                 self.assertNotIn('${{', line)
 
+    def test_partial_reruns_select_successful_producer_outputs_after_prerequisite_report(self) -> None:
+        root = SCRIPT_DIR.parent / '.github/workflows'
+        ci = (root / 'ci.yml').read_text()
+        products = (root / 'ci-integration-products.yml').read_text()
+        self.assertNotIn('fromJSON(', ci)
+        self.assertNotIn('fromJSON(', products)
+        worker = ci.split('\n  build-and-test:\n', 1)[1].split('\n  style:\n', 1)[0]
+        self.assertIn('needs.build-test-bundles.outputs.context', worker)
+        self.assertIn('steps.selected.outputs.build_artifact', worker)
+        self.assertIn('--check-toolchain', worker)
+        final = ci.split('\n  style:\n', 1)[1].split('\n  secret-scan:\n', 1)[0]
+        self.assertLess(final.index('ci_job_diagnostics.py prerequisites'), final.index('ci_admission.py select'))
+        self.assertIn('steps.selected.outputs.coverage_artifact', final)
+        self.assertIn('toJSON(needs.build-and-test.outputs)', final)
+        for shard in range(1, 5):
+            self.assertIn(f'steps.selected.outputs.receipt_artifact_{shard}', final)
+        self.assertNotIn('pattern:', final)
+        contracts = ci.split('\n  workflow-contracts:\n', 1)[1].split('\n  integration-products:\n', 1)[0]
+        self.assertIn('make ci-portable-selftest', contracts)
+        self.assertIn('Scripts/test_modularization_tooling.py', (SCRIPT_DIR.parent / 'Makefile').read_text().split('ci-workflow-selftest:', 1)[1].split('\n\n', 1)[0])
+
+    def test_contract_failure_never_suppresses_the_main_commit_range_secret_scan(self) -> None:
+        ci = (SCRIPT_DIR.parent / '.github/workflows/ci.yml').read_text()
+        candidate = ci.split('\n  candidate:\n', 1)[1].split('\n  workflow-contracts:\n', 1)[0]
+        self.assertNotIn('make ci-workflow-selftest', candidate)
+        secret = ci.split('\n  secret-scan:\n', 1)[1].split('    steps:', 1)[0]
+        self.assertIn('    needs: candidate\n', secret)
+        self.assertNotIn('workflow-contracts', secret)
+        build = ci.split('\n  build-test-bundles:\n', 1)[1].split('    steps:', 1)[0]
+        self.assertIn('    needs: [candidate, workflow-contracts, secret-scan]\n', build)
+
+    def test_main_coalescing_preserves_scans_and_running_work(self) -> None:
+        ci = (SCRIPT_DIR.parent / '.github/workflows/ci.yml').read_text()
+        for name in ('candidate', 'workflow-contracts', 'secret-scan', 'style'):
+            job = re.split(r'\n  [a-z][\w-]*:\n', ci.split(f'\n  {name}:\n', 1)[1], maxsplit=1)[0]
+            self.assertNotIn('concurrency:', job, name)
+        for name, group in (('build-test-bundles', 'build'), ('build-and-test', 'tests'),
+                            ('integration-products', 'sentry')):
+            job = re.split(r'\n  [a-z][\w-]*:\n', ci.split(f'\n  {name}:\n', 1)[1], maxsplit=1)[0]
+            self.assertIn(f'group: ci-{group}-', job)
+            self.assertIn("github.event_name == 'push'", job)
+            self.assertIn("github.ref == 'refs/heads/main'", job)
+            self.assertIn("github.run_attempt == '1'", job)
+            self.assertIn("'main' || github.run_id", job)
+            self.assertIn('cancel-in-progress: false', job)
+
+    def test_portable_checks_run_before_mac_allocation_without_duplicate_suites(self) -> None:
+        ci = (SCRIPT_DIR.parent / '.github/workflows/ci.yml').read_text()
+        contracts = ci.split('\n  workflow-contracts:\n', 1)[1].split('\n  integration-products:\n', 1)[0]
+        build = ci.split('\n  build-test-bundles:\n', 1)[1].split('\n  build-and-test:\n', 1)[0]
+        self.assertIn('make guardrails', build)
+        self.assertLess(build.index('make guardrails'), build.index('Resolve dependency downloads'))
+        self.assertIn('make codex-schema-check', contracts)
+        self.assertNotIn('make conductor-selftest', build)
+        self.assertNotIn('make release-selftest', build)
+        self.assertIn('make ci-macos-selftest', build)
+        commands = subprocess.run(['make', '--no-print-directory', '-n', 'ci-portable-selftest'],
+                                  cwd=SCRIPT_DIR.parent, capture_output=True, text=True, check=True).stdout.splitlines()
+        tests = [line.strip() for line in commands if line.startswith(('python3 ', './Scripts/test_'))]
+        self.assertEqual(len(tests), len(set(tests)), 'portable suites must not run twice through nested Make targets')
+        for script in ('test_ci_admission.py', 'test_ci_job_diagnostics.py', 'test_ci_app_test_runner.py',
+                       'test_ci_test_coverage.py', 'test_ci_resolve_packages.py', 'test_modularization_tooling.py',
+                       'test_conductor_heavy_admission.py', 'test_release_tooling.py'):
+            self.assertTrue(any(script in line for line in tests), script)
+        self.assertFalse(any('test_local_production_installer.py' in line or 'Scripts/test_tip_history.py' in line
+                             for line in tests), 'Apple plutil/ICU checks must stay on macOS')
+        native = subprocess.run(['make', '--no-print-directory', '-n', 'ci-macos-selftest'],
+                                cwd=SCRIPT_DIR.parent, capture_output=True, text=True, check=True).stdout
+        self.assertIn('Scripts/test_local_production_installer.py', native)
+        self.assertIn('Scripts/test_tip_history.py', native)
+        self.assertIn('ArchiveTests.test_real_ditto_and_codesign_reject_unsigned_fixture_without_running_it', native)
+        self.assertIn('Scripts/test_modularization_index_graph.py LibraryBindingTests', native)
+
     def test_supplemental_product_workflows_are_manual_only(self) -> None:
-        # The integration profile above already gates both products. Automatic
-        # copies consume scarce macOS runners without adding an admission gate.
+        # Sentry is already blocking; universal qualification belongs to publication
+        # or an explicit diagnostic, not another automatic copy per push.
         for name in ('ci-main.yml', 'release-candidate.yml'):
             with self.subTest(workflow=name):
                 workflow = (SCRIPT_DIR.parent / '.github/workflows' / name).read_text()
@@ -388,8 +475,8 @@ class CatalogTests(unittest.TestCase):
         # The old 120-minute job killed a valid four-hour operation on main.
         # Compare the independent owners rather than pinning another timeout copy.
         root = SCRIPT_DIR.parent
-        products = (root / '.github/workflows/ci-integration-products.yml').read_text()
-        package = products.split('\n  package:\n', 1)[1]
+        products = (root / '.github/workflows/release-candidate.yml').read_text()
+        package = products.split('\n  artifact:\n', 1)[1]
         job_seconds = int(package.split('    timeout-minutes:', 1)[1].splitlines()[0]) * 60
         step = package.split('      - name: Package secret-free universal ad-hoc release candidate\n', 1)[1]
         step = step.split('\n      - name:', 1)[0]
@@ -400,22 +487,28 @@ class CatalogTests(unittest.TestCase):
         self.assertGreaterEqual(job_seconds, step_seconds + 15 * 60,
                                 'Preflight, smoke, and diagnostic upload need time outside the package step')
 
-    def test_style_shell_rejects_each_failed_cancelled_or_skipped_obligation(self) -> None:
+    def test_style_command_rejects_each_failed_cancelled_or_skipped_obligation(self) -> None:
         import os
         import textwrap
+        import ci_job_diagnostics
         ci = (SCRIPT_DIR.parent / '.github/workflows/ci.yml').read_text()
-        gate = ci.split('      - name: Fail if a prerequisite failed or was skipped', 1)[1]
-        script = textwrap.dedent(gate.split('        run: |\n', 1)[1].split('\n      - name:', 1)[0])
-        keys = ('CANDIDATE_RESULT', 'PRODUCTS_RESULT', 'BUILD_RESULT', 'SHARD_RESULT', 'SECRET_RESULT')
+        gate = ci.split('      - name: Report prerequisites and release eligibility', 1)[1]
+        command = textwrap.dedent(gate.split('        run: |\n', 1)[1].split('\n      - name:', 1)[0])
+        needs = {key: {'result': 'success', 'outputs': {}} for key in ci_job_diagnostics.JOBS}
         with tempfile.TemporaryDirectory() as directory:
-            env = {**os.environ, **dict.fromkeys(keys, 'success'), 'GITHUB_STEP_SUMMARY': directory + '/summary'}
-            self.assertEqual(subprocess.run(['bash', '-c', script], env=env, capture_output=True).returncode, 0)
-            for key in keys:
+            env = {**{k: v for k, v in os.environ.items() if not k.startswith('GITHUB_')}, 'HOME': directory, 'NEEDS_CONTEXT': json.dumps(needs), 'GITHUB_STEP_SUMMARY': directory + '/summary',
+                   'GITHUB_SERVER_URL': 'https://github.com', 'GITHUB_REPOSITORY': 'example/repo',
+                   'GITHUB_RUN_ID': '42', 'GITHUB_RUN_ATTEMPT': '2', 'GITHUB_EVENT_NAME': 'push'}
+            self.assertEqual(subprocess.run(['bash', '-c', command], cwd=SCRIPT_DIR.parent,
+                                           env=env, capture_output=True).returncode, 0)
+            for key in needs:
                 for result in ('failure', 'cancelled', 'skipped'):
                     with self.subTest(obligation=key, result=result):
-                        run = subprocess.run(['bash', '-c', script], env={**env, key: result}, capture_output=True)
+                        changed = {**needs, key: {'result': result}}
+                        run = subprocess.run(['bash', '-c', command], cwd=SCRIPT_DIR.parent,
+                                             env={**env, 'NEEDS_CONTEXT': json.dumps(changed)}, capture_output=True)
                         self.assertNotEqual(run.returncode, 0)
-                        self.assertIn(b'Style is the aggregate gate', run.stdout)
+                        self.assertIn(b'Style is the aggregate', run.stdout)
 
     def test_ci_typecheck_warning_classification(self) -> None:
         warning = '/checkout/Sources/RepoPrompt/App/X.swift:3:4: warning: expression took 502ms to type-check'

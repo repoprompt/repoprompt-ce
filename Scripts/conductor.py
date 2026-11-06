@@ -3588,6 +3588,7 @@ class OperationRegistry:
         "LC_CTYPE",
         "REPOPROMPT_CODEX_ARCH",
         "REPOPROMPT_CODEX_CACHE_ROOT",
+        "REPOPROMPT_CLEAN_PUBLIC_SWIFTPM_BUILDS",
     ]
     STYLE_ENV_KEYS = [
         "GITHUB_ACTIONS",

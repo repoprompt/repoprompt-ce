@@ -261,19 +261,36 @@ package struct DomainAgentSessionLaneBoard: Hashable, Sendable {
     package let sendBlockers: [String]
     package let subagentRunning: Int
     package let subagentFinished: Int
+    /// Process-local availability of the cached census; unknown must not look like zero.
+    /// Not part of the poll wire format.
+    package let subagentCountsKnown: Bool
+
+    package var directRunningHelperCount: Int? {
+        subagentCountsKnown && subagentRunning >= 0 ? subagentRunning : nil
+    }
 
     package init(
         runOutcome: RunOutcome,
         failureReason: FailureReason?,
         sendBlockers: [String],
         subagentRunning: Int,
-        subagentFinished: Int
+        subagentFinished: Int,
+        subagentCountsKnown: Bool = false
     ) {
         self.runOutcome = runOutcome
         self.failureReason = failureReason
         self.sendBlockers = sendBlockers
         self.subagentRunning = subagentRunning
         self.subagentFinished = subagentFinished
+        self.subagentCountsKnown = subagentCountsKnown
+    }
+
+    /// Publication equivalence excludes only private census availability. Full value equality
+    /// still includes it so internal caches can distinguish unknown from known zero.
+    package func hasSamePublishedState(as other: Self) -> Bool {
+        runOutcome == other.runOutcome && failureReason == other.failureReason
+            && sendBlockers == other.sendBlockers && subagentRunning == other.subagentRunning
+            && subagentFinished == other.subagentFinished
     }
 
     /// Explicit quiet board for fixtures; snapshot construction itself has no default.
@@ -304,6 +321,19 @@ package struct DomainAgentSessionObservationSnapshot: Hashable, Sendable {
 
     package var hasPendingInteraction: Bool {
         pendingInteractionKind != nil
+    }
+
+    /// Public change cursors preserve their existing semantics while private cached metadata
+    /// can refresh independently. Keep every public observation field in this comparison.
+    package func hasSamePublishedState(as other: Self) -> Bool {
+        sessionID == other.sessionID && displayName == other.displayName
+            && providerDisplayName == other.providerDisplayName && status == other.status
+            && board.hasSamePublishedState(as: other.board) && idleForSend == other.idleForSend
+            && idleSince == other.idleSince && waitingOn == other.waitingOn
+            && pendingInteractionKind == other.pendingInteractionKind
+            && latestVisibleAssistantPreview == other.latestVisibleAssistantPreview
+            && visibleRowCount == other.visibleRowCount && lastActivityAt == other.lastActivityAt
+            && context == other.context
     }
 
     /// Normalizes and byte-caps every textual field at construction so a buggy bridge cannot publish
@@ -346,6 +376,18 @@ package struct DomainAgentSessionObservationSnapshot: Hashable, Sendable {
         self.visibleRowCount = max(0, visibleRowCount)
         self.lastActivityAt = lastActivityAt
         self.context = context
+    }
+}
+
+/// Exact live Manage requirement for cached metadata actually rendered in a provider-bound batch.
+/// Process-local only; never encoded into the prompt or persisted.
+package struct DomainAgentSessionManagedObservationRequirement: Hashable, Sendable {
+    package let reference: DomainAgentSessionLinkReference
+    package let target: DomainAgentSessionLinkEndpointIdentity
+
+    package init(reference: DomainAgentSessionLinkReference, target: DomainAgentSessionLinkEndpointIdentity) {
+        self.reference = reference
+        self.target = target
     }
 }
 

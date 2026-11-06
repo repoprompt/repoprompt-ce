@@ -3,8 +3,9 @@ name: Release Candidate
 on:
   workflow_dispatch:
 
-# Optional downloadable candidate. CI already gates every integration on an
-# equivalent release-mode package and MCP smoke; do not build it twice per push.
+# Explicit release qualification for packaging changes or a downloadable candidate.
+# Tip/stable qualify their own exact artifacts before publication; Style is not
+# release qualification. Do not restore an automatic build on every PR/main push.
 # Each explicit request keeps its source and can finish independently.
 concurrency:
   group: release-candidate-${{ github.run_id }}
@@ -15,27 +16,104 @@ permissions:
 
 jobs:
   artifact:
-    name: Package Ad-Hoc Candidate
+    name: Release-mode Package and MCP Smoke
     runs-on: macos-26
+    # Conductor bounds universal artifact construction at four hours. Let that
+    # deadline report failure and leave time for smoke/diagnostic upload instead
+    # of cancelling a still-valid build at the former two-hour job limit.
+    timeout-minutes: 270
+    outputs:
+      artifact-name: ${{ steps.archive-name.outputs.name }}
+    env:
+      PYTHONUNBUFFERED: "1"
     steps:
-      - name: Check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Configure retained package diagnostics
+        run: echo "REPOPROMPT_DEV_DAEMON_STATE_DIR=$RUNNER_TEMP/candidate-conductor" >> "$GITHUB_ENV"
+
+      - name: Identify release build cache compatibility
+        id: release-toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          key="$(python3 Scripts/ci_release_cache.py --sentry 1)"
+          [[ "$key" =~ ^swiftpm-release-v2-[0-9a-f]{64}$ ]]
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
+      # Cache only SwiftPM intermediates, never packaged apps or admission evidence.
+      # Only an explicit main diagnostic can seed compatible intermediates.
+      # Branch diagnostics restore only; signed publication still builds clean.
+      - name: Restore universal release build intermediates
+        id: release-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .build/public-release-swiftpm
+          key: ${{ steps.release-toolchain.outputs.key }}
 
       - name: Run release preflight
-        run: ./Scripts/release.sh preflight
+        run: ./conductor release preflight --full-log
 
-      - name: Package ad-hoc release candidate
-        run: ./Scripts/release.sh artifact
+      - name: Package secret-free universal ad-hoc release candidate
+        timeout-minutes: 245
+        env:
+          REPOPROMPT_CLEAN_PUBLIC_SWIFTPM_BUILDS: "0"
+        run: ./conductor release artifact --full-log
 
-      - name: Smoke release-candidate packaged MCP roundtrip
+      - name: Smoke exact release-mode packaged MCP helper
+        env:
+          REPOPROMPT_PACKAGED_SMOKE_DIAGNOSTICS_DIR: ${{ runner.temp }}/packaged-smoke
         run: |
           ./Scripts/smoke_packaged_mcp_roundtrip.sh \
             ".build/release/RepoPrompt.app" \
-            "Release-candidate packaged app" \
+            "Release-candidate package" \
             ".build/release/RepoPrompt-artifact-manifest.json"
-      - name: Upload release-candidate artifact
+
+      # A partial diagnostic rerun reuses the successful producer's exact name,
+      # not the consumer's newer attempt number. This is not Style evidence.
+      - name: Identify candidate archive
+        id: archive-name
+        env:
+          ARTIFACT_NAME: RepoPrompt-CE-release-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+        run: printf 'name=%s\n' "$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Transfer the same candidate to older macOS runners
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
-          name: RepoPrompt-CE-release-candidate
-          path: dist/*
+          name: ${{ steps.archive-name.outputs.name }}
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS
+            dist/*-artifact-manifest.json
           if-no-files-found: error
+          retention-days: 1
+
+      - name: Seed universal release build cache (explicit main diagnostic only)
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && steps.release-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .build/public-release-swiftpm
+          key: ${{ steps.release-cache.outputs.cache-primary-key }}
+
+      - name: Retain package manifest and failure diagnostics
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: release-candidate-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .build/release/RepoPrompt-artifact-manifest.json
+            ${{ runner.temp }}/packaged-smoke
+            ${{ runner.temp }}/candidate-conductor/jobs/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  compatibility:
+    name: Older macOS Compatibility
+    needs: artifact
+    uses: ./.github/workflows/macos-compatibility.yml
+    with:
+      artifact-name: ${{ needs.artifact.outputs.artifact-name }}
+      tooling-ref: ${{ github.sha }}

@@ -1848,9 +1848,13 @@ public enum AIModel: Equatable, Hashable {
         }
     }
 
-    static func codexBaseModelPrecedes(_ lhs: String, _ rhs: String) -> Bool {
-        let leftMetadata = semanticSortMetadata(identifier: lhs, fallbackDisplayName: lhs, reasoningEffort: nil)
-        let rightMetadata = semanticSortMetadata(identifier: rhs, fallbackDisplayName: rhs, reasoningEffort: nil)
+    static func codexBaseModelPrecedes(
+        _ lhs: String,
+        _ rhs: String,
+        discoveredRecords: [CodexDynamicModelRecord] = []
+    ) -> Bool {
+        let leftMetadata = semanticSortMetadata(identifier: lhs, fallbackDisplayName: lhs, reasoningEffort: nil, discoveredRecords: discoveredRecords)
+        let rightMetadata = semanticSortMetadata(identifier: rhs, fallbackDisplayName: rhs, reasoningEffort: nil, discoveredRecords: discoveredRecords)
         return semanticMetadataPrecedes(leftMetadata, rightMetadata)
     }
 
@@ -1870,11 +1874,14 @@ public enum AIModel: Equatable, Hashable {
         return humanizedCodexBaseModel(baseModelID)
     }
 
-    static func codexPreviewDisplayAlias(for raw: String) -> String? {
+    static func codexPreviewDisplayAlias(
+        for raw: String,
+        discoveredRecords: @autoclosure () -> [CodexDynamicModelRecord] = CodexDynamicModelStore.load()
+    ) -> String? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
 
-        let specifier = CodexModelSpecifier(raw: trimmed)
+        let specifier = CodexModelSpecifier(raw: trimmed, discoveredRecords: discoveredRecords())
         let base = specifier.baseModel ?? trimmed
         let normalizedBase = normalizedSemanticText(base)
         let canonicalBase: String
@@ -1901,16 +1908,20 @@ public enum AIModel: Equatable, Hashable {
         return label
     }
 
-    static func stripCodexReasoningSuffix(from label: String) -> String {
+    static func stripCodexReasoningSuffix(
+        from label: String,
+        discoveredRecords: @autoclosure () -> [CodexDynamicModelRecord] = CodexDynamicModelStore.load()
+    ) -> String {
         let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return trimmed }
 
-        let specifier = codexSpecifierFromSemanticLabel(trimmed)
+        let records = discoveredRecords()
+        let specifier = codexSpecifierFromSemanticLabel(trimmed, discoveredRecords: records)
         guard specifier.reasoningEffort != nil, let baseModel = specifier.baseModel else {
             return trimmed
         }
 
-        var stripped = humanizedCodexBaseModel(baseModel)
+        var stripped = humanizedCodexBaseModel(baseModel, discoveredRecords: records)
         if let serviceTier = specifier.serviceTier {
             stripped += serviceTier == CodexServiceTierVariantCatalog.fastServiceTier
                 ? " Fast"
@@ -1979,9 +1990,10 @@ public enum AIModel: Equatable, Hashable {
     private static func semanticSortMetadata(
         identifier: String,
         fallbackDisplayName: String,
-        reasoningEffort: CodexReasoningEffort?
+        reasoningEffort: CodexReasoningEffort?,
+        discoveredRecords: @autoclosure () -> [CodexDynamicModelRecord] = CodexDynamicModelStore.load()
     ) -> SemanticSortMetadata {
-        let semanticSource = codexPreviewDisplayAlias(for: identifier) ?? (identifier.isEmpty ? fallbackDisplayName : identifier)
+        let semanticSource = codexPreviewDisplayAlias(for: identifier, discoveredRecords: discoveredRecords()) ?? (identifier.isEmpty ? fallbackDisplayName : identifier)
         let normalizedIdentifier = normalizedSemanticText(semanticSource)
         let family = semanticFamily(in: normalizedIdentifier)
         let versionComponents = semanticVersionComponents(in: normalizedIdentifier)
@@ -2037,7 +2049,11 @@ public enum AIModel: Equatable, Hashable {
         codexSpecifierFromSemanticLabel(text).reasoningEffort
     }
 
-    private static func codexSpecifierFromSemanticLabel(_ text: String) -> CodexModelSpecifier {
+    private static func codexSpecifierFromSemanticLabel(
+        _ text: String,
+        discoveredRecords: @autoclosure () -> [CodexDynamicModelRecord] = CodexDynamicModelStore.load()
+    ) -> CodexModelSpecifier {
+        let records = discoveredRecords()
         let parseableText = text
             .replacingOccurrences(of: "CLI·", with: "")
             .replacingOccurrences(of: "(", with: " ")
@@ -2045,12 +2061,12 @@ public enum AIModel: Equatable, Hashable {
         let normalized = normalizedSemanticText(parseableText)
         let candidates = codexSpecifierCandidates(fromNormalizedSemanticText: normalized)
         for candidate in candidates {
-            let specifier = CodexModelSpecifier(raw: candidate)
+            let specifier = CodexModelSpecifier(raw: candidate, discoveredRecords: records)
             if specifier.reasoningEffort != nil {
                 return specifier
             }
         }
-        return CodexModelSpecifier(raw: normalized)
+        return CodexModelSpecifier(raw: normalized, discoveredRecords: records)
     }
 
     private static func codexSpecifierCandidates(fromNormalizedSemanticText normalized: String) -> [String] {
@@ -2077,8 +2093,11 @@ public enum AIModel: Equatable, Hashable {
         return stripCodexReasoningSuffix(from: withoutPrefix)
     }
 
-    private static func humanizedCodexBaseModel(_ raw: String) -> String {
-        if let alias = codexPreviewDisplayAlias(for: raw) {
+    private static func humanizedCodexBaseModel(
+        _ raw: String,
+        discoveredRecords: @autoclosure () -> [CodexDynamicModelRecord] = CodexDynamicModelStore.load()
+    ) -> String {
+        if let alias = codexPreviewDisplayAlias(for: raw, discoveredRecords: discoveredRecords()) {
             return alias
         }
 

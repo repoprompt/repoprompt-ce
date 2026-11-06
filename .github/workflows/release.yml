@@ -27,7 +27,7 @@ jobs:
   validate-ref:
     name: Validate Approved Release Ref
     if: github.ref == 'refs/heads/main'
-    runs-on: macos-26
+    runs-on: ubuntu-latest
     outputs:
       commit: ${{ steps.release-ref.outputs.commit }}
       tooling-commit: ${{ steps.release-ref.outputs.tooling-commit }}
@@ -45,14 +45,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          echo "commit=$(./Scripts/verify_release_ref.sh "$RELEASE_TAG")" >> "$GITHUB_OUTPUT"
-          echo "tooling-commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          commit="$(./Scripts/verify_release_ref.sh "$RELEASE_TAG")"
+          tooling_commit="$(git rev-parse HEAD)"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ && "$tooling_commit" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "Release source and tooling must resolve to full lowercase commit SHAs" >&2
+            exit 1
+          }
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "tooling-commit=$tooling_commit" >> "$GITHUB_OUTPUT"
 
   stage:
     name: Build Approved Source Without Secrets
     needs: validate-ref
     if: github.ref == 'refs/heads/main'
     runs-on: macos-26
+    outputs:
+      artifact-name: ${{ steps.archive-name.outputs.name }}
     permissions:
       contents: read
     steps:
@@ -140,15 +149,21 @@ jobs:
           REPOPROMPT_ENABLE_SENTRY: "1"
         run: ./trusted-control-plane/Scripts/release.sh stage-archive
 
+      - name: Identify staged release artifact
+        id: archive-name
+        env:
+          ARTIFACT_NAME: RepoPrompt-CE-staged-release-${{ github.run_id }}-${{ github.run_attempt }}
+        run: printf 'name=%s\n' "$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+
       - name: Upload staged release source
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
-          name: RepoPrompt-CE-staged-release
+          name: ${{ steps.archive-name.outputs.name }}
           path: |
             release-source/dist/*-stage.zip
             release-source/dist/*-stage.zip.sha256
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
 
   publish:
     name: Sign, Notarize, and Create Draft
@@ -158,6 +173,8 @@ jobs:
     if: github.ref == 'refs/heads/main'
     environment: release
     runs-on: macos-26
+    outputs:
+      artifact-name: ${{ steps.archive-name.outputs.name }}
     permissions:
       contents: write
     steps:
@@ -169,10 +186,15 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Require exact staged release artifact
+        env:
+          PRODUCER_ARTIFACT: ${{ needs.stage.outputs.artifact-name }}
+        run: test -n "$PRODUCER_ARTIFACT"
+
       - name: Download staged release source
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
         with:
-          name: RepoPrompt-CE-staged-release
+          name: ${{ needs.stage.outputs.artifact-name }}
           path: staged-release
 
       - name: Check out approved source as data
@@ -373,16 +395,31 @@ jobs:
           rm -f "$RUNNER_TEMP/repoprompt-successor-identity-anchor"
           rm -rf "$RUNNER_TEMP/repoprompt-release-secrets"
 
+      - name: Identify signed release artifact
+        id: archive-name
+        env:
+          ARTIFACT_NAME: RepoPrompt-CE-signed-release-zip-${{ github.run_id }}-${{ github.run_attempt }}
+        run: printf 'name=%s\n' "$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+
       - name: Upload signed release ZIP for secret-free smoke
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
-          name: RepoPrompt-CE-signed-release-zip
+          name: ${{ steps.archive-name.outputs.name }}
           path: |
             release-source/dist/*.zip
             release-source/dist/SHA256SUMS
             release-source/dist/*-artifact-manifest.json
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
+
+  compatibility:
+    name: Older macOS Signed Artifact Compatibility
+    needs: [validate-ref, publish]
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/macos-compatibility.yml
+    with:
+      artifact-name: ${{ needs.publish.outputs.artifact-name }}
+      tooling-ref: ${{ needs.validate-ref.outputs.tooling-commit }}
 
   smoke-signed-helper:
     name: Smoke Signed Helper Without Release Secrets
@@ -402,10 +439,15 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Require exact signed release artifact
+        env:
+          PRODUCER_ARTIFACT: ${{ needs.publish.outputs.artifact-name }}
+        run: test -n "$PRODUCER_ARTIFACT"
+
       - name: Download signed release ZIP
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
         with:
-          name: RepoPrompt-CE-signed-release-zip
+          name: ${{ needs.publish.outputs.artifact-name }}
           path: signed-release
 
       - name: Extract and statically validate signed helper layout

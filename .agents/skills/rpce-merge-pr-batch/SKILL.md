@@ -113,7 +113,7 @@ When a check fails:
 1. Read the exact GitHub Actions job log.
 2. Distinguish a product failure from an unrelated flaky test or runner failure.
 3. Fix product failures and push a new head.
-4. Rerun an unrelated flaky job once only when evidence supports it.
+4. Rerun an unrelated transient/flaky job once only when evidence supports it. For `integration-v3`, the native failed/specific-job rerun consumes successful ancestors by exact producer identity. Missing/expired artifacts or toolchain drift require rerunning Build and Static Gates and dependents, or all jobs. Older v1/v2 runs still require Re-run all jobs. Read `docs/architecture/ci-admission.md`; a retry never refreshes the original base/head. Inspect Style's prerequisite table and exact receipts, not an inherited green row alone.
 5. Require the final exact head to be green.
 
 ### 8. Merge

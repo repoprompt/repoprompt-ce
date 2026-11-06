@@ -153,6 +153,55 @@ final class DirectHeadlessWorkingDirectoryBindingTests: XCTestCase {
         }
     }
 
+    /// #335 follow-up: a rejected `close_tab` grants no exemption; a later replacement that drops
+    /// that tab's payload from the durable working copy still requires a verified backup first.
+    func testRejectedCloseTabDoesNotExemptALaterLossyReplacement() async throws {
+        let profile = try makeProfile()
+        try await withSession(profile, extraOperations: [
+            "manage_workspaces.create_tab", "manage_workspaces.close_tab"
+        ]) { session in
+            let created = await Self.callTool(session.client, "manage_workspaces", [
+                "action": .string("create_tab"), "name": .string("Second"), "focus": .bool(true)
+            ])
+            XCTAssertFalse(created.isError, created.text)
+            let active = try await Self.status(session)
+            let workspaceID = try XCTUnwrap(active.workspaceUUID)
+            let closedID = try XCTUnwrap(active.contextID)
+            let refused = await Self.callTool(session.client, "manage_workspaces", [
+                "action": .string("close_tab"), "tab": .string(closedID)
+            ])
+            XCTAssertTrue(refused.isError, refused.text)
+
+            let store = session.prepared.runtime.workspaceStore
+            let workingValue = await store.canonicalWorkspaceSnapshot(workspaceID)
+            let working = try XCTUnwrap(workingValue)
+            var object = try XCTUnwrap(JSONSerialization.jsonObject(with: working.document.documentBytes) as? [String: Any])
+            let tabs = try XCTUnwrap(object["composeTabs"] as? [[String: Any]])
+            let remaining = tabs.filter { ($0["id"] as? String) != closedID }
+            XCTAssertEqual(remaining.count, tabs.count - 1)
+            object["composeTabs"] = remaining
+            object["activeComposeTabID"] = remaining.first?["id"]
+            let reduced = try DomainWorkspaceDocument.decode(
+                documentBytes: JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
+                fileURL: working.document.fileURL
+            )
+            let outcome = await store.execute(DomainWorkspaceCommandEnvelope(
+                operationID: UUID(),
+                expectedWorkspaceRevision: working.revisions.workingRevision,
+                origin: .standalone,
+                command: .replaceWorkingDocument(reduced)
+            ))
+            XCTAssertEqual(outcome.disposition, .applied, outcome.diagnostic ?? "")
+            XCTAssertNotNil(
+                DomainRecoveryBackup.verifiedBackupURL(
+                    documentURL: working.document.fileURL,
+                    documentBytes: working.document.documentBytes
+                ),
+                "Dropping a tab's payload is backed up; a rejected close never exempts it"
+            )
+        }
+    }
+
     func testWorkspaceMetadataDoesNotGrantCloseAuthority() async throws {
         let profile = try makeProfile()
         try await withSession(profile) { session in

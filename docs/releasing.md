@@ -316,19 +316,36 @@ transition/successor sibling feeds and no Sparkle-key change. Tip workflows must
 `repoprompt-ce-updates` or use `v*` tags, and must not feed into `Promote Release`. Stable promotion
 remains the only path that updates the stable appcast.
 
-`Publish Tip` runs automatically after successful CI on protected `main`. Every checked-in rollout
-role follows the complete build, sign, notarize, smoke, and publish path; a role changes the artifact
-and identity policy but never suppresses the release or produces a successful no-publication run.
+`Publish Tip` runs automatically after successful main-push CI in the source repository. When an
+automatic run leaves the rolling queue, it considers the authenticated successful triggering
+event alongside up to 300 recent successful `ci.yml` main-push runs, then selects the newest
+passing source on the observed protected-main first-parent chain. The event remains eligible
+even if the completed run is not yet visible in GitHub's list API.
+Source ancestry, rather than completion order, determines the candidate. A late completion of old
+CI therefore cannot replace a newer passing source, and a newer failing or unfinished main does
+not suppress an earlier passing source. The selected CI run, attempt and full source SHA are
+recorded in setup outputs and the summary. An API error or a bounded search with no eligible source
+fails explicitly; it never substitutes untested main.
+
+Every new qualified source follows the complete build, sign, notarize, smoke, and publish path.
+Before allocating Macs, setup checks public versioned Tip metadata. An already published source,
+or a source covered by a newer published protected-main commit, is reported as already covered
+without rebuilding immutable release bytes. Malformed metadata, mismatched full SHAs, network
+errors and authorization failures remain errors. The final **Tip Publication Result** distinguishes
+publication, already-covered work and blocked work, including every prerequisite result.
 Manual dispatch remains a recovery path and takes no operator-supplied release inputs. It derives the
 rollout role and identity policy from the checked-in declaration on protected `main`.
 
 There is deliberately no commit input. For a manual dispatch, GitHub's selected `main` ref and
 `github.sha` are the immutable candidate. Setup fetches protected `origin/main` and requires the
-candidate commit, workflow-definition commit, and checked-out release tooling to be that exact live
-commit. A stale browser tab therefore cannot publish an older main commit merely because somebody
-pasted a convincing SHA into a text box. Before the secret-free build, the protected role-aware
-credential preflight runs the same authenticated protected-main verifier used at publication
-mutation boundaries. Source reads use the workflow's source-repository token; the separate Tip
+candidate commit, workflow-definition commit, and initial checked-out release tooling to be that
+exact live commit. Automatic runs instead pin the observed protected-main tooling SHA when setup
+starts and keep it separate from the exact source selected by passing CI. All subsequent jobs use
+those two immutable SHAs; signing, smoke and publication read candidate data from the approved
+source checkout and execute scripts from the trusted tooling checkout. Before the secret-free
+build, the protected role-aware credential preflight proves the source remains in authenticated
+protected-main ancestry, as the publisher does at mutation boundaries. Source reads use the
+workflow's source-repository token; the separate Tip
 updater token is reserved for updater-repository reads and writes. The signing preflight uses an
 isolated ephemeral keychain without changing the runner user's keychain search list.
 
@@ -366,12 +383,22 @@ T's `sparkle:minimumUpdateVersion`, bypassing the credential preparer.
 
 Automatic and manual runs use separate rolling concurrency lanes. Each lane keeps at most one
 queued run and does not cancel in-flight release work; publication remains serialized across both
-lanes by `main-tip-publish`. A retry therefore resumes or audits one exact draft instead of abandoning
-a different tag halfway through publication. Setup and credential preflight require the candidate to
-be the exact protected-main head before expensive work starts. If `main` advances while that work is
-running, publication may finish only while the candidate remains in authenticated protected-main
-ancestry. The monotonic build and rollout-progression checks still reject an older candidate when a
-newer Tip has already become public, while the newest queued run converges the feed on current `main`.
+lanes by `main-tip-publish`. The next automatic setup selects the newest passing source at execution
+time, so queue coalescing does not rely on CI completion order. If `main` advances while work is
+running, publication may finish only while the source remains in authenticated protected-main
+ancestry. Monotonic build and rollout-progression checks still prevent an older candidate from
+replacing a newer public Tip.
+
+Staged and signed workflow artifacts have immutable names containing the producing run and attempt.
+Consumers use the successful producer's exact output, including on native failed-job retries; they
+never invent a name from their own newer attempt. Tip, Publish Release and Promote Release retain
+these artifacts for seven days. Use **Re-run failed jobs** for a signing, smoke or publisher failure
+so successful prerequisites are reused. A full rerun produces new artifact names without conflicting
+with earlier uploads, but a partially uploaded release draft still requires the original signed
+bytes. If those bytes have expired, use a new source commit/tag or an explicitly reviewed draft
+cleanup; never overwrite mismatching release assets. Already public Tip tags are detected before
+building again. Deterministic code or configuration errors require a fix, rather than repeated
+rebuilds of the same failing source.
 
 Remote mutation is confined to that protected publication job. Immediately before draft creation
 and again immediately before making a draft public, it proves the candidate is still on live
@@ -480,24 +507,16 @@ keeps the pre-history release inventories unchanged. This is not bootstrap autho
 An inactive policy also rejects a live catalog rather than silently dropping an existing chain.
 Do not use an environment variable, API 404, or a one-entry/fabricated seed catalog to activate it.
 
-**Additional activation blocker:** the approved exact-tag contract is circular in the current
-workflow. `historyEnabledSinceTag` must equal `tip-<candidate SHA12>`, while the policy is itself
-checked into that candidate and setup requires `tooling-commit == candidate commit`. Adding that
-tag changes the candidate SHA. A later tooling-only commit also fails setup's equality check.
-Thus supplying the audits below does not by itself make first activation executable. This is a
-**conditional workflow restriction**, not an inherent catalog-format requirement: the shell already
-reads policy from the trusted control-plane scripts root separately from `REPOPROMPT_APPROVED_SOURCE_ROOT`,
-and the generic admission CLI accepts an explicit policy file. However, setup skips an earlier UI
-candidate once `main` advances, then explicitly requires the tooling and selected source commits to
-match; dispatch has no earlier-candidate input. A later policy-only commit cannot currently pin and
-sign the prior UI commit through this workflow. Whether that independently reviewed ordering/input
-can be authorized is a plan/evidence decision, **not** implemented permission to change source
-provenance, add an anchor, setting, override or bootstrap bypass.
-The emitted bootstrap evidence also records the candidate commit/tag, while its canonical digest
-is pinned in that candidate's policy. The approved activation ordering must resolve this evidence
-binding as well as the activation tag; merely changing the tag field is not sufficient.
-Keep signed-catalog publication disabled and resolve this decision explicitly before its first
-activation. These publication gates do not gate browsing or verified acquisition of existing releases.
+**First activation still requires a reviewed ordering:** `historyEnabledSinceTag` must equal
+`tip-<candidate SHA12>`, and bootstrap evidence records that same candidate commit/tag while its
+canonical digest is pinned by policy. Automatic Tip setup now separates protected-main tooling from
+the exact CI-qualified source, so the former source/tooling equality restriction is gone. This does
+not activate signed catalogs or resolve the evidence bindings by itself. The automatic selector may
+choose a newer passing source, and manual dispatch still has no earlier-candidate input. An approved
+activation plan must bind the policy, bootstrap evidence and actual selected source together and
+prove that ordering through the hosted workflow. Keep signed-catalog publication disabled until
+that review and the audits below are complete; no anchor, setting, override or bootstrap bypass is
+introduced by CI recovery. These gates do not gate browsing or verified acquisition of existing releases.
 
 **User-visible behavior:** an ordinary Tip with no signed catalog uses the immediate release fallback.
 It does not wait for a 30-entry bootstrap, a policy floor, an activation tag, or an invented history
@@ -630,6 +649,65 @@ The ZIP is accompanied by a deterministic external
 architecture sets, executable/helper hashes, signing identifiers and teams,
 designated requirements, certificate fingerprints when present, and the
 canonical entitlement hash without recording secrets, host paths, or timestamps.
+
+Packaging, staged signing, archive validation, and promotion inspect every Mach-O
+slice of the app and `repoprompt-mcp` with
+`Scripts/validate_macos_runtime_symbols.py`. This rejects known Swift overlay
+imports that lack SDK availability annotations but are missing from supported
+macOS runtimes, including `os.Logger.isEnabled(type:)` and `os.Logger.disabled`
+(#1603). Use `OSLog.isEnabled(type:)` with a `Logger` created from the same handle
+instead. This bounded denylist is not a complete macOS 14 compatibility audit;
+launch validation on the oldest supported OS remains necessary.
+
+### Older macOS artifact compatibility
+
+The required integration products now transfer the **same ZIP and manifest**
+built on macOS 26 to macOS 15 ARM64 and Intel runners. Both run the existing
+isolated app/MCP roundtrip. Stable promotion and Tip publication also wait for
+these checks against their signed, checksum-bound artifacts; transition PKGs
+are expanded and checked without installation. Nothing is rebuilt or re-signed
+on the compatibility runners. The runtime and native architecture must match
+the selected matrix cell, and failures retain a JSON result plus smoke logs.
+Automated packaged smoke disables telemetry for the test process so CI activity
+does not contribute production Sentry events.
+
+This detects unknown missing-symbol and startup regressions beyond the bounded
+symbol denylist. It does **not** establish macOS 14 compatibility. GitHub retired
+its hosted macOS 14 images on [November 2, 2026](https://github.com/actions/runner-images/issues/13518),
+and the project currently has no macOS 14 CI runner. The advertised deployment
+minimum remains 14.0; changing it is a separate product decision.
+
+For a macOS 14 check, use a disposable Sonoma VM on compatible Apple silicon.
+[Tart's quick start](https://tart.run/quick-start/) lists prebuilt Sonoma images;
+for example, these commands create and start a local VM (a substantial download):
+
+```bash
+brew install cirruslabs/cli/tart
+tart clone ghcr.io/cirruslabs/macos-sonoma-base:latest rpce-sonoma
+tart run rpce-sonoma
+```
+
+Verify the guest with `sw_vers`; retain its exact OS/build and image digest for
+repeatability, and keep it on macOS 14. A Parallels VM installed from a compatible
+Sonoma IPSW is another option. In the guest, install Python 3.11+ and compatible
+Xcode command-line tools, check out the exact validation-tooling commit, and copy
+the already-built release ZIP (or transition PKG), `SHA256SUMS`, and artifact
+manifest into one directory. Then run:
+
+```bash
+python3 Scripts/smoke_macos_compatibility.py /path/to/release-artifacts \
+  --expected-major 14 --expected-arch arm64 --report /tmp/rpce-sonoma/result.json
+```
+
+Use `--expected-arch x86_64` on a native Intel macOS 14 runner. The helper refuses
+a newer host in place of the requested runtime. It verifies the transferred
+enclosure and manifest checksums, checks signatures and linked symbols, then
+launches the actual app until its embedded MCP helper completes the roundtrip.
+The result records the artifact digest and observed runtime. Run this only in a
+disposable test environment: it launches the app with isolated state and cleans
+up its owned process session. A successful newer-OS check must never be reported
+as macOS 14 evidence. A future macOS 14 CI runner should run this same helper;
+the current PR/merge gate has no dependency on unprovisioned self-hosted hardware.
 
 The direct fallback commands are `make release-preflight` and
 `make release-artifact`. The GitHub **Release Candidate** workflow runs the same

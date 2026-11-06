@@ -396,7 +396,7 @@ extension OracleViewModel {
                 )
             },
             progress: { [weak self] event in
-                await self?.receiveOracleGroupProgress(event, owner: owner)
+                await self?.receiveOracleGroupProgress(event, owner: owner, invocationID: invocationID)
                 await callbacks?.progress(event)
             }
         )
@@ -651,7 +651,8 @@ extension OracleViewModel {
             return OracleLaneExecutionResponse(
                 response: response.response,
                 executionProfile: response.executionProfile,
-                capturedModelName: capturedName()
+                capturedModelName: capturedName(),
+                assistantReplyID: queryID
             )
         } catch let cancellation as OracleLaneCancellation {
             throw OracleLaneCancellation(
@@ -1054,6 +1055,7 @@ extension OracleViewModel {
         if let current = oracleGroupPresentations[next.key] {
             // A store read can win the race with the prepared callback for the same revision.
             let beginsKnownExecution = next.revision == current.revision && next.turnID == current.turnID
+                && next.members == current.members
                 && !current.isTerminal && current.invocationID == nil && invocationID != nil
             guard next.revision > current.revision || beginsKnownExecution else { return }
         }
@@ -1061,10 +1063,11 @@ extension OracleViewModel {
         pruneOracleGroupPresentations()
     }
 
-    func receiveOracleGroupProgress(_ event: OracleProgressEvent, owner: OracleConversationOwner) {
+    func receiveOracleGroupProgress(_ event: OracleProgressEvent, owner: OracleConversationOwner, invocationID: UUID) {
         let key = OracleGroupPresentation.Key(groupID: event.groupID, owner: owner)
         guard var current = oracleGroupPresentations[key] else { return }
         let previous = current
+        guard current.invocationID == invocationID else { return }
         current.receive(event)
         if current != previous { oracleGroupPresentations[key] = current }
     }

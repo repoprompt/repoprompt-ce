@@ -15,12 +15,65 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+
+import conductor
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
 ROLLOUT_TOOL = SCRIPT_DIR / "stable_rollout.py"
 POLICY = SCRIPT_DIR / "apple_identity_policy.json"
 PROFILE_TOOL = SCRIPT_DIR / "embedded_provisioning_profile.py"
+
+
+class ReleaseBuildCachePolicyTests(unittest.TestCase):
+    def test_conductor_release_artifact_keeps_incremental_builds_explicit(self) -> None:
+        policy = "REPOPROMPT_CLEAN_PUBLIC_SWIFTPM_BUILDS"
+        for requested, keeps_cache in ((None, False), ("1", False), ("0", True)):
+            with self.subTest(requested=requested), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                scripts = root / "Scripts"
+                scripts.mkdir()
+                builder = scripts / "build_swiftpm_release_products.sh"
+                builder.write_bytes((SCRIPT_DIR / builder.name).read_bytes())
+                builder.chmod(0o755)
+                fixtures = {
+                    "release.sh": '#!/usr/bin/env bash\n[[ "$1" == artifact ]] || exit 76\nexec "$(dirname "$0")/build_swiftpm_release_products.sh"\n',
+                    "run_without_github_tokens.sh": '#!/usr/bin/env bash\nexec "$@"\n',
+                    "patch_keyboard_shortcuts_resource_lookup.sh": '#!/usr/bin/env bash\nexit 77\n',
+                    "compare_swiftpm_release_resources.py": '#!/usr/bin/env python3\n',
+                    "lipo": '#!/usr/bin/env bash\nexit 0\n',
+                    "ditto": '#!/usr/bin/env bash\nexit 0\n',
+                }
+                for name, source in fixtures.items():
+                    script = scripts / name
+                    script.write_text(source)
+                    script.chmod(0o755)
+                sentinel = root / ".build/public-release-swiftpm/previous-build"
+                sentinel.parent.mkdir(parents=True)
+                sentinel.touch()
+                client_env = {"PATH": f"{scripts}:{os.environ['PATH']}"}
+                if requested is not None:
+                    client_env[policy] = requested
+                with mock.patch.dict(os.environ, client_env, clear=True):
+                    snapshot = conductor.OperationRegistry.client_env_snapshot()
+                request = json.loads(json.dumps({
+                    "operation": "release", "args": {"subcommand": "artifact"}, "env": snapshot,
+                }))
+                with mock.patch.dict(os.environ, {policy: "1" if requested == "0" else "0"}):
+                    argv, _, cwd, environment, _ = conductor.OperationRegistry(root).prepare(request)
+                result = subprocess.run(argv, cwd=cwd, env=environment,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 77, result.stdout + result.stderr)
+                self.assertEqual(sentinel.exists(), keeps_cache, result.stdout + result.stderr)
+                self.assertTrue((sentinel.parent / ".repoprompt-public-swiftpm-scratch").is_file())
+
+    def test_release_cache_policy_changes_request_identity(self) -> None:
+        registry = conductor.OperationRegistry(ROOT_DIR)
+        request = {"operation": "release", "args": {"subcommand": "artifact"}}
+        clean = {**request, "env": {"REPOPROMPT_CLEAN_PUBLIC_SWIFTPM_BUILDS": "1"}}
+        incremental = {**request, "env": {"REPOPROMPT_CLEAN_PUBLIC_SWIFTPM_BUILDS": "0"}}
+        self.assertNotEqual(registry.fingerprint(clean), registry.fingerprint(incremental))
 
 
 class PromotionCurlConfigTests(unittest.TestCase):
@@ -221,6 +274,7 @@ class ReleaseStagePhaseTests(unittest.TestCase):
 
     def test_phases_after_tag_verification_scrub_github_tokens(self) -> None:
         stubs = (
+            'ditto() { return 99; }; '
             'resolve_without_lockfile_drift() { printf "token=%s\\n" "${GH_TOKEN-unset}"; }; '
             "run_preflight() { :; }; prepare_dist() { :; }"
         )

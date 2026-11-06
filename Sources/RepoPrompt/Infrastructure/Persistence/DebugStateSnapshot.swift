@@ -248,12 +248,15 @@ struct DebugStateSnapshot {
         let copiedFiles: Int
         let copiedBytes: Int
         let seconds: Double
+        let preferencesID: UUID?
     }
 
     enum Failure: Error, LocalizedError {
         case sourceChanged, cancelled, unsafeFile, unsafeDestination, duplicateDestination, database(Int32), unsupportedWAL
+        case oracleRetention(String)
         var errorDescription: String? {
             switch self {
+            case let .oracleRetention(reason): "Retained Oracle state could not be combined: \(reason) Original state was preserved."
             case .sourceChanged: "Production state changed during capture. Retry when release is idle; no profile was replaced."
             case .cancelled: "Debug state preparation was cancelled before publication; no profile was replaced."
             case .unsafeFile: "A snapshot source is missing, aliased, or not a regular metadata file. Original state was preserved."
@@ -481,7 +484,8 @@ struct DebugStateSnapshot {
             cleanSlate: cleanSlate,
             copiedFiles: plan.entries.count + plan.generated.count,
             copiedBytes: bytes,
-            seconds: Date().timeIntervalSince(startedAt)
+            seconds: Date().timeIntervalSince(startedAt),
+            preferencesID: UUID()
         )
         try JSONEncoder().encode(receipt).write(to: stage.appendingPathComponent("debugSeed.json"), options: .withoutOverwriting)
         // Last safe stopping point: after the swap the new profile is published and complete.

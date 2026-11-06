@@ -604,13 +604,15 @@ class PublishTipReleaseTests(unittest.TestCase):
         self.assertEqual(state["source_lookup_auth"], [False])
         self.assertEqual(state["mutations"], [])
 
-    def test_tip_workflow_does_not_set_explicit_job_timeouts(self) -> None:
-        timeout_lines = [
-            line.strip()
-            for line in WORKFLOW.read_text(encoding="utf-8").splitlines()
-            if line.split("#", 1)[0].partition(":")[0].strip() == "timeout-minutes"
-        ]
-        self.assertEqual(timeout_lines, [])
+    def test_only_lightweight_tip_jobs_have_new_timeouts(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        sections = re.split(r"^  ([A-Za-z_][\w-]*):\n", workflow.split("\njobs:\n", 1)[1], flags=re.M)
+        jobs = dict(zip(sections[1::2], sections[2::2]))
+        bounded = {name for name, job in jobs.items() if "timeout-minutes:" in job}
+        self.assertEqual(bounded, {"setup", "result"})
+        for name in bounded:
+            self.assertIn("runs-on: ubuntu-latest", jobs[name])
+            self.assertIn("timeout-minutes: 10", jobs[name])
 
     def test_workflow_preflight_and_publisher_share_source_authority_contract(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
@@ -621,7 +623,7 @@ class PublishTipReleaseTests(unittest.TestCase):
         for section in (credential_preflight, publish):
             self.assertIn("TIP_SOURCE_GH_TOKEN: ${{ github.token }}", section)
         self.assertIn(
-            './trusted-control-plane/Scripts/verify_tip_source_commit.sh "credential preflight"',
+            './trusted-control-plane/Scripts/verify_tip_source_commit.sh --allow-ancestor "credential preflight"',
             credential_preflight,
         )
 
@@ -664,6 +666,11 @@ class TipAdmissionTests(unittest.TestCase):
         self.output = self.root / "output"
         self.summary = self.root / "summary"
         self.http_calls = self.root / "http-calls"
+        self.api_calls = self.root / "api-calls"
+        self.ci_runs = self.root / "ci-runs.json"
+        self.event_path = self.root / "github event.json"
+        self.published_manifest = self.root / "published-tip.json"
+        self.latest_manifest = self.root / "latest-tip.json"
         self.appcast = self.root / "appcast.xml"
         self.appcast.write_text(
             '<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">'
@@ -687,11 +694,20 @@ class TipAdmissionTests(unittest.TestCase):
             "RUNNER_TEMP": str(self.runner_temp),
             "GITHUB_OUTPUT": str(self.output),
             "GITHUB_STEP_SUMMARY": str(self.summary),
+            "GITHUB_REPOSITORY": SOURCE_REPOSITORY,
+            "GITHUB_EVENT_PATH": str(self.event_path),
             "TIP_UPDATE_REPOSITORY": UPDATE_REPOSITORY,
             "ADMISSION_HTTP_CALLS": str(self.http_calls),
             "ADMISSION_APPCAST": str(self.appcast),
             "ADMISSION_STABLE_FEED_URL": json.loads(POLICY.read_text())["sparkle"]["stableFeedURL"],
             "ADMISSION_CURL_STATUS": "0",
+            "ADMISSION_CI_RUNS": str(self.ci_runs),
+            "ADMISSION_API_CALLS": str(self.api_calls),
+            "ADMISSION_API_STATUS": "0",
+            "ADMISSION_PUBLISHED_MANIFEST": str(self.published_manifest),
+            "ADMISSION_LATEST_MANIFEST": str(self.latest_manifest),
+            "ADMISSION_PUBLISHED_STATUS": "404",
+            "ADMISSION_LATEST_STATUS": "404",
         }
         curl_stub = r'''#!/usr/bin/env python3
 import os
@@ -701,24 +717,51 @@ from pathlib import Path
 args = sys.argv[1:]
 with Path(os.environ["ADMISSION_HTTP_CALLS"]).open("a") as calls:
     calls.write("curl\n")
-if os.environ["ADMISSION_STABLE_FEED_URL"] not in args or "--fail" not in args:
-    raise SystemExit("unexpected admission HTTP request")
 status = int(os.environ["ADMISSION_CURL_STATUS"])
 if status:
     print("fixture HTTP/auth failure", file=sys.stderr)
     raise SystemExit(status)
-shutil.copyfile(os.environ["ADMISSION_APPCAST"], args[args.index("--output") + 1])
+url = next(arg for arg in args if arg.startswith("https://"))
+output = args[args.index("--output") + 1]
+if url.endswith("/identity-rollout.json"):
+    key = "LATEST" if "/releases/latest/download/" in url else "PUBLISHED"
+    status = os.environ[f"ADMISSION_{key}_STATUS"]
+    if status == "200":
+        shutil.copyfile(os.environ[f"ADMISSION_{key}_MANIFEST"], output)
+    else:
+        Path(output).write_text("not found\n")
+    print(status, end="")
+elif os.environ["ADMISSION_STABLE_FEED_URL"] == url and "--fail" in args:
+    shutil.copyfile(os.environ["ADMISSION_APPCAST"], output)
+else:
+    raise SystemExit("unexpected admission HTTP request")
 '''
         PublishTipReleaseTests._write_executable(self.bin_dir / "curl", curl_stub)
+        gh_stub = r'''#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+args = sys.argv[1:]
+if len(args) != 2 or args[0] != "api" or "actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=100&page=" not in args[1]:
+    raise SystemExit("unexpected admission GitHub API request")
+with Path(os.environ["ADMISSION_API_CALLS"]).open("a") as calls:
+    calls.write(args[1] + "\n")
+status = int(os.environ["ADMISSION_API_STATUS"])
+if status:
+    raise SystemExit(status)
+print(Path(os.environ["ADMISSION_CI_RUNS"]).read_text())
+'''
+        PublishTipReleaseTests._write_executable(self.bin_dir / "gh", gh_stub)
         self._git(self.root, "init", "-q", "-b", "main", str(self.source))
         (self.source / "Scripts").mkdir()
-        for path in (ROLLOUT_TOOL, POLICY):
+        for path in (ROLLOUT_TOOL, POLICY, SCRIPT_DIR / "tip_ci_selection.py"):
             shutil.copyfile(path, self.source / "Scripts" / path.name)
         for name in ("tip-rollout.json", "version.env"):
             shutil.copyfile(ROOT_DIR / name, self.source / name)
         self._git(self.source, "add", ".")
         self._git(self.source, "commit", "-qm", "tested candidate")
         self.candidate = self._git(self.source, "rev-parse", "HEAD")
+        self.write_ci_runs(self.candidate)
         (self.source / "advance").write_text("new protected main\n", encoding="utf-8")
         self._git(self.source, "add", ".")
         self._git(self.source, "commit", "-qm", "advance main")
@@ -728,6 +771,35 @@ shutil.copyfile(os.environ["ADMISSION_APPCAST"], args[args.index("--output") + 1
         # The checkout starts with an old origin/main: admission must fetch it.
         self._git(self.checkout, "update-ref", "refs/remotes/origin/main", self.candidate)
         self._git(self.source, "update-ref", "refs/heads/main", self.candidate)
+
+    def write_ci_runs(self, *commits: str) -> None:
+        runs = [{
+            "id": 123 + index,
+            "run_attempt": 2,
+            "head_sha": commit,
+            "head_branch": "main",
+            "event": "push",
+            "status": "completed",
+            "conclusion": "success",
+            "path": ".github/workflows/ci.yml",
+            "repository": {"full_name": SOURCE_REPOSITORY},
+            "head_repository": {"full_name": SOURCE_REPOSITORY},
+        } for index, commit in enumerate(commits)]
+        self.ci_runs.write_text(json.dumps({"total_count": len(runs), "workflow_runs": runs}))
+
+    def publication(self, commit: str, *, latest: bool = False, **overrides) -> None:
+        tag = f"tip-{commit[:12]}"
+        manifest = {
+            "schemaVersion": 1,
+            "channel": "tip",
+            "releaseCommit": commit,
+            "sourceTag": tag,
+            "buildNumber": "36.0.1",
+            "updateRepository": UPDATE_REPOSITORY,
+            "appcastItems": [{"tag": tag, "buildNumber": "36.0.1"}],
+            **overrides,
+        }
+        (self.latest_manifest if latest else self.published_manifest).write_text(json.dumps(manifest))
 
     def _git(self, cwd: Path, *arguments: str) -> str:
         result = subprocess.run(
@@ -741,6 +813,7 @@ shutil.copyfile(os.environ["ADMISSION_APPCAST"], args[args.index("--output") + 1
         self.output.write_text("", encoding="utf-8")
         self.summary.write_text("", encoding="utf-8")
         self.http_calls.write_text("", encoding="utf-8")
+        self.api_calls.write_text("", encoding="utf-8")
         environment = {
             **self.environment,
             "EVENT_NAME": "workflow_run",
@@ -748,9 +821,30 @@ shutil.copyfile(os.environ["ADMISSION_APPCAST"], args[args.index("--output") + 1
             "DISPATCH_COMMIT": self.advanced,
             "DISPATCH_REF": "refs/heads/main",
             "WORKFLOW_RUN_COMMIT": self.candidate,
+            "WORKFLOW_RUN_EVENT": "push",
+            "WORKFLOW_RUN_BRANCH": "main",
+            "WORKFLOW_RUN_REPOSITORY": SOURCE_REPOSITORY,
+            "WORKFLOW_RUN_PATH": ".github/workflows/ci.yml",
+            "WORKFLOW_RUN_CONCLUSION": "success",
             "WORKFLOW_DEFINITION_COMMIT": self.candidate,
             **overrides,
         }
+        self.event_path.write_text(json.dumps({
+            "action": "completed",
+            "repository": {"full_name": SOURCE_REPOSITORY},
+            "workflow_run": {
+                "id": 100,
+                "run_attempt": 2,
+                "head_sha": environment["WORKFLOW_RUN_COMMIT"],
+                "head_branch": environment["WORKFLOW_RUN_BRANCH"],
+                "event": environment["WORKFLOW_RUN_EVENT"],
+                "status": "completed",
+                "conclusion": environment["WORKFLOW_RUN_CONCLUSION"],
+                "path": environment["WORKFLOW_RUN_PATH"],
+                "repository": {"full_name": SOURCE_REPOSITORY},
+                "head_repository": {"full_name": environment["WORKFLOW_RUN_REPOSITORY"]},
+            },
+        }))
         result = subprocess.run(
             ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", self.admission_script],
             cwd=self.checkout, env=environment, text=True, capture_output=True, timeout=10,
@@ -774,19 +868,21 @@ shutil.copyfile(os.environ["ADMISSION_APPCAST"], args[args.index("--output") + 1
         self.assertEqual(outputs["short-sha"], self.candidate[:12])
         self.assertEqual(outputs["tag"], f"tip-{self.candidate[:12]}")
         self.assertEqual(outputs["build-number"], "36.0.1")
-        self.assertEqual(self.http_calls.read_text(), "curl\n")
+        self.assertEqual(outputs["ci-run"], "123")
+        self.assertEqual(outputs["ci-attempt"], "2")
+        self.assertEqual(self.http_calls.read_text(), "curl\n" * 3)
 
-    def test_superseded_tested_commit_skips_before_http_without_release_outputs(self) -> None:
+    def test_newer_untested_main_keeps_passing_source_and_pins_current_tooling(self) -> None:
         self._git(self.source, "update-ref", "refs/heads/main", self.advanced)
         for tooling in (self.candidate, self.advanced):
             with self.subTest(tooling=tooling):
                 self._git(self.checkout, "checkout", "-q", "--detach", tooling)
                 result, outputs = self._run(WORKFLOW_DEFINITION_COMMIT=tooling)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(outputs, {"eligible": "false"})
-                self.assertEqual(self.http_calls.read_text(), "")
-                self.assertIn("::notice::", result.stdout)
-                self.assertIn("superseded", result.stdout)
+                self.assertEqual(outputs["eligible"], "true")
+                self.assertEqual(outputs["commit"], self.candidate)
+                self.assertEqual(outputs["tooling-commit"], self.advanced)
+                self.assertEqual(self.http_calls.read_text(), "curl\n" * 3)
                 for commit in (self.candidate, self.advanced):
                     self.assertIn(commit, self.summary.read_text())
                 self.assertEqual(self._git(self.checkout, "rev-parse", "origin/main"), self.advanced)
@@ -825,12 +921,92 @@ shutil.copyfile(os.environ["ADMISSION_APPCAST"], args[args.index("--output") + 1
         )
         self.assertEqual(self.http_calls.read_text(), "")
 
-    def test_eligible_source_still_requires_same_commit_tooling(self) -> None:
+    def test_late_old_trigger_selects_newest_successful_main_source_at_setup(self) -> None:
+        self._git(self.source, "update-ref", "refs/heads/main", self.advanced)
+        self.write_ci_runs(self.advanced, self.candidate)
+        result, outputs = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs["commit"], self.advanced)
+        self.assertEqual(outputs["tooling-commit"], self.advanced)
+        self.assertEqual(outputs["ci-run"], "123")
+        self.assertEqual(outputs["build-number"], "36.0.2")
+
+    def test_successful_trigger_not_yet_listed_does_not_select_older_source(self) -> None:
+        self._git(self.source, "update-ref", "refs/heads/main", self.advanced)
+        result, outputs = self._run(WORKFLOW_RUN_COMMIT=self.advanced)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs["eligible"], "true")
+        self.assertEqual(outputs["commit"], self.advanced)
+        self.assertEqual(outputs["tooling-commit"], self.advanced)
+        self.assertEqual(outputs["ci-run"], "100")
+        self.assertEqual(outputs["ci-attempt"], "2")
+        self.assertEqual(outputs["build-number"], "36.0.2")
+
+    def test_stale_manual_dispatch_remains_rejected(self) -> None:
         self._git(self.source, "update-ref", "refs/heads/main", self.advanced)
         self.assert_rejected(
-            "Release tooling and selected protected-main source are not the same commit",
-            WORKFLOW_RUN_COMMIT=self.advanced,
+            "Manual Tip source and workflow tooling must match",
+            EVENT_NAME="workflow_dispatch", DISPATCH_COMMIT=self.candidate,
         )
+
+    def test_automatic_trigger_must_itself_be_successful_source_main_push_ci(self) -> None:
+        for overrides in (
+            {"WORKFLOW_RUN_EVENT": "pull_request"},
+            {"WORKFLOW_RUN_BRANCH": "feature"},
+            {"WORKFLOW_RUN_REPOSITORY": "fork/repo"},
+            {"WORKFLOW_RUN_PATH": ".github/workflows/release.yml"},
+            {"WORKFLOW_RUN_CONCLUSION": "failure"},
+        ):
+            with self.subTest(overrides=overrides):
+                self.assert_rejected("Automatic Tip requires successful", **overrides)
+                self.assertEqual(self.api_calls.read_text(), "")
+                self.assertEqual(self.http_calls.read_text(), "")
+
+    def test_empty_ci_lookup_keeps_authenticated_trigger_without_selecting_untested_main(self) -> None:
+        self._git(self.source, "update-ref", "refs/heads/main", self.advanced)
+        self.write_ci_runs()
+        result, outputs = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs["eligible"], "true")
+        self.assertEqual(outputs["commit"], self.candidate)
+        self.assertEqual(outputs["tooling-commit"], self.advanced)
+        self.assertEqual(outputs["ci-run"], "100")
+        self.assertEqual(outputs["ci-attempt"], "2")
+
+    def test_authenticated_trigger_does_not_hide_ci_api_failure(self) -> None:
+        self.assert_rejected("GitHub main CI lookup failed", ADMISSION_API_STATUS="1")
+        self.assertEqual(self.http_calls.read_text(), "")
+
+    def test_already_public_exact_source_is_not_rebuilt(self) -> None:
+        self.publication(self.candidate)
+        result, outputs = self._run(ADMISSION_PUBLISHED_STATUS="200")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs["eligible"], "false")
+        self.assertEqual(outputs["outcome"], "already-published")
+        self.assertEqual(outputs["commit"], self.candidate)
+        self.assertEqual(self.http_calls.read_text(), "curl\n")
+        self.assertIn("no rebuild", self.summary.read_text())
+
+    def test_newer_public_main_source_skips_obsolete_candidate_without_rollback(self) -> None:
+        self._git(self.source, "update-ref", "refs/heads/main", self.advanced)
+        self.publication(self.advanced, latest=True)
+        result, outputs = self._run(ADMISSION_LATEST_STATUS="200")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs["eligible"], "false")
+        self.assertEqual(outputs["outcome"], "newer-published")
+        self.assertEqual(self.http_calls.read_text(), "curl\n" * 2)
+
+    def test_publication_errors_and_mismatched_source_are_not_rebuild_authority(self) -> None:
+        self.publication(self.advanced)
+        self.assert_rejected("different source commit", ADMISSION_PUBLISHED_STATUS="200")
+        self.publication(self.candidate, sourceTag="tip-ffffffffffff")
+        self.assert_rejected("invalid source binding", ADMISSION_PUBLISHED_STATUS="200")
+        self.assert_rejected("Published Tip lookup failed with HTTP 403", ADMISSION_PUBLISHED_STATUS="403")
+        self.assert_rejected("Published Tip lookup failed with HTTP 500", ADMISSION_PUBLISHED_STATUS="500")
+
+    def test_malformed_published_manifest_is_a_failure(self) -> None:
+        self.published_manifest.write_text("not JSON")
+        self.assert_rejected("JSONDecodeError", ADMISSION_PUBLISHED_STATUS="200")
 
     def test_candidate_outside_main_ancestry_is_not_benign_supersession(self) -> None:
         self._git(self.checkout, "checkout", "-qb", "unrelated", self.candidate)
@@ -869,8 +1045,11 @@ shutil.copyfile(os.environ["ADMISSION_APPCAST"], args[args.index("--output") + 1
         jobs = re.split(r"^  ([A-Za-z_][\w-]*):\n", workflow.split("\njobs:\n", 1)[1], flags=re.M)
         sections = dict(zip(jobs[1::2], jobs[2::2]))
         setup_header = sections.pop("setup").split("    steps:\n", 1)[0]
+        result_header = sections.pop("result").split("    steps:\n", 1)[0]
+        self.assertIn("if: always()", result_header)
+        self.assertIn("needs: [setup, credential-preflight, stage, sign, compatibility, smoke-no-secrets, publish]", result_header)
         self.assertIn("      eligible: ${{ steps.tip.outputs.eligible }}", setup_header)
-        self.assertEqual(set(sections), {"credential-preflight", "stage", "sign", "smoke-no-secrets", "publish"})
+        self.assertEqual(set(sections), {"credential-preflight", "stage", "sign", "compatibility", "smoke-no-secrets", "publish"})
         for name, section in sections.items():
             with self.subTest(job=name):
                 header = section.split("    steps:\n", 1)[0]
@@ -879,6 +1058,153 @@ shutil.copyfile(os.environ["ADMISSION_APPCAST"], args[args.index("--output") + 1
                 self.assertIsNotNone(needs)
                 self.assertIn("setup", needs.group(0).split())
                 self.assertNotIn("continue-on-error:", section)
+
+
+class ReleaseWorkflowRecoveryTests(unittest.TestCase):
+    def job(self, filename: str, name: str) -> str:
+        workflow = (ROOT_DIR / ".github/workflows" / filename).read_text()
+        match = re.search(rf"^  {re.escape(name)}:\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow, re.M | re.S)
+        self.assertIsNotNone(match, name)
+        return match[1]
+
+    def test_stable_ref_verification_failure_is_not_masked_by_output_echo(self):
+        with tempfile.TemporaryDirectory(prefix="release-ref-contract-") as directory:
+            root = Path(directory)
+            (root / "Scripts").mkdir()
+            (root / "bin").mkdir()
+            output = root / "outputs"
+            PublishTipReleaseTests._write_executable(
+                root / "Scripts/verify_release_ref.sh",
+                '#!/usr/bin/env bash\nprintf "%s\\n" "$VERIFY_SHA"\nexit "$VERIFY_STATUS"\n',
+            )
+            PublishTipReleaseTests._write_executable(
+                root / "bin/git",
+                '#!/usr/bin/env bash\nprintf "%s\\n" "$TOOLING_SHA"\nexit "$GIT_STATUS"\n',
+            )
+            environment = {
+                "PATH": f"{root / 'bin'}:/usr/bin:/bin",
+                "HOME": str(root),
+                "GITHUB_OUTPUT": str(output),
+                "RELEASE_TAG": "v1.2.3",
+                "VERIFY_SHA": COMMIT,
+                "TOOLING_SHA": ADVANCED_COMMIT,
+                "VERIFY_STATUS": "0",
+                "GIT_STATUS": "0",
+            }
+            for filename in ("release.yml", "release-promote.yml"):
+                job = self.job(filename, "validate-ref")
+                self.assertIn("runs-on: ubuntu-latest", job)
+                script = textwrap.dedent(job.split("        run: |\n", 1)[1])
+                for override in ({"VERIFY_STATUS": "1"}, {"VERIFY_SHA": ""}, {"VERIFY_SHA": "not-a-sha"},
+                                 {"TOOLING_SHA": ""}, {"TOOLING_SHA": "not-a-sha"}, {"GIT_STATUS": "2"}, {}):
+                    with self.subTest(workflow=filename, override=override):
+                        output.write_text("")
+                        result = subprocess.run(
+                            ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script],
+                            cwd=root, env={**environment, **override}, text=True, capture_output=True, timeout=10,
+                        )
+                        if override:
+                            self.assertNotEqual(result.returncode, 0)
+                            self.assertEqual(output.read_text(), "")
+                        else:
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertEqual(output.read_text(), f"commit={COMMIT}\ntooling-commit={ADVANCED_COMMIT}\n")
+
+    def test_release_producers_use_immutable_attempt_names_and_consumers_reuse_outputs(self):
+        cases = (
+            ("main-tip.yml", "stage", "RepoPrompt-CE-staged-tip", (("sign", "name"),)),
+            ("main-tip.yml", "sign", "RepoPrompt-CE-signed-tip", (("compatibility", "artifact-name"), ("smoke-no-secrets", "name"), ("publish", "name"))),
+            ("release.yml", "stage", "RepoPrompt-CE-staged-release", (("publish", "name"),)),
+            ("release.yml", "publish", "RepoPrompt-CE-signed-release-zip", (("compatibility", "artifact-name"), ("smoke-signed-helper", "name"))),
+            ("release-promote.yml", "smoke-reviewed-helper", "reviewed-release-compatibility", (("compatibility", "artifact-name"),)),
+        )
+        for filename, producer, prefix, consumers in cases:
+            with self.subTest(workflow=filename, producer=producer):
+                job = self.job(filename, producer)
+                self.assertIn("artifact-name: ${{ steps.archive-name.outputs.name }}", job)
+                self.assertIn(f"ARTIFACT_NAME: {prefix}-${{{{ github.run_id }}}}-${{{{ github.run_attempt }}}}", job)
+                self.assertIn("name: ${{ steps.archive-name.outputs.name }}", job)
+                self.assertIn("retention-days: 7", job)
+                self.assertNotIn("overwrite: true", job)
+                for consumer, field in consumers:
+                    section = self.job(filename, consumer)
+                    self.assertIn(f"{field}: ${{{{ needs.{producer}.outputs.artifact-name }}}}", section)
+                    if field == "name":
+                        self.assertIn(f"PRODUCER_ARTIFACT: ${{{{ needs.{producer}.outputs.artifact-name }}}}", section)
+                        self.assertIn('run: test -n "$PRODUCER_ARTIFACT"', section)
+
+    def test_compatibility_does_not_skip_immutable_candidates_without_attempt(self):
+        compatibility = self.job("macos-compatibility.yml", "smoke")
+        header = compatibility.split("    steps:\n", 1)[0]
+        self.assertNotIn("    if:", header)
+        self.assertIn("if: inputs.admission != ''", compatibility)
+        self.assertIn('Scripts/ci_admission.py verify --context "$ADMISSION_CONTEXT"', compatibility)
+        self.assertNotIn("fromJSON(inputs.admission).attempt", compatibility)
+
+    def test_empty_producer_output_cannot_download_all_artifacts(self):
+        compatibility = self.job("macos-compatibility.yml", "smoke")
+        self.assertIn("PRODUCER_ARTIFACT: ${{ inputs.artifact-name }}", compatibility)
+        guard = compatibility.split("      - name: Require an exact producer artifact\n", 1)[1].split("\n      - name:", 1)[0]
+        script = guard.split("        run: ", 1)[1].strip()
+        for name in ("", "RepoPrompt-CE-signed-tip-123-1"):
+            with self.subTest(name=name):
+                result = subprocess.run(["bash", "-c", script], env={"PRODUCER_ARTIFACT": name}, timeout=5)
+                self.assertEqual(result.returncode == 0, bool(name))
+
+    def test_tip_uses_source_data_separately_from_pinned_trusted_tooling(self):
+        for name in ("smoke-no-secrets", "publish"):
+            with self.subTest(job=name):
+                job = self.job("main-tip.yml", name)
+                self.assertIn("ref: ${{ needs.setup.outputs.tooling-commit }}", job)
+                self.assertIn("ref: ${{ needs.setup.outputs.commit }}", job)
+                self.assertIn("path: approved-source", job)
+                self.assertIn("REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/approved-source", job)
+                self.assertIn("REPOPROMPT_APPROVED_SOURCE_ROOT: ${{ github.workspace }}/approved-source", job)
+
+    def test_tip_result_reports_each_failed_cancelled_or_skipped_prerequisite(self):
+        job = self.job("main-tip.yml", "result")
+        script = textwrap.dedent(job.split("        run: |\n", 1)[1])
+        names = ("setup", "credential-preflight", "stage", "sign", "compatibility", "smoke-no-secrets", "publish")
+        with tempfile.TemporaryDirectory(prefix="tip-result-") as directory:
+            summary = Path(directory) / "summary"
+            def execute(needs, **overrides):
+                summary.write_text("")
+                environment = {
+                    "PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin",
+                    "NEEDS_JSON": json.dumps(needs),
+                    "EVENT_NAME": "workflow_run",
+                    "UPSTREAM_CONCLUSION": "success",
+                    "GITHUB_STEP_SUMMARY": str(summary),
+                    **overrides,
+                }
+                return subprocess.run(["bash", "-e", "-c", script], env=environment, text=True, capture_output=True, timeout=10)
+            needs = {name: {"result": "success", "outputs": {}} for name in names}
+            needs["setup"]["outputs"] = {"eligible": "true", "outcome": "qualified", "commit": COMMIT, "tag": TAG}
+            result = execute(needs)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Tip published", summary.read_text())
+            for name in names:
+                for state in ("failure", "cancelled", "skipped"):
+                    with self.subTest(job=name, state=state):
+                        needs[name]["result"] = state
+                        result = execute(needs)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(f"| {name} | {state} |", summary.read_text())
+                        self.assertIn("Re-run failed jobs", summary.read_text())
+                        needs[name]["result"] = "success"
+            for name in names:
+                needs[name]["result"] = "skipped"
+            result = execute(needs, UPSTREAM_CONCLUSION="failure")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("blocked by upstream CI", summary.read_text())
+            needs["setup"]["result"] = "success"
+            for outcome in ("already-published", "newer-published"):
+                needs["setup"]["outputs"].update(eligible="false", outcome=outcome)
+                result = execute(needs)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Tip already published", summary.read_text())
+            needs["setup"]["outputs"]["outcome"] = "unknown-skip"
+            self.assertNotEqual(execute(needs).returncode, 0)
 
 
 if __name__ == "__main__":
