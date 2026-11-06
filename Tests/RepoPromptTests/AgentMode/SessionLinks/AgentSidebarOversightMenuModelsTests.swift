@@ -2907,7 +2907,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         var tracked: NSMenu?
         let ended = NotificationCenter.default.addObserver(forName: NSMenu.didEndTrackingNotification, object: nil, queue: nil) { note in
             MainActor.assumeIsolated {
-                guard !cancelAfterOpening, let menu = note.object as? NSMenu, menu === tracked else { return }
+                guard let menu = note.object as? NSMenu, menu === tracked else { return }
                 finished.fulfill()
             }
         }
@@ -2920,8 +2920,10 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
                     MainActor.assumeIsolated {
                         whileTracking?(menu)
                         if cancelAfterOpening {
+                            // Cancellation requests the end of tracking; it does not complete it.
+                            // The run-loop presenter keeps MainActor work live, so resuming here
+                            // can race menu teardown or a second opening. Wait for didEndTracking.
                             menu.cancelTracking()
-                            finished.fulfill()
                         }
                     }
                 }
