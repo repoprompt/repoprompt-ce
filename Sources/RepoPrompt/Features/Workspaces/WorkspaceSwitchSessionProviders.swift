@@ -29,7 +29,7 @@ final class ChatWorkspaceSwitchSessionProvider: WorkspaceSwitchSessionProvider {
         guard let workspaceManager, let oracleViewModel else { return }
         let expectedWorkspaceID = workspaceManager.activeWorkspaceID
         if let expectedWorkspaceID {
-            let registry = AppDomainRuntimeComposition.shared.oracleBackgroundInvocations
+            let registry = OracleBackgroundInvocationRegistry.shared
             let drain = registry.closeAll(workspaceID: expectedWorkspaceID)
             if !registry.isShuttingDown { await drain.value }
             guard deletionToken?.isActive ?? true, workspaceManager.activeWorkspaceID == expectedWorkspaceID else { return }

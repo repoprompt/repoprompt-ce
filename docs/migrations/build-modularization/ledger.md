@@ -102,6 +102,23 @@ provider lifecycle, or persistence ownership; independently constructed instance
 tests. Future catalogue-service extraction should absorb this projection and remove this singleton,
 not duplicate it in individual registries. No other new global owner is authorized by this exception.
 
+## Ratchet exception — background Oracle invocations (2026-11-06)
+
+`app_static_shared_declarations`: **89 → 90**, solely for
+`OracleBackgroundInvocationRegistry.shared`. Generated with
+`python3 Scripts/modularization_metrics.py update --allow-regression --baseline .build/validation-artifacts/oracle-index/ratchets.generated.json`
+after copying the current baseline to that temporary path. Only this metric is adopted
+in `ratchets.json`; all other baseline keys remain unchanged.
+This is an explicit one-owner exception, not a relaxation of the gate or a rename to evade its shared count.
+
+The owner is the process-memory index of background Oracle invocations used by
+`ask_oracle`/`oracle_chat_log`, provider awareness, and session deletion, independent of
+window and run lifetimes. No existing initializer or hook supplies the registry to
+deletion after writer and attachment drains but before file removal, and after the
+commit reporter returns. App-owned runtime/store ownership and canonical durable result
+authority remain unchanged. This owner only tracks process-local workers, awareness,
+and drain completion. The exception authorizes no other global owner.
+
 ## Decisions
 
 | ID | Decision | Status |

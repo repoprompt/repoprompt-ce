@@ -187,7 +187,7 @@ extension OracleViewModel {
             requireGroup: freezeGroupLanes
         )
         guard oracleBackgroundHistoryAdmissionIsOpen(workspaceID: workspaceID, groupID: selection.group?.group.id) else { throw OracleGroupClaimError.conflict }
-        if let group = selection.group, AppDomainRuntimeComposition.shared.oracleBackgroundInvocations.hasLiveGroup(group.group.id) { throw OracleGroupClaimError.conflict }
+        if let group = selection.group, OracleBackgroundInvocationRegistry.shared.hasLiveGroup(group.group.id) { throw OracleGroupClaimError.conflict }
         let beginsNewConversation: Bool = switch route {
         case .start:
             true
@@ -1001,11 +1001,12 @@ extension OracleViewModel {
         }
     }
 
+    var oracleConversationStore: DomainOracleConversationStore {
+        AppDomainRuntimeComposition.shared.oracleConversationStore
+    }
+
     static func oracleGroupOwner(workspaceID: UUID?, tabID: UUID) throws -> OracleConversationOwner {
-        try OracleConversationOwner(
-            kind: "app-tab",
-            identifier: "workspace:\(workspaceID?.uuidString ?? "none"):tab:\(tabID.uuidString)"
-        )
+        try OracleConversationOwner.appTab(workspaceID: workspaceID, tabID: tabID)
     }
 
     static func oracleProjectionName(base: String, laneIndex: Int) -> String {
@@ -1089,7 +1090,7 @@ extension OracleViewModel {
         ) else { return false }
         let memberIDs = Set(group.members.map(\.memberID.rawValue))
         guard memberIDs.contains(session.id) else { return false }
-        await AppDomainRuntimeComposition.shared.oracleBackgroundInvocations.drainGroup(group.group.id).value
+        await OracleBackgroundInvocationRegistry.shared.drainGroup(group.group.id).value
         guard let latest = try await store.load(groupID: group.group.id, owner: owner), latest.members == group.members else { return false }
         group = latest
         guard invalidateDeletedSnapshot.isCurrent() else {
@@ -1113,7 +1114,7 @@ extension OracleViewModel {
             owner: owner,
             expectedRevision: group.revision
         )
-        AppDomainRuntimeComposition.shared.oracleBackgroundInvocations.removeSettledGroup(group.group.id)
+        OracleBackgroundInvocationRegistry.shared.removeSettledGroup(group.group.id)
         invalidateDeletedSnapshot.invalidate()
         // A released lane's save is an un-awaited tracked task; let it land (and record its file) before deleting files.
         if let workspaceID = session.workspaceID { await drainTrackedAutosaves(for: workspaceID) }

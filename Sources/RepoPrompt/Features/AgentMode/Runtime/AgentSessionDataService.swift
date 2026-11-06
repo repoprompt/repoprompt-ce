@@ -1795,7 +1795,7 @@ actor AgentSessionDataService {
         var fileRemoved = false
         do {
             let oracleDrain = await MainActor.run {
-                AppDomainRuntimeComposition.shared.oracleBackgroundInvocations.closeAll(sessionID: sessionID)
+                OracleBackgroundInvocationRegistry.shared.closeAll(sessionID: sessionID)
             }
             await oracleDrain.value
             try Task.checkCancellation()
@@ -1816,7 +1816,7 @@ actor AgentSessionDataService {
         // withdrawn even while committed cleanup is suspended. A refused attempt never sets this.
         committedSessionDeletionFileURLs.insert(fileURL)
         await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(attempt, fileRemoved: fileRemoved)
-        await MainActor.run { AppDomainRuntimeComposition.shared.oracleBackgroundInvocations.removeSettledSession(sessionID) }
+        await MainActor.run { OracleBackgroundInvocationRegistry.shared.removeSettledSession(sessionID) }
         // Retained images belong to the committed session; a refused attempt never reaches here.
         AgentSessionAttachmentStore.removeSessionFolder(sessionID: sessionID, agentSessionsFolder: fileURL.deletingLastPathComponent())
         finishDeletionAttempt(for: fileURL, committed: true)

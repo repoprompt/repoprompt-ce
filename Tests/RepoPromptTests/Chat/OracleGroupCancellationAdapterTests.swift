@@ -28,6 +28,30 @@ private final class OracleFoundationGate {
 
 @MainActor
 final class OracleGroupCancellationAdapterTests: XCTestCase {
+    func testBackgroundRegistrySharesProcessIdentityAcrossProductionAccessPaths() async {
+        let composition = WindowStateCompositionFactory.make(
+            windowID: -9326,
+            deferredInitialAgentSystemWorkspaceRefresh: true,
+            sharedMCPService: MCPService(),
+            loadStoredAPISettingsDataOnInit: false,
+            automaticProviderModelDiscoveryEnabled: false
+        )
+        await composition.workspaceManager.awaitInitialized()
+        defer { composition.workspaceManager.prepareForWindowClose() }
+        let service = MCPOracleToolService(
+            askOracleToolName: "ask_oracle", oracleSendToolName: "oracle_send", oracleChatLogToolName: "oracle_chat_log",
+            promptVM: composition.promptManager, oracleVM: composition.oracleViewModel, liveRunPurpose: { _ in .agentModeRun },
+            resolveTabContextSnapshot: { _ in throw CancellationError() }, requireCurrentTabContext: { _ in throw CancellationError() },
+            stabilizedVirtualContext: { $0 }, resolveDelegatedReviewPackaging: { _, _, _, _ in nil },
+            rebindChatSessionIfNeeded: { _, _ in throw CancellationError() },
+            resolveTabIDForAgentMode: { _, _ in throw CancellationError() }, requireTargetWindow: { throw CancellationError() }, rawExplicitTabID: { _ in nil },
+            sendStageProgress: { _, _, _, _ in }, withHeartbeat: { _, _, _, _, operation in try await operation() },
+            sendChat: { _, _, _ in throw CancellationError() }, exportOracleResponse: { _ in throw CancellationError() }
+        )
+        let registry = OracleBackgroundInvocationRegistry.shared
+        XCTAssertTrue(service.backgroundRegistry === registry)
+    }
+
     func testStreamedPrimaryProgressSuppliesCancellationPartialAfterAuxiliarySettles() async throws {
         let composition = WindowStateCompositionFactory.make(
             windowID: -9325,
@@ -172,7 +196,7 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
     func testAppServiceCollectColdRecoveryAndStop() async throws {
         let fixture = try await AgentRunMCPControlledSessionContext.make(workspaceNamePrefix: "Background Oracle", workspaceSwitchReason: "oracle fixture", clientName: "oracle-fixture", unusedStartRunMessage: "No parent provider")
         addTeardownBlock { await fixture.cleanup() }
-        let window = fixture.window, session = fixture.session, registry = AppDomainRuntimeComposition.shared.oracleBackgroundInvocations
+        let window = fixture.window, session = fixture.session, registry = OracleBackgroundInvocationRegistry.shared
         let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspaceID)
         let settings = GlobalSettingsStore.shared, priorAdditional = settings.additionalOracleModelRaws()
         try settings.setAdditionalOracleModelRaws([AIModel.gpt54.rawValue], commit: false)
@@ -461,7 +485,7 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
         _ = session.beginRunAttempt(source: "oracle-catalog-fixture")
         session.runState = .running
         let runID = try XCTUnwrap(session.runID)
-        let registry = AppDomainRuntimeComposition.shared.oracleBackgroundInvocations
+        let registry = OracleBackgroundInvocationRegistry.shared
         let owner = try OracleBackgroundInvocationRegistry.Owner(
             workspaceID: workspaceID, binding: XCTUnwrap(session.persistentSessionBindingIdentity)
         )
@@ -880,7 +904,7 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
         let transport = AgentSessionLinkCapturingHeadlessProvider(failuresRemaining: 1)
         let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in transport })
         let recipient = try harness.makeBoundSession(agent: .openCode)
-        let processRegistry = AppDomainRuntimeComposition.shared.oracleBackgroundInvocations
+        let processRegistry = OracleBackgroundInvocationRegistry.shared
         let recipientOwner = try OracleBackgroundInvocationRegistry.Owner(workspaceID: XCTUnwrap(harness.host.workspaceManager?.activeWorkspaceID), binding: XCTUnwrap(recipient.persistentSessionBindingIdentity))
         recipient.oracleBackgroundOwner = recipientOwner
         let physicalHold = OracleFoundationGate()

@@ -1880,7 +1880,7 @@ class OracleViewModel: ObservableObject {
         guard oracleHistoryClearingWorkspaces.insert(activeWS.id).inserted else { return }
         defer { oracleHistoryClearingWorkspaces.remove(activeWS.id) }
         let invalidateDeletedSnapshot = captureChatSessionCatalogDeletionFence(for: activeWS.id)
-        await AppDomainRuntimeComposition.shared.oracleBackgroundInvocations.closeAll(workspaceID: activeWS.id).value
+        await OracleBackgroundInvocationRegistry.shared.closeAll(workspaceID: activeWS.id).value
         await cancelAllActiveSessionStreams(cleanupOwnerIsCurrent: invalidateDeletedSnapshot.isCurrent)
         await drainTrackedAutosaves(for: activeWS.id)
         guard invalidateDeletedSnapshot.isCurrent(), isActiveChatWorkspace(activeWS) else { return }
@@ -1901,7 +1901,7 @@ class OracleViewModel: ObservableObject {
             return
         }
         sessionOperationError = nil
-        AppDomainRuntimeComposition.shared.oracleBackgroundInvocations.removeSettledWorkspace(activeWS.id)
+        OracleBackgroundInvocationRegistry.shared.removeSettledWorkspace(activeWS.id)
 
         // 3) An obsolete deletion must not clear a successor workspace/root's runtime state.
         guard invalidateDeletedSnapshot.isCurrent(), isActiveChatWorkspace(activeWS) else { return }
@@ -4150,7 +4150,7 @@ class OracleViewModel: ObservableObject {
     private func handleComposeTabsWillClose(_ tabIDs: Set<UUID>) async {
         for tabID in tabIDs {
             if let workspaceID = workspaceManager.activeWorkspaceID {
-                await AppDomainRuntimeComposition.shared.oracleBackgroundInvocations.closeAll(workspaceID: workspaceID, tabID: tabID).value
+                await OracleBackgroundInvocationRegistry.shared.closeAll(workspaceID: workspaceID, tabID: tabID).value
             }
             // 1. Cancel headless stream (plan/question generation) for this tab
             if headlessRuntime.hasActiveStream(for: tabID) {

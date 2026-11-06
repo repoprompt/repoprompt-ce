@@ -89,6 +89,8 @@ final class OracleBackgroundHandoff: Sendable {
 /// Process-local execution/discovery references only. Answers and terminal outcomes stay canonical.
 @MainActor
 final class OracleBackgroundInvocationRegistry {
+    static let shared = OracleBackgroundInvocationRegistry()
+
     static let activeLimit = 4
     static let inactiveSessionLimit = 64
     static let inactiveProcessLimit = 256
@@ -217,7 +219,7 @@ final class OracleBackgroundInvocationRegistry {
             guard let registry, let entry = registry.entry(for: self), !entry.finishing,
                   let reference = entry.reference, document.group.id == reference.groupID,
                   document.members == reference.members,
-                  try document.owner == (OracleViewModel.oracleGroupOwner(workspaceID: owner.workspaceID, tabID: owner.binding.tabID)),
+                  try document.owner == (OracleConversationOwner.appTab(workspaceID: owner.workspaceID, tabID: owner.binding.tabID)),
                   let turn = document.turns.last, turn.id == reference.turnID, turn.state == .terminal,
                   turn.backgroundExecution == provenance, turn.status != nil, turn.finishedAt != nil,
                   turn.results.count == reference.members.count
@@ -538,7 +540,7 @@ final class OracleBackgroundInvocationRegistry {
         guard let entry = entry(for: job), !entry.finishing, entry.reference == nil, document.group.size >= 2,
               let turn = document.turns.last, turn.state == .prepared,
               turn.backgroundExecution == job.provenance,
-              try document.owner == (OracleViewModel.oracleGroupOwner(workspaceID: job.owner.workspaceID, tabID: job.owner.binding.tabID))
+              try document.owner == (OracleConversationOwner.appTab(workspaceID: job.owner.workspaceID, tabID: job.owner.binding.tabID))
         else { throw RegistryError.invalidExecution }
         let reference = Reference(groupID: document.group.id, turnID: turn.id, members: document.members, provenance: job.provenance)
         entry.reference = reference

@@ -336,6 +336,13 @@ package struct OracleConversationOwner: Hashable, Codable {
         self.identifier = identifier
     }
 
+    package static func appTab(workspaceID: UUID?, tabID: UUID) throws -> Self {
+        try OracleConversationOwner(
+            kind: "app-tab",
+            identifier: "workspace:\(workspaceID?.uuidString ?? "none"):tab:\(tabID.uuidString)"
+        )
+    }
+
     package init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         try self.init(

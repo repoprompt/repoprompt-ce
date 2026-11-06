@@ -48,7 +48,7 @@ extension AgentModeViewModel {
         if case let .blocked(failure) = selection { return .blocked(failure) }
         if queueHasCommittedDrain() { return .blocked(.targetBusy) }
         guard let binding = session.persistentSessionBindingIdentity else { return .blocked(.targetBusy) }
-        let oracleHadWork = session.oracleBackgroundOwner.map { AppDomainRuntimeComposition.shared.oracleBackgroundInvocations.hasLiveOwner($0) } ?? false
+        let oracleHadWork = session.oracleBackgroundOwner.map { OracleBackgroundInvocationRegistry.shared.hasLiveOwner($0) } ?? false
         var oracleDrained = !oracleHadWork
 
         if selection == .notRunning {

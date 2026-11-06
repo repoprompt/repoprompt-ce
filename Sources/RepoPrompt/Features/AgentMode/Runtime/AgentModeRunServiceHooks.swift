@@ -423,3 +423,14 @@ extension AgentModeRunService.Hooks {
         )
     }
 }
+
+@MainActor
+extension OracleBackgroundAwareness {
+    func reserve(session: AgentTabSession, providerID: ObjectIdentifier?, registry: OracleBackgroundInvocationRegistry? = nil) -> Reservation? {
+        guard let owner = session.oracleBackgroundOwner, let runID = session.runID,
+              owner.binding == session.persistentSessionBindingIdentity,
+              !session.bindingTransitionInProgress else { return nil }
+        let registry = registry ?? OracleBackgroundInvocationRegistry.shared
+        return reserve(owner: owner, runID: runID, providerID: providerID, registry: registry)
+    }
+}

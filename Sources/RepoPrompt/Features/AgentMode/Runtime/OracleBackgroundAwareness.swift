@@ -43,11 +43,7 @@ final class OracleBackgroundAwareness {
         inFlight = nil
     }
 
-    func reserve(session: AgentTabSession, providerID: ObjectIdentifier?, registry: OracleBackgroundInvocationRegistry? = nil) -> Reservation? {
-        guard let owner = session.oracleBackgroundOwner, let runID = session.runID,
-              owner.binding == session.persistentSessionBindingIdentity,
-              !session.bindingTransitionInProgress else { return nil }
-        let registry = registry ?? AppDomainRuntimeComposition.shared.oracleBackgroundInvocations
+    func reserve(owner: OracleBackgroundInvocationRegistry.Owner, runID: UUID, providerID: ObjectIdentifier?, registry: OracleBackgroundInvocationRegistry) -> Reservation? {
         guard !registry.admissionIsClosed(for: owner) else { return nil }
         let context = Context(owner: owner, runID: runID, providerID: providerID, generation: contextGeneration)
         if currentContext != context {
@@ -80,46 +76,12 @@ final class OracleBackgroundAwareness {
 
     func accept(_ reservation: Reservation?, registry: OracleBackgroundInvocationRegistry? = nil) {
         guard let reservation, inFlight?.id == reservation.id, currentContext == reservation.context else { return }
-        let registry = registry ?? AppDomainRuntimeComposition.shared.oracleBackgroundInvocations
+        let registry = registry ?? OracleBackgroundInvocationRegistry.shared
         guard registry.awarenessVersion(for: reservation.context.owner).epoch == reservation.epoch else {
             inFlight = nil
             return
         }
         accepted = (reservation.epoch, reservation.revision)
         inFlight = nil
-    }
-}
-
-extension AgentModeViewModel {
-    @discardableResult
-    func closeOracleBackground(for session: AgentTabSession) -> Task<Void, Never>? {
-        guard let owner = session.oracleBackgroundOwner else { return nil }
-        let drain = AppDomainRuntimeComposition.shared.oracleBackgroundInvocations.close(owner)
-        session.oracleBackgroundDrain = drain
-        session.oracleBackgroundAwareness.resetContext()
-        return drain
-    }
-
-    @discardableResult
-    func awaitOracleBackgroundDrain(for session: AgentTabSession, timeout: TimeInterval = 30) async -> Bool {
-        guard let owner = session.oracleBackgroundOwner else { return true }
-        let registry = AppDomainRuntimeComposition.shared.oracleBackgroundInvocations
-        guard let drain = closeOracleBackground(for: session) else { return true }
-        if registry.isDrained(owner) { return true }
-        let settled = await OracleBackgroundInvocationRegistry.awaitDrain(drain, timeout: timeout)
-        return settled && sessions[session.tabID] === session && session.persistentSessionBindingIdentity == owner.binding
-    }
-
-    func closeOracleBackgroundWindowAdmission() {
-        for session in sessions.values {
-            closeOracleBackground(for: session)
-        }
-    }
-
-    func joinOracleBackgroundWindowDrain() async {
-        let drains = sessions.values.compactMap { closeOracleBackground(for: $0) }
-        for drain in drains {
-            await drain.value
-        }
     }
 }
