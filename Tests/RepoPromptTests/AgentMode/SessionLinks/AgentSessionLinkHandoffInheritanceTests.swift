@@ -2936,7 +2936,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     projection, source: source, historyReference: nil, budget: budget
                 ))
                 let payload = AgentProviderHandover.render(carrier)
-                session.pendingHandoff = try .init(
+                session.pendingHandoff = .init(
                     payload: payload, createdAt: Date(),
                     sourceItemID: session.items.last?.id, providerSwitchDelivery: .ready
                 )
@@ -3062,7 +3062,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 )
                 session.isChangingExecutionLocation = false
 
-                session.pendingHandoff = try .init(payload: "foreign-slot", createdAt: Date())
+                session.pendingHandoff = .init(payload: "foreign-slot", createdAt: Date())
                 XCTAssertEqual(
                     vm.providerSwitchTransitionAdmission(session),
                     .hard(AgentSessionLinkSendFailure.targetBusy.message),
@@ -3350,7 +3350,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 let vm = fixture.viewModel
                 let session = fixture.sourceSession
                 let provider = session.selectedAgent
-                session.pendingHandoff = try .init(payload: "foreign-slot", createdAt: Date())
+                session.pendingHandoff = .init(payload: "foreign-slot", createdAt: Date())
                 await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
                 let preview = try XCTUnwrap(vm.providerSwitchPreview)
                 let forced = await vm.applyProviderSwitch(preview.id, force: true)
@@ -3412,7 +3412,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     let vm = fixture.viewModel
                     let session = fixture.sourceSession
                     let provider = session.selectedAgent
-                    session.pendingHandoff = try .init(payload: "foreign-slot", createdAt: Date())
+                    session.pendingHandoff = .init(payload: "foreign-slot", createdAt: Date())
                     if awaitingApproval {
                         session.pendingApproval = AgentApprovalRequest(
                             requestID: .codex(.int(1)),
@@ -3682,7 +3682,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     projection, source: source, historyReference: nil, budget: budget
                 ))
                 let payload = AgentProviderHandover.render(carrier)
-                session.pendingHandoff = try .init(
+                session.pendingHandoff = .init(
                     payload: payload, createdAt: Date(),
                     sourceItemID: session.items.last?.id, providerSwitchDelivery: .ready
                 )
