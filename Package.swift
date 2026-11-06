@@ -50,6 +50,7 @@ var repoPromptAppDependencies: [Target.Dependency] = [
     "RepoPromptACPProviders",
     "RepoPromptCodexProvider",
     "RepoPromptAIContracts",
+    "RepoPromptWorkspaceContext",
     "RepoPromptDomainRuntime",
     "RepoPromptFoundation",
     "RepoPromptProcess",
@@ -97,6 +98,8 @@ var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptCodexProvider",
     "RepoPromptAIContracts",
     "RepoPromptApp",
+    "RepoPromptWorkspaceContext",
+    "RepoPromptWorkspaceContextTestSupport",
     "RepoPromptFoundation",
     "RepoPromptProcess",
     "RepoPromptInstrumentation",
@@ -372,6 +375,39 @@ let package = Package(
             swiftSettings: swift6LanguageMode + [
                 .define("DEBUG", .when(configuration: .debug))
             ]
+        ),
+        .target(
+            name: "RepoPromptWorkspaceContext",
+            dependencies: [
+                "RepoPromptC", "RepoPromptCodeMapCore", "RepoPromptDomainRuntime",
+                "RepoPromptFileSystem", "RepoPromptFoundation", "RepoPromptInstrumentation",
+                "RepoPromptPersistence", "RepoPromptRegexCore", "RepoPromptSettingsCore",
+                "RepoPromptShared", "RepoPromptVCS", "RepoPromptWorkspaceCore"
+            ],
+            path: "Sources/RepoPromptWorkspaceContext",
+            swiftSettings: [
+                .define("DEBUG", .when(configuration: .debug)),
+                .enableUpcomingFeature("BareSlashRegexLiterals")
+            ]
+        ),
+        .target(
+            name: "RepoPromptWorkspaceContextTestSupport",
+            dependencies: [
+                "RepoPromptWorkspaceContext", "RepoPromptCodeMapCore", "RepoPromptFileSystem",
+                "RepoPromptFoundation", "RepoPromptPersistence", "RepoPromptVCS"
+            ],
+            path: "Tests/RepoPromptWorkspaceContextTestSupport",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
+        .testTarget(
+            name: "RepoPromptWorkspaceContextTests",
+            dependencies: [
+                "RepoPromptWorkspaceContext", "RepoPromptWorkspaceContextTestSupport",
+                "RepoPromptCodeMapCore", "RepoPromptFileSystem", "RepoPromptFoundation",
+                "RepoPromptPersistence", "RepoPromptWorkspaceCore"
+            ],
+            path: "Tests/RepoPromptWorkspaceContextTests",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
         ),
         .target(
             name: "RepoPromptApp",

@@ -2,6 +2,7 @@ import RepoPromptACPProviders
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 
 //
 //  AgentInputBar.swift

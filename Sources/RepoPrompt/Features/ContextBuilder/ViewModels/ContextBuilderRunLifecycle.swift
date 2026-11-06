@@ -2,6 +2,7 @@ import Foundation
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 
 enum ContextBuilderRunOrigin: Equatable {
     case ui

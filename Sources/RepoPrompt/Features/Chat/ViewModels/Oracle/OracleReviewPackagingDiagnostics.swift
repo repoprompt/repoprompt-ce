@@ -3,6 +3,7 @@ import Foundation
 import RepoPromptAIContracts
 import RepoPromptFoundation
 import RepoPromptShared
+import RepoPromptWorkspaceContext
 
 enum OracleSendOrigin: String {
     case askOracle

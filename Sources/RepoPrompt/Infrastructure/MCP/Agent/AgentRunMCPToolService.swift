@@ -6,6 +6,7 @@ import RepoPromptInstrumentation
 import RepoPromptSettingsCore
 import RepoPromptShared
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 
 struct OracleExportFile: Equatable {
     let path: String

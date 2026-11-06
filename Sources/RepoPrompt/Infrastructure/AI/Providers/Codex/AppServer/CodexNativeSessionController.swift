@@ -5,6 +5,7 @@ import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
 import RepoPromptInstrumentation
+import RepoPromptWorkspaceContext
 
 private actor CodexInboundStreamTaskStartGate {
     private var continuation: CheckedContinuation<Void, Never>?

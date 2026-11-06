@@ -6,6 +6,7 @@ import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import RepoPromptVCS
+@testable import RepoPromptWorkspaceContext
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 

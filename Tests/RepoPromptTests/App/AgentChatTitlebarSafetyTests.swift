@@ -9,6 +9,7 @@ import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptPersistence
 import RepoPromptSettingsCore
+@testable import RepoPromptWorkspaceContext
 import SwiftUI
 import XCTest
 

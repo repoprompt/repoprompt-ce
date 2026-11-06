@@ -6,6 +6,7 @@ import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptCodexProvider
 import RepoPromptSecureStorage
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 #if DEBUG

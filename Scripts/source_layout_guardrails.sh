@@ -43,6 +43,9 @@ required_dirs=(
   "Sources/RepoPromptShared/MCP"
   "Sources/RepoPromptWorkspaceCore"
   "Sources/RepoPromptDomainRuntime"
+  "Sources/RepoPromptWorkspaceContext"
+  "Tests/RepoPromptWorkspaceContextTests"
+  "Tests/RepoPromptWorkspaceContextTestSupport"
   "Tests/RepoPromptTests"
   "Tests/RepoPromptWorkspaceCoreTests"
   "Tests/RepoPromptDomainRuntimeTests"
@@ -83,6 +86,20 @@ shared_mcp_required_files=(
 for file in "${shared_mcp_required_files[@]}"; do
   if [[ ! -f "$file" ]]; then
     fail "required shared MCP file missing: $file"
+  fi
+done
+
+# WorkspaceContext owns context/search/codemap orchestration, not app composition.
+print_matches \
+  "RepoPromptWorkspaceContext imports app/UI ownership" \
+  grep -R -n -E '^(@testable[[:space:]]+)?import[[:space:]]+(RepoPromptApp|AppKit|SwiftUI)([[:space:]]|$)' Sources/RepoPromptWorkspaceContext Tests/RepoPromptWorkspaceContextTests Tests/RepoPromptWorkspaceContextTestSupport --include='*.swift'
+print_matches \
+  "RepoPromptWorkspaceContext reads app-global preferences or bundle identity" \
+  grep -R -n -E 'UserDefaults[.]standard|Bundle[.]main' Sources/RepoPromptWorkspaceContext --include='*.swift'
+for retired in Sources/RepoPrompt/Infrastructure/WorkspaceContext Sources/RepoPrompt/Features/Search Sources/RepoPrompt/Features/CodeMap; do
+  if [[ -d "$retired" ]]; then
+    print_matches "WorkspaceContext implementation remains in retired app family: $retired" \
+      find "$retired" -type f -name '*.swift' -print
   fi
 done
 
@@ -843,6 +860,7 @@ allowed_tracked_docs=(
   "docs/migrations/build-modularization-2026-09-28.md"
   "docs/migrations/build-modularization/completion-plan.md"
   "docs/migrations/build-modularization/ledger.md"
+  "docs/migrations/build-modularization/m6-workspace-move-manifest.tsv"
   "docs/migrations/build-modularization/ratchets.json"
   "docs/migrations/build-modularization/build-ratchets.json"
   "docs/open-source-readiness.md"
@@ -913,13 +931,28 @@ if ! python3 Scripts/swift_imports.py --forbid-ui \
   Sources/RepoPromptFoundation Sources/RepoPromptInstrumentation \
   Sources/RepoPromptProcess Sources/RepoPromptRegexCore \
   Sources/RepoPromptFileSystem Sources/RepoPromptVCS \
-  Sources/RepoPromptPersistence Sources/RepoPromptSettingsCore; then
+  Sources/RepoPromptPersistence Sources/RepoPromptSettingsCore \
+  Sources/RepoPromptAIContracts Sources/RepoPromptAgentProviderContracts \
+  Sources/RepoPromptClaudeProvider Sources/RepoPromptCodexProvider \
+  Sources/RepoPromptACPProviders Sources/RepoPromptHTTPProviders; then
   fail "UI framework import in app-free target"
 fi
 if [[ -d Sources/RepoPromptProcess ]]; then
   print_matches "ambient Bundle.main or UserDefaults.standard in RepoPromptProcess" \
     grep -R -n -E 'Bundle[.]main|UserDefaults[.]standard' Sources/RepoPromptProcess --include='*.swift'
 fi
+
+# M8 provider policy comes from app adapters, not ambient process preferences.
+print_matches "ambient UserDefaults.standard in an M8 provider or contract target" \
+  grep -R -n -E 'UserDefaults[.]standard' \
+    Sources/RepoPromptAIContracts Sources/RepoPromptAgentProviderContracts \
+    Sources/RepoPromptClaudeProvider Sources/RepoPromptCodexProvider \
+    Sources/RepoPromptACPProviders Sources/RepoPromptHTTPProviders --include='*.swift'
+# These consumers use NativeAgentRuntimeControlling; construction stays elsewhere.
+print_matches "concrete provider import in a neutral native runtime consumer" \
+  grep -n -E 'import[[:space:]]+RepoPrompt(ClaudeProvider|CodexProvider|ACPProviders|HTTPProviders)([[:space:].]|$)' \
+    Sources/RepoPrompt/Features/AgentMode/Runtime/Runners/ClaudeIntegratedAgentModeRunner.swift \
+    Sources/RepoPrompt/Features/AgentMode/Runtime/Claude/ClaudeControllerEventListener.swift
 
 # Swift class runtime names embed the module (`_TtC13RepoPromptApp...`), so these
 # APIs silently change identity when a type moves. Use explicit string identities.

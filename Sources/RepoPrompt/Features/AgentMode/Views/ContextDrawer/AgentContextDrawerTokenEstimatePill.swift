@@ -1,3 +1,4 @@
+import RepoPromptWorkspaceContext
 import SwiftUI
 
 struct AgentContextDrawerTokenEstimatePill: View {

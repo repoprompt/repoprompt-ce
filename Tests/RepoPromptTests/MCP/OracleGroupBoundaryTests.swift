@@ -5,6 +5,7 @@ import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 @testable import RepoPromptMCPCore
 import RepoPromptSettingsCore
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 #if DEBUG

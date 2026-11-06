@@ -5,6 +5,7 @@ import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
 import RepoPromptSettingsCore
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 @MainActor

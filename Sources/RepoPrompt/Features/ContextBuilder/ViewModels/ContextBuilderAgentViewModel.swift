@@ -10,6 +10,7 @@ import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 import SwiftUI
 

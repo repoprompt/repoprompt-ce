@@ -3580,6 +3580,7 @@ class OperationRegistry:
         "SWIFTFLAGS",
         "TMPDIR",
         "HOME",
+        "CFFIXED_USER_HOME",
         "USER",
         "LOGNAME",
         "SHELL",

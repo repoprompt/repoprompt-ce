@@ -3,6 +3,7 @@ import MCP
 import RepoPromptAIContracts
 import RepoPromptSettingsCore
 import RepoPromptVCS
+@testable import RepoPromptWorkspaceContext
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
 

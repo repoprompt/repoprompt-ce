@@ -5,6 +5,7 @@ import RepoPromptFileSystem
 import RepoPromptHTTPProviders
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 import SwiftUI
 
 #if DEBUG

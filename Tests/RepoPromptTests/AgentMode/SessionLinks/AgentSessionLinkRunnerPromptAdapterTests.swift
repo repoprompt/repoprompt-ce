@@ -2,6 +2,7 @@ import Foundation
 import RepoPromptACPProviders
 import RepoPromptAIContracts
 @testable import RepoPromptApp
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 /// Headless runner adapter, driven through the real `HeadlessAgentModeRunner`.
