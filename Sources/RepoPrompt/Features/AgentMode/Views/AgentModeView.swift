@@ -1438,12 +1438,6 @@ struct AgentModeChatDetailView: View {
         #endif
     }
 
-    private var markdownFileLinkOpener: MarkdownFileLinkOpener {
-        MarkdownFileLinkOpener { target in
-            await promptManager.fileManager.openFileForMarkdownLink(target)
-        }
-    }
-
     private var supportsAutoScroll: Bool {
         if #available(macOS 15.0, *) {
             return true
@@ -2742,14 +2736,6 @@ struct AgentModeChatDetailView: View {
         return false
     }
 
-    /// Stable cancel closure for the active run, captured at render time.
-    private func cancelActiveToolsAction(runInteraction: AgentRunInteractionUISnapshot) -> (() -> Void)? {
-        guard let runID = runInteraction.activeRunID else { return nil }
-        return { [weak agentModeVM] in
-            agentModeVM?.cancelActiveToolsForRun(runID: runID, reason: "tool_card_header_cancel")
-        }
-    }
-
     private func transcriptRowView(
         item: AgentChatItem,
         block: AgentTranscriptRenderBlock,
@@ -3249,36 +3235,6 @@ struct AgentModeChatDetailView: View {
         }
         transcriptBlockExpansion = nextExpansion
         transcriptBlockDefaultExpansion = nextDefaults
-    }
-
-    // MARK: - Handoff
-
-    private func handoffConfig(for itemID: UUID, runInteraction: AgentRunInteractionUISnapshot) -> AgentHandoffConfig {
-        AgentHandoffConfig(
-            itemID: itemID,
-            defaultDestinationAgent: runInteraction.selectedAgent,
-            defaultModelRaw: runInteraction.selectedModelRaw,
-            defaultReasoningEffortRaw: runInteraction.selectedReasoningEffortRaw,
-            availableAgentsProvider: { [weak agentModeVM] in
-                agentModeVM?.availableAgents ?? []
-            },
-            modelOptionsProvider: { [weak agentModeVM] agent in
-                agentModeVM?.modelOptions(for: agent) ?? []
-            },
-            windowID: windowID,
-            buildPayloadForClipboard: { [weak agentModeVM] in
-                await agentModeVM?.buildHandoffPayload(upToItemID: itemID) ?? ""
-            },
-            performHandoff: { [weak agentModeVM] selection in
-                guard let vm = agentModeVM else { return }
-                try await vm.prepareHandoffToNewTab(
-                    upToItemID: itemID,
-                    destinationAgent: selection.agent,
-                    destinationModelRaw: selection.modelRaw,
-                    destinationReasoningEffortRaw: selection.reasoningEffortRaw
-                )
-            }
-        )
     }
 
     private var topSentinel: some View {
