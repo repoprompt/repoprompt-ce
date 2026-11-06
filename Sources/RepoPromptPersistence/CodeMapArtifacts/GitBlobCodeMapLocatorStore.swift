@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 import RepoPromptCodeMapCore
@@ -167,11 +168,16 @@ package actor GitBlobCodeMapLocatorStore {
     private let policy: GitBlobCodeMapLocatorStorePolicy
     private let hooks: GitBlobCodeMapLocatorStoreHooks
     private var maintenanceEstimate = GitBlobCodeMapLocatorMaintenanceEstimate()
+    /// Canonical decoding is reusable only after the leaf is securely admitted and all bytes
+    /// are read and hashed again. Never use this cache for quota accounting or read authority.
+    private var maintenanceValidationProofs: [String: GitBlobLocatorValidationProof] = [:]
 
     #if DEBUG
         private var debugMaintenanceSweepCount: UInt64 = 0
         private var debugMaintenanceExaminedRecordCount: UInt64 = 0
         private var debugLastMaintenanceResult: GitBlobCodeMapLocatorMaintenanceResult?
+        private var debugMaintenanceDecodeCount: UInt64 = 0
+        private var debugMaintenanceValidationHitCount: UInt64 = 0
     #endif
 
     package init(
@@ -482,6 +488,10 @@ package actor GitBlobCodeMapLocatorStore {
     }
 
     #if DEBUG
+        package func debugMaintenanceValidationCounts() -> (decodes: UInt64, hits: UInt64, retainedProofs: Int) {
+            (debugMaintenanceDecodeCount, debugMaintenanceValidationHitCount, maintenanceValidationProofs.count)
+        }
+
         package func debugMaintenanceAccounting() -> GitBlobCodeMapLocatorMaintenanceAccounting {
             GitBlobCodeMapLocatorMaintenanceAccounting(
                 sweepCount: debugMaintenanceSweepCount,
@@ -584,7 +594,7 @@ package actor GitBlobCodeMapLocatorStore {
                     break shardLoop
                 }
                 examined += 1
-                switch try Self.inspectMaintenanceRecord(
+                switch try inspectMaintenanceRecord(
                     parent: shard,
                     shardName: shardName,
                     name: name
@@ -652,6 +662,7 @@ package actor GitBlobCodeMapLocatorStore {
                 remainingBytes = remainingBytes >= entry.byteCount ? remainingBytes - entry.byteCount : 0
                 evicted += 1
                 touchedShards.insert(entry.shard)
+                maintenanceValidationProofs.removeValue(forKey: entry.name)
             }
         }
         guard remainingCount <= policy.maximumRecordCount,
@@ -667,6 +678,10 @@ package actor GitBlobCodeMapLocatorStore {
             } else if errno != ENOTEMPTY, errno != ENOENT {
                 throw Self.ioError("maintenance-shard-prune")
             }
+        }
+        if !hasMore {
+            let retainedNames = Set(entries.map(\.name))
+            maintenanceValidationProofs = maintenanceValidationProofs.filter { retainedNames.contains($0.key) }
         }
         let result = GitBlobCodeMapLocatorMaintenanceResult(
             examinedCount: examined,
@@ -745,11 +760,15 @@ package actor GitBlobCodeMapLocatorStore {
         }
     }
 
-    private static func inspectMaintenanceRecord(
+    private func inspectMaintenanceRecord(
         parent: GitBlobLocatorDirectoryDescriptor,
         shardName: String,
         name: String
     ) throws -> GitBlobLocatorMaintenanceRecordInspection {
+        var retained = false
+        defer {
+            if !retained { maintenanceValidationProofs.removeValue(forKey: name) }
+        }
         let descriptor = openat(
             parent.rawValue,
             name,
@@ -782,13 +801,35 @@ package actor GitBlobCodeMapLocatorStore {
             } else {
                 do {
                     let data = try Self.readExactly(descriptor, byteCount: Int(identity.size))
-                    _ = try GitBlobCodeMapLocatorRecordCodec.decodeStored(data, filenameDigest: name)
+                    let checksum = Data(SHA256.hash(data: data))
+                    if let proof = maintenanceValidationProofs[name],
+                       proof.identity == identity, proof.checksum == checksum
+                    {
+                        #if DEBUG
+                            debugMaintenanceValidationHitCount &+= 1
+                        #endif
+                    } else {
+                        #if DEBUG
+                            debugMaintenanceDecodeCount &+= 1
+                        #endif
+                        _ = try GitBlobCodeMapLocatorRecordCodec.decodeStored(data, filenameDigest: name)
+                        if maintenanceValidationProofs[name] != nil ||
+                            maintenanceValidationProofs.count < min(4096, policy.maximumRecordCount)
+                        {
+                            maintenanceValidationProofs[name] = GitBlobLocatorValidationProof(
+                                identity: identity, checksum: checksum
+                            )
+                        }
+                    }
                 } catch {
                     isCorrupt = true
                 }
             }
         }
-        guard isTemporary || isCorrupt else { return .retained(identity) }
+        guard isTemporary || isCorrupt else {
+            retained = true
+            return .retained(identity)
+        }
         guard try Self.secureRemove(parent: parent, name: name, descriptor: descriptor) else {
             return .ignored
         }
@@ -1344,6 +1385,11 @@ private enum GitBlobLocatorMaintenanceRecordInspection {
     case removedTemporary
     case removedCorrupt
     case retained(GitBlobLocatorFileIdentity)
+}
+
+private struct GitBlobLocatorValidationProof {
+    let identity: GitBlobLocatorFileIdentity
+    let checksum: Data
 }
 
 private struct GitBlobLocatorMaintenanceEntry {

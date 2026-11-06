@@ -905,3 +905,182 @@ final class AgentToolResultPersistenceContextTests: XCTestCase {
         XCTAssertNotEqual(cached, baseline(transcript))
     }
 }
+
+/// Per-activity tool-result sanitation must not scan an entire multi-megabyte payload
+/// for liveness markers on every transcript rebuild (Sentry REPOPROMPT-1D1/-78/-1D7/
+/// -1DB for the ACP marker search, -1D2/-1D9 for the ICU regex captures).
+final class AgentToolResultSanitizationBoundsTests: XCTestCase {
+    private typealias Policy = AgentToolResultPersistencePolicy
+
+    private let limit = Policy.livenessMarkerScanByteLimit
+    private let exitCodeRegex = try! NSRegularExpression(
+        pattern: #"process\s+completed\s+with\s+exit\s+code\s+(-?[0-9]+)"#,
+        options: [.caseInsensitive]
+    )
+    private let processIDRegex = try! NSRegularExpression(
+        pattern: #"process\s+running\s+with\s+session\s+id\s+([^\s]+)"#,
+        options: [.caseInsensitive]
+    )
+
+    // MARK: - Scan windows
+
+    func testPayloadWithinBudgetIsScannedWhole() {
+        let text = String(repeating: "x", count: limit * 2)
+        XCTAssertEqual(Policy.livenessScanWindows(for: text), [.init(text: text, isTruncatedAtEnd: false)])
+    }
+
+    func testLargePayloadIsScannedAsHeadThenTailOnly() {
+        let text = String(repeating: "x", count: limit * 2 + 1)
+        let windows = Policy.livenessScanWindows(for: text)
+        XCTAssertEqual(windows.count, 2)
+        XCTAssertEqual(windows[0].text.utf8.count, limit)
+        XCTAssertTrue(windows[0].isTruncatedAtEnd)
+        XCTAssertEqual(windows[1].text.utf8.count, limit)
+        XCTAssertFalse(windows[1].isTruncatedAtEnd)
+        XCTAssertTrue(text.hasPrefix(windows[0].text))
+        XCTAssertTrue(text.hasSuffix(windows[1].text))
+    }
+
+    func testWindowBytesSubmittedToRegexAreBoundedForAnyPayloadSize() {
+        for byteCount in [limit * 2 + 1, limit * 10, 1_000_000, 5_000_000] {
+            let text = String(repeating: "y", count: byteCount)
+            let scanned = Policy.livenessScanWindows(for: text).reduce(0) { $0 + $1.text.utf8.count }
+            XCTAssertEqual(scanned, limit * 2, "payload of \(byteCount) bytes")
+        }
+    }
+
+    func testWindowsNeverSplitAMultiByteScalar() {
+        // Every scalar is 3 bytes and the budget is a power of two, so the raw byte
+        // cut lands inside a scalar at both ends; the cut rounds to a scalar boundary,
+        // so a window may miss or carry at most one partial scalar's worth of bytes.
+        let text = String(repeating: "✓", count: limit)
+        let windows = Policy.livenessScanWindows(for: text)
+        XCTAssertEqual(windows.count, 2)
+        for window in windows {
+            XCTAssertFalse(window.text.unicodeScalars.contains("\u{FFFD}"))
+            XCTAssertTrue(window.text.allSatisfy { $0 == "✓" })
+            XCTAssertLessThanOrEqual(abs(window.text.utf8.count - limit), 3)
+        }
+        XCTAssertTrue(text.hasPrefix(windows[0].text))
+        XCTAssertTrue(text.hasSuffix(windows[1].text))
+    }
+
+    // MARK: - Liveness captures
+
+    private func largePayload(head: String = "", middle: String = "", tail: String = "") -> String {
+        let filler = String(repeating: "filler line of command output\n", count: limit / 30 + 2)
+        return head + filler + middle + filler + tail
+    }
+
+    func testMarkerInHeadOfLargePayloadIsCaptured() {
+        let payload = largePayload(head: "Process completed with exit code 3\n")
+        XCTAssertEqual(Policy.capturedLivenessMarker(in: payload, regex: exitCodeRegex), "3")
+    }
+
+    func testMarkerInTailOfLargePayloadIsCaptured() {
+        let payload = largePayload(tail: "\nProcess running with session id shell-42")
+        XCTAssertEqual(Policy.capturedLivenessMarker(in: payload, regex: processIDRegex), "shell-42")
+    }
+
+    func testHeadMarkerWinsOverTailMarker() {
+        let payload = largePayload(head: "process completed with exit code 1\n", tail: "\nprocess completed with exit code 2")
+        XCTAssertEqual(Policy.capturedLivenessMarker(in: payload, regex: exitCodeRegex), "1")
+    }
+
+    func testMarkerOutsideBothWindowsIsNotCaptured() {
+        // Documented bound: the same limit `BashToolResultParser` applies to these markers.
+        let payload = largePayload(middle: "\nProcess completed with exit code 9\n")
+        XCTAssertNil(Policy.capturedLivenessMarker(in: payload, regex: exitCodeRegex))
+    }
+
+    func testCaptureCutByTheHeadBoundaryIsRejectedInsteadOfTruncated() {
+        let marker = "process completed with exit code 12345"
+        // The head window ends after "…exit code 12", cutting the capture short.
+        let prefix = String(repeating: "a", count: limit - marker.utf8.count + 3)
+        let payload = prefix + marker + String(repeating: "b", count: limit * 2)
+        XCTAssertGreaterThan(payload.utf8.count, limit * 2)
+        XCTAssertTrue(Policy.livenessScanWindows(for: payload)[0].text.hasSuffix("exit code 12"))
+        XCTAssertNil(Policy.capturedLivenessMarker(in: payload, regex: exitCodeRegex))
+    }
+
+    func testNoMatchIsSynthesisedAcrossTheHeadTailGap() {
+        let headPart = "process completed with exit"
+        let tailPart = "code 7"
+        let payload = String(repeating: "a", count: limit - headPart.utf8.count) + headPart
+            + String(repeating: "b", count: limit)
+            + tailPart + String(repeating: "c", count: limit - tailPart.utf8.count)
+        let windows = Policy.livenessScanWindows(for: payload)
+        XCTAssertTrue(windows[0].text.hasSuffix(headPart))
+        XCTAssertTrue(windows[1].text.hasPrefix(tailPart))
+        XCTAssertNil(Policy.capturedLivenessMarker(in: payload, regex: exitCodeRegex))
+    }
+
+    func testSmallPayloadKeepsWholeInputFirstMatchSemantics() {
+        XCTAssertEqual(
+            Policy.capturedLivenessMarker(in: "Process running with session id abc-123 then session id zzz", regex: processIDRegex),
+            "abc-123"
+        )
+        XCTAssertEqual(Policy.capturedLivenessMarker(in: "x\nprocess completed with exit code -1\n", regex: exitCodeRegex), "-1")
+        XCTAssertNil(Policy.capturedLivenessMarker(in: "exit code 0", regex: exitCodeRegex))
+        XCTAssertNil(Policy.capturedLivenessMarker(in: nil, regex: exitCodeRegex))
+        XCTAssertNil(Policy.capturedLivenessMarker(in: "", regex: exitCodeRegex))
+    }
+
+    // MARK: - ACP marker detection
+
+    func testACPMarkerIsDetectedByExactBytesAnywhereInThePayload() {
+        let huge = String(repeating: "tëxt with ünicode ✓\n", count: 50000)
+        XCTAssertTrue(Policy.containsUTF8Literal("{\"rawOutput\":\"\(huge)\",\"acp_status\":\"completed\"}", "\"acp_status\""))
+        XCTAssertTrue(Policy.containsUTF8Literal("{\"acp_status\":\"completed\",\"rawOutput\":\"\(huge)\"}", "\"acp_status\""))
+        XCTAssertFalse(Policy.containsUTF8Literal("{\"rawOutput\":\"\(huge)\",\"status\":\"completed\"}", "\"acp_status\""))
+        XCTAssertFalse(Policy.containsUTF8Literal("acp_status", "\"acp_status\""))
+        XCTAssertFalse(Policy.containsUTF8Literal("", "\"acp_status\""))
+        XCTAssertTrue(Policy.containsUTF8Literal("anything", ""))
+    }
+
+    func testACPMarkerDetectionMatchesFoundationContainsForBridgedStrings() {
+        let bridged = NSString(string: "prefix \"acp_status\" suffix") as String
+        XCTAssertTrue(Policy.containsUTF8Literal(bridged, "\"acp_status\""))
+        XCTAssertEqual(Policy.containsUTF8Literal(bridged, "\"acp_status\""), bridged.contains("\"acp_status\""))
+    }
+
+    // MARK: - End to end
+
+    func testLargeToolResultSanitizesLikeASmallOne() throws {
+        func envelope(_ text: String) -> String {
+            "{\"content\":[{\"type\":\"text\",\"text\":\"\(text)\"}]}"
+        }
+        let small = AgentChatItem.toolResult(name: "read_file", resultJSON: envelope("line\\n"), sequenceIndex: 1)
+        let large = AgentChatItem.toolResult(
+            name: "read_file",
+            resultJSON: envelope(String(repeating: "let value = compute(index: 42) // sample\\n", count: 120_000)),
+            sequenceIndex: 1
+        )
+        XCTAssertGreaterThan(large.toolResultJSON?.utf8.count ?? 0, 4_000_000)
+
+        let smallSanitized = try XCTUnwrap(Policy.sanitizedToolResult(for: small))
+        let clock = ContinuousClock()
+        let start = clock.now
+        let largeSanitized = try XCTUnwrap(Policy.sanitizedToolResult(for: large))
+        let duration = start.duration(to: clock.now)
+        print("TOOL_RESULT_SANITIZATION_MEASUREMENT bytes=\(large.toolResultJSON?.utf8.count ?? 0) duration=\(duration)")
+
+        XCTAssertEqual(largeSanitized.persistedStatusWord, smallSanitized.persistedStatusWord)
+        XCTAssertEqual(largeSanitized.transcriptStatus, smallSanitized.transcriptStatus)
+        XCTAssertEqual(largeSanitized.summaryOnly, smallSanitized.summaryOnly)
+        XCTAssertEqual(largeSanitized.processID, smallSanitized.processID)
+        XCTAssertEqual(largeSanitized.exitCode, smallSanitized.exitCode)
+        XCTAssertEqual(largeSanitized.toolIsError, smallSanitized.toolIsError)
+        XCTAssertNil(largeSanitized.processID)
+        XCTAssertNil(largeSanitized.exitCode)
+    }
+
+    func testLargeBashOutputStillReportsExitCodeFromItsTail() throws {
+        let output = String(repeating: "build log line\n", count: 300_000) + "\nProcess completed with exit code 2"
+        let item = AgentChatItem.toolResult(name: "bash", resultJSON: output, sequenceIndex: 1)
+        XCTAssertGreaterThan(item.toolResultJSON?.utf8.count ?? 0, limit * 2)
+        let sanitized = try XCTUnwrap(Policy.sanitizedToolResult(for: item))
+        XCTAssertEqual(sanitized.exitCode, 2)
+        XCTAssertEqual(sanitized.transcriptStatus, .failed)
+    }
+}

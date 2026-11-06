@@ -184,3 +184,81 @@ final class RemovedFolderIndexRebuildTests: XCTestCase {
         )
     }
 }
+
+final class WorkspaceAppliedIndexFolderOrderingTests: XCTestCase {
+    func testMixedFoldersPreserveLegacyOrderIncludingEqualPaths() {
+        let paths = [
+            "z/deep/child", "z", "", "a/child", "a", "A", "a/10", "a/2",
+            "a/child", "é", "e\u{301}", "日本語/名前", ".hidden/child", ".hidden",
+            "a//child/", "/", "nested/longer/path/leaf", "日本語", "z/deep"
+        ]
+        let folders = records(paths)
+        let inputs = [
+            folders,
+            Array(folders.reversed()),
+            Array(folders.dropFirst(7)) + Array(folders.prefix(7))
+        ]
+
+        for input in inputs {
+            let expected = legacySorted(input)
+            let actual = WorkspaceAppliedIndexFolderOrdering.sorted(input)
+            // Both sorts are stable: equal paths must retain their distinct records' input order.
+            XCTAssertEqual(actual.map(\.id), expected.map(\.id))
+            XCTAssertEqual(actual, expected)
+        }
+    }
+
+    func testDepthIsEvaluatedOncePerRecordForLargeMixedBatch() {
+        let paths = (0 ..< 2048).map { index in
+            let depth = index % 9
+            return (0 ..< depth).map { "level\($0)" }.joined(separator: "/")
+                + "/folder\((index * 37) % 251)"
+        }
+        let folders = records(paths)
+        var evaluatedPaths: [String] = []
+        let actual = WorkspaceAppliedIndexFolderOrdering.sorted(folders) { path in
+            evaluatedPaths.append(path)
+            return path.split(separator: "/").count
+        }
+
+        XCTAssertEqual(evaluatedPaths, folders.map(\.standardizedRelativePath))
+        XCTAssertEqual(evaluatedPaths.count, folders.count)
+        XCTAssertEqual(actual.map(\.id), legacySorted(folders).map(\.id))
+        XCTAssertEqual(WorkspaceAppliedIndexFolderOrdering.sorted(folders).map(\.id), actual.map(\.id))
+    }
+
+    func testEmptyAndSingletonBatches() {
+        for folders in [[], records(["single/deep/path"])] {
+            var depthEvaluations = 0
+            let actual = WorkspaceAppliedIndexFolderOrdering.sorted(folders) { path in
+                depthEvaluations += 1
+                return path.split(separator: "/").count
+            }
+            XCTAssertEqual(actual, folders)
+            XCTAssertEqual(depthEvaluations, folders.count)
+            XCTAssertEqual(WorkspaceAppliedIndexFolderOrdering.sorted(folders), folders)
+        }
+    }
+
+    private func legacySorted(_ folders: [WorkspaceFolderRecord]) -> [WorkspaceFolderRecord] {
+        folders.sorted { lhs, rhs in
+            let lhsDepth = lhs.standardizedRelativePath.split(separator: "/").count
+            let rhsDepth = rhs.standardizedRelativePath.split(separator: "/").count
+            if lhsDepth != rhsDepth { return lhsDepth < rhsDepth }
+            return lhs.standardizedRelativePath < rhs.standardizedRelativePath
+        }
+    }
+
+    private func records(_ paths: [String]) -> [WorkspaceFolderRecord] {
+        let rootIDs = [UUID(), UUID()]
+        return paths.enumerated().map { index, path in
+            WorkspaceFolderRecord(
+                rootID: rootIDs[index % rootIDs.count],
+                name: path,
+                relativePath: path,
+                fullPath: "/workspace/\(path)",
+                parentFolderID: nil
+            )
+        }
+    }
+}
