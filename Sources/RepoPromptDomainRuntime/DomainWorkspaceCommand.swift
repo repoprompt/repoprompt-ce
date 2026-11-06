@@ -150,6 +150,9 @@ package enum DomainCommandErrorCode: String, Codable, Sendable {
     case persistenceFailure = "persistence_failure"
     case lockTimedOut = "lock_timed_out"
     case cancelled
+    /// A durable replacement was refused because the bytes it would discard have no verified
+    /// recovery backup yet (#335). Nothing durable changed; a later save may retry.
+    case recoveryBackupRequired = "recovery_backup_required"
 }
 
 package enum DomainExactRootResolution: String, Codable, Equatable, Sendable {
@@ -169,6 +172,8 @@ package struct DomainCommandOutcome: Codable, Equatable, Sendable {
     package let diagnostic: String?
     package let workspace: DomainWorkspaceSnapshot?
     package let exactRootResolution: DomainExactRootResolution?
+    /// Which durable copy a `recoveryBackupRequired` refusal protected (#335).
+    package let recoveryBackupLocation: DomainDurableReplacement.Location?
 
     package init(
         operationID: UUID,
@@ -180,8 +185,10 @@ package struct DomainCommandOutcome: Codable, Equatable, Sendable {
         errorCode: DomainCommandErrorCode? = nil,
         diagnostic: String? = nil,
         workspace: DomainWorkspaceSnapshot? = nil,
-        exactRootResolution: DomainExactRootResolution? = nil
+        exactRootResolution: DomainExactRootResolution? = nil,
+        recoveryBackupLocation: DomainDurableReplacement.Location? = nil
     ) {
+        self.recoveryBackupLocation = recoveryBackupLocation
         self.operationID = operationID
         self.disposition = disposition
         self.before = before

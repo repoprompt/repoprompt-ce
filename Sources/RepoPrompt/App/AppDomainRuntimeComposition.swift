@@ -136,7 +136,8 @@ final class AppDomainRuntimeComposition: Sendable {
                 legacyRuntimeDefaults: legacyRuntimeDefaults,
                 metrics: AppDomainRuntimeMetrics.editFlowSink,
                 metadataPathPolicy: locations.identity.buildFlavor == .debug
-                    ? AppMetadataPathPolicy(locations: locations, roots: [root, workspaceStorageDirectory]) : nil
+                    ? AppMetadataPathPolicy(locations: locations, roots: [root, workspaceStorageDirectory]) : nil,
+                durableReplacementGuard: WorkspaceUnreadableDocumentBackup.durableReplacementGuard
             )
         )
         defaultRuntime = runtime

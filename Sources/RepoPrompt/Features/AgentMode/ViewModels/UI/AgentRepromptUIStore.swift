@@ -1,12 +1,14 @@
 import Combine
 import Foundation
 
+/// Preparation state is keyed by composer tab: a rewrite keeps running when its session is not
+/// visible, and another session can prepare its own at the same time.
 @MainActor
 final class AgentRepromptUIStore: ObservableObject {
     /// Preparation, not a keystroke deadline, distinguishes the first Return from the next.
     /// This only chooses the UI action; operation validation and fresh claim admission still apply.
     func hasPreparedDraft(tabID: UUID, text: String) -> Bool {
-        presentation?.sourceTabID == tabID || recoveries[tabID]?.draftAtInvalidation.utf8.elementsEqual(text.utf8) == true
+        presentations[tabID] != nil || recoveries[tabID]?.draftAtInvalidation.utf8.elementsEqual(text.utf8) == true
             || hasCancelledDraft(tabID: tabID, text: text)
     }
 
@@ -47,7 +49,7 @@ final class AgentRepromptUIStore: ObservableObject {
             tabID: tabID,
             recovery: recoveries[tabID],
             publication: draftUpdate?.tabID == tabID ? draftUpdate : nil,
-            autoSend: autoSendRequest?.tabID == tabID ? autoSendRequest : nil,
+            autoSend: autoSendRequests[tabID],
             cancelledDraft: cancelledDrafts[tabID]
         )
     }
@@ -56,7 +58,9 @@ final class AgentRepromptUIStore: ObservableObject {
     func clearSubmittedDraft(_ snapshot: SubmittedDraft) {
         if recoveries[snapshot.tabID] == snapshot.recovery { recoveries[snapshot.tabID] = nil }
         if draftUpdate == snapshot.publication { draftUpdate = nil }
-        if autoSendRequest == snapshot.autoSend { autoSendRequest = nil }
+        if autoSendRequests[snapshot.tabID] == snapshot.autoSend {
+            autoSendRequests[snapshot.tabID] = nil
+        }
         if cancelledDrafts[snapshot.tabID] == snapshot.cancelledDraft { cancelledDrafts[snapshot.tabID] = nil }
     }
 
@@ -105,7 +109,7 @@ final class AgentRepromptUIStore: ObservableObject {
     }
 
     func allowsAttachmentMutation(tabID: UUID, currentTabID: UUID?) -> Bool {
-        currentTabID == tabID && (presentation?.sourceTabID != tabID || presentation?.phase.isBusy != true)
+        currentTabID == tabID && presentations[tabID]?.phase.isBusy != true
     }
 
     struct AutoSendRequest: Equatable {
@@ -113,6 +117,13 @@ final class AgentRepromptUIStore: ObservableObject {
         let tabID: UUID
         let text: String
         let generation: UInt64
+    }
+
+    /// Set only when the composer shows the text to send and can dispatch it. Consuming a request
+    /// is one-shot, so it must wait for a live submit target rather than be spent on a stale one.
+    func autoSendReadyID(tabID: UUID?, visibleDraft: String, canSubmit: Bool) -> UUID? {
+        guard canSubmit, let tabID, let request = autoSendRequests[tabID], request.text == visibleDraft else { return nil }
+        return request.operationID
     }
 
     struct OneShotDisclosureRequest: Identifiable {
@@ -147,11 +158,11 @@ final class AgentRepromptUIStore: ObservableObject {
         composerFocusRestoreRequest = .init(tabID: tabID)
     }
 
-    @Published var autoSendRequest: AutoSendRequest?
+    @Published var autoSendRequests: [UUID: AutoSendRequest] = [:]
     @Published var oneShotDisclosureRequest: OneShotDisclosureRequest?
-    @Published var presentation: Presentation?
+    @Published var presentations: [UUID: Presentation] = [:]
     @Published var draftUpdate: DraftUpdate?
-    @Published var pendingQuestions: AgentAskUserPendingState?
+    @Published var pendingQuestionsByTab: [UUID: AgentAskUserPendingState] = [:]
     @Published var recoveries: [UUID: Recovery] = [:]
 
     func recover(tabID: UUID, text: String, originalDraft: String, reason: String, currentDraft: String, requiresDecision: Bool = false) {

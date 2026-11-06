@@ -61,6 +61,33 @@ package protocol WorkspaceDiskWritePolicy: Sendable {
     func trace(_ event: String, metadata: Metadata?, url: URL, extra: [String: String])
 }
 
+/// A backend error carried to the caller of the write it belongs to. The error is the backend's own
+/// (for example a host refusal such as a missing recovery backup), not a generic flag.
+package struct WorkspaceDiskWriteFailure: Error, @unchecked Sendable {
+    package let error: any Error
+
+    package init(_ error: any Error) {
+        self.error = error
+    }
+}
+
+/// Durability outcome of one enqueued payload. A payload coalesced into a newer one for the same
+/// URL resolves with the newer payload's outcome, which is the save that carries its content.
+package enum WorkspaceDiskWriteOutcome {
+    case written
+    /// The write policy decided no physical write was needed.
+    case skipped
+    case failed(WorkspaceDiskWriteFailure)
+}
+
+/// Distinguishes the reasons a normalization write did not happen; only `.failed` is an error.
+package enum WorkspaceNormalizationWriteResult {
+    case written
+    case skippedPendingWrite
+    case skippedFileChanged
+    case failed(WorkspaceDiskWriteFailure)
+}
+
 /// Both write paths belong to the same host-selected backend. Custom backends
 /// must supply both operations; neither silently falls back to physical writes.
 /// File stamp checks remain filesystem-owned. Normalization must not suspend
@@ -91,6 +118,10 @@ package actor WorkspaceDiskWriter<Policy: WorkspaceDiskWritePolicy> {
         var newestMetadata: Policy.Metadata?
         var newestIdentity: WorkspaceDiskPayloadIdentity?
         var newestLifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
+        /// Callers whose content the newest (not yet started) payload carries.
+        var newestReceipts: [CheckedContinuation<WorkspaceDiskWriteOutcome, Never>] = []
+        /// Callers whose content the running write carries.
+        var inFlightReceipts: [CheckedContinuation<WorkspaceDiskWriteOutcome, Never>] = []
         var task: Task<Void, Never>?
     }
 
@@ -119,7 +150,24 @@ package actor WorkspaceDiskWriter<Policy: WorkspaceDiskWritePolicy> {
         enqueue(data: data, url: url, metadata: metadata)
     }
 
-    private func enqueue(data: Data, url: URL, metadata: Policy.Metadata?) {
+    /// Enqueues like `enqueueWorkspace` and returns the durability outcome of the write that
+    /// carries this payload (this one or a newer coalesced one), including backend errors.
+    package func enqueueWorkspaceAwaitingReceipt(
+        data: Data,
+        url: URL,
+        metadata: Policy.Metadata?
+    ) async -> WorkspaceDiskWriteOutcome {
+        await withCheckedContinuation { receipt in
+            enqueue(data: data, url: url, metadata: metadata, receipt: receipt)
+        }
+    }
+
+    private func enqueue(
+        data: Data,
+        url: URL,
+        metadata: Policy.Metadata?,
+        receipt: CheckedContinuation<WorkspaceDiskWriteOutcome, Never>? = nil
+    ) {
         let correlation = EditFlowPerf.currentLifecycleCorrelation
         policy.trace("workspaceSave.enqueue", metadata: metadata, url: url, extra: [:])
         recordLatestSelectionIfNeeded(metadata)
@@ -137,6 +185,16 @@ package actor WorkspaceDiskWriter<Policy: WorkspaceDiskWritePolicy> {
                 decision = "replacedExistingNewerSelectionRevision"
             } else if policy.shouldKeepExistingPayload(existing: pending.newestIdentity, incoming: identity, metadata: metadata, url: url) {
                 policy.trace("workspaceSave.coalesce", metadata: metadata, url: url, extra: ["decision": "keptExistingNewerDate"])
+                if let receipt {
+                    // The kept payload is newer, so its write is this caller's durability point;
+                    // with no queued payload, the running write already carries newer content.
+                    if pending.newestData.isEmpty {
+                        pending.inFlightReceipts.append(receipt)
+                    } else {
+                        pending.newestReceipts.append(receipt)
+                    }
+                    pendingByURL[url] = pending
+                }
                 return
             } else {
                 decision = "storedAsNewest"
@@ -145,11 +203,21 @@ package actor WorkspaceDiskWriter<Policy: WorkspaceDiskWritePolicy> {
             pending.newestMetadata = metadata
             pending.newestIdentity = identity
             pending.newestLifecycleCorrelation = correlation ?? pending.newestLifecycleCorrelation
+            if let receipt {
+                pending.newestReceipts.append(receipt)
+            }
             pendingByURL[url] = pending
             policy.trace("workspaceSave.coalesce", metadata: metadata, url: url, extra: ["decision": decision])
             return
         }
-        pendingByURL[url] = Pending(newestData: data, newestMetadata: metadata, newestIdentity: identity, newestLifecycleCorrelation: correlation, task: nil)
+        pendingByURL[url] = Pending(
+            newestData: data,
+            newestMetadata: metadata,
+            newestIdentity: identity,
+            newestLifecycleCorrelation: correlation,
+            newestReceipts: receipt.map { [$0] } ?? [],
+            task: nil
+        )
         runNext(for: url)
     }
 
@@ -159,10 +227,23 @@ package actor WorkspaceDiskWriter<Policy: WorkspaceDiskWritePolicy> {
     }
 
     package func writeNormalizationIfUnchanged(data: Data, url: URL, expectedFileSize: Int64, expectedModificationDate: Date, metadata: Policy.Metadata? = nil) -> Bool {
-        guard pendingByURL[url] == nil else { return false }
+        if case .written = writeNormalizationIfUnchangedResult(
+            data: data,
+            url: url,
+            expectedFileSize: expectedFileSize,
+            expectedModificationDate: expectedModificationDate,
+            metadata: metadata
+        ) {
+            return true
+        }
+        return false
+    }
+
+    package func writeNormalizationIfUnchangedResult(data: Data, url: URL, expectedFileSize: Int64, expectedModificationDate: Date, metadata: Policy.Metadata? = nil) -> WorkspaceNormalizationWriteResult {
+        guard pendingByURL[url] == nil else { return .skippedPendingWrite }
         do {
             let values = try url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
-            guard Int64(values.fileSize ?? -1) == expectedFileSize, values.contentModificationDate == expectedModificationDate else { return false }
+            guard Int64(values.fileSize ?? -1) == expectedFileSize, values.contentModificationDate == expectedModificationDate else { return .skippedFileChanged }
             policy.trace("workspaceSave.syncWrite.begin", metadata: metadata, url: url, extra: ["path": "normalization"])
             let state = EditFlowPerf.begin(EditFlowPerf.Stage.WorkspaceDurability.atomicWrite)
             EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.WorkspaceDurability.writeBegan)
@@ -173,11 +254,11 @@ package actor WorkspaceDiskWriter<Policy: WorkspaceDiskWritePolicy> {
             try backend.normalizationAtomicWrite(data, url)
             recordLatestSelectionIfNeeded(metadata)
             policy.trace("workspaceSave.syncWrite.success", metadata: metadata, url: url, extra: ["path": "normalization"])
-            return true
+            return .written
         } catch {
             policy.trace("workspaceSave.syncWrite.failure", metadata: metadata, url: url, extra: ["error": error.localizedDescription, "path": "normalization"])
             print("💾 Normalization write skipped \(url.lastPathComponent): \(error)")
-            return false
+            return .failed(WorkspaceDiskWriteFailure(error))
         }
     }
 
@@ -209,6 +290,8 @@ package actor WorkspaceDiskWriter<Policy: WorkspaceDiskWritePolicy> {
         slot.newestMetadata = nil
         slot.newestIdentity = nil
         slot.newestLifecycleCorrelation = nil
+        slot.inFlightReceipts = slot.newestReceipts
+        slot.newestReceipts = []
         pendingByURL[url] = slot
         let key = policy.selectionKey(metadata: metadata)
         let latest = key.flatMap { latestSelectionByWorkspaceTab[$0] }
@@ -222,6 +305,7 @@ package actor WorkspaceDiskWriter<Policy: WorkspaceDiskWritePolicy> {
             let effective = policy.effectivePayloadForWrite(data: data, identity: identity, url: url, metadata: metadata, latestSelection: latest, lastWrittenRevision: lastWritten)
             policy.trace("workspaceSave.write.begin", metadata: effective.metadata, url: url, extra: ["shouldWrite": "\(effective.shouldWrite)"])
             var succeeded = false
+            var failure: WorkspaceDiskWriteFailure?
             do {
                 if effective.shouldWrite {
                     #if DEBUG
@@ -240,9 +324,15 @@ package actor WorkspaceDiskWriter<Policy: WorkspaceDiskWritePolicy> {
             } catch {
                 policy.trace("workspaceSave.write.failure", metadata: effective.metadata, url: url, extra: ["error": error.localizedDescription])
                 print("💾 Write failed \(url.lastPathComponent): \(error)")
+                failure = WorkspaceDiskWriteFailure(error)
             }
             policy.trace("workspaceSave.write.finish", metadata: effective.metadata, url: url, extra: ["writeSucceeded": "\(succeeded)"])
-            await self?.writerFinished(for: url, effective: effective, writeSucceeded: succeeded)
+            let outcome: WorkspaceDiskWriteOutcome = if let failure {
+                .failed(failure)
+            } else {
+                succeeded ? .written : .skipped
+            }
+            await self?.writerFinished(for: url, effective: effective, outcome: outcome)
         }
         if var current = pendingByURL[url] {
             current.task = task
@@ -250,7 +340,11 @@ package actor WorkspaceDiskWriter<Policy: WorkspaceDiskWritePolicy> {
         }
     }
 
-    private func writerFinished(for url: URL, effective: EffectivePayload, writeSucceeded: Bool) {
+    private func writerFinished(for url: URL, effective: EffectivePayload, outcome: WorkspaceDiskWriteOutcome) {
+        var writeSucceeded = false
+        if case .written = outcome {
+            writeSucceeded = true
+        }
         #if DEBUG
             identityPayloadCount &+= effective.identityPayloadCount
             fullWorkspacePayloadCount &+= effective.fullWorkspacePayloadCount
@@ -259,6 +353,12 @@ package actor WorkspaceDiskWriter<Policy: WorkspaceDiskWritePolicy> {
             lastWrittenSelectionRevisionByWorkspaceTab[key] = max(lastWrittenSelectionRevisionByWorkspaceTab[key, default: 0], effective.effectiveSelectionRevision)
         }
         guard var slot = pendingByURL[url] else { return }
+        let receipts = slot.inFlightReceipts
+        slot.inFlightReceipts = []
+        pendingByURL[url] = slot
+        for receipt in receipts {
+            receipt.resume(returning: outcome)
+        }
         if slot.newestData.isEmpty {
             pendingByURL.removeValue(forKey: url)
             if let waiters = waitersByURL.removeValue(forKey: url) {
@@ -285,6 +385,9 @@ package actor WorkspaceDiskWriter<Policy: WorkspaceDiskWritePolicy> {
         package func removeAllForTesting() {
             for pending in pendingByURL.values {
                 pending.task?.cancel()
+                for receipt in pending.newestReceipts + pending.inFlightReceipts {
+                    receipt.resume(returning: .skipped)
+                }
             }
             pendingByURL.removeAll()
             latestSelectionByWorkspaceTab.removeAll()
