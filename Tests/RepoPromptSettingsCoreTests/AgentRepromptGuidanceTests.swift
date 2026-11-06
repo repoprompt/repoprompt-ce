@@ -14,5 +14,7 @@ final class AgentRepromptGuidanceTests: XCTestCase {
         XCTAssertTrue(AgentRepromptGuidance.defaultText.contains("Markdown"))
         XCTAssertTrue(AgentRepromptGuidance.defaultText.contains("near-identically"))
         XCTAssertFalse(AgentRepromptGuidance.defaultText.contains("Context Builder"))
+        XCTAssertFalse(AgentRepromptGuidance.defaultText.contains("open questions"), "Must not invite commentary on what the message left unsaid")
+        XCTAssertFalse(AgentRepromptGuidance.defaultText.contains("assumptions"))
     }
 }

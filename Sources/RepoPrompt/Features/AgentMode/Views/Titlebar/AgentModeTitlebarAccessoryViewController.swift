@@ -9,15 +9,15 @@
 import Cocoa
 import SwiftUI
 
-// MARK: - SwiftUI View for Titlebar Button
+// MARK: - SwiftUI Views for Titlebar Buttons
 
 /// Compact "New Session" button designed for the titlebar area
-private struct AgentModeTitlebarNewSessionView: View {
-    let onNewSession: () -> Void
+struct AgentModeTitlebarNewSessionButton: View {
+    let action: () -> Void
     @State private var isHovering = false
 
     var body: some View {
-        Button(action: onNewSession) {
+        Button(action: action) {
             Image(systemName: "square.and.pencil")
                 .font(.system(size: 15, weight: .medium))
                 .foregroundColor(.primary.opacity(isHovering ? 1.0 : 0.7))
@@ -38,6 +38,53 @@ private struct AgentModeTitlebarNewSessionView: View {
         }
         .hoverTooltip("New Session", .bottom)
         .accessibilityLabel("New Session")
+    }
+}
+
+private struct AgentModeTitlebarSidebarToggleButton: View {
+    let isSidebarCollapsed: Bool
+    let action: () -> Void
+    @State private var isHovering = false
+
+    private var label: String {
+        isSidebarCollapsed ? "Show Sidebar" : "Hide Sidebar"
+    }
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "sidebar.left")
+                .font(.system(size: 15, weight: .medium))
+                .foregroundColor(.primary.opacity(isHovering ? 1.0 : 0.7))
+        }
+        .buttonStyle(TitlebarAccessoryButtonStyle(isHovering: isHovering))
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.15)) {
+                isHovering = hovering
+            }
+        }
+        .hoverTooltip(label, .bottom)
+        .accessibilityLabel(label)
+    }
+}
+
+/// Everything beside the traffic lights. The toggle comes first so it never moves when the sidebar
+/// collapses. Compose normally sits at the sidebar's trailing edge; that cluster goes away with the
+/// sidebar, so compose appears here while it is hidden.
+private struct AgentModeTitlebarLeadingView: View {
+    let isSidebarCollapsed: Bool
+    let onToggleSidebar: () -> Void
+    let onNewSession: () -> Void
+
+    var body: some View {
+        HStack(spacing: 2) {
+            AgentModeTitlebarSidebarToggleButton(
+                isSidebarCollapsed: isSidebarCollapsed,
+                action: onToggleSidebar
+            )
+            if isSidebarCollapsed {
+                AgentModeTitlebarNewSessionButton(action: onNewSession)
+            }
+        }
     }
 }
 
@@ -76,11 +123,19 @@ struct TitlebarAccessoryButtonStyle: ButtonStyle {
 
 @MainActor
 final class AgentModeTitlebarAccessoryViewController: NSTitlebarAccessoryViewController {
-    private var hostingView: NSHostingView<AgentModeTitlebarNewSessionView>?
-    private var onNewSession: () -> Void
+    private var hostingView: NSHostingView<AgentModeTitlebarLeadingView>?
+    private var rootView: AgentModeTitlebarLeadingView
 
-    init(onNewSession: @escaping () -> Void) {
-        self.onNewSession = onNewSession
+    init(
+        isSidebarCollapsed: Bool,
+        onToggleSidebar: @escaping () -> Void,
+        onNewSession: @escaping () -> Void
+    ) {
+        rootView = AgentModeTitlebarLeadingView(
+            isSidebarCollapsed: isSidebarCollapsed,
+            onToggleSidebar: onToggleSidebar,
+            onNewSession: onNewSession
+        )
         super.init(nibName: nil, bundle: nil)
         layoutAttribute = .leading
     }
@@ -91,16 +146,26 @@ final class AgentModeTitlebarAccessoryViewController: NSTitlebarAccessoryViewCon
     }
 
     override func loadView() {
-        let swiftUIView = AgentModeTitlebarNewSessionView(onNewSession: onNewSession)
-        let hosting = NSHostingView(rootView: swiftUIView)
+        let hosting = NSHostingView(rootView: rootView)
         hosting.frame.size = hosting.fittingSize
         hostingView = hosting
         view = hosting
     }
 
-    /// Updates the action closure without recreating the controller
-    func update(onNewSession: @escaping () -> Void) {
-        self.onNewSession = onNewSession
-        hostingView?.rootView = AgentModeTitlebarNewSessionView(onNewSession: onNewSession)
+    /// Updates the content without recreating the controller
+    func update(
+        isSidebarCollapsed: Bool,
+        onToggleSidebar: @escaping () -> Void,
+        onNewSession: @escaping () -> Void
+    ) {
+        rootView = AgentModeTitlebarLeadingView(
+            isSidebarCollapsed: isSidebarCollapsed,
+            onToggleSidebar: onToggleSidebar,
+            onNewSession: onNewSession
+        )
+        guard let hostingView else { return }
+        hostingView.rootView = rootView
+        // The accessory's width follows its content: compose comes and goes with the sidebar.
+        hostingView.frame.size = hostingView.fittingSize
     }
 }

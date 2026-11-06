@@ -1,5 +1,52 @@
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
+
+/// What the rewriter may know about a file sent with a message: its name and kind, never its
+/// contents or absolute location. Tagged files use the workspace-relative path the user tagged.
+struct AgentRepromptAttachment: Codable, Equatable {
+    static let limit = 20
+    static let maximumEncodedBytes = 8 * 1024
+    private static let nameBytes = 200
+    private static let taggedFileKind = "taggedFile"
+
+    let name: String
+    let kind: String
+
+    static func list(files: [AgentFileAttachment], tagged: [AgentTaggedFileAttachment]) -> [Self] {
+        let all = files.map { Self(name: bounded(name(of: $0)), kind: $0.kind.rawValue) }
+            + tagged.map { Self(name: bounded(name(ofTagged: $0.relativePath)), kind: taggedFileKind) }
+        var entries = Array(all.prefix(limit))
+        // Names are bounded in raw bytes, but JSON escaping can still grow them. An unusual file
+        // name must cost a list entry, not fail the rewrite of an otherwise short draft.
+        while let encoded = try? JSONEncoder().encode(entries), encoded.count > maximumEncodedBytes {
+            entries.removeLast()
+        }
+        return entries
+    }
+
+    private static func name(of file: AgentFileAttachment) -> String {
+        var name = file.facts.fileName
+        if name.isEmpty {
+            switch file.source {
+            case let .localFile(path): name = path
+            case let .url(value): name = URL(string: value)?.lastPathComponent ?? ""
+            }
+        }
+        // A decoded URL component can itself contain separators.
+        let component = AttachmentFacts.lastPathComponent(name)
+        return component.isEmpty ? "attachment" : component
+    }
+
+    /// A tagged path is meant to be workspace-relative; never forward an absolute one.
+    private static func name(ofTagged path: String) -> String {
+        path.hasPrefix("/") || path.hasPrefix("~") ? AttachmentFacts.lastPathComponent(path) : path
+    }
+
+    private static func bounded(_ name: String) -> String {
+        AgentRepromptHistory.trimmed(name, bytes: nameBytes)
+    }
+}
 
 struct AgentRepromptRequest: Encodable {
     struct Answer: Codable, Equatable {
@@ -10,19 +57,26 @@ struct AgentRepromptRequest: Encodable {
     }
 
     let originalText: String
-    var manifest = ""
     var guidance = AgentRepromptGuidance.defaultText
     var answers: [Answer]?
     var recentChat: [AgentRepromptHistory.Turn] = []
+    /// Files sent with this draft. Names and kinds only.
+    var attachments: [AgentRepromptAttachment] = []
+    var sessionTitle: String?
 
-    enum CodingKeys: String, CodingKey { case originalText, manifest, answers, recentChat }
+    enum CodingKeys: String, CodingKey { case originalText, answers, recentChat, attachments, sessionTitle }
 
     func encode(to encoder: Encoder) throws {
         var values = encoder.container(keyedBy: CodingKeys.self)
         try values.encode(originalText, forKey: .originalText)
-        try values.encode(manifest, forKey: .manifest)
         try values.encodeIfPresent(answers, forKey: .answers)
-        if !recentChat.isEmpty { try values.encode(recentChat, forKey: .recentChat) }
+        if !recentChat.isEmpty {
+            try values.encode(recentChat, forKey: .recentChat)
+        }
+        if !attachments.isEmpty {
+            try values.encode(attachments, forKey: .attachments)
+        }
+        try values.encodeIfPresent(sessionTitle, forKey: .sessionTitle)
     }
 }
 
@@ -100,7 +154,7 @@ enum AgentRepromptError: Error, LocalizedError, Equatable {
 
     var errorDescription: String? {
         switch self {
-        case .disclosureRequired: "Review the Re-prompt recipient disclosure before retrying."
+        case .disclosureRequired: "Re-prompt's data disclosure needs review. Turn Re-prompt off and on to review it, or press Return to send as typed."
         case .missingModel: "The selected Re-prompt model is unavailable. Connect it or choose another in Agent Models settings."
         case .sizeLimit: "Re-prompt text exceeds its size limit. Shorten it and try again."
         case .timeout: "Re-prompt timed out. Partial text is recoverable; retry or use the original."
