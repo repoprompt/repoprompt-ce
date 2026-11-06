@@ -201,7 +201,15 @@ private struct LaneUpdateDeliveryAccessibilityValue: ViewModifier {
 
 // MARK: - Agent Message Bubble
 
-struct CodexManagedLoginAction {
+struct CodexManagedLoginAction: Equatable {
+    /// The caller must advance revision when the callbacks change for the same owner.
+    let ownerID: ObjectIdentifier
+    var revision: UInt64 = 0
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.ownerID == rhs.ownerID && lhs.revision == rhs.revision
+    }
+
     let browser: (@MainActor @escaping @Sendable (URL) -> Void) async throws -> Bool
     let deviceCode: (@MainActor @escaping @Sendable (CodexManagedChatgptDeviceCode, Bool) -> Void) async throws -> Bool
 }
@@ -223,8 +231,8 @@ struct AgentTranscriptRowInputs: Equatable {
     let runInteraction: AgentRunInteractionUISnapshot
     let runtimeFooter: AgentMessageRuntimeFooter?
     let autoExpandEnabled: Bool
-    let liveBashExecutionByItemID: [UUID: AgentModeViewModel.BashLiveExecutionState]
-    let recentAssistantItemIDs: Set<UUID>
+    let liveBashExecution: AgentModeViewModel.BashLiveExecutionState?
+    let isRecentAssistant: Bool
     let approvalVisible: Bool
 }
 
@@ -241,8 +249,7 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
             && lhs.agentModeVM === rhs.agentModeVM
             && lhs.promptManager === rhs.promptManager
             && lhs.contextBuilderAgentVM === rhs.contextBuilderAgentVM
-            // Login callbacks are opaque. Such rows always refresh, never compare callbacks away.
-            && lhs.codexManagedLoginAction == nil && rhs.codexManagedLoginAction == nil
+            && lhs.codexManagedLoginAction == rhs.codexManagedLoginAction
     }
 
     var body: some View {
@@ -270,7 +277,7 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
             showRunScopedToolCancel: inputs.cancelRunID != nil,
             cancelActiveToolsAction: cancelAction,
             codexManagedLoginAction: codexManagedLoginAction,
-            recentAssistantItemIDs: inputs.recentAssistantItemIDs,
+            recentAssistantItemIDs: inputs.isRecentAssistant ? [inputs.item.id] : [],
             runtimeFooter: inputs.runtimeFooter
         )
         #if DEBUG
@@ -280,7 +287,7 @@ struct AgentTranscriptRow: View, @MainActor Equatable {
             await promptManager.fileManager.openFileForMarkdownLink(target)
         })
         .environment(\.agentToolCardAutoExpandEnabled, inputs.autoExpandEnabled)
-        .environment(\.agentLiveBashExecutionByItemID, inputs.liveBashExecutionByItemID)
+        .environment(\.agentLiveBashExecutionByItemID, inputs.liveBashExecution.map { [inputs.item.id: $0] } ?? [:])
         .environment(\.agentApprovalVisible, inputs.approvalVisible)
     }
 

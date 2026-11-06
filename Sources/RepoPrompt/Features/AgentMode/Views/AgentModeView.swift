@@ -173,6 +173,7 @@ struct AgentModeView: View {
 
     private var codexManagedLoginAction: CodexManagedLoginAction {
         CodexManagedLoginAction(
+            ownerID: ObjectIdentifier(windowState.apiSettingsViewModel),
             browser: { openURL in
                 try await windowState.apiSettingsViewModel.startCodexManagedChatgptLogin(openURL: openURL)
             },
@@ -2596,6 +2597,9 @@ struct AgentModeChatDetailView: View {
 
     @ViewBuilder
     private func transcriptBlockView(block: AgentTranscriptRenderBlock, renderContext: TranscriptRenderContext) -> some View {
+        #if DEBUG
+            let _ = AgentTranscriptTailRenderProbe.sink?(.block(block.id))
+        #endif
         switch block.kind {
         case .activityCluster:
             let supportsExpansion = transcriptBlockSupportsExpansion(block)
@@ -2761,14 +2765,14 @@ struct AgentModeChatDetailView: View {
                 runInteraction: runInteraction,
                 runtimeFooter: transcript.runtimeFooterByItemID[item.id],
                 autoExpandEnabled: autoExpandEnabled,
-                liveBashExecutionByItemID: transcript.activeBashLiveExecutionByItemID,
-                recentAssistantItemIDs: renderContext.recentAssistantItemIDs,
+                liveBashExecution: transcript.activeBashLiveExecutionByItemID[item.id],
+                isRecentAssistant: renderContext.recentAssistantItemIDs.contains(item.id),
                 approvalVisible: renderContext.interactionBlockerVisible
             ),
             agentModeVM: agentModeVM,
             promptManager: promptManager,
             contextBuilderAgentVM: contextBuilderAgentVM,
-            codexManagedLoginAction: item.kind == .error ? codexManagedLoginAction : nil
+            codexManagedLoginAction: item.kind == .error && CodexManagedAuthRecoveryClassifier.preservesAsUserFacingGuidance(item.text) ? codexManagedLoginAction : nil
         )
         .equatable()
         .id(item.id)

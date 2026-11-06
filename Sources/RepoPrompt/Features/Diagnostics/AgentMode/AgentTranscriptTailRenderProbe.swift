@@ -11,6 +11,7 @@
         }
 
         enum Event {
+            case block(String)
             case body(UUID, String)
             case footer(UUID?, String)
             case native(NativeBoundary, UUID?, CodeBlockTextView)

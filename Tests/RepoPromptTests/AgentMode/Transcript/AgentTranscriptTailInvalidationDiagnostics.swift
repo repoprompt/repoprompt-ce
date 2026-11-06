@@ -22,7 +22,7 @@
 
         @MainActor
         private final class Recorder {
-            var allowedIDs: Set<UUID> = []
+            var blocks: [String: Int] = [:]
             var bodies: [UUID: Int] = [:]
             var latestBody: [UUID: String] = [:]
             var footers: [UUID: String] = [:]
@@ -32,17 +32,16 @@
 
             func receive(_ event: AgentTranscriptTailRenderProbe.Event) {
                 switch event {
+                case let .block(id): blocks[id, default: 0] += 1
                 case let .body(id, text):
-                    guard allowedIDs.contains(id) else { return }
                     bodies[id, default: 0] += 1
                     latestBody[id] = text
                 case let .footer(id?, text):
-                    guard allowedIDs.contains(id) else { return }
                     footers[id] = text
                 case .footer(nil, _): return
                 case let .native(boundary, scope, view):
                     let key = ObjectIdentifier(view)
-                    if let scope, allowedIDs.contains(scope), natives[key]?.view !== view {
+                    if let scope, natives[key]?.view !== view {
                         natives[key] = NativeWitness(view, rowID: scope)
                     }
                     guard let witness = natives[key], witness.view === view else { return }
@@ -101,7 +100,6 @@
                 AgentTranscriptTailRenderProbe.sink = nil
             }
             let recorder = Recorder()
-            recorder.allowedIDs = Set((0 ..< 50).map(Self.id))
             AgentTranscriptTailRenderProbe.sink = { recorder.receive($0) }
             let fixture = try await makeFixture(turns: 10, recorder: recorder)
             defer { fixture.window.contentView = nil
@@ -133,7 +131,6 @@
             let selection = NSRange(location: 8, length: 12)
             view.setSelectedRange(selection)
             let originalStorage = view.attributedString()
-            let anchors = fixture.store.snapshot.presentation.rowAnchorIndex
             var tail = try XCTUnwrap(fixture.store.snapshot.presentation.visibleRows.first { $0.id == tailID })
             tail.text += " SELECTION_TAIL"
             var next = replacing(tail, in: fixture.store.snapshot)
@@ -147,7 +144,6 @@
             XCTAssertTrue(recorder.attached(userID, window: fixture.window).contains { $0 === view })
             XCTAssertEqual(view.selectedRange(), selection)
             XCTAssertTrue(view.attributedString().isEqual(to: originalStorage))
-            XCTAssertEqual(fixture.store.snapshot.presentation.rowAnchorIndex, anchors)
             XCTAssertTrue(recorder.bodies.allSatisfy { $0.key == tailID || $0.value == 0 }, "Non-tail calls: \(recorder.bodies.filter { $0.key != tailID })")
             XCTAssertEqual(recorder.counts[userID]?["update", default: 0] ?? 0, 0)
             var user = try XCTUnwrap(next.presentation.visibleRows.first { $0.id == userID })
@@ -182,7 +178,7 @@
                         suppressAskUserTranscriptUI: false, activeContextBuilderCallID: nil, activeContextBuilderResultID: nil,
                         rawToolResultPayload: payload, rawToolResultPayloadRenderRevision: revision, cancelRunID: run.activeRunID,
                         runInteraction: run, runtimeFooter: nil, autoExpandEnabled: true,
-                        liveBashExecutionByItemID: [:], recentAssistantItemIDs: [], approvalVisible: false
+                        liveBashExecution: nil, isRecentAssistant: false, approvalVisible: false
                     ),
                     agentModeVM: vm,
                     promptManager: fixture.state.promptManager,
@@ -211,9 +207,110 @@
                 agentModeVM: vm,
                 promptManager: fixture.state.promptManager,
                 contextBuilderAgentVM: fixture.state.contextBuilderAgentViewModel,
-                codexManagedLoginAction: .init(browser: { _ in throw Refused.providerLaunch }, deviceCode: { _ in throw Refused.providerLaunch })
+                codexManagedLoginAction: .init(ownerID: ObjectIdentifier(vm), browser: { _ in throw Refused.providerLaunch }, deviceCode: { _ in throw Refused.providerLaunch })
             )
-            XCTAssertFalse(opaque == opaque, "Opaque callbacks must never be silently excluded from equality")
+            XCTAssertEqual(opaque, opaque, "Action identity must be reflexive")
+            var callbackInvocations = 0
+            let newAction = CodexManagedLoginAction(
+                ownerID: ObjectIdentifier(vm),
+                revision: 1,
+                browser: { _ in callbackInvocations += 1
+                    return true
+                },
+                deviceCode: { _ in false }
+            )
+            let replaced = AgentTranscriptRow(
+                inputs: original.inputs,
+                agentModeVM: vm,
+                promptManager: fixture.state.promptManager,
+                contextBuilderAgentVM: fixture.state.contextBuilderAgentViewModel,
+                codexManagedLoginAction: newAction
+            )
+            XCTAssertNotEqual(opaque, replaced)
+            let authenticated = try await XCTUnwrap(replaced.codexManagedLoginAction).browser { _ in }
+            XCTAssertTrue(authenticated)
+            XCTAssertEqual(callbackInvocations, 1)
+        }
+
+        func testRowBoundaryIsolatesSettledErrorsAndUnrelatedBashUpdates() async throws {
+            let oldAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            defer { GlobalSettingsStore.shared.setMCPAutoStart(oldAutoStart, commit: false)
+                AgentTranscriptTailRenderProbe.sink = nil
+            }
+            let recorder = Recorder()
+            AgentTranscriptTailRenderProbe.sink = { recorder.receive($0) }
+            let fixture = try await makeFixture(turns: 10, recorder: recorder)
+            defer { fixture.window.contentView = nil
+                fixture.window.close()
+            }
+            let userID = fixture.source[45].id
+            let tailID = fixture.source[49].id
+            let ordinaryID = fixture.source[41].id
+            let loginID = fixture.source[42].id
+            let bashID = fixture.source[43].id
+            try await wait(fixture, seconds: 60, gate: "rich native witness") { self.hasRichWitness(userID, in: fixture) }
+            var next = fixture.store.snapshot
+            for (id, message) in [(ordinaryID, "Ordinary settled error"), (loginID, CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)] {
+                var item = try XCTUnwrap(next.presentation.visibleRows.first { $0.id == id })
+                item.kind = .error
+                item.text = message
+                next = replacing(item, in: next)
+            }
+            var bash = try XCTUnwrap(next.presentation.visibleRows.first { $0.id == bashID })
+            bash.toolName = "bash"
+            bash.toolArgsJSON = "{}"
+            bash.toolResultJSON = "{\"output\":\"initial\",\"isRunning\":true}"
+            next = replacing(bash, in: next)
+            fixture.store.update(next)
+            try await wait(fixture, seconds: 5, gate: "settled error and bash bodies") {
+                recorder.latestBody[ordinaryID] == "Ordinary settled error" && recorder.latestBody[loginID] == CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage && recorder.bodies[bashID, default: 0] > 0
+            }
+            var serial = recorder.serial
+            var quietSince = ProcessInfo.processInfo.systemUptime
+            try await wait(fixture, seconds: 5, gate: "error fixture quiet window") {
+                if serial != recorder.serial { serial = recorder.serial
+                    quietSince = ProcessInfo.processInfo.systemUptime
+                }
+                return ProcessInfo.processInfo.systemUptime - quietSince >= 0.22
+            }
+            var tail = try XCTUnwrap(next.presentation.visibleRows.first { $0.id == tailID })
+            tail.text += " BASH_AND_ERROR_TAIL"
+            next = replacing(tail, in: next)
+            next.activeBashLiveExecutionByItemID[bashID] = .init(
+                executionKey: "synthetic-bash",
+                transcriptItemID: bashID,
+                toolName: "bash",
+                invocationID: bash.toolInvocationID,
+                fallbackSignature: "synthetic",
+                processID: nil,
+                command: "printf synthetic",
+                statusWord: "running",
+                exitCode: nil,
+                output: "updated output",
+                isSummaryOnly: false,
+                lastSignalAt: tail.timestamp
+            )
+            recorder.bodies = [:]
+            recorder.counts = [:]
+            fixture.store.update(next)
+            try await wait(fixture, seconds: 5, gate: "tail and Bash refresh") {
+                recorder.latestBody[tailID]?.hasSuffix("BASH_AND_ERROR_TAIL") == true && recorder.bodies[bashID, default: 0] > 0
+            }
+            XCTAssertEqual(recorder.bodies[ordinaryID, default: 0], 0)
+            XCTAssertEqual(recorder.bodies[loginID, default: 0], 0)
+            XCTAssertEqual(recorder.bodies[userID, default: 0], 0)
+            XCTAssertEqual(recorder.counts[userID]?["update", default: 0] ?? 0, 0)
+
+            // Exercise the normal source mutation, coalescer and VM publication path too.
+            let vm = fixture.state.agentModeViewModel
+            let session = vm.session(for: fixture.tabID)
+            vm.enqueueAssistantDelta(" NORMAL_VM_DELTA", session: session)
+            vm.flushPendingAssistantDelta(session)
+            try await wait(fixture, seconds: 5, gate: "normal VM delta reaches attached native storage") {
+                recorder.attached(tailID, window: fixture.window).contains { $0.string.contains("NORMAL_VM_DELTA") }
+            }
+            XCTAssertTrue(session.items.last?.text.hasSuffix("NORMAL_VM_DELTA") == true)
         }
 
         func testStreamingTailInvalidationAcrossSessionSizes() async throws {
@@ -236,7 +333,6 @@
 
         private func run(turns: Int, repeatIndex: Int) async throws {
             let recorder = Recorder()
-            recorder.allowedIDs = Set((0 ..< turns * 5).map(Self.id))
             AgentTranscriptTailRenderProbe.sink = { recorder.receive($0) }
             defer { AgentTranscriptTailRenderProbe.sink = nil }
             let fixture = try await makeFixture(turns: turns, recorder: recorder)
@@ -291,6 +387,9 @@
             guard runInteraction.runState == .running else {
                 throw GateFailure(description: "canonical run interaction must be running")
             }
+            guard tail.isStreaming else {
+                throw GateFailure(description: "production-projected tail is not streaming; no streaming samples accepted")
+            }
             let tailBlockKinds = base.presentation.visibleBlocks.filter { $0.rows.contains { $0.id == tailID } }.map { String(describing: $0.kind) }
             print("TAIL_ROUTE turns=\(turns) repeat=\(repeatIndex) runState=\(runInteraction.runState) projectedStreaming=\(tail.isStreaming) blockKinds=\(tailBlockKinds) cadence=\(tail.isStreaming ? "streamingCoalesced" : "immediate")")
             guard !MarkdownStreamingFreezeBoundaryResolver.shouldConsiderSegmentation(for: tail.text + String(repeating: "x", count: 9 * 128)) else {
@@ -313,9 +412,10 @@
                       next.presentationRevision == base.presentationRevision + 1, tail.text.utf8.count == oldTail.text.utf8.count + 128
                 else { throw GateFailure(description: "unexpected stable input change chunk=\(ordinal)") }
                 recorder.bodies = [:]
+                recorder.blocks = [:]
                 recorder.counts = [:]
-                recorder.latestBody[tailID] = nil
-                recorder.footers[tailID] = nil
+                recorder.latestBody = [:]
+                recorder.footers = [:]
                 publications = 0
                 let layoutsBefore = fixture.host.layouts
                 let cpuBefore = try mainThreadCPU()
@@ -365,10 +465,18 @@
                         "mainThreadCPUMS": cpuMS,
                         "settleWallMS": wallMS,
                         "hostLayouts": fixture.host.layouts - layoutsBefore,
+                        "blockBuildCalls": recorder.blocks.values.reduce(0, +),
+                        "blockBuildCallsByID": recorder.blocks,
                         "presentedRows": base.presentation.visibleRows.count,
                         "presentedBlocks": base.presentation.visibleBlocks.count
                     ]
-                    for (name, ids) in cohorts {
+                    // Include newly evaluated/mounted IDs, not just the setup population.
+                    let observed = Set(recorder.bodies.keys).union(recorder.counts.keys).union(recorder.footers.keys)
+                    let chunkCohorts: [(String, Set<UUID>)] = [
+                        ("older", observed.subtracting(activeIDs).subtracting([tailID])),
+                        ("activeStable", observed.intersection(activeIDs)), ("tail", [tailID])
+                    ]
+                    for (name, ids) in chunkCohorts {
                         var counters = Dictionary(uniqueKeysWithValues: ["make", "update", "replacement", "size", "ensureLayout", "draw"].map { ($0, 0) })
                         for id in ids {
                             for (key, value) in recorder.counts[id] ?? [:] {
@@ -376,8 +484,10 @@
                             }
                         }
                         record[name] = [
+                            "setupEvaluatedDenominator": cohorts.first { $0.0 == name }!.1.count,
+                            "observedIDs": ids.map(\.uuidString).sorted(),
                             "evaluatedDenominator": ids.count,
-                            "mountedNativeRows": ids.intersection(mountedIDs).count,
+                            "setupMountedNativeRows": cohorts.first { $0.0 == name }!.1.intersection(mountedIDs).count,
                             "bodyCalls": ids.reduce(0) { $0 + recorder.bodies[$1, default: 0] },
                             "bodyDistinct": ids.count(where: { recorder.bodies[$0, default: 0] > 0 }),
                             "native": counters
@@ -548,7 +658,6 @@
             guard vm.ui.runInteraction.snapshot.runState == .running else {
                 throw GateFailure(description: "live fixture did not publish running interaction")
             }
-            recorder.allowedIDs.formUnion(vm.ui.transcript.snapshot.presentation.visibleRows.map(\.id))
 
             let parent = AgentModeDetailWithSidebarView(
                 agentModeVM: vm, runtimeVM: vm.ui.runtimeMetrics.runtimeVM, statusPillsUI: vm.ui.statusPills,
@@ -556,6 +665,7 @@
                 promptManager: state.promptManager, workspaceSearchService: state.workspaceSearchService,
                 selectionCoordinator: state.selectionCoordinator, stressHarness: nil, windowID: state.windowID,
                 currentTabID: tab.id, codexManagedLoginAction: CodexManagedLoginAction(
+                    ownerID: ObjectIdentifier(vm),
                     browser: { _ in throw Refused.providerLaunch }, deviceCode: { _ in throw Refused.providerLaunch }
                 )
             ).environment(\.agentWindowIsFocused, false)
