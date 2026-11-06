@@ -121,6 +121,49 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
         }
     }
 
+    func testHumanHandoffMissingBytesPreservesHistoryAndReportsOnlyUICount() async throws {
+        try await withFixture(bindSource: false) { fixture in
+            let (store, attachment, parentImage) = try await installHandoffImage(fixture)
+            try FileManager.default.removeItem(at: parentImage)
+            let cutoff = try XCTUnwrap(fixture.sourceSession.items.last?.id)
+            let payload = await fixture.viewModel.buildHandoffPayload(upToItemID: cutoff)
+            let sourceItems = fixture.sourceSession.items
+            var counts: [Int] = []
+            fixture.viewModel.test_setAgentSessionSaver { session, workspace, count in
+                try await AgentSessionDataService.shared.saveAgentSession(
+                    session, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count
+                )
+            }
+            let childTabID = try await fixture.viewModel.prepareHandoffToNewTab(
+                upToItemID: cutoff,
+                destinationAgent: fixture.sourceSession.selectedAgent,
+                destinationModelRaw: fixture.sourceSession.selectedModelRaw,
+                destinationReasoningEffortRaw: fixture.sourceSession.selectedReasoningEffortRaw,
+                activateDestination: true, inheritOversightLinks: false,
+                missingImagePolicy: .omitMissingImagesForHumanHandoff,
+                onImagesOmitted: { counts.append($0) }
+            )
+            let child = try XCTUnwrap(fixture.viewModel.sessions[childTabID])
+            XCTAssertEqual(counts, [1])
+            XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, childTabID)
+            let saved = try await AgentSessionDataService.shared.loadAgentSession(
+                id: XCTUnwrap(child.activeAgentSessionID),
+                for: XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+            )
+            XCTAssertEqual(try XCTUnwrap(saved).items.flatMap(\.attachments), [attachment])
+            /// Every export gets a fresh delivery receipt; only that envelope ID may differ.
+            func withoutDeliveryID(_ payload: String) -> String {
+                payload.replacingOccurrences(of: #"delivery_id="[^"]+""#, with: "delivery_id=\"receipt\"", options: .regularExpression)
+            }
+            XCTAssertEqual(try withoutDeliveryID(XCTUnwrap(child.pendingHandoff.payload)), withoutDeliveryID(payload))
+            XCTAssertEqual(child.items.map(\.kind), sourceItems.map(\.kind))
+            XCTAssertEqual(child.items.flatMap(\.attachments), [attachment])
+            XCTAssertEqual(fixture.sourceSession.items.flatMap(\.attachments), [attachment])
+            XCTAssertNil(child.operationAdmissionFailureMessage)
+            XCTAssertFalse(try FileManager.default.fileExists(atPath: store.sessionFolderURL(sessionID: XCTUnwrap(child.activeAgentSessionID)).path))
+        }
+    }
+
     func testHandoffRejectsStorageRootChangeDuringImageCopyWithoutRebindingTheChild() async throws {
         try await withFixture(bindSource: false) { fixture in
             let (store, attachment, parentImage) = try await installHandoffImage(fixture)

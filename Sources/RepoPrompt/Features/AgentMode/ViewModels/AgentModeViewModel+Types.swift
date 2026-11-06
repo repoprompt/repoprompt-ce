@@ -724,6 +724,16 @@ extension AgentModeViewModel {
         let shouldEnableCodexComputerUse: Bool
     }
 
+    /// Request-local save-phase evidence. A thrown saver or later currency failure is NOT proof
+    /// of no write. Switch apply may roll back only while this remains beforeWrite.
+    enum RequiredSavePhase: Equatable {
+        case beforeWrite
+        case writeMayHaveCommitted
+        /// The frozen payload's saver returned, but its live-owner currency may still fail.
+        case writeReturned
+        case durablySaved(AgentSessionRestorationBindingToken)
+    }
+
     struct PendingHandoffState: Equatable {
         var payload: String?
         var createdAt: Date?
@@ -734,6 +744,10 @@ extension AgentModeViewModel {
         var isStagedForSend: Bool = false
         /// Durable failure/preparation marker; ordinary send cleanup must never clear it.
         var executionLocationFailure: String?
+        /// Nil retains the existing fork/resume-recovery delivery policy.
+        var providerSwitchDelivery: AgentProviderSwitchDelivery?
+        /// Captured by the existing physical fence; never persisted or reused by another dispatch.
+        var providerSwitchDispatch: ProviderSwitchPhysicalDispatch?
 
         var hasPayload: Bool {
             guard let payload else { return false }
@@ -746,6 +760,8 @@ extension AgentModeViewModel {
             sourceItemID = nil
             defersProviderLockUntilSend = false
             isStagedForSend = false
+            providerSwitchDelivery = nil
+            providerSwitchDispatch = nil
         }
     }
 

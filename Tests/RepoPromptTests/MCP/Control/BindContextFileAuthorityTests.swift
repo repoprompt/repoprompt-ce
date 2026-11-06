@@ -979,6 +979,59 @@ import XCTest
             XCTAssertEqual(reply.files, [])
         }
 
+        @MainActor
+        func testStartExpiryDuringSourceBindingAwaitSkipsRebindWithoutWithdrawingChild() async throws {
+            let childTabID = UUID()
+            let fixture = try await makeFixture(rootPaths: [makeTemporaryRoot().path], extraTabIDs: [childTabID])
+            let server = fixture.window.mcpServer
+            let metadata = metadata(for: fixture)
+            try server.bindTabForConnection(connectionID: fixture.connectionID, clientName: nil, tabID: fixture.contextID, workspaceID: fixture.workspace.id, windowID: fixture.window.windowID)
+            let prior = server.connectionBindingSnapshot(forConnection: fixture.connectionID)
+            let gate = RootHydrationSuspensionGate()
+            var bindingReached = false
+            server.test_shouldPreserveAgentRunSourceBinding = { _, _ in bindingReached = true
+                await gate.hold()
+                return false
+            }
+            addTeardownBlock { await gate.release() }
+            defer { server.test_shouldPreserveAgentRunSourceBinding = nil }
+            let vm = fixture.window.agentModeViewModel
+            let target = try await vm.mcpResolveOrCreateSessionTarget(tabID: childTabID, sessionID: nil, createIfNeeded: true, sessionName: nil)
+            let expiry = AgentRunStartExpiry(toolName: "agent_explore", budgetSeconds: 5)
+            let dispatched = expectation(description: "accepted child dispatches after expiry")
+            let callerReturned = expectation(description: "binding caller returns before release")
+            let caller = Task {
+                defer { callerReturned.fulfill() }
+                return try await AgentRunStartBudget.run(expiry: expiry) {
+                    let result = try await AgentExternalMCPRunStarter.startApplyingRequestBindingPolicy(
+                        target: target, message: "test", metadata: metadata,
+                        bindCurrentRequestToTab: { tab, metadata, expiry in
+                            try await server.bindCurrentRequestToTabIfPossible(tabID: tab, metadata: metadata, startExpiry: expiry)
+                        }, agentModeVM: vm, agentRaw: nil, modelRaw: nil, reasoningEffortRaw: nil,
+                        dispatchInstruction: { _, _, _, _, _ in dispatched.fulfill()
+                            return .startedRun
+                        }, startExpiry: expiry
+                    )
+                    return Value.object(result.snapshot.asObject())
+                } onExpiry: {
+                    XCTAssertTrue(bindingReached, "Expiry must occur at the held binding stage")
+                    XCTAssertNotNil(expiry.activatedSessionID)
+                    return AgentRunMCPToolService.startExpiryValue(sessionID: expiry.activatedSessionID ?? UUID(), agentModeVM: vm)
+                }
+            }
+            await fulfillment(of: [callerReturned], timeout: 6)
+            await gate.release()
+            let reply = try await caller.value
+            XCTAssertEqual(reply.objectValue?["status"], .string("running"))
+            await gate.release()
+            await fulfillment(of: [dispatched], timeout: 3)
+            XCTAssertEqual(server.connectionBindingSnapshot(forConnection: fixture.connectionID).tabID, prior.tabID)
+            XCTAssertNotNil(try vm.mcpRegistration(sessionID: XCTUnwrap(target.sessionID)))
+            // Nil tokens preserve the existing manage-session binding policy.
+            try await server.bindCurrentRequestToTabIfPossible(tabID: childTabID, metadata: metadata)
+            XCTAssertEqual(server.connectionBindingSnapshot(forConnection: fixture.connectionID).tabID, childTabID)
+        }
+
         private func failureValue(tool: String, args: [String: Value]) throws -> Value {
             try MCPFileToolProvider.authorityFailureValue(
                 toolName: tool,
@@ -988,7 +1041,7 @@ import XCTest
         }
 
         @MainActor
-        private func makeFixture(rootPaths: [String]) async throws -> Fixture {
+        private func makeFixture(rootPaths: [String], extraTabIDs: [UUID] = []) async throws -> Fixture {
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
             defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
@@ -998,7 +1051,7 @@ import XCTest
             let workspace = WorkspaceModel(
                 name: "Authority",
                 repoPaths: rootPaths,
-                composeTabs: [ComposeTabState(id: contextID, name: "Context")],
+                composeTabs: [ComposeTabState(id: contextID, name: "Context")] + extraTabIDs.map { ComposeTabState(id: $0, name: "Extra") },
                 activeComposeTabID: contextID
             )
             window.workspaceManager.workspaces = [workspace]
