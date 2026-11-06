@@ -1,0 +1,461 @@
+#if DEBUG
+    import AppKit
+    import Combine
+    import Darwin
+    @testable import RepoPromptApp
+    import RepoPromptSettingsCore
+    import SwiftUI
+    import XCTest
+
+    /// Opt-in production-host diagnostic, not a latency assertion or a replacement transcript view.
+    @MainActor
+    final class AgentTranscriptTailInvalidationDiagnostics: XCTestCase {
+        @MainActor
+        private final class NativeWitness {
+            weak var view: CodeBlockTextView?
+            let rowID: UUID
+            init(_ view: CodeBlockTextView, rowID: UUID) {
+                self.view = view
+                self.rowID = rowID
+            }
+        }
+
+        @MainActor
+        private final class Recorder {
+            var allowedIDs: Set<UUID> = []
+            var bodies: [UUID: Int] = [:]
+            var latestBody: [UUID: String] = [:]
+            var footers: [UUID: String] = [:]
+            var natives: [ObjectIdentifier: NativeWitness] = [:]
+            var counts: [UUID: [String: Int]] = [:]
+            var serial = 0
+
+            func receive(_ event: AgentTranscriptTailRenderProbe.Event) {
+                switch event {
+                case let .body(id, text):
+                    guard allowedIDs.contains(id) else { return }
+                    bodies[id, default: 0] += 1
+                    latestBody[id] = text
+                case let .footer(id?, text):
+                    guard allowedIDs.contains(id) else { return }
+                    footers[id] = text
+                case .footer(nil, _): return
+                case let .native(boundary, scope, view):
+                    let key = ObjectIdentifier(view)
+                    if let scope, allowedIDs.contains(scope), natives[key]?.view !== view {
+                        natives[key] = NativeWitness(view, rowID: scope)
+                    }
+                    guard let witness = natives[key], witness.view === view else { return }
+                    counts[witness.rowID, default: [:]][boundary.rawValue, default: 0] += 1
+                }
+                serial += 1
+            }
+
+            func attached(_ id: UUID, window: NSWindow) -> [CodeBlockTextView] {
+                natives.values.compactMap { $0.rowID == id && $0.view?.window === window ? $0.view : nil }
+            }
+        }
+
+        private final class CountingHost: NSHostingView<AnyView> {
+            var layouts = 0
+            override func layout() {
+                layouts += 1
+                super.layout()
+            }
+        }
+
+        @MainActor
+        private struct Fixture {
+            let state: WindowState
+            let tabID: UUID
+            let host: CountingHost
+            let window: NSWindow
+            let source: [AgentChatItem]
+            let recorder: Recorder
+            var store: AgentTranscriptUIStore {
+                state.agentModeViewModel.ui.transcript
+            }
+        }
+
+        private enum Refused: Error { case providerLaunch }
+
+        private var ownedStates: [WindowState] = []
+
+        override func tearDown() async throws {
+            AgentTranscriptTailRenderProbe.sink = nil
+            for state in ownedStates {
+                await state.tearDown()
+            }
+            ownedStates = []
+            try await super.tearDown()
+        }
+
+        private struct GateFailure: Error, CustomStringConvertible {
+            let description: String
+        }
+
+        func testStreamingTailInvalidationAcrossSessionSizes() async throws {
+            try XCTSkipUnless(ProcessInfo.processInfo.environment["RPCE_RUN_SCALE_TESTS"] == "1", "Opt-in M0: prompt-exports/optimize-streaming-tail-runs.md")
+            let oldAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            let oldFont = FontScaleManager.shared.preset
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            FontScaleManager.shared.setPreset(.normal)
+            defer {
+                GlobalSettingsStore.shared.setMCPAutoStart(oldAutoStart, commit: false)
+                FontScaleManager.shared.setPreset(oldFont)
+            }
+            for (repeatIndex, order) in [[10, 40, 200], [40, 200, 10], [200, 10, 40]].enumerated() {
+                for turns in order {
+                    print("TAIL_SETUP turns=\(turns) repeat=\(repeatIndex + 1)")
+                    try await run(turns: turns, repeatIndex: repeatIndex + 1)
+                }
+            }
+        }
+
+        private func run(turns: Int, repeatIndex: Int) async throws {
+            let recorder = Recorder()
+            recorder.allowedIDs = Set((0 ..< turns * 5).map(Self.id))
+            AgentTranscriptTailRenderProbe.sink = { recorder.receive($0) }
+            defer { AgentTranscriptTailRenderProbe.sink = nil }
+            let fixture = try await makeFixture(turns: turns, recorder: recorder)
+            defer {
+                fixture.window.contentView = nil
+                fixture.window.close()
+            }
+            let snapshot = fixture.store.snapshot
+            let olderIDs = Set(fixture.source.dropLast(5).filter { $0.kind == .user }.map(\.id))
+            let activeID = fixture.source[(turns - 1) * 5].id
+            let tailID = try XCTUnwrap(fixture.source.last?.id)
+            print("TAIL_PRESENTATION turns=\(turns) repeat=\(repeatIndex) blocks=\(snapshot.presentation.visibleBlocks.count) rows=\(snapshot.presentation.visibleRows.count) hydrated=\(snapshot.isHydrated) pane=\(snapshot.panePresentation) font=\(FontScaleManager.shared.preset) viewport=1000x800 sourceTailStreaming=\(fixture.source.last?.isStreaming == true) projectedTailStreaming=\(snapshot.presentation.visibleRows.last(where: { $0.id == tailID })?.isStreaming == true)")
+            var failure: Error?
+            do {
+                guard snapshot.currentTabID == fixture.tabID, snapshot.presentation.tabID == fixture.tabID,
+                      snapshot.isHydrated, snapshot.panePresentation == .transcript
+                else { throw GateFailure(description: "production pane scope/hydration") }
+                try await wait(fixture, seconds: 60, gate: "attached rich native older/active witnesses") {
+                    olderIDs.contains { self.hasRichWitness($0, in: fixture) }
+                        && self.hasRichWitness(activeID, in: fixture)
+                        && fixture.host.layouts > 0
+                        && recorder.counts.values.contains { $0["ensureLayout", default: 0] > 0 }
+                }
+                print("TAIL_MOUNT_GATE passed olderRows=\(olderIDs.count(where: { self.hasRichWitness($0, in: fixture) })) active=\(recorder.attached(activeID, window: fixture.window).count) tail=\(recorder.attached(tailID, window: fixture.window).count)")
+                try await calibrateNativeUpdate(fixture, rowID: activeID)
+                try await measureChunks(fixture, turns: turns, repeatIndex: repeatIndex, tailID: tailID)
+            } catch {
+                print("TAIL_BASELINE_UNAVAILABLE turns=\(turns) repeat=\(repeatIndex) gate=\(error) bodies=\(recorder.bodies.count) nativeInstances=\(recorder.natives.count) attached=\(recorder.natives.values.count(where: { $0.view?.window === fixture.window })) layouts=\(fixture.host.layouts) nativeCounts=\(recorder.counts.values.reduce(into: [String: Int]()) { result, counts in for (key, value) in counts { result[key, default: 0] += value } })")
+                failure = error
+            }
+            AgentTranscriptTailRenderProbe.sink = nil
+            fixture.window.contentView = nil
+            fixture.window.close()
+            await fixture.state.tearDown()
+            ownedStates.removeAll { $0 === fixture.state }
+            if let failure { throw failure }
+        }
+
+        private func measureChunks(_ fixture: Fixture, turns: Int, repeatIndex: Int, tailID: UUID) async throws {
+            let recorder = fixture.recorder
+            let evaluated = Set(recorder.bodies.keys)
+            let activeIDs = Set(fixture.source.suffix(5).map(\.id)).subtracting([tailID])
+            let cohorts: [(String, Set<UUID>)] = [
+                ("older", evaluated.subtracting(activeIDs).subtracting([tailID])),
+                ("activeStable", evaluated.intersection(activeIDs)), ("tail", [tailID])
+            ]
+            guard cohorts[0].1.count > 0, cohorts[1].1.count > 0 else { throw GateFailure(description: "stable cohorts empty") }
+            let mountedIDs = Set(recorder.natives.values.compactMap { $0.view?.window === fixture.window ? $0.rowID : nil })
+            var base = fixture.store.snapshot
+            var tail = try XCTUnwrap(base.presentation.visibleRows.first { $0.id == tailID })
+            guard tail.isStreaming else {
+                throw GateFailure(description: "production-projected tail has isStreaming=false; streaming baseline unavailable")
+            }
+            guard !MarkdownStreamingFreezeBoundaryResolver.shouldConsiderSegmentation(for: tail.text + String(repeating: "x", count: 9 * 128)) else {
+                throw GateFailure(description: "workload exceeds single native renderer boundary")
+            }
+            var publications = 0
+            let subscription = fixture.store.$snapshot.dropFirst().sink { _ in publications += 1 }
+            defer { subscription.cancel() }
+            for ordinal in 0 ... 8 {
+                let marker = String(format: "CHUNK%02d", ordinal)
+                let status = String(format: "Streaming %02d", ordinal)
+                let oldTail = tail
+                tail.text += String(repeating: "x", count: 128 - marker.utf8.count) + marker
+                var next = replacing(tail, in: base)
+                next.runtimeFooterByItemID[tailID] = AgentMessageRuntimeFooter(itemID: tailID, anchorDate: tail.timestamp, completedDate: nil, statusText: status)
+                var reversed = replacing(oldTail, in: next)
+                reversed.presentationRevision = base.presentationRevision
+                reversed.runtimeFooterByItemID = base.runtimeFooterByItemID
+                guard reversed == base, reversed.presentation.contentEqualsExcludingPerformance(base.presentation),
+                      next.presentationRevision == base.presentationRevision + 1, tail.text.utf8.count == oldTail.text.utf8.count + 128
+                else { throw GateFailure(description: "unexpected stable input change chunk=\(ordinal)") }
+                recorder.bodies = [:]
+                recorder.counts = [:]
+                recorder.latestBody[tailID] = nil
+                recorder.footers[tailID] = nil
+                publications = 0
+                let layoutsBefore = fixture.host.layouts
+                let cpuBefore = try mainThreadCPU()
+                let start = ProcessInfo.processInfo.systemUptime
+                fixture.store.update(next)
+                var driveMS = (ProcessInfo.processInfo.systemUptime - start) * 1000
+                var serial = recorder.serial
+                var lastChange = ProcessInfo.processInfo.systemUptime
+                var quietTurns = 0
+                var acknowledged = false
+                while ProcessInfo.processInfo.systemUptime - start < 5 {
+                    let driveStart = ProcessInfo.processInfo.systemUptime
+                    fixture.host.layoutSubtreeIfNeeded()
+                    driveMS += (ProcessInfo.processInfo.systemUptime - driveStart) * 1000
+                    let now = ProcessInfo.processInfo.systemUptime
+                    if recorder.serial != serial {
+                        serial = recorder.serial
+                        lastChange = now
+                        quietTurns = 0
+                    } else { quietTurns += 1 }
+                    let ready = publications == 1 && recorder.latestBody[tailID]?.hasSuffix(marker) == true
+                        && recorder.footers[tailID] == status
+                        && recorder.attached(tailID, window: fixture.window).contains { $0.string.contains(marker) }
+                    if ready, quietTurns >= 2, now - lastChange >= 0.22 { acknowledged = true
+                        break
+                    }
+                    try await Task.sleep(for: .milliseconds(20))
+                }
+                let wallMS = (ProcessInfo.processInfo.systemUptime - start) * 1000
+                let cpuMS = try (mainThreadCPU()) - cpuBefore
+                guard acknowledged, publications == 1, fixture.store.snapshot == next else {
+                    throw GateFailure(description: "chunk=\(ordinal) marker/status/native/settle gate publications=\(publications) body=\(recorder.latestBody[tailID]?.hasSuffix(marker) == true) footer=\(recorder.footers[tailID] == status) native=\(recorder.attached(tailID, window: fixture.window).contains { $0.string.contains(marker) })")
+                }
+                if ordinal > 0 {
+                    var record: [String: Any] = [
+                        "turns": turns,
+                        "repeat": repeatIndex,
+                        "chunk": ordinal,
+                        "revision": next.presentationRevision,
+                        "mainDriveElapsedMS": driveMS,
+                        "mainThreadCPUMS": cpuMS,
+                        "settleWallMS": wallMS,
+                        "hostLayouts": fixture.host.layouts - layoutsBefore,
+                        "presentedRows": base.presentation.visibleRows.count,
+                        "presentedBlocks": base.presentation.visibleBlocks.count
+                    ]
+                    for (name, ids) in cohorts {
+                        var counters: [String: Int] = [:]
+                        for id in ids {
+                            for (key, value) in recorder.counts[id] ?? [:] {
+                                counters[key, default: 0] += value
+                            }
+                        }
+                        record[name] = [
+                            "evaluatedDenominator": ids.count,
+                            "mountedNativeRows": ids.intersection(mountedIDs).count,
+                            "bodyCalls": ids.reduce(0) { $0 + recorder.bodies[$1, default: 0] },
+                            "bodyDistinct": ids.count(where: { recorder.bodies[$0, default: 0] > 0 }),
+                            "native": counters
+                        ] as [String: Any]
+                    }
+                    let json = try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys])
+                    print("TAIL_SAMPLE \(String(decoding: json, as: UTF8.self))")
+                } else { print("TAIL_WARMUP passed turns=\(turns) repeat=\(repeatIndex)") }
+                base = next
+            }
+        }
+
+        /// CPU consumed by the current main thread, including callbacks between driver intervals.
+        private func mainThreadCPU() throws -> Double {
+            guard Thread.isMainThread else { throw GateFailure(description: "CPU clock off main thread") }
+            let thread = mach_thread_self()
+            defer { mach_port_deallocate(mach_task_self_, thread) }
+            var info = thread_basic_info_data_t()
+            var count = mach_msg_type_number_t(MemoryLayout<thread_basic_info_data_t>.size / MemoryLayout<integer_t>.size)
+            let result = withUnsafeMutablePointer(to: &info) { pointer in
+                pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                    thread_info(thread, thread_flavor_t(THREAD_BASIC_INFO), $0, &count)
+                }
+            }
+            guard result == KERN_SUCCESS else { throw GateFailure(description: "main-thread CPU clock unavailable") }
+            return Double(info.user_time.seconds + info.system_time.seconds) * 1000
+                + Double(info.user_time.microseconds + info.system_time.microseconds) / 1000
+        }
+
+        private func hasRichWitness(_ id: UUID, in fixture: Fixture) -> Bool {
+            fixture.recorder.bodies[id, default: 0] > 0 && fixture.recorder.attached(id, window: fixture.window).contains { view in
+                view.string.contains("CODEMARK") && view.string.contains("TABLEMARK")
+                    && view.lastMeasuredSize.width > 1 && view.lastMeasuredSize.height > 1 && containsTable(view)
+            }
+        }
+
+        private func calibrateNativeUpdate(_ fixture: Fixture, rowID: UUID) async throws {
+            let base = fixture.store.snapshot
+            var changed = try XCTUnwrap(base.presentation.visibleRows.first { $0.id == rowID })
+            changed.text = changed.text.replacingOccurrences(of: "CODEMARK", with: "CALIBRATED")
+            let before = fixture.recorder.counts[rowID]?["update", default: 0] ?? 0
+            var publications = 0
+            let subscription = fixture.store.$snapshot.dropFirst().sink { _ in publications += 1 }
+            defer { subscription.cancel() }
+            fixture.store.update(replacing(changed, in: base))
+            try await wait(fixture, seconds: 5, gate: "native positive control update and attached storage") {
+                (fixture.recorder.counts[rowID]?["update", default: 0] ?? 0) > before
+                    && fixture.recorder.attached(rowID, window: fixture.window).contains { $0.string.contains("CALIBRATED") && !$0.string.contains("CODEMARK") }
+            }
+            guard publications == 1 else { throw GateFailure(description: "control publications=\(publications), expected 1") }
+            let original = try XCTUnwrap(base.presentation.visibleRows.first { $0.id == rowID })
+            let restored = replacing(original, in: fixture.store.snapshot)
+            fixture.store.update(restored)
+            try await wait(fixture, seconds: 5, gate: "native positive control restoration") {
+                self.hasRichWitness(rowID, in: fixture) && fixture.recorder.attached(rowID, window: fixture.window).allSatisfy { !$0.string.contains("CALIBRATED") }
+            }
+            guard publications == 2 else { throw GateFailure(description: "control restore publications=\(publications), expected 2") }
+            print("TAIL_NATIVE_CONTROL passed updates=\((fixture.recorder.counts[rowID]?["update", default: 0] ?? 0) - before) publications=\(publications)")
+        }
+
+        /// Derive coherent variants from one production-built presentation, preserving every block identity.
+        private func replacing(_ item: AgentChatItem, in base: AgentTranscriptUISnapshot) -> AgentTranscriptUISnapshot {
+            func rows(_ rows: [AgentChatItem]) -> [AgentChatItem] {
+                rows.map { $0.id == item.id ? item : $0 }
+            }
+            func blocks(_ input: [AgentTranscriptRenderBlock]) -> [AgentTranscriptRenderBlock] {
+                input.map { block in
+                    let grouped = block.groupedHistory.map { history in
+                        AgentTranscriptGroupedHistory(summary: history.summary, sections: history.sections.map { section in
+                            AgentTranscriptGroupedSection(id: section.id, kind: section.kind, title: section.title, icon: section.icon, childBlocks: blocks(section.childBlocks), clusterSummary: section.clusterSummary)
+                        })
+                    }
+                    var copy = AgentTranscriptRenderBlock(
+                        id: block.id, kind: block.kind, turnID: block.turnID, spanID: block.spanID,
+                        retentionTier: block.retentionTier, rows: rows(block.rows), isArchived: block.isArchived,
+                        primaryAnchor: block.primaryAnchor, anchorActivityID: block.anchorActivityID, activityIDs: block.activityIDs,
+                        clusterSummary: block.clusterSummary, groupedHistory: grouped, collapsedHistoryRange: block.collapsedHistoryRange,
+                        defaultPresentation: block.defaultPresentation
+                    )
+                    copy.displaySummaryInputs = block.displaySummaryInputs
+                    return copy
+                }
+            }
+            let p = base.presentation
+            var result = base
+            result.presentationRevision += 1
+            result.presentation = AgentTranscriptPresentationSnapshot(
+                tabID: p.tabID, revision: p.revision + 1,
+                visibleBlocks: blocks(p.visibleBlocks), workingBlocks: blocks(p.workingBlocks),
+                visibleRows: rows(p.visibleRows), workingRows: rows(p.workingRows),
+                rowAnchorIndex: p.rowAnchorIndex, anchorBlockIndex: p.anchorBlockIndex, archivedHistoryState: p.archivedHistoryState,
+                isCompressedHistoryRevealed: p.isCompressedHistoryRevealed, isTranscriptWindowExpanded: p.isTranscriptWindowExpanded,
+                isWindowCappedWhileActive: p.isWindowCappedWhileActive, bindingsHydrated: p.bindingsHydrated,
+                hydratedPersistentBinding: p.hydratedPersistentBinding, hydratedBindingTransitionGeneration: p.hydratedBindingTransitionGeneration,
+                performanceSnapshot: p.performanceSnapshot, metadata: p.metadata, rawToolResultPayloadRenderRevisionByItemID: p.rawToolResultPayloadRenderRevisionByItemID
+            )
+            result.archivedBlocks = blocks(base.archivedBlocks)
+            return result
+        }
+
+        private func containsTable(_ view: CodeBlockTextView) -> Bool {
+            guard let storage = view.textStorage else { return false }
+            var found = false
+            storage.enumerateAttribute(.paragraphStyle, in: NSRange(location: 0, length: storage.length)) { value, _, _ in
+                if let style = value as? NSParagraphStyle, style.textBlocks.contains(where: { $0 is NSTextTableBlock }) { found = true }
+            }
+            return found
+        }
+
+        private func wait(_ fixture: Fixture, seconds: Double, gate: String, until ready: () -> Bool) async throws {
+            let deadline = ProcessInfo.processInfo.systemUptime + seconds
+            while ProcessInfo.processInfo.systemUptime < deadline {
+                fixture.host.layoutSubtreeIfNeeded()
+                if ready() { return }
+                // A scheduler/coalescer servicing interval, never a substitute for the readiness oracle.
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            throw GateFailure(description: gate)
+        }
+
+        private func makeFixture(turns: Int, recorder: Recorder) async throws -> Fixture {
+            _ = NSApplication.shared
+            let state = WindowState(
+                agentModeViewModelFactory: { windowID, prompt, manager, server in
+                    let vm = AgentModeViewModel(
+                        testWindowID: windowID,
+                        codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) },
+                        claudeControllerFactory: { _, _, _, _ in MonitorFakeNativeController() },
+                        headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider(failuresRemaining: 1) },
+                        acpProviderFactory: { _, _ in throw Refused.providerLaunch },
+                        acpControllerFactory: { _, _ in throw Refused.providerLaunch },
+                        connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+                        mcpRunRoutingCleaner: { _, _, _ in },
+                        mcpServerEnabler: { false },
+                        testMCPServer: server,
+                        testWorkspaceFileContextStore: prompt.workspaceFileContextStore
+                    )
+                    vm.promptManager = prompt
+                    vm.workspaceManager = manager
+                    return vm
+                },
+                contextBuilderProviderFactory: { _, _, _, _ in AgentSessionLinkCapturingHeadlessProvider(failuresRemaining: 1) }
+            )
+            ownedStates.append(state)
+            await state.workspaceManager.awaitInitialized()
+            let tab = ComposeTabState(name: "Synthetic transcript baseline", activeAgentSessionID: Self.id(90000))
+            let workspace = WorkspaceModel(name: "Transcript baseline", repoPaths: [], ephemeralFlag: true, composeTabs: [tab], activeComposeTabID: tab.id)
+            state.workspaceManager.workspaces = [workspace]
+            let switched = await state.workspaceManager.switchWorkspace(to: workspace, saveState: false, reason: "transcriptTailDiagnostic")
+            guard switched == .switched else { throw GateFailure(description: "workspace activation") }
+            state.promptManager.loadComposeTabsFromWorkspace(workspace)
+            let vm = state.agentModeViewModel
+            await vm.handleWorkspaceSwitch(workspace)
+            vm.test_setCurrentTabIDOverride(tab.id)
+            _ = await vm.ensureSessionReady(tabID: tab.id)
+            let session = vm.session(for: tab.id)
+            _ = vm.test_installPersistentSessionBinding(sessionID: tab.activeAgentSessionID, on: session, updateWorkspaceMetadata: true)
+            session.hasLoadedPersistedState = true
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            session.markCurrentBindingHydrated()
+            session.isTranscriptWindowExpanded = true
+            let source = Self.items(turns: turns)
+            session.items = source
+            let transcript = AgentTranscriptIO.buildTranscript(from: source, terminalState: .running, nextSequenceIndex: source.count, compact: false)
+            _ = vm.applyTranscriptPresentation(transcript, sourceItems: source, to: session)
+            _ = vm.test_publishTranscriptPresentation(tabID: tab.id, forceRevision: true)
+            vm.syncTranscriptUIState()
+            recorder.allowedIDs.formUnion(vm.ui.transcript.snapshot.presentation.visibleRows.map(\.id))
+
+            let parent = AgentModeDetailWithSidebarView(
+                agentModeVM: vm, runtimeVM: vm.ui.runtimeMetrics.runtimeVM, statusPillsUI: vm.ui.statusPills,
+                contextBuilderAgentVM: state.contextBuilderAgentViewModel, oracleViewModel: state.oracleViewModel,
+                promptManager: state.promptManager, workspaceSearchService: state.workspaceSearchService,
+                selectionCoordinator: state.selectionCoordinator, stressHarness: nil, windowID: state.windowID,
+                currentTabID: tab.id, codexManagedLoginAction: CodexManagedLoginAction(
+                    browser: { _ in throw Refused.providerLaunch }, deviceCode: { _ in throw Refused.providerLaunch }
+                )
+            ).environment(\.agentWindowIsFocused, false)
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 800), styleMask: [.titled], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            let host = CountingHost(rootView: AnyView(parent))
+            window.contentView = host
+            // Never order the window, activate the app, reassign rootView, or force drawing.
+            host.layoutSubtreeIfNeeded()
+            return Fixture(state: state, tabID: tab.id, host: host, window: window, source: source, recorder: recorder)
+        }
+
+        private static func id(_ value: Int) -> UUID {
+            UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", value + 1))!
+        }
+
+        private static func rich(_ turn: Int) -> String {
+            let code = (0 ..< 48).map { "let code\($0) = \(turn * 100 + $0) // CODEMARK" }.joined(separator: "\n")
+            let table = (0 ..< 12).map { "| TABLEMARK\($0) | \(turn) | value\($0) |" }.joined(separator: "\n")
+            return "Turn \(turn) rich request\n\n```swift\n\(code)\n```\n\n| Marker | Turn | Value |\n| --- | --- | --- |\n\(table)\n\n"
+        }
+
+        private static func items(turns: Int) -> [AgentChatItem] {
+            (0 ..< turns).flatMap { turn -> [AgentChatItem] in
+                let start = turn * 5
+                let date = Date(timeIntervalSince1970: 1_800_000_000 + Double(turn * 60))
+                return [
+                    AgentChatItem(id: id(start), timestamp: date, kind: .user, text: rich(turn), sequenceIndex: start),
+                    AgentChatItem(id: id(start + 1), timestamp: date, kind: .assistant, text: "Settled opener \(turn)", sequenceIndex: start + 1),
+                    AgentChatItem(id: id(start + 2), timestamp: date, kind: .toolCall, text: "", toolName: "read_file", toolInvocationID: id(10000 + turn), toolArgsJSON: "{\"path\":\"Synthetic.swift\"}", sequenceIndex: start + 2),
+                    AgentChatItem(id: id(start + 3), timestamp: date, kind: .toolResult, text: "Synthetic result", toolName: "read_file", toolInvocationID: id(10000 + turn), toolResultJSON: "{\"content\":\"Synthetic result\"}", toolIsError: false, sequenceIndex: start + 3),
+                    AgentChatItem(id: id(start + 4), timestamp: date, kind: .assistant, text: turn == turns - 1 ? rich(turn) + "Open streaming paragraph " : "Settled conclusion \(turn)", sequenceIndex: start + 4, isStreaming: turn == turns - 1)
+                ]
+            }
+        }
+    }
+#endif

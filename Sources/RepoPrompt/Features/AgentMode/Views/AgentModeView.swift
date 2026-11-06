@@ -2793,11 +2793,14 @@ struct AgentModeChatDetailView: View {
             codexManagedLoginAction: codexManagedLoginAction
         )
         .id(item.id)
-        .environment(\.markdownFileLinkOpener, markdownFileLinkOpener)
-        .environment(\.agentToolCardAutoExpandEnabled, autoExpandEnabled)
-        .environment(\.agentLiveBashExecutionByItemID, transcript.activeBashLiveExecutionByItemID)
-        .environment(\.agentRecentAssistantItemIDs, renderContext.recentAssistantItemIDs)
-        .environment(\.agentApprovalVisible, renderContext.interactionBlockerVisible)
+        #if DEBUG
+            .environment(\.agentTranscriptProbeRowID, item.id)
+        #endif
+            .environment(\.markdownFileLinkOpener, markdownFileLinkOpener)
+            .environment(\.agentToolCardAutoExpandEnabled, autoExpandEnabled)
+            .environment(\.agentLiveBashExecutionByItemID, transcript.activeBashLiveExecutionByItemID)
+            .environment(\.agentRecentAssistantItemIDs, renderContext.recentAssistantItemIDs)
+            .environment(\.agentApprovalVisible, renderContext.interactionBlockerVisible)
     }
 
     private func toolCardAutoExpandEnabled(for block: AgentTranscriptRenderBlock, lockTargetID: UUID?) -> Bool {

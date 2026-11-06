@@ -18,6 +18,9 @@ extension EnvironmentValues {
 /// - Uses the shared message timestamp formatter so timestamp labels stay consistent.
 /// - Observes FontScaleManager so footer text follows Agent Mode text size.
 private struct MessageFooterStrip: View {
+    #if DEBUG
+        @Environment(\.agentTranscriptProbeRowID) private var probeRowID
+    #endif
     @Environment(\.agentModePerfRecorder) private var perfRecorder
     let text: String
     let timestamp: Date
@@ -97,6 +100,9 @@ private struct MessageFooterStrip: View {
     }
 
     private func runtimeFooterText(_ runtimeFooter: AgentMessageRuntimeFooter, now: Date) -> some View {
+        #if DEBUG
+            AgentTranscriptTailRenderProbe.sink?(.footer(probeRowID, runtimeFooter.statusText))
+        #endif
         let elapsed = AgentRuntimeDurationFormatter.string(from: runtimeFooter.anchorDate, to: now)
         return Text("\(runtimeFooter.statusText) · \(elapsed)")
             .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
@@ -287,6 +293,9 @@ struct AgentMessageBubble: View {
     }
 
     var body: some View {
+        #if DEBUG
+            let _ = AgentTranscriptTailRenderProbe.sink?(.body(item.id, item.text))
+        #endif
         let renderItem = renderingItem
         switch renderItem.kind {
         case .user:
