@@ -6,6 +6,35 @@ import XCTest
 
 @MainActor
 final class AgentSessionLifecycleAuthorityContractTests: XCTestCase {
+    #if DEBUG
+        func testProviderSwitchRequiresOwnedTeardownAndAcceptedWorkToSettle() async throws {
+            let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+            let session = harness.makeSession(agent: .openCode)
+            session.testInstallPersistentSessionBinding(sessionID: UUID())
+            let runID = UUID()
+            session.installRunID(runID)
+            session.runState = .running
+            let ownership = session.beginRunAttempt(source: "provider-switch-terminal-test")
+            let release = AgentSessionLinkStopSignal<Void>()
+            defer { release.finish(()) }
+            session.installRunAttemptTerminalResources(ownership: ownership) { _ in { await release.value() } }
+            XCTAssertFalse(harness.service.providerSwitchTerminalIsSettled(session))
+            let cancellation = Task { await harness.service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted) }
+            try await AsyncTestWait.waitUntil("terminal published before owned teardown") {
+                session.runState == .cancelled && !session.terminalCommitInProgress
+            }
+            XCTAssertNil(session.activeRunOwnership)
+            XCTAssertFalse(harness.service.providerSwitchTerminalIsSettled(session), "Terminal publication does not prove teardown settled")
+            release.finish(())
+            await cancellation.value
+            XCTAssertTrue(harness.service.providerSwitchTerminalIsSettled(session))
+            session.mcpFollowUpRunPending = true
+            XCTAssertFalse(harness.service.providerSwitchTerminalIsSettled(session))
+            session.mcpFollowUpRunPending = false
+            XCTAssertTrue(harness.service.providerSwitchTerminalIsSettled(session))
+        }
+    #endif
+
     func testCanonicalPresenceRearmsMissingWorkspaceRepair() {
         let authority = AgentSessionLifecycleAuthority()
         let tab = ComposeTabState(isPinned: true)

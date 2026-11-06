@@ -318,6 +318,7 @@ class WindowState: ObservableObject {
     private var wantsAgentTitlebarAccessory: Bool = false
     /// Action to call when the "New Session" button is tapped
     private var agentNewSessionAction: (() -> Void)?
+    private var isAgentSidebarCollapsed = false
     /// Narrow titlebar state observed only by the principal toolbar title cluster.
     let agentChatTitleCluster = AgentChatTitleClusterModel(title: WindowTitleFormatter.defaultTitle)
 
@@ -1722,6 +1723,13 @@ class WindowState: ObservableObject {
         }
     }
 
+    /// Tells the accessory the sidebar was hidden or shown: compose moves into it while hidden.
+    func setAgentSidebarCollapsed(_ collapsed: Bool) {
+        guard isAgentSidebarCollapsed != collapsed else { return }
+        isAgentSidebarCollapsed = collapsed
+        applyAgentTitlebarAccessoryIfPossible()
+    }
+
     /// Installs the titlebar accessory if conditions are met (Agent mode active + window attached)
     private func applyAgentTitlebarAccessoryIfPossible() {
         guard !shouldSuppressObservationSideEffects,
@@ -1732,13 +1740,29 @@ class WindowState: ObservableObject {
             return
         }
 
+        let windowID = windowID
+        let toggleSidebar = {
+            NotificationCenter.default.post(
+                name: .toggleRepoPromptNavigationSidebar,
+                object: nil,
+                userInfo: ["windowID": windowID]
+            )
+        }
         if let existing = agentTitlebarAccessory {
-            existing.update(onNewSession: action)
+            existing.update(
+                isSidebarCollapsed: isAgentSidebarCollapsed,
+                onToggleSidebar: toggleSidebar,
+                onNewSession: action
+            )
             if !window.titlebarAccessoryViewControllers.contains(where: { $0 === existing }) {
                 window.addTitlebarAccessoryViewController(existing)
             }
         } else {
-            let accessory = AgentModeTitlebarAccessoryViewController(onNewSession: action)
+            let accessory = AgentModeTitlebarAccessoryViewController(
+                isSidebarCollapsed: isAgentSidebarCollapsed,
+                onToggleSidebar: toggleSidebar,
+                onNewSession: action
+            )
             window.addTitlebarAccessoryViewController(accessory)
             agentTitlebarAccessory = accessory
         }
@@ -3157,8 +3181,9 @@ class WindowState: ObservableObject {
 
         _ = surface
 
+        // An agent asking a question reaches here automatically, so it must not end typing.
         if promptManager.activeComposeTabID != tabID {
-            await promptManager.switchComposeTab(tabID)
+            await promptManager.switchComposeTab(tabID, focusIntent: .preservesLiveText)
         }
 
         return true

@@ -2878,7 +2878,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
             ),
             agentModeVM: state.agentModeViewModel, sidebarUI: state.agentModeViewModel.ui.sessionSidebar,
             promptManager: state.promptManager, apiSettingsVM: state.apiSettingsViewModel,
-            currentTabID: tabID, onManageWorkspaces: {}
+            currentTabID: tabID, onManageWorkspaces: {}, onNewSession: {}
         )
     }
 
@@ -2907,7 +2907,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         var tracked: NSMenu?
         let ended = NotificationCenter.default.addObserver(forName: NSMenu.didEndTrackingNotification, object: nil, queue: nil) { note in
             MainActor.assumeIsolated {
-                guard !cancelAfterOpening, let menu = note.object as? NSMenu, menu === tracked else { return }
+                guard let menu = note.object as? NSMenu, menu === tracked else { return }
                 finished.fulfill()
             }
         }
@@ -2920,8 +2920,10 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
                     MainActor.assumeIsolated {
                         whileTracking?(menu)
                         if cancelAfterOpening {
+                            // Cancellation requests the end of tracking; it does not complete it.
+                            // The run-loop presenter keeps MainActor work live, so resuming here
+                            // can race menu teardown or a second opening. Wait for didEndTracking.
                             menu.cancelTracking()
-                            finished.fulfill()
                         }
                     }
                 }
@@ -2969,5 +2971,79 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         let mountedRegions = regions(in: fixture.host).filter { !$0.visibleRect.isEmpty }
         XCTAssertEqual(mountedRegions.count, 1, "The actual sidebar search must leave only the intended row region")
         return try XCTUnwrap(mountedRegions.first, "Real sidebar must mount its native row region")
+    }
+}
+
+/// `NSMenu.popUp` spins a nested tracking run loop until the menu closes. The deferred
+/// context-menu presentation must reach that call from a run-loop block, not from a
+/// main-dispatch-queue block: the main queue's drain is not re-entrant, so a popup
+/// started inside `DispatchQueue.main.async` freezes every MainActor job for as long
+/// as the menu is open (Sentry REPOPROMPT-16N).
+@MainActor
+final class StableMenuDeferredPresentationTests: XCTestCase {
+    @MainActor
+    private final class Flag {
+        var isSet = false
+    }
+
+    /// Posts a main-queue block that sets the returned flag — the same path MainActor
+    /// jobs and Sentry's hang probe take.
+    private func postMainQueueSentinel() -> Flag {
+        let flag = Flag()
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated { flag.isSet = true }
+        }
+        return flag
+    }
+
+    /// Spins the run loop like a tracking session would, until `flag` is set or
+    /// `timeout` elapses. Returns whether the flag was set.
+    private func spinNestedRunLoop(timeout: TimeInterval, until flag: Flag) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !flag.isSet, Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+        }
+        return flag.isSet
+    }
+
+    func testScheduledBlockCanServiceTheMainQueueFromANestedRunLoop() throws {
+        // The guarantee under test can only be observed when no main-queue drain is
+        // already on the stack (a run-loop block cannot escape an enclosing drain);
+        // skip rather than fail in a host where the control sentinel never runs.
+        try XCTSkipUnless(
+            spinNestedRunLoop(timeout: 5, until: postMainQueueSentinel()),
+            "Test host cannot service the main queue from a nested run loop (a drain is already on the stack)"
+        )
+
+        let scheduledBlockFinished = expectation(description: "scheduled block finished")
+        let sentinelRanDuringNestedLoop = Flag()
+        StableMenuDeferredPresentation.schedule {
+            // Stand-in for the nested tracking loop `NSMenu.popUp` runs.
+            sentinelRanDuringNestedLoop.isSet = self.spinNestedRunLoop(timeout: 5, until: self.postMainQueueSentinel())
+            scheduledBlockFinished.fulfill()
+        }
+        wait(for: [scheduledBlockFinished], timeout: 10)
+        XCTAssertTrue(
+            sentinelRanDuringNestedLoop.isSet,
+            "A main-queue block must run while the deferred presentation's nested run loop spins"
+        )
+    }
+
+    func testScheduledBlockRunsOnTheMainThreadAfterTheCurrentPass() {
+        let ran = expectation(description: "block ran")
+        let stillInsideScheduleCall = Flag()
+        stillInsideScheduleCall.isSet = true
+        let observedSynchronousInvocation = Flag()
+        let ranOnMainThread = Flag()
+        StableMenuDeferredPresentation.schedule {
+            // Sampled inside the block: true only if `schedule` invoked it synchronously.
+            observedSynchronousInvocation.isSet = stillInsideScheduleCall.isSet
+            ranOnMainThread.isSet = Thread.isMainThread
+            ran.fulfill()
+        }
+        stillInsideScheduleCall.isSet = false
+        wait(for: [ran], timeout: 10)
+        XCTAssertFalse(observedSynchronousInvocation.isSet, "schedule must defer the block to a later run-loop pass")
+        XCTAssertTrue(ranOnMainThread.isSet)
     }
 }

@@ -442,11 +442,11 @@ extension AgentModeViewModel {
         }
         let counts = agentSessionLinkCensusWorkspaceID == candidate.workspaceID
             ? agentSessionLinkSubagentCensus.counts(for: candidate.sessionID)
-            : .init()
+            : nil
         return Self.observationSnapshot(
             for: session,
             candidate: candidate,
-            subagentCounts: (running: counts.running, finished: counts.finished)
+            subagentCounts: counts.map { (running: $0.running, finished: $0.finished) }
         )
     }
 
@@ -741,7 +741,7 @@ extension AgentModeViewModel {
     static func observationSnapshot(
         for session: TabSession,
         candidate: AgentSessionLinkEndpointCandidate,
-        subagentCounts: (running: Int, finished: Int)
+        subagentCounts: (running: Int, finished: Int)?
     ) -> DomainAgentSessionObservationSnapshot {
         let projection = statusProjection(for: session)
         let blockers = sendBlockers(sendReadinessInputs(
@@ -775,7 +775,7 @@ extension AgentModeViewModel {
     static func laneBoard(
         for session: TabSession,
         blockers: [SendBlocker],
-        subagentCounts: (running: Int, finished: Int)
+        subagentCounts: (running: Int, finished: Int)?
     ) -> DomainAgentSessionLaneBoard {
         let runOutcome: DomainAgentSessionLaneBoard.RunOutcome = switch session.runState {
         case .idle: .none
@@ -795,8 +795,9 @@ extension AgentModeViewModel {
             runOutcome: runOutcome,
             failureReason: failureReason,
             sendBlockers: blockers.map(\.rawValue),
-            subagentRunning: subagentCounts.running,
-            subagentFinished: subagentCounts.finished
+            subagentRunning: subagentCounts?.running ?? 0,
+            subagentFinished: subagentCounts?.finished ?? 0,
+            subagentCountsKnown: subagentCounts != nil
         )
     }
 
@@ -1645,6 +1646,8 @@ extension AgentModeViewModel {
         case stopInProgress = "stop_in_progress"
         case backgroundCompactionSettling = "background_compaction_settling"
         case candidateClosing = "candidate_closing"
+        case providerSwitchUnconfirmed = "provider_switch_unconfirmed"
+        case providerHandoverNeedsReview = "provider_handover_needs_review"
     }
 
     /// One sample of every send-readiness condition. The board and `idleForSend` consume the same
@@ -1667,6 +1670,8 @@ extension AgentModeViewModel {
         var stopInProgress: Bool
         var backgroundCompactionSettling = false
         var isCandidateClosing: Bool
+        var providerSwitchUnconfirmed = false
+        var providerHandoverNeedsReview = false
     }
 
     static func sendReadinessInputs(
@@ -1676,7 +1681,7 @@ extension AgentModeViewModel {
     ) -> SendReadinessInputs {
         SendReadinessInputs(
             status: status,
-            runStateIsActive: session.runState.isActive,
+            runStateIsActive: session.runState.isActive || providerSwitchHasOwnedCarryingAttempt(session),
             hasLoadedPersistedState: session.hasLoadedPersistedState,
             bindingTransitionInProgress: session.bindingTransitionInProgress,
             terminalCommitInProgress: session.terminalCommitInProgress,
@@ -1691,7 +1696,9 @@ extension AgentModeViewModel {
             hasPendingSelfCompact: session.selfCompactState.blocksOverseerDelivery,
             stopInProgress: session.stopState.isStopping(binding: session.persistentSessionBindingIdentity),
             backgroundCompactionSettling: session.isSettlingACPBackgroundCompaction,
-            isCandidateClosing: candidate.isClosing
+            isCandidateClosing: candidate.isClosing,
+            providerSwitchUnconfirmed: providerSwitchUnconfirmed(session),
+            providerHandoverNeedsReview: providerSwitchNeedsReview(session)
         )
     }
 
@@ -1714,6 +1721,8 @@ extension AgentModeViewModel {
         if input.stopInProgress { blockers.append(.stopInProgress) }
         if input.backgroundCompactionSettling { blockers.append(.backgroundCompactionSettling) }
         if input.isCandidateClosing { blockers.append(.candidateClosing) }
+        if input.providerSwitchUnconfirmed { blockers.append(.providerSwitchUnconfirmed) }
+        if input.providerHandoverNeedsReview { blockers.append(.providerHandoverNeedsReview) }
         return blockers.sorted { $0.rawValue < $1.rawValue }
     }
 

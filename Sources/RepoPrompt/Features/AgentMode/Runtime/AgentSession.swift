@@ -1,6 +1,25 @@
 import Foundation
 import RepoPromptSettingsCore
 
+/// Present-but-unreadable delivery evidence must never become legacy resend authority.
+enum AgentProviderSwitchDelivery: String, Codable, Equatable {
+    case ready
+    case sending
+
+    init(from decoder: Decoder) throws {
+        let value = try? decoder.singleValueContainer().decode(String.self)
+        self = value.flatMap(Self.init(rawValue:)) ?? .sending
+    }
+}
+
+extension KeyedDecodingContainer {
+    /// Also used by the synthesized lightweight header decoder. Only an absent key is legacy.
+    func decodeIfPresent(_ type: AgentProviderSwitchDelivery.Type, forKey key: Key) throws -> AgentProviderSwitchDelivery? {
+        guard contains(key) else { return nil }
+        return (try? decode(type, forKey: key)) ?? .sending
+    }
+}
+
 // MARK: - Agent Session Error
 
 enum AgentSessionError: Error, LocalizedError {
@@ -146,6 +165,20 @@ struct AgentTokenUsagePersist: Codable, Equatable {
 
 // MARK: - Agent Session
 
+/// A model's own context capacity, scoped to the provider and model it was reported for, so a
+/// value from another model never bounds or sizes this one.
+struct AgentContextWindowCapacity: Codable, Equatable {
+    var tokens: Int
+    var agentRaw: String
+    /// The base model without its effort suffix (see `modelKey(forRaw:)`): effort does not change capacity.
+    var modelRaw: String
+
+    /// The identity a capacity is stored under: the base model, or the default model when none is named.
+    static func modelKey(forRaw raw: String?) -> String {
+        ClaudeModelSpecifier(raw: raw).baseModel ?? AgentModel.defaultModel.rawValue
+    }
+}
+
 /// Persisted agent mode session containing the chat transcript and configuration
 struct AgentSession: Codable, Identifiable {
     // 9 adds the granular observer-session Auto-wake target UUID set.
@@ -237,6 +270,9 @@ struct AgentSession: Codable, Identifiable {
     var codexLastTotalTokens: Int?
     var codexTotalTotalTokens: Int?
     var codexMcpSessionKey: String?
+    /// The model's own context capacity, before any Claude auto-compact cap. `codexContextWindow`
+    /// keeps the effective window; this is the validation ceiling for the provider and model it names.
+    var contextWindowCapacity: AgentContextWindowCapacity?
 
     /// Parent session ID for thread nesting (child sessions spawned from another session)
     var parentSessionID: UUID?
@@ -267,6 +303,7 @@ struct AgentSession: Codable, Identifiable {
 
     /// Pending handoff payload (injected into the provider-facing text on the destination tab's
     /// first user send, then cleared). Persisted so it survives close/reopen.
+    var pendingHandoffProviderSwitchDelivery: AgentProviderSwitchDelivery?
     var pendingHandoffPayload: String?
     var pendingHandoffCreatedAt: Date?
     var pendingHandoffSourceItemID: UUID?
@@ -323,10 +360,12 @@ struct AgentSession: Codable, Identifiable {
         codexLastTotalTokens: Int? = nil,
         codexTotalTotalTokens: Int? = nil,
         codexMcpSessionKey: String? = nil,
+        contextWindowCapacity: AgentContextWindowCapacity? = nil,
         parentSessionID: UUID? = nil,
         createdByOverseerSessionID: UUID? = nil,
         organizationalParentID: UUID? = nil,
         delegationScopeID: UUID? = nil,
+        pendingHandoffProviderSwitchDelivery: AgentProviderSwitchDelivery? = nil,
         pendingHandoffPayload: String? = nil,
         pendingHandoffCreatedAt: Date? = nil,
         pendingHandoffSourceItemID: UUID? = nil,
@@ -373,10 +412,12 @@ struct AgentSession: Codable, Identifiable {
         self.codexLastTotalTokens = codexLastTotalTokens
         self.codexTotalTotalTokens = codexTotalTotalTokens
         self.codexMcpSessionKey = codexMcpSessionKey
+        self.contextWindowCapacity = contextWindowCapacity
         self.parentSessionID = parentSessionID
         self.createdByOverseerSessionID = createdByOverseerSessionID
         self.organizationalParentID = organizationalParentID
         self.delegationScopeID = delegationScopeID
+        self.pendingHandoffProviderSwitchDelivery = pendingHandoffProviderSwitchDelivery
         self.pendingHandoffPayload = pendingHandoffPayload
         self.pendingHandoffCreatedAt = pendingHandoffCreatedAt
         self.pendingHandoffSourceItemID = pendingHandoffSourceItemID
@@ -425,10 +466,12 @@ struct AgentSession: Codable, Identifiable {
         case codexLastTotalTokens
         case codexTotalTotalTokens
         case codexMcpSessionKey
+        case contextWindowCapacity
         case parentSessionID
         case createdByOverseerSessionID
         case organizationalParentID
         case delegationScopeID
+        case pendingHandoffProviderSwitchDelivery
         case pendingHandoffPayload
         case pendingHandoffCreatedAt
         case pendingHandoffSourceItemID
@@ -498,10 +541,12 @@ struct AgentSession: Codable, Identifiable {
         codexLastTotalTokens = try container.decodeIfPresent(Int.self, forKey: .codexLastTotalTokens)
         codexTotalTotalTokens = try container.decodeIfPresent(Int.self, forKey: .codexTotalTotalTokens)
         codexMcpSessionKey = try container.decodeIfPresent(String.self, forKey: .codexMcpSessionKey)
+        contextWindowCapacity = try? container.decodeIfPresent(AgentContextWindowCapacity.self, forKey: .contextWindowCapacity)
         parentSessionID = try container.decodeIfPresent(UUID.self, forKey: .parentSessionID)
         createdByOverseerSessionID = try container.decodeIfPresent(UUID.self, forKey: .createdByOverseerSessionID)
         organizationalParentID = try container.decodeIfPresent(UUID.self, forKey: .organizationalParentID)
         delegationScopeID = try container.decodeIfPresent(UUID.self, forKey: .delegationScopeID)
+        pendingHandoffProviderSwitchDelivery = try container.decodeIfPresent(AgentProviderSwitchDelivery.self, forKey: .pendingHandoffProviderSwitchDelivery)
         pendingHandoffPayload = try container.decodeIfPresent(String.self, forKey: .pendingHandoffPayload)
         pendingHandoffCreatedAt = try container.decodeIfPresent(Date.self, forKey: .pendingHandoffCreatedAt)
         pendingHandoffSourceItemID = try container.decodeIfPresent(UUID.self, forKey: .pendingHandoffSourceItemID)

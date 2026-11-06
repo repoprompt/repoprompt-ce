@@ -9,6 +9,7 @@ import RepoPromptSettingsCore
 //
 
 import AppKit
+import Combine
 import RepoPromptInstrumentation
 import SwiftUI
 import UniformTypeIdentifiers
@@ -32,6 +33,7 @@ struct AgentComposerActions {
     let modelOptions: (_ agent: AgentProviderKind, _ includeClaudeEffortVariants: Bool) -> [AgentModelOption]
     let canSelectAgentInCurrentChat: (_ agent: AgentProviderKind) -> Bool
     let selectAgentModel: (_ agent: AgentProviderKind, _ rawModel: String) -> Void
+    var reviewAgentModel: (_ agent: AgentProviderKind, _ rawModel: String, _ cursorParameterIntent: AgentModeViewModel.ProviderSwitchCursorParameterIntent?) -> Bool = { _, _, _ in false }
     let reasoningEffortOptionsForCurrentSelection: () -> [CodexReasoningEffort]
     let selectReasoningEffort: (_ effort: CodexReasoningEffort?) -> Void
     let selectACPModelParameter: (_ target: ACPModelParameterSelection, _ openCodeDiscoveryKey: OpenCodeACPModelParameterKey?) -> Void
@@ -64,6 +66,9 @@ struct AgentInputBar: View {
     @Binding var transcriptBottomClearance: CGFloat
 
     @FocusState var isFocused: Bool
+    @State private var providerSwitchBannerHeight: CGFloat = 0
+    @State private var composerOnlyBottomInset: CGFloat = 0
+    @State private var composerOnlyBottomClearance: CGFloat = 0
 
     /// Height of the footer spacing below the composer chrome
     static let footerHeight: CGFloat = 28
@@ -94,6 +99,22 @@ struct AgentInputBar: View {
         #if DEBUG
             let _ = perfRecorder.increment("ui.body.inputBar")
         #endif
+        AgentProviderSwitchPresentation(viewModel: agentModeVM, tabID: currentTabID, content: composer, bannerHeight: $providerSwitchBannerHeight)
+            .onChange(of: providerSwitchBannerHeight) { _, _ in syncProviderSwitchGeometry() }
+            .onChange(of: composerOnlyBottomInset) { _, _ in syncProviderSwitchGeometry() }
+            .onChange(of: composerOnlyBottomClearance) { _, _ in syncProviderSwitchGeometry() }
+            .overlay(alignment: .bottom) {
+                statusPills
+                    .padding(.bottom, Self.footerHeight + ComposerChrome<EmptyView, EmptyView>.baseBarHeight + composerOnlyBottomInset - 8)
+            }
+    }
+
+    private func syncProviderSwitchGeometry() {
+        composerBottomInset = composerOnlyBottomInset + providerSwitchBannerHeight
+        transcriptBottomClearance = composerOnlyBottomClearance + providerSwitchBannerHeight
+    }
+
+    private var composer: some View {
         AgentComposerView(
             props: composerUI.props,
             placeholderText: composerPlaceholderText,
@@ -107,15 +128,11 @@ struct AgentInputBar: View {
             repromptStore: agentModeVM.repromptUIStore,
             pendingSubmissionStore: composerUI,
             resetTextFieldTrigger: $resetTextFieldTrigger,
-            composerBottomInset: $composerBottomInset,
-            transcriptBottomClearance: $transcriptBottomClearance,
+            composerBottomInset: $composerOnlyBottomInset,
+            transcriptBottomClearance: $composerOnlyBottomClearance,
             isFocused: _isFocused
         )
         .equatable()
-        .overlay(alignment: .bottom) {
-            statusPills
-                .padding(.bottom, Self.footerHeight + ComposerChrome<EmptyView, EmptyView>.baseBarHeight + composerBottomInset - 8)
-        }
     }
 
     private var composerActions: AgentComposerActions {
@@ -173,8 +190,15 @@ struct AgentInputBar: View {
             },
             canSelectAgentInCurrentChat: { agent in agentModeVM.canSelectAgentInCurrentChat(agent) },
             selectAgentModel: { agent, rawModel in
+                if agentModeVM.requestProviderSwitchSelection(agent: agent, model: rawModel, tabID: currentTabID) { return }
+                guard !composerUI.props.areModelControlsDisabled,
+                      agentModeVM.canSelectAgentInCurrentChat(agent) else { return }
+                AgentModelCatalog.updateLastUsedEffortIfEncoded(agentKind: agent, rawModel: rawModel)
                 agentModeVM.selectedAgent = agent
                 agentModeVM.selectModel(rawModel: rawModel)
+            },
+            reviewAgentModel: { agent, model, intent in
+                agentModeVM.requestProviderSwitchSelection(agent: agent, model: model, tabID: currentTabID, cursorParameterIntent: intent)
             },
             reasoningEffortOptionsForCurrentSelection: { agentModeVM.reasoningEffortOptionsForCurrentSelection() },
             selectReasoningEffort: { effort in agentModeVM.selectReasoningEffort(effort) },
@@ -308,9 +332,72 @@ struct AgentComposerView: View, Equatable {
 
     @FocusState var isFocused: Bool
 
+    /// A session taking focus goes to its pending question if it has one, otherwise the composer,
+    /// including when an approval is pending. Only a user-started switch may end typing in
+    /// another field.
+    private func routeActivationFocus(tabID: UUID?, overridesLiveText: Bool) {
+        lastActivationRoutedTabID = tabID
+        pendingInteractionHandoffTask?.cancel()
+        guard let tabID else { return }
+        let overridable = overridesLiveText ? nativeComposerEditor.currentTextEntry : nil
+        guard let repromptViewModel else {
+            composerFocusActivationRequest = .init(overridableTextEntry: overridable)
+            return
+        }
+        let store = repromptViewModel.ui.runInteraction
+        store.clearPendingCardFocus()
+        guard repromptViewModel.hasPendingQuestionForFocus(tabID: tabID) else {
+            composerFocusActivationRequest = .init(overridableTextEntry: overridable)
+            return
+        }
+        composerFocusActivationRequest = nil
+        // The composer is reused across sessions, so an automated switch must also count it as
+        // live: moving someone typing there onto a card would interrupt them.
+        store.requestPendingCardFocus(tabID: tabID, mayDeliver: { [editor = nativeComposerEditor] in
+            !editor.isTextEntryActive(includingEditor: true, excepting: overridable)
+        })
+    }
+
+    /// Answering a card hands focus on: to the next pending card, or back to the composer. Both
+    /// are polite, so resolving a card never pulls focus from something else the user moved to.
+    private func handlePendingInteractionChange(_ snapshot: AgentRunInteractionUISnapshot) {
+        let previous = lastPendingInteractions
+        let keys = snapshot.pendingInteractionFocusKeys
+        lastPendingInteractions = (snapshot.currentTabID, keys)
+        guard previous.tabID == snapshot.currentTabID, let tabID = snapshot.currentTabID, tabID == currentTabID,
+              previous.keys != keys else { return }
+        // A focus request for a card that has since changed must not fire later on another card.
+        let store = repromptViewModel?.ui.runInteraction
+        store?.clearPendingCardFocus()
+        pendingInteractionHandoffTask?.cancel()
+        let handoff = AgentPendingInteractionFocusHandoff.evaluate(previousKeys: previous.keys, keys: keys)
+        guard handoff != .none else { return }
+        let editor = nativeComposerEditor
+        pendingInteractionHandoffTask = Task { @MainActor in
+            // The answered card's own field may still be attached; a field the user moved to
+            // instead is a different entry and is left alone below.
+            await editor.waitForOtherTextEntryToDepart()
+            guard !Task.isCancelled else { return }
+            switch handoff {
+            case .none:
+                break
+            case .returnToComposer:
+                composerFocusRestoreRequest = UUID()
+            case .focusNextCard:
+                store?.requestPendingCardFocus(tabID: tabID, mayDeliver: {
+                    !editor.isTextEntryActive(includingEditor: true)
+                })
+            }
+        }
+    }
+
+    private var pendingInteractionSnapshots: AnyPublisher<AgentRunInteractionUISnapshot, Never> {
+        repromptViewModel?.ui.runInteraction.$snapshot.eraseToAnyPublisher() ?? Empty().eraseToAnyPublisher()
+    }
+
     private func flushDraftOnDeparture(tabID: UUID) {
         guard AgentRepromptUIStore.shouldFlushDraftOnDeparture(
-            tabID: tabID, presentation: repromptStore.presentation, publication: repromptStore.draftUpdate,
+            tabID: tabID, presentation: repromptStore.presentations[tabID], publication: repromptStore.draftUpdate,
             acknowledged: acknowledgedRepromptPublicationsByTab[tabID]
         ) else { return }
         actions.storeDraft(tabID, localInputText, acknowledgedDraftRestorationSequenceByTab[tabID] ?? 0)
@@ -324,6 +411,10 @@ struct AgentComposerView: View, Equatable {
     @State private var acknowledgedRepromptPublicationsByTab: [UUID: AgentRepromptUIStore.PublicationIdentity] = [:]
     @State private var repromptStripHeight: CGFloat = 0
     @State private var composerFocusRestoreRequest: UUID?
+    @State private var composerFocusActivationRequest: TextFieldFocusActivationRequest?
+    @State private var lastActivationRoutedTabID: UUID?
+    @State private var pendingInteractionHandoffTask: Task<Void, Never>?
+    @State private var lastPendingInteractions: (tabID: UUID?, keys: [String]) = (nil, [])
     @State private var editorTextFieldHeight: CGFloat = ResizableTextField.height(forPresetIndex: 0, preset: .normal)
     @State private var isInputEmpty: Bool = true
     @State private var chromeOcclusion: CGFloat = 0
@@ -409,7 +500,13 @@ struct AgentComposerView: View, Equatable {
     }
 
     private var repromptPresentation: AgentRepromptUIStore.Presentation? {
-        repromptStore.presentation.flatMap { $0.sourceTabID == currentTabID ? $0 : nil }
+        currentTabID.flatMap { repromptStore.presentations[$0] }
+    }
+
+    /// A rewrite that finished in a session not on screen waits here until its composer is back,
+    /// has loaded that text and can dispatch it.
+    private var repromptAutoSendReadyID: UUID? {
+        repromptStore.autoSendReadyID(tabID: currentTabID, visibleDraft: localInputText, canSubmit: canSubmitToRenderedTarget)
     }
 
     private var repromptUndoRecovery: AgentRepromptUIStore.Recovery? {
@@ -592,12 +689,14 @@ struct AgentComposerView: View, Equatable {
             if let tabID = currentTabID {
                 loadDraftFromSession(for: tabID)
             }
+            routeActivationFocus(tabID: currentTabID, overridesLiveText: false)
         }
         .onDisappear {
             // Store draft when leaving
             if let tabID = currentTabID {
                 flushDraftOnDeparture(tabID: tabID)
             }
+            pendingInteractionHandoffTask?.cancel()
             steeringUnsupportedDismissTask?.cancel()
             steeringUnsupportedDismissTask = nil
             modelMenuSnapshotReleaseTask?.cancel()
@@ -613,7 +712,17 @@ struct AgentComposerView: View, Equatable {
             if let newTabID {
                 loadDraftFromSession(for: newTabID)
             }
+            if lastActivationRoutedTabID != newTabID {
+                routeActivationFocus(tabID: newTabID, overridesLiveText: false)
+            }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .composerActivationRequested)) { notification in
+            // Delivered synchronously with the tab write, ahead of the tab-change handler above.
+            guard notification.userInfo?["windowID"] as? Int == windowID,
+                  let tabID = notification.userInfo?["tabID"] as? UUID else { return }
+            routeActivationFocus(tabID: tabID, overridesLiveText: true)
+        }
+        .onReceive(pendingInteractionSnapshots) { handlePendingInteractionChange($0) }
         .onChange(of: localInputText) { _, newValue in
             isInputEmpty = newValue.isEmpty
             guard let tabID = currentTabID, !isSyncingDraftFromSession else { return }
@@ -631,13 +740,13 @@ struct AgentComposerView: View, Equatable {
             // @Published delivers before the stored property changes; acknowledge the incoming revision.
             acknowledgedRepromptPublicationsByTab[update.tabID] = update.identity
         }
-        .task(id: repromptStore.autoSendRequest?.operationID) { @MainActor in
+        .task(id: repromptAutoSendReadyID) { @MainActor in
             // Submit after publication commits, never reentrantly inside @Published.willSet.
             // Automatic mode sends the operation-owned draft, not a possibly older native
             // streaming chunk. Native edits already revoke the operation before mutation.
             await Task.yield()
-            guard !Task.isCancelled, let request = repromptStore.autoSendRequest,
-                  request.tabID == currentTabID,
+            guard !Task.isCancelled, let tabID = currentTabID, let request = repromptStore.autoSendRequests[tabID],
+                  repromptAutoSendReadyID == request.operationID,
                   let viewModel = repromptViewModel,
                   viewModel.consumeRepromptAutoSend(
                       request, tabID: currentTabID, visibleDraft: localInputText,
@@ -819,6 +928,7 @@ struct AgentComposerView: View, Equatable {
                 onCommandReturn: repromptViewModel == nil ? nil : repromptAgain,
                 commandReturnMatcher: { LocalKeyboardShortcut.matches($0, .repromptDraft) },
                 focusRestoreRequest: composerFocusRestoreRequest,
+                focusActivationRequest: composerFocusActivationRequest,
                 nativeEditor: nativeComposerEditor,
                 nativeEditorIdentity: currentTabID.map { AnyHashable($0) },
                 onHeightChange: { newHeight in
@@ -1094,8 +1204,8 @@ struct AgentComposerView: View, Equatable {
 
     @ViewBuilder
     private var agentProviderModelPicker: some View {
-        let isLocked = props.isProviderPickerLockedForCurrentTab
-        let lockedMessage = props.lockedAgentSelectionMessage
+        let isLocked = false
+        let lockedMessage: String? = nil
         StableMenuButton(
             items: agentProviderModelMenuItems,
             triggerStyle: .plain,
@@ -1127,8 +1237,6 @@ struct AgentComposerView: View, Equatable {
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
         }
-        .disabled(modelControlsDisabled)
-        .opacity(modelControlsDisabled ? 0.55 : 1.0)
         .hoverTooltip(providerChipTooltip(isLocked: isLocked, lockedMessage: lockedMessage))
         .frame(maxWidth: providerChipMaxWidth, alignment: .leading)
         .fixedSize(horizontal: true, vertical: false)
@@ -1136,24 +1244,11 @@ struct AgentComposerView: View, Equatable {
 
     private func agentProviderModelMenuItems() -> [StableMenuItem] {
         var items: [StableMenuItem] = []
-        if let lockedMessage = props.lockedAgentSelectionMessage {
-            items.append(.message(lockedMessage))
-            items.append(.separator)
-        }
-
         items.append(.header("Model"))
         for agent in props.availableAgents {
             let canSelectAgent = actions.canSelectAgentInCurrentChat(agent)
-            if canSelectAgent {
-                let modelItems = inputBarModelMenuItems(for: agent)
-                items.append(.submenu(agent.displayName, items: modelItems))
-            } else {
-                items.append(.action(
-                    agent.displayName,
-                    isEnabled: false,
-                    imageSystemName: "lock.fill"
-                ) {})
-            }
+            let modelItems = inputBarModelMenuItems(for: agent)
+            items.append(.submenu(agent.displayName, imageSystemName: canSelectAgent ? nil : "arrow.left.arrow.right", items: modelItems))
         }
         AgentProviderSettingsMenuAction.appendStableMenuItem(
             to: &items,
@@ -1185,10 +1280,12 @@ struct AgentComposerView: View, Equatable {
                     )
                 },
                 onSelectModel: { model in
+                    if actions.reviewAgentModel(.cursor, model.rawValue, nil) { return }
                     guard !modelControlsDisabled, actions.canMutateCursorModel(props.currentTabID), actions.canSelectAgentInCurrentChat(.cursor) else { return }
                     actions.selectAgentModel(.cursor, model.rawValue)
                 },
                 onSelectParameter: { model, parameter in
+                    if actions.reviewAgentModel(.cursor, model.rawValue, .select(parameter)) { return }
                     guard !modelControlsDisabled, actions.canMutateCursorModel(props.currentTabID), actions.canSelectAgentInCurrentChat(.cursor) else { return }
                     if props.selectedAgent != .cursor || (try? CursorAIModelCatalog.ModelSpecifier(raw: props.selectedModelRaw).baseModelRaw) != model.rawValue {
                         actions.selectAgentModel(.cursor, model.rawValue)
@@ -1196,6 +1293,7 @@ struct AgentComposerView: View, Equatable {
                     actions.selectACPModelParameter(parameter, nil)
                 },
                 onClearParameter: { model, identity in
+                    if actions.reviewAgentModel(.cursor, model.rawValue, .clear(identity)) { return }
                     guard !modelControlsDisabled, actions.canMutateCursorModel(props.currentTabID), actions.canSelectAgentInCurrentChat(.cursor) else { return }
                     if props.selectedAgent != .cursor || (try? CursorAIModelCatalog.ModelSpecifier(raw: props.selectedModelRaw).baseModelRaw) != model.rawValue {
                         actions.selectAgentModel(.cursor, model.rawValue)
@@ -1252,10 +1350,6 @@ struct AgentComposerView: View, Equatable {
             imageSystemName: AgentModelSelectionWarningVisuals.stableMenuImageSystemName(agent: agent, rawModel: model.rawValue),
             style: AgentModelSelectionWarningVisuals.stableMenuStyle(agent: agent, rawModel: model.rawValue)
         ) {
-            AgentModelCatalog.updateLastUsedEffortIfEncoded(
-                agentKind: agent,
-                rawModel: model.rawValue
-            )
             actions.selectAgentModel(agent, model.rawValue)
         }
     }

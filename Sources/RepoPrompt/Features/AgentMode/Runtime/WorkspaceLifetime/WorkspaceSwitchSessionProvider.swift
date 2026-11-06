@@ -214,11 +214,12 @@ final class AgentModeWorkspaceSwitchCleanupProvider {
     /// Stops tracking background cleanup tasks without cancelling them.
     ///
     /// Cancellation was previously used here, but the cleanup body calls
-    /// `ProcessTermination.terminateAndReap` which uses `try? Task.sleep` in
-    /// its polling loop — cancelling the parent task makes those sleeps return
-    /// immediately, turning a bounded wait into a busy poll on the main actor.
-    /// Instead of cancelling, we simply stop tracking the tasks and let them
-    /// drain naturally. The tasks hold their own references to sessions and
+    /// `ProcessTermination.terminateAndReap`, whose polling loop used to sleep
+    /// with `try? Task.sleep` — cancelling the parent task made those sleeps
+    /// return immediately, turning a bounded wait into a busy poll on the main
+    /// actor (#481). The reaper now sleeps independently of task cancellation,
+    /// but this path still lets the tasks drain naturally rather than
+    /// cancelling them: they hold their own references to sessions and
     /// coordinators (captured before the initial yield), so process
     /// termination completes even if the provider is deallocated.
     func cancelAllBackgroundCleanup() {

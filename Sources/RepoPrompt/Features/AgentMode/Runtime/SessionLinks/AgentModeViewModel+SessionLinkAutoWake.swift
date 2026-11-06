@@ -632,6 +632,21 @@ extension AgentModeViewModel {
             }
             switch route {
             case .idleFollowUp:
+                let switchPreparation: ProviderSwitchSendPreparation?
+                switch await providerSwitchSendAdmission(
+                    session: session, input: "", skipsAugmentation: true,
+                    supplementalInput: reservedClaim.fragment, autoWakeID: wakeID,
+                    isCurrent: { self.agentSessionLinkAutoWakeSession(for: endpoint) === session
+                        && session.oversight.pendingAutoWake?.wakeID == wakeID
+                        && self.agentSessionLinkAutoWakeRoute(session) == .idleFollowUp
+                    }
+                ) {
+                case let .success(preparation): switchPreparation = preparation
+                case .failure:
+                    abandonAgentSessionLinkPromptClaim(reservedClaim)
+                    cancelAgentSessionLinkAutoWake(for: endpoint, reason: .requiredClaimUnavailable)
+                    return
+                }
                 #if DEBUG
                     if test_beforeRoutineIdleFollowUpStart?(session, wakeID) == false {
                         agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
@@ -642,7 +657,8 @@ extension AgentModeViewModel {
                 let startOutcome = await startAgentRun(
                     tabID: endpoint.tabID,
                     initialMessage: "",
-                    directStartOptions: startOptions
+                    directStartOptions: startOptions,
+                    providerSwitchPreparation: switchPreparation
                 )
                 if case .some(.queuedFallback) = startOutcome {
                     // Codex owns a durable queued submission. Keep the wake identity attached until
@@ -766,7 +782,7 @@ extension AgentModeViewModel {
     /// would otherwise take the ordinary-dispatch early return and turn a fenced lane update into an
     /// unfenced provider call with no claim, no provenance row, and no snooze/selection check.
     @discardableResult
-    func agentSessionLinkAcquirePhysicalDispatch(
+    func agentSessionLinkAcquireAutoWakePhysicalDispatch(
         for session: TabSession,
         dispatchID: AgentSessionLinkPromptDispatchID
     ) -> Bool {
@@ -1307,20 +1323,36 @@ extension AgentModeViewModel {
             return
         }
         let proof = await agentSessionLinkProveProviderInput(for: session, claim: claim)
-        if claim.localInput != nil {
-            guard agentSessionLinkAutoWakeSession(for: endpoint) === session,
-                  session.oversight.pendingAutoWake?.wakeID == wakeID,
-                  agentSessionLinkAutoWakeRoute(session) == .waitingContinuation else { return }
-            guard !Task.isCancelled else {
-                // Retire preparation through its existing owner. A bare return leaves the
-                // cancelled task waiting for a physical attempt that must never happen.
-                cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
-                return
-            }
-        }
-        guard agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: claim.dispatchID) else {
+        guard agentSessionLinkAutoWakeSession(for: endpoint) === session,
+              session.oversight.pendingAutoWake?.wakeID == wakeID,
+              agentSessionLinkAutoWakeRoute(session) == .waitingContinuation else { return }
+        guard !Task.isCancelled else {
+            // Retire preparation through its existing owner. A bare return leaves the
+            // cancelled task waiting for a physical attempt that must never happen.
+            cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
             return
         }
+        // A .sending marker already owned by this live run means the handover is in flight on the
+        // very turn this continuation resumes; refusing here would deadlock the wake's own turn.
+        let switchInFlightOnActiveRun = Self.providerSwitchIsInFlightOnActiveRun(session)
+        if !switchInFlightOnActiveRun, case .failure = await providerSwitchSendAdmission(
+            session: session, input: claim.fragment, skipsAugmentation: true,
+            inputAlreadyIncludesSupplement: true,
+            isCurrent: { self.agentSessionLinkAutoWakeSession(for: endpoint) === session
+                && session.oversight.pendingAutoWake?.wakeID == wakeID
+                && self.agentSessionLinkAutoWakeRoute(session) == .waitingContinuation
+            }
+        ) {
+            abandonAgentSessionLinkPromptClaim(claim)
+            cancelAgentSessionLinkAutoWake(for: endpoint, reason: .requiredClaimUnavailable)
+            return
+        }
+        // This continuation carries the wake, not the handover already owned by its active run.
+        // Preserve that bound handover proof while acquiring the wake through its own fence.
+        let acquired = switchInFlightOnActiveRun
+            ? agentSessionLinkAcquireAutoWakePhysicalDispatch(for: session, dispatchID: claim.dispatchID)
+            : agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: claim.dispatchID)
+        guard acquired else { return }
         // The continuation is also a physical acceptance boundary. Carry the note first, just as
         // native/ACP provider sends do; never consume either receipt before the resume succeeds.
         let carry = AgentSelfCompactParkedPrefix.prepare(claim.fragment, session: session) {}

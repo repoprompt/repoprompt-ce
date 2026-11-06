@@ -3,6 +3,84 @@ import Foundation
 import XCTest
 
 final class WorkspaceDiskWriterContractTests: XCTestCase {
+    // MARK: - Typed receipts (#335 follow-up)
+
+    func testQueuedBackendFailureReachesEveryCoalescedCaller() async throws {
+        let fixture = try NormalizationFixture()
+        defer { fixture.remove() }
+        let gate = ReceiptWriteGate()
+        let writer = WorkspaceDiskWriter(policy: BytePayloadPolicy(), backend: WorkspaceDiskWriteBackend(
+            queuedAtomicWrite: { _, _ in throw InjectedWriteFailure.refused },
+            normalizationAtomicWrite: { _, _ in }
+        ))
+        await writer.setAtomicWriteGateForTesting { await gate.wait() }
+
+        let first = Task { await writer.enqueueWorkspaceAwaitingReceipt(data: Data("A".utf8), url: fixture.url, metadata: nil) }
+        await gate.waitUntilEntered()
+        // B and C usually coalesce while A is in flight; coalesced or not, every caller must
+        // resolve with the outcome of the write that carries its content.
+        let second = Task { await writer.enqueueWorkspaceAwaitingReceipt(data: Data("B".utf8), url: fixture.url, metadata: nil) }
+        let third = Task { await writer.enqueueWorkspaceAwaitingReceipt(data: Data("C".utf8), url: fixture.url, metadata: nil) }
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+        await gate.open()
+
+        for receipt in await [first.value, second.value, third.value] {
+            guard case let .failed(failure) = receipt else { return XCTFail("Expected the backend refusal, got \(receipt)") }
+            XCTAssertEqual(failure.error as? InjectedWriteFailure, .refused)
+        }
+        XCTAssertEqual(try Data(contentsOf: fixture.url), fixture.original)
+    }
+
+    func testCoalescedCallerResolvesWithTheNewerDurableWrite() async throws {
+        let fixture = try NormalizationFixture()
+        defer { fixture.remove() }
+        let gate = ReceiptWriteGate()
+        let writer = WorkspaceDiskWriter(policy: BytePayloadPolicy())
+        await writer.setAtomicWriteGateForTesting { await gate.wait() }
+
+        let first = Task { await writer.enqueueWorkspaceAwaitingReceipt(data: Data("A".utf8), url: fixture.url, metadata: nil) }
+        await gate.waitUntilEntered()
+        let second = Task { await writer.enqueueWorkspaceAwaitingReceipt(data: Data("B".utf8), url: fixture.url, metadata: nil) }
+        let third = Task { await writer.enqueueWorkspaceAwaitingReceipt(data: Data("C".utf8), url: fixture.url, metadata: nil) }
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+        await gate.open()
+
+        for receipt in await [first.value, second.value, third.value] {
+            guard case .written = receipt else { return XCTFail("Expected a durable write, got \(receipt)") }
+        }
+        XCTAssertTrue(try [Data("B".utf8), Data("C".utf8)].contains(Data(contentsOf: fixture.url)))
+    }
+
+    func testNormalizationResultSeparatesSkipsFromBackendFailure() async throws {
+        let fixture = try NormalizationFixture()
+        defer { fixture.remove() }
+        let writer = WorkspaceDiskWriter(policy: BytePayloadPolicy(), backend: WorkspaceDiskWriteBackend(
+            queuedAtomicWrite: { _, _ in },
+            normalizationAtomicWrite: { _, _ in throw InjectedWriteFailure.refused }
+        ))
+
+        let changed = await writer.writeNormalizationIfUnchangedResult(
+            data: Data("normalized".utf8),
+            url: fixture.url,
+            expectedFileSize: fixture.fileSize + 1,
+            expectedModificationDate: fixture.modificationDate
+        )
+        guard case .skippedFileChanged = changed else { return XCTFail("Expected a skip, got \(changed)") }
+
+        let refused = await writer.writeNormalizationIfUnchangedResult(
+            data: Data("normalized".utf8),
+            url: fixture.url,
+            expectedFileSize: fixture.fileSize,
+            expectedModificationDate: fixture.modificationDate
+        )
+        guard case let .failed(failure) = refused else { return XCTFail("Expected the backend refusal, got \(refused)") }
+        XCTAssertEqual(failure.error as? InjectedWriteFailure, .refused)
+    }
+
     func testNormalizationDoesNotBypassInjectedBackendFailure() async throws {
         let fixture = try NormalizationFixture()
         defer { fixture.remove() }
@@ -187,8 +265,35 @@ private struct NormalizationFixture {
     }
 }
 
-private enum InjectedWriteFailure: Error {
+private enum InjectedWriteFailure: Error, Equatable {
     case refused
+}
+
+/// Holds queued writes until opened; reports when the first write reached the gate.
+private actor ReceiptWriteGate {
+    private var isOpen = false
+    private var entered = false
+    private var openWaiters: [CheckedContinuation<Void, Never>] = []
+    private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        entered = true
+        enteredWaiters.forEach { $0.resume() }
+        enteredWaiters.removeAll()
+        guard !isOpen else { return }
+        await withCheckedContinuation { openWaiters.append($0) }
+    }
+
+    func waitUntilEntered() async {
+        guard !entered else { return }
+        await withCheckedContinuation { enteredWaiters.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        openWaiters.forEach { $0.resume() }
+        openWaiters.removeAll()
+    }
 }
 
 private struct BytePayloadPolicy: WorkspaceDiskWritePolicy {

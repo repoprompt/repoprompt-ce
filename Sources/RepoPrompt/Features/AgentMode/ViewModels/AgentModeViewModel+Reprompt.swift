@@ -2,6 +2,17 @@ import Combine
 import Foundation
 import RepoPromptSettingsCore
 
+extension AgentRepromptHistory {
+    private static let maximumTitleBytes = 256
+
+    /// A real title gives the rewriter a topic; a placeholder ("New Chat", "T3") would only add noise.
+    static func sessionTitle(_ name: String?) -> String? {
+        guard let name = ChatSession.displayableName(name), name != "Agent Session",
+              name.range(of: "^[Tt][0-9]+$", options: .regularExpression) == nil else { return nil }
+        return trimmed(name, bytes: maximumTitleBytes)
+    }
+}
+
 extension AgentModeViewModel {
     static func automationJudgingText(original: String, reprompted: String?) -> String {
         guard let reprompted, reprompted.count <= 4000 else { return original }
@@ -32,7 +43,7 @@ extension AgentModeViewModel {
         _ request: AgentRepromptUIStore.AutoSendRequest, tabID: UUID?, visibleDraft: String, hasMarkedText: Bool
     ) -> Bool {
         guard repromptEnabled, currentTabID == tabID, request.tabID == tabID,
-              repromptUIStore.autoSendRequest == request, visibleDraft == request.text, !hasMarkedText,
+              repromptUIStore.autoSendRequests[request.tabID] == request, visibleDraft == request.text, !hasMarkedText,
               let operation = repromptOperation, operation.id == request.operationID else { return false }
         return operation.consumeAutoSend(request)
     }
@@ -43,7 +54,7 @@ extension AgentModeViewModel {
         guard let session = sessions[target.tabID], currentTabID == target.tabID,
               makeComposerSubmitTarget(tabID: target.tabID, session: session) == target,
               session.draftText == text else { return true }
-        if let operation = repromptOperation, operation.sourceTabID == target.tabID {
+        if let operation = repromptOperations[target.tabID] {
             operation.useCurrentDraft(text)
             return operation.isClosed || operation.phase != .completed
         }
@@ -61,7 +72,7 @@ extension AgentModeViewModel {
     func beginComposerReprompt(target: AgentComposerSubmitTarget, text: String, forceReview: Bool = false, reprepare: Bool = false) -> Bool {
         var original = text
         var source = text
-        if let operation = repromptOperation, operation.sourceTabID == target.tabID {
+        if let operation = repromptOperations[target.tabID] {
             guard operation.validate() else { return true }
             if !reprepare || (operation.phase != .completed && operation.phase != .failed) { return operation.phase != .completed }
             original = operation.rawDraft
@@ -93,7 +104,7 @@ extension AgentModeViewModel {
         // reports the failure. No other model is substituted, so a saved choice is never overridden.
         if !forceReview, resolvedRepromptModel(session: session) == nil { return false }
         repromptUIStore.clearCancelledDraft(tabID: target.tabID)
-        repromptOperation?.invalidate(reason: "Another composer began preparation.")
+        repromptOperations[target.tabID]?.invalidate(reason: "A newer preparation began.")
         // A new explicit preparation supersedes old decision/bypass authority, not its recoverable text.
         repromptUIStore.recoveries[target.tabID]?.requiresDecision = false
         repromptUIStore.recoveries[target.tabID]?.bypassesPreparation = false
@@ -105,23 +116,20 @@ extension AgentModeViewModel {
         let capturedPending = Self.pendingUserTurnState(from: session)
         let interactions = Self.repromptBlockingInteractions(session)
         let workflowGeneration = session.userWorkflowSelectionMutationGeneration
-        let roots = workspaceManager?.activeWorkspace?.repoPaths ?? []
-        let selected = workspaceID.flatMap { workspaceManager?.composeTab(for: .init(workspaceID: $0, tabID: target.tabID))?.selection }
-        let paths = (selected?.selectedPaths ?? []) + (selected?.manualCodemapPaths ?? []) + (selected.map { Array($0.slices.keys) } ?? [])
-        let relativePaths = paths.map { path in
-            guard let root = roots.first(where: { path.hasPrefix($0 + "/") }) else {
-                return path.hasPrefix("/") ? URL(fileURLWithPath: path).lastPathComponent : path
-            }
-            return URL(fileURLWithPath: root).lastPathComponent + "/" + path.dropFirst(root.count + 1)
-        }
         let history = repromptIncludesRecentChat ? AgentRepromptHistory.make(
             items: session.items, compactedAt: session.contextCompactedAt, hasActiveTurn: session.runState.isActive,
-            completedUserItemIDs: Set(session.transcript.turns.filter { $0.terminalState == .completed }.compactMap { $0.request?.id })
+            completedUserItemIDs: AgentRepromptHistory.closedRequestIDs(in: session.transcript)
         ) : []
+        let sessionTitle = repromptIncludesRecentChat ? AgentRepromptHistory.sessionTitle(
+            workspaceManager?.composeTabName(with: target.tabID)
+        ) : nil
+        // Attachment controls are locked during preparation, so this list stays true for the whole call.
         let request = AgentRepromptRequest(
             originalText: rewriteSource,
-            manifest: AgentRepromptModelPolicy.manifest(rootNames: roots.map { URL(fileURLWithPath: $0).lastPathComponent }, selectedPaths: relativePaths),
-            guidance: AgentRepromptGuidance.effectiveText(profile.agentRepromptGuidance), recentChat: history
+            guidance: AgentRepromptGuidance.effectiveText(profile.agentRepromptGuidance),
+            recentChat: history,
+            attachments: AgentRepromptAttachment.list(files: session.pendingFileAttachments, tagged: session.pendingTaggedFileAttachments),
+            sessionTitle: sessionTitle
         )
         // Preparation is the point of use: pin the automatic route before any backend call.
         let model = repromptModelResolution(session: session, pinningDefault: true).model
@@ -133,7 +141,7 @@ extension AgentModeViewModel {
             initialDraft: text, mode: forceReview ? .review : (profile.agentRepromptMode ?? .review),
             currentDraft: { [weak session] in session?.draftText ?? "" },
             applyDraft: { [weak self, weak session] value in
-                guard let self, let session, repromptOperation?.id == id,
+                guard let self, let session, repromptOperations[target.tabID]?.id == id,
                       sessions[target.tabID] === session else { return nil }
                 session.draftText = value
                 return session.draftMutationGeneration
@@ -141,11 +149,12 @@ extension AgentModeViewModel {
             chooseEffort: { [weak self] model in
                 await self?.chooseRepromptEffort(model: model, text: rewriteSource, requestID: id) ?? model
             },
+            // Which session is visible is deliberately not part of this: a rewrite outlives a switch.
             isCurrent: { [weak self, weak session] in
-                guard let self, let session, let operation = repromptOperation, operation.id == id else { return false }
+                guard let self, let session, let operation = repromptOperations[target.tabID], operation.id == id else { return false }
                 let live = modelRouterSettingsStore.effectiveAgentModelsProfile(workspaceID: workspaceID)
                 let liveMode = workspaceID.map { self.modelRouterSettingsStore.workspaceAgentModelsSettings(for: $0).inheritanceMode }
-                return sessions[target.tabID] === session && currentTabID == target.tabID
+                return sessions[target.tabID] === session
                     && workspaceManager?.activeWorkspaceID == workspaceID
                     && (operation.mode != .sendAutomatically || repromptEnabled)
                     && makeComposerSubmitTarget(tabID: target.tabID, session: session) == target
@@ -159,10 +168,9 @@ extension AgentModeViewModel {
                     && live.agentRepromptMode == profile.agentRepromptMode
                     && live.agentRepromptIncludesRecentChat == profile.agentRepromptIncludesRecentChat
                     && resolvedRepromptModel(session: session) == model
-                    && (workspaceManager?.activeWorkspace?.repoPaths ?? []) == roots
             }
         )
-        repromptOperation = operation
+        repromptOperations[target.tabID] = operation
         operation.onComplete = { [weak self, weak operation, weak session] brief in
             guard let self, let operation, let session else { return }
             startRepromptSpeculation(session: session, operationID: operation.id, text: brief, originalText: operation.rawDraft)
@@ -172,7 +180,9 @@ extension AgentModeViewModel {
         operation.onClose = { [weak self] in
             guard let self else { return }
             cancelRepromptSpeculation(claimID: id)
-            if repromptOperation?.id == id { repromptOperation = nil }
+            if repromptOperations[target.tabID]?.id == id {
+                repromptOperations[target.tabID] = nil
+            }
             syncStatusPillsUIState()
         }
         let check: () -> Void = { [weak operation] in operation?.scheduleValidation() }
@@ -190,7 +200,7 @@ extension AgentModeViewModel {
     /// Pending interactive reviews retain ownership of their existing keyboard shortcuts.
     @discardableResult
     func requestComposerRepromptAgain(target: AgentComposerSubmitTarget, text: String) -> Bool {
-        let eligibilityText: String = if let owned = repromptOperation, owned.sourceTabID == target.tabID,
+        let eligibilityText: String = if let owned = repromptOperations[target.tabID],
                                          owned.phase == .completed || owned.phase == .failed
         {
             owned.rawDraft // Generated/edited slash-like data is not a staged command.
@@ -200,7 +210,7 @@ extension AgentModeViewModel {
               !isMCPControlled(tabID: target.tabID),
               !Self.repromptBlockingInteractions(session).contains(true),
               Self.isRepromptEligible(text: eligibilityText, hasStagedCommand: stagedSlashCommandProps(tabID: target.tabID) != nil),
-              repromptOperation?.phase.isBusy != true else { return false }
+              repromptOperations[target.tabID]?.phase.isBusy != true else { return false }
         if repromptAvailability == nil, repromptPillProps().isAvailable, repromptPillProps().requiresDisclosure {
             repromptUIStore.oneShotDisclosureRequest = .init(target: target, text: text, generation: session.draftMutationGeneration)
             return true
@@ -220,13 +230,12 @@ extension AgentModeViewModel {
 
     /// Synchronous transfer at the real, local composer claim boundary, before token publication.
     func adoptRepromptPreparation(into claim: AgentComposerSubmitClaim) {
-        guard let operation = repromptOperation, operation.phase == .completed,
-              operation.sourceTabID == claim.attempt.sourceTabID,
+        guard let operation = repromptOperations[claim.attempt.sourceTabID], operation.phase == .completed,
               sessions[operation.sourceTabID] === claim.sourceSession,
               operation.expectedDraft.utf8.elementsEqual(claim.attempt.rawDraftSnapshot.utf8)
         else {
             let tabID = claim.attempt.sourceTabID
-            guard repromptOperation == nil, currentTabID == tabID, sessions[tabID] === claim.sourceSession,
+            guard repromptOperations[tabID] == nil, currentTabID == tabID, sessions[tabID] === claim.sourceSession,
                   let recovery = repromptUIStore.recoveries[tabID], recovery.bypassesPreparation, !recovery.requiresDecision,
                   recovery.draftAtInvalidation.utf8.elementsEqual(claim.attempt.rawDraftSnapshot.utf8),
                   stagedSlashCommandProps(tabID: tabID) == nil else { return }
@@ -246,11 +255,15 @@ extension AgentModeViewModel {
     }
 
     func invalidateRepromptIfNeeded() {
-        _ = repromptOperation?.validate()
+        for operation in Array(repromptOperations.values) {
+            _ = operation.validate()
+        }
     }
 
     func cancelReprompt() {
-        repromptOperation?.cancel()
+        for operation in Array(repromptOperations.values) {
+            operation.cancel()
+        }
     }
 
     func undoReprompt() {

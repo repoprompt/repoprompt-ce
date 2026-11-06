@@ -4693,7 +4693,7 @@ final class AgentSessionLinkRuntimeBridge {
         if chain.scheduledFrame == nil, facts == nil, lastPublishedSnapshotBySession[sessionID] == snapshot { return }
         // Deduplicate the pair. Private settlement advancement is not public activity/readiness.
         guard chain.scheduledFrame?.snapshot != snapshot || chain.scheduledFrame?.runFacts != facts else { return }
-        let publicChanged = lastPublishedSnapshotBySession[sessionID] != snapshot
+        let publicChanged = lastPublishedSnapshotBySession[sessionID]?.hasSamePublishedState(as: snapshot) != true
         lastPublishedSnapshotBySession[sessionID] = snapshot
         if publicChanged, snapshot.idleForSend {
             notePendingSendReadiness(forTargetSession: sessionID)
@@ -4724,7 +4724,7 @@ final class AgentSessionLinkRuntimeBridge {
                 break
             default: return
             }
-            // Only facts-only advancement lacks an authority event. Reuse the existing directional
+            // Private run facts and census availability lack an authority event. Reuse the existing directional
             // inbound query and coalescer. Its inherited O(links) scans are measured, not optimized.
             #if DEBUG
                 let fanoutStart = test_onFactsFanout.map { _ in ContinuousClock.now }
@@ -5208,7 +5208,8 @@ final class AgentSessionLinkRuntimeBridge {
                     idleSince: observation.idleSince,
                     waitingOn: observation.waitingOn,
                     latestVisibleAssistantPreview: observation.latestVisibleAssistantPreview,
-                    runFacts: envelope.runFacts
+                    runFacts: envelope.runFacts,
+                    managedMetadata: item.capabilities.contains(.manage) ? .init(observation) : nil
                 ))
             }
             outbound.append(AgentMonitorPillProps.Outbound(
@@ -6325,6 +6326,22 @@ final class AgentSessionLinkRuntimeBridge {
                 })
             }
         }
+    }
+
+    /// Use the same live consent/elevation owner as other managed handoffs.
+    func reconcileManagedMetadataAuthority() {
+        delegationScopes.reconcileGlobalAutoApprove()
+    }
+
+    func proveManagedMetadata(
+        observer: DomainAgentSessionLinkEndpointIdentity,
+        requirements: [DomainAgentSessionManagedObservationRequirement]
+    ) async -> [DomainAgentSessionLinkCommitAuthorization]? {
+        reconcileManagedMetadataAuthority()
+        guard !isFrozenForTermination, let host,
+              let candidate = host.agentSessionLinkCandidate(for: observer, includeLocation: false),
+              Self.passiveDeliveryIsPermitted(for: candidate) else { return nil }
+        return await authority.managedObservationAuthorizations(observer: observer, requirements: requirements)
     }
 
     func proveLocalInputRead(_ decoration: AgentSessionLinkLocalInputDecoration, observer: DomainAgentSessionLinkEndpointIdentity) async -> Bool {
@@ -8123,11 +8140,12 @@ final class AgentSessionLinkRuntimeBridge {
             clear(.delivered(receipt))
         case let .blocked(failure):
             switch failure {
-            case .targetNotIdle, .targetLoading:
+            case .targetNotIdle, .targetLoading, .providerSwitchUnconfirmed:
                 // The target became busy or is still hydrating. Nothing was mutated, so the entry
                 // waits for the next accepted readiness publication rather than retrying on a timer.
                 park(.targetReadiness, failure: failure)
-            case .persistenceFailed, .persistenceIndeterminate, .targetRestoreUnavailable, .targetCreationIncomplete:
+            case .persistenceFailed, .persistenceIndeterminate, .targetRestoreUnavailable, .targetCreationIncomplete,
+                 .providerHandoverDoesNotFit, .providerHandoverNeedsReview:
                 // Terminal for this entry. `persistence_failed` is retryable by the caller, but only
                 // by explicitly queuing again — never by a background loop over failing storage.
                 clear(.failed(failure))

@@ -25,6 +25,92 @@ extension DebugStateBootstrap.Builder {
         }
     }
 
+    /// Capture both stores through the existing snapshot verifier. Recovery is allowed
+    /// only on these disposable copies; no release-side lock or live-store mutation.
+    mutating func preserveDebugOracleState(workspaceIDs: Set<String>) throws -> [OracleDebugRetention.Omission] {
+        let retained = Set(workspaceIDs.compactMap(UUID.init(uuidString:)))
+        guard !retained.isEmpty else { return [] }
+        let fm = FileManager.default
+        let staging = fm.temporaryDirectory.appendingPathComponent("rpce-oracle-retention-" + UUID().uuidString)
+        try fm.createDirectory(at: staging, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        defer { try? fm.removeItem(at: staging) }
+        let releaseRelative = DomainPersistenceCoordinator.runtimeDirectoryName(profileIdentifier: source.profileIdentifier) + "/oracle"
+        let debugRelative = DomainPersistenceCoordinator.runtimeDirectoryName(profileIdentifier: locations.profileIdentifier) + "/oracle"
+        let releaseCopy = staging.appendingPathComponent("release")
+        let debugCopy = staging.appendingPathComponent("debug")
+        let merged = staging.appendingPathComponent("merged")
+        try captureOracleTree(source.applicationSupportRoot.appendingPathComponent(releaseRelative), to: releaseCopy)
+        try captureOracleTree(locations.applicationSupportRoot.appendingPathComponent(debugRelative), to: debugCopy)
+        try plan.verify()
+        let cancellation = plan.cancellation
+        let omissions: [OracleDebugRetention.Omission]
+        do {
+            omissions = try OracleDebugRetention.combine(releaseRoot: releaseCopy, debugRoot: debugCopy, destination: merged, isRetained: { owner in
+                let parts = owner.identifier.split(separator: ":", omittingEmptySubsequences: false)
+                guard owner.kind == "app-tab", parts.count == 4, parts[0] == "workspace", parts[2] == "tab",
+                      let workspace = UUID(uuidString: String(parts[1])), UUID(uuidString: String(parts[3])) != nil else { return false }
+                return retained.contains(workspace)
+            }) {
+                try cancellation?.check()
+            }
+        } catch let failure as DebugStateSnapshot.Failure {
+            throw failure
+        } catch {
+            throw DebugStateSnapshot.Failure.oracleRetention(error.localizedDescription)
+        }
+        plan.entries.removeAll { $0.relativePath.hasPrefix(debugRelative + "/") }
+        for key in Array(plan.generated.keys) where key.hasPrefix(debugRelative + "/") {
+            plan.generated.removeValue(forKey: key)
+        }
+        func collect(_ directory: URL, relative: String) throws -> [String: Data] {
+            var result: [String: Data] = [:]
+            for url in try fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isDirectoryKey]) {
+                try plan.cancellation?.check()
+                let path = relative + "/" + url.lastPathComponent
+                if try url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true {
+                    try result.merge(collect(url, relative: path)) { _, new in new }
+                } else {
+                    result[path] = try Data(contentsOf: url)
+                }
+            }
+            return result
+        }
+        let generated = try collect(merged, relative: debugRelative)
+        plan.generated.merge(generated) { _, new in new }
+        return omissions
+    }
+
+    private mutating func captureOracleTree(_ directory: URL, to destination: URL) throws {
+        let fm = FileManager.default
+        // Observe the nearest existing ancestor even when the optional store is absent.
+        // Appearance of a runtime/store directory must invalidate this capture.
+        if !fm.fileExists(atPath: directory.path) {
+            var missing = directory
+            while !fm.fileExists(atPath: missing.deletingLastPathComponent().path) {
+                missing.deleteLastPathComponent()
+            }
+            let parent = missing.deletingLastPathComponent()
+            let children = try plan.children(parent)
+            // The ancestor may have appeared between probing and recording membership.
+            // Never bless a listing that already contains the supposedly absent child.
+            guard !children.contains(where: { $0.lastPathComponent == missing.lastPathComponent }) else {
+                throw DebugStateSnapshot.Failure.sourceChanged
+            }
+            return
+        }
+        for url in try plan.children(directory, selection: .init(excluding: ["locks", "claims"])) {
+            let target = destination.appendingPathComponent(url.lastPathComponent)
+            switch try DebugStateSnapshot.kind(url) {
+            case .directory:
+                try captureOracleTree(url, to: target)
+            case .file:
+                let bytes = try plan.read(url)
+                try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try bytes.write(to: target)
+            }
+        }
+    }
+
     private mutating func preserveTree(_ directory: URL, relative: String) throws {
         guard FileManager.default.fileExists(atPath: directory.path) else { return }
         try locations.validateMetadataFile(directory)

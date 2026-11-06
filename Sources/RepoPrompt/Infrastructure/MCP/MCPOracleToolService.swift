@@ -610,7 +610,7 @@ struct MCPOracleToolService {
                     let availability = promptVM.mcpOracleIsProviderConfigured(for: model)
                         ? "available"
                         : "unavailable"
-                    lines.append("  - \(label): \(model.displayName) — \(availability)")
+                    lines.append("  - \(label): \(model.displayName) (\(rawModel)) — \(availability)")
                 } else {
                     lines.append("  - \(label): \(rawModel) — unknown model")
                 }

@@ -3,6 +3,10 @@ import RepoPromptFileSystem
 import RepoPromptInstrumentation
 import SwiftUI
 
+private extension EnvironmentValues {
+    @Entry var handoffOmittedImageCount: Binding<Int> = .constant(0)
+}
+
 /// Agent Mode view - a chat-style interface for long-running agent interactions
 /// with per-tab session management, markdown message rendering, and tool call display
 struct AgentModeView: View {
@@ -14,6 +18,7 @@ struct AgentModeView: View {
     @StateObject private var navigationController: AgentModeNavigationController
     @StateObject private var rootsSidebarStore: AgentWorkspaceRootsSidebarStore
     @ObservedObject private var fontScale = FontScaleManager.shared
+    @State private var omittedHandoffImageCount = 0
 
     private var currentTabID: UUID? {
         promptManager.activeComposeTabID
@@ -57,6 +62,19 @@ struct AgentModeView: View {
     }
 
     var body: some View {
+        content
+            .environment(\.handoffOmittedImageCount, $omittedHandoffImageCount)
+            .alert("Handoff completed", isPresented: Binding(
+                get: { omittedHandoffImageCount > 0 },
+                set: { if !$0 { omittedHandoffImageCount = 0 } }
+            )) {
+                Button("OK", role: .cancel) { omittedHandoffImageCount = 0 }
+            } message: {
+                Text("\(omittedHandoffImageCount) unavailable image(s) could not be copied. The new chat is ready; conversation history is unchanged.")
+            }
+    }
+
+    private var content: some View {
         GeometryReader { proxy in
             let fontPreset = fontScale.preset
             let sidebarMinWidth = AgentSidebarSizing.minWidth(for: fontPreset)
@@ -81,6 +99,9 @@ struct AgentModeView: View {
                             object: nil,
                             userInfo: ["windowID": windowState.windowID]
                         )
+                    },
+                    onNewSession: {
+                        navigationController.requestNewSession(agentModeVM: agentModeVM)
                     }
                 )
                 .navigationSplitViewColumnWidth(
@@ -136,6 +157,9 @@ struct AgentModeView: View {
         .onDisappear {
             navigationController.onDisappear(windowState: windowState, agentModeVM: agentModeVM)
         }
+        .onChange(of: navigationController.columnVisibility, initial: true) { _, visibility in
+            windowState.setAgentSidebarCollapsed(visibility == .detailOnly)
+        }
         .onChange(of: isSystemWorkspaceMode) { _, isSystem in
             navigationController.onWorkspaceModeChanged(
                 isSystem: isSystem,
@@ -183,6 +207,7 @@ struct AgentModeView: View {
 // Transcript scroll types extracted to Components/AgentTranscriptScrollTypes.swift
 
 struct AgentModeChatDetailView: View {
+    @Environment(\.handoffOmittedImageCount) private var omittedHandoffImageCount
     let agentModeVM: AgentModeViewModel
     @ObservedObject var transcriptUI: AgentTranscriptUIStore
     @ObservedObject var runInteractionUI: AgentRunInteractionUIStore
@@ -2469,6 +2494,8 @@ struct AgentModeChatDetailView: View {
             AgentRequestUserInputCard(
                 request: request,
                 allowsRememberedDecision: agentModeVM.codexRememberedApprovalAllowed(for: currentTabID),
+                pendingFocusStore: runInteractionUI,
+                pendingFocusTabID: currentTabID,
                 onSubmit: { response in
                     guard let tabID = currentTabID else { return }
                     agentModeVM.submitUserInputResponse(tabID: tabID, requestID: request.requestID, response: response)
@@ -2513,7 +2540,9 @@ struct AgentModeChatDetailView: View {
                 onUserActivity: {
                     guard let tabID = currentTabID else { return }
                     agentModeVM.noteAskUserCardActivity(tabID: tabID, interactionID: pendingAskUser.interaction.id)
-                }
+                },
+                pendingFocusStore: runInteractionUI,
+                pendingFocusTabID: currentTabID
             )
             .id("pendingAskUser")
             .transition(.opacity)
@@ -3277,7 +3306,9 @@ struct AgentModeChatDetailView: View {
                     upToItemID: itemID,
                     destinationAgent: selection.agent,
                     destinationModelRaw: selection.modelRaw,
-                    destinationReasoningEffortRaw: selection.reasoningEffortRaw
+                    destinationReasoningEffortRaw: selection.reasoningEffortRaw,
+                    missingImagePolicy: .omitMissingImagesForHumanHandoff,
+                    onImagesOmitted: { omittedHandoffImageCount.wrappedValue = $0 }
                 )
             }
         )

@@ -243,10 +243,18 @@ final class CodexProviderQuotaServiceTests: XCTestCase {
 
         await service.setEnabled(true)
         let stream = await service.subscribe()
-        _ = stream
-        // Let the priming read settle so the overlap under test is refresh-vs-refresh.
-        let loaded = await waitUntil { if case .loaded = await service.test_status() { true } else { false } }
-        XCTAssertTrue(loaded)
+        defer { withExtendedLifetime(stream) {} }
+        // Loaded is published before the priming read releases its single-flight registration.
+        let primingFinished = await waitUntil {
+            guard case .loaded = await service.test_status() else { return false }
+            let reading = await service.test_hasInFlightRead()
+            return !reading
+        }
+        guard primingFinished else {
+            XCTFail("expected the priming read to finish before testing concurrent refreshes")
+            await service.shutdown()
+            return
+        }
         let primingReads = await client.requestedMethods.count
 
         async let first: Void = service.refreshNow()
@@ -260,6 +268,7 @@ final class CodexProviderQuotaServiceTests: XCTestCase {
             1,
             "overlapping refreshes coalesce into one read"
         )
+        await service.shutdown()
     }
 
     func testEnablingWithoutAnObserverCreatesNoTransport() async {

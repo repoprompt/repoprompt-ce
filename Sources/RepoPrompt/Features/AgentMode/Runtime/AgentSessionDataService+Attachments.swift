@@ -62,7 +62,8 @@ extension AgentSessionDataService {
         sourceSessionID: UUID?,
         destinationSessionID: UUID,
         store: AgentSessionAttachmentStore,
-        temporaryRoot: URL?
+        temporaryRoot: URL?,
+        missingImagePolicy: AgentSessionAttachmentStore.HandoffMissingImagePolicy = .strict
     ) async throws -> [UUID: AgentFileAttachment] {
         let folder = store.rootURL.deletingLastPathComponent()
         let destinationURL = folder.appendingPathComponent(agentSessionFilename(for: destinationSessionID)).standardizedFileURL
@@ -95,7 +96,7 @@ extension AgentSessionDataService {
             #endif
             return try store.copyForHandoff(
                 attachments, sourceSessionID: sourceSessionID, destinationSessionID: destinationSessionID,
-                temporaryRoot: temporaryRoot
+                temporaryRoot: temporaryRoot, missingImagePolicy: missingImagePolicy
             )
         }
         let token = UUID()

@@ -4,17 +4,13 @@ import Foundation
 package enum AgentRepromptGuidance {
     package static let maximumUTF8Bytes = 16 * 1024
     package static let defaultText = """
-    Rewrite my message into a balanced task brief for an implementing agent. Preserve my intent, scope, important wording, named entities, uncertainty, and explicit constraints. Keep distinctive wording where it already communicates well; improve organization rather than replacing my voice unnecessarily.
+    Rewrite my message so it is clear and direct for an implementing agent. Keep my intent, scope, voice, named entities and explicit constraints. Keep my wording where it already communicates well; improve organization rather than replacing my voice.
 
-    Write natural Markdown. Use headings only when they improve readability; omit empty or unnecessary sections. Acceptance criteria must restate outcomes I requested, not introduce new obligations.
+    Write natural Markdown. Use headings only when a long, multi-part message needs them. Include acceptance criteria only when I stated the outcomes.
 
-    Never invent requirements, repository facts, APIs, files, deadlines, platform choices, or implementation decisions. Never prescribe implementation steps, architectures, testing requirements, migrations, or delegation unless I requested them. A clearer brief is not an implementation plan.
+    State what I said, plainly and with confidence. Do not guess at what I might mean, suggest files, or point out what I left unsaid.
 
-    Distinguish supplied facts from assumptions. Do not convert uncertainty into a requirement. Avoid assumptions where a question would materially change scope, safety, correctness, or the requested outcome.
-
-    Ask only load-bearing questions that cannot reasonably be left open. Prefer a useful brief with explicit open questions over a long interview. Do not ask about information already supplied, or ask me to choose incidental implementation details.
-
-    For a short, trivial or already-clear message, return it near-identically. Do not expand it into a formal task plan. Use supplied vocabulary without inventing repository facts.
+    For a short, trivial or already-clear message, return it near-identically. Do not expand it into a formal task plan.
     """
 
     package static func normalizedOverride(_ text: String?) -> String? {

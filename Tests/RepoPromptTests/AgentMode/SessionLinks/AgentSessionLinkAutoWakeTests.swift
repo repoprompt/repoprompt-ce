@@ -2448,6 +2448,72 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     /// Drives the real waiting-instruction continuation from suspension through lane acceptance.
     /// The returned origin, user-activity timestamp, and transcript authorship are the observable
     /// contract that distinguishes this from an ordinary user answer.
+    func testWaitingAutoWakeDuringCarryingSwitchKeepsDistinctDispatchOwners() async throws {
+        let fixture = try makeFixture()
+        let vm = fixture.viewModel
+        let session = fixture.session
+        try publishInventory(fixture, revision: 1)
+        let request = AgentChatItem.user("retained history", sequenceIndex: 0)
+        let turn = AgentTranscriptTurn(request: .init(from: request), responseSpans: [], conclusionActivityID: nil, terminalState: .completed, startedAt: request.timestamp, completedAt: request.timestamp)
+        let projection = try AgentProviderHandover.project(AgentTranscript(turns: [turn]))
+        let source = try AgentProviderHandover.Source(provider: "source", model: "source-model")
+        let payload = AgentProviderHandover.render(AgentProviderHandover.history(projection, source: source, historyReference: nil))
+        session.pendingHandoff = .init(payload: payload, createdAt: Date(), providerSwitchDelivery: .ready)
+        vm.test_setAgentSessionSaver { _, _, _ in FileManager.default.temporaryDirectory.appendingPathComponent("wake-switch-\(UUID()).json") }
+        guard case let .success(.some(preparation)) = await vm.providerSwitchSendAdmission(session: session, input: "new task") else {
+            return XCTFail("A fitting handover must admit before its carrying run")
+        }
+        let messages = await vm.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
+        XCTAssertNotNil(messages)
+        session.beginRunAttempt(source: "test.switch.waitingAutoWake")
+        let carryingID = AgentSessionLinkPromptDispatchID.acpPromptTurn(runAttemptID: UUID())
+        XCTAssertTrue(vm.agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: carryingID))
+        let carryingProof = try XCTUnwrap(session.pendingHandoff.providerSwitchDispatch)
+        XCTAssertEqual(carryingProof.dispatchID, carryingID)
+        session.runState = .running
+        session.oversight.autoWakeOnUpdates = true
+        let userRowsBefore = session.items.count(where: { $0.kind == .user })
+        let waiting = Task { @MainActor in
+            try await vm.waitForNextUserInstruction(tabID: fixture.tabID, prompt: "What next?", timeoutSeconds: 30)
+        }
+        try await AsyncTestWait.waitUntil("the carrying run's instruction continuation") {
+            await MainActor.run { session.instructionContinuation != nil }
+        }
+        defer {
+            session.instructionTimeoutTask?.cancel()
+            session.instructionContinuation?.resume(throwing: CancellationError())
+            session.instructionContinuation = nil
+            waiting.cancel()
+        }
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        let wake = try XCTUnwrap(session.oversight.pendingAutoWake)
+        XCTAssertNotEqual(AgentSessionLinkPromptDispatchID.autoWake(wakeID: wake.wakeID), carryingID)
+        do {
+            try await AsyncTestWait.waitUntil("the lane update to resume the carrying run") {
+                await MainActor.run { session.instructionContinuation == nil }
+            }
+        } catch {
+            XCTAssertEqual(session.pendingHandoff.providerSwitchDispatch, carryingProof)
+            XCTAssertEqual(session.oversight.pendingAutoWake?.wakeID, wake.wakeID)
+            XCTAssertNotNil(vm.agentSessionLinkPromptClaimStore.pendingClaim(dispatchID: .autoWake(wakeID: wake.wakeID), observerSessionID: fixture.sessionID))
+            return XCTFail("A distinct wake remains claimed without resuming the carrying run")
+        }
+        await wake.task?.value
+        XCTAssertNil(session.oversight.pendingAutoWake, "The continuation's own wake must settle")
+        XCTAssertNil(vm.agentSessionLinkPromptClaimStore.pendingClaim(dispatchID: .autoWake(wakeID: wake.wakeID), observerSessionID: fixture.sessionID), "The accepted continuation must release its own prompt claim")
+        XCTAssertEqual(session.pendingHandoff.providerSwitchDispatch, carryingProof, "A lane continuation must neither rebind nor accept the carrying handover")
+        XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
+        XCTAssertEqual(session.pendingHandoff.payload, payload)
+        guard session.instructionContinuation == nil else {
+            return XCTFail("The lane update must resume the existing continuation, not strand an owed wake")
+        }
+        let response = try await waiting.value
+        XCTAssertEqual(response.origin, .laneUpdateAutoWake(wakeID: wake.wakeID))
+        XCTAssertEqual(session.items.count(where: { $0.id == wake.wakeID && $0.kind == .system }), 1)
+        XCTAssertEqual(session.items.count(where: { $0.kind == .user }), userRowsBefore)
+        XCTAssertFalse(session.items.contains { $0.recoveryDiagnostic?.reason == "providerSwitch" && $0.recoveryDiagnostic?.outcome == "sent" })
+    }
+
     func testWaitingContinuationPreservesSystemOriginWithoutUserAttribution() async throws {
         let fixture = try makeFixture()
         // This assertion also covers Claude's non-Codex token accounting; the generic fixture uses
@@ -6185,6 +6251,15 @@ extension AgentSessionLinkAutoWakeTests {
             runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date(timeIntervalSince1970: 0)
         ))
         let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { _ in })
+        var managedProofCalls = 0
+        observer.viewModel.test_agentSessionLinkManagedMetadataProof = { endpoint, requirements in
+            managedProofCalls += 1
+            XCTAssertFalse(requirements.isEmpty)
+            let proof = await bridge.proveManagedMetadata(observer: endpoint, requirements: requirements)
+            XCTAssertNotNil(proof, "the isolated bridge owns the exact live grant")
+            return proof
+        }
+        defer { observer.viewModel.test_agentSessionLinkManagedMetadataProof = nil }
         guard case .added = await bridge.addMonitorLink(observerSessionID: observer.sessionID, rawTargetSessionID: target.sessionID.uuidString) else {
             return XCTFail("grant failed")
         }
@@ -6277,6 +6352,8 @@ extension AgentSessionLinkAutoWakeTests {
         let physical = await observer.nativeController.sentMessages
         XCTAssertEqual(physical.count, 1)
         XCTAssertTrue(try XCTUnwrap(physical.first).contains("ordinary successor finished"))
+        XCTAssertTrue(try XCTUnwrap(physical.first).contains("run_outcome=\"completed\""))
+        XCTAssertEqual(managedProofCalls, 1, "physical delivery uses the isolated authority, not an approval bypass")
         XCTAssertEqual(claim.passive?.receipt.deliveredStatuses.first?.settledThrough, 2)
         try bridge.applyPassiveMonitorNoticeReceipt(XCTUnwrap(claim.passive?.receipt), observerEndpoint: observerEndpoint)
         XCTAssertTrue(try XCTUnwrap(observer.viewModel.agentSessionLinkPassiveNoticesBySessionID[observer.sessionID]).entries.isEmpty)
@@ -6582,7 +6659,16 @@ extension AgentSessionLinkAutoWakeTests {
         let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: .distantPast))
         let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { _ in })
         let terminal = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, replayTranscript: true)
+        defer {
+            a.viewModel.test_agentSessionLinkManagedMetadataProof = nil
+            b.viewModel.test_agentSessionLinkManagedMetadataProof = nil
+        }
         for (observer, target) in [(a, b), (b, a)] {
+            observer.viewModel.test_agentSessionLinkManagedMetadataProof = { endpoint, requirements in
+                let proof = await bridge.proveManagedMetadata(observer: endpoint, requirements: requirements)
+                XCTAssertNotNil(proof, "the ring's isolated authority must authorize its physical handoff")
+                return proof
+            }
             guard case .added = await bridge.addMonitorLink(observerSessionID: observer.sessionID, rawTargetSessionID: target.sessionID.uuidString) else { return XCTFail("ring grant failed") }
             observer.session.isPreparingInitialWorktree = true
             observer.session.oversight.autoWakeOnUpdates = false

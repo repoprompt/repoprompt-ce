@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reject wrong integration trees and mixed attempts before hosted evidence is consumed."""
+"""Reruns reuse only successful, exact producer evidence; never an unrelated build."""
 import copy
 import json
 from pathlib import Path
@@ -12,8 +12,55 @@ import io
 import contextlib
 
 import ci_admission as admission
+import ci_job_diagnostics as diagnostics
 import modularization_ci_build as ci_build
 import modularization_ci_artifact as artifact
+
+
+class WorkerSchedulingTests(unittest.TestCase):
+    def test_four_workers_retain_independent_scheduling_outputs_and_exact_coverage(self):
+        workflow = (Path(__file__).resolve().parent.parent / '.github/workflows/ci.yml').read_text()
+        worker = workflow.split('\n  build-and-test:\n', 1)[1].split('\n  style:\n', 1)[0]
+        self.assertIn('shard: [1, 2, 3, 4]', worker)
+        self.assertIn('fail-fast: false', worker)
+        self.assertNotIn('max-parallel:', worker)
+        self.assertNotIn('continue-on-error:', worker)
+        group = next(line for line in worker.splitlines() if 'group: ci-tests-' in line)
+        self.assertTrue(group.endswith('-${{ matrix.shard }}'))
+        self.assertIn('timeout-minutes: 40', worker)
+        self.assertIn('timeout-minutes: 32', worker)
+        self.assertEqual(worker.count('./conductor ci-shard'), 1)
+        self.assertIn('--shard-count 4 --shard-index ${{ matrix.shard }} --timeout 1800', worker)
+        self.assertIn('artifact_$SHARD_INDEX=shard-execution-$SHARD_INDEX-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT', worker)
+        self.assertIn('path: .build/ci-test-results/shard-${{ matrix.shard }}*', worker)
+        self.assertIn("if: ${{ always() && steps.execution.outcome == 'success' }}", worker)
+        aggregate = workflow.split('\n  style:\n', 1)[1].split('\n  secret-scan:\n', 1)[0]
+        self.assertIn('toJSON(needs)', aggregate)
+        self.assertIn('SHARD_OUTPUTS: ${{ toJSON(needs.build-and-test.outputs) }}', aggregate)
+        self.assertIn('--shard-outputs "$SHARD_OUTPUTS"', aggregate)
+        self.assertNotIn('pattern:', aggregate)
+        for shard in range(1, 5):
+            self.assertIn(f'receipt_artifact_{shard}: ${{{{ steps.execution.outputs.artifact_{shard} }}}}', worker)
+            self.assertIn(f'failure_{shard}: ${{{{ steps.diagnostics.outputs.failure_{shard} }}}}', worker)
+            self.assertIn(f'name: ${{{{ steps.selected.outputs.receipt_artifact_{shard} }}}}', aggregate)
+        self.assertIn('--shard-count 4 --admission-context', aggregate)
+
+    def test_all_integration_producers_and_consumers_retain_native_arm_validation(self):
+        root = Path(__file__).resolve().parent.parent
+        for name, count in [('ci.yml', 2), ('ci-integration-products.yml', 1), ('xcode-workspace.yml', 1)]:
+            text = (root / '.github/workflows' / name).read_text()
+            mac_labels = [line.strip().split(': ', 1)[1] for line in text.splitlines()
+                          if line.strip().startswith('runs-on: macos')]
+            self.assertEqual(mac_labels, ['macos-26'] * count, name)
+            self.assertEqual(text.count('DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer'), count, name)
+        producer = (root / '.github/workflows/ci.yml').read_text().split('\n  build-test-bundles:\n', 1)[1].split('\n  build-and-test:\n', 1)[0]
+        self.assertLess(producer.index('ci_admission.py produce'), producer.index('Run compiler-dependent repository guardrails'))
+        self.assertLess(producer.index('ci_admission.py produce'), producer.index('Resolve dependency downloads'))
+        # Publication retains native ARM builds and both oldest-runtime architectures.
+        compatibility = (root / '.github/workflows/macos-compatibility.yml').read_text()
+        self.assertIn('runner: macos-15\n', compatibility)
+        self.assertIn('runner: macos-15-intel\n', compatibility)
+        self.assertIn('runs-on: macos-26\n', (root / '.github/workflows/main-tip.yml').read_text())
 
 
 class CandidateTests(unittest.TestCase):
@@ -92,16 +139,183 @@ class CheckoutTests(unittest.TestCase):
         self.assertEqual(lines['range'], f'{self.base}..{self.head}')
         return json.loads(lines['context'])
 
-    def test_full_profile_rerun_passes_but_failed_jobs_only_cannot_reuse_context(self):
+    def producer(self, context, attempt='1'):
+        return admission.producer_context(context, attempt, {'swift': 'Swift fixture', 'xcode': 'Xcode fixture', 'architecture': 'arm64'})
+
+    def test_root_producer_rejects_uncalibrated_architecture_before_emitting_evidence(self):
+        context = self.context()
+        self.assertEqual(context['root_architecture'], 'arm64')
+        output = self.root / 'producer-output'
+        argv = ['admission', 'produce', '--root', str(self.root), '--run-id', '42', '--attempt', '1',
+                '--context', json.dumps(context), '--output', str(output)]
+        for architecture in ('x86_64', 'arm64'):
+            output.unlink(missing_ok=True)
+            versions = {'swift': 'Swift fixture', 'xcode': 'Xcode fixture', 'architecture': architecture}
+            with self.subTest(architecture=architecture), mock.patch('sys.argv', argv), \
+                    mock.patch.object(admission, 'toolchain', return_value=versions), \
+                    mock.patch('sys.stderr', new_callable=io.StringIO) as errors, \
+                    mock.patch('sys.stdout', new_callable=io.StringIO) as logs:
+                if architecture != 'arm64':
+                    with self.assertRaises(SystemExit) as failed:
+                        admission.main()
+                    self.assertEqual(failed.exception.code, 1)
+                    self.assertIn('Restore the intended runner; do not raise timing budgets', errors.getvalue())
+                    self.assertNotIn('Re-run all jobs', errors.getvalue())
+                    self.assertFalse(output.exists())
+                    self.assertIn('root_measurement_toolchain', logs.getvalue())
+                    self.assertIn('Swift fixture', logs.getvalue())
+                else:
+                    self.assertEqual(admission.main(), 0)
+                    self.assertIn('root_measurement_toolchain', logs.getvalue())
+                    self.assertIn('root-build-42-1', output.read_text())
+        wrong = {**self.producer(context), 'toolchain': {**versions, 'architecture': 'x86_64'}}
+        with self.assertRaises(admission.CandidateMismatch):
+            admission.verify_producer(wrong, context, '2')
+
+    def test_unavailable_pinned_toolchain_is_a_configuration_failure_not_a_rebuild_hint(self):
+        context = self.context()
+        output = self.root / 'producer-output'
+        argv = ['admission', 'produce', '--root', str(self.root), '--run-id', '42', '--attempt', '1',
+                '--context', json.dumps(context), '--output', str(output)]
+        for error in (FileNotFoundError('xcodebuild'), subprocess.CalledProcessError(1, ['xcodebuild', '-version'])):
+            with self.subTest(error=type(error).__name__), mock.patch('sys.argv', argv), \
+                    mock.patch.dict('os.environ', {'DEVELOPER_DIR': '/Applications/MissingXcode.app/Contents/Developer'}), \
+                    mock.patch('sys.stderr', new_callable=io.StringIO) as errors:
+                # Isolate toolchain discovery; checkout validation has separate executable tests.
+                with mock.patch.object(admission, 'verify'), \
+                        mock.patch.object(admission.subprocess, 'check_output', side_effect=error), \
+                        self.assertRaises(SystemExit) as failed:
+                    admission.main()
+                self.assertEqual(failed.exception.code, 1)
+                self.assertIn('MissingXcode.app', errors.getvalue())
+                self.assertIn('do not rerun unchanged configuration', errors.getvalue())
+                self.assertNotIn('Re-run Build and Static Gates', errors.getvalue())
+                self.assertFalse(output.exists())
+
+    def test_native_partial_rerun_keeps_candidate_but_selects_actual_producer_attempt(self):
         first = self.context()
-        self.assertEqual(self.command('verify', context=json.dumps(first)).returncode, 0)
-        partial = self.command('verify', '2', context=json.dumps(first))
-        self.assertNotEqual(partial.returncode, 0)
-        self.assertIn('Re-run all jobs', partial.stderr)
-        second = self.context('2')
-        self.assertEqual(self.command('verify', '2', context=json.dumps(second)).returncode, 0)
+        self.assertNotIn('attempt', first)
+        self.assertEqual(self.context('2'), first)
+        self.assertEqual(self.command('verify', '2', context=json.dumps(first)).returncode, 0)
+        producer = self.producer(first)
+        output = self.root / 'selection'
+        receipts = {f'receipt_artifact_{i}': f'shard-execution-{i}-42-{2 if i == 2 else 1}' for i in range(1, 5)}
+        for attempt in ('2', '10'):
+            result = self.command('select', attempt, context=json.dumps(first), producer_context=json.dumps(producer),
+                                  shard_outputs=json.dumps({**receipts, 'failure_2': ''}), output=output)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            outputs = dict(line.split('=', 1) for line in output.read_text().splitlines())
+            self.assertEqual(outputs, {'build_artifact': 'root-build-42-1',
+                                       'coverage_artifact': 'expected-coverage-42-1', **receipts})
+        # A new producer is distinct even on the same candidate. Old receipts
+        # cannot be relabelled as evidence for a rebuild.
+        second = self.producer(first, '2')
         with self.assertRaisesRegex(ValueError, 'identity mismatch'):
-            admission.verify_build_identity({'producer': 'build-test-bundles', 'context': first}, second)
+            admission.verify_build_identity({'producer': 'build-test-bundles', 'context': producer}, second)
+        self.assertNotEqual(self.command('bind', '2', context=json.dumps(first), producer_context=json.dumps(producer)).returncode, 0)
+
+    def test_real_coverage_cli_accepts_retried_worker_but_rejects_receipts_after_rebuild(self):
+        import ci_test_coverage as coverage
+        from ci_app_test_runner import assign_suites_to_shards, parse_suite_methods
+        context = self.context()
+        producer = self.producer(context)
+        bound = self.command('bind', context=json.dumps(context), producer_context=json.dumps(producer))
+        self.assertEqual(bound.returncode, 0, bound.stderr)
+        metadata = self.root / admission.METADATA.parent
+        tests = [f'CoreTests.Suite{index}/testOne' for index in range(4)]
+        (metadata / 'ci-test-list.txt').write_text('\n'.join(tests) + '\n')
+        (metadata / 'test-targets.json').write_text(json.dumps({'targets': ['CoreTests']}))
+        # Retried workers and successful ancestors consume the same attempt-1
+        # build. Style accepts the combined exact receipts, not a consumer attempt.
+        receipts = self.root / 'shard-execution'
+        receipts.mkdir()
+        suites = parse_suite_methods('\n'.join(tests))
+        shards, _ = assign_suites_to_shards({suite: len(methods) for suite, methods in suites.items()}, 4)
+        for index, shard in enumerate(shards, 1):
+            assigned = sorted(test for suite in shard for test in suites[suite])
+            (receipts / f'shard-{index}.json').write_text(json.dumps({
+                'schema': 1, 'shard_count': 4, 'shard_index': index,
+                'listing_sha256': coverage.listing_digest(tests), 'assigned': assigned,
+                'executed': assigned, 'skipped': [], 'admission': producer, 'producer': f'build-and-test-{index}'}))
+        args = [sys.executable, str(Path(coverage.__file__).resolve()), '--metadata', str(metadata),
+                '--receipts', str(receipts), '--shard-count', '4', '--admission-context']
+        self.assertEqual(subprocess.run([*args, json.dumps(producer)], capture_output=True).returncode, 0)
+        rebuilt = self.producer(context, '3')
+        rebound = self.command('bind', '3', context=json.dumps(context), producer_context=json.dumps(rebuilt))
+        self.assertEqual(rebound.returncode, 0, rebound.stderr)
+        rejected = subprocess.run([*args, json.dumps(rebuilt)], capture_output=True, text=True)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn('identity mismatch', rejected.stderr)
+        (receipts / 'shard-4.json').unlink()
+        self.assertNotEqual(subprocess.run([*args, json.dumps(rebuilt)], capture_output=True).returncode, 0)
+
+    def test_selection_rejects_missing_wrong_run_candidate_future_or_malformed_producer(self):
+        context = self.context()
+        producer = self.producer(context)
+        cases = [None, {}, {**producer, 'attempt': '3'}, {**producer, 'attempt': '0'},
+                 {**producer, 'attempt': '١'}, {**producer, 'attempt': '1\n'}, {**producer, 'toolchain': {}},
+                 {**producer, 'candidate': {**context, 'run_id': '43'}},
+                 {**producer, 'candidate': {**context, 'base': 'a' * 40}}]
+        for bad in cases:
+            with self.subTest(producer=bad):
+                output = self.root / 'selection'
+                result = self.command('select', '2', context=json.dumps(context), producer_context=json.dumps(bad), output=output)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('Re-run all jobs', result.stderr)
+                self.assertFalse(output.exists())
+        receipts = {f'receipt_artifact_{i}': f'shard-execution-{i}-42-1' for i in range(1, 5)}
+        for bad in ('', 'shard-execution-1-43-1', 'shard-execution-1-42-3', 'shard-execution-2-42-1',
+                    'shard-execution-all-42-1', 'latest', '../root-build-42-1', None):
+            with self.subTest(artifact=bad):
+                output = self.root / 'selection'
+                result = self.command('select', '2', context=json.dumps(context), producer_context=json.dumps(producer),
+                                      shard_outputs=json.dumps({**receipts, 'receipt_artifact_1': bad}), output=output)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(output.exists())
+        for shard in range(1, 5):
+            missing = {key: value for key, value in receipts.items() if key != f'receipt_artifact_{shard}'}
+            with self.subTest(missing=shard), self.assertRaises(ValueError):
+                admission.select_receipt_artifacts(missing, '42', '2', '1')
+        with self.assertRaises(ValueError):
+            admission.select_receipt_artifacts(receipts, '42', '3', '2')
+
+    def test_toolchain_drift_blocks_reuse_with_rebuild_instructions(self):
+        context = self.context()
+        producer = self.producer(context)
+        argv = ['admission', 'select', '--root', str(self.root), '--run-id', '42', '--attempt', '2',
+                '--context', json.dumps(context), '--producer-context', json.dumps(producer),
+                '--check-toolchain', '--output', str(self.root / 'selection')]
+        with mock.patch('sys.argv', argv), mock.patch.object(admission, 'toolchain', return_value={'swift': 'new', 'xcode': 'new', 'architecture': 'arm64'}), \
+                mock.patch('sys.stderr', new_callable=io.StringIO) as errors, self.assertRaises(SystemExit):
+            admission.main()
+        self.assertIn('toolchain-drift', errors.getvalue())
+        self.assertIn('Re-run Build and Static Gates', errors.getvalue())
+        self.assertFalse((self.root / 'selection').exists())
+
+    def test_worker_rejects_other_architecture_even_with_identical_swift_and_xcode(self):
+        context = self.context()
+        producer = self.producer(context)
+        output = self.root / 'selected'
+        argv = ['admission', 'select', '--root', str(self.root), '--run-id', '42', '--attempt', '2',
+                '--context', json.dumps(context), '--producer-context', json.dumps(producer),
+                '--check-toolchain', '--output', str(output)]
+        for architecture, expected in [('arm64', 0), ('x86_64', 1)]:
+            output.unlink(missing_ok=True)
+            installed = {**producer['toolchain'], 'architecture': architecture}
+            with self.subTest(architecture=architecture), mock.patch('sys.argv', argv), \
+                    mock.patch.object(admission, 'toolchain', return_value=installed), \
+                    mock.patch('sys.stderr', new_callable=io.StringIO) as errors:
+                if expected:
+                    with self.assertRaises(SystemExit) as failure:
+                        admission.main()
+                    self.assertEqual(failure.exception.code, expected)
+                    self.assertIn('violates the declared arm64 platform', errors.getvalue())
+                    self.assertNotIn('toolchain-drift', errors.getvalue())
+                    self.assertNotIn('Re-run Build and Static Gates', errors.getvalue())
+                    self.assertFalse(output.exists())
+                else:
+                    self.assertEqual(admission.main(), 0)
+                    self.assertIn('root-build-42-1', output.read_text())
 
     def test_legacy_release_profile_cannot_be_relabelled_as_current_integration(self):
         context = self.context()
@@ -110,8 +324,11 @@ class CheckoutTests(unittest.TestCase):
         for fields in (
             {'profile': 'integration-v1', 'products': 'sentry-privacy-and-release-smoke'},
             {'profile': 'integration-v1'},
+            {'profile': 'integration-v2', 'schema': 1},
             {'products': 'sentry-privacy-and-release-smoke'},
             {'products': ''},
+            {'root_architecture': None},
+            {'root_architecture': 'x86_64'},
         ):
             with self.subTest(fields=fields):
                 result = self.command('verify', context=json.dumps({**context, **fields}))
@@ -121,10 +338,11 @@ class CheckoutTests(unittest.TestCase):
 
     def test_binding_rejects_other_tree_commit_run_profile_and_producer(self):
         context = self.context()
-        bound = self.command('bind', context=json.dumps(context))
+        producer = self.producer(context)
+        bound = self.command('bind', context=json.dumps(context), producer_context=json.dumps(producer))
         self.assertEqual(bound.returncode, 0, bound.stderr)
         identity = admission.build_identity(self.root)
-        admission.verify_build_identity(identity, context)
+        admission.verify_build_identity(identity, producer)
         for field, value in [('tree', self.base), ('head', self.base), ('run_id', '41'),
                              ('profile', 'unknown'), ('timing_policy', 'report-only')]:
             changed = {**context, field: value}
@@ -136,7 +354,7 @@ class CheckoutTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'producer'):
             admission.build_identity(self.root)
         with self.assertRaisesRegex(ValueError, 'identity mismatch'):
-            admission.verify_build_identity(None, context)
+            admission.verify_build_identity(None, producer)
 
     def test_stale_cache_is_invalidated_but_hosted_boundary_requires_fresh_binding(self):
         context = self.context()
@@ -220,9 +438,92 @@ class TimingProtocolTests(unittest.TestCase):
                 self.assertEqual(report['build_exit_code'], build_status)
                 self.assertEqual(report['budget']['expressions_500ms'], budget)
                 self.assertEqual(report['counts'], {'expression': 1, 'function_body': 0})
+                # Exercise the reporter against the real producer's schema, not only hand-written JSON.
+                summary = diagnostics.build_report(report)
+                self.assertIn(f'| Expressions >=500ms | 1 | {budget} |', summary)
+                if build_status:
+                    self.assertIn('Compiler/build process failed', summary)
+                    self.assertNotIn('Type-check ratchet exceeded', summary)
+                elif budget == 0:
+                    self.assertIn('Type-check ratchet exceeded', summary)
+                else:
+                    self.assertIn('Recorded measurements do not explain this failure', summary)
                 self.assertEqual(report['locations'], [{
                     'path': 'Sources/RepoPrompt/App/X.swift', 'line': 3, 'column': 4,
                     'kind': 'expression', 'duration_ms': 502}])
+
+
+class StatusReportTests(unittest.TestCase):
+    def test_queue_and_execution_require_actual_runner_assignment(self):
+        from ci_status_report import job_timing
+        job = {'id': 1, 'name': 'test', 'status': 'in_progress', 'runner_id': 0,
+               'created_at': '2026-11-04T10:00:00Z', 'started_at': '2026-11-04T10:00:01Z'}
+        now = '2026-11-04T10:10:00Z'
+        pending = job_timing(job, now)
+        self.assertEqual(pending['queue_seconds'], 600)
+        self.assertIsNone(pending['execution_seconds'])
+        running = job_timing({**job, 'runner_id': 5, 'started_at': '2026-11-04T10:04:00Z'}, now)
+        self.assertEqual((running['queue_seconds'], running['execution_seconds']), (240, 360))
+        done = job_timing({**job, 'runner_id': 5, 'status': 'completed',
+                           'completed_at': '2026-11-04T10:06:00Z'}, now)
+        self.assertEqual(done['execution_seconds'], 359)
+        self.assertFalse(done['timing_censored'])
+        for conclusion in ('cancelled', 'skipped', 'failure'):
+            terminal = job_timing({**job, 'status': 'completed', 'conclusion': conclusion}, now)
+            self.assertIsNone(terminal['queue_seconds'])
+            self.assertIsNone(terminal['execution_seconds'])
+
+    def test_report_rejects_mixed_attempts_and_duplicate_pages(self):
+        from ci_status_report import report, seconds
+        run = {'id': 42, 'run_attempt': 2}
+        with self.assertRaisesRegex(ValueError, 'attempt'):
+            report(run, [{'id': 1, 'run_id': 42, 'run_attempt': 1}], '2026-11-04T10:00:00Z')
+        with self.assertRaisesRegex(ValueError, 'duplicate'):
+            report(run, [{'id': 1}, {'id': 1}], '2026-11-04T10:00:00Z')
+        self.assertIsNone(seconds('2026-11-04T10:01:00Z', '2026-11-04T10:00:00Z'))
+
+    def test_collection_pins_attempt_paginates_and_detects_rerun(self):
+        import ci_status_report as status
+        run = {'id': 42, 'run_attempt': 2, 'html_url': 'https://example.invalid/42',
+               'name': 'CI', 'head_sha': 'a' * 40, 'event': 'push', 'status': 'completed',
+               'conclusion': 'success', 'created_at': '2026-11-04T10:00:00Z'}
+        job = {'id': 1, 'run_id': 42, 'run_attempt': 2, 'name': 'test', 'status': 'completed',
+               'runner_id': 3, 'labels': ['macos-26'], 'created_at': run['created_at'],
+               'started_at': '2026-11-04T10:01:00Z', 'completed_at': '2026-11-04T10:03:00Z'}
+        with mock.patch.object(status, 'api', side_effect=[run, [{'total_count': 2, 'jobs': [job]}, {'total_count': 2, 'jobs': [{**job, 'id': 2}]}], run]) as api:
+            result = status.collect('owner/repo', 42)
+        self.assertEqual(result['observed_macos_jobs'], 2)
+        self.assertEqual(result['sum_observed_macos_execution_seconds'], 240)
+        self.assertEqual(api.call_args_list[1], mock.call('repos/owner/repo/actions/runs/42/attempts/2/jobs?per_page=100', pages=True))
+        with mock.patch.object(status, 'api', side_effect=[run, [{'total_count': 1, 'jobs': [job]}], {**run, 'run_attempt': 3}]):
+            with self.assertRaisesRegex(ValueError, 'changed attempt'):
+                status.collect('owner/repo', 42)
+
+    def test_invalid_job_state_and_incomplete_pagination_are_not_silent(self):
+        import ci_status_report as status
+        job = {'id': 1, 'name': 'test', 'runner_id': 8, 'status': 'queued',
+               'created_at': '2026-11-04T10:00:00Z', 'started_at': '2026-11-04T10:00:01Z'}
+        self.assertIsNone(status.job_timing(job, '2026-11-04T10:05:00Z')['execution_seconds'])
+        with self.assertRaises(ValueError):
+            status.job_timing({**job, 'status': 'surprise'}, '2026-11-04T10:05:00Z')
+        for bad in ('bad', '2026-11-04T10:00:00', '0001-01-01T00:00:00Z'):
+            with self.assertRaises(ValueError):
+                status.timestamp(bad)
+        with mock.patch.object(status, 'api', side_effect=[{'id': 42, 'run_attempt': 1},
+                                                         [{'total_count': 2, 'jobs': []}]]):
+            with self.assertRaisesRegex(ValueError, 'truncated'):
+                status.collect('owner/repo', 42)
+
+    def test_api_uses_get_and_does_not_print_debug_stderr(self):
+        import ci_status_report as status
+        with mock.patch.object(status.subprocess, 'run', return_value=mock.Mock(returncode=0, stdout='[]')) as run:
+            self.assertEqual(status.api('repos/owner/repo/actions/runs', pages=True), [])
+        self.assertEqual(run.call_args.args[0], ['gh', 'api', '--method', 'GET',
+                         'repos/owner/repo/actions/runs', '--paginate', '--slurp'])
+        with mock.patch.object(status.subprocess, 'run', return_value=mock.Mock(returncode=1, stderr='private-marker')):
+            with self.assertRaises(ValueError) as failure:
+                status.api('repos/owner/repo/actions/runs')
+        self.assertNotIn('private-marker', str(failure.exception))
 
 
 if __name__ == '__main__':

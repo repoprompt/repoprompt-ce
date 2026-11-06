@@ -182,6 +182,20 @@ extension AgentModeViewModel {
             cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
             return
         }
+        let switchPreparation: ProviderSwitchSendPreparation?
+        switch await providerSwitchSendAdmission(
+            session: session, input: Self.periodicWakeMessage, skipsAugmentation: true,
+            isCurrent: { self.composerSubmitClaimIsCurrent(claim)
+                && session.oversight.pendingAutoWake?.wakeID == attempt.wakeID
+                && (attempt.stopFence?.permitsStart(of: session) ?? true)
+            }
+        ) {
+        case let .success(preparation): switchPreparation = preparation
+        case .failure:
+            releaseComposerSubmitClaim(claim)
+            cancelAgentSessionLinkAutoWake(for: endpoint, reason: .requiredClaimUnavailable)
+            return
+        }
         guard var current = session.oversight.pendingAutoWake,
               current.wakeID == attempt.wakeID, current.phase == .scheduled,
               agentSessionLinkPeriodicWakeIsEligible(session, endpoint: endpoint)
@@ -198,7 +212,8 @@ extension AgentModeViewModel {
         _ = await startAgentRun(
             tabID: endpoint.tabID,
             initialMessage: Self.periodicWakeMessage,
-            directStartOptions: .periodicWake(wakeID: attempt.wakeID, stopFence: attempt.stopFence)
+            directStartOptions: .periodicWake(wakeID: attempt.wakeID, stopFence: attempt.stopFence),
+            providerSwitchPreparation: switchPreparation
         )
         if var current = session.oversight.pendingAutoWake, current.wakeID == attempt.wakeID {
             current.periodicStartReturned = true

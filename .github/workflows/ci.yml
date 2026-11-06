@@ -12,7 +12,7 @@ on:
 
 concurrency:
   # Supersede obsolete PR previews only. Queue candidates, main evidence, and
-  # explicitly rerun full profiles retain their own run-scoped groups.
+  # explicit reruns retain their own run-scoped groups.
   group: ci-${{ github.event_name == 'pull_request' && github.run_attempt == '1' && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == '1' }}
 
@@ -22,12 +22,15 @@ permissions:
 jobs:
   candidate:
     name: Declare Integration Candidate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     outputs:
+      failure: ${{ steps.diagnostics.outputs.failure }}
       context: ${{ steps.candidate.outputs.context }}
       range: ${{ steps.candidate.outputs.range }}
     steps:
       - uses: actions/checkout@v6
+        id: actions-checkout-v6
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -38,35 +41,110 @@ jobs:
           python3 Scripts/ci_admission.py prepare --event-path "$GITHUB_EVENT_PATH" \
             --event-name "$GITHUB_EVENT_NAME" --sha "$GITHUB_SHA" --ref "$GITHUB_REF" \
             --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --output "$GITHUB_OUTPUT"
+      - name: Broadcast failed steps and recovery
+        id: diagnostics
+        if: always()
+        env:
+          STEPS_CONTEXT: ${{ toJSON(steps) }}
+        run: |
+          if [[ -f Scripts/ci_job_diagnostics.py ]]; then
+            python3 Scripts/ci_job_diagnostics.py job
+          else
+            echo '::error::Checkout unavailable; inspect checkout/runner failure. No CI evidence was accepted.'
+            echo 'Checkout unavailable: inspect checkout/runner failure; no evidence accepted.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  workflow-contracts:
+    name: Portable Checks
+    needs: candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      failure: ${{ steps.diagnostics.outputs.failure }}
+    steps:
+      - name: Check out repository
+        id: check-out-repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Test portable tooling before allocating macOS
+        id: test-workflow-contracts
+        run: make ci-portable-selftest
+      - name: Set up Node for pinned Codex CLI
+        id: set-up-node-for-pinned-codex-cli
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Install pinned Codex CLI
+        id: install-pinned-codex-cli
+        run: npm install --global @openai/codex@0.164.0
+      - name: Validate Codex app-server schema contract
+        id: validate-codex-app-server-schema-contract
+        run: make codex-schema-check
+      - name: Broadcast failed steps and recovery
+        id: diagnostics
+        if: always()
+        env:
+          STEPS_CONTEXT: ${{ toJSON(steps) }}
+        run: |
+          if [[ -f Scripts/ci_job_diagnostics.py ]]; then
+            python3 Scripts/ci_job_diagnostics.py job
+          else
+            echo '::error::Workflow-contract checkout unavailable; inspect the job log.'
+            echo 'Workflow-contract checkout unavailable; inspect the job log.' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   integration-products:
     # Sentry/privacy stays blocking, after root gates reject bad candidates.
     # Universal packaging/older-runtime smoke gate publication in release flows;
     # do not duplicate those expensive builds on every integration candidate.
     needs: [candidate, build-test-bundles, build-and-test, secret-scan]
+    concurrency:
+      group: ci-sentry-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == '1' && 'main' || github.run_id }}
+      cancel-in-progress: false
     uses: ./.github/workflows/ci-integration-products.yml
     with:
       admission: ${{ needs.candidate.outputs.context }}
 
   build-test-bundles:
-    needs: candidate
-    # Reject inherited declaration outputs before allocating a macOS runner.
-    if: ${{ fromJSON(needs.candidate.outputs.context).attempt == github.run_attempt }}
+    needs: [candidate, workflow-contracts, secret-scan]
+    # Preserve running work and retain only the newest pending main build.
+    # Job-level coalescing leaves every push's introduced-range scan independent.
+    concurrency:
+      group: ci-build-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == '1' && 'main' || github.run_id }}
+      cancel-in-progress: false
     env:
       ADMISSION_CONTEXT: ${{ needs.candidate.outputs.context }}
+      # Keep timing measurements on the last accepted toolchain, not image defaults.
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
     name: Build and Static Gates
+    # Keep native ARM coverage and the original enforcing measurement platform.
     runs-on: macos-26
     timeout-minutes: 75
+    outputs:
+      failure: ${{ steps.diagnostics.outputs.failure }}
+      context: ${{ steps.producer.outputs.context }}
     steps:
       - name: Check out repository
+        id: check-out-repository
         uses: actions/checkout@v6
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Verify exact candidate and full-profile attempt
+      - name: Verify immutable candidate
+        id: verify-immutable-candidate
         run: python3 Scripts/ci_admission.py verify --context "$ADMISSION_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
+
+      - name: Declare this root build producer and toolchain
+        id: producer
+        run: python3 Scripts/ci_admission.py produce --context "$ADMISSION_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --output "$GITHUB_OUTPUT"
+
+      - name: Run compiler-dependent repository guardrails
+        id: run-repository-guardrails
+        run: make guardrails
 
       - name: Identify SwiftPM support cache compatibility
         id: support-toolchain
@@ -91,6 +169,7 @@ jobs:
           key: support-${{ steps.support-toolchain.outputs.key }}
 
       - name: Invalidate cached admission evidence before any build or selftest
+        id: invalidate-cached-admission-evidence-before-any-build-or-selftest
         if: always()
         run: python3 Scripts/ci_admission.py invalidate --context "$ADMISSION_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
 
@@ -106,44 +185,30 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-binaries-v1-${{ hashFiles('Package.resolved', 'Packages/RepoPromptAgentProviders/Package.resolved') }}
 
       - name: Resolve dependency downloads with bounded retries
+        id: resolve-dependency-downloads-with-bounded-retries
         run: |
           python3 Scripts/ci_resolve_packages.py
           python3 Scripts/ci_resolve_packages.py --scratch-path .build/swiftbuild
           python3 Scripts/ci_resolve_packages.py --root Packages/RepoPromptAgentProviders
 
-      - name: Run repository guardrails
-        run: make guardrails
-
-      - name: Run hosted runner and admission selftests
-        run: make ci-app-test-runner-selftest
+      - name: Verify macOS process supervision and platform tooling
+        id: run-hosted-runner-and-admission-selftests
+        run: make ci-macos-selftest
 
       - name: Install Swift style tools
+        id: install-swift-style-tools
         run: ./Scripts/install_format_tools.sh install
 
       - name: Run Swift style lint
+        id: run-swift-style-lint
         run: make lint
 
-      - name: Run conductor tests
-        run: make conductor-selftest
-
-      - name: Set up Node for pinned Codex CLI
-        uses: actions/setup-node@v6
-        with:
-          node-version: 24
-
-      - name: Install pinned Codex CLI
-        run: npm install --global @openai/codex@0.164.0
-
-      - name: Validate Codex app-server schema contract
-        run: make dev-codex-schema-check
-
-      - name: Run release workflow tests
-        run: make release-selftest
-
       - name: Run provider package tests
+        id: run-provider-package-tests
         run: ./conductor provider-test
 
       - name: Build root test bundles with import and type-check gates
+        id: build-root-test-bundles-with-import-and-type-check-gates
         shell: bash
         env:
           # One measurement protocol and unchanged budget on PR, queue and main.
@@ -155,18 +220,26 @@ jobs:
           build_status=${PIPESTATUS[0]}
           set -e
           if (( build_status != 0 )); then
-            log_path="$(sed -n 's/^Log:[[:space:]]*//p' "$RUNNER_TEMP/ci-build-tests-conductor.txt" | tail -n 1)"
-            if [[ -n "$log_path" && -f "$log_path" ]]; then
-              cp "$log_path" "$RUNNER_TEMP/ci-build-tests.log"
-              echo 'Compiler errors and test failures from the full conductor log:'
-              grep -E 'error:|FAIL' "$RUNNER_TEMP/ci-build-tests.log" || true
-            else
-              echo "Conductor full log was unavailable: $log_path" >&2
-            fi
+            # Every diagnostic operation is best-effort; preserve the build status.
+            (
+              log_path="$(sed -n 's/^Log:[[:space:]]*//p' "$RUNNER_TEMP/ci-build-tests-conductor.txt" | tail -n 1)"
+              if [[ -n "$log_path" && -f "$log_path" ]]; then
+                cp "$log_path" "$RUNNER_TEMP/ci-build-tests.log"
+                echo 'Compiler errors and test failures (last 200 matching lines):'
+                grep -E 'error:|FAIL' "$log_path" | tail -n 200 || true
+                echo 'Final build output (includes non-compiler gate failures):'
+                tail -n 80 "$log_path"
+              else
+                echo "Conductor full log was unavailable: $log_path" >&2
+              fi
+              python3 Scripts/ci_job_diagnostics.py build \
+                --timing-report .build/modularization/typecheck-timing.json
+            ) || true
           fi
           exit "$build_status"
 
       - name: Retain type-check measurements on success and failure
+        id: retain-type-check-measurements-on-success-and-failure
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -176,6 +249,7 @@ jobs:
           retention-days: 14
 
       - name: Upload failed root test build log
+        id: upload-failed-root-test-build-log
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -191,12 +265,14 @@ jobs:
         run: python3 Scripts/modularization_index_graph.py check --output .build/modularization/index-check.json
 
       - name: Capture failed compiler index graph
+        id: capture-failed-compiler-index-graph
         if: ${{ failure() && steps.compiler_index_gate.outcome == 'failure' }}
         run: |
           mkdir -p .build/modularization
           python3 Scripts/modularization_index_graph.py dump --output .build/modularization/index-failure-graph.json
 
       - name: Retain failed compiler index diagnostics
+        id: retain-failed-compiler-index-diagnostics
         if: ${{ failure() && steps.compiler_index_gate.outcome == 'failure' }}
         uses: actions/upload-artifact@v4
         with:
@@ -209,6 +285,7 @@ jobs:
 
       # All executor-parity module checks gate PRs before merge, on the same warm VM.
       - name: Run all app-free module parity tests
+        id: run-all-app-free-module-parity-tests
         shell: bash
         run: |
           set -euo pipefail
@@ -219,6 +296,7 @@ jobs:
           done
 
       - name: Retain full module execution logs
+        id: retain-full-module-execution-logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -229,16 +307,22 @@ jobs:
           retention-days: 7
 
       - name: Bind root producer to the immutable candidate
-        run: python3 Scripts/ci_admission.py bind --context "$ADMISSION_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
+        id: bind-root-producer-to-the-immutable-candidate
+        env:
+          ROOT_CONTEXT: ${{ steps.producer.outputs.context }}
+        run: python3 Scripts/ci_admission.py bind --context "$ADMISSION_CONTEXT" --producer-context "$ROOT_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --check-toolchain
 
       - name: Archive only runnable test products and gate attestations
-        run: python3 Scripts/modularization_ci_artifact.py pack --output root-build.tar.gz --admission-context "$ADMISSION_CONTEXT"
+        id: archive-only-runnable-test-products-and-gate-attestations
+        env:
+          ROOT_CONTEXT: ${{ steps.producer.outputs.context }}
+        run: python3 Scripts/modularization_ci_artifact.py pack --output root-build.tar.gz --admission-context "$ROOT_CONTEXT"
 
       - name: Share expected coverage independently of the runnable products
+        id: share-expected-coverage-independently-of-the-runnable-products
         uses: actions/upload-artifact@v4
         with:
-          overwrite: true
-          name: expected-coverage-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ steps.producer.outputs.coverage_artifact }}
           path: |
             .build/modularization/ci-test-list.txt
             .build/modularization/test-targets.json
@@ -247,15 +331,17 @@ jobs:
           retention-days: 7
 
       - name: Share the single build with test shards
+        id: share-the-single-build-with-test-shards
         uses: actions/upload-artifact@v4
         with:
-          overwrite: true
-          name: root-build-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          name: ${{ steps.producer.outputs.build_artifact }}
           path: root-build.tar.gz
           retention-days: 7
 
       # Keep binary artifacts main-scoped too; PRs restore without saving their own caches.
       - name: Save checksum-verified SwiftPM binary artifacts (main only)
+        id: save-checksum-verified-swiftpm-binary-artifacts-main-only
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.binaries-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
@@ -269,6 +355,7 @@ jobs:
       # One compatible main seed; PRs restore only. Root products/receipts are
       # transferred explicitly to shards, never through an acceleration cache.
       - name: Save SwiftPM dependencies and provider support cache (main only)
+        id: save-swiftpm-dependencies-and-provider-support-cache-main-only
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.rootbundles-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
@@ -279,127 +366,227 @@ jobs:
             Packages/RepoPromptAgentProviders/.build
           key: ${{ steps.rootbundles-cache.outputs.cache-primary-key }}
 
+      - name: Broadcast failed steps and recovery
+        id: diagnostics
+        if: always()
+        env:
+          STEPS_CONTEXT: ${{ toJSON(steps) }}
+        run: |
+          if [[ -f Scripts/ci_job_diagnostics.py ]]; then
+            python3 Scripts/ci_job_diagnostics.py job
+          else
+            echo '::error::Checkout unavailable; inspect checkout/runner failure. No CI evidence was accepted.'
+            echo 'Checkout unavailable: inspect checkout/runner failure; no evidence accepted.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   build-and-test:
-    name: Test Root Shard (No Build)
+    name: Test Root Shard (No Build) (${{ matrix.shard }})
     needs: [candidate, build-test-bundles]
-    if: ${{ fromJSON(needs.candidate.outputs.context).attempt == github.run_attempt }}
+    concurrency:
+      group: ci-tests-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == '1' && 'main' || github.run_id }}-${{ matrix.shard }}
+      cancel-in-progress: false
     env:
-      ADMISSION_CONTEXT: ${{ needs.candidate.outputs.context }}
+      ADMISSION_CONTEXT: ${{ needs.build-test-bundles.outputs.context }}
+      CANDIDATE_CONTEXT: ${{ needs.candidate.outputs.context }}
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    # Keep native ARM coverage and the original enforcing measurement platform.
     runs-on: macos-26
-    timeout-minutes: 30
+    # Restore four independent workers; one failure must not cancel other shards.
     strategy:
       fail-fast: false
       matrix:
         shard: [1, 2, 3, 4]
+    # Original 30-minute execution deadline plus setup and cleanup/upload room.
+    timeout-minutes: 40
+    outputs:
+      failure_1: ${{ steps.diagnostics.outputs.failure_1 }}
+      failure_2: ${{ steps.diagnostics.outputs.failure_2 }}
+      failure_3: ${{ steps.diagnostics.outputs.failure_3 }}
+      failure_4: ${{ steps.diagnostics.outputs.failure_4 }}
+      receipt_artifact_1: ${{ steps.execution.outputs.artifact_1 }}
+      receipt_artifact_2: ${{ steps.execution.outputs.artifact_2 }}
+      receipt_artifact_3: ${{ steps.execution.outputs.artifact_3 }}
+      receipt_artifact_4: ${{ steps.execution.outputs.artifact_4 }}
     steps:
       - name: Check out repository
+        id: check-out-repository
         uses: actions/checkout@v6
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
 
-      - name: Verify exact candidate and full-profile attempt
-        run: python3 Scripts/ci_admission.py verify --context "$ADMISSION_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
+      - name: Select the successful root producer and verify toolchain
+        id: selected
+        run: python3 Scripts/ci_admission.py select --context "$CANDIDATE_CONTEXT" --producer-context "$ADMISSION_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --check-toolchain --output "$GITHUB_OUTPUT"
 
       - name: Download the single root build
+        id: download-the-single-root-build
         uses: actions/download-artifact@v4
         with:
-          name: root-build-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ steps.selected.outputs.build_artifact }}
 
       - name: Restore build bundle and SwiftPM state
+        id: restore-build-bundle-and-swiftpm-state
         shell: bash
         run: gzip -dc root-build.tar.gz | tar -xf -
 
       - name: Verify transferred build candidate and producer
+        id: verified-build
         run: python3 Scripts/modularization_ci_artifact.py verify --admission-context "$ADMISSION_CONTEXT"
 
+      - name: Declare this execution artifact
+        id: execution
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+        run: echo "artifact_$SHARD_INDEX=shard-execution-$SHARD_INDEX-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
       - name: Run root test shard without compiling
-        run: ./conductor ci-shard --shard-count 4 --shard-index ${{ matrix.shard }} --full-log
+        id: run-root-test-shard-without-compiling
+        timeout-minutes: 32
+        run: ./conductor ci-shard --shard-count 4 --shard-index ${{ matrix.shard }} --timeout 1800 --full-log
 
       - name: Retain execution receipts and full shard logs
-        if: always()
+        id: retain-execution-receipts-and-full-shard-logs
+        if: ${{ always() && steps.execution.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
-          overwrite: true
-          name: shard-execution-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .build/ci-test-results/shard-*
+          name: ${{ steps.execution.outputs[format('artifact_{0}', matrix.shard)] }}
+          path: .build/ci-test-results/shard-${{ matrix.shard }}*
           if-no-files-found: error
           retention-days: 7
+
+      - name: Broadcast failed steps and recovery
+        id: diagnostics
+        if: always()
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+          STEPS_CONTEXT: ${{ toJSON(steps) }}
+        run: |
+          if [[ -f Scripts/ci_job_diagnostics.py ]]; then
+            python3 Scripts/ci_job_diagnostics.py job
+          else
+            echo '::error::Checkout unavailable; inspect checkout/runner failure. No CI evidence was accepted.'
+            echo 'Checkout unavailable: inspect checkout/runner failure; no evidence accepted.' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   style:
     # Protect main requires exactly Style: it must be the FINAL gate, not an early green row.
     name: Style
-    needs: [candidate, build-test-bundles, build-and-test, secret-scan, integration-products]
+    needs: [candidate, workflow-contracts, build-test-bundles, build-and-test, secret-scan, integration-products]
     if: always()
     env:
-      ADMISSION_CONTEXT: ${{ needs.candidate.outputs.context }}
-    runs-on: ubuntu-latest
+      ADMISSION_CONTEXT: ${{ needs.build-test-bundles.outputs.context }}
+      CANDIDATE_CONTEXT: ${{ needs.candidate.outputs.context }}
+      SHARD_OUTPUTS: ${{ toJSON(needs.build-and-test.outputs) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      failure: ${{ steps.diagnostics.outputs.failure }}
     steps:
       - name: Check out repository
+        id: check-out-repository
         uses: actions/checkout@v6
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
 
-      - name: Require one full-profile attempt
-        run: python3 Scripts/ci_admission.py verify --context "$ADMISSION_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
-
-      - name: Fail if a prerequisite failed or was skipped
+      - name: Report prerequisites and release eligibility
+        id: report-prerequisites-and-release-eligibility
+        if: always()
         env:
-          CANDIDATE_RESULT: ${{ needs.candidate.result }}
-          PRODUCTS_RESULT: ${{ needs.integration-products.result }}
-          BUILD_RESULT: ${{ needs.build-test-bundles.result }}
-          SECRET_RESULT: ${{ needs.secret-scan.result }}
-          SHARD_RESULT: ${{ needs.build-and-test.result }}
-        shell: bash
+          NEEDS_CONTEXT: ${{ toJSON(needs) }}
         run: |
-          {
-            echo '## CI prerequisite results'
-            echo "- Candidate declaration: $CANDIDATE_RESULT"
-            echo "- Sentry-enabled build and privacy: $PRODUCTS_RESULT"
-            echo "- Build and Static Gates: $BUILD_RESULT"
-            echo "- Root test shards: $SHARD_RESULT"
-            echo "- Secret Scan: $SECRET_RESULT"
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-          if [[ "$CANDIDATE_RESULT" != success || "$PRODUCTS_RESULT" != success || "$BUILD_RESULT" != success || "$SHARD_RESULT" != success || "$SECRET_RESULT" != success ]]; then
-            echo '::error::CI prerequisite failed, was cancelled, or was skipped. Inspect the failing job; Style is the aggregate gate.'
+          if [[ -f Scripts/ci_job_diagnostics.py ]]; then
+            python3 Scripts/ci_job_diagnostics.py prerequisites
+          else
+            echo '::error::Prerequisite report unavailable after checkout failure. Inspect the dependency jobs; evidence cannot be accepted.'
+            echo 'Prerequisite report unavailable after checkout failure; inspect dependency jobs.' >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 
+      - name: Select exact successful producer evidence
+        id: selected
+        run: python3 Scripts/ci_admission.py select --context "$CANDIDATE_CONTEXT" --producer-context "$ADMISSION_CONTEXT" --shard-outputs "$SHARD_OUTPUTS" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --output "$GITHUB_OUTPUT"
+
       - name: Download expected coverage
+        id: download-expected-coverage
         uses: actions/download-artifact@v4
         with:
-          name: expected-coverage-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ steps.selected.outputs.coverage_artifact }}
           path: expected-coverage
 
-      - name: Download all shard execution receipts
+      # Unique matrix outputs retain the exact artifact for each successful shard,
+      # including ancestors of a partial retry. Never select artifacts by recency.
+      - name: Download shard 1 execution receipt
+        id: download-shard-1-execution-receipt
         uses: actions/download-artifact@v4
         with:
-          pattern: shard-execution-*-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ steps.selected.outputs.receipt_artifact_1 }}
           path: shard-execution
-          merge-multiple: true
+
+      - name: Download shard 2 execution receipt
+        id: download-shard-2-execution-receipt
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.selected.outputs.receipt_artifact_2 }}
+          path: shard-execution
+
+      - name: Download shard 3 execution receipt
+        id: download-shard-3-execution-receipt
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.selected.outputs.receipt_artifact_3 }}
+          path: shard-execution
+
+      - name: Download shard 4 execution receipt
+        id: download-shard-4-execution-receipt
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.selected.outputs.receipt_artifact_4 }}
+          path: shard-execution
 
       - name: Prove exact union and every test target
+        id: prove-exact-union-and-every-test-target
         run: python3 Scripts/ci_test_coverage.py --metadata expected-coverage --receipts shard-execution --shard-count 4 --admission-context "$ADMISSION_CONTEXT"
 
+      - name: Broadcast failed steps and recovery
+        id: diagnostics
+        if: always()
+        env:
+          STEPS_CONTEXT: ${{ toJSON(steps) }}
+        run: |
+          if [[ -f Scripts/ci_job_diagnostics.py ]]; then
+            python3 Scripts/ci_job_diagnostics.py job
+          else
+            echo '::error::Checkout unavailable; inspect checkout/runner failure. No CI evidence was accepted.'
+            echo 'Checkout unavailable: inspect checkout/runner failure; no evidence accepted.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   secret-scan:
+    # Contract failures must not suppress the introduced-range scan on main.
     needs: candidate
     env:
       ADMISSION_CONTEXT: ${{ needs.candidate.outputs.context }}
     name: Secret Scan
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      failure: ${{ steps.diagnostics.outputs.failure }}
     steps:
       - name: Check out repository
+        id: check-out-repository
         uses: actions/checkout@v6
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Verify exact candidate and full-profile attempt
+      - name: Verify immutable candidate
+        id: verify-immutable-candidate
         run: python3 Scripts/ci_admission.py verify --context "$ADMISSION_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
 
       - name: Install pinned gitleaks
+        id: install-pinned-gitleaks
         shell: bash
         run: |
           set -euo pipefail
@@ -410,6 +597,7 @@ jobs:
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
       - name: Scan introduced commit range
+        id: scan-introduced-commit-range
         env:
           ADMISSION_RANGE: ${{ needs.candidate.outputs.range }}
         run: |
@@ -417,4 +605,18 @@ jobs:
           gitleaks git --redact --log-opts="$ADMISSION_RANGE" .
 
       - name: Scan checked-in source tree
+        id: scan-checked-in-source-tree
         run: gitleaks dir --redact .
+
+      - name: Broadcast failed steps and recovery
+        id: diagnostics
+        if: always()
+        env:
+          STEPS_CONTEXT: ${{ toJSON(steps) }}
+        run: |
+          if [[ -f Scripts/ci_job_diagnostics.py ]]; then
+            python3 Scripts/ci_job_diagnostics.py job
+          else
+            echo '::error::Checkout unavailable; inspect checkout/runner failure. No CI evidence was accepted.'
+            echo 'Checkout unavailable: inspect checkout/runner failure; no evidence accepted.' >> "$GITHUB_STEP_SUMMARY"
+          fi
