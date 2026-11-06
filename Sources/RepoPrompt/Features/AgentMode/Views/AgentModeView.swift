@@ -3,7 +3,7 @@ import RepoPromptFileSystem
 import RepoPromptInstrumentation
 import SwiftUI
 
-private extension EnvironmentValues {
+extension EnvironmentValues {
     @Entry var handoffOmittedImageCount: Binding<Int> = .constant(0)
 }
 
@@ -208,7 +208,6 @@ struct AgentModeView: View {
 // Transcript scroll types extracted to Components/AgentTranscriptScrollTypes.swift
 
 struct AgentModeChatDetailView: View {
-    @Environment(\.handoffOmittedImageCount) private var omittedHandoffImageCount
     let agentModeVM: AgentModeViewModel
     @ObservedObject var transcriptUI: AgentTranscriptUIStore
     @ObservedObject var runInteractionUI: AgentRunInteractionUIStore
