@@ -3,6 +3,7 @@ import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 import SwiftUI
 
 #if DEBUG

@@ -31,7 +31,8 @@
         "RepoPromptProviderQuota",
         "RepoPromptShared",
         "RepoPromptWorkspaceCore",
-        "Sparkle"
+        "Sparkle",
+        "RepoPromptWorkspaceContext"
       ],
       "test_target": "RepoPromptTests"
     },
@@ -62,7 +63,9 @@
     },
     "RepoPromptProviderQuotaTests": {
       "source_root": "Tests/RepoPromptProviderQuotaTests",
-      "allowed_dependencies": ["RepoPromptProviderQuota"]
+      "allowed_dependencies": [
+        "RepoPromptProviderQuota"
+      ]
     },
     "RepoPromptDomainRuntime": {
       "source_root": "Sources/RepoPromptDomainRuntime",
@@ -268,7 +271,9 @@
         "RepoPromptProviderQuota",
         "RepoPromptShared",
         "RepoPromptTestSupport",
-        "RepoPromptWorkspaceCore"
+        "RepoPromptWorkspaceCore",
+        "RepoPromptWorkspaceContext",
+        "RepoPromptWorkspaceContextTestSupport"
       ]
     },
     "RepoPromptWorkspaceCore": {
@@ -308,6 +313,48 @@
       "allowed_dependencies": [
         "RepoPromptSettingsCore",
         "RepoPromptProviderQuota"
+      ]
+    },
+    "RepoPromptWorkspaceContext": {
+      "source_root": "Sources/RepoPromptWorkspaceContext",
+      "allowed_dependencies": [
+        "RepoPromptC",
+        "RepoPromptCodeMapCore",
+        "RepoPromptDomainRuntime",
+        "RepoPromptFileSystem",
+        "RepoPromptFoundation",
+        "RepoPromptInstrumentation",
+        "RepoPromptPersistence",
+        "RepoPromptRegexCore",
+        "RepoPromptSettingsCore",
+        "RepoPromptShared",
+        "RepoPromptVCS",
+        "RepoPromptWorkspaceCore"
+      ],
+      "test_target": "RepoPromptWorkspaceContextTests",
+      "app_free_tests": true
+    },
+    "RepoPromptWorkspaceContextTestSupport": {
+      "source_root": "Tests/RepoPromptWorkspaceContextTestSupport",
+      "allowed_dependencies": [
+        "RepoPromptWorkspaceContext",
+        "RepoPromptCodeMapCore",
+        "RepoPromptFileSystem",
+        "RepoPromptFoundation",
+        "RepoPromptPersistence",
+        "RepoPromptVCS"
+      ]
+    },
+    "RepoPromptWorkspaceContextTests": {
+      "source_root": "Tests/RepoPromptWorkspaceContextTests",
+      "allowed_dependencies": [
+        "RepoPromptWorkspaceContext",
+        "RepoPromptWorkspaceContextTestSupport",
+        "RepoPromptCodeMapCore",
+        "RepoPromptFileSystem",
+        "RepoPromptFoundation",
+        "RepoPromptPersistence",
+        "RepoPromptWorkspaceCore"
       ]
     }
   },
@@ -481,6 +528,27 @@
       "former_app_files": [
         "Sources/RepoPrompt/Features/Settings/Models/GlobalSettingsDocument.swift",
         "Sources/RepoPrompt/Features/Settings/Models/GlobalSettingsFileStore.swift"
+      ]
+    },
+    "WorkspaceContext": {
+      "owner": "RepoPromptWorkspaceContext",
+      "former_app_roots": [
+        "Sources/RepoPrompt/Infrastructure/WorkspaceContext",
+        "Sources/RepoPrompt/Features/Search",
+        "Sources/RepoPrompt/Features/CodeMap"
+      ],
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemSeedPlan+AppIntegration.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitBlobIdentityService.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitBlobSourceMaterializationService.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitPrefixControlEvidenceManifest.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitTargetEvidenceManifestStore.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitTargetEvidenceManifests.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitTargetEvidenceStreamingParsers.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitWorkspaceMetadataMonitor.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitWorkspacePolicyCanonicalizationDiagnostics.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitWorkspaceStateAuthority.swift",
+        "Sources/RepoPrompt/Infrastructure/VCS/GitWorktreeInitializationModels.swift"
       ]
     }
   }

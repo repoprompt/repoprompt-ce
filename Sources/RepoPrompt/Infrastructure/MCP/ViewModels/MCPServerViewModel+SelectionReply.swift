@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptFoundation
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 
 extension MCPServerViewModel {
     enum SelectionReplyIngressPolicy: Equatable {

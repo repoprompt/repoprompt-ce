@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptSettingsCore
+@testable import RepoPromptWorkspaceContext
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import XCTest
@@ -2381,6 +2382,55 @@ final class AgentSessionPointReadScalingTests: XCTestCase {
             XCTAssertEqual(viewModel.authoritativeLiveSessionStates(for: [targetID])[targetID], .ambiguous)
             await window.tearDown()
         }
+    }
+
+    func testScalarWorktreeBindingReadIsBoundedAndRejectsFreshConflictingClaims() async {
+        let window = WindowState()
+        await window.workspaceManager.awaitInitialized()
+        let manager = window.workspaceManager
+        let vm = window.agentModeViewModel
+        let sessionID = UUID()
+        var target = ComposeTabState(name: "Drawer target", activeAgentSessionID: sessionID)
+        target.selection = StoredSelection(selectedPaths: (0 ..< 500).map { "/repo/File\($0).swift" })
+        let unrelated = (0 ..< 1000).map { ComposeTabState(name: "Other \($0)", activeAgentSessionID: UUID()) }
+        let workspace = WorkspaceModel(
+            name: "Drawer scale", repoPaths: [], ephemeralFlag: true,
+            composeTabs: unrelated + [target], activeComposeTabID: target.id
+        )
+        manager.workspaces = [workspace]
+        manager.activeWorkspace = workspace
+        let live = AgentModeViewModel.TabSession(tabID: target.id)
+        vm.test_installLiveSession(live)
+        live.testInstallPersistentSessionBinding(sessionID: sessionID)
+        live.hasLoadedPersistedState = true
+        manager.test_sessionCarrierRowsVisited = 0
+        vm.test_persistentBindingClaimRowsVisited = 0
+        XCTAssertEqual(vm.worktreeBindingState(forAgentSessionID: sessionID, tabID: target.id), .hydrated([]))
+        XCTAssertLessThanOrEqual(manager.test_sessionCarrierRowsVisited, 3)
+        XCTAssertEqual(vm.test_persistentBindingClaimRowsVisited, 1)
+
+        var duplicate = target
+        duplicate.id = UUID()
+        manager.workspaces[0].stashedTabs.append(StashedTab(tab: duplicate))
+        XCTAssertEqual(vm.worktreeBindingState(forAgentSessionID: sessionID, tabID: target.id), .unavailable)
+        manager.workspaces[0].stashedTabs.removeAll()
+        let otherWorkspace = WorkspaceModel(name: "Other owner", repoPaths: [], ephemeralFlag: true, composeTabs: [duplicate])
+        manager.workspaces.append(otherWorkspace)
+        XCTAssertEqual(vm.worktreeBindingState(forAgentSessionID: sessionID, tabID: target.id), .unavailable)
+        manager.workspaces.removeLast()
+        let secondLive = AgentModeViewModel.TabSession(tabID: UUID())
+        vm.test_installLiveSession(secondLive)
+        secondLive.testInstallPersistentSessionBinding(sessionID: sessionID)
+        XCTAssertEqual(vm.worktreeBindingState(forAgentSessionID: sessionID, tabID: target.id), .unavailable)
+        secondLive.testInstallPersistentSessionBinding(sessionID: nil)
+        XCTAssertEqual(vm.worktreeBindingState(forAgentSessionID: sessionID, tabID: target.id), .hydrated([]))
+        manager.workspaces[0].composeTabs[unrelated.count].activeAgentSessionID = UUID()
+        XCTAssertEqual(
+            vm.worktreeBindingState(forAgentSessionID: sessionID, tabID: target.id),
+            .unavailable,
+            "An explicit tab must not bypass a conflicting persisted claim"
+        )
+        await window.tearDown()
     }
 
     func testPointMetadataUpdatePreservesOtherRowsAndReadsOnlyTheChangedTab() async {

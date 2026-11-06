@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptFoundation
+import RepoPromptWorkspaceContext
 
 struct PromptFileEntry {
     let file: FileViewModel

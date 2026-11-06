@@ -1,6 +1,7 @@
 import Combine
 import RepoPromptFileSystem
 import RepoPromptInstrumentation
+import RepoPromptWorkspaceContext
 import SwiftUI
 
 extension EnvironmentValues {
