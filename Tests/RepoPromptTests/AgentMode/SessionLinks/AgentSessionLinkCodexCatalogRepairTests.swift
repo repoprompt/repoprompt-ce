@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
@@ -63,6 +64,114 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
                 }
             }
         }
+    }
+
+    func testTurnRuntimeOwnerBridgesQueueWritesWithoutDuplicateObservation() throws {
+        let fixture = try makeFixture()
+        let session = fixture.session
+        let runtime = session.codexTurnState
+        let entry = Self.fallbackQueueEntry(controller: fixture.controller, session: session)
+        var observations = 0
+        let observation = session.monitorObservationSignal.sink { observations += 1 }
+        defer { observation.cancel() }
+
+        runtime.fallbackQueue = [entry]
+        XCTAssertEqual(session.codexFallbackQueue, [entry])
+        XCTAssertEqual(observations, 1)
+        session.codexFallbackQueue[0].state = .dispatching
+        XCTAssertEqual(runtime.fallbackQueue[0].state, .dispatching)
+        XCTAssertEqual(observations, 2, "Computed forwarding must preserve in-place writeback and emit once")
+        runtime.fallbackDispatchInFlight = entry
+        XCTAssertEqual(session.codexFallbackDispatchInFlight, entry)
+        XCTAssertEqual(observations, 3)
+        session.codexFallbackDispatchInFlight?.state = .dispatching
+        XCTAssertEqual(runtime.fallbackDispatchInFlight?.state, .dispatching)
+        XCTAssertEqual(observations, 4, "Optional in-place writeback emits exactly once")
+        session.codexFallbackDispatchInFlight = nil
+        XCTAssertNil(runtime.fallbackDispatchInFlight)
+        XCTAssertEqual(observations, 5)
+        // These fields were silent before extraction and must not broaden invalidation.
+        session.codexPendingTurnKind = .user
+        session.codexPendingAuthRetryTurn = nil
+        session.codexAuthoritativeActiveTurn = nil
+        session.codexAnonymousActiveTurn = nil
+        session.codexRoutingObservedTurnID = "observed-turn"
+        session.codexPendingSteerLifecycleReconciliation = nil
+        session.codexFallbackHookGateOwnerBlocker = nil
+        session.codexFallbackSuccessorRetryTask = nil
+        XCTAssertEqual(observations, 5)
+        let pump = Task<Void, Never> {}
+        runtime.fallbackPumpTask = pump
+        XCTAssertNotNil(session.codexFallbackPumpTask)
+        XCTAssertEqual(observations, 6)
+        session.codexFallbackPumpTask?.cancel()
+        XCTAssertTrue(runtime.fallbackPumpTask?.isCancelled == true)
+        session.codexFallbackPumpTask = nil
+        XCTAssertEqual(observations, 7)
+        XCTAssertTrue(session.codexDispatchSerialGate === runtime.dispatchSerialGate)
+    }
+
+    func testControllerReplacementKeepsTurnOwnerButInvalidatesControllerIdentity() throws {
+        let fixture = try makeFixture()
+        let session = fixture.session
+        let runtime = session.codexTurnState
+        let generation = session.codexControllerGeneration
+        let gate = session.codexDispatchSerialGate
+        let entry = Self.fallbackQueueEntry(controller: fixture.controller, session: session)
+        let identity = CodexTurnRuntimeState.AuthoritativeTurnIdentity(
+            threadID: entry.originThreadID, turnID: "active-turn", turnKind: .user,
+            controllerInstanceID: ObjectIdentifier(fixture.controller), controllerGeneration: generation,
+            runID: session.runID, runAttemptID: entry.originRunAttemptID
+        )
+        runtime.authoritativeActiveTurn = identity
+        runtime.anonymousActiveTurn = .init(
+            threadID: identity.threadID, turnKind: identity.turnKind,
+            controllerInstanceID: identity.controllerInstanceID, controllerGeneration: generation,
+            runID: identity.runID, runAttemptID: identity.runAttemptID
+        )
+        runtime.routingObservedTurnID = identity.turnID
+        runtime.pendingSteerLifecycleReconciliation = .init(priorIdentity: identity, acceptedDispatchTurnID: "accepted-turn")
+        runtime.fallbackHookGateOwnerBlocker = .init(
+            threadID: identity.threadID, turnID: identity.turnID,
+            controllerInstanceID: identity.controllerInstanceID, controllerGeneration: generation,
+            runID: identity.runID, runAttemptID: identity.runAttemptID
+        )
+        runtime.fallbackQueue = [entry]
+
+        session.codexController = nil
+
+        XCTAssertTrue(session.codexTurnState === runtime)
+        XCTAssertTrue(session.codexDispatchSerialGate === gate)
+        XCTAssertNotEqual(session.codexControllerGeneration, generation)
+        XCTAssertNil(runtime.authoritativeActiveTurn)
+        XCTAssertNil(runtime.anonymousActiveTurn)
+        XCTAssertNil(runtime.routingObservedTurnID)
+        XCTAssertNil(runtime.fallbackHookGateOwnerBlocker)
+        XCTAssertEqual(runtime.pendingSteerLifecycleReconciliation?.priorIdentity, identity)
+        XCTAssertEqual(runtime.fallbackQueue, [entry], "Only the coordinator retires queued work; replacement cannot silently discard it")
+        let pump = Task<Void, Never> {}
+        let retry = Task<Void, Never> {}
+        runtime.fallbackPumpTask = pump
+        runtime.fallbackSuccessorRetryTask = retry
+        fixture.viewModel.test_codexCoordinator.handleMCPControlReset(for: session, reason: "turn owner test")
+        XCTAssertTrue(runtime.fallbackQueue.isEmpty)
+        XCTAssertTrue(pump.isCancelled)
+        XCTAssertTrue(retry.isCancelled)
+        XCTAssertNil(runtime.fallbackPumpTask)
+        XCTAssertNil(runtime.fallbackSuccessorRetryTask)
+        XCTAssertEqual(runtime.pendingSteerLifecycleReconciliation?.priorIdentity, identity)
+        session.beginRunAttempt(source: "test.turnOwner")
+        XCTAssertNil(runtime.pendingSteerLifecycleReconciliation)
+    }
+
+    func testRetainedTurnRuntimeOwnerDoesNotRetainPresentationSession() throws {
+        var session: AgentTabSession? = AgentTabSession(tabID: UUID())
+        weak var weakSession = session
+        let runtime = try XCTUnwrap(session?.codexTurnState)
+        session = nil
+        XCTAssertNil(weakSession)
+        // Late cleanup after the session goes away is a no-op notification, not a resurrection.
+        runtime.fallbackQueue = []
     }
 
     // MARK: - Repair
