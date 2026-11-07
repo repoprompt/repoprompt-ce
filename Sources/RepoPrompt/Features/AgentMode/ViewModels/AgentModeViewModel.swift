@@ -59,25 +59,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ taskLabelKind: AgentModelCatalog.TaskLabelKind?
     ) -> any CodexSessionControlling
     typealias CodexControllerFactoryWithComputerUse = CodexAgentModeCoordinator.CodexControllerFactory
-    typealias HeadlessProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?) -> HeadlessAgentProvider
-    typealias ACPProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?) async throws -> (any ACPAgentProvider)?
-    typealias ACPControllerFactory = (_ provider: any ACPAgentProvider, _ runRequest: ACPRunRequest) throws -> ACPAgentSessionController
-    typealias ConnectionPolicyInstaller = (
-        _ clientName: String,
-        _ windowID: Int,
-        _ restrictedTools: Set<String>,
-        _ oneShot: Bool,
-        _ reason: String?,
-        _ ttl: TimeInterval,
-        _ tabID: UUID?,
-        _ runID: UUID?,
-        _ additionalTools: Set<String>?,
-        _ purpose: MCPRunPurpose,
-        _ taskLabelKind: AgentModelCatalog.TaskLabelKind?,
-        _ allowsAgentExternalControlTools: Bool,
-        _ requiresExpectedAgentPID: Bool
-    ) async -> Void
-    typealias MCPServerEnabler = () async -> Bool
+    // Source compatibility for presentation composition; runtime contracts own the types.
+    typealias HeadlessProviderFactory = AgentRunExecutionContracts.HeadlessProviderFactory
+    typealias ACPProviderFactory = AgentRunExecutionContracts.ACPProviderFactory
+    typealias ACPControllerFactory = AgentRunExecutionContracts.ACPControllerFactory
+    typealias ConnectionPolicyInstaller = AgentRunExecutionContracts.ConnectionPolicyInstaller
+    typealias MCPServerEnabler = AgentRunExecutionContracts.MCPServerEnabler
     typealias MCPRunRoutingCleaner = (_ runID: UUID, _ windowID: Int, _ reason: String) async -> Void
     typealias MCPRunToolCanceller = (_ runID: UUID, _ reason: String?) -> Int
     typealias ProviderConversationCleaner = ProviderConversationCleanupRegistry.Cleaner

@@ -64,8 +64,8 @@ final class ACPIntegratedAgentModeRunner {
     private let hooks: AgentModeRunService.Hooks
     private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
     private let toolTrackingHooks: AgentToolTrackingHooks
-    private let providerFactory: AgentModeViewModel.ACPProviderFactory
-    private let controllerFactory: AgentModeViewModel.ACPControllerFactory
+    private let providerFactory: AgentRunExecutionContracts.ACPProviderFactory
+    private let controllerFactory: AgentRunExecutionContracts.ACPControllerFactory
     private var toolTrackingByTabID: [UUID: AgentToolTrackingController] = [:]
     private var toolTrackingRunIDByTabID: [UUID: UUID] = [:]
     private enum ToolObservationSource: Equatable { case tracker, provider }
@@ -172,8 +172,8 @@ final class ACPIntegratedAgentModeRunner {
         hooks: AgentModeRunService.Hooks,
         terminalCommitBarrier: AgentRunTerminalCommitBarrier,
         toolTrackingHooks: AgentToolTrackingHooks,
-        providerFactory: @escaping AgentModeViewModel.ACPProviderFactory,
-        controllerFactory: @escaping AgentModeViewModel.ACPControllerFactory
+        providerFactory: @escaping AgentRunExecutionContracts.ACPProviderFactory,
+        controllerFactory: @escaping AgentRunExecutionContracts.ACPControllerFactory
     ) {
         self.hooks = hooks
         self.terminalCommitBarrier = terminalCommitBarrier

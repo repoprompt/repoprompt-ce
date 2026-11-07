@@ -977,6 +977,17 @@ final class AgentTabSession: ObservableObject {
         selectedAgent.usesClaudeTooling ? selectedClaudeEffortRaw : selectedReasoningEffortRaw
     }
 
+    /// Capture provider request values at dispatch, without exporting this mutable host object.
+    var acpRunInput: AgentACPRunInput {
+        AgentACPRunInput(
+            agent: selectedAgent,
+            selectedModelRaw: selectedModelRaw,
+            providerSessionID: providerSessionID,
+            taskLabelKind: mcpControlContext?.taskLabelKind,
+            modelParameterSelections: acpModelParameterSelections
+        )
+    }
+
     private var acpModelParameterSelectionRevisionByIdentity: [ACPModelParameterIdentity: UInt64] = [:]
     private var nextACPModelParameterSelectionRevision: UInt64 = 0
     var acpModelParameterSelections: [ACPModelParameterSelection] = [] {
