@@ -385,8 +385,9 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
             to: fixture.endpoint
         )
         XCTAssertEqual(fixture.viewModel.currentTabID, fixture.tabID)
-        XCTAssertFalse(fixture.viewModel.ui.statusPills.snapshot.monitor.routineWakeIntervalEnabled)
-        for (enabled, seconds) in [(true, 3600), (false, 10800)] {
+        XCTAssertTrue(fixture.viewModel.ui.statusPills.snapshot.monitor.routineWakeIntervalEnabled)
+        XCTAssertEqual(fixture.viewModel.ui.statusPills.snapshot.monitor.routineWakeIntervalSeconds, 300)
+        for (enabled, seconds) in [(false, 3600), (true, 10800)] {
             XCTAssertTrue(fixture.viewModel.agentSessionLinkSetRoutineWakeInterval(
                 enabled: enabled,
                 seconds: seconds,
@@ -413,7 +414,7 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
             let displayed = fixture.viewModel.ui.statusPills.snapshot.monitor
             XCTAssertEqual(displayed.periodicIdleWakeEnabled, enabled)
             XCTAssertEqual(displayed.periodicIdleWakeIntervalSeconds, seconds)
-            XCTAssertFalse(displayed.routineWakeIntervalEnabled)
+            XCTAssertTrue(displayed.routineWakeIntervalEnabled)
             XCTAssertEqual(displayed.routineWakeIntervalSeconds, 300)
         }
     }
