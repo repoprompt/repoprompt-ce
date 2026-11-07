@@ -73,6 +73,29 @@ final class AgentSessionRuntimeStore {
         return .unique(Writer(scope: scope, session: session, binding: binding, restoration: restoration))
     }
 
+    /// Includes window-free owners and pending operations that keep a scope alive. Neither a
+    /// selected window nor writer election may make live files eligible for garbage collection.
+    func attachmentSweepProtection() -> (sessionIDs: Set<UUID>, temporaryPaths: Set<String>) {
+        var sessionIDs: Set<UUID> = []
+        var paths: Set<String> = []
+        for scope in scopes.values.compactMap(\.value) {
+            let pending = scope.attachments.sweepProtection
+            sessionIDs.formUnion(pending.sessionIDs)
+            paths.formUnion(pending.temporaryPaths)
+            for session in scope.sessions.values {
+                if let sessionID = session.activeAgentSessionID { sessionIDs.insert(sessionID) }
+                var attachments = session.pendingFileAttachments + session.attachmentsPendingProviderConsumptionCleanup
+                switch session.attachmentTurnState {
+                case .idle: break
+                case let .reserved(_, turnAttachments), let .consumed(_, turnAttachments):
+                    attachments.append(contentsOf: turnAttachments)
+                }
+                paths.formUnion(attachments.compactMap(AgentImageAttachmentAvailabilityResolver.path(for:)))
+            }
+        }
+        return (sessionIDs, paths)
+    }
+
     private func refreshBindingObservation(for session: AgentTabSession) {
         let owners = scopes.values.compactMap(\.value).filter { $0.sessions[session.tabID] === session }
         guard !owners.isEmpty else {
@@ -95,7 +118,10 @@ final class AgentSessionRuntimeStore {
         fileprivate let id = UUID()
         fileprivate let store: AgentSessionRuntimeStore
         let presentation = AgentSessionPresentationRuntime()
+        let usage = AgentSessionUsageRuntime()
+        lazy var stream = AgentSessionStreamRuntime(scope: self)
         lazy var persistence = AgentSessionPersistenceRuntime(scope: self)
+        lazy var attachments = AgentSessionAttachmentRuntime(scope: self)
         var saveQueue: AgentSessionSaveQueue {
             persistence.queue
         }

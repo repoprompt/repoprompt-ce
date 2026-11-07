@@ -1468,8 +1468,8 @@ final class ACPIntegratedAgentModeRunner {
             // Enforced, not only advised: overseer sends and compactions, parked `when_sendable`
             // sends, and automatic wakes all see this session as not idle until the span ends.
             session.beginACPBackgroundCompactionSettle(duration: Self.acpBackgroundCompactionSettleDuration)
-            toolTrackingHooks.requestUIRefresh(session.tabID, false)
-            toolTrackingHooks.scheduleSave(session.tabID)
+            toolTrackingHooks.requestUIRefresh(session, false)
+            toolTrackingHooks.scheduleSave(session)
         }
         log("provider control command turn completed \(outcome.debugDescription)", runID: runID)
         return outcome
@@ -1885,8 +1885,8 @@ final class ACPIntegratedAgentModeRunner {
                 row.toolIsError = row.toolIsError == true || session.runLifecycle.lastTerminalCommitRevision?.terminalState == .cancelled
                 if !hadResult { toolTrackingHooks.addToolOutputTokens(payload, session) }
                 session.replaceItem(at: index, with: row)
-                toolTrackingHooks.requestUIRefresh(session.tabID, true)
-                toolTrackingHooks.scheduleSave(session.tabID)
+                toolTrackingHooks.requestUIRefresh(session, true)
+                toolTrackingHooks.scheduleSave(session)
             }
         )
     }
@@ -2026,8 +2026,8 @@ final class ACPIntegratedAgentModeRunner {
             )
             session.appendItem(toolItem)
         }
-        toolTrackingHooks.requestUIRefresh(session.tabID, false)
-        toolTrackingHooks.scheduleSave(session.tabID)
+        toolTrackingHooks.requestUIRefresh(session, false)
+        toolTrackingHooks.scheduleSave(session)
     }
 
     private func handleTrackerToolResult(
@@ -2100,8 +2100,8 @@ final class ACPIntegratedAgentModeRunner {
             toolResultItem.toolArgsJSON = argsJSON
             session.appendItem(toolResultItem)
         }
-        toolTrackingHooks.requestUIRefresh(session.tabID, false)
-        toolTrackingHooks.scheduleSave(session.tabID)
+        toolTrackingHooks.requestUIRefresh(session, false)
+        toolTrackingHooks.scheduleSave(session)
     }
 
     private func indexedThenActiveTurnToolCandidates(
@@ -2572,8 +2572,8 @@ final class ACPIntegratedAgentModeRunner {
                 session.appendItem(toolItem)
                 recordProviderPlaceholderInvocationIfNeeded(call.invocationID, argsJSON: call.argsJSON, tabID: session.tabID)
             }
-            toolTrackingHooks.requestUIRefresh(session.tabID, false)
-            toolTrackingHooks.scheduleSave(session.tabID)
+            toolTrackingHooks.requestUIRefresh(session, false)
+            toolTrackingHooks.scheduleSave(session)
             return true
 
         case let .toolResult(result):
@@ -2646,8 +2646,8 @@ final class ACPIntegratedAgentModeRunner {
                 toolResultItem.toolArgsJSON = result.argsJSON
                 session.appendItem(toolResultItem)
             }
-            toolTrackingHooks.requestUIRefresh(session.tabID, false)
-            toolTrackingHooks.scheduleSave(session.tabID)
+            toolTrackingHooks.requestUIRefresh(session, false)
+            toolTrackingHooks.scheduleSave(session)
             return true
 
         case let .legacyEvent(legacy):
@@ -2663,8 +2663,8 @@ final class ACPIntegratedAgentModeRunner {
                 sequenceIndex: session.nextSequenceIndex
             )
             session.appendItem(toolItem)
-            toolTrackingHooks.requestUIRefresh(session.tabID, false)
-            toolTrackingHooks.scheduleSave(session.tabID)
+            toolTrackingHooks.requestUIRefresh(session, false)
+            toolTrackingHooks.scheduleSave(session)
             return true
         }
     }

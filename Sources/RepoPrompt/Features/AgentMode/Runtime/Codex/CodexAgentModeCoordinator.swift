@@ -263,6 +263,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     private weak var viewModel: AgentModeViewModel?
     private var persistenceRuntime: AgentSessionPersistenceRuntime?
+    private var attachmentRuntime: AgentSessionAttachmentRuntime?
     private var terminalCommitBarrier: AgentRunTerminalCommitBarrier?
     private var terminalSessionBinder: (@MainActor (AgentTabSession) -> AgentRunTerminalSessionBinding)?
     #if DEBUG
@@ -490,6 +491,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     func attach(viewModel: AgentModeViewModel) {
         self.viewModel = viewModel
         installPersistenceRuntime(viewModel.persistenceRuntime)
+        installAttachmentRuntime(viewModel.attachmentRuntime)
+    }
+
+    func installAttachmentRuntime(_ runtime: AgentSessionAttachmentRuntime) {
+        attachmentRuntime = runtime
     }
 
     func installPersistenceRuntime(_ runtime: AgentSessionPersistenceRuntime) {
@@ -3777,7 +3783,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         session.mcpFollowUpRunPending = false
         session.codexPendingTurnKind = nil
-        viewModel?.finalizeAttachmentsForTurn(
+        attachmentRuntime?.finalizeAttachmentsForTurn(
             for: session,
             reservationID: entry.attachmentReservationID,
             disposition: .restoreToPending
@@ -3865,7 +3871,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             if case let .mcp(attemptID) = inFlight.origin {
                 session.codexSteerAckTracker.markStale(attemptID: attemptID, reason: reason)
             }
-            viewModel?.finalizeAttachmentsForTurn(
+            attachmentRuntime?.finalizeAttachmentsForTurn(
                 for: session,
                 reservationID: inFlight.attachmentReservationID,
                 disposition: .keepFiles
@@ -5886,8 +5892,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         attachmentReservationID: UUID?
     ) async {
         setRunningStatus("Waiting for response…", source: .transport, session: session, urgent: true)
-        viewModel?.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session: session)
-        viewModel?.markAttachmentsConsumed(for: session, reservationID: attachmentReservationID)
+        attachmentRuntime?.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session: session)
+        attachmentRuntime?.markAttachmentsConsumed(for: session, reservationID: attachmentReservationID)
         updateCodexStallWatchdogState(for: session)
     }
 
@@ -7787,7 +7793,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     runID: activeSendRunID, runAttemptID: activeSendRunAttemptID
                 )
             } catch {
-                viewModel?.finalizeAttachmentsForTurn(
+                attachmentRuntime?.finalizeAttachmentsForTurn(
                     for: session, reservationID: attachmentReservationID, disposition: .restoreToPending
                 )
                 return .cancelled
@@ -7801,7 +7807,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 steeringMessage
             )
             if Task.isCancelled {
-                viewModel?.finalizeAttachmentsForTurn(
+                attachmentRuntime?.finalizeAttachmentsForTurn(
                     for: session,
                     reservationID: attachmentReservationID,
                     disposition: .restoreToPending
@@ -7811,7 +7817,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             guard drained else {
                 let message = "Codex did not send because child agent_run.wait scopes did not drain after steering wake."
                 logCodex("[AgentModeVM] sendCodexNativeMessage: \(message)")
-                viewModel?.finalizeAttachmentsForTurn(
+                attachmentRuntime?.finalizeAttachmentsForTurn(
                     for: session,
                     reservationID: attachmentReservationID,
                     disposition: .restoreToPending
@@ -7826,7 +7832,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                   session.selectedAgent == .codexExec
             else {
                 let message = "Codex did not send because the active run changed while waiting for child agent_run.wait scopes to drain."
-                viewModel?.finalizeAttachmentsForTurn(
+                attachmentRuntime?.finalizeAttachmentsForTurn(
                     for: session,
                     reservationID: attachmentReservationID,
                     disposition: .restoreToPending
@@ -7836,7 +7842,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         if hasCodexStartupClaim(for: session) {
             let message = "Codex did not send because thread routing is still being confirmed."
-            viewModel?.finalizeAttachmentsForTurn(
+            attachmentRuntime?.finalizeAttachmentsForTurn(
                 for: session,
                 reservationID: attachmentReservationID,
                 disposition: .restoreToPending
@@ -7912,7 +7918,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             // and unwind without dispatching a first turn. Cancellation owns the terminal state, so this
             // publishes no failure.
             clearCodexPendingAuthRetryTurn(session)
-            viewModel?.finalizeAttachmentsForTurn(
+            attachmentRuntime?.finalizeAttachmentsForTurn(
                 for: session,
                 reservationID: attachmentReservationID,
                 disposition: .restoreToPending
@@ -7921,7 +7927,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         if session.activeRunAttemptID != sendRunAttemptIDAtEntry {
             clearCodexPendingAuthRetryTurn(session)
-            viewModel?.finalizeAttachmentsForTurn(
+            attachmentRuntime?.finalizeAttachmentsForTurn(
                 for: session,
                 reservationID: attachmentReservationID,
                 disposition: .restoreToPending
@@ -7930,7 +7936,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         if hasCodexStartupClaim(for: session) {
             clearCodexPendingAuthRetryTurn(session)
-            viewModel?.finalizeAttachmentsForTurn(
+            attachmentRuntime?.finalizeAttachmentsForTurn(
                 for: session,
                 reservationID: attachmentReservationID,
                 disposition: .restoreToPending
@@ -7963,7 +7969,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     deleteDeferredFilesWhenFailureHasNoInFlight: false
                 )
             } else {
-                viewModel?.finalizeAttachmentsForTurn(
+                attachmentRuntime?.finalizeAttachmentsForTurn(
                     for: session,
                     reservationID: attachmentReservationID,
                     disposition: .restoreToPending
@@ -7980,7 +7986,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
         guard await validateCodexComputerUseScope(session: session, controller: controller, activationID: computerUseActivationID) else {
             clearCodexPendingAuthRetryTurn(session)
-            viewModel?.finalizeAttachmentsForTurn(for: session, reservationID: attachmentReservationID, disposition: .restoreToPending)
+            attachmentRuntime?.finalizeAttachmentsForTurn(for: session, reservationID: attachmentReservationID, disposition: .restoreToPending)
             return .preDispatchRejected(message: CodexComputerUseWorkflow.ineligibleMessage)
         }
 
@@ -7996,7 +8002,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     notifyOnCompleted: false
                 )
             } else {
-                viewModel?.finalizeAttachmentsForTurn(
+                attachmentRuntime?.finalizeAttachmentsForTurn(
                     for: session,
                     reservationID: attachmentReservationID,
                     disposition: .restoreToPending
@@ -8052,7 +8058,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 dispatchID: promptDispatchID
             )
             clearCodexPendingAuthRetryTurn(session)
-            viewModel?.finalizeAttachmentsForTurn(
+            attachmentRuntime?.finalizeAttachmentsForTurn(
                 for: session,
                 reservationID: attachmentReservationID,
                 disposition: .restoreToPending
@@ -8103,7 +8109,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 dispatchID: promptDispatchID
             )
             clearCodexPendingAuthRetryTurn(session)
-            viewModel?.finalizeAttachmentsForTurn(
+            attachmentRuntime?.finalizeAttachmentsForTurn(
                 for: session,
                 reservationID: attachmentReservationID,
                 disposition: .restoreToPending
@@ -8174,7 +8180,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     dispatchID: promptDispatchID
                 )
                 self.clearCodexPendingAuthRetryTurn(session)
-                self.viewModel?.finalizeAttachmentsForTurn(
+                self.attachmentRuntime?.finalizeAttachmentsForTurn(
                     for: session,
                     reservationID: attachmentReservationID,
                     disposition: .restoreToPending
@@ -8217,7 +8223,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     dispatchID: promptDispatchID
                 )
                 self.clearCodexPendingAuthRetryTurn(session)
-                self.viewModel?.finalizeAttachmentsForTurn(
+                self.attachmentRuntime?.finalizeAttachmentsForTurn(
                     for: session,
                     reservationID: attachmentReservationID,
                     disposition: .restoreToPending
@@ -8686,7 +8692,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     sendRunID: sendRunID,
                     controller: controller
                 ) else {
-                    viewModel?.finalizeAttachmentsForTurn(
+                    attachmentRuntime?.finalizeAttachmentsForTurn(
                         for: session,
                         reservationID: attachmentReservationID,
                         disposition: .restoreToPending
@@ -8703,7 +8709,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         notifyOnCompleted: false
                     )
                 } else {
-                    viewModel?.finalizeAttachmentsForTurn(
+                    attachmentRuntime?.finalizeAttachmentsForTurn(
                         for: session,
                         reservationID: attachmentReservationID,
                         disposition: .restoreToPending
@@ -8746,7 +8752,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     notifyOnCompleted: false
                 )
             } else {
-                viewModel?.finalizeAttachmentsForTurn(
+                attachmentRuntime?.finalizeAttachmentsForTurn(
                     for: session,
                     reservationID: attachmentReservationID,
                     disposition: .restoreToPending
@@ -9633,7 +9639,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         case .failed:
             .failed
         }
-        let attachmentDisposition: AgentModeViewModel.AttachmentTurnDisposition = if turnStatus == .failed {
+        let attachmentDisposition: DomainAgentRunAttachmentTurnDisposition = if turnStatus == .failed {
             if deleteDeferredFilesWhenFailureHasNoInFlight,
                case .idle = session.attachmentTurnState
             {

@@ -10,6 +10,8 @@ final class AgentSessionPresentationRuntime {
         let refresh: (AgentTabSession, Bool) -> Void
         let turnComplete: (AgentTabSession) -> Void
         let turnFailed: (AgentTabSession, String?) -> Void
+        var assistantDelta: ((AgentTabSession, Int, UInt64) -> Void)?
+        var derivedTranscript: ((AgentTabSession) -> Void)?
     }
 
     struct Attachment: Equatable {
@@ -40,6 +42,14 @@ final class AgentSessionPresentationRuntime {
     private func sink(for session: AgentTabSession) -> Sink? {
         guard let entry = entries[ObjectIdentifier(session)], entry.session === session else { return nil }
         return entry.sink
+    }
+
+    func assistantDeltaApplied(_ session: AgentTabSession, sourceItemsRevision: Int, flushGeneration: UInt64) {
+        sink(for: session)?.assistantDelta?(session, sourceItemsRevision, flushGeneration)
+    }
+
+    func derivedTranscriptChanged(_ session: AgentTabSession) {
+        sink(for: session)?.derivedTranscript?(session)
     }
 
     static func applyRunActivity(to session: AgentTabSession, isActive: Bool) {

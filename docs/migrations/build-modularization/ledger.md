@@ -3806,3 +3806,86 @@ prepared execution host must become window-free. The obsolete prepared-window
 factory and close-cancels-run path are not retired yet. These remaining gates are
 part of M9, not delegated to M10. No publishing or visible app lifecycle action
 occurred.
+
+### M9 continuation — provider attachment and stream effects (2026-11-07)
+
+`Scope.attachments` owns reservation/consumption/finalization, admitted retention
+and hydration-repair tasks, and canonical attachment-path application. The run
+service and Codex call this concrete owner; the VM no longer stores retention
+tasks or performs those mutations. File admission and deletion still belong to
+`AgentSessionDataService`. Reservations capture both the temporary directory and
+retained root, rather than consulting the selected workspace when a turn ends.
+Publication after IO checks the exact live object, binding/restoration incarnation
+and storage location; stale disk effects remain available for a later exact
+hydration repair. Admitted tasks retain their scope until completion; cancelling
+a drain waiter does not claim that the move completed. Sweep protection now comes
+from live runtime scopes plus admitted retention operations, not a window census.
+
+`Scope.stream` owns accepted stream application, tool accounting, buffered text,
+reasoning status and terminal transcript repair. It shares the scope's usage and
+persistence services. Run/tool hooks bind those actual services, while exact-object
+presentation sinks carry assistant revision/generation and derived-publication
+notifications. Tool-hook refresh/save no longer targets a potentially recycled
+tab ID. The existing run-attempt and terminal authorities are unchanged. The
+stream owner borrows the run service/coordinator weakly to avoid a hook cycle;
+the final runtime host still must own those dependencies independently of UI.
+
+Review compared the moved algorithms against their removed bodies. It identified
+missing-placement cleanup and first-binding retention cases: managed temporary
+cleanup remains available without a reservation, and a previously unbound live
+object qualifies its first retained-session destination at consumption. An
+already bound reservation never adopts a different identity. Explicit test storage
+overrides do not require a workspace presentation. A stale reasoning flush also
+releases its pending slot instead of suppressing later previews. That reasoning
+feature remains disabled by existing policy; no feature flag was enabled for
+validation. The hydration repair admission was checked against the real caller:
+`persistentBindingTransitionIsCurrent` already requires the exact object in the
+scope before `applyPersistedHydration` can invoke it. Usage wrappers had no hidden
+publication side effects beyond the moved save-on-appended-usage behavior.
+
+Initial attachment conductor ticket `012bddb4-9487-43cc-9012-cf61d9e4c845`
+(`m9-attachment-runtime-v1`) passed **130 tests**: image retention 29, Oracle
+attachment forwarding 2, standalone attachment runtime 4, deletion 21, Codex
+resume/wedge commit 74. Combined stream ticket
+`ef7a800b-3948-404d-b965-84f23410cb1d` (`m9-stream-attachments-v1`) passed
+**95 tests** before review fixes: ACP execution 11, ACP tool correlation 10, image
+retention 29, quiet lifecycle 25, transcript retention 12, standalone attachment
+4 and stream 4. The filter's `AgentAssistantPresentation` term matched no suite;
+the expanded run uses actual pane presentation/publication suite names. Expanded
+post-review validation and lint are recorded below once settled. The standalone fixtures construct no window, prompt VM or workspace VM.
+
+Post-review runs `59a2ac39-dea1-4280-bb7c-fa3ff8fb0f95`
+(`m9-stream-attachments-v2`) and `fbbcedce-110b-46b4-ab0d-27f42866fbeb`
+(`m9-stream-attachments-v3`) each ran 255 tests with one failure in the new
+explicit-storage VM fixture. Keeping the UI adapter explicitly alive did not fix
+it. Diagnostic ticket `9f9a5b8c-ccdf-4b32-9a75-9cbcd8e3ee8b` isolated the failing
+location witness: object, binding and restoration stayed current, but URL equality
+changed after creation of a previously absent retention directory. The captured
+location now explicitly represents directories before they exist, preserving the
+same-path identity without weakening incarnation or moved-storage rejection. The
+regression asserts absent storage before retention, normalized directory identity,
+unchanged binding/location and the repaired row afterward. Lint tickets
+`3a3eb149-aa56-45fc-bea1-a9c7226f4f6a` and
+`1e766b04-22c4-4cc2-9d87-a5ae028ad5a9` passed on their respective pre-fix trees;
+neither is claimed as final post-normalization evidence.
+
+Final conductor ticket `24eafbdb-e608-4c20-aa36-4f6064223221`
+(`m9-stream-attachments-v4`) passed **255 tests** after directory normalization:
+ACP execution 11, ACP tool correlation 10, image retention 30, quiet lifecycle 25,
+transcript retention 12, standalone attachment runtime 6, deletion 21, standalone
+stream runtime 5, pane presentation 42, pane snapshot publication 4, Claude
+compaction usage 4, Claude plugin bridge 11, Codex resume/wedge commit 74.
+Final lint `8e6245da-f558-43e5-bf2c-ccde2566c96a`
+(`m9-stream-attachments-lint-v3`) passed on the same Swift tree. Scoped formatting,
+not a repository-wide baseline, preceded these runs. No visible app lifecycle
+action was taken.
+
+The first commit preflight rejected the additional test-file count (`340 > 339`).
+The two new runtime-effect suites were consolidated, without dropping tests, into
+`AgentSessionProviderEffectsRuntimeTests.swift`; no baseline was raised. Conductor
+`3a532555-fe8b-4c3d-96ac-53c6b9688026` passed all **11** consolidated tests.
+
+This is still not final M9 acceptance. Provider input, binding/MCP interaction,
+queued-work and terminal/handoff services, exact domain catalog composition, the
+saved execution host and bounded retirement remain in M9. The prepared-window
+factory and close-cancels-run path still exist; M10's target move is untouched.

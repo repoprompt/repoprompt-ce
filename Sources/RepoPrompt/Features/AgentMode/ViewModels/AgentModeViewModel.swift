@@ -784,16 +784,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private let workflowStore = AgentWorkflowStore.shared
     let attachmentStore = AgentAttachmentStore()
     let attachmentWorkspaceDirectoryProvider: () -> URL?
-    /// App composition owns launch policy and the live window registry; standalone tests inject both.
+    /// App composition owns launch policy; file protection is derived from live runtime scopes.
     let attachmentPersistenceIsSuppressed: () -> Bool
-    let attachmentSweepViewModels: () -> [AgentModeViewModel]
     /// Overrides `<workspace>/AgentSessions/attachments` (tests); `nil` uses the active workspace.
     var sessionAttachmentsRootOverride: (() -> URL?)?
-    var sessionAttachmentLimits: AgentSessionAttachmentStore.Limits = .standard
+    var sessionAttachmentLimits: AgentSessionAttachmentStore.Limits = .standard {
+        didSet { runtimeSessionStore.attachments.limits = sessionAttachmentLimits }
+    }
+
     /// Latest blocked-attach notice surfaced in the composer instead of a mid-run transcript row.
     var imageAttachmentNotice: AgentImageAttachmentNoticeProps?
-    /// Off-main moves of finished turns' images into session storage, keyed by a per-move token.
-    var attachmentRetentionTasks: [UUID: Task<Void, Never>] = [:]
     /// Attachment roots already swept this process (`AgentModeViewModel+DraftsAttachments`).
     static var sweptSessionAttachmentRoots: Set<String> = []
     /// Delay before the startup sweep runs, so it never competes with workspace restore.
@@ -1101,7 +1101,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     nonisolated static let transcriptVisibleItemLimit = 50
     private nonisolated static let detachedTranscriptVisibleItemBuffer = 5
     private nonisolated static let detachedTranscriptEvictionChunkSize = 5
-    private nonisolated static let pendingToolFinalizationNonToolBoundary = AgentSessionTranscriptRefreshRuntime.pendingToolFinalizationNonToolBoundary
     nonisolated static let staleComposerSubmitTargetMessage = "This composer changed before the message could be sent. Please try again."
     private nonisolated static let childAgentRunWaitDrainTimeoutSeconds: TimeInterval = 2.0
 
@@ -2034,6 +2033,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 turnFailed: { [weak self] session, error in
                     guard let self, sessions[session.tabID] === session else { return }
                     notifyAgentTurnFailed(for: session, errorText: error)
+                },
+                assistantDelta: { [weak self] session, revision, generation in
+                    guard let self, sessions[session.tabID] === session else { return }
+                    requestAssistantPresentationRefresh(session: session, sourceItemsRevision: revision, flushGeneration: generation)
+                },
+                derivedTranscript: { [weak self] session in
+                    guard let self, sessions[session.tabID] === session else { return }
+                    publishDerivedTranscriptState(for: session)
                 }
             ))
         }
@@ -2689,7 +2696,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         workspaceManager: WorkspaceManagerViewModel,
         mcpServer: MCPServerViewModel,
         attachmentPersistenceIsSuppressed: @escaping () -> Bool,
-        attachmentSweepViewModels: @escaping () -> [AgentModeViewModel],
         oracleViewModel: OracleViewModel? = nil,
         applyEditsApprovalStore: ApplyEditsApprovalStore = .shared,
         clearConsumedAttachmentsAfterProviderConsumption: Bool = true,
@@ -2707,7 +2713,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         self.workspaceManager = workspaceManager
         self.mcpServer = mcpServer
         self.attachmentPersistenceIsSuppressed = attachmentPersistenceIsSuppressed
-        self.attachmentSweepViewModels = attachmentSweepViewModels
         self.oracleViewModel = oracleViewModel
         self.applyEditsApprovalStore = applyEditsApprovalStore
         self.modelRouterSettingsStore = modelRouterSettingsStore
@@ -2921,7 +2926,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             testWorkspacePath: String? = nil,
             testWorkspaceDirectory: URL? = nil,
             attachmentPersistenceIsSuppressed: @escaping () -> Bool = { false },
-            attachmentSweepViewModels: @escaping () -> [AgentModeViewModel] = { [] },
             applyEditsApprovalStore: ApplyEditsApprovalStore = .shared,
             clearConsumedAttachmentsAfterProviderConsumption: Bool = true,
             shouldManageCodexTooling: Bool = false,
@@ -2998,7 +3002,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             workspaceManager = nil
             mcpServer = testMCPServer
             self.attachmentPersistenceIsSuppressed = attachmentPersistenceIsSuppressed
-            self.attachmentSweepViewModels = attachmentSweepViewModels
             modelRouterSettingsStore = testModelRouterSettingsStore
             self.applyEditsApprovalStore = applyEditsApprovalStore
             catalogDiagnosticsSink = testCatalogDiagnosticsSink
@@ -3163,7 +3166,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessionListCacheGeneration &+= 1
     }
 
-    let usageRuntime = AgentSessionUsageRuntime()
+    var usageRuntime: AgentSessionUsageRuntime {
+        runtimeSessionStore.usage
+    }
+
+    var streamRuntime: AgentSessionStreamRuntime {
+        runtimeSessionStore.stream
+    }
 
     func slashSkillSuggestions(for query: String) async -> [MentionSuggestion] {
         let sourceTabID = currentTabID
@@ -3573,23 +3582,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             usage: usageRuntime.makeRunHooks(scheduleSave: { session in
                 persistence.scheduleSave(for: session)
             }),
-            attachments: .init(
-                reserveAttachmentsForTurn: { [weak self] attachments, session in
-                    self?.reserveAttachmentsForTurn(attachments, session: session)
-                },
-                markAttachmentsConsumed: { [weak self] session, reservationID in
-                    self?.markAttachmentsConsumed(for: session, reservationID: reservationID)
-                },
-                stageConsumedAttachmentFilesForDeferredCleanup: { [weak self] attachments, session in
-                    self?.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session: session)
-                },
-                consumeDeferredAttachmentCleanup: { [weak self] session, shouldDeleteFiles in
-                    self?.consumeDeferredAttachmentCleanup(for: session, shouldDeleteFiles: shouldDeleteFiles)
-                },
-                finalizeAttachmentsForTurn: { [weak self] session, reservationID, disposition in
-                    self?.finalizeAttachmentsForTurn(for: session, reservationID: reservationID, disposition: disposition)
-                }
-            ),
+            attachments: attachmentRuntime.makeRunHooks(),
             presentation: runtimeSessionStore.presentation.makeRunHooks(),
             bindingObservation: .init(
                 updateBindings: { [weak self] session in
@@ -3611,43 +3604,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
             ),
             persistence: persistence.makeRunHooks(),
-            transcript: .init(
-                handleHeadlessStreamResult: { [weak self] result, session, runID, runAttemptID in
-                    await self?.handleStreamResult(result, session: session, runID: runID, runAttemptID: runAttemptID)
-                },
-                finalizeStreamingItems: { [weak self] session in
-                    self?.finalizeStreamingItems(in: session)
-                },
-                finalizePendingToolCalls: { [weak self] session, terminalState in
-                    _ = self?.finalizePendingToolCalls(
-                        in: session,
-                        terminalState: terminalState,
-                        includeExplicitRepoPromptToolCalls: AgentTranscriptQualityRepair.shouldFinalizeExplicitRepoPromptTools(
-                            context: .liveTerminal(agentKind: session.selectedAgent)
-                        )
-                    )
-                },
-                finalizePendingToolCallsWithUpperBound: { [weak self] session, terminalState, maxSequenceIndexExclusive in
-                    _ = self?.finalizePendingToolCalls(
-                        in: session,
-                        terminalState: terminalState,
-                        includeExplicitRepoPromptToolCalls: AgentTranscriptQualityRepair.shouldFinalizeExplicitRepoPromptTools(
-                            context: .liveTerminal(agentKind: session.selectedAgent)
-                        ),
-                        maxSequenceIndexExclusive: maxSequenceIndexExclusive
-                    )
-                },
-                flushPendingAssistantDelta: { [weak self] session in
-                    self?.flushPendingAssistantDelta(session)
-                },
-                beginClaudeProviderOutputSegment: { [weak self] session in
-                    self?.flushPendingAssistantDelta(session)
-                    self?.endActiveAssistantSegment(session)
-                },
-                clearPendingAssistantDelta: { [weak self] session in
-                    self?.clearPendingAssistantDelta(session)
-                }
-            ),
+            transcript: streamRuntime.makeRunHooks(),
             providerInput: .init(
                 buildHeadlessAgentMessage: { [weak self] session, initialMessage, runID, attachments in
                     self?.buildHeadlessAgentMessage(
@@ -3803,14 +3760,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         )
         let toolTrackingHooks = makeToolTrackingHooks()
-        // Wire hooks so per-tab Claude handlers get proper viewmodel callbacks.
+        // Tool application is owned by the same runtime scope as streaming and persistence.
         claudeCoordinator.toolTrackingHooks = toolTrackingHooks
-        return AgentModeRunService(
+        let service = AgentModeRunService(
             dependencies: dependencies,
             hooks: hooks,
             toolTrackingHooks: toolTrackingHooks,
             perfRecorder: perfRecorder
         )
+        streamRuntime.runService = service
+        streamRuntime.codexCoordinator = codexCoordinator
+        return service
     }
 
     private func scheduleTypedACPFollowUpRun(
@@ -3950,35 +3910,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
-    /// Build the generic orchestration hooks that provider tool tracking handlers need.
     private func makeToolTrackingHooks() -> AgentToolTrackingHooks {
-        AgentToolTrackingHooks(
-            flushPendingAssistantDelta: { [weak self] session in
-                self?.flushPendingAssistantDelta(session)
-            },
-            endActiveAssistantSegment: { [weak self] session in
-                self?.endActiveAssistantSegment(session)
-            },
-            endActiveReasoningSegment: { [weak self] session in
-                self?.endActiveReasoningSegment(session)
-            },
-            sealAssistantBoundary: { [weak self] session in
-                self?.flushPendingAssistantDelta(session)
-                self?.endActiveAssistantSegment(session)
-            },
-            requestUIRefresh: { [weak self] tabID, urgent in
-                self?.requestUIRefresh(tabID: tabID, urgent: urgent)
-            },
-            scheduleSave: { [weak self] tabID in
-                self?.scheduleSave(for: tabID)
-            },
-            addToolInputTokens: { [weak self] payload, session in
-                self?.addToolInputTokens(payload, for: session)
-            },
-            addToolOutputTokens: { [weak self] payload, session in
-                self?.addToolOutputTokens(payload, for: session)
-            }
-        )
+        streamRuntime.makeToolTrackingHooks()
     }
 
     func toggleComputerUse(tabID: UUID, expectedSessionIdentity: ObjectIdentifier) async {
@@ -16635,6 +16568,28 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
+    var attachmentRuntime: AgentSessionAttachmentRuntime {
+        let runtime = runtimeSessionStore.attachments
+        guard runtime.configuration == nil else { return runtime }
+        runtime.clearsConsumedFiles = clearConsumedAttachmentsAfterProviderConsumption
+        runtime.limits = sessionAttachmentLimits
+        runtime.configuration = .init(
+            location: { [weak self] session in self?.attachmentLocation(for: session) },
+            locationIsCurrent: { [weak self] location, session in
+                guard let self, let current = attachmentLocation(for: session) else { return false }
+                return current.retainedRoot == location.retainedRoot
+            }
+        )
+        runtime.invalidatePreviews = { paths in
+            guard !paths.isEmpty else { return }
+            AttachmentTilePreviewCache.shared.retainedImages.invalidate(paths: paths)
+        }
+        // Both services share the same scope; the persistence adapter is installed before a
+        // retention completion can schedule its canonical-path repair.
+        _ = persistenceRuntime
+        return runtime
+    }
+
     var persistenceRuntime: AgentSessionPersistenceRuntime {
         let runtime = runtimeSessionStore.persistence
         if runtime.composition == nil { installPersistenceComposition(runtime) }
@@ -20823,190 +20778,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return AgentMessage(systemPrompt: systemPrompt, userMessage: fullMessage, resumeSessionID: resumeSessionID)
     }
 
-    private static let claudeReasoningStatusBufferCharacterLimit = 4000
-    private static let claudeReasoningStatusPreviewCharacterLimit = 128
-    private static let claudeReasoningStatusUpdateIntervalNanos: UInt64 = 120_000_000
-
-    #if DEBUG
-        private static func claudeReasoningDebug(_ message: @autoclosure () -> String) {
-            guard ClaudeReasoningExtractionFeature.isEnabled else { return }
-            let line = "[ClaudeReasoningDebug][ViewModel] \(message())"
-            print(line)
-            ClaudeReasoningDebugLog.append(line)
-        }
-    #else
-        private static func claudeReasoningDebug(_ message: @autoclosure () -> String) {}
-    #endif
-
-    private static func claudeReasoningDebugSnippet(_ text: String, limit: Int = 160) -> String {
-        text
-            .replacingOccurrences(of: "\n", with: "\\n")
-            .replacingOccurrences(of: "\r", with: "\\r")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .prefix(limit)
-            .description
-    }
-
-    private static func claudeReasoningStatusPreview(from rawBuffer: String) -> String? {
-        let trimmed = rawBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        let normalized = ReasoningTextFormatter.normalize(trimmed)
-        let candidateLine = normalized
-            .components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .last(where: { !$0.isEmpty })
-            ?? normalized
-        let collapsed = candidateLine
-            .split(whereSeparator: { $0.isWhitespace })
-            .joined(separator: " ")
-        let cleaned = stripClaudeReasoningPreviewDecoration(collapsed)
-        guard !cleaned.isEmpty else { return nil }
-        return tailTruncatedOneLine(cleaned, limit: claudeReasoningStatusPreviewCharacterLimit)
-    }
-
-    private static func stripClaudeReasoningPreviewDecoration(_ text: String) -> String {
-        var value = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        while value.hasPrefix("#") {
-            value.removeFirst()
-            value = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        for marker in ["- ", "* ", "• "] where value.hasPrefix(marker) {
-            value.removeFirst(marker.count)
-            value = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        if value.hasPrefix("**"), value.hasSuffix("**"), value.count > 4 {
-            value.removeFirst(2)
-            value.removeLast(2)
-            value = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        return value
-    }
-
-    private static func tailTruncatedOneLine(_ text: String, limit: Int) -> String {
-        guard text.count > limit else { return text }
-        let suffixLimit = max(1, limit - 1)
-        var suffix = String(text.suffix(suffixLimit))
-        if let firstWhitespace = suffix.firstIndex(where: { $0.isWhitespace }),
-           firstWhitespace != suffix.startIndex
-        {
-            suffix = String(suffix[suffix.index(after: firstWhitespace)...])
-        }
-        if suffix.count > suffixLimit {
-            suffix = String(suffix.suffix(suffixLimit))
-        }
-        return "…" + suffix
-    }
-
-    private static func claudeDisplayableStatusText(_ raw: String?) -> String? {
-        var text = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !text.isEmpty else { return nil }
-        if let range = text.range(of: "Permission mode:", options: [.caseInsensitive]) {
-            text = String(text[..<range.lowerBound])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            while text.hasSuffix("—") || text.hasSuffix("-") {
-                text.removeLast()
-                text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-        }
-        guard !text.isEmpty else { return nil }
-        return text
-    }
-
-    @discardableResult
-    private func setTransportRunningStatus(
-        _ text: String?,
-        session: TabSession,
-        allowOverrideReasoning: Bool = false
-    ) -> Bool {
-        if session.runningStatusSource == .reasoning, !allowOverrideReasoning {
-            return false
-        }
-        if allowOverrideReasoning {
-            session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
-        }
-        return session.setRunningStatus(text, source: .transport)
+    private static func claudeReasoningStatusPreview(from raw: String) -> String? {
+        AgentSessionStreamRuntime.claudeReasoningStatusPreview(from: raw)
     }
 
     @discardableResult
     private func applyClaudeReasoningStatusDelta(_ delta: String, session: TabSession) -> Bool {
-        guard ClaudeReasoningExtractionFeature.isEnabled else { return false }
-        guard session.selectedAgent.usesClaudeNativeRuntime else {
-            Self.claudeReasoningDebug("drop delta for non-Claude-native agent tab=\(session.tabID.uuidString) selectedAgent=\(session.selectedAgent.rawValue)")
-            return false
-        }
-        let trimmedDelta = delta.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedDelta.isEmpty else {
-            Self.claudeReasoningDebug("drop empty reasoning delta tab=\(session.tabID.uuidString)")
-            return false
-        }
-        Self.claudeReasoningDebug("apply delta tab=\(session.tabID.uuidString) deltaLen=\(delta.count) trimmedLen=\(trimmedDelta.count) snippet=\(Self.claudeReasoningDebugSnippet(delta)) statusBefore=\(session.runningStatusText ?? "nil") sourceBefore=\(String(describing: session.runningStatusSource))")
-        session.claudeReasoningStatusBuffer = delta
-        if session.claudeReasoningStatusBuffer.count > Self.claudeReasoningStatusBufferCharacterLimit {
-            session.claudeReasoningStatusBuffer = String(session.claudeReasoningStatusBuffer.suffix(Self.claudeReasoningStatusBufferCharacterLimit))
-            Self.claudeReasoningDebug("trimmed reasoning buffer tab=\(session.tabID.uuidString) bufferLen=\(session.claudeReasoningStatusBuffer.count)")
-        }
-        guard let preview = Self.claudeReasoningStatusPreview(from: session.claudeReasoningStatusBuffer) else {
-            Self.claudeReasoningDebug("no displayable preview tab=\(session.tabID.uuidString) bufferLen=\(session.claudeReasoningStatusBuffer.count)")
-            return false
-        }
-        Self.claudeReasoningDebug("pending preview tab=\(session.tabID.uuidString) preview=\(Self.claudeReasoningDebugSnippet(preview)) existingFlushTask=\(session.claudeReasoningStatusFlushTask != nil)")
-        if session.runningStatusSource == .reasoning {
-            session.claudeReasoningStatusPendingText = nil
-            session.claudeReasoningStatusFlushTask?.cancel()
-            session.claudeReasoningStatusFlushTask = nil
-            let changed = session.setRunningStatus(preview, source: .reasoning)
-            Self.claudeReasoningDebug("replace visible preview tab=\(session.tabID.uuidString) changed=\(changed) preview=\(Self.claudeReasoningDebugSnippet(preview))")
-            if changed {
-                requestUIRefresh(tabID: session.tabID)
-            }
-            return changed
-        }
-        session.claudeReasoningStatusPendingText = preview
-        guard session.claudeReasoningStatusFlushTask == nil else { return false }
-        session.claudeReasoningStatusFlushTask = Task { [weak self, weak session] in
-            do {
-                try await Task.sleep(nanoseconds: Self.claudeReasoningStatusUpdateIntervalNanos)
-            } catch {
-                return
-            }
-            guard !Task.isCancelled else { return }
-            await MainActor.run {
-                guard !Task.isCancelled, let self, let session else { return }
-                session.claudeReasoningStatusFlushTask = nil
-                guard session.selectedAgent.usesClaudeNativeRuntime else {
-                    Self.claudeReasoningDebug("flush dropped for non-Claude-native agent tab=\(session.tabID.uuidString) selectedAgent=\(session.selectedAgent.rawValue)")
-                    return
-                }
-                guard let pendingText = session.claudeReasoningStatusPendingText else {
-                    Self.claudeReasoningDebug("flush found no pending text tab=\(session.tabID.uuidString)")
-                    return
-                }
-                session.claudeReasoningStatusPendingText = nil
-                let changed = session.setRunningStatus(pendingText, source: .reasoning)
-                Self.claudeReasoningDebug("flush preview tab=\(session.tabID.uuidString) changed=\(changed) pending=\(Self.claudeReasoningDebugSnippet(pendingText)) statusAfter=\(session.runningStatusText ?? "nil") sourceAfter=\(String(describing: session.runningStatusSource))")
-                if changed {
-                    self.requestUIRefresh(tabID: session.tabID)
-                }
-            }
-        }
-        return false
-    }
-
-    @discardableResult
-    private func clearClaudeReasoningStatus(_ session: TabSession) -> Bool {
-        guard session.selectedAgent.usesClaudeNativeRuntime else { return false }
-        let shouldLog = !session.claudeReasoningStatusBuffer.isEmpty
-            || session.claudeReasoningStatusPendingText != nil
-            || session.claudeReasoningStatusFlushTask != nil
-            || session.runningStatusSource == .reasoning
-        if shouldLog {
-            Self.claudeReasoningDebug("clear status tab=\(session.tabID.uuidString) bufferLen=\(session.claudeReasoningStatusBuffer.count) pending=\(session.claudeReasoningStatusPendingText ?? "nil") source=\(String(describing: session.runningStatusSource))")
-        }
-        let changed = session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
-        if shouldLog {
-            Self.claudeReasoningDebug("clear status complete tab=\(session.tabID.uuidString) changed=\(changed) statusAfter=\(session.runningStatusText ?? "nil") sourceAfter=\(String(describing: session.runningStatusSource))")
-        }
-        return changed
+        streamRuntime.applyClaudeReasoningStatusDelta(delta, session: session)
     }
 
     #if DEBUG
@@ -21028,372 +20806,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     #endif
 
-    private func handleStreamResult(
-        _ result: AIStreamResult,
-        session: TabSession,
-        runID: UUID,
-        runAttemptID: UUID
-    ) async {
-        if session.activeRunAttemptID != runAttemptID,
-           let reroutedSession = sessions.values.first(where: {
-               $0.runID == runID && $0.activeRunAttemptID == runAttemptID
-           }),
-           reroutedSession !== session
-        {
-            await handleStreamResult(
-                result,
-                session: reroutedSession,
-                runID: runID,
-                runAttemptID: runAttemptID
-            )
-            return
-        }
-        await MainActor.run {
-            guard session.runID == runID,
-                  session.activeRunAttemptID == runAttemptID,
-                  let owner = session.activeRunOwnership,
-                  session.isCurrentRunAttemptForCurrentBinding(owner) else { return }
-            session.noteAcceptedStream(result, owner: owner)
-            var shouldUpdateBindings = false
-            switch result.type {
-            case "content":
-                // Normal content text
-                guard let content = result.text, !content.isEmpty else { break }
-                shouldUpdateBindings = clearClaudeReasoningStatus(session) || shouldUpdateBindings
-                enqueueAssistantDelta(content, session: session)
-
-            case "final_content":
-                // Final authoritative message content for the turn.
-                guard let content = result.text else { break }
-                shouldUpdateBindings = clearClaudeReasoningStatus(session) || shouldUpdateBindings
-                // Materialize any pending content delta first so we preserve ordering.
-                flushPendingAssistantDelta(session)
-                guard AgentDisplayableText.hasDisplayableBody(content) else { break }
-
-                // Search backward for a trailing assistant bubble. It may not be the
-                // very last item if system events (e.g. rate-limit telemetry) were
-                // interleaved, which can prematurely finalize the streaming segment.
-                // Walk past system items but stop at tool calls, user messages, etc.
-                let attemptStartKey = session.quietLedger.startKey(owner: owner) ?? session.nextSequenceIndex
-                let providerStartKey = session.claudeProviderOutputBoundary.flatMap { $0.attemptID == owner.attemptID ? $0.startSequenceIndex : nil }
-                let outputStartKey = max(attemptStartKey, providerStartKey ?? attemptStartKey)
-                let tailAssistantIndex: Int? = {
-                    if let streamingAssistantIndex = self.resumableStreamingAssistantIndexAcrossTrailingUserInterjections(in: session),
-                       session.items[streamingAssistantIndex].sequenceIndex >= outputStartKey
-                    {
-                        return streamingAssistantIndex
-                    }
-                    for i in session.items.indices.reversed() {
-                        switch session.items[i].kind {
-                        case .assistant:
-                            return session.items[i].sequenceIndex >= outputStartKey ? i : nil
-                        case .system:
-                            continue
-                        default:
-                            return nil
-                        }
-                    }
-                    return nil
-                }()
-
-                if let index = tailAssistantIndex {
-                    var updated = session.items[index]
-                    updated.text = content
-                    updated.isStreaming = false
-                    session.replaceItem(at: index, with: updated)
-                } else {
-                    let assistantItem = AgentChatItem.assistant(content, sequenceIndex: session.nextSequenceIndex)
-                    session.appendItem(assistantItem)
-                }
-                shouldUpdateBindings = true
-
-            case "reasoning":
-                guard ClaudeReasoningExtractionFeature.isEnabled else { break }
-                // Claude provider-internal reasoning/thinking traces update only the
-                // transient running-status row. They are intentionally never added to
-                // the persisted chat transcript.
-                Self.claudeReasoningDebug("handleStreamResult reasoning tab=\(session.tabID.uuidString) hasReasoning=\(result.reasoning != nil) textLen=\(result.text?.count ?? 0) reasoningLen=\(result.reasoning?.count ?? 0) selectedAgent=\(session.selectedAgent.rawValue)")
-                if session.selectedAgent.usesClaudeNativeRuntime,
-                   let reasoning = result.reasoning ?? result.text
-                {
-                    shouldUpdateBindings = applyClaudeReasoningStatusDelta(reasoning, session: session) || shouldUpdateBindings
-                } else {
-                    Self.claudeReasoningDebug("reasoning result ignored tab=\(session.tabID.uuidString) usesClaudeNative=\(session.selectedAgent.usesClaudeNativeRuntime)")
-                }
-
-            case "tool_call":
-                // Structured tool call event with args. Keep any Claude reasoning
-                // status visible through tool execution; it is replaced by the next
-                // reasoning update or cleared when assistant content starts.
-                guard let toolName = result.toolName else { break }
-                let argsJSON = result.toolArgsJSON ?? result.toolArgs
-                flushPendingAssistantDelta(session)
-                endActiveAssistantSegment(session)
-                endActiveReasoningSegment(session)
-                // Route provider-specific tool events through dedicated handlers.
-                if runService.handleProviderToolStreamEvent(result, session: session) {
-                    shouldUpdateBindings = true
-                    break
-                }
-                if AgentToolTrackingSupport.shouldSuppressProviderToolEvent(
-                    toolName: toolName,
-                    invocationID: result.toolInvocationID
-                ) {
-                    break
-                }
-                addToolInputTokens(argsJSON, for: session)
-                guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { break }
-                if AgentToolTrackingSupport.shouldAutoCompleteProviderToolCall(
-                    for: session,
-                    toolName: toolName,
-                    invocationID: result.toolInvocationID
-                ) {
-                    let syntheticResultJSON = AgentToolTrackingSupport.syntheticCompletedToolResultJSON(
-                        note: "Provider emitted tool_call without a matching tool_result event."
-                    )
-                    var toolResultItem = AgentChatItem.toolResult(
-                        name: toolName,
-                        invocationID: result.toolInvocationID,
-                        resultJSON: syntheticResultJSON,
-                        isError: false,
-                        sequenceIndex: session.nextSequenceIndex
-                    )
-                    toolResultItem.toolArgsJSON = argsJSON
-                    session.appendItem(toolResultItem)
-                } else {
-                    let toolItem = AgentChatItem.toolCall(name: toolName, invocationID: result.toolInvocationID, argsJSON: argsJSON, sequenceIndex: session.nextSequenceIndex)
-                    session.appendItem(toolItem)
-                }
-                shouldUpdateBindings = true
-
-            case "tool_result":
-                // Structured tool result event with output. Preserve Claude reasoning
-                // status across tool results.
-                guard let toolName = result.toolName else { break }
-                let outputJSON = result.toolResultJSON ?? result.toolOutput ?? ""
-                let argsJSON = result.toolArgsJSON ?? result.toolArgs
-                flushPendingAssistantDelta(session)
-                endActiveAssistantSegment(session)
-                endActiveReasoningSegment(session)
-                // Route provider-specific tool events through dedicated handlers.
-                if runService.handleProviderToolStreamEvent(result, session: session) {
-                    shouldUpdateBindings = true
-                    break
-                }
-                if AgentToolTrackingSupport.shouldSuppressProviderToolEvent(
-                    toolName: toolName,
-                    invocationID: result.toolInvocationID
-                ) {
-                    break
-                }
-                addToolOutputTokens(outputJSON, for: session)
-                guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { break }
-                let invocationID = result.toolInvocationID
-                if let invocationID,
-                   let index = session.items.lastIndex(where: { $0.toolInvocationID == invocationID })
-                {
-                    var updated = session.items[index]
-                    updated.kind = .toolResult
-                    updated.toolArgsJSON = argsJSON ?? updated.toolArgsJSON
-                    if let payload = AgentToolResultPayloadRetention.resolvedPayload(
-                        existing: updated.toolResultJSON,
-                        incoming: outputJSON,
-                        incomingIsError: result.toolIsError
-                    ) {
-                        updated.toolResultJSON = payload
-                        updated.toolIsError = result.toolIsError
-                        updated.text = payload
-                    }
-                    session.replaceItem(at: index, with: updated)
-                } else if let index = session.items.lastIndex(where: { $0.kind == .toolCall && $0.toolName == toolName }) {
-                    var updated = session.items[index]
-                    updated.kind = .toolResult
-                    updated.toolInvocationID = invocationID ?? updated.toolInvocationID
-                    updated.toolResultJSON = outputJSON
-                    updated.toolArgsJSON = argsJSON ?? updated.toolArgsJSON
-                    updated.toolIsError = result.toolIsError
-                    updated.text = outputJSON
-                    session.replaceItem(at: index, with: updated)
-                } else {
-                    let toolResultItem = AgentChatItem.toolResult(
-                        name: toolName,
-                        invocationID: invocationID,
-                        resultJSON: outputJSON,
-                        isError: result.toolIsError,
-                        sequenceIndex: session.nextSequenceIndex
-                    )
-                    session.appendItem(toolResultItem)
-                }
-                codexCoordinator.reconcileCodexCommandExecutionRunningUpdate(
-                    toolName: toolName,
-                    argsJSON: argsJSON,
-                    resultJSON: outputJSON,
-                    isError: result.toolIsError,
-                    session: session
-                )
-                shouldUpdateBindings = true
-
-            case "event":
-                // Legacy tool usage event (e.g., "Using tool: read_file") - fallback for compatibility
-                if let eventText = result.text, eventText.hasPrefix("Using tool: ") {
-                    flushPendingAssistantDelta(session)
-                    endActiveAssistantSegment(session)
-                    endActiveReasoningSegment(session)
-                    let toolName = String(eventText.dropFirst("Using tool: ".count))
-                    if AgentToolTrackingSupport.shouldSuppressProviderToolEvent(toolName: toolName, invocationID: nil) {
-                        break
-                    }
-                    guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { break }
-                    let toolItem = AgentChatItem.toolCall(name: toolName, argsJSON: nil, sequenceIndex: session.nextSequenceIndex)
-                    session.appendItem(toolItem)
-                    shouldUpdateBindings = true
-                }
-
-            case "tool_progress":
-                if let progress = result.text?.trimmingCharacters(in: .whitespacesAndNewlines), !progress.isEmpty {
-                    shouldUpdateBindings = setTransportRunningStatus(progress, session: session) || shouldUpdateBindings
-                }
-
-            case "status":
-                nonCodexContextUsageEstimator(for: session.selectedAgent)?.ingestStatusSignal(result.text, session: session)
-                let statusText = session.selectedAgent.usesClaudeNativeRuntime
-                    ? Self.claudeDisplayableStatusText(result.text)
-                    : result.text?.trimmingCharacters(in: .whitespacesAndNewlines)
-                if let statusText, !statusText.isEmpty {
-                    shouldUpdateBindings = setTransportRunningStatus(statusText, session: session) || shouldUpdateBindings
-                } else if session.selectedAgent.usesClaudeNativeRuntime,
-                          result.text?.range(of: "Permission mode:", options: [.caseInsensitive]) != nil,
-                          session.runningStatusSource != .reasoning
-                {
-                    shouldUpdateBindings = session.setRunningStatus(nil, source: nil) || shouldUpdateBindings
-                }
-
-            case "usage":
-                if ingestNonCodexUsageReport(
-                    promptTokens: result.promptTokens,
-                    completionTokens: result.completionTokens,
-                    contextUsedTokens: result.contextUsedTokens,
-                    modelContextWindow: result.modelContextWindow,
-                    session: session
-                ) {
-                    shouldUpdateBindings = true
-                }
-
-            case "auth_status":
-                if let status = result.text?.trimmingCharacters(in: .whitespacesAndNewlines), !status.isEmpty {
-                    shouldUpdateBindings = setTransportRunningStatus(status, session: session, allowOverrideReasoning: true) || shouldUpdateBindings
-                    let systemItem = AgentChatItem.system(status, sequenceIndex: session.nextSequenceIndex)
-                    session.appendItem(systemItem)
-                    shouldUpdateBindings = true
-                }
-
-            case "session_state_changed":
-                // Claude Code lifecycle event — update run-state UI only, no transcript rows.
-                let state = result.text?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
-                switch state {
-                case "idle":
-                    shouldUpdateBindings = clearClaudeReasoningStatus(session) || shouldUpdateBindings
-                    shouldUpdateBindings = session.setRunningStatus(nil, source: nil) || shouldUpdateBindings
-                case "running":
-                    // Keep active reasoning previews; otherwise show the generic fallback.
-                    if session.runningStatusText == nil {
-                        shouldUpdateBindings = setTransportRunningStatus("Thinking…", session: session) || shouldUpdateBindings
-                    }
-                default:
-                    if !state.isEmpty {
-                        // Humanize: replace underscores with spaces, capitalize words
-                        let humanized = state.replacingOccurrences(of: "_", with: " ").capitalized
-                        shouldUpdateBindings = setTransportRunningStatus(humanized, session: session) || shouldUpdateBindings
-                    }
-                }
-
-            case "task_progress":
-                // Claude Code task progress — update running status text, no transcript rows.
-                // Do not displace a visible Claude reasoning preview.
-                if let progressText = result.text?.trimmingCharacters(in: .whitespacesAndNewlines),
-                   !progressText.isEmpty
-                {
-                    shouldUpdateBindings = setTransportRunningStatus(progressText, session: session) || shouldUpdateBindings
-                }
-
-            case "system":
-                // System messages - skip lifecycle messages that don't need UI display.
-                // Preserve Claude reasoning previews until the next reasoning or assistant message.
-                if let text = result.text, !text.isEmpty {
-                    if session.selectedAgent == .antigravity,
-                       text.trimmingCharacters(in: .whitespacesAndNewlines)
-                       .range(of: #"^I\d{4}\s+\d+\s"#, options: .regularExpression) != nil
-                    {
-                        break
-                    }
-                    nonCodexContextUsageEstimator(for: session.selectedAgent)?.ingestSystemSignal(text, session: session)
-                    flushPendingAssistantDelta(session)
-                    endActiveAssistantSegment(session)
-                    // Filter out agent lifecycle messages that shouldn't appear in chat
-                    let skipMessages = ["Agent initialized", "Agent completed", "Agent cancelled"]
-                    guard !skipMessages.contains(text) else { break }
-                    let systemItem = AgentChatItem.system(text, sequenceIndex: session.nextSequenceIndex)
-                    session.appendItem(systemItem)
-                    shouldUpdateBindings = true
-                }
-
-            case "error":
-                // Error messages. Preserve Claude reasoning previews until terminal
-                // finalization clears run state.
-                if let text = result.text, !text.isEmpty {
-                    flushPendingAssistantDelta(session)
-                    endActiveAssistantSegment(session)
-                    let errorItem = AgentChatItem.error(text, sequenceIndex: session.nextSequenceIndex)
-                    session.appendItem(errorItem)
-                    shouldUpdateBindings = true
-                }
-
-            case "message_stop":
-                shouldUpdateBindings = clearClaudeReasoningStatus(session) || shouldUpdateBindings
-                shouldUpdateBindings = session.setRunningStatus(nil, source: nil) || shouldUpdateBindings
-                flushPendingAssistantDelta(session)
-                endActiveAssistantSegment(session)
-                // Stream completed - assistant streaming segments already finalized above.
-
-                // Store provider session ID for resumption (native Claude or ACP runtimes).
-                if let sessionID = result.providerSessionID,
-                   session.selectedAgent.usesClaudeNativeRuntime || session.selectedAgent.acpProviderID != nil
-                {
-                    session.providerSessionID = sessionID
-                    session.providerCleanupHandle = ProviderConversationCleanupHandle.resolved(
-                        provider: session.selectedAgent.rawValue,
-                        explicit: nil,
-                        providerSessionID: sessionID,
-                        codexConversationID: session.codexConversationID,
-                        codexRolloutPath: session.codexRolloutPath
-                    )
-                    session.isDirty = true
-                    self.scheduleSave(for: session.tabID)
-                }
-
-                // Track per-turn token usage for resumable non-Codex agents.
-                ingestNonCodexTurnFinalization(
-                    promptTokens: result.promptTokens,
-                    completionTokens: result.completionTokens,
-                    contextUsedTokens: result.contextUsedTokens,
-                    modelContextWindow: result.modelContextWindow,
-                    session: session
-                )
-                shouldUpdateBindings = true
-
-            case AIStreamResult.lifecycleType:
-                // Lifecycle events (init/complete/cancel) are not rendered in chat
-                // They're handled via session.runState for UI state management
-                break
-
-            default:
-                break
-            }
-
-            if shouldUpdateBindings {
-                requestUIRefresh(tabID: session.tabID)
-            }
-        }
+    private func handleStreamResult(_ result: AIStreamResult, session: TabSession, runID: UUID, runAttemptID: UUID) async {
+        if result.type == "tool_call" || result.type == "tool_result" { _ = runService }
+        await streamRuntime.handleStreamResult(result, session: session, runID: runID, runAttemptID: runAttemptID)
     }
 
     // MARK: - Tool Event Filtering
@@ -21407,198 +20822,41 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func finalizeStreamingItems(in session: TabSession) {
-        // This owner changes streaming flags only, never membership, keys or completed text.
-        session.mutateItemsBatch(touchActivity: false, preservesQuietRange: true) { items in
-            for index in items.indices where items[index].isStreaming {
-                items[index].isStreaming = false
-            }
-        }
+        streamRuntime.finalizeStreamingItems(in: session)
     }
 
     @discardableResult
-    private func finalizePendingToolCalls(
-        in session: TabSession,
-        terminalState: AgentSessionRunState,
-        includeExplicitRepoPromptToolCalls: Bool = false
-    ) -> Int {
-        finalizePendingToolCalls(
-            in: session,
-            terminalState: terminalState,
-            includeExplicitRepoPromptToolCalls: includeExplicitRepoPromptToolCalls,
-            maxSequenceIndexExclusive: nil
-        )
-    }
-
-    @discardableResult
-    private func finalizePendingToolCalls(
-        in session: TabSession,
-        terminalState: AgentSessionRunState,
-        includeExplicitRepoPromptToolCalls: Bool = false,
-        maxSequenceIndexExclusive: Int?
-    ) -> Int {
-        var finalizedCount = 0
-        session.mutateItemsBatch(touchActivity: false) { items in
-            finalizedCount = Self.finalizePendingToolCallsInItems(
-                &items,
-                terminalState: terminalState,
-                includeExplicitRepoPromptToolCalls: includeExplicitRepoPromptToolCalls,
-                maxSequenceIndexExclusive: maxSequenceIndexExclusive
-            )
-        }
-        if finalizedCount > 0 {
-            refreshDerivedTranscriptState(for: session, reason: .manualRefresh)
-        }
-        #if DEBUG
-            if includeExplicitRepoPromptToolCalls || finalizedCount > 0 {
-                let tail = session.items.suffix(6).map { item in
-                    let tool = item.toolName ?? "-"
-                    return "\(item.sequenceIndex):\(item.kind.rawValue):\(tool)"
-                }.joined(separator: " | ")
-                print("[ACPAgentRunToolTracking] finalizePendingToolCalls session=\(session.activeAgentSessionID?.uuidString ?? "nil") agent=\(session.selectedAgent.rawValue) state=\(terminalState.rawValue) includeExplicit=\(includeExplicitRepoPromptToolCalls) finalized=\(finalizedCount) tail=\(tail)")
-            }
-        #endif
-        return finalizedCount
-    }
-
-    @discardableResult
-    private nonisolated static func finalizePendingToolCallsInItems(
-        _ items: inout [AgentChatItem],
-        terminalState: AgentSessionRunState,
-        includeExplicitRepoPromptToolCalls: Bool = false,
-        maxSequenceIndexExclusive: Int?
-    ) -> Int {
-        AgentTranscriptIO.finalizePendingToolCalls(
-            in: &items,
-            terminalState: terminalState,
-            includeExplicitRepoPromptToolCalls: includeExplicitRepoPromptToolCalls,
-            maxSequenceIndexExclusive: maxSequenceIndexExclusive,
-            nonToolBoundary: pendingToolFinalizationNonToolBoundary
-        )
+    private func finalizePendingToolCalls(in session: TabSession, terminalState: AgentSessionRunState, includeExplicitRepoPromptToolCalls: Bool = false, maxSequenceIndexExclusive: Int? = nil) -> Int {
+        streamRuntime.finalizePendingToolCalls(in: session, terminalState: terminalState, includeExplicitRepoPromptToolCalls: includeExplicitRepoPromptToolCalls, maxSequenceIndexExclusive: maxSequenceIndexExclusive)
     }
 
     func enqueueAssistantDelta(_ delta: String, session: TabSession) {
-        session.pendingAssistantDelta += delta
-        if session.assistantDeltaFlushTask == nil {
-            session.assistantDeltaTaskGeneration &+= 1
-            let taskGeneration = session.assistantDeltaTaskGeneration
-            session.assistantDeltaFlushTask = Task { [weak self, weak session] in
-                do {
-                    try await Task.sleep(nanoseconds: 250_000_000)
-                } catch {
-                    return
-                }
-                await MainActor.run {
-                    guard let self, let session,
-                          session.assistantDeltaTaskGeneration == taskGeneration
-                    else { return }
-                    self.flushPendingAssistantDelta(session)
-                }
-            }
-        }
+        streamRuntime.enqueueAssistantDelta(delta, session: session)
     }
 
     func clearPendingAssistantDelta(_ session: TabSession) {
-        session.pendingAssistantDelta = ""
-        session.assistantDeltaTaskGeneration &+= 1
-        session.assistantDeltaFlushTask?.cancel()
-        session.assistantDeltaFlushTask = nil
+        streamRuntime.clearPendingAssistantDelta(session)
     }
 
     func flushPendingAssistantDelta(_ session: TabSession) {
-        guard !session.pendingAssistantDelta.isEmpty else { return }
-        let delta = session.pendingAssistantDelta
-        clearPendingAssistantDelta(session)
-        if applyAssistantDelta(delta, session: session) {
-            session.assistantDeltaFlushGeneration &+= 1
-            requestAssistantPresentationRefresh(
-                session: session,
-                sourceItemsRevision: session.sourceItemsRevision,
-                flushGeneration: session.assistantDeltaFlushGeneration
-            )
-        }
-    }
-
-    private func resumableStreamingAssistantIndexAcrossTrailingUserInterjections(in session: TabSession) -> Int? {
-        for index in session.items.indices.reversed() {
-            let item = session.items[index]
-            if item.kind == .assistant, item.isStreaming {
-                return index
-            }
-            guard item.kind == .user else {
-                return nil
-            }
-        }
-        return nil
+        streamRuntime.flushPendingAssistantDelta(session)
     }
 
     @discardableResult
     func applyAssistantDelta(_ delta: String, session: TabSession) -> Bool {
-        if let streamingAssistantIndex = resumableStreamingAssistantIndexAcrossTrailingUserInterjections(in: session) {
-            session.mutateItem(at: streamingAssistantIndex) { item in
-                item.text += delta
-            }
-            return true
-        }
-
-        guard AgentDisplayableText.hasDisplayableBody(delta) else {
-            return false
-        }
-        var assistantItem = AgentChatItem.assistant(delta, sequenceIndex: session.nextSequenceIndex)
-        assistantItem.isStreaming = true
-        session.appendItem(assistantItem)
-        return true
+        streamRuntime.applyAssistantDelta(delta, session: session)
     }
 
     func endActiveAssistantSegment(_ session: TabSession) {
-        // Only streaming flags change here; source identity, text and order remain complete.
-        session.mutateItemsBatch(touchActivity: false, preservesQuietRange: true) { items in
-            for index in items.indices where items[index].kind == .assistant && items[index].isStreaming {
-                items[index].isStreaming = false
-            }
-        }
+        streamRuntime.endActiveAssistantSegment(session)
     }
 
     func applyReasoningDelta(_ delta: String, groupID: String?, session: TabSession) {
-        if let groupID, let localID = session.reasoningItemIDsByGroupID[groupID],
-           let index = session.items.firstIndex(where: { $0.id == localID })
-        {
-            session.mutateItem(at: index) { item in
-                item.text += delta
-            }
-            session.activeReasoningItemID = localID
-        } else if let activeID = session.activeReasoningItemID,
-                  groupID == nil,
-                  let index = session.items.firstIndex(where: { $0.id == activeID })
-        {
-            session.mutateItem(at: index) { item in
-                item.text += delta
-            }
-        } else {
-            var thinkingItem = AgentChatItem.thinking(delta, sequenceIndex: session.nextSequenceIndex)
-            thinkingItem.isStreaming = true
-            session.appendItem(thinkingItem)
-            session.activeReasoningItemID = thinkingItem.id
-            if let groupID {
-                session.reasoningItemIDsByGroupID[groupID] = thinkingItem.id
-            }
-        }
+        streamRuntime.applyReasoningDelta(delta, groupID: groupID, session: session)
     }
 
     func endActiveReasoningSegment(_ session: TabSession) {
-        let activeIDs = Set(session.reasoningItemIDsByGroupID.values)
-        let allIDs = session.activeReasoningItemID.map { activeIDs.union([$0]) } ?? activeIDs
-        session.mutateItemsBatch(touchActivity: false) { items in
-            for itemID in allIDs {
-                if let index = items.firstIndex(where: { $0.id == itemID }),
-                   items[index].kind == .thinking,
-                   items[index].isStreaming
-                {
-                    items[index].isStreaming = false
-                }
-            }
-        }
-        session.activeReasoningItemID = nil
-        session.reasoningItemIDsByGroupID.removeAll()
+        streamRuntime.endActiveReasoningSegment(session)
     }
 
     func makeRunCancelTarget(
