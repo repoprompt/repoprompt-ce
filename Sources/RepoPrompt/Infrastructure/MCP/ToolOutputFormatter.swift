@@ -2250,7 +2250,7 @@ extension ToolOutputFormatter {
     }
 
     static func formatOracleChatLog(args: [String: Value], value: Value, emitResources: Bool) -> [MCP.Tool.Content] {
-        if value.objectValue?["oracle_turn_id"] != nil, let group = formatOracleGroup(value: value, heading: "## Oracle Chat Log \(statusIcon(success: true))") { return [.text(group)] }
+        if value.objectValue?["oracle_turn_id"] != nil, let group = formatOracleGroup(value: value, heading: "## Oracle Chat Log \(statusIcon(success: true))") { return [.text(text: group, annotations: nil, _meta: nil)] }
         _ = emitResources
         guard case let .object(obj) = value, let arr = obj["messages"]?.arrayValue else {
             return formatGeneric(value: value)
