@@ -1,5 +1,10 @@
 import Foundation
+import RepoPromptACPProviders
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
+import RepoPromptClaudeProvider
 import RepoPromptDomainRuntime
+import RepoPromptHTTPProviders
 import RepoPromptInstrumentation
 
 class AIProviderFactory {
@@ -62,7 +67,7 @@ class AIProviderFactory {
     ) async throws -> AIProvider {
         switch providerType {
         case .anthropic:
-            return AnthropicProvider(apiKey: key)
+            return AnthropicProvider(apiKey: key, host: AnthropicAppHost())
         case .openAI:
             let raw = UserDefaults.standard.string(forKey: "customBaseURLOpenAI")
             let split = OpenAIURLHelper.splitBaseURLAndVersion(raw)
@@ -73,29 +78,29 @@ class AIProviderFactory {
             let storedVersion = UserDefaults.standard.string(forKey: "customOpenAIVersionOverride")
             let finalVersion = storedVersion ?? split.version
             let serviceTier = UserDefaults.standard.string(forKey: "openAIServiceTier")
-            return OpenAIProvider(apiKey: key, baseURL: baseURL, configuredMaxTokens: nil, overrideVersion: finalVersion, serviceTier: serviceTier, httpCredentialConsentEndpoint: UserDefaults.standard.string(forKey: "openAIHTTPConsentEndpoint"))
+            return OpenAIProvider(host: OpenAIProviderAppHost(), apiKey: key, baseURL: baseURL, configuredMaxTokens: nil, overrideVersion: finalVersion, serviceTier: serviceTier, httpCredentialConsentEndpoint: UserDefaults.standard.string(forKey: "openAIHTTPConsentEndpoint"))
         case .ollama:
             let baseURL = ollamaURL ?? URL(string: "http://localhost:11434")!
-            return OllamaProvider(baseURL: baseURL)
+            return OllamaProvider(host: OpenAIProviderAppHost(), baseURL: baseURL)
         case .azure:
             guard let config = azureConfiguration else {
                 return BlankProvider()
             }
-            return AzureOpenAIProvider(configuration: config)
+            return AzureOpenAIProvider(configuration: config, host: AzureOpenAIAppHost())
         case .openRouter:
-            return OpenRouterProvider(apiKey: key)
+            return OpenRouterProvider(apiKey: key, host: OpenRouterAppHost())
         case .gemini:
-            return GeminiProvider(apiKey: key)
+            return GeminiProvider(host: OpenAIProviderAppHost(), apiKey: key)
         case .deepseek:
-            return DeepSeekProvider(apiKey: key)
+            return DeepSeekProvider(host: OpenAIProviderAppHost(), apiKey: key)
         case .fireworks: // <-- Add Fireworks case
-            return FireworksProvider(apiKey: key)
+            return FireworksProvider(host: OpenAIProviderAppHost(), apiKey: key)
         case .grok: // <-- Add Grok case
-            return GrokProvider(apiKey: key)
+            return GrokProvider(host: OpenAIProviderAppHost(), apiKey: key)
         case .groq: // <-- Add Groq case
-            return GroqProvider(apiKey: key)
+            return GroqProvider(host: OpenAIProviderAppHost(), apiKey: key)
         case .zAI:
-            return ZAIProvider(apiKey: key)
+            return ZAIProvider(host: OpenAIProviderAppHost(), apiKey: key)
         case .claudeCode: // <-- Add Claude Code case
             return ClaudeCodeProvider()
         case .codex:
@@ -148,6 +153,7 @@ class AIProviderFactory {
                     throw AIProviderError.missingURL
                 }
                 return OpenAIProvider(
+                    host: OpenAIProviderAppHost(),
                     apiKey: key,
                     baseURL: baseURL,
                     configuredMaxTokens: configuredMaxTokens,
@@ -159,7 +165,7 @@ class AIProviderFactory {
 
             // Fallback: manual HTTP provider for exotic/custom formats
             return CustomOpenAIProvider(
-                baseURL: baseStr,
+                host: CustomOpenAIAppHost(), baseURL: baseStr,
                 apiKey: key,
                 defaultModel: config.defaultModel,
                 defaultTemperature: 0, // Keep deterministic by default; configurable later if needed
@@ -186,27 +192,6 @@ class BlankProvider: AIProvider {
     }
 
     func dispose() async {}
-}
-
-enum AIProviderType: Codable, Equatable {
-    case anthropic
-    case openAI
-    case ollama
-    case azure
-    case openRouter
-    case gemini
-    case deepseek // <-- New deepseek provider case
-    case customProvider
-    case fireworks // <-- New fireworks provider case
-    case grok // <-- New grok provider case
-    case groq // <-- New groq provider case
-    case zAI // <-- New Z.AI provider case
-    case claudeCode // <-- New Claude Code provider case
-    case codex // <-- New Codex CLI provider case
-    case openCode // OpenCode CLI provider case
-    case cursor // Cursor CLI provider case
-    case grokBuild // Grok Build CLI provider case
-    case devin
 }
 
 extension AIProviderType {
@@ -238,79 +223,9 @@ extension AIProviderType {
     }
 }
 
-enum AIProviderError: Error {
-    case missingOllamaURL
-    case missingAzureConfiguration
-    case missingAPIKey
-    case missingURL
-    case providerNotConfigured
-    case invalidModel
-    case invalidSystemPrompt
-    case messageCreationFailed
-    case invalidResponse(detail: String) // Add associated value 'detail'
-    case invalidConfiguration(detail: String) // Added for configuration issues
-    case apiError(source: Error?) // Added for underlying API errors
-    case unknown(source: Error?) // Added for other unexpected errors
-}
-
-extension AIProviderError: LocalizedError {
-    var errorDescription: String? {
-        switch self {
-        case .missingOllamaURL:
-            "Missing Ollama URL."
-        case .missingAzureConfiguration:
-            "Missing Azure OpenAI configuration."
-        case .missingAPIKey:
-            "Missing API key."
-        case .missingURL:
-            "Missing provider URL."
-        case .providerNotConfigured:
-            "Provider is not configured."
-        case .invalidModel:
-            "Invalid model."
-        case .invalidSystemPrompt:
-            "Invalid system prompt."
-        case .messageCreationFailed:
-            "Failed to create provider message."
-        case let .invalidResponse(detail), let .invalidConfiguration(detail):
-            detail
-        case let .apiError(source), let .unknown(source):
-            source?.localizedDescription ?? String(describing: self)
-        }
-    }
-}
-
 public typealias ProviderConversationCleanupAction = RepoPromptDomainRuntime.ProviderConversationCleanupAction
 public typealias ProviderConversationCleanupHandle = RepoPromptDomainRuntime.ProviderConversationCleanupHandle
 typealias ProviderConversationCleanupOutcome = RepoPromptDomainRuntime.ProviderConversationCleanupOutcome
 typealias AIProviderCompletionOutcome = RepoPromptDomainRuntime.AIProviderCompletionOutcome
 typealias AIStreamResult = RepoPromptDomainRuntime.AIStreamResult
 typealias AICompletionResult = RepoPromptDomainRuntime.AICompletionResult
-
-protocol AIProvider {
-    func streamMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int?) async throws -> AsyncThrowingStream<AIStreamResult, Error>
-    func completeMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int?) async throws -> AICompletionResult
-    func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome
-    func dispose() async
-}
-
-protocol AIModelGetter {
-    func getAvailableModels() async throws -> [String]
-}
-
-/// Default protocol extensions
-extension AIProvider {
-    func streamMessage(_ aiMessage: AIMessage, model: AIModel) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
-        try await streamMessage(aiMessage, model: model, maxTokens: nil)
-    }
-
-    func completeMessage(_ aiMessage: AIMessage, model: AIModel) async throws -> AICompletionResult {
-        try await completeMessage(aiMessage, model: model, maxTokens: nil)
-    }
-
-    func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome {
-        .unsupported(message: "Provider has no local API for \(action.rawValue) cleanup of conversations.")
-    }
-
-    func dispose() async {}
-}

@@ -1,3 +1,4 @@
+import RepoPromptAIContracts
 import SwiftUI
 
 enum AgentProviderSettingsMenuAction {

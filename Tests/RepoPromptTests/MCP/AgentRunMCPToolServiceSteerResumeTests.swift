@@ -1,5 +1,7 @@
 import Foundation
 import MCP
+import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 @testable import RepoPromptMCPServer
 import RepoPromptSettingsCore
 import RepoPromptWorkspaceContext
@@ -1447,7 +1449,7 @@ final class AgentRunStartBudgetTests: XCTestCase {
         let cancellationReturned = expectation(description: "cancelled caller returns without joining")
         let task = Task {
             defer { cancellationReturned.fulfill() }
-            try await AgentRunStartBudget.run(expiry: .init(toolName: "agent_run", budgetSeconds: 60)) {
+            _ = try await AgentRunStartBudget.run(expiry: .init(toolName: "agent_run", budgetSeconds: 60)) {
                 cancellationStage.fulfill()
                 await cancelledGate.hold()
                 XCTAssertTrue(Task.isCancelled)

@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptAIContracts
+import RepoPromptClaudeProvider
 import RepoPromptSettingsCore
 
 /// A stateless, tool-less side call. Inputs are the draft, attachment names, the session title and bounded chat excerpts.
@@ -50,7 +52,7 @@ struct AgentRepromptService {
             let provider = try await pool.createProvider(for: model)
             defer { Task { await provider.dispose() } }
             let stream: AsyncThrowingStream<AIStreamResult, Error> = if let claude = provider as? ClaudeCodeProvider {
-                try await claude.streamMessage(message, model: model, promptDelivery: .nativeSystemPrompt)
+                try await claude.streamMessage(message, model: model, promptDelivery: ClaudeCLIAppPromptPolicy.delivery(.nativeSystemPrompt))
             } else {
                 try await provider.streamMessage(message, model: model, maxTokens: nil)
             }

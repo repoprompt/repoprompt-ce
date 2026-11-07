@@ -45,6 +45,12 @@ var packageDependencies: [Package.Dependency] = [
 
 var repoPromptAppDependencies: [Target.Dependency] = [
     "RepoPromptMCPServer",
+    "RepoPromptClaudeProvider",
+    "RepoPromptAgentProviderContracts",
+    "RepoPromptHTTPProviders",
+    "RepoPromptACPProviders",
+    "RepoPromptCodexProvider",
+    "RepoPromptAIContracts",
     "RepoPromptWorkspaceContext",
     "RepoPromptDomainRuntime",
     "RepoPromptFoundation",
@@ -87,6 +93,12 @@ var repoPromptSettingsCoreSwiftSettings: [SwiftSetting] = [
 
 var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptMCPServer",
+    "RepoPromptClaudeProvider",
+    "RepoPromptAgentProviderContracts",
+    "RepoPromptHTTPProviders",
+    "RepoPromptACPProviders",
+    "RepoPromptCodexProvider",
+    "RepoPromptAIContracts",
     "RepoPromptApp",
     "RepoPromptWorkspaceContext",
     "RepoPromptWorkspaceContextTestSupport",
@@ -144,6 +156,84 @@ let package = Package(
             path: "Sources/RepoPromptExecutable"
         ),
         .target(
+            name: "RepoPromptClaudeProvider",
+            dependencies: [
+                "RepoPromptAgentProviderContracts",
+                "RepoPromptAIContracts",
+                "RepoPromptDomainRuntime",
+                "RepoPromptFoundation",
+                "RepoPromptProcess",
+                "RepoPromptProviderQuota",
+                .product(name: "RepoPromptClaudeCompatibleProvider", package: "RepoPromptAgentProviders")
+            ],
+            path: "Sources/RepoPromptClaudeProvider"
+        ),
+        .testTarget(
+            name: "RepoPromptClaudeProviderTests",
+            dependencies: ["RepoPromptClaudeProvider", "RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptProcess"],
+            path: "Tests/RepoPromptClaudeProviderTests"
+        ),
+        .target(
+            name: "RepoPromptAgentProviderContracts",
+            dependencies: ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptProviderQuota"],
+            path: "Sources/RepoPromptAgentProviderContracts"
+        ),
+        .testTarget(
+            name: "RepoPromptAgentProviderContractsTests",
+            dependencies: ["RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime"],
+            path: "Tests/RepoPromptAgentProviderContractsTests"
+        ),
+        .target(
+            name: "RepoPromptHTTPProviders",
+            dependencies: [
+                "RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFoundation",
+                .product(name: "SwiftOpenAI", package: "SwiftOpenAI"),
+                .product(name: "SwiftAnthropic", package: "SwiftAnthropic")
+            ],
+            path: "Sources/RepoPromptHTTPProviders"
+        ),
+        .testTarget(
+            name: "RepoPromptHTTPProvidersTests",
+            dependencies: [
+                "RepoPromptHTTPProviders", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFoundation",
+                .product(name: "SwiftOpenAI", package: "SwiftOpenAI"),
+                .product(name: "SwiftAnthropic", package: "SwiftAnthropic")
+            ],
+            path: "Tests/RepoPromptHTTPProvidersTests"
+        ),
+        .target(
+            name: "RepoPromptCodexProvider",
+            dependencies: ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptMCPCore", "RepoPromptProcess", "RepoPromptProviderQuota", "RepoPromptShared", "RepoPromptAgentProviderContracts", "RepoPromptFoundation"],
+            path: "Sources/RepoPromptCodexProvider",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
+        .testTarget(
+            name: "RepoPromptCodexProviderTests",
+            dependencies: ["RepoPromptCodexProvider", "RepoPromptAIContracts", "RepoPromptShared", "RepoPromptDomainRuntime", "RepoPromptProcess"],
+            path: "Tests/RepoPromptCodexProviderTests"
+        ),
+        .target(
+            name: "RepoPromptACPProviders",
+            dependencies: ["RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFoundation", "RepoPromptMCPCore", "RepoPromptProcess"],
+            path: "Sources/RepoPromptACPProviders",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug)), .enableUpcomingFeature("BareSlashRegexLiterals")]
+        ),
+        .testTarget(
+            name: "RepoPromptACPProvidersTests",
+            dependencies: ["RepoPromptACPProviders", "RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFileSystem", "RepoPromptFoundation", "RepoPromptProcess"],
+            path: "Tests/RepoPromptACPProvidersTests"
+        ),
+        .target(
+            name: "RepoPromptAIContracts",
+            dependencies: [],
+            path: "Sources/RepoPromptAIContracts"
+        ),
+        .testTarget(
+            name: "RepoPromptAIContractsTests",
+            dependencies: ["RepoPromptAIContracts"],
+            path: "Tests/RepoPromptAIContractsTests"
+        ),
+        .target(
             name: "RepoPromptProviderQuota",
             dependencies: [],
             path: "Sources/RepoPromptProviderQuota",
@@ -158,6 +248,7 @@ let package = Package(
         .target(
             name: "RepoPromptDomainRuntime",
             dependencies: [
+                "RepoPromptAIContracts",
                 "RepoPromptShared",
                 "RepoPromptWorkspaceCore",
                 "RepoPromptC",
@@ -233,7 +324,7 @@ let package = Package(
         ),
         .target(
             name: "RepoPromptSettingsCore",
-            dependencies: ["RepoPromptFoundation", "RepoPromptDomainRuntime", "RepoPromptProviderQuota", "RepoPromptShared"],
+            dependencies: ["RepoPromptAIContracts", "RepoPromptFoundation", "RepoPromptDomainRuntime", "RepoPromptProviderQuota", "RepoPromptShared"],
             path: "Sources/RepoPromptSettingsCore",
             swiftSettings: repoPromptSettingsCoreSwiftSettings
         ),
@@ -370,6 +461,7 @@ let package = Package(
         .testTarget(
             name: "RepoPromptDomainRuntimeTests",
             dependencies: [
+                "RepoPromptAIContracts",
                 "RepoPromptDomainRuntime",
                 .product(name: "MCP", package: "swift-sdk")
             ],

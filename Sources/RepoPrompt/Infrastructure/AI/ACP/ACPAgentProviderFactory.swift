@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptACPProviders
+import RepoPromptAIContracts
 
 enum ACPAgentProviderFactory {
     /// Injectable so tests can supply keys without touching the keychain. Defaults to the

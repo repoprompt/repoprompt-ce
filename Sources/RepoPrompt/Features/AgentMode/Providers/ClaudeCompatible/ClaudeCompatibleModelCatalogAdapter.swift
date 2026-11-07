@@ -1,4 +1,7 @@
 import Foundation
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
+import RepoPromptClaudeProvider
 
 /// Model-catalog seam for the Claude-compatible plugin path.
 ///

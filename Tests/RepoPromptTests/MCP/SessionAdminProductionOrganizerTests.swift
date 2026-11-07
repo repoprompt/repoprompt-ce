@@ -4,6 +4,7 @@ import MCP
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
+import RepoPromptWorkspaceContext
 import XCTest
 
 // MARK: - Delegation placement persistence
@@ -1089,7 +1090,7 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
     }
 
     func testPublishedSubscriberReentryCannotBorrowCarrierPublicationProof() async {
-        for outerMutation in ["carriers", "presentation", "selection"] {
+        for outerMutation in ["carriers", "presentation", "selection", "storedOnly"] {
             let window = WindowState()
             await window.workspaceManager.awaitInitialized()
             let manager = window.workspaceManager
@@ -1126,6 +1127,10 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
                 XCTAssertEqual(manager.updateComposeTabPresentation(workspaceID: workspace.id, tabIDs: [target.id]) { _, value in
                     value.name = "Renamed"
                 }, [target.id])
+            case "storedOnly":
+                var updated = target
+                updated.selection = StoredSelection(selectedPaths: ["/nested-selection"])
+                XCTAssertTrue(manager.updateComposeTabStoredOnly(updated, inWorkspaceID: workspace.id))
             default:
                 XCTAssertTrue(manager.updateActiveComposeTabSelection(workspaceID: workspace.id, activeComposeTabID: sibling.id))
             }
@@ -1136,6 +1141,67 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
                 manager, sessionIDs: Set([target, sibling].compactMap(\.activeAgentSessionID)),
                 tabIDs: [target.id, sibling.id, injected.id], bindings: [target, sibling, injected]
             )
+            await window.tearDown()
+        }
+
+        for reentry in ["tabReorder", "workspaceAndTabReorder", "removedTab", "removedWorkspace"] {
+            let window = WindowState(automaticProviderModelDiscoveryEnabled: false)
+            await window.workspaceManager.awaitInitialized()
+            let manager = window.workspaceManager
+            let target = ComposeTabState(name: "Revision target", activeAgentSessionID: UUID())
+            let sibling = ComposeTabState(name: "Unchanged sibling", activeAgentSessionID: UUID())
+            let workspace = WorkspaceModel(
+                name: "Revision owner", repoPaths: [], ephemeralFlag: true,
+                composeTabs: [target, sibling], activeComposeTabID: target.id
+            )
+            let otherTab = ComposeTabState(name: "Other workspace tab")
+            let other = WorkspaceModel(name: "Other owner", repoPaths: [], ephemeralFlag: true, composeTabs: [otherTab])
+            manager.workspaces = [workspace, other]
+            manager.activeWorkspace = workspace
+            let targetIdentity = WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: target.id)
+            let siblingIdentity = WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: sibling.id)
+            let targetRevision = manager.committedSelectionRevision(for: targetIdentity)
+            let siblingRevision = manager.committedSelectionRevision(for: siblingIdentity)
+            let otherRevision = manager.selectionRevisionForMCP(workspaceID: other.id, tabID: otherTab.id)
+            var reentered = false
+            // Chooser delivery runs after workspaces storage is installed, but before the
+            // stored update records its selection revision. Reordering here must persist.
+            let subscription = manager.$workspaceChooserPresentation.dropFirst().sink { _ in
+                guard !reentered else { return }
+                reentered = true
+                var models = manager.workspaces
+                switch reentry {
+                case "tabReorder":
+                    models[0].composeTabs.reverse()
+                case "workspaceAndTabReorder":
+                    models[0].composeTabs.reverse()
+                    models.reverse()
+                case "removedTab":
+                    models[0].composeTabs.removeAll { $0.id == target.id }
+                default:
+                    models.removeAll { $0.id == workspace.id }
+                }
+                manager.workspaces = models
+            }
+            var updated = target
+            updated.selection = StoredSelection(selectedPaths: ["/reentrant-selection"])
+            XCTAssertTrue(manager.updateComposeTabStoredOnly(updated, inWorkspaceID: workspace.id), reentry)
+            subscription.cancel()
+            XCTAssertTrue(reentered, reentry)
+            if reentry == "tabReorder" || reentry == "workspaceAndTabReorder" {
+                XCTAssertEqual(manager.workspaces.first { $0.id == workspace.id }?.composeTabs.map(\.id), [sibling.id, target.id], reentry)
+                if reentry == "workspaceAndTabReorder" {
+                    XCTAssertEqual(manager.workspaces.map(\.id), [other.id, workspace.id], reentry)
+                }
+                XCTAssertGreaterThan(manager.committedSelectionRevision(for: targetIdentity), targetRevision, reentry)
+                XCTAssertEqual(manager.composeTab(for: targetIdentity)?.selection, updated.selection, reentry)
+                XCTAssertEqual(manager.composeTab(for: siblingIdentity)?.selection, sibling.selection, reentry)
+            } else {
+                XCTAssertNil(manager.composeTab(for: targetIdentity), reentry)
+                XCTAssertEqual(manager.committedSelectionRevision(for: targetIdentity), targetRevision, reentry)
+            }
+            XCTAssertEqual(manager.committedSelectionRevision(for: siblingIdentity), siblingRevision, reentry)
+            XCTAssertEqual(manager.selectionRevisionForMCP(workspaceID: other.id, tabID: otherTab.id), otherRevision, reentry)
             await window.tearDown()
         }
     }

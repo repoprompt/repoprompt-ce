@@ -1,3 +1,4 @@
+import RepoPromptACPProviders
 import RepoPromptSettingsCore
 import RepoPromptShared
 

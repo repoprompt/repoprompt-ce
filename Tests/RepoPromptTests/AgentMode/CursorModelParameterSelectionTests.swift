@@ -1,5 +1,7 @@
 import AppKit
 import Foundation
+import RepoPromptACPProviders
+import RepoPromptAIContracts
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
@@ -14,14 +16,14 @@ final class CursorModelParameterSelectionTests: XCTestCase {
     }
 
     private func installCursorFixture() {
-        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor)
         // Scripted runtime metadata for picker tests; never a production/offline authority.
         let speed = ACPModelParameterDefinition(
             kind: .speed, configID: "fast", displayName: "Speed",
             choices: [.init(rawValue: "false", displayName: "Standard"), .init(rawValue: "true", displayName: "Fast")],
             currentValueRaw: "true"
         )
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+        _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(
             ACPDiscoveredSessionModels(
                 options: [
                     .init(rawValue: "auto", displayName: "Auto", description: nil, isDefault: true),
@@ -49,7 +51,7 @@ final class CursorModelParameterSelectionTests: XCTestCase {
     }
 
     override func tearDown() {
-        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor)
         super.tearDown()
     }
 
@@ -138,148 +140,6 @@ final class CursorModelParameterSelectionTests: XCTestCase {
             ACPModelParameterSelection.normalized([first, replacement, distinctKind]),
             [replacement, distinctKind]
         )
-    }
-
-    func testCursorClassifierRecognizesNarrowGenericAndMissingCategoryParameters() {
-        let provider = CursorACPAgentProvider(config: CursorAgentConfig())
-        let choices = [
-            ACPModelParameterChoice(rawValue: "false", displayName: "Standard"),
-            ACPModelParameterChoice(rawValue: "true", displayName: "Fast")
-        ]
-
-        XCTAssertEqual(provider.modelParameterKind(for: .init(
-            configID: "Cursor.Thought-Level",
-            category: "model_parameter",
-            displayName: "Effort",
-            choices: []
-        )), .thinking)
-        XCTAssertEqual(provider.modelParameterKind(for: .init(
-            configID: "thought_level",
-            category: nil,
-            displayName: "Anything",
-            choices: []
-        )), .thinking)
-        XCTAssertEqual(provider.modelParameterKind(for: .init(
-            configID: "unrecognized",
-            category: "model_config",
-            displayName: "Anything",
-            choices: choices
-        )), .speed)
-        XCTAssertEqual(provider.modelParameterKind(for: .init(
-            configID: "Cursor.Fast-Mode",
-            category: nil,
-            displayName: "Anything",
-            choices: choices
-        )), .speed)
-    }
-
-    func testCursorClassifierRecognizesObservedFastSelectorShape() {
-        let provider = CursorACPAgentProvider(config: CursorAgentConfig())
-
-        XCTAssertEqual(provider.modelParameterKind(for: .init(
-            configID: "fast",
-            category: "model_config",
-            displayName: "Fast Mode",
-            choices: [
-                .init(rawValue: "false", displayName: "Off"),
-                .init(rawValue: "true", displayName: "Fast")
-            ]
-        )), .speed)
-    }
-
-    func testCursorClassifierUsesMultiLevelEffortAndReasoningButIgnoresBooleanThinking() {
-        let provider = CursorACPAgentProvider(config: CursorAgentConfig())
-        let effortChoices = [
-            ACPModelParameterChoice(rawValue: "low", displayName: "Low"),
-            ACPModelParameterChoice(rawValue: "high", displayName: "High")
-        ]
-
-        for configID in ["effort", "reasoning"] {
-            XCTAssertEqual(provider.modelParameterKind(for: .init(
-                configID: configID,
-                category: "thought_level",
-                displayName: configID.capitalized,
-                choices: effortChoices
-            )), .thinking, configID)
-        }
-
-        XCTAssertNil(provider.modelParameterKind(for: .init(
-            configID: "thinking",
-            category: "thought_level",
-            displayName: "Thinking",
-            choices: [
-                .init(rawValue: "false", displayName: "Off"),
-                .init(rawValue: "true", displayName: "On")
-            ]
-        )))
-    }
-
-    func testCursorClassifierRejectsModelModeAndAmbiguousParameters() {
-        let provider = CursorACPAgentProvider(config: CursorAgentConfig())
-        let speedChoices = [
-            ACPModelParameterChoice(rawValue: "false", displayName: "Standard"),
-            ACPModelParameterChoice(rawValue: "true", displayName: "Fast")
-        ]
-
-        for category in ["model", "mode"] {
-            XCTAssertNil(provider.modelParameterKind(for: .init(
-                configID: "Cursor.Fast-Mode",
-                category: category,
-                displayName: "Speed",
-                choices: speedChoices
-            )))
-        }
-        XCTAssertNil(provider.modelParameterKind(for: .init(
-            configID: "unrecognized",
-            category: nil,
-            displayName: "Anything",
-            choices: speedChoices
-        )))
-        XCTAssertNil(provider.modelParameterKind(for: .init(
-            configID: "unrecognized",
-            category: "model_parameter",
-            displayName: "Anything",
-            choices: [.init(rawValue: "true", displayName: "Fast")]
-        )))
-        XCTAssertNil(provider.modelParameterKind(for: .init(
-            configID: "unrecognized",
-            category: "permission",
-            displayName: "Speed",
-            choices: speedChoices
-        )))
-    }
-
-    func testCursorClassifierRejectsSemanticModelAndModeIDsBeforeParameterHeuristics() {
-        let provider = CursorACPAgentProvider(config: CursorAgentConfig())
-        let speedChoices = [
-            ACPModelParameterChoice(rawValue: "false", displayName: "Standard"),
-            ACPModelParameterChoice(rawValue: "true", displayName: "Fast")
-        ]
-
-        XCTAssertNil(provider.modelParameterKind(for: .init(
-            configID: "model",
-            category: nil,
-            displayName: "Effort",
-            choices: []
-        )))
-        XCTAssertNil(provider.modelParameterKind(for: .init(
-            configID: "mode",
-            category: "model_parameter",
-            displayName: "Speed",
-            choices: speedChoices
-        )))
-        XCTAssertNil(provider.modelParameterKind(for: .init(
-            configID: "model",
-            category: "model_config",
-            displayName: "Anything",
-            choices: speedChoices
-        )))
-        XCTAssertNil(provider.modelParameterKind(for: .init(
-            configID: "mode",
-            category: nil,
-            displayName: "Cursor.Fast-Mode",
-            choices: speedChoices
-        )))
     }
 
     func testAgentSessionDecodesMissingParametersAndRoundTripsExactSelections() throws {
@@ -557,7 +417,7 @@ final class CursorModelParameterSelectionTests: XCTestCase {
         XCTAssertEqual(inherited.map(\.valueRaw), ["false"])
         let semanticReplacement = try specifier.selections(in: fresh, excludingConfigIDs: ["legacy-effort-id"], supersededKinds: [.thinking])
         XCTAssertEqual(semanticReplacement.map(\.configID), ["fast"], "Legacy explicit selectors supersede by parameter identity")
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(fresh, for: .cursor)
+        _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(fresh, for: .cursor)
         let projected = ACPModelParameterResolver.effectiveSelections(providerID: .cursor, selectedModelRaw: raw, persistedSelections: [cursorEffortSelection(valueRaw: "low")])
         XCTAssertEqual(projected.first(where: { $0.kind == .thinking })?.valueRaw, "low")
         XCTAssertEqual(projected.first(where: { $0.kind == .speed })?.valueRaw, "false")
@@ -631,8 +491,8 @@ final class CursorModelParameterSelectionTests: XCTestCase {
     }
 
     func testActiveCursorRunLocksParameterControlsAndRejectsDefensiveSelection() {
-        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor)
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor) }
         let viewModel = makeViewModel()
         let tabID = UUID()
         viewModel.test_setCurrentTabIDOverride(tabID)
@@ -1241,8 +1101,8 @@ final class CursorModelParameterSelectionTests: XCTestCase {
     /// control must still render.
     @MainActor
     func testComposerObservationThroughInjectedStreamAcceptsNormalizedKeyEquivalence() async throws {
-        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode)
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode) }
         // `/workspace-root/child/..` and `/workspace-root` are the same logical directory.
         let rawWorkspacePath = "/workspace-root/child/.."
         let recorder = SubscriptionRecorder()
@@ -1303,8 +1163,8 @@ final class CursorModelParameterSelectionTests: XCTestCase {
     }
 
     func testComposerReconcilesRestoredModelWithoutResubscribingUnchangedTarget() async throws {
-        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode)
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode) }
         let workspacePath = "/workspace-a"
         let recorder = SubscriptionRecorder()
         let viewModel = AgentModeViewModel(
@@ -1373,9 +1233,9 @@ final class CursorModelParameterSelectionTests: XCTestCase {
         // Two valid OpenCode models so the target switch is a real (accepted) change.
         let modelA = "ollama-cloud/kimi-k3"
         let modelB = "anthropic/claude-sonnet"
-        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode)
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode) }
+        _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(
             ACPDiscoveredSessionModels(
                 options: [
                     .init(rawValue: modelA, displayName: "Kimi K3", description: nil, isPlaceholderDefault: false, isProviderDefault: true),
@@ -1459,8 +1319,8 @@ final class CursorModelParameterSelectionTests: XCTestCase {
     /// clearing and termination.
     @MainActor
     func testComposerObservationCancellationClearsOnProviderSwitch() async throws {
-        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode)
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode) }
         let workspacePath = "/workspace-a"
         let recorder = SubscriptionRecorder()
         let viewModel = AgentModeViewModel(

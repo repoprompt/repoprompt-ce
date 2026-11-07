@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 
 /// Internal mode for the Agent Session Switcher HUD.

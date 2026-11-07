@@ -12,6 +12,7 @@ import Logging
 import MCP
 import Ontology
 import OSLog
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
 import RepoPromptInstrumentation

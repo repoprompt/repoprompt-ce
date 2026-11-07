@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
 
 /// Ephemeral choice for one composer-created user turn. Never written to the model picker or settings.
 struct AutoEffortTurnSelection: Equatable {

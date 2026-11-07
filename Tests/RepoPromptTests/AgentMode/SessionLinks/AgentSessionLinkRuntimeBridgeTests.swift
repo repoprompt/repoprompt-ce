@@ -2,6 +2,8 @@ import AppKit
 import Combine
 import Foundation
 import MCP
+import RepoPromptACPProviders
+import RepoPromptAIContracts
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptPersistence
@@ -7840,7 +7842,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     // MARK: - Overseer-created lanes
 
     func testRoleLaneCreationUsesDestinationAvailabilityWithoutSubstitution() async throws {
-        let registry = AgentACPModelRegistry.shared
+        let registry = AgentModelCatalogRuntime.shared.acpRegistry
         registry.test_reset(providerID: .cursor)
         defer { registry.test_reset(providerID: .cursor) }
         let cursorModel = AgentModelOption(

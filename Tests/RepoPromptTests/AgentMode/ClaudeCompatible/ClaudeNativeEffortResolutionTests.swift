@@ -1,5 +1,8 @@
 import Foundation
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptClaudeProvider
 import RepoPromptSettingsCore
 import XCTest
 
@@ -8,11 +11,11 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
         func resolve(
             variant _: ClaudeCodeRuntimeVariant,
             requestedModel _: String?
-        ) async throws -> ClaudeCodeLaunchEnvironment {
-            ClaudeCodeLaunchEnvironment(
+        ) async throws -> ClaudeCompatiblePluginLaunchEnvironment {
+            ClaudeCompatiblePluginLaunchEnvironment(
                 effectiveModel: "claude-opus-5-5",
                 environmentOverrides: [:],
-                backend: .defaultClaude
+                backendID: nil
             )
         }
     }
@@ -197,6 +200,7 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
     func testNativeConfigurationUsesSessionEffortRatherThanSharedOrEncodedEffort() async {
         let requests = EffortRequests()
         let controller = ClaudeNativeProcessSessionController(
+            host: ClaudeNativeSessionAppHost(),
             runID: UUID(), tabID: UUID(), windowID: 1, workspacePath: nil,
             config: .discovery(commandName: "/usr/bin/false", runtimeVariant: .standard),
             environmentResolver: FixedModelResolver()
@@ -221,6 +225,7 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
 
     func testTurnScopedEffortOverridesEncodedModelEffortInFlagSettings() async throws {
         let controller = ClaudeNativeProcessSessionController(
+            host: ClaudeNativeSessionAppHost(),
             runID: UUID(),
             tabID: UUID(),
             windowID: 1,
@@ -514,13 +519,14 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
     }
 
     private actor PassthroughResolver: ClaudeCodeLaunchEnvironmentResolving {
-        func resolve(variant _: ClaudeCodeRuntimeVariant, requestedModel: String?) async throws -> ClaudeCodeLaunchEnvironment {
-            .init(effectiveModel: requestedModel, environmentOverrides: [:], backend: .defaultClaude)
+        func resolve(variant _: ClaudeCodeRuntimeVariant, requestedModel: String?) async throws -> ClaudeCompatiblePluginLaunchEnvironment {
+            .init(effectiveModel: requestedModel, environmentOverrides: [:], backendID: nil)
         }
     }
 
     private func controller() -> ClaudeNativeProcessSessionController {
         .init(
+            host: ClaudeNativeSessionAppHost(),
             runID: UUID(),
             tabID: UUID(),
             windowID: 1,

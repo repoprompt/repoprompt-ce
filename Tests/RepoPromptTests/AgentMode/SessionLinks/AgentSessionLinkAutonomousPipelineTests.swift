@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentProviderContracts
 @testable import RepoPromptMCPServer
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
@@ -41,6 +42,8 @@ final class AgentSessionLinkAutonomousPipelineTests: XCTestCase {
     func testAutonomousPipelineRelaysThroughThreeSessionsUnderTwoIndependentDirectGrants() async throws {
         let pipeline = try makePipeline()
         let observer = pipeline.observer
+        // This relay exercises successive admissions, not routine interval throttling.
+        observer.session.oversight.routineWakeIntervalEnabled = false
         let observerEndpoint = try endpoint(observer)
 
         // Two grants the user created separately. Neither implies the other, and neither is inferred

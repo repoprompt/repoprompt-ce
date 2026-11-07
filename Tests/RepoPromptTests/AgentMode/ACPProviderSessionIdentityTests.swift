@@ -1,5 +1,7 @@
 import Foundation
 import os
+import RepoPromptACPProviders
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptProcess
@@ -7,31 +9,76 @@ import RepoPromptSettingsCore
 import XCTest
 
 final class ACPProviderSessionIdentityTests: XCTestCase {
-    func testACPBootstrapRefusesDevinNewAndColdResumeWithoutFixtureOptIn() async throws {
-        // Hydration can request a fresh controller for a persisted provider session;
-        // neither that identity nor discovery is permission to start a provider in XCTest.
-        for resumeID in [nil, "persisted-devin-session"] as [String?] {
-            let workspace = try makeTemporaryDirectory()
-            let recordURL = workspace.appendingPathComponent("requests.jsonl")
-            let provider = try FakeACPProvider(
-                providerID: .devin,
-                commandPath: makeFakeACPServerScript().path,
-                environment: ["ACP_RECORD_PATH": recordURL.path]
-            )
-            let request = makeRunRequest(agentKind: .devin, workspacePath: workspace.path, resumeSessionID: resumeID)
-            let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
-            do {
-                _ = try await controller.bootstrap()
-                XCTFail("Discovery and cold resume must fail closed without an explicit fixture permit")
-            } catch {
-                XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal, "Unexpected refusal: \(error)")
+    func testAntigravityPollingKeepsLastGoodRegistryForEmptyDiscovery() async throws {
+        struct Client: AntigravityACPModelDiscoveryClient {
+            let models: ACPDiscoveredSessionModels
+            func discoverModels(workspacePath _: String?) async throws -> ACPDiscoveredSessionModels? {
+                models
             }
-            let identity = await controller.currentProviderSessionIdentity()
-            XCTAssertNil(identity.runtimeSessionID)
-            XCTAssertEqual(identity.loadSessionID, resumeID)
-            await controller.shutdown()
-            XCTAssertFalse(FileManager.default.fileExists(atPath: recordURL.path), "Refusal must precede ACP initialization")
         }
+        let registry = AgentACPModelRegistry(dependencies: .init(loadAll: { [:] }, load: { _ in nil }, save: { _, _ in }, remove: { _ in }, invalidate: { _ in }))
+        let model = AgentModelOption(rawValue: "antigravity-fixture", displayName: "Fixture", description: nil, isPlaceholderDefault: false, isProviderDefault: false)
+        let populated = AntigravityACPModelPollingService(client: Client(models: .init(options: [model], currentModelRaw: model.rawValue)), registry: registry, logFailure: { _ in })
+        let first = try await populated.discoverOnce(workspacePath: nil)
+        XCTAssertEqual(first?.models.options.map(\.rawValue), ["antigravity-fixture"])
+        await populated.shutdown()
+        let empty = AntigravityACPModelPollingService(client: Client(models: .init(options: [], currentModelRaw: nil)), registry: registry, logFailure: { _ in })
+        let refreshed = await empty.refreshNow(workspacePath: nil)
+        let latest = await empty.latestSnapshot()
+        XCTAssertTrue(refreshed)
+        XCTAssertEqual(latest?.models.options.map(\.rawValue), ["antigravity-fixture"])
+        XCTAssertEqual(latest?.isLiveDiscovery, true)
+        await empty.shutdown()
+    }
+
+    func testAntigravityPropagatesSessionHomePreparationFailure() {
+        let names = ACPToolNameResolution(isRepoPromptServerIdentifier: { _ in false }, canonicalRepoPromptToolName: { _ in nil }, isRepoPromptToolNameWithServerPrefix: { _ in false })
+        let provider = AntigravityACPAgentProvider(
+            executablePath: "fallback", harnessPath: nil, installedRuntime: { nil },
+            prepareSessionHome: { throw NSError(domain: "fixture-home", code: 7) }, toolNames: names
+        )
+        let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: nil, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
+        XCTAssertThrowsError(try provider.makeLaunchConfiguration(for: request)) { error in
+            XCTAssertEqual((error as NSError).domain, "fixture-home")
+        }
+    }
+
+    func testAntigravityReadsRuntimeFreshForSupportAndLaunch() async throws {
+        final class RuntimeSequence: @unchecked Sendable {
+            private let lock = NSLock()
+            private var count = 0
+            func next() -> (command: String, harness: String)? {
+                lock.withLock {
+                    count += 1
+                    return count == 1 ? ("/usr/bin/true", "first") : ("/second/runtime", "second")
+                }
+            }
+        }
+        let sequence = RuntimeSequence()
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("antigravity-seam-home")
+        let names = ACPToolNameResolution(isRepoPromptServerIdentifier: { _ in false }, canonicalRepoPromptToolName: { _ in nil }, isRepoPromptToolNameWithServerPrefix: { _ in false })
+        let provider = AntigravityACPAgentProvider(
+            executablePath: "fallback", harnessPath: "explicit-harness", installedRuntime: { sequence.next() },
+            prepareSessionHome: { home }, toolNames: names
+        )
+        let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: "/tmp/workspace", resumeSessionID: "resume", attachments: [], taskLabelKind: nil)
+        let support = try await provider.support(for: request)
+        XCTAssertEqual(support, .supported)
+        let launch = try provider.makeLaunchConfiguration(for: request)
+        XCTAssertEqual(launch.command, "/second/runtime")
+        XCTAssertEqual(launch.environment["ANTIGRAVITY_HARNESS_PATH"], "explicit-harness")
+        XCTAssertEqual(launch.environment["GEMINI_HOME"], home.path)
+        XCTAssertEqual(launch.environment["AGY_ACP_FORCE_FILE_STORAGE"], "1")
+        XCTAssertEqual(launch.workingDirectory, "/tmp/workspace")
+        let server = RepoPromptMCPServerConfiguration(command: "/usr/bin/true")
+        let session = try provider.makeSessionConfiguration(for: request, mcpServer: server)
+        XCTAssertEqual(session.mode, .load(existingSessionID: "resume"))
+        XCTAssertEqual(session.mcpServers, [server])
+    }
+
+    func testAppAuthorityRejectsLookalikeServer() {
+        XCTAssertNil(ACPRuntimeEventParsing.repoPromptToolName(from: ["title": "read_file (NotRepoPromptCE)"]))
+        XCTAssertEqual(ACPRuntimeEventParsing.repoPromptToolName(from: ["title": "read_file (RepoPromptCE)"]), "mcp__RepoPromptCE__read_file")
     }
 
     func testDevinKnownUpdatesDuringRealNewBootstrapKeepForeignFence() async throws {
@@ -174,19 +221,6 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
         XCTAssertEqual(bootstrap.providerSessionIdentity.loadSessionID, "fresh-runtime-id")
         XCTAssertEqual(bootstrap.providerSessionIdentity.loadSessionIDConfidence, .verified)
         XCTAssertEqual(recordedSessionLoadIDs(at: recordURL), ["stale-session-id"])
-    }
-
-    func testProviderSessionIdentityNormalizesEmptyIDs() {
-        let identity = ACPProviderSessionIdentity(
-            providerID: .cursor,
-            runtimeSessionID: " cursor-runtime-id ",
-            loadSessionID: "  ",
-            loadSessionIDConfidence: .verified
-        )
-
-        XCTAssertEqual(identity.runtimeSessionID, "cursor-runtime-id")
-        XCTAssertNil(identity.loadSessionID)
-        XCTAssertEqual(identity.loadSessionIDConfidence, .unavailable)
     }
 
     func testNegotiatedImagesRequireLiteralTrueAndRefusalKeepsTextUsable() async throws {

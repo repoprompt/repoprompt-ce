@@ -5,6 +5,7 @@ import RepoPromptFileSystem
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
 import RepoPromptShared
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 #if DEBUG
@@ -86,6 +87,196 @@ import XCTest
             manager.activeWorkspace = second
             XCTAssertEqual(manager.agentSessionLifecycleTabs(workspaceID: second.id, sessionID: sessionID), [laterTab, sharedTab])
             XCTAssertEqual(manager.workspaces.map(\.id), [first.id, second.id])
+        }
+
+        func testStoredOnlySelectionPublishesOnceWithoutCarrierMaintenanceAndPersists() async throws {
+            var tab = ComposeTabState(name: "Stored target", activeAgentSessionID: UUID())
+            tab.lastModified = .distantPast
+            let seed = WorkspaceModel(dateModified: .distantPast, name: "Stored owner", repoPaths: [], composeTabs: [tab], activeComposeTabID: tab.id)
+            try writeWorkspace(seed)
+            try writeLegacyIndex([seed])
+            let manager = makeManager(windowID: -17850)
+            await manager.awaitInitialized()
+            let before = try XCTUnwrap(manager.workspace(withID: seed.id))
+            let originalTab = try XCTUnwrap(before.composeTabs.first)
+            let dirty = manager.debugStateVersionForWorkspace(seed.id)
+            let revision = manager.selectionRevisionForMCP(workspaceID: seed.id, tabID: tab.id)
+            let rebuilds = manager.test_sessionCarrierIndexRebuildCount
+            manager.test_sessionCarrierIndexMaintenanceRowsVisited = 0
+            var publications = 0
+            let subscription = manager.$workspaces.dropFirst().sink { _ in publications += 1 }
+            var update = originalTab
+            update.selection = StoredSelection(selectedPaths: ["/stored/README.md"])
+            XCTAssertTrue(manager.updateComposeTabStoredOnly(update, inWorkspaceID: seed.id))
+            let stored = try XCTUnwrap(manager.workspace(withID: seed.id))
+            XCTAssertEqual(publications, 1)
+            XCTAssertEqual(manager.test_sessionCarrierIndexRebuildCount, rebuilds)
+            XCTAssertEqual(manager.test_sessionCarrierIndexMaintenanceRowsVisited, 0)
+            XCTAssertGreaterThan(stored.composeTabs[0].lastModified, originalTab.lastModified)
+            XCTAssertGreaterThan(stored.dateModified, before.dateModified)
+            XCTAssertGreaterThan(manager.debugStateVersionForWorkspace(seed.id), dirty)
+            let committedRevision = manager.selectionRevisionForMCP(workspaceID: seed.id, tabID: tab.id)
+            XCTAssertGreaterThan(committedRevision, revision)
+            XCTAssertEqual(try manager.sessionCarriers(sessionIDs: [XCTUnwrap(tab.activeAgentSessionID)]).map(\.tab), stored.composeTabs)
+            // An equal selection/tab is a true no-op, including timestamps, dirty state and revision.
+            let storedDirty = manager.debugStateVersionForWorkspace(seed.id)
+            XCTAssertTrue(manager.updateComposeTabStoredOnly(stored.composeTabs[0], inWorkspaceID: seed.id))
+            XCTAssertEqual(publications, 1)
+            XCTAssertEqual(manager.workspace(withID: seed.id), stored)
+            XCTAssertEqual(manager.debugStateVersionForWorkspace(seed.id), storedDirty)
+            XCTAssertEqual(manager.selectionRevisionForMCP(workspaceID: seed.id, tabID: tab.id), committedRevision)
+            subscription.cancel()
+            let url = try await manager.saveWorkspaceToFileAsync(stored, preserveDiskRepoPathsIfUnchangedSinceBaseline: false)
+            await manager.workspaceDiskWriter.flush(url: url)
+            let disk = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: url))
+            XCTAssertEqual(disk.composeTabs, stored.composeTabs)
+            XCTAssertEqual(disk.dateModified, stored.dateModified)
+            XCTAssertEqual(manager.selectionRevisionForMCP(workspaceID: seed.id, tabID: tab.id), committedRevision)
+            // A fresh manager restores the changed canonical selection, not a stale UI snapshot.
+            let restored = makeManager(windowID: -17851)
+            XCTAssertEqual(restored.workspace(withID: seed.id)?.composeTabs, stored.composeTabs)
+        }
+
+        func testStoredOnlyIdentityChangeWithEqualSelectionRebuildsAndContentChangeStillWrites() async throws {
+            let manager = makeManager(windowID: -17852)
+            await manager.awaitInitialized()
+            let tab = ComposeTabState(name: "Old identity", activeAgentSessionID: UUID())
+            let workspace = WorkspaceModel(name: "Identity owner", repoPaths: [], ephemeralFlag: true, composeTabs: [tab])
+            manager.workspaces = [workspace]
+            var publications = 0
+            let subscription = manager.$workspaces.dropFirst().sink { _ in publications += 1 }
+            let rebuilds = manager.test_sessionCarrierIndexRebuildCount
+            var update = tab
+            update.activeAgentSessionID = UUID()
+            XCTAssertTrue(manager.updateComposeTabStoredOnly(update, inWorkspaceID: workspace.id))
+            XCTAssertEqual(publications, 1)
+            XCTAssertEqual(manager.test_sessionCarrierIndexRebuildCount, rebuilds + 1)
+            XCTAssertTrue(try manager.sessionCarriers(sessionIDs: [XCTUnwrap(tab.activeAgentSessionID)]).isEmpty)
+            XCTAssertEqual(try manager.sessionCarriers(sessionIDs: [XCTUnwrap(update.activeAgentSessionID)]).map(\.tab.id), [tab.id])
+            XCTAssertNil(try manager.agentSessionLifecycleWorkspaceID(tabID: tab.id, sessionID: XCTUnwrap(tab.activeAgentSessionID)))
+            XCTAssertEqual(try manager.agentSessionLifecycleWorkspaceID(tabID: tab.id, sessionID: XCTUnwrap(update.activeAgentSessionID)), workspace.id)
+            XCTAssertEqual(manager.selectionRevisionForMCP(workspaceID: workspace.id, tabID: tab.id), 0)
+            update = try XCTUnwrap(manager.workspaces.first?.composeTabs.first)
+            update.promptText = "Content changes also survive an equal selection"
+            XCTAssertTrue(manager.updateComposeTabStoredOnly(update, inWorkspaceID: workspace.id))
+            XCTAssertEqual(publications, 2)
+            XCTAssertEqual(manager.test_sessionCarrierIndexRebuildCount, rebuilds + 1)
+            XCTAssertEqual(manager.workspaces[0].composeTabs[0].promptText, update.promptText)
+            subscription.cancel()
+        }
+
+        func testStoredOnlyDuplicateRoutesKeepFirstMatchAndGenericMaintenance() async {
+            let manager = makeManager(windowID: -17853)
+            await manager.awaitInitialized()
+            let tab = ComposeTabState(name: "First", activeAgentSessionID: UUID())
+            var duplicateTab = tab
+            duplicateTab.name = "Later tab"
+            let first = WorkspaceModel(name: "First workspace", repoPaths: [], ephemeralFlag: true, composeTabs: [tab, duplicateTab])
+            var duplicateWorkspace = first
+            duplicateWorkspace.name = "Later workspace"
+            let other = WorkspaceModel(name: "Other workspace", repoPaths: [], ephemeralFlag: true, composeTabs: [duplicateTab])
+            for models in [[first, other], [first, duplicateWorkspace]] {
+                manager.workspaces = models
+                let rebuilds = manager.test_sessionCarrierIndexRebuildCount
+                var publications = 0
+                let subscription = manager.$workspaces.dropFirst().sink { _ in publications += 1 }
+                var update = tab
+                update.selection = StoredSelection(selectedPaths: ["/first-match"])
+                manager.updateComposeTabStoredOnly(update)
+                XCTAssertEqual(publications, 1)
+                XCTAssertEqual(manager.test_sessionCarrierIndexRebuildCount, rebuilds + 1)
+                XCTAssertEqual(manager.workspaces[0].composeTabs[0].selection, update.selection)
+                XCTAssertEqual(manager.workspaces[0].composeTabs[1], duplicateTab)
+                XCTAssertEqual(manager.workspaces[1], models[1])
+                XCTAssertFalse(manager.updateComposeTabStoredOnly(update, inWorkspaceID: UUID()))
+                var missingTab = ComposeTabState(name: "Missing")
+                missingTab.selection = update.selection
+                XCTAssertFalse(manager.updateComposeTabStoredOnly(missingTab, inWorkspaceID: first.id))
+                XCTAssertEqual(publications, 1)
+                subscription.cancel()
+            }
+        }
+
+        func testStoredOnlyPeerStressKeepsEqualStaleClosedAndReplacedHostsWriteFree() async {
+            let source = makeManager(windowID: -17854)
+            await source.awaitInitialized()
+            let models = (0 ..< 4).map { workspace in
+                WorkspaceModel(
+                    name: "Stress \(workspace)", repoPaths: [], ephemeralFlag: true,
+                    composeTabs: (0 ..< 250).map { ComposeTabState(name: "Tab \(workspace)-\($0)", activeAgentSessionID: UUID()) }
+                )
+            }
+            let target = models[0].composeTabs[0]
+            let identity = WorkspaceSelectionIdentity(workspaceID: models[0].id, tabID: target.id)
+            source.workspaces = models
+            let windows = (0 ..< 7).map { _ in WindowState(automaticProviderModelDiscoveryEnabled: false) }
+            let previousWindows = WindowStatesManager.shared.allWindows
+            addTeardownBlock { @MainActor in
+                WindowStatesManager.shared.allWindows = previousWindows
+                for window in windows {
+                    await window.tearDown()
+                }
+            }
+            for window in windows {
+                await window.workspaceManager.awaitInitialized()
+                window.workspaceManager.workspaces = models
+                window.workspaceManager.activeWorkspace = nil
+            }
+            let peers = Array(windows.prefix(5))
+            let unrelated = windows[5]
+            unrelated.workspaceManager.workspaces = [WorkspaceModel(name: "Unrelated", repoPaths: [], ephemeralFlag: true)]
+            let unrelatedBaseline = unrelated.workspaceManager.workspaces
+            let replacement = windows[6]
+            WindowStatesManager.shared.allWindows = peers + [unrelated]
+            let observed = [source] + windows.map(\.workspaceManager)
+            let rebuilds = observed.map(\.test_sessionCarrierIndexRebuildCount)
+            var publications = Array(repeating: 0, count: observed.count)
+            let subscriptions = observed.enumerated().map { index, manager in
+                manager.test_sessionCarrierIndexMaintenanceRowsVisited = 0
+                return manager.$workspaces.dropFirst().sink { _ in publications[index] += 1 }
+            }
+            defer { subscriptions.forEach { $0.cancel() } }
+            let selection = StoredSelection(selectedPaths: (0 ..< 500).map { "/stress/File\($0).swift" })
+            func propagation(_ selection: StoredSelection) -> MCPSelectionPeerPropagation {
+                let registration = source.registerMCPSelectionSourceMutation(for: identity)
+                return MCPSelectionPeerPropagation(
+                    identity: identity, selection: selection, sourceRevision: registration.sourceRevision,
+                    peerHostIDs: registration.peerHostIDs, mirrorToUIIfActive: false
+                )
+            }
+            let first = propagation(selection)
+            var update = target
+            update.selection = selection
+            XCTAssertTrue(source.updateComposeTabStoredOnly(update, inWorkspaceID: identity.workspaceID))
+            await source.propagateMCPSelectionToPeerHosts(first)
+            XCTAssertEqual(publications, [1, 1, 1, 1, 1, 1, 0, 0])
+            for peer in peers {
+                XCTAssertEqual(peer.workspaceManager.composeTab(for: identity)?.selection, selection)
+                XCTAssertGreaterThan(peer.workspaceManager.committedSelectionRevision(for: identity), 0)
+                XCTAssertEqual(Array(peer.workspaceManager.workspaces.dropFirst()), Array(models.dropFirst()))
+            }
+            // Newer equal propagation still converges, without touching canonical storage.
+            await source.propagateMCPSelectionToPeerHosts(propagation(selection))
+            XCTAssertEqual(publications, [1, 1, 1, 1, 1, 1, 0, 0])
+            let nextSelection = StoredSelection(selectedPaths: selection.selectedPaths + ["/stress/New.swift"])
+            let next = propagation(nextSelection)
+            // Capture host generations first, then close one and replace another with the same document.
+            peers[3].beginClose()
+            WindowStatesManager.shared.allWindows = Array(peers.prefix(4)) + [replacement, unrelated]
+            let revisions = peers.map { $0.workspaceManager.committedSelectionRevision(for: identity) }
+            await source.propagateMCPSelectionToPeerHosts(next)
+            await source.propagateMCPSelectionToPeerHosts(first) // Delayed older work cannot roll back peers.
+            XCTAssertEqual(publications, [1, 2, 2, 2, 1, 1, 0, 0])
+            for (index, peer) in peers.enumerated() {
+                XCTAssertEqual(peer.workspaceManager.composeTab(for: identity)?.selection, index < 3 ? nextSelection : selection)
+                let revision = peer.workspaceManager.committedSelectionRevision(for: identity)
+                if index < 3 { XCTAssertGreaterThan(revision, revisions[index]) }
+                else { XCTAssertEqual(revision, revisions[index]) }
+            }
+            XCTAssertEqual(replacement.workspaceManager.composeTab(for: identity)?.selection, target.selection)
+            XCTAssertEqual(observed.map(\.test_sessionCarrierIndexRebuildCount), rebuilds)
+            XCTAssertEqual(observed.map(\.test_sessionCarrierIndexMaintenanceRowsVisited), Array(repeating: 0, count: observed.count))
+            XCTAssertEqual(unrelated.workspaceManager.workspaces, unrelatedBaseline)
         }
 
         func testDirectTabSwitchPreservesDraftAndPersistsSelectionWithoutUnrelatedCarrierRebuilds() async throws {
@@ -2526,14 +2717,38 @@ import XCTest
 
     /// The custom-storage preference read seam: the value a test process inherited from a killed run
     /// never pins this run's workspace store, while values the run's own fixtures set and every product
-    /// launch are unchanged. Test defaults use a volatile domain, so nothing is persisted.
+    /// launch are unchanged. Read-only test defaults never publish fixture paths process-wide.
     final class WorkspaceStoragePreferenceTests: XCTestCase {
+        private final class StorageDefaults: UserDefaults, @unchecked Sendable {
+            private let storedPath: String?
+
+            init(path: String?) {
+                storedPath = path
+                super.init(suiteName: "workspace-storage-preference-\(UUID().uuidString)")!
+            }
+
+            override func string(forKey defaultName: String) -> String? {
+                defaultName == WorkspaceStoragePreference.key ? storedPath : super.string(forKey: defaultName)
+            }
+        }
+
         private func defaults(storing path: String?) -> UserDefaults {
-            let defaults = UserDefaults(suiteName: "workspace-storage-preference-\(UUID().uuidString)")!
-            defaults.setVolatileDomain(
-                path.map { [WorkspaceStoragePreference.key: $0] } ?? [:], forName: UserDefaults.argumentDomain
-            )
-            return defaults
+            // NSArgumentDomain is shared even by named suites. Publishing synthetic storage paths
+            // there can redirect unrelated live workspace tasks while this fixture is alive.
+            StorageDefaults(path: path)
+        }
+
+        func testFixtureDefaultsDoNotChangeArgumentDomain() {
+            let original = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain) as NSDictionary
+            for path in [stale, nil] {
+                withExtendedLifetime(defaults(storing: path)) {
+                    XCTAssertEqual(
+                        UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain) as NSDictionary,
+                        original,
+                        "Fixture defaults must not replace or clear the process-wide argument domain"
+                    )
+                }
+            }
         }
 
         private let stale = "/var/folders/x/T/rpce-local-tests-gone/25bf8e1a2393f110/new-window-selection-1/Workspaces"

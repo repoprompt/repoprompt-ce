@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCodexProvider
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 

@@ -1,5 +1,8 @@
 import Foundation
 import MCP
+import RepoPromptAIContracts
+import RepoPromptCodexProvider
+import RepoPromptDomainRuntime
 import RepoPromptFoundation
 import RepoPromptInstrumentation
 import RepoPromptMCPServer

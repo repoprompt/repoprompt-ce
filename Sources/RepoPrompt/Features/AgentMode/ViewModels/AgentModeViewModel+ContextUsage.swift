@@ -1,4 +1,7 @@
 import Foundation
+import RepoPromptAIContracts
+import RepoPromptClaudeProvider
+import RepoPromptDomainRuntime
 
 @MainActor
 extension AgentModeViewModel {

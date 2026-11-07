@@ -2,6 +2,9 @@ import AppKit
 import Combine
 import Foundation
 import MCP
+import RepoPromptACPProviders
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import SwiftUI
@@ -1749,15 +1752,15 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
 
         func testCursorModelMenuVariantsStayTransientUntilSwitchAndRollbackWithTuple() async throws {
             GlobalSettingsStore.installApplicationModelIdentityPolicy()
-            AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
-            defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+            AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor)
+            defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor) }
             let model = "grok-4.6"
             let definition = ACPModelParameterDefinition(
                 kind: .thinking, configID: "effort", displayName: "Effort",
                 choices: [.init(rawValue: "low", displayName: "Low"), .init(rawValue: "high", displayName: "High")],
                 currentValueRaw: "low"
             )
-            _ = AgentACPModelRegistry.shared.updateDiscoveredModels(.init(
+            _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(.init(
                 options: [.init(rawValue: model, displayName: "Grok 4.6", description: nil, isDefault: false)],
                 currentModelRaw: model, modelParameterSets: [.init(baseModelRaw: model, parameters: [definition])]
             ), for: .cursor)
@@ -2933,7 +2936,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     projection, source: source, historyReference: nil, budget: budget
                 ))
                 let payload = AgentProviderHandover.render(carrier)
-                session.pendingHandoff = try .init(
+                session.pendingHandoff = .init(
                     payload: payload, createdAt: Date(),
                     sourceItemID: session.items.last?.id, providerSwitchDelivery: .ready
                 )
@@ -3059,7 +3062,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 )
                 session.isChangingExecutionLocation = false
 
-                session.pendingHandoff = try .init(payload: "foreign-slot", createdAt: Date())
+                session.pendingHandoff = .init(payload: "foreign-slot", createdAt: Date())
                 XCTAssertEqual(
                     vm.providerSwitchTransitionAdmission(session),
                     .hard(AgentSessionLinkSendFailure.targetBusy.message),
@@ -3347,7 +3350,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 let vm = fixture.viewModel
                 let session = fixture.sourceSession
                 let provider = session.selectedAgent
-                session.pendingHandoff = try .init(payload: "foreign-slot", createdAt: Date())
+                session.pendingHandoff = .init(payload: "foreign-slot", createdAt: Date())
                 await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
                 let preview = try XCTUnwrap(vm.providerSwitchPreview)
                 let forced = await vm.applyProviderSwitch(preview.id, force: true)
@@ -3409,7 +3412,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     let vm = fixture.viewModel
                     let session = fixture.sourceSession
                     let provider = session.selectedAgent
-                    session.pendingHandoff = try .init(payload: "foreign-slot", createdAt: Date())
+                    session.pendingHandoff = .init(payload: "foreign-slot", createdAt: Date())
                     if awaitingApproval {
                         session.pendingApproval = AgentApprovalRequest(
                             requestID: .codex(.int(1)),
@@ -3679,7 +3682,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     projection, source: source, historyReference: nil, budget: budget
                 ))
                 let payload = AgentProviderHandover.render(carrier)
-                session.pendingHandoff = try .init(
+                session.pendingHandoff = .init(
                     payload: payload, createdAt: Date(),
                     sourceItemID: session.items.last?.id, providerSwitchDelivery: .ready
                 )

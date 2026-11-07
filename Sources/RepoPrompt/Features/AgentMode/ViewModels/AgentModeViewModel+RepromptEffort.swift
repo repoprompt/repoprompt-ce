@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 extension AgentModeViewModel {
     /// A bounded wording pass should not wait for a separate Auto Effort model call.

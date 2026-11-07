@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptAIContracts
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptPersistence
@@ -17,7 +18,7 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
                 let originalProfile = settings.globalAgentModelsProfile()
                 defer {
                     settings.setGlobalAgentModelsProfile(originalProfile, contextBuilderWriteIntent: .preserveExistingOwnership)
-                    AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode)
+                    AgentModelCatalogRuntime.shared.invalidate(.claudeCode)
                 }
                 var profile = originalProfile
                 profile.mcpAgentRoleOverrides = ["explore": "claudeCode:sonnet:medium"]
@@ -27,12 +28,12 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
                 try await AsyncTestWait.waitUntil("model writer availability") {
                     fixture.window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable
                 }
-                AgentAdvertisedModelCatalog.shared.record([
+                AgentModelCatalogRuntime.shared.record([
                     AgentModelOption(
                         rawValue: "sonnet:medium", displayName: "Sonnet", description: nil,
                         isPlaceholderDefault: false, isProviderDefault: false
                     )
-                ], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
+                ], for: .claudeCode, generation: AgentModelCatalogRuntime.shared.productionGeneration(for: .claudeCode))
                 let binding = fixture.session.persistentSessionBindingIdentity
                 let peerWorkspace = fixture.replica.workspaceManager.activeWorkspace
                 let peerIndex = fixture.replica.agentModeViewModel.ownerValidatedSessionIndex

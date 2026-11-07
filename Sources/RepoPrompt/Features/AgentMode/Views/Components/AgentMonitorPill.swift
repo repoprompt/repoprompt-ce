@@ -660,39 +660,27 @@ struct AgentMonitorPopoverView: View {
         .accessibilityLabel("Auto-wake for \(row.displayName)")
     }
 
-    /// The routine-limit checkbox, its interval picker, and the countdown.
-    ///
-    /// The picker stays visible while limiting is off so the retained choice is not hidden, and the
-    /// countdown renders only when the runtime says the interval is the one thing delaying a wake.
+    /// Routine interval picker and countdown; zero represents no delay.
     private func routineWakeIntervalRow(now: Date) -> some View {
         let controlsDisabled = isChangingAutoWake || props.autoWakeUnavailableReason != nil
         return HStack(spacing: 8) {
-            Toggle(AgentMonitorRoutineWakeCopy.limitLabel, isOn: Binding(
-                get: { props.routineWakeIntervalEnabled },
-                set: {
-                    setRoutineWakeInterval(
-                        enabled: $0,
-                        seconds: props.routineWakeIntervalSeconds
-                    )
-                }
-            ))
-            .toggleStyle(.checkbox)
-            .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
-            .fixedSize()
-            .disabled(controlsDisabled)
-            .hoverTooltip(AgentMonitorRoutineWakeCopy.tooltip, .top)
-            .accessibilityLabel(AgentMonitorRoutineWakeCopy.accessibilityLabel)
-            .accessibilityValue(props.routineWakeIntervalEnabled ? "On" : "Off")
+            Text(AgentMonitorRoutineWakeCopy.limitLabel)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
 
             Picker(AgentMonitorRoutineWakeCopy.intervalLabel, selection: Binding(
-                get: { props.routineWakeIntervalSeconds },
-                set: {
-                    setRoutineWakeInterval(
-                        enabled: props.routineWakeIntervalEnabled,
-                        seconds: $0
+                get: {
+                    AgentSessionLinkRoutineWakeInterval.pickerSeconds(
+                        enabled: props.routineWakeIntervalEnabled, seconds: props.routineWakeIntervalSeconds
                     )
+                },
+                set: {
+                    let selection = AgentSessionLinkRoutineWakeInterval.pickerSelection(
+                        $0, retaining: props.routineWakeIntervalSeconds
+                    )
+                    setRoutineWakeInterval(enabled: selection.enabled, seconds: selection.seconds)
                 }
             )) {
+                Text(AgentMonitorRoutineWakeCopy.noDelayLabel).tag(0)
                 ForEach(AgentSessionLinkRoutineWakeInterval.optionsSeconds, id: \.self) { seconds in
                     Text(AgentMonitorRoutineWakeCopy.optionLabel(seconds: seconds)).tag(seconds)
                 }
@@ -701,7 +689,8 @@ struct AgentMonitorPopoverView: View {
             .labelsHidden()
             .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
             .fixedSize()
-            .disabled(controlsDisabled || !props.routineWakeIntervalEnabled)
+            .disabled(controlsDisabled)
+            .hoverTooltip(AgentMonitorRoutineWakeCopy.tooltip, .top)
             .accessibilityLabel(AgentMonitorRoutineWakeCopy.intervalAccessibilityLabel)
 
             if let countdown = AgentMonitorRoutineWakeCopy.countdown(

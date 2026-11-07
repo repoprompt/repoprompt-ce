@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptACPProviders
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptProcess
 import RepoPromptSecureStorage
@@ -76,22 +78,6 @@ final class DevinPermissionLevelTests: XCTestCase {
         XCTAssertEqual(Level.acceptEdits.launchArguments, ["--permission-mode", "accept-edits"])
         XCTAssertEqual(Level.smart.launchArguments, ["--permission-mode", "smart"])
         XCTAssertEqual(Level.fullApproval.launchArguments, ["--permission-mode", "dangerous"])
-    }
-
-    func testDevinClassifiesOnlyThoughtLevel() {
-        let provider = DevinACPAgentProvider(config: DevinAgentConfig())
-        XCTAssertTrue(provider.supportsParameterizedModelPicker)
-        let cases: [(configID: String, category: String?, kind: ACPModelParameterKind?)] = [
-            ("arbitrary_effort_id", " ThOuGhT_LeVeL ", .thinking),
-            ("thought_level", "model_config", nil),
-            ("speed", "model_config", nil),
-            ("speed", "speed", nil)
-        ]
-        for (configID, category, expectedKind) in cases {
-            XCTAssertEqual(provider.modelParameterKind(for: .init(
-                configID: configID, category: category, displayName: configID, choices: []
-            )), expectedKind)
-        }
     }
 
     func testOnlyFullApprovalIsAWarningLevel() {
@@ -292,21 +278,6 @@ final class DevinPermissionLevelTests: XCTestCase {
         XCTAssertEqual(launch.arguments, ["--permission-mode", "accept-edits", "acp"])
     }
 
-    func testResolvedLaunchAlwaysHoldsTheBareACPSubcommand() throws {
-        // `makeLaunchConfiguration` prepends the permission flag to the resolver's argv, so
-        // the resolver must never emit a wrapper/shim invocation ahead of `acp`.
-        let directory = try makeTestDirectory(name: "DevinResolvedLaunchInvariant")
-        let executable = directory.appendingPathComponent("devin")
-        try "#!/bin/sh\nexit 0\n".write(to: executable, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
-
-        let resolved = try DevinACPLaunchResolver().resolvedLaunch(
-            for: DevinAgentConfig(commandName: executable.path)
-        )
-        XCTAssertEqual(resolved.arguments, ["acp"])
-        XCTAssertEqual((resolved.command as NSString).lastPathComponent, "devin")
-    }
-
     func testLaunchRejectsAnUnrecognizedPermissionMode() throws {
         let (provider, directory) = try makeProvider()
         XCTAssertThrowsError(
@@ -361,111 +332,6 @@ final class DevinPermissionLevelTests: XCTestCase {
         DevinIntegrationConfiguration.cleanupReportingFailures(artifact: cleanupArtifact)
     }
 
-    func testConcurrentProbeDoesNotInvalidateAResolvedBareCommandLaunch() async throws {
-        let directory = try makeTestDirectory(name: "DevinConcurrentBareCommandLaunch")
-        let executable = directory.appendingPathComponent("devin")
-        try "#!/bin/sh\necho 'Run as an ACP server over stdio'\n".write(
-            to: executable,
-            atomically: true,
-            encoding: .utf8
-        )
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
-        let gate = DevinProbeEnvironmentGate(environment: ["PATH": directory.path])
-        let resolver = DevinACPLaunchResolver(launchEnvironmentProvider: { _ in
-            await gate.nextEnvironment()
-        })
-        let config = DevinAgentConfig(commandName: "devin", includeRepoPromptMCPServer: false)
-
-        let initialSupport = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
-        XCTAssertEqual(initialSupport, .supported)
-        let secondProbe = Task { try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) } }
-        await gate.waitForSecondCall()
-        let resolved = Result { try resolver.resolvedLaunch(for: config) }
-        await gate.releaseSecondCall()
-        let secondSupport = try await secondProbe.value
-        XCTAssertEqual(secondSupport, .supported)
-
-        XCTAssertEqual(
-            try resolved.get().command,
-            try ExecutableFileIdentity.captureForTrustedPathLaunch(atPath: executable.path).canonicalPath
-        )
-    }
-
-    func testRoutineInfoStderrIsHiddenWhileActionableOutputRemainsVisible() throws {
-        let (provider, _) = try makeProvider()
-
-        XCTAssertFalse(provider.shouldEmitStderrLine(
-            "2026-09-14T09:52:20.134260Z  INFO chisel: elapsed_since_main_ms=4 logging initialized"
-        ))
-        XCTAssertFalse(provider.shouldEmitStderrLine(
-            "2026-09-14T09:52:20Z INFO chisel: logging initialized"
-        ))
-        XCTAssertTrue(provider.shouldEmitStderrLine("2026-09-14T09:52:20Z ERROR chisel: startup failed"))
-        XCTAssertFalse(provider.shouldEmitStderrLine(
-            "2026-09-15T11:10:05.047288Z  WARN message_forest: MessageChain tree duplication: system prefix changed"
-        ))
-        XCTAssertFalse(provider.shouldEmitStderrLine(
-            "2026-09-17T09:10:27.520189Z  WARN windsurf_api_client::remote_config: remote config revalidation failed, keeping last-good value: error sending request for url (https://unleash.codeium.com/api/client/features): operation timed out"
-        ))
-        XCTAssertFalse(provider.shouldEmitStderrLine(
-            "2026-09-17T09:11:36Z WARN windsurf_api_client::remote_config: remote config revalidation failed, keeping last-good value: error decoding response body"
-        ))
-        XCTAssertTrue(provider.shouldEmitStderrLine("2026-09-14T09:52:20Z  WARN chisel: retrying"))
-        XCTAssertTrue(provider.shouldEmitStderrLine("permission denied while reading config"))
-    }
-
-    func testOracleOneShotArgumentsUseSelectedModelAndPromptFile() {
-        XCTAssertEqual(
-            DevinCLIProvider.test_arguments(
-                modelName: "claude-opus-4-6",
-                promptFilePath: "/tmp/prompt.md"
-            ),
-            [
-                "--model", "claude-opus-4-6",
-                "--respect-workspace-trust", "false",
-                "--permission-mode", "auto",
-                "--prompt-file", "/tmp/prompt.md",
-                "-p"
-            ]
-        )
-    }
-
-    func testOracleOneShotPromptRequestsOnePlainAnswerWithoutTools() {
-        let prompt = DevinCLIProvider.test_promptText(from: AIMessage(
-            systemPrompt: "Return Markdown.",
-            userMessage: "Summarize this."
-        ))
-
-        XCTAssertTrue(prompt.contains("Return Markdown."))
-        XCTAssertTrue(prompt.contains("Summarize this."))
-        XCTAssertTrue(prompt.contains("Do not use any tools"))
-    }
-
-    func testOracleAttachmentsCarryThroughToolLessACPMessage() {
-        let image = OracleAttachment(payload: .image(.png, Data([1, 2, 3])), fileName: "image.png", title: "Diagram")
-        let message = DevinCLIProvider.test_makeImageAgentMessage(from: AIMessage(
-            systemPrompt: "Return Markdown.",
-            conversationMessages: [.init(role: .user, content: "Describe the image.")],
-            attachments: [image],
-            temperature: nil,
-            promptSectionsOrder: PromptAssemblyBuilder.defaultSectionOrder,
-            disabledPromptSections: []
-        ))
-
-        XCTAssertEqual(message.attachments, [image])
-        XCTAssertTrue(message.systemPrompt.contains("Return Markdown."))
-        XCTAssertTrue(message.systemPrompt.contains("Do not use any tools"))
-        XCTAssertTrue(message.userMessage.contains("Describe the image."))
-        XCTAssertFalse(message.userMessage.contains("Do not use any tools"))
-        XCTAssertNil(message.resumeSessionID)
-
-        let config = DevinCLIProvider(config: DevinAgentConfig(commandName: "custom-devin", additionalPathHints: ["/custom/bin"])).test_makeImageHeadlessConfig(modelName: "claude-opus-4-6")
-        XCTAssertEqual(config.commandName, "custom-devin")
-        XCTAssertEqual(config.additionalPathHints, ["/custom/bin"])
-        XCTAssertEqual(config.modelString, "claude-opus-4-6")
-        XCTAssertFalse(config.includeRepoPromptMCPServer)
-    }
-
     func testOracleModelIdentityPreservesRawDevinModelID() {
         let model = AIModel.devinCustom(name: "anthropic/claude-opus-4.6")
 
@@ -476,8 +342,8 @@ final class DevinPermissionLevelTests: XCTestCase {
     }
 
     func testDevinPickersExposeOnlyAdvertisedModels() {
-        AgentACPModelRegistry.shared.test_reset(providerID: .devin)
-        addTeardownBlock { AgentACPModelRegistry.shared.test_reset(providerID: .devin) }
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .devin)
+        addTeardownBlock { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .devin) }
         let availability = AgentModelCatalog.AvailabilityContext(devinAvailable: true)
 
         XCTAssertTrue(AgentModelCatalog.options(for: .devin, availability: availability).isEmpty)
@@ -487,7 +353,7 @@ final class DevinPermissionLevelTests: XCTestCase {
             AgentModelOption(rawValue: "swe-2-high", displayName: "SWE-2 High", description: nil, isDefault: true),
             AgentModelOption(rawValue: "gpt-5-6-sol-medium", displayName: "GPT-5.6 Sol Medium Thinking", description: nil, isDefault: false)
         ]
-        AgentACPModelRegistry.shared.updateDiscoveredModels(
+        AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(
             ACPDiscoveredSessionModels(options: options, currentModelRaw: "swe-2-high"),
             for: .devin
         )
@@ -521,6 +387,51 @@ final class DevinPermissionLevelTests: XCTestCase {
                 workspacePath: "/tmp/workspace"
             ) is DevinACPHeadlessAgentProvider
         )
+    }
+
+    func testProviderCleanupUsesCanonicalArtifactOwnershipAndRemovesTheRealOverlay() async throws {
+        let directory = try makeTestDirectory(name: "DevinProviderCleanup")
+        let sourceRoot = directory.appendingPathComponent("xdg", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourceRoot, withIntermediateDirectories: true)
+        let executable = directory.appendingPathComponent("devin")
+        try "#!/bin/sh\necho 'Run as an ACP server over stdio'\n".write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let resolver = DevinACPLaunchResolver(launchEnvironmentProvider: { _ in
+            ACPLaunchEnvironment(environment: ["PATH": directory.path, "HOME": sourceRoot.path, "XDG_CONFIG_HOME": sourceRoot.path])
+        })
+        let provider = DevinACPAgentProvider(
+            config: DevinAgentConfig(commandName: executable.path, includeRepoPromptMCPServer: false),
+            launchResolver: resolver
+        )
+        let request = makeRequest(workspacePath: directory.path, launchPermissionMode: nil)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await provider.support(for: request) }
+        XCTAssertEqual(support, .supported)
+        let launch = try provider.makeLaunchConfiguration(for: request)
+        let overlayRoot = try XCTUnwrap(launch.environment["XDG_CONFIG_HOME"])
+        let artifact = try XCTUnwrap(launch.cleanupArtifact)
+        addTeardownBlock { try? FileManager.default.removeItem(atPath: overlayRoot) }
+        XCTAssertEqual(artifact.providerID, .devin)
+        XCTAssertEqual(artifact.kind, DevinIntegrationConfiguration.cleanupArtifactKind)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: overlayRoot + "/devin/mcp_config.json"))
+
+        func configuration(with candidate: ACPLaunchCleanupArtifact) -> ACPLaunchConfiguration {
+            ACPLaunchConfiguration(
+                providerID: launch.providerID, command: launch.command, arguments: launch.arguments,
+                environment: launch.environment, workingDirectory: launch.workingDirectory,
+                additionalPathHints: launch.additionalPathHints, enableDebugLogging: launch.enableDebugLogging,
+                cleanupArtifact: candidate, expectedExecutableIdentity: launch.expectedExecutableIdentity,
+                explicitEnvironmentKeys: launch.explicitEnvironmentKeys
+            )
+        }
+        for foreignArtifact in [
+            ACPLaunchCleanupArtifact(providerID: .cursor, id: artifact.id, kind: artifact.kind),
+            ACPLaunchCleanupArtifact(providerID: .devin, id: artifact.id, kind: artifact.kind + "-unrelated")
+        ] {
+            await provider.cleanupLaunchArtifacts(for: configuration(with: foreignArtifact))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: overlayRoot), "Foreign artifacts must not authorize overlay removal")
+        }
+        await provider.cleanupLaunchArtifacts(for: launch)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: overlayRoot))
     }
 
     // MARK: - Controller reuse key
@@ -936,42 +847,6 @@ final class DevinPermissionLevelTests: XCTestCase {
             taskLabelKind: nil,
             launchPermissionMode: launchPermissionMode
         )
-    }
-}
-
-private actor DevinProbeEnvironmentGate {
-    private let environment: [String: String]
-    private var callCount = 0
-    private var secondCallWaiters: [CheckedContinuation<Void, Never>] = []
-    private var releaseSecondCallContinuation: CheckedContinuation<Void, Never>?
-
-    init(environment: [String: String]) {
-        self.environment = environment
-    }
-
-    func nextEnvironment() async -> ACPLaunchEnvironment {
-        callCount += 1
-        if callCount == 2 {
-            let waiters = secondCallWaiters
-            secondCallWaiters.removeAll()
-            waiters.forEach { $0.resume() }
-            await withCheckedContinuation { continuation in
-                releaseSecondCallContinuation = continuation
-            }
-        }
-        return ACPLaunchEnvironment(environment: environment)
-    }
-
-    func waitForSecondCall() async {
-        guard callCount < 2 else { return }
-        await withCheckedContinuation { continuation in
-            secondCallWaiters.append(continuation)
-        }
-    }
-
-    func releaseSecondCall() {
-        releaseSecondCallContinuation?.resume()
-        releaseSecondCallContinuation = nil
     }
 }
 

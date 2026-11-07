@@ -5,6 +5,7 @@ import RepoPromptSettingsCore
     import Darwin
     import Foundation
     import MCP
+    import RepoPromptAIContracts
     @testable import RepoPromptApp
     import XCTest
 

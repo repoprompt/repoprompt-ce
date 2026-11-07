@@ -180,12 +180,12 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
     }
     if (
         _by_name_dependencies(domain_runtime)
-        != ["RepoPromptShared", "RepoPromptWorkspaceCore", "RepoPromptC", "RepoPromptCodeMapCore"]
+        != ["RepoPromptAIContracts", "RepoPromptShared", "RepoPromptWorkspaceCore", "RepoPromptC", "RepoPromptCodeMapCore"]
         or domain_runtime_products != {("Logging", "swift-log"), ("MCP", "swift-sdk")}
-        or len(domain_runtime.get("dependencies", [])) != 6
+        or len(domain_runtime.get("dependencies", [])) != 7
     ):
         raise GeneratorError(
-            "RepoPromptDomainRuntime dependencies must remain RepoPromptShared, RepoPromptWorkspaceCore, RepoPromptC, "
+            "RepoPromptDomainRuntime dependencies must remain RepoPromptAIContracts, RepoPromptShared, RepoPromptWorkspaceCore, RepoPromptC, "
             "RepoPromptCodeMapCore, Logging, and pinned MCP"
         )
 
@@ -194,8 +194,8 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         raise GeneratorError("RepoPromptDomainRuntimeTests must remain a test target")
     if domain_runtime_tests.get("path") != "Tests/RepoPromptDomainRuntimeTests":
         raise GeneratorError("RepoPromptDomainRuntimeTests target path drifted")
-    if _by_name_dependencies(domain_runtime_tests) != ["RepoPromptDomainRuntime"]:
-        raise GeneratorError("RepoPromptDomainRuntimeTests must directly own RepoPromptDomainRuntime")
+    if _by_name_dependencies(domain_runtime_tests) != ["RepoPromptAIContracts", "RepoPromptDomainRuntime"]:
+        raise GeneratorError("RepoPromptDomainRuntimeTests must directly own RepoPromptDomainRuntime and its AIContracts values")
     if _by_name_dependencies(repo_prompt_app).count("RepoPromptDomainRuntime") != 1:
         raise GeneratorError("RepoPromptApp must depend exactly once on RepoPromptDomainRuntime")
 

@@ -1,5 +1,8 @@
 import Darwin
 import Foundation
+import RepoPromptACPProviders
+import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import RepoPromptProcess
 
 enum DevinIntegrationConfiguration {

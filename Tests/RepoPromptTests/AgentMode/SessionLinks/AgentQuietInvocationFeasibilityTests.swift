@@ -1,6 +1,8 @@
 #if DEBUG
     import Foundation
     import MCP
+    import RepoPromptACPProviders
+    import RepoPromptAIContracts
     import RepoPromptSettingsCore
     import XCTest
     @_spi(TestSupport) @testable import RepoPromptApp
