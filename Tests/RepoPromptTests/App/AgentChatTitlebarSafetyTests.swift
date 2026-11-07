@@ -6,6 +6,7 @@ import KeyboardShortcuts
 import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+@testable import RepoPromptMCPServer
 import RepoPromptPersistence
 import RepoPromptSettingsCore
 @testable import RepoPromptWorkspaceContext

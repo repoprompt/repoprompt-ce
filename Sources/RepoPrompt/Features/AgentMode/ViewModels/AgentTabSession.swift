@@ -3,6 +3,7 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
+import RepoPromptMCPServer
 import RepoPromptSettingsCore
 
 /// Shared only by the existing wake attempt and callback-capable producer wrappers. No claim/cache

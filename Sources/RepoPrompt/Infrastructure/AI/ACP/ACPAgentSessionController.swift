@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import os
 import RepoPromptFoundation
+import RepoPromptMCPServer
 import RepoPromptProcess
 import RepoPromptSettingsCore
 

@@ -1,6 +1,7 @@
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+@testable import RepoPromptMCPServer
 import XCTest
 
 /// The bounded repair for a Codex observer whose *returned* MCP catalog is stuck saying

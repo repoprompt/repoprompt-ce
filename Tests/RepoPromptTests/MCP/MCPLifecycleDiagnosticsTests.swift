@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+@testable import RepoPromptMCPServer
 import XCTest
 
 final class MCPLifecycleDiagnosticsTests: XCTestCase {

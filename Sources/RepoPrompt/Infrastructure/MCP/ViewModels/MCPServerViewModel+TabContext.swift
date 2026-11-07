@@ -3,6 +3,7 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
+import RepoPromptMCPServer
 import RepoPromptShared
 import RepoPromptVCS
 import RepoPromptWorkspaceContext

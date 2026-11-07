@@ -1,6 +1,7 @@
 import Darwin
 import Darwin.POSIX.fcntl
 import Foundation
+import RepoPromptMCPServer
 import RepoPromptProcess
 import RepoPromptProviderQuota
 

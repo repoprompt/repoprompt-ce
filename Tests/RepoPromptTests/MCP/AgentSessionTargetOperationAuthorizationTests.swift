@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+@testable import RepoPromptMCPServer
 import RepoPromptSettingsCore
 @testable import RepoPromptWorkspaceContext
 @_spi(TestSupport) @testable import RepoPromptApp

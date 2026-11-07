@@ -1,6 +1,7 @@
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+@testable import RepoPromptMCPServer
 import RepoPromptShared
 import RepoPromptTestSupport
 import XCTest
@@ -31,7 +32,7 @@ final class TaskLocalPayloadLayoutGuardTests: XCTestCase {
             "final class",
         "Sources/RepoPrompt/Infrastructure/MCP/MCPToolWorkCountDiagnostics.swift#currentGitCapture": "final class",
         "Sources/RepoPrompt/Infrastructure/MCP/MCPToolWorkCountDiagnostics.swift#currentReadFileCapture": "final class",
-        "Sources/RepoPrompt/Infrastructure/MCP/MCPInvocationContext.swift#diagnosticSink": "closure",
+        "Sources/RepoPromptMCPServer/Context/MCPToolInvocationContext.swift#diagnosticSink": "closure",
         "Sources/RepoPrompt/Infrastructure/MCP/MCPToolObserverDiagnostics.swift#recorder": "final class",
         "Sources/RepoPromptWorkspaceContext/Search/WorkspaceFileSearchDebugTiming.swift#collector": "final class",
         "Sources/RepoPromptWorkspaceContext/Search/WorkspaceFileSearchDebugTiming.swift#catalogBuildObserver":

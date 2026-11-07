@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptMCPServer
 import RepoPromptSettingsCore
 
 #if REPOPROMPT_SENTRY_ENABLED

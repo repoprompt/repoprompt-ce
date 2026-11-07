@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptMCPServer
 import RepoPromptProcess
 
 final actor ClaudeNativeProcessSessionController {

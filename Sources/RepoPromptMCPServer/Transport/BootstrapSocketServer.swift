@@ -1,3 +1,7 @@
+// Exported Swift 5 package values need explicit cross-module Sendable contracts.
+// swiftformat:disable redundantSendable
+import RepoPromptDomainRuntime
+
 //
 //	BootstrapSocketServer.swift
 //	RepoPrompt
@@ -158,18 +162,23 @@ private final class BootstrapHandshakeSocket: @unchecked Sendable {
 /// Process identity captured while accepting a bootstrap socket connection.
 /// `claimedPID` is handshake metadata used only for compatibility admission heuristics and diagnostics.
 /// `observedKernelPID` is obtained from LOCAL_PEERPID and is the only PID eligible for principal verification.
-struct BootstrapClientProcessIdentity: Equatable {
-    let claimedPID: Int
-    let observedKernelPID: Int?
+package struct BootstrapClientProcessIdentity: Equatable, Sendable {
+    package init(claimedPID: Int, observedKernelPID: Int?) {
+        self.claimedPID = claimedPID
+        self.observedKernelPID = observedKernelPID
+    }
 
-    var admissionPID: Int {
+    package let claimedPID: Int
+    package let observedKernelPID: Int?
+
+    package var admissionPID: Int {
         observedKernelPID ?? claimedPID
     }
 }
 
 /// Actor that manages the single bootstrap UNIX socket.
-/// Accepts CLI connections and hands them off to ServerNetworkManager.
-actor BootstrapSocketServer {
+/// Accepts CLI connections and hands them off to the app connection host.
+package actor BootstrapSocketServer {
     private let socketURL: URL
     private let logger: Logger
     private let peerPIDResolver: @Sendable (Int32) -> Int?
@@ -199,22 +208,22 @@ actor BootstrapSocketServer {
     private var drainRequestedWhileBusy: Bool = false
 
     /// Result of connection admission decision
-    struct Admission {
-        let accepted: Bool
+    package struct Admission {
+        package let accepted: Bool
         /// Called synchronously while handshake ownership is transferred. The receiver
         /// must publish the descriptor into storage visible to full shutdown.
-        let publishTransferredFD: (@Sendable (Int32) -> Bool)?
+        package let publishTransferredFD: (@Sendable (Int32) -> Bool)?
         /// Called after the bootstrap server successfully sends the accepted response
         /// and synchronously publishes transferred descriptor ownership.
         /// This is where MCP server startup should be scheduled.
-        let postAccept: (@Sendable () async -> Void)?
+        package let postAccept: (@Sendable () async -> Void)?
         /// Called if a reserved acceptance is abandoned before deferred startup commits.
         /// Used to release the reserved slot and clean up any pre-commit state.
-        let onAcceptAborted: (@Sendable () async -> Void)?
+        package let onAcceptAborted: (@Sendable () async -> Void)?
         /// Optional override rejection response
-        let rejection: MCPBootstrapResponse?
+        package let rejection: MCPBootstrapResponse?
 
-        static func accept(
+        package static func accept(
             publishTransferredFD: @escaping @Sendable (Int32) -> Bool,
             postAccept: @escaping @Sendable () async -> Void,
             onAcceptAborted: (@Sendable () async -> Void)? = nil
@@ -228,7 +237,7 @@ actor BootstrapSocketServer {
             )
         }
 
-        static func reject(_ response: MCPBootstrapResponse? = nil) -> Self {
+        package static func reject(_ response: MCPBootstrapResponse? = nil) -> Self {
             .init(accepted: false, publishTransferredFD: nil, postAccept: nil, onAcceptAborted: nil, rejection: response)
         }
     }
@@ -239,7 +248,7 @@ actor BootstrapSocketServer {
     private var onNewConnection: ((Int32, String, BootstrapClientProcessIdentity, String?) async -> Admission)?
 
     #if DEBUG
-        enum DebugHandshakeReadPhase {
+        package enum DebugHandshakeReadPhase {
             case accepted
             case queued
             case began
@@ -251,7 +260,7 @@ actor BootstrapSocketServer {
         private var debugBeforeHandshakePoll: (@Sendable (UUID) -> Void)?
 
         /// Test-only events and a physical I/O gate; neither owns admission or scheduling.
-        func debugSetHandshakeReadHooks(
+        package func debugSetHandshakeReadHooks(
             observer: (@Sendable (UUID, DebugHandshakeReadPhase) -> Void)?,
             beforePoll: (@Sendable (UUID) -> Void)? = nil
         ) {
@@ -260,8 +269,8 @@ actor BootstrapSocketServer {
         }
     #endif
 
-    init(
-        socketURL: URL = MCPFilesystemConstants.bootstrapSocketURL(),
+    package init(
+        socketURL: URL,
         logger: Logger? = nil,
         peerPIDResolver: @escaping @Sendable (Int32) -> Int? = { BootstrapSocketServer.peerPID(for: $0) }
     ) {
@@ -283,7 +292,7 @@ actor BootstrapSocketServer {
     /// Starts listening on the bootstrap socket.
     /// - Parameter onNewConnection: Callback invoked for each new CLI connection.
     ///   Return an Admission with postAccept closure for MCP startup.
-    func start(
+    package func start(
         onNewConnection: @escaping (Int32, String, BootstrapClientProcessIdentity, String?) async -> Admission
     ) throws {
         #if DEBUG
@@ -413,23 +422,23 @@ actor BootstrapSocketServer {
     }
 
     /// Returns true when the server has an active listen socket.
-    func isListening() -> Bool {
+    package func isListening() -> Bool {
         isRunning && listenFD >= 0
     }
 
     #if DEBUG
-        struct DebugHandshakeIOLeaseShutdownRaceResult {
-            let remainedOpenUntilInitiatingShutdown: Bool
-            let closedAfterShutdownFinished: Bool
-            let peerObservedEOF: Bool
+        package struct DebugHandshakeIOLeaseShutdownRaceResult {
+            package let remainedOpenUntilInitiatingShutdown: Bool
+            package let closedAfterShutdownFinished: Bool
+            package let peerObservedEOF: Bool
         }
 
-        enum DebugHandshakeIOLeaseShutdownRaceError: Error {
+        package enum DebugHandshakeIOLeaseShutdownRaceError: Error {
             case socketPairCreationFailed(errno: Int32)
             case timedOut(phase: String)
         }
 
-        func debugListenerHasCloseOnExec() -> Bool? {
+        package func debugListenerHasCloseOnExec() -> Bool? {
             guard isRunning, listenFD >= 0 else { return nil }
             let flags = fcntl(listenFD, F_GETFD)
             guard flags >= 0 else { return false }
@@ -518,7 +527,7 @@ actor BootstrapSocketServer {
     #endif
 
     /// Stops the bootstrap socket server.
-    func stop() {
+    package func stop() {
         // Record intent even if start() has not run yet. Actor message ordering can
         // otherwise allow a queued start to bind after its parent's full stop returns.
         stopRequested = true
@@ -700,18 +709,18 @@ actor BootstrapSocketServer {
 
     // MARK: - Health Diagnostics
 
-    struct ListenerDiagnostics {
-        let isRunning: Bool
-        let listenFDValid: Bool
-        let ownsSocketPath: Bool
-        let socketPathStatus: BootstrapSocketOwnership.PathStatus?
-        let acceptSourceExists: Bool
-        let acceptSuspendedForBackpressure: Bool
-        let inFlightHandshakes: Int
-        let maxInFlightHandshakes: Int
+    package struct ListenerDiagnostics {
+        package let isRunning: Bool
+        package let listenFDValid: Bool
+        package let ownsSocketPath: Bool
+        package let socketPathStatus: BootstrapSocketOwnership.PathStatus?
+        package let acceptSourceExists: Bool
+        package let acceptSuspendedForBackpressure: Bool
+        package let inFlightHandshakes: Int
+        package let maxInFlightHandshakes: Int
     }
 
-    func diagnostics() -> ListenerDiagnostics {
+    package func diagnostics() -> ListenerDiagnostics {
         let fdValid: Bool = {
             guard listenFD >= 0 else { return false }
             if fcntl(listenFD, F_GETFL) >= 0 {
@@ -733,7 +742,7 @@ actor BootstrapSocketServer {
         )
     }
 
-    func ensureAccepting() {
+    package func ensureAccepting() {
         guard isRunning, listenFD >= 0, socketOwnership?.pathStatus() == .owned else { return }
         if acceptSource == nil {
             do {
@@ -846,7 +855,7 @@ actor BootstrapSocketServer {
             return
         }
 
-        // Invoke callback to let ServerNetworkManager decide
+        // Invoke callback to let the app connection host decide
         guard let handler = onNewConnection else {
             logger.error("BootstrapSocketServer: no connection handler registered")
             _ = await sendResponseAsync(.rejected(reason: "Server not ready", errorCode: "server_not_ready"), to: handshakeSocket)
@@ -1120,7 +1129,7 @@ actor BootstrapSocketServer {
 
 // MARK: - Errors
 
-enum BootstrapSocketError: Error {
+package enum BootstrapSocketError: Error {
     case startCancelled
     case socketCreationFailed(errno: Int32)
     case descriptorConfigurationFailed(role: String, error: POSIXDescriptorConfigurationError)

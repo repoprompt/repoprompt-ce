@@ -229,3 +229,17 @@ make dev-test
 ```
 
 Use `make run` only when it is safe to stop any existing RepoPrompt instance and launch the debug app.
+
+## MCP server adapter boundary (M7)
+
+`Sources/RepoPromptMCPServer` is the app-free owner of Unix/bootstrap transports,
+request timelines and delivery fences, neutral invocation context, execution
+supervision, resource admission adapters, and publication/failure classification.
+Its tests live in `Tests/RepoPromptMCPServerTests`; they may not import the app.
+The app's `Infrastructure/MCP` retains live window/run/connection authority,
+settings and consent adaptation, SDK handler registration, and response formatting.
+Transport callbacks use `MCPServerConnectionHost`; execution callbacks carry typed
+identity values and narrowly scoped effects, never app view models.
+DomainRuntime continues to own canonical catalogs, physical permits, host
+invocations, cancellation and settlement. Do not recreate these owners in either
+the app manager or server adapter.

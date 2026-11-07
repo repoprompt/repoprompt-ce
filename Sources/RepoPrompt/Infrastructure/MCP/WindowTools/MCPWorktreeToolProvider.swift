@@ -2,6 +2,7 @@ import Foundation
 import JSONSchema
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptMCPServer
 import RepoPromptSettingsCore
 import RepoPromptVCS
 import RepoPromptWorkspaceContext

@@ -5,6 +5,7 @@ import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptFileSystem
+@testable import RepoPromptMCPServer
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
 import RepoPromptShared

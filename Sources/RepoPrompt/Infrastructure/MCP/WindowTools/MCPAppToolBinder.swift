@@ -2,6 +2,7 @@ import Foundation
 import JSONSchema
 import MCP
 import Ontology
+import RepoPromptMCPServer
 import RepoPromptWorkspaceContext
 
 enum MCPToolFreshnessPolicy {

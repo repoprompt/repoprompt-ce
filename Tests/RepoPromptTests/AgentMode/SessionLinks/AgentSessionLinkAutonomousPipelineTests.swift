@@ -1,4 +1,5 @@
 import Foundation
+@testable import RepoPromptMCPServer
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import XCTest

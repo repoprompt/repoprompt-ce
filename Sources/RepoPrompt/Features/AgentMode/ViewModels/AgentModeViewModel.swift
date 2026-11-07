@@ -6,6 +6,7 @@ import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptInstrumentation
+import RepoPromptMCPServer
 import RepoPromptSettingsCore
 import RepoPromptShared
 import RepoPromptVCS

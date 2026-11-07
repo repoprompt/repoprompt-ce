@@ -9,6 +9,7 @@ The app target (`RepoPromptApp`) is the composition and product-flow owner, not 
 | `RepoPrompt`, `RepoPromptMCP` | Thin executable entries | App or MCP core respectively |
 | `RepoPromptApp` | Product flow, UI, composition | May depend on lower app-free targets |
 | `RepoPromptMCPCore`, `RepoPromptDomainRuntime` | Headless CLI and domain runtime | Never depend on app |
+| `RepoPromptMCPServer` | Unix/bootstrap transport, captured invocation dispatch, execution supervision and publication gates | DomainRuntime, Shared and Instrumentation; no app/UI/settings owner |
 | `RepoPromptCodeMapCore`, `RepoPromptRegexCore`, `RepoPromptWorkspaceCore`, `RepoPromptShared` | Narrow reusable cores | Never depend on app |
 | `RepoPromptFoundation`, `RepoPromptInstrumentation` | Reusable substrate and diagnostic sink contracts | Never depend on app |
 | `RepoPromptProcess` | Headless process and CLI mechanics (no `Bundle.main` or `UserDefaults.standard`) | Foundation and Shared only |

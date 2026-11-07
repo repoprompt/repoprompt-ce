@@ -2,6 +2,7 @@ import Combine
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+@testable import RepoPromptMCPServer
 import XCTest
 
 private actor AutoWakeCatalogAuthorityGate {

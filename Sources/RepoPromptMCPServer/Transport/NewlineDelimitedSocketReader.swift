@@ -1,4 +1,5 @@
-import RepoPromptFileSystem
+// Exported Swift 5 package values need explicit cross-module Sendable contracts.
+// swiftformat:disable redundantSendable
 
 //
 //  NewlineDelimitedSocketReader.swift
@@ -71,7 +72,7 @@ public enum NewlineDelimitedSocketReaderTerminal: @unchecked Sendable {
 /// Not actor-isolated; intended to be driven from transports on a dedicated queue.
 /// Each instance is single-use; create a new reader after stop or terminal delivery.
 public final class NewlineDelimitedSocketReader {
-    typealias ReadOperation = (Int32, UnsafeMutableRawPointer?, Int) -> Int
+    package typealias ReadOperation = (Int32, UnsafeMutableRawPointer?, Int) -> Int
 
     private struct ReadEventSource {
         let id: ObjectIdentifier
@@ -201,7 +202,7 @@ public final class NewlineDelimitedSocketReader {
         )
     }
 
-    init(
+    package init(
         fd: Int32,
         queue: DispatchQueue,
         logger: Logger,
@@ -268,7 +269,7 @@ public final class NewlineDelimitedSocketReader {
         }
     }
 
-    func processReadableEvent() {
+    package func processReadableEvent() {
         syncOnQueue {
             if lifecycle == .idle {
                 generation &+= 1
