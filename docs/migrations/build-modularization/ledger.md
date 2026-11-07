@@ -4404,3 +4404,59 @@ provider/input composition, runtime-addressed MCP/admin/link commands and
 presentation-preserving host handoff/drain remain M9 gates. This checkpoint does
 not qualify the final full suite, products/compiler index, warning ratchet or live
 smoke. M10 is untouched. No push, PR edit or visible app lifecycle action occurred.
+
+### M9 continuation — direct-host startup cancellation and drain (2026-11-08)
+
+Retired direct/headless Agent startup's publish-then-install cancellation sequence.
+The existing domain store now receives the exact activation-qualified cancellation
+handler atomically with registration, before epoch preparation or running visibility.
+The coordinator tracks the setup operation from its first suspension through task
+attachment or rollback; shutdown joins that operation, including root preparation.
+Cancellation after running publication but before task attachment prevents physical
+provider launch. Installed cancellation joins the exact registration's task through
+terminal publication rather than treating `task.cancel()` as settled work. Old task
+completion cannot publish into a replacement registration. No second registration,
+terminal, or persistence authority was introduced.
+
+Setup failures now roll back the prepared root overlay and clean up their exact
+registration, including caller cancellation after epoch admission. Existing domain
+cleanup intentionally retains dormant resumable metadata; this slice neither erases
+that history nor changes its retention policy. A generation-zero registration from
+an already-shut-down store is cancellation, not an internal epoch error. The existing
+domain shutdown deadline still determines cooperative versus interrupted settlement.
+This does not replace the app's prepared-window host or finish general writer admission.
+
+Six new deterministic regression cases cover atomic pending cancellation, domain
+shutdown joining held setup, caller cancellation after admission, cancellation of an
+already-visible running start before physical launch, coordinator shutdown joining
+rollback, and an already-shut-down store. They use the real domain store, a held epoch
+or post-publication seam, and a provider-launch file witness; no visible app is created.
+Initial ticket `9752d41c-fb7f-4aac-8f33-676a451b2689` ran 40 tests with three new
+assertion failures: the fixtures incorrectly expected canonical dormant metadata to
+be deleted. The assertions now explicitly verify preserved dormant/resumable history,
+zero live registrations/handlers, and the cancellation outcome; production cleanup
+policy was not weakened. Ticket `0f30235c-162b-4499-bfc1-517ad79b7664` passed 41 tests
+(the additional nonexistent `DirectHeadlessRootOverlayTests` filter matched none).
+Expanded `4fa2f12f-6f15-4ddc-9d7b-dc76b4adb47d` and
+`c69aa911-2e9b-4471-91fa-61e6b6078c1d` each passed 106 tests. An explicit local
+coordinator capture removed the edited path's compiler capture warnings without
+isolation escape hatches or formatter suppression.
+
+Final ticket `e1c4a56a-9650-4933-bd82-304810d3b07c` passed **106 tests** after extending
+setup ownership before its first suspension: startup/payload 8, direct composition 35,
+context builder 6, file read 2, search 11, workspace visibility 4, Oracle groups 29,
+working-directory binding 6, and execution contracts 5. Final MCP product build
+`e78947f3-2f57-4e85-bce9-a51c4d277b03` and lint
+`3b81b2e6-c4e4-4908-92b4-6d96ea7b596f` passed the same Swift tree, with no compiler
+warnings from the two edited files. Earlier MCP product
+`5c4bbf73-7426-4d7b-9e67-a88208e0cd64` and lint tickets
+`08149446-6d50-4f18-bf0d-c50991ca97cc` / `92e4c523-3e45-4394-aec1-6a9a6cb0d384`
+also passed their respective intermediate trees. The change received one independent
+review and uses the mandatory staged contribution preflight before commit.
+
+M9 remains incomplete: independent app writer admission, remaining provider-input
+composition, canonical saved-target execution without WindowState/PromptVM/WorkspaceVM,
+runtime-addressed commands, presentation-preserving handoff/drain, and final whole-PR
+qualification remain open. This receipt does not qualify the full app product, a fresh
+compiler index, the aggregate warning ratchet, the full test suite, or live smoke.
+M10 is untouched. No push, PR edit or visible app lifecycle action occurred.

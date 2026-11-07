@@ -38,8 +38,17 @@ actor DirectHeadlessProviderCoordinator {
         }
     }
 
+    /// Transient startup/drain state only. The domain store remains the registration and
+    /// terminal authority; this joins the work that must finish before its handler returns.
+    private struct PendingStart {
+        let sessionID: UUID
+        var cancellationRequested = false
+        var drainWaiters: [CheckedContinuation<Void, Never>] = []
+    }
+
     private struct AgentRecord {
         let registration: DomainAgentSessionRegistration
+        let activationID: UUID
         let epoch: DomainAgentRunTurnEpoch
         let runID: UUID
         let agentID: String
@@ -71,9 +80,23 @@ actor DirectHeadlessProviderCoordinator {
     private let allowsProviderProcessLaunchForTesting: Bool
     private let beginEpoch: BeginEpoch
     private var agents: [UUID: AgentRecord] = [:]
+    private var pendingStarts: [UUID: PendingStart] = [:]
     private var providerTasks: [UUID: Task<String, Error>] = [:]
     private var conversations: [UUID: Conversation] = [:]
     private var isShuttingDown = false
+
+    #if DEBUG
+        private var pendingStartCancellationObserver: (@Sendable () -> Void)?
+        private var runningPublicationObserver: (@Sendable (DomainAgentSessionRegistration) async -> Void)?
+
+        func test_observePendingStartCancellation(_ observer: @escaping @Sendable () -> Void) {
+            pendingStartCancellationObserver = observer
+        }
+
+        func test_observeRunningPublication(_ observer: @escaping @Sendable (DomainAgentSessionRegistration) async -> Void) {
+            runningPublicationObserver = observer
+        }
+    #endif
 
     init(
         runtime: MCPDomainRuntime,
@@ -187,10 +210,16 @@ actor DirectHeadlessProviderCoordinator {
 
     func startAgent(args: [String: Value], request: DomainPhysicalToolRequest) async throws -> Value {
         guard !isShuttingDown else { throw CancellationError() }
+        let sessionID = DomainChildLaunchContext.current?.runID ?? UUID()
+        let activationID = UUID()
+        pendingStarts[activationID] = PendingStart(sessionID: sessionID)
+        defer { finishPendingStart(activationID) }
+        try checkPendingStart(activationID)
         await settingsStore.bootstrap()
         let cleanupGuidance = try await settingsStore.effectiveValue(
             for: "agent_mode.show_built_in_workflow_cleanup_guidance"
         )
+        try checkPendingStart(activationID)
         guard case let .bool(includeSessionCleanupGuidance) = cleanupGuidance else {
             throw MCPError.internalError("Built-in workflow cleanup guidance setting is not boolean.")
         }
@@ -203,7 +232,6 @@ actor DirectHeadlessProviderCoordinator {
         guard descriptor.executable != nil else {
             throw MCPError.invalidRequest("Provider '\(descriptor.id)' is unavailable: \(descriptor.unavailableReason ?? "not configured")")
         }
-        let sessionID = DomainChildLaunchContext.current?.runID ?? UUID()
         let runID = sessionID
         guard let connectionID = request.securityContext?.connectionID else {
             throw DirectHeadlessDomainContext.Error.routingUnavailable
@@ -216,83 +244,153 @@ actor DirectHeadlessProviderCoordinator {
             arguments: args,
             connectionID: connectionID
         )
-        let registration = await runtime.agentSessionStore.register(sessionID: sessionID)
-        let activationID = UUID()
-        let epoch: DomainAgentRunTurnEpoch
-        switch await beginEpoch(registration, activationID) {
-        case let .accepted(value): epoch = value
-        case let .rejected(reason):
-            await context.rollbackSessionRootOverlay(rootOverlayPreparation)
-            await runtime.agentSessionStore.cleanup(registration: registration)
-            throw MCPError.internalError(reason)
-        case .stale:
-            await context.rollbackSessionRootOverlay(rootOverlayPreparation)
-            await runtime.agentSessionStore.cleanup(registration: registration)
-            throw MCPError.internalError("agent epoch changed during start")
-        }
-        let name = args["session_name"]?.stringValue
-        guard !isShuttingDown else { throw CancellationError() }
-        try Task.checkCancellation()
-        let record = AgentRecord(
-            registration: registration,
-            epoch: epoch,
-            runID: runID,
-            agentID: descriptor.id,
-            model: args["model"]?.stringValue,
-            name: name,
-            parentSessionID: parentSessionID,
-            worktreeBindings: rootOverlayPreparation.bindings,
-            latestSnapshot: nil,
-            task: nil
-        )
-        var runningRecord = record
-        let running = snapshot(
-            record: runningRecord,
-            status: .running,
-            statusText: "Running",
-            assistantText: nil,
-            failure: nil
-        )
-        runningRecord.latestSnapshot = running
-        agents[sessionID] = runningRecord
-        await runtime.agentSessionStore.noteSnapshot(
-            running,
-            cursor: DomainAgentSessionWaitCursor(registration: registration, epoch: epoch)
-        )
-        let capturedRequest = request
-        let capturedCarrierEnvironment = DomainChildLaunchContext.current?.environment ?? [:]
-        let task = Task { [weak self] in
-            guard let self else { return }
-            let report = await DomainAgentRunExecutionCore.execute {
-                do {
-                    let text = try await runProviderOnce(
-                        message: message,
-                        providerID: descriptor.id,
-                        model: args["model"]?.stringValue,
-                        request: capturedRequest,
-                        sessionID: sessionID,
-                        purpose: .agent,
-                        carrierEnvironment: capturedCarrierEnvironment
-                    )
-                    return .completed(assistantText: text)
-                } catch {
-                    if Task.isCancelled { throw CancellationError() }
-                    throw error
-                }
+        var registrationToCleanup: DomainAgentSessionRegistration?
+        do {
+            // Coordinator shutdown joins the entire setup operation, including root preparation.
+            // Do not publish a registration if cancellation arrived during that preparation.
+            try checkPendingStart(activationID)
+            // Cancellation is installed by the store in the same actor turn as registration,
+            // before either an epoch await or a running snapshot can expose this start.
+            let registration = await runtime.agentSessionStore.register(sessionID: sessionID) { [weak self] registration in
+                await self?.cancelRegisteredAgent(registration: registration, activationID: activationID)
             }
-            guard case let .terminal(outcome) = report.result else { return }
-            await finishAgent(sessionID: sessionID, outcome: outcome)
-        }
-        agents[sessionID]?.task = task
-        await runtime.agentSessionStore.installCancellationHandler(registration: registration) { [weak self] in
-            await self?.cancelAgent(sessionID: sessionID)
-        }
+            registrationToCleanup = registration
+            guard registration.generation > 0 else { throw CancellationError() }
+            try checkPendingStart(activationID)
+            let epoch: DomainAgentRunTurnEpoch
+            let epochResult = await beginEpoch(registration, activationID)
+            try checkPendingStart(activationID)
+            switch epochResult {
+            case let .accepted(value): epoch = value
+            case let .rejected(reason): throw MCPError.internalError(reason)
+            case .stale: throw MCPError.internalError("agent epoch changed during start")
+            }
+            let name = args["session_name"]?.stringValue
+            let record = AgentRecord(
+                registration: registration,
+                activationID: activationID,
+                epoch: epoch,
+                runID: runID,
+                agentID: descriptor.id,
+                model: args["model"]?.stringValue,
+                name: name,
+                parentSessionID: parentSessionID,
+                worktreeBindings: rootOverlayPreparation.bindings,
+                latestSnapshot: nil,
+                task: nil
+            )
+            var runningRecord = record
+            let running = snapshot(
+                record: runningRecord,
+                status: .running,
+                statusText: "Running",
+                assistantText: nil,
+                failure: nil
+            )
+            runningRecord.latestSnapshot = running
+            agents[sessionID] = runningRecord
+            await runtime.agentSessionStore.noteSnapshot(
+                running,
+                cursor: DomainAgentSessionWaitCursor(registration: registration, epoch: epoch)
+            )
+            #if DEBUG
+                await runningPublicationObserver?(registration)
+            #endif
+            try checkPendingStart(activationID)
+            guard agents[sessionID]?.registration == registration,
+                  agents[sessionID]?.activationID == activationID
+            else { throw MCPError.internalError("agent registration changed during start") }
+            let capturedRequest = request
+            let capturedCarrierEnvironment = DomainChildLaunchContext.current?.environment ?? [:]
+            let task = Task { [weak self] in
+                guard let coordinator = self else { return }
+                let report = await DomainAgentRunExecutionCore.execute {
+                    do {
+                        let text = try await coordinator.runProviderOnce(
+                            message: message,
+                            providerID: descriptor.id,
+                            model: args["model"]?.stringValue,
+                            request: capturedRequest,
+                            sessionID: sessionID,
+                            purpose: .agent,
+                            carrierEnvironment: capturedCarrierEnvironment
+                        )
+                        return .completed(assistantText: text)
+                    } catch {
+                        if Task.isCancelled { throw CancellationError() }
+                        throw error
+                    }
+                }
+                guard case let .terminal(outcome) = report.result else { return }
+                await coordinator.finishAgent(registration: registration, outcome: outcome)
+            }
+            agents[sessionID]?.task = task
+            // No suspension between the last cancellation fence and attaching this task.
+            // Once attached, the exact-registration handler cancels and joins the task.
+            finishPendingStart(activationID)
 
-        if args["detach"]?.boolValue == true {
-            return running.toValue()
+            if args["detach"]?.boolValue == true {
+                return running.toValue()
+            }
+            let timeout = args["timeout"]?.doubleValue ?? 120
+            return await waitAgent(sessionID: sessionID, timeout: timeout).toValue()
+        } catch {
+            if let registrationToCleanup, agents[sessionID]?.registration == registrationToCleanup {
+                agents.removeValue(forKey: sessionID)
+            }
+            await context.rollbackSessionRootOverlay(rootOverlayPreparation)
+            if let registrationToCleanup {
+                await runtime.agentSessionStore.cleanup(registration: registrationToCleanup)
+            }
+            throw error
         }
-        let timeout = args["timeout"]?.doubleValue ?? 120
-        return await waitAgent(sessionID: sessionID, timeout: timeout).toValue()
+    }
+
+    private func checkPendingStart(_ activationID: UUID) throws {
+        guard !isShuttingDown,
+              let pending = pendingStarts[activationID], !pending.cancellationRequested
+        else { throw CancellationError() }
+        try Task.checkCancellation()
+    }
+
+    private func finishPendingStart(_ activationID: UUID) {
+        let pending = pendingStarts.removeValue(forKey: activationID)
+        for waiter in pending?.drainWaiters ?? [] {
+            waiter.resume()
+        }
+    }
+
+    private func waitForPendingStart(_ activationID: UUID) async {
+        guard pendingStarts[activationID] != nil else { return }
+        await withCheckedContinuation { continuation in
+            guard pendingStarts[activationID] != nil else {
+                continuation.resume()
+                return
+            }
+            pendingStarts[activationID]?.drainWaiters.append(continuation)
+        }
+    }
+
+    private func requestPendingStartCancellation(_ activationID: UUID) {
+        guard pendingStarts[activationID] != nil else { return }
+        pendingStarts[activationID]?.cancellationRequested = true
+        #if DEBUG
+            pendingStartCancellationObserver?()
+        #endif
+    }
+
+    private func cancelRegisteredAgent(
+        registration: DomainAgentSessionRegistration,
+        activationID: UUID
+    ) async {
+        if pendingStarts[activationID]?.sessionID == registration.sessionID {
+            requestPendingStartCancellation(activationID)
+            await waitForPendingStart(activationID)
+        }
+        guard let record = agents[registration.sessionID],
+              record.registration == registration, record.activationID == activationID else { return }
+        record.task?.cancel()
+        await record.task?.value
     }
 
     func pollAgent(sessionID: UUID, timeout: TimeInterval) async -> DomainAgentRunSnapshot {
@@ -334,6 +432,9 @@ actor DirectHeadlessProviderCoordinator {
     }
 
     func cancelAgent(sessionID: UUID) async {
+        for activationID in pendingStarts.keys where pendingStarts[activationID]?.sessionID == sessionID {
+            requestPendingStartCancellation(activationID)
+        }
         agents[sessionID]?.task?.cancel()
     }
 
@@ -480,6 +581,10 @@ actor DirectHeadlessProviderCoordinator {
 
     func shutdown() async {
         isShuttingDown = true
+        let pendingActivationIDs = Array(pendingStarts.keys)
+        for activationID in pendingActivationIDs {
+            requestPendingStartCancellation(activationID)
+        }
         let agentTasks = agents.values.compactMap(\.task)
         let physicalTasks = Array(providerTasks.values)
         for task in agentTasks {
@@ -494,6 +599,9 @@ actor DirectHeadlessProviderCoordinator {
         for task in physicalTasks {
             _ = try? await task.value
         }
+        for activationID in pendingActivationIDs {
+            await waitForPendingStart(activationID)
+        }
         providerTasks.removeAll()
     }
 
@@ -501,11 +609,11 @@ actor DirectHeadlessProviderCoordinator {
     /// The canonical exactly-once settlement stays owned by
     /// `DomainAgentRunSessionStore.publishTerminal`.
     private func finishAgent(
-        sessionID: UUID,
+        registration: DomainAgentSessionRegistration,
         outcome: DomainAgentRunTerminalOutcome
     ) async {
-        guard var record = agents[sessionID] else { return }
-        record.task = nil
+        let sessionID = registration.sessionID
+        guard var record = agents[sessionID], record.registration == registration else { return }
         let terminal = snapshot(
             record: record,
             status: outcome.snapshotStatus,
@@ -521,6 +629,10 @@ actor DirectHeadlessProviderCoordinator {
             commitID: UUID(),
             successorKind: nil
         )
+        // Keep the task joinable until terminal publication has actually settled.
+        if agents[sessionID]?.registration == registration {
+            agents[sessionID]?.task = nil
+        }
     }
 
     /// Concise terminal `status_text`. The final reply travels only in the bounded
