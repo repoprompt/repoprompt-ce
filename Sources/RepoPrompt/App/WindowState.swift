@@ -565,6 +565,7 @@ class WindowState: ObservableObject {
         }
         if !isPreparedSessionOwner { manager.detachPreparedRuntimeCarriers(from: self) }
         isClosing = true
+        agentModeViewModel.closeOracleBackgroundWindowAdmission()
         failUnstartedCommandsForWindowClose()
 
         if !manager.isTerminating, !isPreparedSessionOwner {
@@ -1322,10 +1323,13 @@ class WindowState: ObservableObject {
     @discardableResult
     func stopAgentRunFromShortcut() -> Bool {
         let viewModel = agentModeViewModel
-        guard viewModel.isAgentModeActive,
-              let target = viewModel.composerRunCancelTarget(tabID: viewModel.currentTabID)
-        else { return false }
-        Task { _ = await viewModel.cancelAgentRun(target: target) }
+        guard viewModel.isAgentModeActive else { return false }
+        if let target = viewModel.composerRunCancelTarget(tabID: viewModel.currentTabID) {
+            Task { _ = await viewModel.cancelAgentRun(target: target) }
+            return true
+        }
+        guard let target = viewModel.composerOracleBackgroundCancelTarget(tabID: viewModel.currentTabID) else { return false }
+        Task { _ = await viewModel.cancelOracleBackground(target: target) }
         return true
     }
 
@@ -3098,6 +3102,7 @@ class WindowState: ObservableObject {
 
     func tearDown() async {
         beginClose()
+        if !WindowStatesManager.shared.isTerminating { await agentModeViewModel.joinOracleBackgroundWindowDrain() }
         // Join cancelled startup before saves/root drains so it cannot publish or hydrate late.
         await workspaceManager.awaitInitialWorkspaceActivationCompletion()
         await workspaceManager.awaitPostSwitchGitDataLoadShutdown()

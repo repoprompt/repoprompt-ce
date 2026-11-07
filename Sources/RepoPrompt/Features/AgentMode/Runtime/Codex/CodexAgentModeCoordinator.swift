@@ -3739,13 +3739,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
             let released = inputProof.flatMap { viewModel?.agentSessionLinkHandoffProviderInput(for: session, dispatchID: promptDispatchID, claim: monitoring?.claim, proof: $0) }
             guard released?.mustAbortDispatch != true else { throw CancellationError() }
+            let oracle = session.oracleBackgroundAwareness.reserve(session: session, providerID: ObjectIdentifier(controller))
+            defer { session.oracleBackgroundAwareness.release(oracle) }
+            let ordinaryText = released?.text(head.providerText) ?? monitoring?.text ?? head.providerText
             _ = try await controller.startUserTurn(
-                text: released?.text(head.providerText) ?? monitoring?.text ?? head.providerText,
+                text: oracle?.decorating(ordinaryText) ?? ordinaryText,
                 attachments: head.attachments,
                 model: head.model,
                 reasoningEffort: head.reasoningEffort,
                 serviceTier: head.serviceTier
             )
+            session.oracleBackgroundAwareness.accept(oracle)
             // Acceptance is the non-throwing `startUserTurn` return that produces the enclosing `.sent`
             // path; the in-flight bookkeeping below is local state, not provider acceptance.
             if let auditTurnID = head.optimisticUserItemID {
@@ -6225,13 +6229,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     ), !released.mustAbortDispatch else { throw CancellationError() }
                     finalReplayText = released.text(replayTurn.text)
                 }
+                let oracle = session.oracleBackgroundAwareness.reserve(session: session, providerID: ObjectIdentifier(controller))
+                defer { session.oracleBackgroundAwareness.release(oracle) }
                 let receipt = try await controller.startUserTurn(
-                    text: finalReplayText,
+                    text: oracle?.decorating(finalReplayText) ?? finalReplayText,
                     attachments: replayTurn.attachments,
                     model: replayTurn.model,
                     reasoningEffort: replayTurn.reasoningEffort,
                     serviceTier: replayTurn.serviceTier
                 )
+                session.oracleBackgroundAwareness.accept(oracle)
                 if let auditTurnID = replayTurn.auditTurnID {
                     session.updateAutomationAudit(turnID: auditTurnID) {
                         $0.recordCodexStartAccepted(
@@ -8183,6 +8190,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         // Auth replay only reattaches an acknowledged auto-wake claim; it never accepts it again.
         defer { withExtendedLifetime(monitoring?.quietMarkerProducerLifetime) {} }
         var releasedMonitoringClaim: AgentSessionLinkOutboundPromptClaim?
+        var oracleAwareness: OracleBackgroundAwareness.Reservation?
+        defer { session.oracleBackgroundAwareness.release(oracleAwareness) }
         var acquiredAgentSessionLinkPhysicalDispatch = false
         let prepareAgentSessionLinkPhysicalDispatch: () async -> NativeSendOutcome? = {
             if isSelfNote {
@@ -8407,13 +8416,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             releasedMonitoringClaim = released?.claim
                             let baseText = released?.text(text) ?? monitoring?.text ?? text
                             let dispatchText = parkedNote.map { $0.frame + "\n\n" + baseText } ?? baseText
+                            oracleAwareness = isSelfNote ? nil : session.oracleBackgroundAwareness.reserve(session: session, providerID: ObjectIdentifier(controller))
                             receipt = try await controller.startUserTurn(
-                                text: dispatchText,
+                                text: oracleAwareness?.decorating(dispatchText) ?? dispatchText,
                                 attachments: attachments,
                                 model: physicalSelection.model,
                                 reasoningEffort: physicalSelection.reasoningEffort,
                                 serviceTier: physicalSelection.serviceTier
                             )
+                            session.oracleBackgroundAwareness.accept(oracleAwareness)
                         } catch {
                             if let noteDispatchID {
                                 var state = session.selfCompactState
@@ -8496,11 +8507,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     releasedMonitoringClaim = released?.claim
                     let baseText = released?.text(text) ?? monitoring?.text ?? text
                     let dispatchText = parkedNote.map { $0.frame + "\n\n" + baseText } ?? baseText
+                    oracleAwareness = session.oracleBackgroundAwareness.reserve(session: session, providerID: ObjectIdentifier(controller))
                     let receipt = try await controller.steerUserTurn(
-                        text: dispatchText,
+                        text: oracleAwareness?.decorating(dispatchText) ?? dispatchText,
                         attachments: attachments,
                         expectedTurnID: identity.turnID
                     )
+                    session.oracleBackgroundAwareness.accept(oracleAwareness)
                     if let parkedNote {
                         var state = session.selfCompactState
                         if state.noteAccepted(parkedNote.dispatchID) {
@@ -8520,6 +8533,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         )
                     }
                 } catch let mismatch as CodexTurnSteerError {
+                    session.oracleBackgroundAwareness.release(oracleAwareness)
+                    oracleAwareness = nil
                     if let parkedNote {
                         // A definitive rejection re-parks the note; the ordinary fallback below then
                         // carries it exactly once on its own start. An ambiguous one settles instead
@@ -8558,11 +8573,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         // This logical input already crossed handoff. A bounded transport retry
                         // reuses only its exact baseline; optional inputs never replay.
                         let retryText = releasedMonitoringClaim.map { AgentSessionLinkPromptComposer.decorated(text, with: $0) } ?? text
+                        oracleAwareness = session.oracleBackgroundAwareness.reserve(session: session, providerID: ObjectIdentifier(controller))
                         let receipt = try await controller.steerUserTurn(
-                            text: retryText,
+                            text: oracleAwareness?.decorating(retryText) ?? retryText,
                             attachments: attachments,
                             expectedTurnID: actualTurnID
                         )
+                        session.oracleBackgroundAwareness.accept(oracleAwareness)
                         recordAcceptedSteer()
                         guard receipt.acceptedTurnID == actualTurnID else {
                             throw CodexTurnSteerError.expectedTurnMismatch(
