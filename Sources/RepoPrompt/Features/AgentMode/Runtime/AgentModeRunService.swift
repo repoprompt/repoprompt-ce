@@ -9,12 +9,12 @@ import RepoPromptInstrumentation
 final class AgentModeRunService {
     struct Dependencies {
         let windowID: Int
-        let headlessProviderFactory: AgentModeViewModel.HeadlessProviderFactory
-        let acpProviderFactory: AgentModeViewModel.ACPProviderFactory
-        let acpControllerFactory: AgentModeViewModel.ACPControllerFactory
-        let connectionPolicyInstaller: AgentModeViewModel.ConnectionPolicyInstaller
+        let headlessProviderFactory: AgentRunExecutionContracts.HeadlessProviderFactory
+        let acpProviderFactory: AgentRunExecutionContracts.ACPProviderFactory
+        let acpControllerFactory: AgentRunExecutionContracts.ACPControllerFactory
+        let connectionPolicyInstaller: AgentRunExecutionContracts.ConnectionPolicyInstaller
         let expectedPIDPolicyArmer: (MCPBootstrapLeaseSpec) async -> Bool
-        let mcpServerEnabler: AgentModeViewModel.MCPServerEnabler
+        let mcpServerEnabler: AgentRunExecutionContracts.MCPServerEnabler
         let workspacePathProvider: (AgentTabSession) throws -> String?
         let codexCoordinator: CodexAgentModeCoordinator
         let claudeCoordinator: ClaudeAgentModeCoordinator
@@ -324,8 +324,7 @@ final class AgentModeRunService {
             return outcome
         }
 
-        let acpRunRequest = Self.makeACPRunRequest(
-            session: session,
+        let acpRunRequest = session.acpRunInput.makeRequest(
             workspacePath: workspacePath,
             attachments: attachments,
             runtimePermission: runtimePermission
@@ -460,8 +459,7 @@ final class AgentModeRunService {
             await failBeforeProviderStartup(session: session, message: message)
             return false
         }
-        guard let runRequest = Self.makeACPRunRequest(
-            session: session,
+        guard let runRequest = session.acpRunInput.makeRequest(
             workspacePath: workspacePath,
             attachments: attachments,
             runtimePermission: runtimePermission
@@ -480,39 +478,6 @@ final class AgentModeRunService {
         )
         steeringDebugLog("[AgentRunSteeringWake] ACP active submit runner returned sent=\(sent) agent=\(selectedAgent.rawValue) model=\(runRequest.modelString ?? "default") runID=\(String(describing: targetRunID)) attempt=\(String(describing: targetRunAttemptID))")
         return sent
-    }
-
-    static func makeACPRunRequest(
-        session: AgentTabSession,
-        workspacePath: String?,
-        attachments: [AgentFileAttachment],
-        runtimePermission: AgentProviderRuntimePermissionBinding
-    ) -> ACPRunRequest? {
-        let selectedAgent = session.selectedAgent
-        guard selectedAgent.acpProviderID != nil else { return nil }
-        let selectedModelString = session.selectedModelRaw == AgentModel.defaultModel.rawValue
-            ? nil
-            : session.selectedModelRaw
-        return ACPRunRequest(
-            agentKind: selectedAgent,
-            modelString: selectedModelString,
-            workspacePath: workspacePath,
-            resumeSessionID: session.providerSessionID,
-            attachments: attachments,
-            taskLabelKind: session.mcpControlContext?.taskLabelKind,
-            sessionModeID: runtimePermission.acpSessionModeID,
-            autoApproveAllToolPermissions: runtimePermission.autoApproveAllACPToolPermissions,
-            launchPermissionMode: runtimePermission.acpLaunchPermissionMode,
-            // Resolve pins for whichever ACP provider is selected, not Cursor alone: OpenCode
-            // effort pins ride this same path, and narrowing it to `.cursor` silently drops them.
-            modelParameterSelections: selectedAgent.acpProviderID.map { providerID in
-                ACPModelParameterResolver.effectiveSelections(
-                    providerID: providerID,
-                    selectedModelRaw: session.selectedModelRaw,
-                    persistedSelections: session.acpModelParameterSelections
-                )
-            } ?? []
-        )
     }
 
     @discardableResult

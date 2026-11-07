@@ -795,8 +795,7 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
         _ fixture: Fixture,
         waitForAdvertisement: Bool = true
     ) async throws -> ACPAgentSessionController {
-        let request = try XCTUnwrap(AgentModeRunService.makeACPRunRequest(
-            session: fixture.session,
+        let request = try XCTUnwrap(fixture.session.acpRunInput.makeRequest(
             workspacePath: fixture.workspacePath,
             attachments: [],
             runtimePermission: fixture.viewModel.providerBindingService.runtimePermission(

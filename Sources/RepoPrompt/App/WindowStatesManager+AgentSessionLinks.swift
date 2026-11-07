@@ -133,12 +133,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         } else { preparedOversightPreparationInFlight[id] = count - 1 }
     }
 
-    enum SavedOversightPreparationFailure: String, Error {
-        case missing = "target_missing"
-        case ambiguous = "target_ambiguous"
-        case changed = "target_binding_changed"
-        case unreadable = "target_saved_state_unreadable"
-    }
+    typealias SavedOversightPreparationFailure = AgentSavedSessionTargetLoader.Failure
 
     /// Point reads of one UUID in known workspace locations. No folder enumeration, provider
     /// reconnect, UI activation or unrelated session hydration is performed.
@@ -165,40 +160,46 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
                 }
             }
         }
-        let matches = agentSessionLinkCandidates(forSessionIDs: [target], includeLocation: false)[target] ?? []
-        let live = matches.count == 1 ? matches.first : nil
-        var found: SavedOversightSessionLocation?
-        for (_, (window, workspace)) in owners {
-            let entry: AgentSessionIndexEntry?
-            do {
-                if let live, live.workspaceID == workspace.id, live.restorationReadiness.isAuthoritative,
-                   let current = census.metadata[target]?.first(where: { $0.workspaceID == workspace.id })?.entry
-                {
-                    // A current authoritative runtime remains usable when saving is unavailable.
-                    // Disk is continuity for a cold owner, not a veto over known live state.
-                    entry = current
-                } else if let record = try await AgentSessionDataService.shared.metadataRecordForSessionID(target, for: workspace) {
-                    guard record.id == target, record.workspaceID == nil || record.workspaceID == workspace.id else { return .failure(.ambiguous) }
-                    entry = record.sidebarEntry()
-                } else {
-                    entry = census.metadata[target]?.first(where: { $0.workspaceID == workspace.id })?.entry
-                }
-            } catch { return .failure(.unreadable) }
-            guard let entry else { continue }
-            let tabs = workspace.composeTabs.filter { $0.id == entry.tabID }
-            let stashes = workspace.stashedTabs.filter { $0.tab.id == entry.tabID }
-            guard tabs.count + stashes.count == 1 else {
-                return .failure(tabs.isEmpty && stashes.isEmpty ? .missing : .ambiguous)
-            }
-            let location = SavedOversightSessionLocation(
-                window: window, workspace: workspace, tab: tabs.first ?? stashes[0].tab,
-                stashedTabID: stashes.first?.id, entry: entry
+        func location(for saved: AgentSavedSessionTargetLoader.Target) -> SavedOversightSessionLocation? {
+            guard let (window, _) = owners[saved.workspace.id], !window.isClosing else { return nil }
+            return SavedOversightSessionLocation(
+                window: window, workspace: saved.workspace, tab: saved.tab,
+                stashedTabID: saved.stashedTabID, entry: saved.entry
             )
-            guard location.isCurrent, !deletion.isPermanentlyDeleted(sessionID: target), !deletion.isDeletionInProgress(sessionID: target) else { return .failure(.changed) }
-            guard found == nil else { return .failure(.ambiguous) }
-            found = location
         }
-        guard let found else { return .failure(.missing) }
+        let resolution = await AgentSavedSessionTargetLoader.load(
+            sessionID: target,
+            workspaces: owners.values.map(\.1).sorted { $0.id.uuidString < $1.id.uuidString },
+            readRecord: { id, workspace in
+                try await AgentSessionDataService.shared.metadataRecordForSessionID(id, for: workspace)
+            },
+            currentMetadata: { workspaceID in
+                let current = AgentSessionCarrierResolver.capture(windows: self.allWindows, sessionIDs: [target])
+                guard let entry = current.metadata[target]?.first(where: { $0.workspaceID == workspaceID })?.entry else { return nil }
+                let matches = self.agentSessionLinkCandidates(forSessionIDs: [target], includeLocation: false)[target] ?? []
+                let live = matches.count == 1 ? matches.first : nil
+                return .init(entry: entry, isAuthoritative: live?.workspaceID == workspaceID && live?.restorationReadiness.isAuthoritative == true)
+            },
+            currentWorkspace: { workspaceID in
+                guard let (window, _) = owners[workspaceID], !window.isClosing else { return nil }
+                return window.workspaceManager.workspace(withID: workspaceID)
+            },
+            isAvailable: {
+                !deletion.isPermanentlyDeleted(sessionID: target) && !deletion.isDeletionInProgress(sessionID: target)
+            },
+            isCurrent: { saved in
+                let current = AgentSessionCarrierResolver.capture(windows: self.allWindows, sessionIDs: [target])
+                return !current.ambiguousSessionIDs.contains(target) && !current.replicatedSessionIDs.contains(target)
+                    && location(for: saved)?.isCurrent == true
+            }
+        )
+        let found: SavedOversightSessionLocation
+        switch resolution {
+        case let .failure(reason): return .failure(reason)
+        case let .success(saved):
+            guard let current = location(for: saved) else { return .failure(.changed) }
+            found = current
+        }
         // Metadata is not authority. Bound the pre-card cache; live owners remain separately held.
         if preparedOversightLocations.count >= 128, preparedOversightLocations[target] == nil {
             preparedOversightLocations = preparedOversightLocations.filter { preparedOversightWindows[$0.key] != nil }

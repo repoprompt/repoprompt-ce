@@ -278,7 +278,6 @@ enum WindowStateCompositionFactory {
             workspaceManager: workspaceManager,
             mcpServer: mcpServer,
             attachmentPersistenceIsSuppressed: { AppLaunchConfiguration.current.suppressesAgentSessionPersistence },
-            attachmentSweepViewModels: { WindowStatesManager.shared.allWindows.map(\.agentModeViewModel) },
             oracleViewModel: oracleViewModel,
             applyEditsApprovalStore: applyEditsApprovalStore,
             modelRouterSettingsStore: settingsStore,

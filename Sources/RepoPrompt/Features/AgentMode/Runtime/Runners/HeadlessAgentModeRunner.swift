@@ -4,12 +4,12 @@ import RepoPromptDomainRuntime
 
 @MainActor
 final class HeadlessAgentModeRunner {
-    private let headlessProviderFactory: AgentModeViewModel.HeadlessProviderFactory
+    private let headlessProviderFactory: AgentRunExecutionContracts.HeadlessProviderFactory
     private let hooks: AgentModeRunService.Hooks
     private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
 
     init(
-        headlessProviderFactory: @escaping AgentModeViewModel.HeadlessProviderFactory,
+        headlessProviderFactory: @escaping AgentRunExecutionContracts.HeadlessProviderFactory,
         hooks: AgentModeRunService.Hooks,
         terminalCommitBarrier: AgentRunTerminalCommitBarrier
     ) {

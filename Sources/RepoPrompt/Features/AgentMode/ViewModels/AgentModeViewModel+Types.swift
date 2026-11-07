@@ -187,13 +187,7 @@ extension AgentModeViewModel {
         let flushGeneration: UInt64
     }
 
-    struct PersistentBindingTransitionToken: Equatable {
-        let tabID: UUID
-        let sessionIdentity: ObjectIdentifier
-        let binding: AgentPersistentSessionBindingIdentity?
-        let transitionGeneration: UInt64
-        let sourceItemsRevision: Int
-    }
+    typealias PersistentBindingTransitionToken = AgentPersistentBindingTransitionToken
 
     struct PersistedHydrationCommitToken: Equatable {
         let transition: PersistentBindingTransitionToken
@@ -211,17 +205,7 @@ extension AgentModeViewModel {
         let saveRequestGeneration: UInt64
     }
 
-    struct SessionSaveCommitToken: Equatable {
-        let tabID: UUID
-        let sessionIdentity: ObjectIdentifier
-        let workspaceID: UUID
-        let workspaceDirectoryPath: String
-        let binding: AgentPersistentSessionBindingIdentity
-        let bindingTransitionGeneration: UInt64
-        let sourceItemsRevision: Int
-        let persistenceMutationGeneration: UInt64
-        let saveRequestGeneration: UInt64
-    }
+    typealias SessionSaveCommitToken = AgentSessionSaveCommitToken
 
     enum PersistentBindingResolution: Equatable {
         case unique(tabID: UUID)
@@ -672,15 +656,7 @@ extension AgentModeViewModel {
         let shouldEnableCodexComputerUse: Bool
     }
 
-    /// Request-local save-phase evidence. A thrown saver or later currency failure is NOT proof
-    /// of no write. Switch apply may roll back only while this remains beforeWrite.
-    enum RequiredSavePhase: Equatable {
-        case beforeWrite
-        case writeMayHaveCommitted
-        /// The frozen payload's saver returned, but its live-owner currency may still fail.
-        case writeReturned
-        case durablySaved(AgentSessionRestorationBindingToken)
-    }
+    typealias RequiredSavePhase = AgentSessionRequiredSavePhase
 
     struct PendingHandoffState: Equatable {
         var payload: String?
@@ -913,21 +889,9 @@ extension AgentModeViewModel {
         }
     }
 
-    struct DerivedTranscriptSyncState: Equatable {
-        let sourceItemsRevision: Int
-        let nextSequenceIndex: Int
-        let runState: AgentSessionRunState
-        let selectedAgent: AgentProviderKind
-        let hidePendingQuestionToolCall: Bool
-        let projectionProtection: AgentTranscriptProjectionProtection
-    }
+    typealias DerivedTranscriptSyncState = AgentDerivedTranscriptSyncState
 
-    struct PersistableTranscriptSnapshot {
-        let transcript: AgentTranscript
-        let projectionCounts: AgentTranscriptProjectionCounts
-        let canonicalVisibleRowCount: Int
-        let lastUserMessageAt: Date?
-    }
+    typealias PersistableTranscriptSnapshot = AgentPersistableTranscriptSnapshot
 
     struct ActiveTranscriptFollowBindingState: Equatable {
         var tabID: UUID?
@@ -1046,33 +1010,9 @@ extension AgentModeViewModel {
         }
     }
 
-    struct BuiltTranscriptPresentation {
-        var localInputSeed = AgentSessionLinkRetainedLocalInputIndex.Seed()
-        let transcript: AgentTranscript
-        let baseProjection: AgentTranscriptProjection
-        let fullProjection: AgentTranscriptProjection
-        let workingProjection: AgentTranscriptProjection
-        let projection: AgentTranscriptProjection
-        let turnProjectionCaches: [UUID: AgentTranscriptTurnProjectionCache]
-        let archivedSnapshot: AgentArchivedTranscriptSnapshot
-        /// Semantic reuse evidence from the existing validated sanitizer prefix, not a claim
-        /// that building the archive projection avoided traversal or reused its storage.
-        let reusesPreviousArchive: Bool
-        let projectionProtection: AgentTranscriptProjectionProtection
-        let canonicalVisibleRowCount: Int
-        let projectionCounts: AgentTranscriptProjectionCounts
-        let analyticsSnapshot: AgentTranscriptAnalyticsSnapshot
-        let sanitizedActivityCount: Int
-        let performanceSnapshot: AgentTranscriptPerformanceSnapshot
-        let rawToolResultPayloadRenderRevisionByItemID: [UUID: Int]
-    }
+    typealias BuiltTranscriptPresentation = AgentBuiltTranscriptPresentation
 
-    enum DerivedTranscriptRefreshReason: String {
-        case liveMutation
-        case saveSession
-        case coldLoad
-        case manualRefresh
-    }
+    typealias DerivedTranscriptRefreshReason = AgentDerivedTranscriptRefreshReason
 
     /// Internal for cross-file AgentModeViewModel extension access after the mechanical file split.
     struct SessionTreeNode {

@@ -1,0 +1,219 @@
+import Foundation
+@testable import RepoPromptApp
+import RepoPromptDomainRuntime
+import XCTest
+
+@MainActor
+final class AgentSessionPersistenceRuntimeTests: XCTestCase {
+    func testRunHookPersistsWithoutPresentationAndRetainsScopeUntilDebounceSettles() async throws {
+        var fixture: Fixture? = try Fixture()
+        let root = try XCTUnwrap(fixture?.root)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = try XCTUnwrap(fixture?.scope.persistence)
+        let session = try XCTUnwrap(fixture?.session)
+        let workspace = try XCTUnwrap(fixture?.placement.workspace)
+        weak var scope = fixture?.scope
+        let entered = expectation(description: "Debounce admitted")
+        var release: CheckedContinuation<Void, Never>?
+        runtime.debounce = {
+            await withCheckedContinuation { release = $0
+                entered.fulfill()
+            }
+        }
+        runtime.makeRunHooks().scheduleSave(session)
+        let task = try XCTUnwrap(session.saveDebounceTask)
+        await fulfillment(of: [entered], timeout: 5)
+        fixture = nil
+        XCTAssertNotNil(scope, "An admitted debounce retains its exact scope, not a presentation")
+        XCTAssertNil(runtime.presentation)
+        release?.resume()
+        await task.value
+        XCTAssertFalse(session.isDirty)
+        XCTAssertNil(scope, "The completed debounce releases its exact scope")
+        let saved = try await AgentSessionDataService.shared.loadAgentSession(id: XCTUnwrap(session.activeAgentSessionID), for: workspace)
+        XCTAssertEqual(saved?.effectiveItemCount, 2)
+        XCTAssertEqual(saved?.name, "Headless persistence")
+    }
+
+    func testDebounceRequalifiesSameObjectButCannotPersistRecycledTab() async throws {
+        for replaceObject in [false, true] {
+            let f = try Fixture()
+            defer { f.cleanUp() }
+            let entered = expectation(description: "Original debounce admitted")
+            let rearmed = replaceObject ? nil : expectation(description: "Requalified debounce admitted")
+            var releases: [CheckedContinuation<Void, Never>] = []
+            var writes = 0
+            f.scope.persistence.debounce = {
+                await withCheckedContinuation { continuation in
+                    releases.append(continuation)
+                    if releases.count == 1 { entered.fulfill() } else { rearmed?.fulfill() }
+                }
+            }
+            f.scope.persistence.saver = { payload, workspace, count in
+                writes += 1
+                return try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count)
+            }
+            f.scope.persistence.scheduleSave(for: f.session)
+            let originalTask = try XCTUnwrap(f.session.saveDebounceTask)
+            await fulfillment(of: [entered], timeout: 5)
+            if replaceObject {
+                let successor = AgentTabSession(tabID: f.session.tabID)
+                successor.isDirty = true
+                f.scope.replaceSessions([successor.tabID: successor])
+            } else {
+                let prior = f.session.currentRestorationBindingToken
+                try f.session.installPersistentSessionBinding(.init(tabID: f.session.tabID, sessionID: XCTUnwrap(f.session.activeAgentSessionID), workspaceID: f.placement.workspace.id))
+                XCTAssertNotEqual(prior, f.session.currentRestorationBindingToken)
+                f.session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            }
+            releases[0].resume()
+            await originalTask.value
+            XCTAssertEqual(writes, 0, "The old timer cannot write a different incarnation")
+            if replaceObject {
+                XCTAssertEqual(releases.count, 1)
+                XCTAssertNil(f.scope.sessions[f.session.tabID]?.saveDebounceTask)
+                XCTAssertTrue(try XCTUnwrap(f.scope.sessions[f.session.tabID]).isDirty)
+            } else {
+                try await fulfillment(of: [XCTUnwrap(rearmed)], timeout: 5)
+                let newTask = try XCTUnwrap(f.session.saveDebounceTask)
+                releases[1].resume()
+                await newTask.value
+                XCTAssertEqual(writes, 1)
+                XCTAssertFalse(f.session.isDirty, "A transition follow-up must not be lost")
+            }
+        }
+    }
+
+    func testMissingCompositionCannotAcknowledgeRequiredPersistence() async {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        session.isDirty = true
+        scope.replaceSessions([session.tabID: session])
+        scope.persistence.scheduleSave(for: session)
+        XCTAssertNil(session.saveDebounceTask)
+        let result = await scope.persistence.flushSaveRequired(for: session.tabID, workspaceID: UUID())
+        guard case .failure = result else { return XCTFail("Missing runtime composition is not a durable acknowledgment") }
+        XCTAssertTrue(session.isDirty)
+    }
+
+    func testConfiguredCreationAndRequiredFlushUseSameRuntimeTransaction() async throws {
+        let f = try Fixture(fresh: true)
+        defer { f.cleanUp() }
+        let handle = try XCTUnwrap(f.creation)
+        var phases: [AgentSessionRequiredSavePhase] = []
+        let result = await f.scope.persistence.saveSessionCore(for: f.session.tabID, creationSave: .configured(handle), observingPhase: { phases.append($0) })
+        guard case let .durablySaved(binding) = result else { return XCTFail("Configured first save must acknowledge its exact incarnation") }
+        XCTAssertEqual(binding, f.session.currentRestorationBindingToken)
+        XCTAssertTrue(f.session.qualifiedRestorationReadiness.isAuthoritative)
+        XCTAssertFalse(f.session.isDirty)
+        XCTAssertEqual(phases, [.writeMayHaveCommitted, .writeReturned, .durablySaved(binding)])
+        f.session.isDirty = true
+        let flush = await f.scope.persistence.flushSaveRequired(for: f.session.tabID, workspaceID: f.placement.workspace.id)
+        try flush.get()
+        XCTAssertFalse(f.session.isDirty)
+    }
+
+    func testHeldRequiredSaveDoesNotAcknowledgeMovedStorageOrReboundIncarnation() async throws {
+        for rebind in [false, true] {
+            let f = try Fixture()
+            defer { f.cleanUp() }
+            let entered = expectation(description: "Disk write completed")
+            var release: CheckedContinuation<Void, Never>?
+            var savedURL: URL?
+            f.scope.persistence.saver = { payload, workspace, count in
+                savedURL = try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count)
+                await withCheckedContinuation { release = $0
+                    entered.fulfill()
+                }
+                return try XCTUnwrap(savedURL)
+            }
+            let work = Task { await f.scope.persistence.flushSaveRequired(for: f.session.tabID, workspaceID: f.placement.workspace.id) }
+            await fulfillment(of: [entered], timeout: 5)
+            if rebind {
+                try f.session.installPersistentSessionBinding(.init(tabID: f.session.tabID, sessionID: XCTUnwrap(f.session.activeAgentSessionID), workspaceID: f.placement.workspace.id))
+            } else {
+                f.placement.workspace.customStoragePath = f.root.appendingPathComponent("moved")
+            }
+            release?.resume()
+            guard case .failure = await work.value else { return XCTFail("A stale disk write is not a required-save receipt") }
+            f.session.saveDebounceTask?.cancel()
+            XCTAssertNotNil(savedURL, "Partial disk effect must remain observable")
+            XCTAssertTrue(f.session.isDirty)
+        }
+    }
+
+    func testAdmissionRefusalLeavesDirtyWithoutStartingIO() async throws {
+        let f = try Fixture()
+        defer { f.cleanUp() }
+        var writes = 0
+        f.scope.persistence.saver = { _, _, _ in writes += 1
+            return f.root
+        }
+        f.placement.refusal = "provider transition"
+        let result = await f.scope.persistence.flushSaveRequired(for: f.session.tabID, workspaceID: f.placement.workspace.id)
+        guard case let .failure(error) = result else { return XCTFail("An existing authority's refusal must defer persistence") }
+        XCTAssertEqual(error.message, "provider transition")
+        XCTAssertEqual(writes, 0)
+        XCTAssertTrue(f.session.isDirty)
+        f.placement.refusal = nil
+        f.scope.persistence.saver = { payload, workspace, count in
+            try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count)
+        }
+        try await f.scope.persistence.flushSaveRequired(for: f.session.tabID, workspaceID: f.placement.workspace.id).get()
+        XCTAssertFalse(f.session.isDirty)
+    }
+
+    @MainActor
+    private final class Placement {
+        var workspace: WorkspaceModel
+        var refusal: String?
+        init(_ workspace: WorkspaceModel) {
+            self.workspace = workspace
+        }
+    }
+
+    @MainActor
+    private final class Fixture {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("M9Persistence-\(UUID())")
+        let store = AgentSessionRuntimeStore()
+        let scope: AgentSessionRuntimeStore.Scope
+        let session = AgentTabSession(tabID: UUID())
+        let placement: Placement
+        let creation: AgentSessionCreationHandle?
+
+        init(fresh: Bool = false) throws {
+            let workspace = WorkspaceModel(name: "Headless persistence", repoPaths: [], customStoragePath: root)
+            placement = Placement(workspace)
+            scope = store.makeScope()
+            let claim = AgentSessionCreationClaim(workspaceID: workspace.id)
+            session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: claim.sessionID, workspaceID: workspace.id))
+            if fresh { creation = try XCTUnwrap(session.acceptFreshCreation(claim, workspaceID: workspace.id)) }
+            else { creation = nil
+                session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            }
+            session.runState = .completed
+            session.setItemsSilently([
+                AgentChatItem(kind: .user, text: "Persist me without a window", sequenceIndex: 0),
+                AgentChatItem(kind: .assistant, text: "A real saved response", sequenceIndex: 1)
+            ], reason: .persistedSessionHydration)
+            session.nextSequenceIndex = 2
+            session.isDirty = true
+            scope.replaceSessions([session.tabID: session])
+            let placement = placement
+            scope.persistence.composition = .init(
+                workspace: { placement.workspace },
+                workspaceWithID: { $0 == placement.workspace.id ? placement.workspace : nil },
+                displayName: { _ in "Headless persistence" },
+                isSuppressed: { false }, bypassesSuppression: { false }, isPreparedSavedHost: { true },
+                saveAdmission: { _ in placement.refusal },
+                creationIsCurrent: { $0.session.creationHandleIsCurrent($0) },
+                admitBinding: { session in session.activeAgentSessionID.map { .init(sessionID: $0, creation: nil) } }
+            )
+        }
+
+        func cleanUp() {
+            session.saveDebounceTask?.cancel()
+            try? FileManager.default.removeItem(at: root)
+        }
+    }
+}

@@ -977,6 +977,17 @@ final class AgentTabSession: ObservableObject {
         selectedAgent.usesClaudeTooling ? selectedClaudeEffortRaw : selectedReasoningEffortRaw
     }
 
+    /// Capture provider request values at dispatch, without exporting this mutable host object.
+    var acpRunInput: AgentACPRunInput {
+        AgentACPRunInput(
+            agent: selectedAgent,
+            selectedModelRaw: selectedModelRaw,
+            providerSessionID: providerSessionID,
+            taskLabelKind: mcpControlContext?.taskLabelKind,
+            modelParameterSelections: acpModelParameterSelections
+        )
+    }
+
     private var acpModelParameterSelectionRevisionByIdentity: [ACPModelParameterIdentity: UInt64] = [:]
     private var nextACPModelParameterSelectionRevision: UInt64 = 0
     var acpModelParameterSelections: [ACPModelParameterSelection] = [] {
@@ -1044,7 +1055,10 @@ final class AgentTabSession: ObservableObject {
     var attachmentTurnState: AgentModeViewModel.AttachmentTurnState = .idle
     /// `AgentSessions/attachments` of the workspace this turn was sent from, captured when its
     /// images are reserved so a mid-turn workspace switch cannot retain them elsewhere.
-    var attachmentRetentionRoot: URL?
+    var attachmentRetentionPlacement: AgentSessionAttachmentPlacement?
+    var attachmentRetentionRoot: URL? {
+        attachmentRetentionPlacement?.location.retainedRoot
+    }
 
     /// Provider session ID for resumption (e.g., Claude CLI session_id)
     var providerSessionID: String?
@@ -1563,7 +1577,7 @@ final class AgentTabSession: ObservableObject {
     }
 
     // Persistence
-    /// Synchronous derived-index maintenance for the window owning this live object.
+    /// Synchronous derived-index maintenance for the runtime store owning this live object.
     var persistentSessionBindingDidChange: (() -> Void)?
     private(set) var persistentSessionBindingIdentity: AgentPersistentSessionBindingIdentity?
     var activeAgentSessionID: UUID? {
@@ -1646,10 +1660,10 @@ final class AgentTabSession: ObservableObject {
 
     var sourceItemsRevision: Int = 0
     var pendingSourceItemsMutationSummary: AgentModeViewModel.PendingSourceItemsMutationSummary?
-    var pendingDerivedTranscriptRefreshReason: AgentModeViewModel.DerivedTranscriptRefreshReason?
+    var pendingDerivedTranscriptRefreshReason: AgentDerivedTranscriptRefreshReason?
     var derivedTranscriptRefreshTask: Task<Void, Never>?
     var derivedTranscriptRefreshGeneration: UInt64 = 0
-    var derivedTranscriptSyncState: AgentModeViewModel.DerivedTranscriptSyncState?
+    var derivedTranscriptSyncState: AgentDerivedTranscriptSyncState?
     var pendingCommandRunningByKey: [String: CodexNativeSessionController.CommandExecutionRunningUpdate] = [:]
     var pendingCommandRunningFlushTask: Task<Void, Never>?
     var pendingCommandRunningFlushUsesLiveOutputDelay: Bool = false
@@ -1967,7 +1981,7 @@ final class AgentTabSession: ObservableObject {
     /// The view model additionally checks runtime-map ownership and the workspace carrier.
     func restoreReadinessAfterRefusedTransition(
         _ previousReadiness: AgentSessionRestorationReadiness,
-        expectedTransition: AgentModeViewModel.PersistentBindingTransitionToken
+        expectedTransition: AgentPersistentBindingTransitionToken
     ) {
         guard !bindingTransitionInProgress,
               persistentBindingTransitionToken() == expectedTransition,
@@ -2023,8 +2037,8 @@ final class AgentTabSession: ObservableObject {
             || !queuedMCPElicitationRequests.isEmpty
     }
 
-    func persistentBindingTransitionToken() -> AgentModeViewModel.PersistentBindingTransitionToken {
-        AgentModeViewModel.PersistentBindingTransitionToken(
+    func persistentBindingTransitionToken() -> AgentPersistentBindingTransitionToken {
+        AgentPersistentBindingTransitionToken(
             tabID: tabID,
             sessionIdentity: ObjectIdentifier(self),
             binding: persistentSessionBindingIdentity,
