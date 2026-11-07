@@ -77,11 +77,13 @@ struct AgentSessionHydrationRequest {
 }
 
 struct AgentSessionHydrationPayload {
+    /// Exact storage request scope, including legacy payloads without an embedded workspace ID.
+    let sourceWorkspaceID: UUID
     let sessionID: UUID
     let persistedSession: AgentSession
     let canonicalLiveItems: [AgentChatItem]
     let transcript: AgentTranscript
-    let builtPresentation: AgentModeViewModel.BuiltTranscriptPresentation
+    let builtPresentation: AgentBuiltTranscriptPresentation
     let normalizedRunState: AgentSessionRunState
     let normalizedSelection: AgentModelCatalog.NormalizedAgentSelection
     let lastUserMessageAt: Date?

@@ -2223,6 +2223,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         return output
     }
 
+    func selectionPolicy(forModelRaw modelRaw: String, includeGlobalFallback: Bool) -> AgentCodexSelectionPolicy {
+        let options = reasoningEffortOptions(forModelRaw: modelRaw, agentKind: .codexExec)
+        return .init(
+            options: options,
+            defaultEffort: defaultReasoningEffort(forModelRaw: modelRaw, agentKind: .codexExec),
+            lastUsed: lastUsedReasoningEffort(
+                forModelRaw: modelRaw, validOptions: options, includeGlobalFallback: includeGlobalFallback
+            )
+        )
+    }
+
     func normalizeCodexSelectionForSession(
         _ session: AgentTabSession,
         preservingExplicitEffort: Bool
@@ -2238,38 +2249,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return
         }
 
-        let parsed = CodexModelSpecifier(raw: session.selectedModelRaw)
         let normalizedModel = Self.normalizedCodexSelectionModelRaw(from: session.selectedModelRaw)
-        let explicitEffort = preservingExplicitEffort
-            ? CodexReasoningEffort.parse(session.selectedReasoningEffortRaw)
-            : nil
-        let parsedEffort = parsed.reasoningEffort
-        let options = reasoningEffortOptions(forModelRaw: normalizedModel, agentKind: .codexExec)
-        let defaultEffort = defaultReasoningEffort(forModelRaw: normalizedModel, agentKind: .codexExec)
-        let lastUsed = lastUsedReasoningEffort(
-            forModelRaw: normalizedModel,
-            validOptions: options,
-            includeGlobalFallback: preservingExplicitEffort
+        let chosenEffort = selectionPolicy(
+            forModelRaw: normalizedModel, includeGlobalFallback: preservingExplicitEffort
+        ).reasoningEffort(
+            modelRaw: session.selectedModelRaw,
+            explicitRaw: preservingExplicitEffort ? session.selectedReasoningEffortRaw : nil
         )
-        let chosenEffort: CodexReasoningEffort? = {
-            guard !options.isEmpty else { return nil }
-            if let explicitEffort, options.contains(explicitEffort) {
-                return explicitEffort
-            }
-            if let parsedEffort, options.contains(parsedEffort) {
-                return parsedEffort
-            }
-            if let lastUsed, options.contains(lastUsed) {
-                return lastUsed
-            }
-            if let defaultEffort, options.contains(defaultEffort) {
-                return defaultEffort
-            }
-            if options.contains(.medium) {
-                return .medium
-            }
-            return options.first
-        }()
 
         session.selectedModelRaw = normalizedModel
         session.selectedReasoningEffortRaw = chosenEffort?.rawValue
@@ -2304,19 +2290,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         from agentSession: AgentSession,
         session: AgentTabSession
     ) {
-        session.codexConversationID = agentSession.codexConversationID
-        session.codexRolloutPath = agentSession.codexRolloutPath
-        session.providerCleanupHandle = agentSession.resolvedProviderCleanupHandle
-        session.codexModel = agentSession.codexModel
-        session.codexReasoningEffort = agentSession.codexReasoningEffort
-        session.codexContextUsage = AgentContextUsage(
-            modelContextWindow: agentSession.codexContextWindow,
-            lastTotalTokens: agentSession.codexLastTotalTokens,
-            totalTotalTokens: agentSession.codexTotalTotalTokens
-        )
+        AgentSessionHydrationRuntime.restoreCodexMetadata(from: agentSession, to: session)
         viewModel?.refreshCodexContextUsageSnapshot(for: session)
         if session.selectedAgent == .codexExec {
-            session.codexNeedsReconnect = agentSession.codexConversationID != nil || agentSession.codexRolloutPath != nil
             reconcilePersistedCodexCommandStatusIfNeeded(session: session)
         }
     }
@@ -4348,15 +4324,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     }
 
     private static func normalizedCodexSelectionModelRaw(from raw: String?) -> String {
-        let specifier = CodexModelSpecifier(raw: raw)
-        guard let baseModel = specifier.baseModel else { return AgentModel.defaultModel.rawValue }
-        if let serviceTier = CodexServiceTierVariantCatalog.supportedServiceTier(
-            baseModelID: baseModel,
-            serviceTier: specifier.serviceTier
-        ) {
-            return "\(baseModel)-\(serviceTier)"
-        }
-        return baseModel
+        AgentCodexSelectionPolicy.normalizedModelRaw(from: raw)
     }
 
     private func shouldShowNativeSlashCommand(

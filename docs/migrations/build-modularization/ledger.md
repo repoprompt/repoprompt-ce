@@ -3613,3 +3613,77 @@ hydration and execution hosting, remaining provider/VM execution callbacks,
 settlement-driven presentation handoff and bounded writer retirement still require
 integration. The optional presentation router is not a second lifecycle authority.
 Final product/index/full-suite validation and live smoke are not claimed here.
+
+### M9 completion continuation — runtime transcript construction and hydration
+
+Starting at `3f1bdc5e6`, the production saved-payload path now uses runtime-owned
+transcript construction/application and full persisted-field application. The
+builder's sanitization, cache reuse, quiet display, analytics and instrumentation
+algorithms move unchanged; the VM keeps compatibility forwarding entry points.
+The loader no longer calls a static VM transcript builder. A neutral transition
+token preserves exact object, binding generation and source revision checks.
+Full field application checks the saved session and workspace identity and returns
+a binding-qualified applied-payload receipt. Existing synchronous provider repairs
+finish before that receipt publishes readiness through the existing restoration
+authority. An old receipt cannot grant readiness to a later binding incarnation.
+Codex effort resolution is a frozen policy shared with the coordinator's normalizer,
+not a second preference store. Latest indexed organizational placement still wins
+over payload placement. Pending provider-switch tuples keep their existing override.
+
+The real-disk regression constructs neither WindowState, PromptViewModel nor
+WorkspaceManagerViewModel. It loads a saved payload and checks transcript, metadata,
+usage capacity, indexed placement and readiness on a standalone session object;
+negative cases cover stale incarnation and foreign workspace before mutation.
+This is payload hydration, not yet a window-free execution host. Attachment repair,
+provider command reconciliation, preference effects, and index/UI publication still
+run in the caller tail; save-core and execution-host extraction remain necessary.
+
+Intermediate receipts (continued below as validation completes):
+
+- `84c53053-df23-4af0-912f-7285b0330c59` (`m9-transcript-runtime-v1`): failed
+  compilation before tests on two new fixture initializers; corrected persisted
+  item conversion and explicit viewport state.
+- `d6a9aa12-ef41-4341-ae6a-a1e7f1672d1c` (`m9-transcript-runtime-v2`): **56 tests
+  passed** (2 transcript-runtime, 14 quiet-display, 40 context-load).
+- `5e558bb6-8057-417d-8195-fbe718e51076` (`m9-full-hydration-v1`): failed
+  compilation before tests because the new Codex policy omitted contract/provider imports.
+- `885781de-99b3-41b4-a4b9-753242ac1f89` (`m9-full-hydration-v2`): failed
+  compilation before tests on an unqualified nested handoff-state initializer;
+  corrected to infer the existing field type, without adding a VM construction.
+- `725ffea8-0da3-4ec8-a044-c090569318b2` (`m9-full-hydration-v3`): failed
+  compilation before tests because the nested receipt's synchronous readiness method
+  lacked explicit MainActor isolation. The method now expresses the existing session
+  actor boundary; no executor hop or unchecked sendability was introduced.
+- `6fea7758-c6a2-4059-aab9-4b790befa2d6` (`m9-full-hydration-v4`): production
+  compilation passed; test compilation failed on a new capacity fixture using an
+  integer instead of `AgentContextWindowCapacity`. Corrected the typed fixture.
+- `af46e86c-b5e8-41f8-9dc6-ee4225935cff`: conductor lint passed before the final
+  capacity-fixture correction (that file was subsequently scoped-formatted).
+
+The standalone workspace fence uses the exact load request's `sourceWorkspaceID`:
+legacy files may omit their embedded workspace ID, but an explicit conflicting
+embedded ID is refused. A real-disk legacy regression keeps the embedded field nil
+and proves the scoped load is accepted without inventing persisted identity. A
+mechanical comparison against `3f1bdc5e6` verified all six moved transcript-builder
+method bodies match, apart from the neutral result-type name and formatting.
+
+Review added the standalone workspace fence and separated field application from
+readiness publication. The suggested lost refresh-task/cold-load side effects were
+checked against source: the old mark-synchronized helper only assigns the sync
+stamp, and `setItemsSilently` still cancels pending derived work. The old supplied-
+presentation hydration path did no additional cold-load work. Readiness is binding-
+qualified, not source-revision-qualified. The Codex normalizer's non-Codex branch
+already published the agent-neutral selection bindings; no preference mutation is
+introduced by the forwarding binding publication. The prior Codex selection restore
+already stripped model effort suffixes before normalization, so its precedence is
+preserved rather than changing it based on the review's inferred alternative.
+
+Final focused receipt for this transition: `a2634059-9e37-4792-9b60-674e15072484`
+(`m9-full-hydration-v5`) **194 tests passed**: quiet-display 14, first-save 47,
+context-load 40, standalone transcript/hydration 7, Claude native effort 12, Codex
+resume/wedge commit 74. Final lint `97e94d70-874e-4f75-b7ba-f49854e52dd9`
+(`m9-full-hydration-lint-v2`) passed. The runtime builder move and legacy workspace receipt
+are included in this passing tree. No app was launched or stopped. M9 remains
+in progress: complete save-core ownership, window-free execution composition and
+MCP/link/admin routing, presentation handoff and bounded retirement/drain remain
+required; this receipt is not acceptance of those unfinished paths.

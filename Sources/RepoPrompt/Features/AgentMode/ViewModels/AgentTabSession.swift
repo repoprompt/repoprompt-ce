@@ -1660,7 +1660,7 @@ final class AgentTabSession: ObservableObject {
     var pendingDerivedTranscriptRefreshReason: AgentModeViewModel.DerivedTranscriptRefreshReason?
     var derivedTranscriptRefreshTask: Task<Void, Never>?
     var derivedTranscriptRefreshGeneration: UInt64 = 0
-    var derivedTranscriptSyncState: AgentModeViewModel.DerivedTranscriptSyncState?
+    var derivedTranscriptSyncState: AgentDerivedTranscriptSyncState?
     var pendingCommandRunningByKey: [String: CodexNativeSessionController.CommandExecutionRunningUpdate] = [:]
     var pendingCommandRunningFlushTask: Task<Void, Never>?
     var pendingCommandRunningFlushUsesLiveOutputDelay: Bool = false
@@ -1978,7 +1978,7 @@ final class AgentTabSession: ObservableObject {
     /// The view model additionally checks runtime-map ownership and the workspace carrier.
     func restoreReadinessAfterRefusedTransition(
         _ previousReadiness: AgentSessionRestorationReadiness,
-        expectedTransition: AgentModeViewModel.PersistentBindingTransitionToken
+        expectedTransition: AgentPersistentBindingTransitionToken
     ) {
         guard !bindingTransitionInProgress,
               persistentBindingTransitionToken() == expectedTransition,
@@ -2034,8 +2034,8 @@ final class AgentTabSession: ObservableObject {
             || !queuedMCPElicitationRequests.isEmpty
     }
 
-    func persistentBindingTransitionToken() -> AgentModeViewModel.PersistentBindingTransitionToken {
-        AgentModeViewModel.PersistentBindingTransitionToken(
+    func persistentBindingTransitionToken() -> AgentPersistentBindingTransitionToken {
+        AgentPersistentBindingTransitionToken(
             tabID: tabID,
             sessionIdentity: ObjectIdentifier(self),
             binding: persistentSessionBindingIdentity,

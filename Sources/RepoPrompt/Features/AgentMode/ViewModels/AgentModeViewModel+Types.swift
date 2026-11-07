@@ -187,13 +187,7 @@ extension AgentModeViewModel {
         let flushGeneration: UInt64
     }
 
-    struct PersistentBindingTransitionToken: Equatable {
-        let tabID: UUID
-        let sessionIdentity: ObjectIdentifier
-        let binding: AgentPersistentSessionBindingIdentity?
-        let transitionGeneration: UInt64
-        let sourceItemsRevision: Int
-    }
+    typealias PersistentBindingTransitionToken = AgentPersistentBindingTransitionToken
 
     struct PersistedHydrationCommitToken: Equatable {
         let transition: PersistentBindingTransitionToken
@@ -895,14 +889,7 @@ extension AgentModeViewModel {
         }
     }
 
-    struct DerivedTranscriptSyncState: Equatable {
-        let sourceItemsRevision: Int
-        let nextSequenceIndex: Int
-        let runState: AgentSessionRunState
-        let selectedAgent: AgentProviderKind
-        let hidePendingQuestionToolCall: Bool
-        let projectionProtection: AgentTranscriptProjectionProtection
-    }
+    typealias DerivedTranscriptSyncState = AgentDerivedTranscriptSyncState
 
     struct PersistableTranscriptSnapshot {
         let transcript: AgentTranscript
@@ -1028,26 +1015,7 @@ extension AgentModeViewModel {
         }
     }
 
-    struct BuiltTranscriptPresentation {
-        var localInputSeed = AgentSessionLinkRetainedLocalInputIndex.Seed()
-        let transcript: AgentTranscript
-        let baseProjection: AgentTranscriptProjection
-        let fullProjection: AgentTranscriptProjection
-        let workingProjection: AgentTranscriptProjection
-        let projection: AgentTranscriptProjection
-        let turnProjectionCaches: [UUID: AgentTranscriptTurnProjectionCache]
-        let archivedSnapshot: AgentArchivedTranscriptSnapshot
-        /// Semantic reuse evidence from the existing validated sanitizer prefix, not a claim
-        /// that building the archive projection avoided traversal or reused its storage.
-        let reusesPreviousArchive: Bool
-        let projectionProtection: AgentTranscriptProjectionProtection
-        let canonicalVisibleRowCount: Int
-        let projectionCounts: AgentTranscriptProjectionCounts
-        let analyticsSnapshot: AgentTranscriptAnalyticsSnapshot
-        let sanitizedActivityCount: Int
-        let performanceSnapshot: AgentTranscriptPerformanceSnapshot
-        let rawToolResultPayloadRenderRevisionByItemID: [UUID: Int]
-    }
+    typealias BuiltTranscriptPresentation = AgentBuiltTranscriptPresentation
 
     enum DerivedTranscriptRefreshReason: String {
         case liveMutation
