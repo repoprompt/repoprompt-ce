@@ -467,70 +467,7 @@ extension AgentModeViewModel {
     typealias MCPInstructionDispatch = AgentMCPInstructionDispatch
     typealias MCPActiveInstructionDispatchPlan = AgentMCPActiveInstructionDispatchPlan
 
-    struct MCPInteractionResponsePayload: Equatable {
-        enum ResponseArgument: Equatable {
-            case missing
-            case scalar(String)
-            case nonScalar
-        }
-
-        enum AnswerValueShape: Equatable {
-            case scalarString
-            case stringArray
-            case structuredObject
-        }
-
-        let suppliedArgumentNames: Set<String>
-        let text: String?
-        let skip: Bool
-        let explicitSkip: Bool
-        let responseArgument: ResponseArgument
-        let amendment: String?
-        let answerValueShapesByQuestionID: [String: AnswerValueShape]
-        let hasNormalizedAnswerFieldNames: Bool
-        let answersByQuestionID: [String: [String]]
-        let askUserAnswersByQuestionID: [String: AgentAskUserAnswer]
-        let hasStructuredAnswerObjects: Bool
-        let elicitationActionRaw: String?
-        let elicitationContent: [String: AgentJSONValue]
-        let elicitationMeta: [String: AgentJSONValue]
-
-        init(
-            suppliedArgumentNames: Set<String> = [],
-            text: String?,
-            skip: Bool,
-            explicitSkip: Bool = false,
-            responseArgument: ResponseArgument,
-            amendment: String?,
-            answerValueShapesByQuestionID: [String: AnswerValueShape] = [:],
-            hasNormalizedAnswerFieldNames: Bool = false,
-            answersByQuestionID: [String: [String]],
-            askUserAnswersByQuestionID: [String: AgentAskUserAnswer] = [:],
-            hasStructuredAnswerObjects: Bool = false,
-            elicitationActionRaw: String? = nil,
-            elicitationContent: [String: AgentJSONValue] = [:],
-            elicitationMeta: [String: AgentJSONValue] = [:]
-        ) {
-            self.suppliedArgumentNames = suppliedArgumentNames
-            self.text = text
-            self.skip = skip
-            self.explicitSkip = explicitSkip
-            self.responseArgument = responseArgument
-            self.amendment = amendment
-            self.answerValueShapesByQuestionID = answerValueShapesByQuestionID
-            self.hasNormalizedAnswerFieldNames = hasNormalizedAnswerFieldNames
-            self.answersByQuestionID = answersByQuestionID
-            self.askUserAnswersByQuestionID = askUserAnswersByQuestionID
-            self.hasStructuredAnswerObjects = hasStructuredAnswerObjects
-            self.elicitationActionRaw = elicitationActionRaw
-            self.elicitationContent = elicitationContent
-            self.elicitationMeta = elicitationMeta
-        }
-
-        func containsArgument(_ name: String) -> Bool {
-            suppliedArgumentNames.contains(name)
-        }
-    }
+    typealias MCPInteractionResponsePayload = AgentMCPInteractionResponsePayload
 
     enum MCPSessionCreationKind {
         case mcpControlled

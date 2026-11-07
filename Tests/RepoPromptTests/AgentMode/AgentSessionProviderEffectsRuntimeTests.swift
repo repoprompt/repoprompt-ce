@@ -665,6 +665,149 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
 
 @MainActor
 final class AgentSessionInteractionRuntimeTests: XCTestCase {
+    func testRetainedInteractionRuntimeDoesNotRetainProviderCommandOwnersThroughTerminalHooks() async throws {
+        var viewModel: AgentModeViewModel? = AgentModeViewModel(
+            testWindowID: -1406, testWorkspacePath: nil, shouldManageCodexTooling: false,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                fatalError("Composing terminal hooks must not launch a provider")
+            }
+        )
+        viewModel?.ensureRunServiceMaterializedForRunStart()
+        let runtime = try XCTUnwrap(viewModel?.interactionRuntime)
+        weak let codex = runtime.codexCommands
+        weak let claude = runtime.claudeCommands
+        XCTAssertNotNil(codex)
+        XCTAssertNotNil(claude)
+        await viewModel?.prepareForWindowClose()
+        viewModel = nil
+        XCTAssertNil(codex, "The terminal binder retains interaction hooks, not their provider command owners")
+        XCTAssertNil(claude)
+        XCTAssertNil(runtime.codexCommands)
+        XCTAssertNil(runtime.claudeCommands)
+    }
+
+    func testManagedQuestionResponseOwnsExactScopeAcrossAuthorizationWithoutPresentation() async throws {
+        var scope: AgentSessionRuntimeStore.Scope? = AgentSessionRuntimeStore().makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        scope?.replaceSessions([session.tabID: session])
+        let runtime = try XCTUnwrap(scope).interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
+        weak let retainedScope = scope
+        let question = AgentAskUserInteraction(title: "Scope", questions: [
+            AgentAskUserQuestion(id: "scope", question: "Which files?", options: [], allowsMultiple: false, allowsCustom: true)
+        ])
+        let installed = expectation(description: "question continuation installed")
+        let answered = Task { @MainActor in
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<AgentAskUserResponse, Error>) in
+                session.pendingAskUser = AgentAskUserPendingState(interaction: question)
+                session.askUserContinuation = continuation
+                session.runState = .waitingForQuestion
+                installed.fulfill()
+            }
+        }
+        await fulfillment(of: [installed], timeout: 3)
+        let request = try AgentSessionLinkInteractionResponseRequest(
+            interactionID: question.id,
+            payload: AgentRunMCPToolService.parseResponsePayload(args: ["skip": .bool(true)])
+        )
+        XCTAssertEqual(runtime.pendingInteraction(for: session).interaction?.id, question.id)
+        let gate = TestReleaseFence(name: "runtime interaction authorization")
+        let submitted = Task { await runtime.respondToPendingInteraction(session: session, isCurrent: { true }, request: request) {
+            await gate.enterAndWait()
+            return true
+        } }
+        guard await gate.waitUntilEntered() else {
+            gate.release()
+            runtime.cancelPendingQuestion(for: session)
+            _ = try? await answered.value
+            _ = await submitted.value
+            return
+        }
+        scope = nil
+        XCTAssertNotNil(retainedScope)
+        gate.release()
+        let outcome = await submitted.value
+        XCTAssertEqual(outcome, .submitted(kind: .question, decision: "skip"))
+        _ = try await answered.value
+        XCTAssertNil(session.askUserContinuation)
+        XCTAssertNil(session.pendingAskUser)
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertNil(retainedScope)
+    }
+
+    func testManagedResponseRechecksGrantObjectAndBindingAfterAuthorization() async throws {
+        for mutation in ["revoke", "rebind", "replace"] {
+            let scope = AgentSessionRuntimeStore().makeScope()
+            let session = AgentTabSession(tabID: UUID())
+            let sessionID = UUID()
+            let workspaceID = UUID()
+            session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: workspaceID))
+            scope.replaceSessions([session.tabID: session])
+            let runtime = scope.interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
+            let question = AgentAskUserInteraction(title: "Scope", questions: [
+                AgentAskUserQuestion(id: "scope", question: "Which files?", options: [], allowsMultiple: false, allowsCustom: true)
+            ])
+            let installed = expectation(description: "question installed before \(mutation)")
+            let answered = Task { @MainActor in
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<AgentAskUserResponse, Error>) in
+                    session.pendingAskUser = AgentAskUserPendingState(interaction: question)
+                    session.askUserContinuation = continuation
+                    installed.fulfill()
+                }
+            }
+            await fulfillment(of: [installed], timeout: 3)
+            let request = try AgentSessionLinkInteractionResponseRequest(
+                interactionID: question.id,
+                payload: AgentRunMCPToolService.parseResponsePayload(args: ["skip": .bool(true)])
+            )
+            let gate = TestReleaseFence(name: "managed response \(mutation)")
+            let submitted = Task { await runtime.respondToPendingInteraction(session: session, isCurrent: { true }, request: request) {
+                await gate.enterAndWait()
+                return mutation != "revoke"
+            } }
+            guard await gate.waitUntilEntered() else {
+                gate.release()
+                runtime.cancelPendingQuestion(for: session)
+                _ = try? await answered.value
+                _ = await submitted.value
+                return
+            }
+            if mutation == "rebind" {
+                session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: workspaceID))
+            } else if mutation == "replace" {
+                scope.replaceSessions([session.tabID: AgentTabSession(tabID: session.tabID)])
+            }
+            gate.release()
+            let outcome = await submitted.value
+            XCTAssertEqual(outcome, .unavailable, mutation)
+            XCTAssertNotNil(session.askUserContinuation, mutation)
+            runtime.cancelPendingQuestion(for: session)
+            do {
+                _ = try await answered.value
+                XCTFail("A refused response must not consume the original question")
+            } catch { XCTAssertTrue(error is CancellationError) }
+        }
+    }
+
+    func testManagedUserInputDoesNotAcknowledgeMissingProviderRoute() async throws {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        scope.replaceSessions([session.tabID: session])
+        let runtime = scope.interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
+        let pending = AgentRequestUserInputRequest(
+            requestID: .string("input"), method: "item/tool/requestUserInput", threadID: "thread", turnID: "turn", itemID: "item",
+            questions: [.init(id: "answer", header: "Answer", question: "Which files?", isOther: true, isSecret: false, options: [])]
+        )
+        session.pendingUserInputRequest = pending
+        let request = try AgentSessionLinkInteractionResponseRequest(
+            interactionID: pending.id,
+            payload: AgentRunMCPToolService.parseResponsePayload(args: ["answers": .object(["answer": .string("all")])])
+        )
+        let outcome = await runtime.respondToPendingInteraction(session: session, isCurrent: { true }, request: request, authorize: { true })
+        guard case let .invalid(message) = outcome else { return XCTFail("Missing provider commands must not report submitted: \(outcome)") }
+        XCTAssertTrue(message.contains("No response was applied"))
+        XCTAssertEqual(session.pendingUserInputRequest, pending)
+    }
+
     func testCancellationHooksResumeQuestionOnceWithoutViewModelAndPreserveStatePriority() async {
         let scope = AgentSessionRuntimeStore().makeScope()
         let session = AgentTabSession(tabID: UUID())

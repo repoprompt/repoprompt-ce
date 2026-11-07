@@ -7,37 +7,15 @@ extension AgentModeViewModel {
     /// approval for `tabID`. Returns whether that approval was consumed.
     @discardableResult
     func submitApprovalDecision(tabID: UUID, requestID: UUID, decision: AgentApprovalDecision) -> Bool {
-        guard let session = sessions[tabID], session.pendingApproval?.id == requestID else {
-            return false
-        }
-        submitApprovalDecision(tabID: tabID, decision: decision)
-        return session.pendingApproval?.id != requestID
+        guard let session = sessions[tabID] else { return false }
+        return interactionRuntime.submitApprovalDecision(session: session, requestID: requestID, decision: decision)
     }
 
     /// Unchecked variant resolving whatever approval is currently pending. Prefer the id-checked
     /// overload for any caller that captured the request earlier (cards, notifications).
     func submitApprovalDecision(tabID: UUID, decision: AgentApprovalDecision) {
-        guard let session = sessions[tabID],
-              let request = session.pendingApproval,
-              decision != .accept || request.supportsPlainApprove
-        else {
-            return
-        }
-        switch request.requestID {
-        case .codex:
-            codexCoordinator.submitApprovalDecision(session: session, decision: decision)
-        case .claudeControl:
-            claudeCoordinator.submitApprovalDecision(session: session, decision: decision)
-        case let .acp(requestID):
-            session.pendingApproval = nil
-            if session.runState == .waitingForApproval {
-                session.runState = .running
-            }
-            requestUIRefresh(tabID: tabID, urgent: true)
-            Task { [controller = session.acpController] in
-                await controller?.respondToPermissionRequest(id: requestID, decision: decision)
-            }
-        }
+        guard let session = sessions[tabID], let requestID = session.pendingApproval?.id else { return }
+        interactionRuntime.submitApprovalDecision(session: session, requestID: requestID, decision: decision)
     }
 
     func submitCodexHookReviewDecision(

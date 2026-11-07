@@ -20,7 +20,31 @@ enum AgentRunInteractionStateChangeReason: String, Equatable {
 
 @MainActor
 final class AgentSessionInteractionRuntime {
-    private weak var scope: AgentSessionRuntimeStore.Scope?
+    private(set) weak var scope: AgentSessionRuntimeStore.Scope?
+    private(set) weak var codexCommands: CodexAgentModeCoordinator?
+    private(set) weak var claudeCommands: ClaudeAgentModeCoordinator?
+
+    func installProviderCommands(codex: CodexAgentModeCoordinator, claude: ClaudeAgentModeCoordinator) {
+        precondition(codexCommands == nil || codexCommands === codex)
+        precondition(claudeCommands == nil || claudeCommands === claude)
+        codexCommands = codex
+        claudeCommands = claude
+    }
+
+    /// Admit an effect synchronously, retaining its exact owner until the effect has joined.
+    func performEffect(for session: AgentTabSession, operation: @escaping @MainActor () async -> Void) {
+        let id = UUID()
+        let owner = scope
+        let task = Task { [self, owner] in
+            defer {
+                pendingEffects.removeValue(forKey: id)
+                _ = owner
+            }
+            await operation()
+        }
+        pendingEffects[id] = PendingEffect(sessionIdentity: ObjectIdentifier(session), task: task)
+    }
+
     let routeID: Int
     let approvalStore: ApplyEditsApprovalStore
     weak var observer: (any AgentRunInteractionStateObserving)?

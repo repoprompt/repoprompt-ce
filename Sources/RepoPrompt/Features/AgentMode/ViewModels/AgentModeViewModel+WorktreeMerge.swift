@@ -656,17 +656,9 @@ extension AgentModeViewModel {
         }
     }
 
-    func submitWorktreeMergeReviewDecision(
-        tabID: UUID,
-        reviewID: UUID,
-        decision: WorktreeMergeReviewDecision
-    ) {
-        guard let session = sessions[tabID],
-              session.pendingWorktreeMergeReview?.id == reviewID,
-              let continuation = session.worktreeMergeReviewContinuation
-        else { return }
-        finishPendingWorktreeMergeReview(session: session)
-        continuation.resume(returning: decision)
+    func submitWorktreeMergeReviewDecision(tabID: UUID, reviewID: UUID, decision: WorktreeMergeReviewDecision) {
+        guard let session = sessions[tabID] else { return }
+        interactionRuntime.submitWorktreeMergeReviewDecision(session: session, reviewID: reviewID, decision: decision)
     }
 
     func pendingWorktreeMergeReview(for tabID: UUID?) -> PendingWorktreeMergeReview? {

@@ -4519,3 +4519,47 @@ remaining provider-input/command composition and presentation-preserving handoff
 Fresh final products/index, aggregate warning enforcement, full-suite and live-smoke
 qualification are not supplied by these focused receipts. The hosted fix is local and
 unpublished. No push, PR edit, merge, visible app lifecycle action or M10 target move.
+
+### M9 continuation — runtime-owned interaction commands (2026-11-08)
+
+Retired the view model's implementation of shared question/approval response parsing,
+question continuation settlement, user-input settlement and managed interaction response
+policy/application. AgentSessionInteractionRuntime now owns those actual bodies; the
+legacy view-model entry points forward exact objects. Managed response holds the exact
+scope across authorization and rechecks object, persistent binding, transition generation,
+interaction and grant before submission. Endpoint/catalog proof remains separate and is
+still supplied by the legacy adapter; this is not independent host admission. Existing
+ACP one-time permission authority, redaction, manual-only restrictions and approval stores
+remain unchanged. Response effects join the runtime's existing effect drain.
+
+The response payload and validated resolution are neutral, nonpersisted values with
+compatibility aliases, not reflected/Codable schema changes. Concrete provider commands
+are weak references: RunService owns the coordinators, whose terminal binder retains
+interaction hooks. Strong references in both directions would create a cycle. A real
+RunService composition/close regression retains only the interaction runtime and proves
+both coordinator owners release. Other standalone tests prove scope lifetime across held
+authorization, revocation, same-ID rebinding, object replacement and refusal rather than a
+false submitted result when user-input commands are unavailable. These standalone tests
+construct no window, PromptVM or WorkspaceVM.
+
+Initial `70906ae6-4ac2-4fdb-a19c-20ee2cbd6566` failed compilation before tests because the
+response payload was still nested in the view model; the actual neutral definition was
+moved rather than adding a runtime-to-VM alias. `8ea0b39a-1910-4468-9e33-2d45adf63c59`
+passed 86 tests. Supplemental `57f3f95f-0ec8-4806-97be-e7bf97a2eecf` ran 39 tests with
+one failing case (seven assertions): the extraction added an unintended missing-controller
+refusal to local ACP approval settlement. The previous behavior was restored, preserving
+the existing tests; managed ACP still requires its actual provider route. No timeout or
+assertion was weakened. Intermediate lint `e9eecacf-8017-4538-acff-c1da13b383fe` passed.
+
+Final `76a8eb1f-0cd5-4f27-bce2-b379014a6136` passed **346 tests**: session-link runtime
+bridge 234, Claude approval/resume 38, MCP steer/resume 27, ACP permission scope 10,
+worktree review 9, interaction runtime 8, Codex approval choice 6, ACP approval availability
+5, overseer ACP policy 4, ACP permission identity 3 and Context Builder ask-user 2.
+Final lint `53a70e3d-bd63-4613-9d82-f1c6656ed8d9` passed the same Swift tree. One independent
+review, scoped formatting, direct final diff review and staged contribution preflight apply.
+
+M9 remains incomplete: independent writer admission, canonical saved-target host construction,
+remaining provider-input/continuation composition, runtime-addressed routing and UI-detached
+handoff/drain still require their production cutover. These receipts are not full-product,
+fresh-index, aggregate-warning, full-suite or live-smoke qualification. No publication,
+visible app lifecycle action or M10 target move occurred.
