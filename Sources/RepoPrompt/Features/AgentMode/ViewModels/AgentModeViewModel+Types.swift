@@ -1062,14 +1062,7 @@ extension AgentModeViewModel {
 
     /// Event emitted when queued steering text needs to be restored to the composer
     /// (e.g., steering send failed, or the user cancelled the run while messages were queued).
-    struct DraftRestorationEvent: Equatable, Identifiable {
-        let id: UUID
-        let tabID: UUID
-        let text: String
-        let message: String
-        let strategy: AgentModeRunService.DraftRestorationStrategy
-        let operation: AgentComposerDraftRestorationOperation?
-    }
+    typealias DraftRestorationEvent = AgentComposerDraftRestorationEvent
 
     struct SlashSkillToken: Equatable {
         let name: String

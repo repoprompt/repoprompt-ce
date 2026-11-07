@@ -145,6 +145,7 @@ final class AgentSessionRuntimeStore {
         lazy var persistence = AgentSessionPersistenceRuntime(scope: self)
         lazy var attachments = AgentSessionAttachmentRuntime(scope: self)
         lazy var handoff = AgentSessionHandoffRuntime(scope: self)
+        lazy var drafts = AgentSessionDraftRuntime(scope: self)
         var saveQueue: AgentSessionSaveQueue {
             persistence.queue
         }

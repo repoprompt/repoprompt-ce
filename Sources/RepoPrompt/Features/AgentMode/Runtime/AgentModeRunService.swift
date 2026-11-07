@@ -1286,7 +1286,7 @@ final class AgentModeRunService {
             .filter { !$0.isEmpty }
         releaseUnconsumedClaudeSupersedingProtection(for: instructions, session: session)
         session.pendingClaudeSteeringInstructions.removeAll(where: shouldRestore)
-        restoreClaudeSteeringDrafts(drafts, tabID: tabID, strategy: strategy)
+        restoreClaudeSteeringDrafts(drafts, session: session, strategy: strategy)
     }
 
     /// Restores only the leading stale instructions so newer queued work remains eligible for a new flush task.
@@ -1304,17 +1304,17 @@ final class AgentModeRunService {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         releaseUnconsumedClaudeSupersedingProtection(for: instructions, session: session)
-        restoreClaudeSteeringDrafts(drafts, tabID: tabID, strategy: strategy)
+        restoreClaudeSteeringDrafts(drafts, session: session, strategy: strategy)
     }
 
     private func restoreClaudeSteeringDrafts(
         _ drafts: [String],
-        tabID: UUID,
+        session: AgentTabSession,
         strategy: DraftRestorationStrategy
     ) {
         guard !drafts.isEmpty else { return }
         let combined = drafts.joined(separator: "\n")
-        hooks.queuedWorkRecovery.restoreDraftText(tabID, combined, "Restored queued steering messages", strategy)
+        hooks.queuedWorkRecovery.restoreDraftText(session, combined, "Restored queued steering messages", strategy)
     }
 
     private func restoreAllQueuedDraftsForExecutionLocationChange(
@@ -1330,7 +1330,7 @@ final class AgentModeRunService {
         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         .filter { !$0.isEmpty }
         guard !drafts.isEmpty else { return }
-        hooks.queuedWorkRecovery.restoreDraftText(tabID, drafts.joined(separator: "\n"), "Restored queued messages after changing execution location", strategy)
+        hooks.queuedWorkRecovery.restoreDraftText(session, drafts.joined(separator: "\n"), "Restored queued messages after changing execution location", strategy)
     }
 
     /// Concatenates all queued Claude steering draft texts and restores them to the composer.
@@ -1350,10 +1350,10 @@ final class AgentModeRunService {
     private func restoreLocalACPSteeringDrafts(
         _ instructions: [AgentTabSession.ACPSteeringInstruction],
         tabID: UUID,
-        session: AgentTabSession? = nil,
+        session: AgentTabSession,
         stopFence: AgentRunStartStopFence? = nil
     ) {
-        if let stopFence, let session,
+        if let stopFence,
            !hooks.queuedWorkRecovery.isCurrentSessionBinding(session, stopFence)
         {
             return
@@ -1363,7 +1363,7 @@ final class AgentModeRunService {
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         guard !drafts.isEmpty else { return }
         hooks.queuedWorkRecovery.restoreDraftText(
-            tabID, drafts.joined(separator: "\n"), "Restored local ACP steering after Stop", .prependAlways
+            session, drafts.joined(separator: "\n"), "Restored local ACP steering after Stop", .prependAlways
         )
     }
 
@@ -1377,7 +1377,7 @@ final class AgentModeRunService {
         session.acpSteeringFlushID = nil
         restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
         session.pendingClaudeSteeringInstructions.removeAll()
-        restoreLocalACPSteeringDrafts(session.pendingACPSteeringInstructions, tabID: tabID)
+        restoreLocalACPSteeringDrafts(session.pendingACPSteeringInstructions, tabID: tabID, session: session)
         if let scheduled = session.scheduledACPFollowUp {
             session.scheduledACPFollowUp = nil
             let drafts = ([AgentTabSession.ScheduledACPFollowUp.QueuedInstruction(
@@ -1387,7 +1387,7 @@ final class AgentModeRunService {
                 .compactMap(\.instruction.localDraftText)
             if !drafts.isEmpty {
                 hooks.queuedWorkRecovery.restoreDraftText(
-                    tabID, drafts.joined(separator: "\n"), "Restored local ACP follow-up after Stop", .prependAlways
+                    session, drafts.joined(separator: "\n"), "Restored local ACP follow-up after Stop", .prependAlways
                 )
             }
         }
@@ -1396,7 +1396,7 @@ final class AgentModeRunService {
             .compactMap(\.localDraftText)
         if !localPending.isEmpty {
             hooks.queuedWorkRecovery.restoreDraftText(
-                tabID, localPending.joined(separator: "\n"),
+                session, localPending.joined(separator: "\n"),
                 "Restored local queued instructions after Stop", .prependAlways
             )
         }

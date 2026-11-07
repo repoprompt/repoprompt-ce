@@ -22,6 +22,8 @@ final class AgentSessionPresentationRuntime {
         var binding: ((AgentTabSession) -> Void)?
         var permissions: ((AgentTabSession) -> Void)?
         var worktreeOperations: ((AgentTabSession) -> Void)?
+        var draftChanged: ((AgentTabSession, String) -> Void)?
+        var draftRestored: ((AgentTabSession, AgentComposerDraftRestorationEvent) -> Void)?
     }
 
     struct Attachment: Equatable {
@@ -64,6 +66,14 @@ final class AgentSessionPresentationRuntime {
 
     func worktreeOperationsChanged(_ session: AgentTabSession) {
         sink(for: session)?.worktreeOperations?(session)
+    }
+
+    func draftChanged(_ session: AgentTabSession, previousText: String) {
+        sink(for: session)?.draftChanged?(session, previousText)
+    }
+
+    func draftRestored(_ session: AgentTabSession, event: AgentComposerDraftRestorationEvent) {
+        sink(for: session)?.draftRestored?(session, event)
     }
 
     func bindingChanged(_ session: AgentTabSession) {

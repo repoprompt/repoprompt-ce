@@ -69,14 +69,14 @@ extension AgentModeRunService {
     ///
     /// Authority: queued-work recovery projection.
     struct QueuedWorkRecoveryHooks {
-        let restoreDraftText: (_ tabID: UUID, _ text: String, _ message: String, _ strategy: DraftRestorationStrategy) -> Void
+        let restoreDraftText: (_ session: AgentTabSession, _ text: String, _ message: String, _ strategy: DraftRestorationStrategy) -> Void
         var isCurrentSessionBinding: @MainActor (AgentTabSession, AgentRunStartStopFence) -> Bool = { session, fence in
             fence.binding == session.persistentSessionBindingIdentity
         }
 
         /// Withdraws a run's initial user row whose send was refused by route verification before
         /// any provider dispatch, restoring its text to an empty composer (see
-        /// `AgentModeViewModel.restoreRouteRefusedUnsentTurn`). Hosts without a composer keep the row.
+        /// `AgentSessionDraftRuntime.restoreRouteRefusedUnsentTurn`). Recovery does not require a composer.
         var restoreRouteRefusedUnsentTurn: @MainActor (
             _ session: AgentTabSession,
             _ userItemID: UUID,

@@ -4222,3 +4222,80 @@ composition, actual window-free saved execution, and presentation-preserving clo
 are not completed by this extraction. No target move, push, PR change, merge or
 visible-app lifecycle action occurred. The earlier incomplete full-suite run remains
 unqualified until a new full run completes.
+
+At committed head `941d5f61e`, conductor product build
+`7786bccd-c4fb-4524-8f35-b4a1828976e8` passed for both products. A fresh compiler-index
+dump/check passed with **1,223/1,360 wrong-way file edges** and **53/66 cycle
+components** (1,109 files; 154,581 symbols), before the full-test cache transition.
+Full-suite ticket `c3cd5637-2b97-49c7-8b77-026bd72de532` subsequently reached its
+existing 3,600-second job limit: **6,837 completed cases, 19 failing cases**, with
+execution interrupted during `WorkspaceOpenFolderOrchestrationTests`. This is an
+incomplete, failed run, not a full-suite pass. The earlier waiter timeouts did not
+cancel or resubmit the job.
+
+One failure was traced to the delegation census fixture installing an unscoped
+binding, then invoking archive's required payload save. The fixture now uses the
+production runtime binding path and asserts the workspace qualification; production
+writer admission remains unchanged. The other 18 failing cases were in
+`SessionAdminWorktreeRecoveryTests`, with watcher `streamStartFailed` errors and
+follow-on mutation/receipt assertions. A process inspection during the run counted
+2,712 numeric descriptors, including 2,226 pipes, but this observation alone does
+not establish the failure cause or attribute it to a baseline. The affected suites
+are being rerun in a fresh test process; no timeout, guard or assertion is relaxed.
+Fresh-process ticket `5b5115be-f054-41f6-a8f9-39c9c1463489` passed all **47 tests**
+(delegation membership census 17, worktree recovery 30). This confirms the fixture
+repair and a passing isolated worktree suite, not the cause of the full-run watcher
+failures and not a substitute for complete-suite qualification. The existing
+conductor `ci-shard` operation provides per-suite process isolation for final
+whole-suite validation; the failed monolithic run remains recorded above.
+
+### M9 continuation — runtime-owned queued draft recovery (2026-11-08)
+
+`AgentSessionDraftRuntime` now owns the existing pending-tab draft storage and
+fragment acknowledgement ledger, restoration composition, stale-editor stores,
+snapshot acknowledgement, and lossless route-refusal withdrawal. Run-service
+recovery hooks retain this concrete runtime and pass the exact originating object,
+not a tab UUID resolved through a weak view model. Composer/reprompt/slash-command
+updates are optional exact-object presentation callbacks; detaching presentation
+cannot discard queued user work. Existing provider and terminal authorities still
+own queue withdrawal and delivery; no new queue, acknowledgement counter or
+persisted schema was introduced.
+
+Review identified the important difference between replacement and absence:
+compose-tab removal detaches the object **before** joining cancellation. A different
+live object reusing the tab ID refuses late recovery, while an absent object still
+uses the existing pending-tab storage (needed for stash). Final claim release
+refuses new recovery. Tests cover both cases, presentation detach, fragment
+acknowledgement, and plain-text route refusal without constructing any UI owner.
+An integration test also covers an explicitly bound but unmaterialized tab: draft
+reads/writes do not create a runtime, and `makeSession` consumes the pending draft
+exactly once when materialized. The legacy per-tab acknowledgement semantics and
+cleanup sites remain intact.
+
+Initial ticket `9bacd207-7824-4bad-a13c-e484d5dc57b6` passed **110 tests** before
+review's absent-object correction and two additional cases. Its route-refusal
+filename-like filter matched no tests; the final route integration is selected by
+actual XCTest class names. Final receipts follow below. This is a required service
+composition transition, **not** independent writer admission or a complete
+window-free execution host. Those M9 gates, presentation-preserving close and full
+validation remain open; M10's target move is untouched.
+
+Final ticket `4f570216-a139-4f99-ae3e-7c6984b3c801` passed **198 tests**: draft
+restoration 11, composer submission 39, reprompt submission 40, ACP steering 27,
+managed Stop 34, delegation census 17 and worktree recovery 30. Route-integration
+ticket `68e11731-51db-4474-a3d5-b69a5221cd24` passed **2 tests**, exercising the real
+Claude and Codex pre-dispatch refusal paths. Lint
+`c38cafb9-ab28-44c6-8ef1-a76193317ee1` passed the same Swift tree. Scope-only runtime
+coverage includes presentation detach, absent-versus-replaced objects, final release,
+lossless user-row withdrawal and acknowledgement; existing VM integration preserves
+reprompt mutation and composer presentation behavior. No visible app action, push,
+PR edit or merge was performed.
+
+The final diff check additionally fenced restoration-event delivery against a
+synchronous presentation observer replacing the tab during `draftChanged`. The
+runtime captures the originating object before notification and refuses to deliver
+that event to its replacement; a deterministic reentrant-observer test covers it.
+VM fallback publication also captures whether a runtime existed before the callback.
+Final corrected ticket `01b26cec-fa0f-45d3-82ec-811e9fbc3e1c` passed **201 tests**
+(the same suites above, draft restoration now 12, with both route integration cases
+included). Final lint `2ccb656a-316a-44d2-8ded-9b937c83fa13` passed this Swift tree.

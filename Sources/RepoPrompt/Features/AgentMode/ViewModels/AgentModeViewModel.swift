@@ -1031,8 +1031,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         lastKnownWorkspaceSnapshot?.id
     }
 
-    var tabDraftText: [UUID: String] = [:]
-    var draftRestorationLedger = AgentComposerDraftRestorationLedger()
+    var draftRuntime: AgentSessionDraftRuntime {
+        runtimeSessionStore.drafts
+    }
+
+    var tabDraftText: [UUID: String] {
+        get { draftRuntime.pendingTabDrafts }
+        set { draftRuntime.pendingTabDrafts = newValue }
+    }
+
+    var draftRestorationLedger: AgentComposerDraftRestorationLedger {
+        get { draftRuntime.ledger }
+        set { draftRuntime.ledger = newValue }
+    }
+
     private var cancellables = Set<AnyCancellable>()
     private let listeners = ListenerRegistry()
     private(set) var isAgentModeActive = false
@@ -2063,6 +2075,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 worktreeOperations: { [weak self] session in
                     guard let self, sessions[session.tabID] === session else { return }
                     publishWorktreeMergeOperationsChange(in: session)
+                },
+                draftChanged: { [weak self] session, previousText in
+                    guard let self, sessions[session.tabID] === session else { return }
+                    publishDraftTextChange(tabID: session.tabID, previousText: previousText, session: session)
+                },
+                draftRestored: { [weak self] session, event in
+                    guard let self, sessions[session.tabID] === session else { return }
+                    publishDraftRestoration(event)
                 }
             ))
         }
@@ -3636,18 +3656,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             attachments: attachmentRuntime.makeRunHooks(),
             presentation: runtimeSessionStore.presentation.makeRunHooks(),
             bindingObservation: mcpRuntime.makeBindingObservationHooks(),
-            queuedWorkRecovery: .init(
-                restoreDraftText: { [weak self] tabID, text, message, strategy in
-                    self?.restoreComposerDraft(tabID: tabID, text: text, message: message, strategy: strategy)
-                },
-                isCurrentSessionBinding: { [weak self] session, fence in
-                    self?.sessions[session.tabID] === session
-                        && session.persistentSessionBindingIdentity == fence.binding
-                },
-                restoreRouteRefusedUnsentTurn: { [weak self] session, userItemID, message in
-                    _ = self?.restoreRouteRefusedUnsentTurn(session: session, userItemID: userItemID, message: message)
-                }
-            ),
+            queuedWorkRecovery: draftRuntime.makeRunHooks(),
             persistence: persistence.makeRunHooks(),
             transcript: streamRuntime.makeRunHooks(),
             providerInput: .init(
