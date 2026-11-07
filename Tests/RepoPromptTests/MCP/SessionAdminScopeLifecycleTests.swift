@@ -8826,10 +8826,16 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             let savedWorkspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
             for id in [historical, stashed] {
                 let carrier = try XCTUnwrap(fixture.indexEntries[id])
-                let url = try await AgentSessionDataService.shared.saveAgentSession(AgentSession(
+                var payload = AgentSession(
                     id: id, workspaceID: savedWorkspace.id, composeTabID: carrier.tabID,
                     name: carrier.name, agentKind: "claudeCode", agentModel: "", isMCPOriginated: false
-                ), for: savedWorkspace)
+                )
+                // The index and durable payload must describe the same provenance.
+                payload.parentSessionID = carrier.parentSessionID
+                payload.createdByOverseerSessionID = carrier.createdByOverseerSessionID
+                payload.organizationalParentID = carrier.organizationalParentID
+                payload.delegationScopeID = carrier.delegationScopeID
+                let url = try await AgentSessionDataService.shared.saveAgentSession(payload, for: savedWorkspace)
                 addTeardownBlock { try? FileManager.default.removeItem(at: url) }
             }
             let vm = fixture.window.agentModeViewModel
@@ -8842,10 +8848,20 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             let runtimeCount = vm.sessions.count
             for id in [historical, stashed] {
                 let result = await WindowStatesManager.shared.resolveSavedOversightLocation(id)
-                guard case let .success(location) = result else { return XCTFail("\(result)") }
+                guard case let .success(location) = result else { return XCTFail("\(id == historical ? "historical" : "stashed"): \(result)") }
                 XCTAssertEqual(location.entry.id, id)
                 XCTAssertTrue(location.isCurrent)
                 XCTAssertNil(WindowStatesManager.shared.preparedOversightWindows[id], "Metadata lookup must not create a runtime")
+                if id == stashed {
+                    var conflicting = location.entry
+                    conflicting.parentSessionID = UUID()
+                    let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: savedWorkspace.id, activationEpoch: 1)
+                    var entries = fixture.indexEntries
+                    entries[id] = conflicting
+                    vm.test_installSessionIndexSnapshot(entries, owner: owner, latestOwner: owner, activeWorkspace: savedWorkspace)
+                    let mismatch = await WindowStatesManager.shared.resolveSavedOversightLocation(id)
+                    guard case .failure(.changed) = mismatch else { return XCTFail("Conflicting provenance must fail closed: \(mismatch)") }
+                }
             }
             XCTAssertTrue(AgentSessionLinkRuntimeBridge.shared.delegationScopes.pendingRequests(forTab: tab.id, sessionID: current).isEmpty)
             XCTAssertEqual(vm.sessions.count, runtimeCount)

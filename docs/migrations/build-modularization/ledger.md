@@ -3352,3 +3352,116 @@ when the user confirmed this resolution is docs-only and requested pushing witho
 tests. None of these attempts is a passing validation receipt. Earlier implementation
 receipts retain their original source provenance. Mandatory commit/push safety gates
 remain applicable. No visible app lifecycle action occurred.
+
+## M9 / #1406 — execution inputs and saved-carrier lookup prerequisites (2026-11-07)
+
+Isolated branch `runtime/20261107-m9-session-writer` starts at #1652's exact
+head `2fe16b92a73d624b9333cf1cc593c6e35836ce93`. At the opening recheck,
+#1652 is open and mergeable, and main remains
+`85505637e94744162e31ae29372975de70f88ac7`, already incorporated by that base.
+M7 and M8 history and the preceding validation receipts are preserved, not
+cherry-picked or represented as validation of this new diff. The primary is untouched.
+
+Continuation recheck: #1652 was squash-merged as `15d858caaa4eff7d9f2d6cb211fb383f4e392a53`.
+Its tree is identical to the original base. The uncommitted continuation was carried
+onto new local branch `runtime/20261107-m9-session-writer-main` at that main commit,
+without rewriting the original branch or duplicating #1652's commits.
+
+### Ownership map and commit grouping
+
+1. **Execution inputs:** runtime-owned factory/routing closure vocabulary and an
+   immutable ACP request input, together with provider-configuration regression tests.
+2. **Saved-carrier lookup:** a window-free exact metadata resolver, its production
+   window adapter and disk/identity/revalidation regressions.
+
+These are prerequisite chunks, **not the independent session writer**. Source
+inspection confirms that `CodexAgentModeCoordinator` still retains a concrete VM
+and uses it for runtime dispatch, route proofs, persistence and presentation. The
+run-service hooks and runners still accept mutable `AgentTabSession`. Replacing
+that ownership requires a real host/capability inversion; a weak writer registry
+beside the window census would only add a parallel authority and is not introduced.
+
+| Responsibility | Owner after this slice | Retired responsibility |
+| --- | --- | --- |
+| Provider/routing factory signatures | `AgentRunExecutionContracts`, using M8 provider/model contracts | VM-owned definitions and runtime references to those five VM aliases; presentation compatibility aliases remain |
+| ACP model/resume/role/pin request assembly | Immutable `AgentACPRunInput`, captured by the existing session host at each dispatch | `AgentModeRunService.makeACPRunRequest(session:)` and its mutable-session input |
+| Exact saved metadata lookup and carrier cardinality | `AgentSavedSessionTargetLoader` | Window-manager implementation of the lookup loop; composition still supplies the catalog and live fences |
+| Durable registration/epochs, attempts and terminal settlement | Existing domain store, run-attempt lifecycle and terminal barrier | None; no replacement authority or schema change |
+| Execution hosting, writer election, payload hydration and handoff/drain | Existing VM, carrier census and prepared-window composition | None; these M9 acceptance gates remain open |
+
+The loader point-reads one UUID per known workspace through `AgentSessionDataService`.
+It constructs no window, prompt VM or workspace VM, does not hydrate payloads or
+start providers, and performs no new writes. Live metadata and carrier placement
+are re-read after IO; the first match is revalidated after later workspace reads.
+Current authoritative live state bypasses disk as before. Conflicting persisted
+identity remains fail-closed, and cancellation is distinguished from unreadable
+storage. The result is request-local evidence, never permission or a writer.
+
+No persisted/reflected class schema changes: closure aliases are source vocabulary,
+and the new input/lookup values are not encoded. Existing provider factories and
+VM-backed callbacks are still injected implementations, not eliminated dependencies.
+No target move is included; M10 remains unchanged.
+
+### Validation receipts
+
+| Check | Result | Conductor ticket |
+| --- | --- | --- |
+| Loader, ACP input/permission and existing run-lifecycle suites | **47 passed**, zero failures | `20f30147-b72b-4681-83d4-1ee98cdb427d` |
+| Full SwiftFormat check + strict SwiftLint | **PASS**, 0/2,088 files require formatting | `284bac1b-e9b8-4864-b985-25f27bf80694` |
+| Repository guardrails after build released SwiftPM lock | **PASS** | `29ddd161-6d8d-4b5f-8eb2-7370bb733cf1` |
+| ACP integration plus historical/stashed lookup | **29 passed, 1 failed**; provenance-inconsistent fixture diagnosed below | `511aad6b-7140-4579-92b2-2c16330011cc` |
+| App product build | **PASS** | `2d0e10ad-7677-48e3-90c8-45660e80fb21` |
+| Loader plus corrected historical/stashed integration | **8 passed**, zero failures; includes conflicting-provenance rejection | `da236742-700f-424a-ab06-2163e6ae1885` |
+
+The historical/stashed integration fixture saved a stashed payload with nil parent
+and organization while its index claimed non-nil provenance. Diagnostic tickets
+`f0b37e13-ccfa-42e3-98ca-c60927b6de7f` and `7032e534-ace8-4229-8d54-8a4f74b946b3`
+reproduced the existing fail-closed provenance check (not cancellation or duplicate
+carriers). The fixture now persists matching provenance and explicitly asserts that
+a conflicting parent is rejected; no production guard was weakened. Temporary
+prints were removed. The 29 successful integration tests cover ACP advertised
+commands, compact runner/transactions and background compaction settlement.
+
+A compiler-index check after the base-branch switch reported freshness unproven
+(0 stale, 0 unindexed files), so it is **not a passing receipt**. A final product
+build/index check is still required for the eventual final source state.
+
+The 47 tests are `AgentSavedSessionTargetLoaderTests` (7),
+`OpenCodeRunRequestPinPropagationTests` (3), `DevinPermissionLevelTests` (33),
+and `AgentRunLifecycleContractsTests` (4). The build took 1,553.25 seconds;
+selected XCTest execution took 27.025 seconds. Two filter terms used file names
+rather than the actual class names and matched nothing; their integration coverage
+is not included in this count. Auxiliary zero-match bundles are not coverage.
+A waiter expired while the same successful ticket was publishing its cache;
+it was rejoined without resubmission.
+
+The first focused conductor ticket `7b2a9cd4-a9b7-4397-b188-ec0666eca437`
+was canceled (exit 130) after source inspection identified a missing provider-contract
+import, now fixed; it is not a test pass. Initial guardrails
+`399e3d9f-6330-4f3a-b3db-23418f4294f6` timed out at 300 seconds waiting for the
+test build's SwiftPM lock. The passing retry ran after that build, without changing
+the timeout. Pinned formatter installation succeeded under ticket
+`81888ee8-127b-468c-a93d-2309c70a751c` after build-cache setup removed the initial
+worktree-local formatter. Only changed Swift files were formatted.
+
+One Oracle diff review identified mixed fresh metadata/old carrier evidence; the
+loader now refreshes carrier placement and checks it again before returning.
+Its closing-window concern was checked against `AgentSessionCarrierResolver.capture`,
+which already excludes closing windows. The proposed override of mismatched disk
+identity by a newly live runtime was not adopted: identity conflicts remain failures.
+
+**M9 remains incomplete:** independent zero/one/conflicting writer admission;
+first-save acknowledgment and pending-start cancellation before visibility;
+administration/scope/link command adoption; inversion of remaining VM/provider
+execution dependencies; window-free payload hydration and execution hosting;
+presentation attachment, deferred handoff and bounded drain. The existing window
+adapter still rejects agreeing replicas; this slice does not claim that acceptance.
+Full-suite, real-provider, live CE MCP, Release/performance and hosted CI are not
+claimed. No publishing, merging or visible app lifecycle action is authorized.
+
+Maintainer-guidance check: this is confirmed structural preparation, not a claim
+of independent-runtime behavior. Existing authorities and persisted identity stay
+intact. Primary risks are stale carrier evidence and dispatch-value drift; focused
+real-disk and input-capture tests cover those boundaries. Lookup remains bounded by
+the supplied workspace catalog with UUID point reads, no polling or new background
+owner. The broader writer transition must not be labeled complete by these changes.
