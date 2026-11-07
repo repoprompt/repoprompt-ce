@@ -3156,6 +3156,140 @@ historical receipts are in [PR #1642](https://github.com/repoprompt/repoprompt-c
 
 No deadline or assertion is relaxed to dispose of these observations. M6 landing does not retroactively explain those failures.
 
+## M9 / #1406 — initial F1/F2 session-runtime preparation (2026-11-07)
+
+Base: current main `7ede2d055469ec487e30f0bdb3508255ec11e05e`, isolated branch
+`runtime/20261107-m9-session-preparation`. M8 / #1642 is merged. M7 / #1651
+was rechecked open at `b711ea3fa46883b23e7dc712bb08b731b252eaa2` before edits.
+Its `AgentTabSession` overlap is an import addition; this slice does not touch its
+MCP transport/execution extraction, package declarations, or module manifest.
+At final handoff main is unchanged and #1651 is still open at
+`114cc3861cef3975a85e0c501e360d631a5fdd45`. Its current overlapping source/test
+patches are only `RepoPromptMCPServer` imports in `AgentTabSession` and
+`AgentSessionLinkCodexCatalogRepairTests`; retain those imports during integration.
+Both lanes append ledger entries at the same tail: preserve both histories, rather
+than choosing one side. No M7 code was cherry-picked or duplicated. Integration
+with that advancing lane must still be validated before merging the combined tree. The dirty
+primary is not used for implementation or validation.
+
+### Split map and bounded scope
+
+| Responsibility | Existing authority | This slice |
+| --- | --- | --- |
+| Durable registration, epoch, persistence health and acknowledgment | `DomainAgentRunSessionStore` | Retained unchanged; no new session registry/store |
+| Transient attempt identity and terminal resource ownership | `AgentRunAttemptLifecycle` | Retained unchanged |
+| Terminal publication, commit ordering and teardown | `AgentRunTerminalCommitBarrier`, driven by `AgentModeRunService` | Retained unchanged |
+| Neutral interaction transport, instruction dispatch/result plan, token accumulator | Four nested types in `AgentModeViewModel+Types` | Top-level values in `Runtime/AgentRunRuntimeValues.swift`; nested aliases preserve consumers |
+| Codex active/anonymous turn identity, accepted-steer reconciliation, fallback queue/in-flight/blocker/pump/retry and dispatch gate | Stored cluster in `AgentTabSession` | One `CodexTurnRuntimeState` instance retained by that session; forwarding properties contain no duplicate storage |
+| Provider/controller lifecycle, cancellation, fallback queue settlement and draft restoration | Existing Codex coordinator and run service | Retained; no new resets, cancellation tasks or automatic teardown |
+| Saved-target resolution and nonvisual preparation | `AgentSessionCarrierResolver`, prepared runtime registry and window composition | Not replaced in this slice; F3 remains open |
+
+The Codex owner remains MainActor-isolated, matching its current callers. Its weak
+notification bridge feeds the existing monitor observation channel on exactly the
+same writes. Controller replacement still rotates the controller generation and
+invalidates active identities without silently dropping queued work; the coordinator
+remains responsible for retiring that queue. M8's Codex provider request-failure and
+shared attachment contracts are reused, not redefined.
+
+**Retired responsibilities:** the VM namespace no longer defines the four selected
+runtime value bodies. `AgentTabSession` no longer stores the 12 turn-routing/fallback
+fields or defines the 13 associated Codex types/gate implementations. Compatibility
+aliases and computed forwarding are intentionally retained. No writer-selection,
+prepared-window or VM-callback branch is claimed retired by this initial slice.
+
+### Identity and persistence audit
+
+The hoisted values and turn-state types are not Codable/NSCoding payloads. Their
+stored UUIDs, controller generations, run/attempt identity, stop fences, attachment
+reservations and monitoring claims are preserved field-for-field. The six MCP
+instruction-dispatch raw strings and their delivery-signaling policy are pinned by
+a compatibility test. Swift reflected/mangled names **do change**; aliases preserve
+source/type equivalence, not the old reflected spelling. A first-party source/test/
+package search found no literal consumers of the moved qualified names. Agent Mode
+reflection sites were inspected: error diagnostics and the test-only
+`agentSessionLinkEvidenceBytes` helper do not define a persisted type-name contract.
+No persistence schema, archived class name, notification name or permission boundary
+is changed. Other nested types and the remaining Codex session fields are not part
+of this hoist.
+
+### Validation and limitations
+
+Final source validation (conductor, no visible app lifecycle):
+
+| Check | Result | Ticket |
+| --- | --- | --- |
+| Focused final F1/F2 and existing runtime/link suites | **119 passed**, zero failures/skips | `5d569d44-4b40-4571-a2f5-682023995b03` |
+| Final full SwiftFormat check + strict SwiftLint | **PASS**, 0/2,063 files require formatting | `2b9f8c93-2871-4f43-8e76-8aa216cc79b9` |
+| Repository guardrails | **PASS** | `62b0a629-5fcd-48f5-9536-39be10c7ab70` |
+| Fresh compiler-index check after successful coordinated test build | **PASS**, wrong-way file edges **1,215/1,360**, largest cycle **53/66** | `.build/modularization/m9-index-check.json` |
+
+The seven executed suites were `AgentRunCancellationOutcomeTests` (6),
+`AgentRunLifecycleContractsTests` (4), `AgentSessionLinkCodexCatalogRepairTests` (21),
+`AgentSessionLinkCodexPromptAdapterTests` (41),
+`AgentSessionLinkNativeAndHeadlessPromptAdapterTests` (31),
+`AgentSessionLinkSteerTransactionLiveTests` (12), and
+`ModularizationCompatibilityGoldenTests` (4). Module bundles matching zero tests
+are not additional coverage. The final job took 3m 41s including compilation and
+post-test work; XCTest execution was 39.59s. No ratchet limits changed and no
+edge-count improvement against a measured base graph is claimed.
+
+Historical first run `126ad602-e5dc-48a8-889a-ba4b29fe1747` compiled and ran **37
+tests: 36 passed, one failed**. The new controller-replacement test incorrectly
+expected MCP-control reset to clear steer reconciliation. The source review and
+execution agreed that queue abandonment preserves it; `beginRunAttempt` clears
+it. Only the test was corrected, preserving production semantics. Three original
+filter terms matched no suite; the final filter uses the verified class names
+above. A 1,200-second waiter timeout did not cancel or fail that cold-build job;
+it later finished in 34m 22s with the stated test failure. First lint
+`7ac20bbf-6d6a-471d-b377-225e5634ea8e` also passed, before the test-only revision.
+
+The one Oracle diff review found no demonstrated production regression and caught
+the incorrect test expectation. Its requested checks were added: optional in-place
+writeback, silent-field observation, cancellation of both runtime-held tasks by
+the real coordinator reset, and serial-gate identity across controller replacement.
+A source scan found no closure-taking mutating/inout uses of the forwarded queue
+that could introduce re-entrant writeback loss. A mechanical body comparison verified
+all 13 moved Codex declarations against HEAD after type-name normalization.
+Formatting used the repository-pinned tool on only the six edited Swift files
+(no whole-repo formatting mutation); conductor installed that pinned tool under
+ticket `25382459-fdb3-4b41-b016-9a596536c3bb`. An initial sandboxed conductor help
+attempt could not create its state directory; approved execution then used the
+ordinary coordinated daemon, not a separate build path.
+
+These are focused in-process integration receipts, not independent-writer or
+real-persistence acceptance for F3. Full app suite, packaged products, real-provider
+or live CE MCP smoke, Release/performance, hosted CI and M7 integration are **NOT_RUN**.
+At this validation checkpoint changes were uncommitted and unpublished.
+
+**M9 is not complete.** F3 still needs an exact session/workspace/incarnation writer
+capability over the existing lifecycle/store authorities, zero/one/conflicting-writer
+outcomes, first-save/pending-start cancellation ordering, and exact saved-target loading
+without a window/prompt/workspace VM. Administration, scope transactions, session-link
+host consumption, deferred presentation handoff and bounded drain remain subsequent
+work. Provider factories and mutable session dependencies still exist in the execution
+seam. No target move belongs here; F4 stays in M10. At the implementation checkpoint,
+no live app action, publish or merge was authorized or performed.
+
+Maintainer-guidance check: the confirmed structural coupling is the scope, not a
+claimed user-visible bug fix. Existing lifecycle/store/settlement authorities remain
+single owners. Primary risks are lost in-place writeback, missed observer invalidation,
+and changed cancellation/identity lifetime; focused integration tests cover those
+boundaries. The additional owner is one small in-memory object per session, with no
+polling, scans or autonomous tasks. Broader F3 behavior is deliberately not approximated
+by a parallel manager or speculative persistence layer.
+
+### Publication preparation
+
+The user subsequently authorized creating a PR. Main was re-attested unchanged at
+`7ede2d055469ec487e30f0bdb3508255ec11e05e`; this remains a standalone partial-M9
+slice, not a branch stacked on M7 and not a closure of #1406. The coordinated
+`swift-build --product RepoPrompt` passed under ticket
+`89cc1d6b-aa75-41c6-b0d3-67810dba803b` (24.4s execution). No implementation source
+changed after the 119-test/lint/guardrail receipts. Mandatory staged-index commit
+and outgoing-range push safety gates apply before publication. Full-suite,
+Release/performance and live-smoke limits above remain; the app was not launched
+or stopped. Hosted checks must be assessed on the published head separately.
+
 ## M7 / #1651 integration after M8 landed (2026-11-07)
 
 Merged main `7ede2d055469ec487e30f0bdb3508255ec11e05e` (M8 / #1642) into
@@ -3199,3 +3333,22 @@ Ratchet configuration matches incoming main exactly. Local receipts are under
 are committed. Full app-suite, Release/performance, live-app smoke and the
 milestone's exact-head publication review remain outside these local receipts.
 No sub-agent, visible app lifecycle, force-push or primary-checkout edit occurred.
+
+## M9 / #1652 — merge-conflict resolution after M7 (2026-11-07)
+
+Merged main `85505637e94744162e31ae29372975de70f88ac7` into M9 head
+`18132a58f5013614a71a9f19968362d383ab51b9`, without rewriting history.
+The only conflict was this Markdown ledger's competing additions; both histories
+are retained. A line-order check confirmed every line from both parent ledgers
+survives. All six M9 Swift files remain byte-identical to the PR head except the
+two incoming M7 MCP-server imports; no code was manually changed by the resolution.
+Conflict-marker and whitespace checks passed. The focused merge-resolution review
+found no actionable issue.
+
+The initially submitted test/build/lint jobs were unnecessary for this Markdown-only
+resolution and were canceled at the user's direction: `89f1f527`, `327435c6`, and
+`5b8ab44e`. A briefly requested focused-test retry (`c1dace8e`) was also canceled
+when the user confirmed this resolution is docs-only and requested pushing without
+tests. None of these attempts is a passing validation receipt. Earlier implementation
+receipts retain their original source provenance. Mandatory commit/push safety gates
+remain applicable. No visible app lifecycle action occurred.

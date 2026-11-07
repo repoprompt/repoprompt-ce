@@ -21,6 +21,39 @@ final class ModularizationCompatibilityGoldenTests: XCTestCase {
         }
     }
 
+    /// F1 aliases preserve source identity, while dispatch raw values remain the MCP wire contract.
+    @MainActor
+    func testSessionRuntimeValueHoistsPreserveDispatchContract() {
+        XCTAssertEqual(ObjectIdentifier(AgentModeViewModel.AgentInteractionTransport.self), ObjectIdentifier(AgentRunInteractionTransport.self))
+        XCTAssertEqual(ObjectIdentifier(AgentModeViewModel.MCPInstructionDispatch.self), ObjectIdentifier(AgentMCPInstructionDispatch.self))
+        XCTAssertEqual(ObjectIdentifier(AgentModeViewModel.MCPActiveInstructionDispatchPlan.self), ObjectIdentifier(AgentMCPActiveInstructionDispatchPlan.self))
+        XCTAssertEqual(ObjectIdentifier(AgentModeViewModel.NonCodexTurnTokenAccumulator.self), ObjectIdentifier(AgentNonCodexTurnTokenAccumulator.self))
+        let cases: [(AgentMCPInstructionDispatch, String, Bool, Bool)] = [
+            (.deliveredIntoWaitingContinuation, "delivered_waiting_continuation", false, false),
+            (.queuedClaudeInterrupt, "queued_claude_interrupt", true, false),
+            (.queuedACPInterrupt, "queued_acp_interrupt", true, false),
+            (.queuedFollowUp, "queued_follow_up", true, true),
+            (.dispatchedCodexTurn, "dispatched_codex_turn", true, true),
+            (.startedRun, "started_run", false, false)
+        ]
+        for (dispatch, rawValue, isActive, signalsDelivery) in cases {
+            XCTAssertEqual(dispatch.rawValue, rawValue)
+            XCTAssertEqual(dispatch.isActiveRunDispatch, isActive)
+            XCTAssertEqual(dispatch.signalsMCPDeliveryAfterDispatch, signalsDelivery)
+        }
+        let sessionID = UUID()
+        let connectionID = UUID()
+        let transport: AgentModeViewModel.AgentInteractionTransport = .mcp(sessionID: sessionID, originatingConnectionID: connectionID)
+        XCTAssertEqual(transport, AgentRunInteractionTransport.mcp(sessionID: sessionID, originatingConnectionID: connectionID))
+        var tokens = AgentModeViewModel.NonCodexTurnTokenAccumulator()
+        tokens.estimatedUserInputTokens = 3
+        tokens.estimatedToolInputTokens = 5
+        tokens.estimatedToolOutputTokens = 7
+        tokens.observedContextUsedTokens = 100
+        XCTAssertEqual(tokens.estimatedInputTokens, 15)
+        XCTAssertEqual(tokens.observedContextUsedTokens, 100)
+    }
+
     // MARK: - Cross-process notification names
 
     /// Darwin notifications cross process boundaries between running app instances.

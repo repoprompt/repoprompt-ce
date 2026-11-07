@@ -771,223 +771,81 @@ final class AgentTabSession: ObservableObject {
         }
     }
 
-    struct CodexPendingAuthRetryTurn: Equatable {
-        /// Undecorated provider text, exactly as every other Codex buffer stores it.
-        var text: String
-        var attachments: [AgentFileAttachment]
-        var model: String?
-        var reasoningEffort: String?
-        var serviceTier: String?
-        var attachmentReservationID: UUID?
-        var expectedTurnID: String?
-        var auditTurnID: UUID?
-        var autoEffortApplied = false
-        var retryAttempted: Bool = false
-        /// Final monitoring identity composed for the original physical dispatch, if any.
-        var monitoringDispatchID: AgentSessionLinkPromptDispatchID?
-        var monitoringDispatchContext: AgentSessionLinkDispatchContext?
-        /// Accepted oversight claim from the original dispatch, retained so managed-auth replay can
-        /// attach the byte-equivalent supplement without acknowledging it twice.
-        var monitoringClaim: AgentSessionLinkOutboundPromptClaim?
+    // Source compatibility only. Turn storage and its value vocabulary live with the Codex runtime.
+    typealias CodexPendingAuthRetryTurn = CodexTurnRuntimeState.PendingAuthRetryTurn
+    typealias CodexTurnKind = CodexTurnRuntimeState.TurnKind
+    typealias CodexHookGateBindingIdentity = CodexTurnRuntimeState.HookGateBindingIdentity
+    typealias CodexAuthoritativeTurnIdentity = CodexTurnRuntimeState.AuthoritativeTurnIdentity
+    typealias CodexAnonymousTurnLiveness = CodexTurnRuntimeState.AnonymousTurnLiveness
+    typealias CodexFallbackOrigin = CodexTurnRuntimeState.FallbackOrigin
+    typealias CodexDispatchSerialGate = CodexTurnRuntimeState.DispatchSerialGate
+    typealias CodexFallbackReason = CodexTurnRuntimeState.FallbackReason
+    typealias CodexFallbackSubmissionContext = CodexTurnRuntimeState.FallbackSubmissionContext
+    typealias CodexFallbackBlockingTurn = CodexTurnRuntimeState.FallbackBlockingTurn
+    typealias CodexPendingSteerLifecycleReconciliation = CodexTurnRuntimeState.PendingSteerLifecycleReconciliation
+    typealias CodexFallbackQueueState = CodexTurnRuntimeState.FallbackQueueState
+    typealias CodexFallbackQueueEntry = CodexTurnRuntimeState.FallbackQueueEntry
+
+    let codexTurnState = CodexTurnRuntimeState()
+
+    var codexPendingTurnKind: CodexTurnKind? {
+        get { codexTurnState.pendingTurnKind }
+        set { codexTurnState.pendingTurnKind = newValue }
     }
 
-    enum CodexTurnKind: String {
-        case user
-        case compact
-        case review
-        case unknown
+    var codexPendingAuthRetryTurn: CodexPendingAuthRetryTurn? {
+        get { codexTurnState.pendingAuthRetryTurn }
+        set { codexTurnState.pendingAuthRetryTurn = newValue }
     }
 
-    struct CodexHookGateBindingIdentity: Equatable {
-        let controllerInstanceID: ObjectIdentifier
-        let controllerGeneration: UUID
+    var codexAuthoritativeActiveTurn: CodexAuthoritativeTurnIdentity? {
+        get { codexTurnState.authoritativeActiveTurn }
+        set { codexTurnState.authoritativeActiveTurn = newValue }
     }
 
-    struct CodexAuthoritativeTurnIdentity: Equatable {
-        let threadID: String
-        let turnID: String
-        let turnKind: CodexTurnKind
-        let controllerInstanceID: ObjectIdentifier
-        let controllerGeneration: UUID
-        let runID: UUID?
-        let runAttemptID: UUID
+    var codexAnonymousActiveTurn: CodexAnonymousTurnLiveness? {
+        get { codexTurnState.anonymousActiveTurn }
+        set { codexTurnState.anonymousActiveTurn = newValue }
     }
 
-    struct CodexAnonymousTurnLiveness: Equatable {
-        let threadID: String
-        let turnKind: CodexTurnKind
-        let controllerInstanceID: ObjectIdentifier
-        let controllerGeneration: UUID
-        let runID: UUID?
-        let runAttemptID: UUID
+    var codexRoutingObservedTurnID: String? {
+        get { codexTurnState.routingObservedTurnID }
+        set { codexTurnState.routingObservedTurnID = newValue }
     }
 
-    enum CodexFallbackOrigin: Equatable {
-        case manual
-        case mcp(attemptID: UUID)
-
-        var isMCP: Bool {
-            switch self {
-            case .mcp:
-                true
-            case .manual:
-                false
-            }
-        }
+    var codexPendingSteerLifecycleReconciliation: CodexPendingSteerLifecycleReconciliation? {
+        get { codexTurnState.pendingSteerLifecycleReconciliation }
+        set { codexTurnState.pendingSteerLifecycleReconciliation = newValue }
     }
 
-    @MainActor
-    final class CodexDispatchSerialGate {
-        private var nextTicket: UInt64 = 0
-        private var servingTicket: UInt64 = 0
-        private var cancelledTickets: Set<UInt64> = []
-        private var waiters: [UInt64: CheckedContinuation<Bool, Never>] = [:]
-
-        func issueTicket() -> UInt64 {
-            defer { nextTicket &+= 1 }
-            return nextTicket
-        }
-
-        func awaitTurn(_ ticket: UInt64) async -> Bool {
-            if cancelledTickets.remove(ticket) != nil {
-                advancePastCancelledTickets()
-                return false
-            }
-            if ticket == servingTicket {
-                return true
-            }
-            return await withCheckedContinuation { continuation in
-                waiters[ticket] = continuation
-            }
-        }
-
-        func finish(_ ticket: UInt64) {
-            guard ticket == servingTicket else { return }
-            servingTicket &+= 1
-            advancePastCancelledTickets()
-            waiters.removeValue(forKey: servingTicket)?.resume(returning: true)
-        }
-
-        func cancel(_ ticket: UInt64) {
-            if let waiter = waiters.removeValue(forKey: ticket) {
-                waiter.resume(returning: false)
-            }
-            cancelledTickets.insert(ticket)
-            guard ticket == servingTicket else { return }
-            advancePastCancelledTickets()
-            waiters.removeValue(forKey: servingTicket)?.resume(returning: true)
-        }
-
-        private func advancePastCancelledTickets() {
-            while cancelledTickets.remove(servingTicket) != nil {
-                servingTicket &+= 1
-            }
-        }
-    }
-
-    enum CodexFallbackReason: Equatable {
-        case activeWithoutAuthoritativeIdentity
-        case staleAuthoritativeIdentity
-        case nonSteerableTurn(kind: CodexTurnKind)
-        case noActiveTurn(failure: CodexAppServerClient.RequestFailure)
-        case expectedTurnMismatch(
-            expectedTurnID: String,
-            actualTurnID: String?,
-            failure: CodexAppServerClient.RequestFailure
-        )
-        case activeTurnNotSteerable(
-            turnKind: String?,
-            failure: CodexAppServerClient.RequestFailure
-        )
-    }
-
-    struct CodexFallbackSubmissionContext: Equatable {
-        let queueID: UUID
-        let providerText: String
-        let attachments: [AgentFileAttachment]
-        let taggedFileAttachments: [AgentTaggedFileAttachment]
-        let draftText: String
-        let optimisticUserItemID: UUID?
-        let origin: CodexFallbackOrigin
-        let dispatchTicket: UInt64?
-        var stopFence: AgentRunStartStopFence?
-        /// Explicit composer provenance; absent/internal contexts never inherit companion access.
-        var isLocalUserInput: Bool = false
-    }
-
-    struct CodexFallbackBlockingTurn: Equatable {
-        let threadID: String
-        let turnID: String
-        let controllerInstanceID: ObjectIdentifier
-        let controllerGeneration: UUID
-        let runID: UUID?
-        let runAttemptID: UUID
-    }
-
-    struct CodexPendingSteerLifecycleReconciliation: Equatable {
-        let priorIdentity: CodexAuthoritativeTurnIdentity
-        let acceptedDispatchTurnID: String
-    }
-
-    enum CodexFallbackQueueState: Equatable {
-        case queued
-        case eligibleForSuccessor(completedTurnID: String)
-        case dispatching
-        case awaitingLifecycleStart
-        case lifecycleStarted
-    }
-
-    struct CodexFallbackQueueEntry: Equatable, Identifiable {
-        let id: UUID
-        let providerText: String
-        let attachments: [AgentFileAttachment]
-        let taggedFileAttachments: [AgentTaggedFileAttachment]
-        let model: String?
-        let reasoningEffort: String?
-        let serviceTier: String?
-        var autoEffortApplied = false
-        let attachmentReservationID: UUID?
-        let optimisticUserItemID: UUID?
-        let draftText: String
-        let origin: CodexFallbackOrigin
-        let fallbackReason: CodexFallbackReason
-        let originThreadID: String
-        let originControllerInstanceID: ObjectIdentifier
-        let originControllerGeneration: UUID
-        let originRunID: UUID
-        let originRunAttemptID: UUID
-        var blockingTurn: CodexFallbackBlockingTurn?
-        var state: CodexFallbackQueueState
-        var monitoringDispatchContext: AgentSessionLinkDispatchContext?
-        var stopFence: AgentRunStartStopFence?
-    }
-
-    var codexPendingTurnKind: CodexTurnKind?
-    var codexPendingAuthRetryTurn: CodexPendingAuthRetryTurn?
-    var codexAuthoritativeActiveTurn: CodexAuthoritativeTurnIdentity?
-    var codexAnonymousActiveTurn: CodexAnonymousTurnLiveness?
-    var codexRoutingObservedTurnID: String?
-    var codexPendingSteerLifecycleReconciliation: CodexPendingSteerLifecycleReconciliation?
-    var codexFallbackQueue: [CodexFallbackQueueEntry] = [] {
-        didSet { noteMonitorObservationInputsChanged() }
+    var codexFallbackQueue: [CodexFallbackQueueEntry] {
+        get { codexTurnState.fallbackQueue }
+        set { codexTurnState.fallbackQueue = newValue }
     }
 
     var codexFallbackDispatchInFlight: CodexFallbackQueueEntry? {
-        didSet { noteMonitorObservationInputsChanged() }
+        get { codexTurnState.fallbackDispatchInFlight }
+        set { codexTurnState.fallbackDispatchInFlight = newValue }
     }
 
-    /// Bridges queued follow-ups to a hook-gate owner's turn for as long as that turn has no
-    /// settled identity of its own. Whichever of the accepted `turn/start` receipt or the
-    /// lifecycle start arrives first supplies the value — they race, and the queue has to be
-    /// bound by then either way. It is transient by design: the turn's terminal event either
-    /// upgrades it to the identity-derived blocker or resolves the queue outright.
-    var codexFallbackHookGateOwnerBlocker: CodexFallbackBlockingTurn?
+    var codexFallbackHookGateOwnerBlocker: CodexFallbackBlockingTurn? {
+        get { codexTurnState.fallbackHookGateOwnerBlocker }
+        set { codexTurnState.fallbackHookGateOwnerBlocker = newValue }
+    }
+
     var codexFallbackPumpTask: Task<Void, Never>? {
-        didSet { noteMonitorObservationInputsChanged() }
+        get { codexTurnState.fallbackPumpTask }
+        set { codexTurnState.fallbackPumpTask = newValue }
     }
 
-    var codexFallbackSuccessorRetryTask: Task<Void, Never>?
-    let codexDispatchSerialGate = CodexDispatchSerialGate()
+    var codexFallbackSuccessorRetryTask: Task<Void, Never>? {
+        get { codexTurnState.fallbackSuccessorRetryTask }
+        set { codexTurnState.fallbackSuccessorRetryTask = newValue }
+    }
+
+    var codexDispatchSerialGate: CodexDispatchSerialGate {
+        codexTurnState.dispatchSerialGate
+    }
 
     /// Instruction steering coordination state
     var instructionContinuation: CheckedContinuation<UserInstructionResponse, Error>? {
@@ -1813,6 +1671,9 @@ final class AgentTabSession: ObservableObject {
     init(tabID: UUID, perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()) {
         self.tabID = tabID
         self.perfRecorder = perfRecorder
+        codexTurnState.onMonitorObservationInputsChanged = { [weak self] in
+            self?.noteMonitorObservationInputsChanged()
+        }
         // The lifecycle facade owns terminal-commit phase state, so bridge it into the explicit
         // oversight change channel from that authority.
         runLifecycle.onTerminalCommitPhaseChange = { [weak self] in
