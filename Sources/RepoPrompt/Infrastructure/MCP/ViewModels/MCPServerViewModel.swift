@@ -1,4 +1,5 @@
 import RepoPromptFileSystem
+import RepoPromptMCPServer
 import RepoPromptSettingsCore
 import RepoPromptWorkspaceContext
 

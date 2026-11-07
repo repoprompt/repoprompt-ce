@@ -1,4 +1,5 @@
 import RepoPromptFileSystem
+@testable import RepoPromptMCPServer
 import RepoPromptSettingsCore
 #if DEBUG
     import Darwin

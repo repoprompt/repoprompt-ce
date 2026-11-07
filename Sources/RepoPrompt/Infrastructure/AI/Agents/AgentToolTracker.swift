@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptMCPServer
 
 /// Observes MCP tool usage for a single agent session and emits uniform events.
 /// Tool observers are registered by runID (not connectionID) to survive connection handovers.

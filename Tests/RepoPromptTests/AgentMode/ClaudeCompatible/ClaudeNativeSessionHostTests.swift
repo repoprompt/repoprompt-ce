@@ -4,6 +4,7 @@ import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptClaudeProvider
+import RepoPromptMCPServer
 import RepoPromptShared
 import XCTest
 

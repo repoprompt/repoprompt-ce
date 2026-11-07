@@ -2818,6 +2818,320 @@ push to `wt/1401-milestone-1`; the PR remains Draft. Exact-head hosted CI is a
 separate gate after publication, not implied by these local passes. Required
 independent review remains open, including this new integration delta.
 
+## M7 / #1405 — local admission retirement checkpoint (2026-11-07)
+
+**Partial preparation, not M7/D4 completion.** Re-attested GitHub main and merged
+#1415 before planning: `21a31933e80fd3b0e347e1517187f6c621654c47`, merge time
+`2026-11-06T18:41:02Z`, M6 head `e8a86685cf64158d74462809f71fcea61c0d3072`.
+The isolated branch is `runtime/20261107-m7-mcp-transport`; the dirty primary is
+not an implementation or validation location. #1642/M8 is a separate lane,
+not a prerequisite. Its open-PR files were checked for overlap; manifest/catalog
+rows and the milestone ledger need ordinary integration reconciliation later.
+The primary's MCP edits are in AgentManage, the prompt VM and the session-control
+provider; none is changed here. No shared file-claim artifact was found in the
+previous `/tmp/rpce-pr-reviews` claim location; that is not a claim that every
+other actor is idle.
+
+### Local file scope and retirement
+
+Owned source paths: `MCPConnectionManager.swift`, `Policies/MCPToolAdmissionPolicy.swift`,
+`WindowTools/MCPGitToolAdmissionController.swift` under app MCP;
+`Features/Diagnostics/MCP/MCPToolConcurrencyEvidence.swift`; and
+`RepoPromptDomainRuntime/MCPDomainConnectionCallAdmission.swift`. The new owner
+suite is `Tests/RepoPromptDomainRuntimeTests/MCPDomainConnectionAdmissionPolicyTests.swift`.
+The headless guard script and this ledger record the boundary. No provider-lane
+source, manifest row, ratchet limit, or primary-checkout file changes.
+
+| Retired app machinery | Surviving owner / effect |
+| --- | --- |
+| Manager `admissionClass` and `callLane` forwarding methods (unused), five `*CallLaneLimit` constants, six connection-ID-taking capacity methods that ignored that ID | `MCPDomainToolCatalog` classifies; the existing domain limiter constructs its six lanes from `MCPDomainToolAdmissionLimits`. Connection publication/replacement and post-await identity checks remain unchanged. |
+| Policy's nine capacity mirrors, classifications dictionary alias and classification forwarder | Consumers read the domain catalog/limits directly, including Git repository admission and release diagnostics. |
+| App extension mapping canonical admission class to lane | The identical mapping is owned beside `MCPDomainConnectionCallLimiters`; `exclusive` still means the historical `ordinary` lane. No lane count, capacity, scheduling, cancellation, or settlement algorithm changes. |
+| Repeated six-argument default construction at five manager sites | Canonical defaults on the existing domain initializer. The DEBUG file-read override and injected idle clock remain explicit. No new factory, registry, policy engine or permit owner. |
+
+`MCPToolAdmissionPolicy` remains the narrow app adapter for role/client facts and
+operation-argument decoding. Its exact-link/activation inputs and domain policy
+calls are unchanged. The watchdog, resource-admission and settlement names are
+already aliases to DomainRuntime, not unextracted implementation; moving those
+aliases into a new target would not retire a responsibility.
+
+### Captured invocation / preserved gates
+
+At the pinned base, `registerHandlers` is in `ServerNetworkManager` (the type in
+`MCPConnectionManager.swift`). Its network packet becomes
+`dispatchInvocationContext` only after exact connection/catalog/window evidence
+is captured. `dispatchResolvedProvider` carries that packet through watchdog
+execution; `resolvedOperation` scopes `MCPInvocationContextBridge` around the
+single `domainHost.invoke(MCPDomainHostInvocation(...))` call. The host consumes
+the resolved registration handle, principal/security context, admitted domain
+context and original admission deadline. App binder/VM effect checks still own
+live presentation identity. This checkpoint does not change that path, add a
+second envelope, or move any check across an await.
+
+Transport registration, lifecycle generation, policy/run revisions, cancellation,
+limiter replacement during tentative idle close, export publication authority,
+terminal fencing, response bytes and replay/delivery accounting are untouched.
+DomainRuntime remains the owner of permits and settlement, not this adapter.
+
+### Recorded prerequisites before D4 relocation
+
+These are remaining M7 work, not permission to import M8 or to claim extraction:
+
+1. **Captured values are not yet an app-free file closure.**
+   `MCPInvocationContextBridge.require` defaults to the app's
+   `MCPInvocationDiagnosticAdapter`; `MCPTabContextSnapshot` carries
+   `AgentSessionWorktreeBindingState`, `AgentWorkspaceLookupContextIdentity`,
+   `ContextBuilderReviewTargetResolution` and `WorkspaceSessionRootLifetimeSnapshot`.
+   The first three are still app-owned: binding state/source/identity are in
+   `Features/AgentMode/Services/AgentWorkspaceLookupContextResolver.swift`, and
+   review resolution is in `Features/ContextBuilder/Services/ContextBuilderReviewTarget.swift`.
+   The lifetime snapshot is already package-visible in WorkspaceContext and
+   must stay with its existing clock; it is not a new app-dependency blocker.
+   `AgentSessionLinkRunCatalogRouteToken` is a pure value over UUIDs, generations
+   and a domain endpoint, currently beside app catalog projection. These are
+   bounded declaration/adapter seams to prepare, not evidence that M8 or a full
+   VM decomposition is required. Separate neutral evidence from app live
+   capture/diagnostics before moving the carrier. Do not erase lifetime checks or
+   replace them with an untyped closure bag.
+2. **Dispatch is still interleaved with app authority and publication.**
+   `registerHandlers` captures live session-link grants, policy revisions and
+   presentation identities, resolves exact registration scope, handles prompt
+   export admission/publication, and calls tool-card observers. A new wrapper
+   around `host.invoke` alone does not remove this orchestration. Freeze a narrow
+   captured-call/app-effect adapter contract with tests at those await boundaries
+   before relocating it; do not move the giant handler unchanged to another app
+   class or silently expand into AgentModeViewModel decomposition.
+3. **Transport closure has app consumers.** `MCPServerConnection` and transport
+   context values are declared alongside manager/dashboard state; bootstrap and
+   Unix transport share them and app diagnostics. Resolve that dependency closure
+   and its consumers before the pure move. Bootstrap/listener/reconnect/proxy and
+   response-byte ownership must remain transport responsibilities.
+4. **No `RepoPromptMCPServer` target or move receipt yet.** The existing
+   DomainRuntime physical-admission owner can be validated app-free now; that
+   does not satisfy the requested new server target, handler reduction, complete
+   app/direct effect matrix, independent milestone review or performance gates.
+   No pure-file-move audit is claimed for this in-place preparation.
+
+### Validation and limits
+
+- Initial owner-module ticket `4005b31f-799a-4e96-9214-af7fef7252d2` passed:
+  **2 tests, 0 failures**, 6m27s including cold dependency/module compilation;
+  test execution 0.017s. This receipt predates the literal-capacity assertions
+  requested by local review; final validation is recorded separately below.
+- Pinned formatter installation `ae8fc5c8-64e5-497b-9724-ff8d692cfe52` passed.
+  The initial format attempt refused system SwiftFormat 0.64.4; it did not format
+  or validate sources. Repository-required 0.61.1 is now locally installed.
+- The new guard was exercised against temporary source fixtures: current source
+  exit 0; baseline mirrors exit 1; missing policy exit 1; missing manager exit 1.
+  Receipt: `build/m7-receipts/admission-guard-cases.txt`. The full headless guard
+  also passed. No production file was temporarily reverted for these probes.
+- One local Oracle review found no visible behavioral regression and requested
+  fail-closed guard inputs and fixed-capacity pins. Both are applied. This is a
+  bounded source review, not the independent full-milestone review or execution
+  evidence. Its alias/catalog assumptions were checked directly against source.
+
+- Strict lint `7366681a-55b3-46bc-8898-0d4062ab1302` passed in 10m18s:
+  SwiftFormat 0.61.1 reported **0/1,954 files** requiring formatting in the
+  repository-defined style scope, followed by successful strict SwiftLint.
+  That formatter scope excludes the domain admission file and new owner test;
+  this is not a claim that all six changed Swift files were checked by that job.
+- The separate six-file scoped formatter unexpectedly reformatted unrelated
+  parts of the domain admission file and removed existing `Sendable` declarations.
+  Final diff inspection caught this. The file was restored to baseline plus
+  only the intended mapping/default changes (**+35/-7**). Formatting the edited
+  range with `redundantSendable` disabled then reported **0/1 files** changed;
+  no unrelated formatting or conformance changes remain. The other five Swift
+  files were unchanged by scoped formatting. Validation before this restoration
+  is explicitly distinguished from the corrected-source rerun below.
+- Broad guardrails `e18aeda3-bd13-4925-a023-6e2f1c7cd8e4` **failed** at the
+  unchanged 300-second job timeout while SwiftPM waited for the concurrent
+  integration build's `.build` lock (PID 63928). This is a failed job, not a
+  passing check or just a waiter timeout. The retry waited for that build to
+  settle; no timeout increase or concurrent duplicate was used.
+
+- Pre-restoration integration `4866de62-8035-414c-8252-778d05e3526b` passed:
+  **52 unique tests, 0 failures, 0 skips**. Executed suites: app role projection
+  2, connection removal/progress 6, export watchdog contracts 37, serialized app
+  cancellation/policy/reconnect 3, direct MCP physical read admission 2, domain
+  lane/effect tests 2. Other target bundles matched zero tests and are not counted
+  as coverage. Conductor execution 20m54s, heavy wait 32.9s; the 1,200-second
+  waiter expired while compilation continued, then the same ticket completed.
+  Counts and exact methods: `build/m7-receipts/integration-test-counts.json`.
+- That pre-restoration source is retained in
+  `build/m7-receipts/integration-v1-source-manifest.sha256` (manifest digest
+  `2905e2766346df2fae038ddeb76b38a6600c8f0d76783a04905d9fcf6109a1c9`).
+  Corrected source is base `21a31933e80fd3b0e347e1517187f6c621654c47` plus the
+  seven source/test/script files in `build/m7-receipts/source-manifest.sha256`
+  (manifest digest `95100e23de5c473c6f0d6d6292146faa60252975641a6e6f7a5f12b6ad392a5f`).
+  Ledger-only updates do not change that source manifest.
+
+- Pre-restoration serialized broad guardrails
+  `30900f27-7400-46a9-991d-ca42863e5128` passed
+  in 1m13s with the unchanged timeout, after the competing build completed.
+  The earlier failed ticket remains recorded above.
+- Pre-restoration compiler-index check passed: **1,304/1,360 wrong-way file edges** and
+  **54/66 largest cycle components**, unchanged from the M6 integration receipt.
+  Receipt: `build/m7-receipts/index-check.txt`. No ratchet baseline was raised.
+- Source concentration, not a runtime-speedup claim: manager **18,620 → 18,535**
+  lines; admission adapter **89 → 53**; existing domain admission owner
+  **881 → 909**. Across the five changed production files the net reduction is
+  **91 lines**. The class-to-lane mapping is moved ownership, not deleted behavior;
+  the genuinely retired paths are enumerated above. `registerHandlers` itself
+  has not been reduced by this checkpoint.
+
+- Pre-restoration Debug products (`RepoPrompt`, `repoprompt-mcp`) built
+  successfully in ticket `2a1c99a6-2dfe-42f7-88e8-e4859900ef74`, 27.4s execution.
+  This is a warm build after test-bundle compilation, not a matched
+  build-performance result. No packaging, installation or visible launch was
+  performed.
+- Corrected-source integration `7ba1e797-8e0f-4059-93a8-3d0947270e21`
+  passed: **52 unique tests, 0 failures, 0 skips**, with the same six suite counts
+  above and the original `Sendable` declarations preserved. Execution 22m05s,
+  global heavy wait 0.279s. Exact terminal test-case results were counted, rather
+  than adding nested suite totals or treating compiler-warning excerpts labeled
+  by the runner as test failures. Receipt:
+  `build/m7-receipts/integration-v2-test-counts.json`.
+- Corrected-source Debug products passed in ticket
+  `e1da05a0-fe9e-4c81-9e83-4740165937df`: `RepoPrompt` and `repoprompt-mcp`,
+  21.9s warm execution after 4m57s global heavy-slot wait. No competing build was
+  submitted to bypass the queue. This is not a build-performance comparison.
+- Corrected-source broad guardrails passed in ticket
+  `dc257505-49fc-464a-bb55-d99cb7979a31`, 1m16s, serialized after the product
+  build with the unchanged timeout.
+- Corrected-source fresh compiler-index check passed unchanged:
+  **1,304/1,360 wrong-way file edges**, **54/66 largest cycle components**.
+  Receipt: `build/m7-receipts/index-check-final.txt`; no baseline changes.
+
+Full-suite execution,
+Release packaging/performance, packaged-process/live MCP and full-milestone
+independent review are **NOT_RUN**. The historical Repo Bench surface is
+unavailable; no replacement benchmark or visible app action was attempted.
+The new owner fixture routes all six representative canonical classifications
+through real limiter permits, performs temporary-file effects, proves overflow
+waits and cancellation prevents its effect, and retains cancelled running owners
+until physical settlement. A separate case checks explicit fixture overrides.
+These controlled effects do not substitute for the full app/direct production
+journey or packaged-process validation.
+
+Maintainer-guidance check: the invariant is one canonical class/capacity owner
+with unchanged physical admission. Redundant forwarding is confirmed from
+source; no user-visible bug or performance gain is claimed. State and scale risks
+are cancellation/permit lifetime and accidental capacity drift; generation,
+authorization, durable-effect and delivery ownership remain unchanged. Scope is
+bounded in-place preparation. Full milestone extraction and acceptance remain
+open; no visible app action, publishing, commit or issue mutation is authorized
+by this checkpoint.
+
+## M7 transport adapter extraction — local implementation (2026-11-07)
+
+This section supersedes the preparation-only scope above, not its historical
+validation receipts. Base remains `21a31933e80fd3b0e347e1517187f6c621654c47`
+(M6/#1415), in isolated branch `runtime/20261107-m7-mcp-transport`.
+No primary-checkout files, GitHub state, or visible app lifecycle were changed.
+
+### Responsibility retirement map
+
+| Responsibility | Owner after extraction |
+| --- | --- |
+| Unix/bootstrap framing, reader cancellation, connection transport and response deadlines | `RepoPromptMCPServer/Transport` |
+| Captured invocation values and single boxed dispatch TaskLocals | `RepoPromptMCPServer/Context` |
+| Argument preparation, export envelope, provider-entry bridge, settlement observation and execution supervision | `RepoPromptMCPServer/Execution` |
+| Physical resource acquisition selection | server adapter over unchanged DomainRuntime host gates |
+| Provider-return, format, completion observer and handler-result sequence | `MCPToolCompletionPublisher`; app supplies formatting and live observer routing |
+| Publication revalidation and post-applied-mutation suppression | `MCPToolPublicationGate`; actual wire delivery remains the transport gate |
+| Catalog, lane capacities, host invocation/registration generations, cancellation and settlement | unchanged DomainRuntime owners |
+| Live window/run/policy capture, connection lifecycle, consent, tool-card ownership and notice effects | app manager and existing app adapters |
+| Bundle identity and health-monitor settings | injected app `MCPServerConnectionConfiguration` |
+
+The manager no longer owns the watchdog algorithm, export bridge/observations,
+execution failure switch, or repeated completion sequences. The captured
+resolution reaches the existing host without fallback/re-resolution. Its host
+accessor executes at the original provider-entry point (including the DEBUG
+runtime override), not during capture. Dispatch fences and the non-short-circuit
+final publication checks preserve their await order. Cleanup-unresponsive retains
+the physical lease through the existing abort path. Window/global observer
+asymmetries remain explicit; global success does not gain a window-only throwing
+publication check or invocation-context wrapper.
+
+The app-free suite exercises socket cancellation, captured context, real-host
+six-admission-class execution, stale successor-registration rejection, and
+publication suppression. Its completion test calls the production sequence,
+not a reimplementation of format/observe/release ordering. Existing app export
+watchdog tests remain the owner of end-to-end export/settlement/physical-delivery
+coverage. These are not packaged/live-app or machine-wide shared app/headless
+read-budget claims. M8 is independent; #1039 is not claimed fixed.
+
+### Move and review evidence
+
+Local audit: `build/m7-receipts/final-audit/whole-file-move-audit.json` records
+HEAD/prepared/final SHA-256 values for the eleven whole-file moves. The accompanying
+`preparation-at-original-paths.patch` and `relocation-only.patch` partition access,
+import and adapter changes from byte-identical relocation. This is a **derived
+local patch partition**, not two committed revisions and not a claim that the
+whole working diff is a pure move. Split carriers, diagnostic values and handler
+components are logic preparation, reviewed separately. The commit-based
+`modularization_move_audit.py` gate remains for an authorized publication lane.
+
+One current-session Oracle implementation review found no regression in the
+reviewed moved dispatch/lease/envelope/delivery logic, and identified remaining
+completion-sequencing ownership plus test/access cleanup. Applied: server-owned
+completion and preparation, moved publication/phase helpers, original-point DEBUG
+hook lookup, stale-successor test, explicit Sendable carriers, and injected bundle/
+settings configuration. This does not substitute for the roadmap's separately
+authorized exact-head Astra/CI publication review. No agents were launched.
+
+### Final local validation
+
+All commands ran in this isolated M7 worktree through Conductor where applicable.
+These are local implementation receipts, not a published milestone acceptance.
+
+| Check | Result | Conductor ticket |
+| --- | --- | --- |
+| Focused app integration: export watchdog, read/mutation path contracts, connection removal/replacement, bootstrap ownership, task-local layout, bind-context authority | **199 passed**, 0 failures | `680edd9e-1841-4320-97fd-7d8efe241980` |
+| Full `RepoPromptMCPServerTests` | **13 passed**, 0 failures | `f5f024d1-4fcd-4db7-b3f2-466a6538cda0` |
+| Full `RepoPromptDomainRuntimeTests` | **557 passed**, 0 failures | `9997f33c-59df-40e4-a986-678f83d057bf` |
+| Full `RepoPromptMCPCoreTests` | **187 passed**, 0 failures | `00a70a99-1b47-4ef4-abc7-3a8263e51bc4` |
+| Final Debug `RepoPrompt` and `repoprompt-mcp` product builds | **PASS**, 2m35s execution | `0a32a129-ec3f-4f81-b8ff-797d49f56d46` |
+| Full formatter check + strict SwiftLint | **PASS**, 0/1,976 files require formatting | `4985c628-f14c-408c-ac2e-5ad51eb40973` |
+| Full repository guardrails | **PASS**, 35.2s execution | `68d9b742-8ddc-426a-8382-6948b8e05a1b` |
+
+The four test runs total **956 tests**, not nested-suite or repeated-run totals.
+The only source change after those runs was sorting the new server-module import
+in `AgentModeViewModel.swift`; the final source matched SwiftFormat's output
+byte-for-byte, with no prompt-body changes. Both products were rebuilt afterward.
+Source hashes and terminal test counts are recorded in the local
+`build/m7-receipts/final-source-manifest.json` and `final-test-counts.json`.
+
+The fresh post-build compiler-index check passed with unchanged baselines:
+**1,296/1,360 wrong-way file edges**, **54/66 largest cycle components**.
+Receipt: `build/m7-receipts/index-check-m7-complete.txt`.
+`git diff --check` passed. No ratchet baseline was raised.
+
+Earlier formatter attempts timed out or reported the unsorted import; the full
+final lint above supersedes them. One guardrail attempt timed out behind SwiftPM,
+and a later overlapping attempt was canceled before the final serialized pass;
+neither is counted as green. Compiler warnings about two unhandled DomainRuntime
+JSON fixtures and existing SDK deprecations remain warnings, not test failures.
+
+**NOT_RUN:** the full app test suite, Release packaging/performance, packaged-process
+and live CE MCP smoke, hosted CI, exact-head Astra publication review, and the
+commit-based move audit. No build-time speedup, production E2E equivalence, or
+external milestone acceptance is claimed. At this validation checkpoint changes
+were uncommitted; no agents, push, PR, issue mutation, merge, or visible app
+launch/stop/relaunch had occurred.
+
+### Publication preparation (2026-11-07)
+
+The user subsequently authorized committing, pushing and opening the M7 PR.
+The implementation source manifest was rechecked without drift. Current remote
+main was re-attested as `f713d289c80335af6246f10c3931838182501215`; the tested
+branch remains based on `21a31933e80fd3b0e347e1517187f6c621654c47`, without
+rebasing or claiming validation against newer main. `make xcode-validate` passed
+for the added package target, including `xcodebuild -list`; generated workspace
+files remain ignored. No visible app lifecycle or sub-agent action was authorized
+or performed. Full app/Release/live validation and the milestone publication
+review remain outstanding as described above.
+
 ## M8 integration after M6 landed (2026-11-07)
 
 M6 / #1415 landed first at main `21a31933e80fd3b0e347e1517187f6c621654c47`.
@@ -2841,3 +3155,47 @@ historical receipts are in [PR #1642](https://github.com/repoprompt/repoprompt-c
   The last-started test does not establish causation.
 
 No deadline or assertion is relaxed to dispose of these observations. M6 landing does not retroactively explain those failures.
+
+## M7 / #1651 integration after M8 landed (2026-11-07)
+
+Merged main `7ede2d055469ec487e30f0bdb3508255ec11e05e` (M8 / #1642) into
+M7 head `b711ea3fa46883b23e7dc712bb08b731b252eaa2`, without rewriting the
+published branch. Ten conflicted files were resolved: package app/test dependency
+lists retain both milestones, five app-test headers retain both import sets,
+three relocated provider controllers retain M8's exact bytes, and both historical
+ledger entries are retained. Provider targets do not gain a server dependency.
+M7 server sources, server tests and canonical connection admission are unchanged.
+
+A full app/test compile exposed one clean-merge integration gap: M8's new
+`ClaudeNativeSessionAppHost` and its test still referenced the app's former
+`ReadSourceFDPreflight`. Both now explicitly import its M7 server owner; the
+provider remains independent. The existing invalid-descriptor host test is
+included in the passing app run. No runtime algorithm or timeout was changed.
+One focused Oracle conflict-resolution review found no actionable issue in the
+package/catalog/import resolution; its stated full-build coverage limit was
+addressed by the compile and regression run below.
+
+| Check | Result | Ticket |
+| --- | --- | --- |
+| Focused app integration, routing authority, connection lifetime, export watchdog, Auto-wake/prompt pipeline, Context Builder selection, Claude host | **414 passed**, 0 failures | `8108eb5f-0e0b-4993-b087-7dbc4920636c` |
+| Full server suite | **13 passed**, 0 failures | `5ed90a51-de41-40ad-9150-f302927d02b7` |
+| Full ACP provider suite | **101 passed**, 0 failures | `77b99d20-264f-4e74-9b7a-416f4427900f` |
+| Full Claude provider suite | **38 passed**, 0 failures | `ba1ec975-7eba-450f-b28a-283fc6f828dc` |
+| Full Codex provider suite | **19 passed**, 0 failures | `c7ebdc67-aa38-49db-90a4-bcb9d8b58797` |
+| Both Debug products | **PASS** | `1806e433-b003-4f0b-ac35-f0d18904d67d` |
+| Full SwiftFormat + strict SwiftLint | **PASS**, 0/2,083 files require formatting | `43fdd96c-db33-4155-abd2-4adcabe3fcc5` |
+| Initial combined-tree guardrails | **PASS** | `1d095f29-3b5a-445e-bae0-062b55a98007` |
+
+Total: **585 tests**. The app waiter initially expired while the same job was
+still running; the job subsequently completed with exit 0 after build-cache
+publication. The first app compile failed on the missing import above, and the
+first lint attempt hit formatter rule timeouts. Those failed attempts are not
+counted as passes; the final runs supersede them without deadline changes.
+
+`make xcode-validate` passed. The fresh post-build compiler-index check passed at
+**1,206/1,360 wrong-way file edges** and **53/66 largest cycle components**.
+Ratchet configuration matches incoming main exactly. Local receipts are under
+`build/m7-receipts/m8-merge-*`; no generated workspace, logs or local audit files
+are committed. Full app-suite, Release/performance, live-app smoke and the
+milestone's exact-head publication review remain outside these local receipts.
+No sub-agent, visible app lifecycle, force-push or primary-checkout edit occurred.

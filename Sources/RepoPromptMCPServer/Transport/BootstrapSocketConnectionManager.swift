@@ -12,18 +12,6 @@ import MCP
 import RepoPromptDomainRuntime
 import RepoPromptShared
 
-// MARK: - Bundle helpers
-
-private extension Bundle {
-    var appName: String {
-        object(forInfoDictionaryKey: "CFBundleName") as? String ?? "Unknown"
-    }
-
-    var appVersion: String {
-        object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0"
-    }
-}
-
 // MARK: - Logger
 
 private let bootstrapLog: Logger = {
@@ -40,7 +28,7 @@ private let bootstrapLog: Logger = {
 
 /// Connection manager for bootstrap socket connections.
 /// Unlike FileSystemMCPConnectionManager, this doesn't use filesystem folders or meta.json.
-actor BootstrapSocketConnectionManager: MCPServerConnection {
+package actor BootstrapSocketConnectionManager: MCPServerConnection {
     private let connectionID: UUID
     private let sessionToken: String
     private let claimedClientPID: Int
@@ -49,30 +37,30 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
     private let purpose: MCPRunPurpose
     private let server: MCP.Server
     private let transport: UnixSocketMCPTransport
-    private let parentManager: ServerNetworkManager
+    private let parentManager: any MCPServerConnectionHost
 
     /// Not a filesystem-backed connection
-    nonisolated var isFilesystemBacked: Bool {
+    package nonisolated var isFilesystemBacked: Bool {
         false
     }
 
     /// No connection folder
-    nonisolated var connectionFolderURL: URL? {
+    package nonisolated var connectionFolderURL: URL? {
         nil
     }
 
     /// Capability token is the session token
-    nonisolated var capabilityToken: String? {
+    package nonisolated var capabilityToken: String? {
         sessionToken
     }
 
     /// Kernel-observed peer PID for this connection. A client-declared PID is never returned here.
-    func peerPID() -> Int? {
+    package func peerPID() -> Int? {
         observedKernelPeerPID
     }
 
     /// Client-declared handshake PID retained only for compatibility diagnostics and admission heuristics.
-    func claimedPID() -> Int {
+    package func claimedPID() -> Int {
         claimedClientPID
     }
 
@@ -84,7 +72,7 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
     private var clientCapabilities: MCP.Client.Capabilities?
     private var startupFailureTransportSnapshot: MCPTransportCloseSnapshot?
 
-    init(
+    package init(
         connectionID: UUID,
         sessionToken: String,
         clientPid: Int,
@@ -93,7 +81,7 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         purpose: MCPRunPurpose,
         codeMapsDisabled: Bool,
         connectedFD: Int32,
-        parentManager: ServerNetworkManager,
+        parentManager: any MCPServerConnectionHost,
         receiveBufferCapacity: Int = 1024
     ) throws {
         self.connectionID = connectionID
@@ -113,9 +101,10 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
             receiveBufferCapacity: receiveBufferCapacity
         )
 
+        let configuration = parentManager.connectionConfiguration
         server = MCP.Server(
-            name: Bundle.main.appName,
-            version: Bundle.main.appVersion,
+            name: configuration.name,
+            version: configuration.version,
             instructions: RepoPromptMCPInstructions.text(for: purpose, codeMapsDisabled: codeMapsDisabled),
             capabilities: MCP.Server.Capabilities(
                 prompts: .init(listChanged: false),
@@ -128,7 +117,7 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         )
     }
 
-    func start(approvalHandler: @escaping (MCP.Client.Info) async -> Bool) async throws {
+    package func start(approvalHandler: @escaping (MCP.Client.Info) async -> Bool) async throws {
         startupFailureTransportSnapshot = nil
 
         // Start close-watch task to clean up when socket closes
@@ -187,15 +176,15 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         }
     }
 
-    func startupFailureTransportCloseSnapshot() -> MCPTransportCloseSnapshot? {
+    package func startupFailureTransportCloseSnapshot() -> MCPTransportCloseSnapshot? {
         startupFailureTransportSnapshot
     }
 
-    func supportsFormElicitation() -> Bool {
+    package func supportsFormElicitation() -> Bool {
         clientCapabilities?.elicitation?.form != nil
     }
 
-    func requestFormElicitation(
+    package func requestFormElicitation(
         message: String,
         requestedSchema: Elicitation.RequestSchema
     ) async throws -> CreateElicitation.Result {
@@ -209,7 +198,7 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         )
     }
 
-    func cancelFormElicitation() async {
+    package func cancelFormElicitation() async {
         guard !isClosing else { return }
         await parentManager.terminateConnection(
             connectionID,
@@ -223,7 +212,7 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
     }
 
     #if DEBUG
-        func debugFailNextExistingFDConnectBeforeReaderStart() async {
+        package func debugFailNextExistingFDConnectBeforeReaderStart() async {
             await transport.debugFailNextExistingFDConnectBeforeReaderStart()
         }
     #endif
@@ -235,8 +224,9 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
     private func startHealthMonitoring() async {
         healthMonitoringTask?.cancel()
         healthMonitoringTask = Task { [self] in
-            let hardIdleSec = UserDefaults.standard.integer(forKey: "mcp.idleConnectionSeconds")
-            let keepaliveSec = UserDefaults.standard.integer(forKey: "mcp.keepaliveSeconds")
+            let policy = parentManager.connectionConfiguration.healthPolicy()
+            let hardIdleSec = policy.idleSeconds
+            let keepaliveSec = policy.keepaliveSeconds
             var lastKeepaliveAt: Date? = nil
             while !Task.isCancelled {
                 guard await parentManager.isRunning() else { break }
@@ -272,7 +262,7 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         }
     }
 
-    func notifyToolListChanged() async {
+    package func notifyToolListChanged() async {
         if !handshakeComplete {
             mcpConnectionLog("Skipping tool list notification - handshake not complete")
             return
@@ -297,7 +287,7 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         handshakeComplete = true
     }
 
-    func stop() async {
+    package func stop() async {
         guard !isClosing else { return }
         isClosing = true
         healthMonitoringTask?.cancel()
@@ -309,7 +299,7 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         updateState(.cancelled)
     }
 
-    func terminate(reason: TerminationReason, message: String?) async {
+    package func terminate(reason: TerminationReason, message: String?) async {
         guard !isClosing else { return }
         mcpConnectionLog("Terminating bootstrap connection \(connectionID) with reason: \(reason.rawValue)")
         await sendTerminateNotification(reason: reason, message: message)
@@ -323,7 +313,7 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         updateState(.cancelled)
     }
 
-    func abortForExecutionWatchdog(context: MCPExecutionWatchdogTerminalContext) async {
+    package func abortForExecutionWatchdog(context: MCPExecutionWatchdogTerminalContext) async {
         if !isClosing {
             mcpConnectionLog("Force-disconnecting bootstrap connection \(connectionID) after unresponsive tool cancellation")
             // Establish terminal ownership before the first await so ordinary
@@ -359,27 +349,27 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         Task { await server.stop() }
     }
 
-    func connectionState() -> ConnectionStateSnapshot {
+    package func connectionState() -> ConnectionStateSnapshot {
         state
     }
 
-    func isViableForRetention() -> Bool {
+    package func isViableForRetention() -> Bool {
         !isClosing && (state == .ready || state == .connecting)
     }
 
-    func secondsSinceLastActivity() async -> TimeInterval {
+    package func secondsSinceLastActivity() async -> TimeInterval {
         await transport.secondsSinceLastActivity() ?? 0
     }
 
-    func transportIngressSnapshot() async -> MCPTransportIngressSnapshot? {
+    package func transportIngressSnapshot() async -> MCPTransportIngressSnapshot? {
         await transport.ingressSnapshot()
     }
 
-    func responseDeliverySnapshot() async -> MCPResponseDeliverySnapshot? {
+    package func responseDeliverySnapshot() async -> MCPResponseDeliverySnapshot? {
         await transport.responseDeliverySnapshot()
     }
 
-    func waitUntilResponseDeliveryDrained() async -> Bool {
+    package func waitUntilResponseDeliveryDrained() async -> Bool {
         await transport.waitUntilResponseDeliveryDrained()
     }
 
@@ -412,7 +402,7 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
 
     /// Sends a progress notification to the CLI.
     /// Used during long-running operations to prevent agent timeouts.
-    func sendProgress(tool: String, kind: RepoPromptProgressKind, stage: String, message: String) async {
+    package func sendProgress(tool: String, kind: RepoPromptProgressKind, stage: String, message: String) async {
         guard !isClosing, handshakeComplete else { return }
 
         let notification: RepoPromptControlNotification<RepoPromptProgressParams> = switch kind {
@@ -437,7 +427,7 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
 
     /// Sends standards-compliant request progress when the MCP caller supplied
     /// `_meta.progressToken` on the original `tools/call` request.
-    func sendMCPProgress(
+    package func sendMCPProgress(
         token: ProgressToken,
         progress: Double,
         message: String?
@@ -447,7 +437,7 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         _ = await deliverMCPProgress(token: token, progress: progress, message: message)
     }
 
-    func deliverMCPProgress(
+    package func deliverMCPProgress(
         token: ProgressToken,
         progress: Double,
         message: String?

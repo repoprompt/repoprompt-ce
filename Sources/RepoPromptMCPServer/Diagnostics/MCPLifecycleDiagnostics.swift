@@ -3,8 +3,8 @@ import Foundation
 /// Synchronous observations only: never owns cancellation, routing, or settlement.
 /// The sink runs under the lock to preserve ordering and make opt-out a barrier.
 /// Sinks must not call back into this recorder. No task, timer, or disk writer is added.
-enum MCPLifecycleDiagnostics {
-    enum Phase: String {
+package enum MCPLifecycleDiagnostics {
+    package enum Phase: String {
         case requestEntered = "request_entered"
         case handlerReturning = "handler_returning"
         case providerEntered = "provider_entered"
@@ -22,14 +22,14 @@ enum MCPLifecycleDiagnostics {
         case removalFinished = "removal_finished"
     }
 
-    struct Event {
-        let connectionID: UUID
-        let invocationID: UUID?
-        let phase: Phase
-        let sequence: UInt64
+    package struct Event {
+        package let connectionID: UUID
+        package let invocationID: UUID?
+        package let phase: Phase
+        package let sequence: UInt64
 
         /// Deliberately closed schema: no arbitrary attributes or caller strings.
-        var data: [String: String] {
+        package var data: [String: String] {
             var data = [
                 "schema": "mcp_lifecycle_v1",
                 "connection_id": connectionID.uuidString,
@@ -41,9 +41,9 @@ enum MCPLifecycleDiagnostics {
         }
     }
 
-    static let shared = Recorder()
+    package static let shared = Recorder()
 
-    final class Recorder: @unchecked Sendable {
+    package final class Recorder: @unchecked Sendable {
         private let lock = NSLock()
         private var sequence: UInt64 = 0
         private var sink: (@Sendable (Event) -> Void)?
@@ -52,13 +52,13 @@ enum MCPLifecycleDiagnostics {
             private var observers: [UUID: @Sendable (Event) -> Void] = [:]
         #endif
 
-        func setSink(_ sink: (@Sendable (Event) -> Void)?) {
+        package func setSink(_ sink: (@Sendable (Event) -> Void)?) {
             lock.lock()
             defer { lock.unlock() }
             self.sink = sink
         }
 
-        func record(_ phase: Phase, connectionID: UUID, invocationID: UUID? = nil) {
+        package func record(_ phase: Phase, connectionID: UUID, invocationID: UUID? = nil) {
             lock.lock()
             defer { lock.unlock() }
             #if DEBUG

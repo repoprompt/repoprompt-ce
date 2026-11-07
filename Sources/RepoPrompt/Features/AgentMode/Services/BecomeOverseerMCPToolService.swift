@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptMCPServer
 
 /// Bootstrap only: exact installed model route, memory-only eligibility, and no invented grant.
 @MainActor

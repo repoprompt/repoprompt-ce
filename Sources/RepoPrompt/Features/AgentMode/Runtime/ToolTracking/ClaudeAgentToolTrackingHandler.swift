@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptMCPServer
 
 // SEARCH-HELPER: Claude, ToolTracking, ToolCorrelation, TrackerLifecycle, ProviderToolStream
 /// Dedicated tool-tracking handler for Claude agent sessions.

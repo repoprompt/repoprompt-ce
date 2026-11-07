@@ -1,3 +1,5 @@
+// Exported Swift 5 package values need explicit cross-module Sendable contracts.
+// swiftformat:disable redundantSendable
 //
 //  UnixSocketMCPTransport.swift
 //  RepoPrompt
@@ -24,7 +26,7 @@ import RepoPromptShared
 
 #if DEBUG
     private final class UnixSocketMCPTransportCallbackGate: @unchecked Sendable {
-        enum Kind: Hashable {
+        package enum Kind: Hashable {
             case terminal
             case cancellation
         }
@@ -89,24 +91,24 @@ import RepoPromptShared
         }
     }
 
-    struct UnixSocketMCPTransportCleanupSnapshot {
-        let hasActiveReader: Bool
-        let pendingReaderCancellationCount: Int
-        let earlyReaderCancellationCount: Int
-        let readerIsRetained: Bool
-        let terminalCallbackCount: Int
-        let pendingTerminalCallbackCount: Int
-        let cancellationCallbackCount: Int
-        let finalizationCount: Int
-        let descriptorCloseCount: Int
-        let staleCancellationCount: Int
-        let staleTerminalCount: Int
-        let socketIsOwned: Bool
+    package struct UnixSocketMCPTransportCleanupSnapshot {
+        package let hasActiveReader: Bool
+        package let pendingReaderCancellationCount: Int
+        package let earlyReaderCancellationCount: Int
+        package let readerIsRetained: Bool
+        package let terminalCallbackCount: Int
+        package let pendingTerminalCallbackCount: Int
+        package let cancellationCallbackCount: Int
+        package let finalizationCount: Int
+        package let descriptorCloseCount: Int
+        package let staleCancellationCount: Int
+        package let staleTerminalCount: Int
+        package let socketIsOwned: Bool
     }
 #endif
 
 private final class MCPTransportIngressGate: @unchecked Sendable {
-    enum OfferResult {
+    package enum OfferResult {
         case accepted
         case overflow(MCPReceiveBufferOverflowError)
         case terminal
@@ -184,14 +186,14 @@ private final class MCPTransportIngressGate: @unchecked Sendable {
     }
 }
 
-typealias MCPTransportResponseDeliveryGate = MCPDomainResponseDeliveryTracker
+package typealias MCPTransportResponseDeliveryGate = MCPDomainResponseDeliveryTracker
 
 /// Rejects explicit `null` request IDs before they reach the MCP SDK, which
 /// decodes them as empty strings. A genuine empty-string ID remains valid.
 private enum MCPExplicitNullRequestIDIngressValidation {
-    struct Result {
-        let forwardedFrame: Data?
-        let rejectedRequestCount: Int
+    package struct Result {
+        package let forwardedFrame: Data?
+        package let rejectedRequestCount: Int
     }
 
     static func validate(_ frame: Data) -> Result {
@@ -237,28 +239,28 @@ private enum MCPExplicitNullRequestIDIngressValidation {
     }
 }
 
-final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendable {
-    struct Token: Hashable {
+package final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendable {
+    package struct Token: Hashable {
         fileprivate let connectionID: String
         fileprivate let connectionGeneration: UInt64
         fileprivate let requestID: JSONRPCBridgeID
     }
 
-    struct DispatchIdentity: Equatable {
-        let connectionID: String
-        let connectionGeneration: UInt64
-        let requestID: JSONRPCBridgeID
+    package struct DispatchIdentity: Equatable {
+        package let connectionID: String
+        package let connectionGeneration: UInt64
+        package let requestID: JSONRPCBridgeID
     }
 
-    struct Deadline: @unchecked Sendable {
-        let instant: Duration
-        let now: @Sendable () -> Duration
+    package struct Deadline: @unchecked Sendable {
+        package let instant: Duration
+        package let now: @Sendable () -> Duration
 
-        var hasExpired: Bool {
+        package var hasExpired: Bool {
             now() >= instant
         }
 
-        var remainingSeconds: TimeInterval {
+        package var remainingSeconds: TimeInterval {
             let remaining = instant - now()
             guard remaining > .zero else { return 0 }
             let components = remaining.components
@@ -267,9 +269,9 @@ final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendable {
         }
     }
 
-    static let shared = MCPExportResponseDeliveryDeadlineRegistry()
+    package static let shared = MCPExportResponseDeliveryDeadlineRegistry()
 
-    static let requestIdentityArgumentKey = "_repoprompt_transport_request_identity"
+    package static let requestIdentityArgumentKey = "_repoprompt_transport_request_identity"
 
     private let lock = NSLock()
     private var pendingRequests: Set<Token> = []
@@ -280,7 +282,7 @@ final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendable {
     /// Carries the transport-observed JSON-RPC identity through SDK dispatch without
     /// relying on handler admission order, which may differ from socket frame order.
     @discardableResult
-    func recordAcceptedClientFrame(
+    package func recordAcceptedClientFrame(
         _ frame: Data,
         connectionID: String,
         connectionGeneration: UInt64
@@ -297,7 +299,7 @@ final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendable {
                       var params = object["params"] as? [String: Any],
                       let requestedToolName = params["name"] as? String
                 else { return object }
-                let canonicalToolName = ServerNetworkManager.canonicalToolName(for: requestedToolName)
+                let canonicalToolName = MCPToolNameCanonicalizer.canonicalToolName(for: requestedToolName)
                 guard canonicalToolName == "prompt" || canonicalToolName == "workspace_context" else {
                     return object
                 }
@@ -338,7 +340,7 @@ final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendable {
         return encoded
     }
 
-    static func dispatchIdentity(from value: Value?) -> DispatchIdentity? {
+    package static func dispatchIdentity(from value: Value?) -> DispatchIdentity? {
         guard let object = value?.objectValue,
               let connectionID = object["connection_id"]?.stringValue,
               let generationString = object["connection_generation"]?.stringValue,
@@ -354,7 +356,7 @@ final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendable {
         )
     }
 
-    func claimToolRequest(
+    package func claimToolRequest(
         connectionID: String,
         connectionGeneration: UInt64,
         requestID: JSONRPCBridgeID
@@ -386,11 +388,11 @@ final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendable {
         }
     #endif
 
-    func install(_ deadline: Deadline, for token: Token) {
+    package func install(_ deadline: Deadline, for token: Token) {
         lock.withLock { deadlines[token] = deadline }
     }
 
-    func deadline(
+    package func deadline(
         forServerFrame frame: Data,
         connectionID: String,
         connectionGeneration: UInt64
@@ -410,7 +412,7 @@ final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendable {
         }
     }
 
-    func completeServerFrame(
+    package func completeServerFrame(
         _ frame: Data,
         connectionID: String,
         connectionGeneration: UInt64
@@ -430,7 +432,7 @@ final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendable {
         }
     }
 
-    func removeConnection(connectionID: String, connectionGeneration: UInt64) {
+    package func removeConnection(connectionID: String, connectionGeneration: UInt64) {
         lock.withLock {
             pendingRequests = pendingRequests.filter {
                 $0.connectionID != connectionID
@@ -927,7 +929,7 @@ public actor UnixSocketMCPTransport: Transport {
     /// cleanup grace expires and before `disconnect()` closes the socket. It makes
     /// only immediate nonblocking writes: a backpressured or partial stream cannot
     /// receive a further valid JSON-RPC frame and is closed instead.
-    nonisolated func sendExecutionWatchdogTerminalErrors(
+    package nonisolated func sendExecutionWatchdogTerminalErrors(
         context: MCPExecutionWatchdogTerminalContext,
         trailingControlFrame: Data? = nil
     ) async -> Int {
@@ -1104,7 +1106,7 @@ public actor UnixSocketMCPTransport: Transport {
         firstCloseSnapshot
     }
 
-    func ingressSnapshot() -> MCPTransportIngressSnapshot {
+    package func ingressSnapshot() -> MCPTransportIngressSnapshot {
         inboundChannel.gate.snapshot()
     }
 
@@ -1114,11 +1116,11 @@ public actor UnixSocketMCPTransport: Transport {
         return Date().timeIntervalSince(lastActivityTime)
     }
 
-    func responseDeliverySnapshot() async -> MCPResponseDeliverySnapshot {
+    package func responseDeliverySnapshot() async -> MCPResponseDeliverySnapshot {
         responseDeliveryGate.snapshot()
     }
 
-    func waitUntilResponseDeliveryDrained() async -> Bool {
+    package func waitUntilResponseDeliveryDrained() async -> Bool {
         await responseDeliveryGate.waitUntilDrained()
     }
 
@@ -1355,73 +1357,73 @@ public actor UnixSocketMCPTransport: Transport {
     #if DEBUG
         private struct DebugExistingFDConnectFailure: Swift.Error {}
 
-        func debugSocketHasCloseOnExec() -> Bool? {
+        package func debugSocketHasCloseOnExec() -> Bool? {
             guard socketFD >= 0 else { return nil }
             let flags = fcntl(socketFD, F_GETFD)
             guard flags >= 0 else { return nil }
             return flags & FD_CLOEXEC != 0
         }
 
-        func debugFailNextExistingFDConnectBeforeReaderStart() {
+        package func debugFailNextExistingFDConnectBeforeReaderStart() {
             failNextExistingFDConnectBeforeReaderStart = true
         }
 
-        func debugDeferNextReceiveOverflowTeardown() {
+        package func debugDeferNextReceiveOverflowTeardown() {
             deferNextReceiveOverflowTeardown = true
         }
 
-        func debugHoldReaderTerminalCallback() {
+        package func debugHoldReaderTerminalCallback() {
             callbackGate.hold(.terminal)
         }
 
-        func debugReleaseReaderTerminalCallbacks() {
+        package func debugReleaseReaderTerminalCallbacks() {
             callbackGate.release(.terminal)
         }
 
-        func debugHoldReaderCancellationCallback() {
+        package func debugHoldReaderCancellationCallback() {
             callbackGate.hold(.cancellation)
         }
 
-        func debugReleaseReaderCancellationCallbacks() {
+        package func debugReleaseReaderCancellationCallbacks() {
             callbackGate.release(.cancellation)
         }
 
-        func debugSetBeforeInboundFrameOfferForTesting(
+        package func debugSetBeforeInboundFrameOfferForTesting(
             _ handler: (@Sendable () -> Void)?
         ) {
             debugBeforeInboundFrameOfferForTesting = handler
         }
 
-        func debugSetBeforeOrdinaryWriteForTesting(
+        package func debugSetBeforeOrdinaryWriteForTesting(
             _ handler: (@Sendable () -> Void)?
         ) {
             debugBeforeOrdinaryWriteForTesting = handler
         }
 
-        func debugSetAfterWriteProgressForTesting(
+        package func debugSetAfterWriteProgressForTesting(
             _ handler: (@Sendable (_ bytesWritten: Int) -> Void)?
         ) {
             debugAfterWriteProgressForTesting = handler
         }
 
-        func debugSetOrdinaryWriteWouldBlockForTesting(
+        package func debugSetOrdinaryWriteWouldBlockForTesting(
             _ handler: (@Sendable () -> Void)?
         ) {
             debugWriteHooks.setOrdinaryWriteWouldBlock(handler)
         }
 
-        func debugSetExecutionWatchdogDidSealForTesting(
+        package func debugSetExecutionWatchdogDidSealForTesting(
             _ handler: (@Sendable () -> Void)?
         ) {
             debugWriteHooks.setExecutionWatchdogDidSeal(handler)
         }
 
-        func debugTriggerReadErrorForCleanupTest(_ code: POSIXErrorCode = .EIO) {
+        package func debugTriggerReadErrorForCleanupTest(_ code: POSIXErrorCode = .EIO) {
             guard let identity = activeReaderOwnership?.identity else { return }
             handleReaderTerminal(.error(POSIXError(code)), from: identity)
         }
 
-        func debugCleanupSnapshot() -> UnixSocketMCPTransportCleanupSnapshot {
+        package func debugCleanupSnapshot() -> UnixSocketMCPTransportCleanupSnapshot {
             UnixSocketMCPTransportCleanupSnapshot(
                 hasActiveReader: activeReaderOwnership != nil,
                 pendingReaderCancellationCount: pendingReaderCancellations.count,
