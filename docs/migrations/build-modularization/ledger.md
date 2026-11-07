@@ -3373,6 +3373,10 @@ without rewriting the original branch or duplicating #1652's commits.
    immutable ACP request input, together with provider-configuration regression tests.
 2. **Saved-carrier lookup:** a window-free exact metadata resolver, its production
    window adapter and disk/identity/revalidation regressions.
+3. **Live session storage:** move the existing live-object map and reverse binding
+   index into `AgentSessionRuntimeStore`, with identity, duplicate-claim, rebinding,
+   retention and VM publication-order regressions. This replaces storage rather
+   than adding a second registry; it does not yet transfer mutation admission.
 
 These are prerequisite chunks, **not the independent session writer**. Source
 inspection confirms that `CodexAgentModeCoordinator` still retains a concrete VM
@@ -3386,6 +3390,7 @@ beside the window census would only add a parallel authority and is not introduc
 | Provider/routing factory signatures | `AgentRunExecutionContracts`, using M8 provider/model contracts | VM-owned definitions and runtime references to those five VM aliases; presentation compatibility aliases remain |
 | ACP model/resume/role/pin request assembly | Immutable `AgentACPRunInput`, captured by the existing session host at each dispatch | `AgentModeRunService.makeACPRunRequest(session:)` and its mutable-session input |
 | Exact saved metadata lookup and carrier cardinality | `AgentSavedSessionTargetLoader` | Window-manager implementation of the lookup loop; composition still supplies the catalog and live fences |
+| Live session objects and synchronous reverse binding index | `AgentSessionRuntimeStore`, owned by existing composition | VM's stored `sessions`, claim maps and binding-index maintenance; computed compatibility access and UI notifications remain |
 | Durable registration/epochs, attempts and terminal settlement | Existing domain store, run-attempt lifecycle and terminal barrier | None; no replacement authority or schema change |
 | Execution hosting, writer election, payload hydration and handoff/drain | Existing VM, carrier census and prepared-window composition | None; these M9 acceptance gates remain open |
 
@@ -3402,6 +3407,17 @@ and the new input/lookup values are not encoded. Existing provider factories and
 VM-backed callbacks are still injected implementations, not eliminated dependencies.
 No target move is included; M10 remains unchanged.
 
+The live-object store retains exact `AgentTabSession` instances and preserves all
+reverse claims, including duplicates, so existing census/admission code can still
+reject conflicts. Binding callbacks update the index synchronously; replacement and
+removal detach retired callbacks. The VM retains a computed compatibility property,
+publishes `objectWillChange` before replacement, then runs census/sidebar/revocation/
+attention notifications in their original order. No `$sessions` consumers or direct
+initializer assignments were found. The store has no persistence, provider-start,
+cancellation or presentation callback and is not a competing writer-election authority.
+A scoped Oracle review found no production regression; its test-name finding was
+applied without weakening the exact-object callback guard.
+
 ### Validation receipts
 
 | Check | Result | Conductor ticket |
@@ -3412,6 +3428,19 @@ No target move is included; M10 remains unchanged.
 | ACP integration plus historical/stashed lookup | **29 passed, 1 failed**; provenance-inconsistent fixture diagnosed below | `511aad6b-7140-4579-92b2-2c16330011cc` |
 | App product build | **PASS** | `2d0e10ad-7677-48e3-90c8-45660e80fb21` |
 | Loader plus corrected historical/stashed integration | **8 passed**, zero failures; includes conflicting-provenance rejection | `da236742-700f-424a-ab06-2163e6ae1885` |
+| Runtime store, identity snapshots, cancellation, lifecycle and lane-first-save suites | **63 passed**, zero failures | `eb9a00c0-ce01-4a5f-9f09-327d92a31bcd` |
+| Final combined input, loader, store, ACP integration and saved-target boundaries | **77 passed**, zero failures | `7bc8169d-4ad8-431d-8704-fc894886aa81` |
+| Final full SwiftFormat check + strict SwiftLint | **PASS** | `7c041bdb-e0d7-4026-b53d-8eb29d7a79e3` |
+| Final app product build | **PASS** | `6621a585-dcdb-44f1-a6de-984a96b04921` |
+| Fresh compiler-index ratchets after final product build | **PASS**: wrong-way file edges 1,205/1,360; largest cycle components 53/66 | `.build/modularization/m9-final-index.json` (1,091 files, 153,464 symbols; local artifact, not committed) |
+
+The 63-test store run comprised `AgentSessionRuntimeStoreTests` (4),
+`AgentContextExportRenderSnapshotTests` (2), `AgentRunCancellationOutcomeTests` (6),
+`AgentRunLifecycleContractsTests` (4) and `AgentSessionLaneFirstSaveTests` (47).
+Ticket `1690c12f-b1c0-4fbe-9425-8c19e3808653` was canceled after 9.9 seconds because
+scoped formatting had not yet completed; it is not a receipt. Formatting completed
+before the passing replacement run. The retired-callback test was subsequently
+renamed to describe the observable guarantee rather than claim guard mutation coverage.
 
 The historical/stashed integration fixture saved a stashed payload with nil parent
 and organization while its index claimed non-nil provenance. Diagnostic tickets
@@ -3422,9 +3451,11 @@ a conflicting parent is rejected; no production guard was weakened. Temporary
 prints were removed. The 29 successful integration tests cover ACP advertised
 commands, compact runner/transactions and background compaction settlement.
 
-A compiler-index check after the base-branch switch reported freshness unproven
-(0 stale, 0 unindexed files), so it is **not a passing receipt**. A final product
-build/index check is still required for the eventual final source state.
+An earlier compiler-index check reported freshness unproven (0 stale, 0 unindexed
+files), so it is **not a passing receipt**. The final product build and subsequent
+fresh-index check above supersede that incomplete attempt; no ratchet baseline was
+increased. Final tests and lint cover the renamed test and current production source.
+Only ledger receipts changed afterward.
 
 The 47 tests are `AgentSavedSessionTargetLoaderTests` (7),
 `OpenCodeRunRequestPinPropagationTests` (3), `DevinPermissionLevelTests` (33),

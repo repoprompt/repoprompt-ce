@@ -1574,7 +1574,7 @@ final class AgentTabSession: ObservableObject {
     }
 
     // Persistence
-    /// Synchronous derived-index maintenance for the window owning this live object.
+    /// Synchronous derived-index maintenance for the runtime store owning this live object.
     var persistentSessionBindingDidChange: (() -> Void)?
     private(set) var persistentSessionBindingIdentity: AgentPersistentSessionBindingIdentity?
     var activeAgentSessionID: UUID? {

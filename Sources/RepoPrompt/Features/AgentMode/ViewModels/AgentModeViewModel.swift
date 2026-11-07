@@ -512,14 +512,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         Int
     ) async -> AsyncThrowingStream<AgentSessionSidebarBuildBatch, Error>
 
-    @Published private(set) var sessions: [UUID: TabSession] = [:] {
-        didSet {
-            refreshLiveSessionBindingIndex(previous: oldValue)
+    private let runtimeSessionStore = AgentSessionRuntimeStore()
+    private(set) var sessions: [UUID: TabSession] {
+        get { runtimeSessionStore.sessions }
+        set {
+            let previous = runtimeSessionStore.sessions
+            // Preserve @Published's will-change ordering without a second stored dictionary.
+            objectWillChange.send()
+            runtimeSessionStore.replaceSessions(newValue)
             rebuildAgentSessionLinkSubagentCensus(reconcileLiveObservers: true)
             syncSidebarUIState(refresh: true, reason: .sessionList)
             // One eager revocation hook covering every live-session removal path (tab close, stash,
             // delete, MCP control teardown) instead of five separate call sites that could drift.
-            notifyAgentSessionLinkBindingsChanged(previous: oldValue)
+            notifyAgentSessionLinkBindingsChanged(previous: previous)
             syncAttentionNotificationObservers()
         }
     }
@@ -6277,38 +6282,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return binding?.sessionID
     }
 
-    private var liveClaimByTabID: [UUID: UUID] = [:]
-    private var liveTabIDsBySessionID: [UUID: Set<UUID>] = [:]
-
-    private func refreshLiveSessionBindingIndex(previous: [UUID: TabSession]) {
-        for (tabID, session) in previous where sessions[tabID] !== session {
-            session.persistentSessionBindingDidChange = nil
-            updateLiveSessionBindingIndex(tabID: tabID)
-        }
-        for (tabID, session) in sessions where previous[tabID] !== session {
-            session.persistentSessionBindingDidChange = { [weak self, weak session] in
-                guard let self, let session, self.sessions[tabID] === session else { return }
-                self.updateLiveSessionBindingIndex(tabID: tabID)
-            }
-            updateLiveSessionBindingIndex(tabID: tabID)
-        }
-    }
-
-    private func updateLiveSessionBindingIndex(tabID: UUID) {
-        if let previous = liveClaimByTabID.removeValue(forKey: tabID) {
-            liveTabIDsBySessionID[previous]?.remove(tabID)
-            if liveTabIDsBySessionID[previous]?.isEmpty == true {
-                liveTabIDsBySessionID.removeValue(forKey: previous)
-            }
-        }
-        if let current = sessions[tabID]?.activeAgentSessionID {
-            liveClaimByTabID[tabID] = current
-            liveTabIDsBySessionID[current, default: []].insert(tabID)
-        }
-    }
-
     func liveSessionTabIDs(for sessionID: UUID) -> Set<UUID> {
-        liveTabIDsBySessionID[sessionID] ?? []
+        runtimeSessionStore.liveSessionTabIDs(for: sessionID)
     }
 
     /// A point snapshot closes over the target's real tab claims, including claims by another
@@ -6326,7 +6301,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 indexed[id] = tabID
                 tabIDs.insert(tabID)
             }
-            tabIDs.formUnion(liveTabIDsBySessionID[id] ?? [])
+            tabIDs.formUnion(runtimeSessionStore.liveSessionTabIDs(for: id))
         }
         let persisted = workspaceManager.sessionBindingCarrierSnapshot(sessionIDs: sessionIDs, additionalTabIDs: tabIDs)
         tabIDs.formUnion(persisted.claims.keys)
