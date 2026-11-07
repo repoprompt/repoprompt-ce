@@ -285,7 +285,15 @@ package actor DomainAgentRunSessionStore {
         )
     }
 
-    package func claimResumableSession(sessionID: UUID) async -> DomainAgentSessionResumeClaimResult {
+    /// Installs cancellation in the same actor turn as the registration, including before a
+    /// resumable claim suspends for its durable write. The generated registration qualifies
+    /// the command so a later replacement cannot be cancelled through an older capability.
+    package typealias RegistrationCancellationHandler = @Sendable (Registration) async -> Void
+
+    package func claimResumableSession(
+        sessionID: UUID,
+        cancellationHandler: RegistrationCancellationHandler? = nil
+    ) async -> DomainAgentSessionResumeClaimResult {
         guard !isShuttingDown else { return .shuttingDown }
         guard records[sessionID] == nil else { return .alreadyActive }
         guard persistenceHealth == .ready,
@@ -301,9 +309,14 @@ package actor DomainAgentRunSessionStore {
         record.nextEpochOrdinal = max(1, metadata.lastEpochOrdinal &+ 1)
         record.continuityGeneration = metadata.continuityGeneration
         records[sessionID] = record
+        bindCancellationHandler(cancellationHandler, to: registration)
         updateMetadata(for: record, state: .active, resumable: true)
-        guard await persistMetadataImmediately() else {
+        let persistedClaim = await persistMetadataImmediately()
+        guard !isShuttingDown else { return .shuttingDown }
+        guard records[sessionID]?.registration == registration else { return .alreadyActive }
+        guard persistedClaim else {
             records.removeValue(forKey: sessionID)
+            cancellationHandlers.removeValue(forKey: sessionID)
             durableMetadata[sessionID] = metadata
             dirtyMetadataSessionIDs.remove(sessionID)
             return .unavailable
@@ -311,7 +324,10 @@ package actor DomainAgentRunSessionStore {
         return .accepted(registration)
     }
 
-    package func register(sessionID: UUID) -> Registration {
+    package func register(
+        sessionID: UUID,
+        cancellationHandler: RegistrationCancellationHandler? = nil
+    ) -> Registration {
         guard !isShuttingDown else {
             return Registration(
                 runtimeID: identity.runtimeID,
@@ -333,18 +349,29 @@ package actor DomainAgentRunSessionStore {
         }
         let registration = makeRegistration(sessionID: sessionID)
         records[sessionID] = Record(registration: registration)
+        bindCancellationHandler(cancellationHandler, to: registration)
         updateMetadata(for: records[sessionID], state: .active, resumable: true)
         scheduleMetadataPersistence()
         return registration
     }
 
-    package func registerIfMissing(sessionID: UUID) -> Registration? {
+    package func registerIfMissing(
+        sessionID: UUID,
+        cancellationHandler: RegistrationCancellationHandler? = nil
+    ) -> Registration? {
         guard !isShuttingDown, records[sessionID] == nil else { return nil }
         let registration = makeRegistration(sessionID: sessionID)
         records[sessionID] = Record(registration: registration)
+        bindCancellationHandler(cancellationHandler, to: registration)
         updateMetadata(for: records[sessionID], state: .active, resumable: true)
         scheduleMetadataPersistence()
         return registration
+    }
+
+    private func bindCancellationHandler(_ handler: RegistrationCancellationHandler?, to registration: Registration) {
+        cancellationHandlers[registration.sessionID] = handler.map { handler in
+            { @Sendable in await handler(registration) }
+        }
     }
 
     package func beginEpoch(
@@ -1331,6 +1358,16 @@ package actor DomainAgentRunSessionStore {
 
         package func test_cancelWaiter(sessionID: UUID, waiterID: UUID) {
             cancelWaiter(sessionID: sessionID, waiterID: waiterID)
+        }
+
+        /// Exercises the same exact-registration capability shutdown consumes, without shutting
+        /// down the shared process runtime used by app integration tests.
+        package func test_invokeCancellationHandler(registration: Registration) async -> Bool {
+            guard records[registration.sessionID]?.registration == registration,
+                  let handler = cancellationHandlers[registration.sessionID]
+            else { return false }
+            await handler()
+            return true
         }
 
         package func test_shutdownOwnedState() -> (recordCount: Int, cancellationHandlerCount: Int) {

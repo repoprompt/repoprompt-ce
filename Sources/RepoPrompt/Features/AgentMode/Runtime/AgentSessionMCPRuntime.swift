@@ -7,6 +7,65 @@ import RepoPromptDomainRuntime
 /// attachment is not required to build snapshots, wake waiters or publish a committed turn.
 @MainActor
 final class AgentSessionMCPRuntime {
+    /// The domain registration owns this capability before control is published. It retains
+    /// the exact runtime scope, not its optional presenter, until domain cleanup/drain releases it.
+    /// A cancellation delivered during setup prevents publication; one delivered afterwards
+    /// joins the existing run service's teardown, never a replacement session's run.
+    @MainActor
+    final class ControlActivationCancellation {
+        private let scope: AgentSessionRuntimeStore.Scope
+        private let session: AgentTabSession
+        private let binding: AgentSessionRestorationBindingToken?
+        private let activationID: UUID
+        private let activationGeneration: UInt64
+        private let cancelInstalledRun: (AgentTabSession) async -> Void
+        private(set) var cancellationRequested = false
+
+        init(
+            scope: AgentSessionRuntimeStore.Scope, session: AgentTabSession,
+            activationID: UUID, cancelInstalledRun: @escaping (AgentTabSession) async -> Void
+        ) {
+            self.scope = scope
+            self.session = session
+            binding = session.currentRestorationBindingToken
+            self.activationID = activationID
+            activationGeneration = session.mcpControlActivationGeneration
+            self.cancelInstalledRun = cancelInstalledRun
+        }
+
+        var permitsPublication: Bool {
+            !cancellationRequested && !scope.isRetiring && isCurrent
+        }
+
+        private var isCurrent: Bool {
+            ownsPersistentIncarnation
+                && session.currentRestorationBindingToken == binding
+                && !session.bindingTransitionInProgress
+                && session.mcpControlActivationGeneration == activationGeneration
+        }
+
+        private var ownsPersistentIncarnation: Bool {
+            !scope.hasReleasedWriterClaims
+                && scope.sessions[session.tabID] === session
+                && binding != nil && session.persistentSessionBindingIdentity == binding?.bindingIdentity
+        }
+
+        func cancel(registration: AgentRunSessionStore.Registration) async {
+            cancellationRequested = true
+            // An installed run still needs its drain while deactivation/binding preparation is
+            // in progress. Do not require setup's transition generation, but never cross into a
+            // replacement persistent binding, even when its UUIDs or context were copied.
+            guard ownsPersistentIncarnation,
+                  session.activeAgentSessionID == registration.sessionID,
+                  let context = session.mcpControlContext,
+                  context.activationID == activationID,
+                  context.registration == registration
+            else { return }
+            AgentSessionInteractionRuntime.cancelPendingInstruction(for: session)
+            await cancelInstalledRun(session)
+        }
+    }
+
     struct Metadata {
         let sessionName: (AgentTabSession, UUID) -> String?
         let parentIsWorktreeBound: (UUID) -> Bool?

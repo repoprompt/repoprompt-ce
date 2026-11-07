@@ -4359,3 +4359,48 @@ gates. Hosted CI must confirm the new published head.
 M9 is still partial: independent writer admission and window-free execution/
 handoff remain open, along with complete-suite and live-smoke qualification.
 This repair does not claim M9 completion. No visible app lifecycle action occurred.
+
+### M9 continuation — cancellation before control visibility (2026-11-08)
+
+Retired the app's publish-then-install cancellation sequence and its weak-VM
+shutdown callback. `DomainAgentRunSessionStore` can now atomically bind an exact
+registration-qualified cancellation capability while creating or reclaiming its
+record, including before a resumable claim awaits persistence. A suspended claim
+rechecks ownership before accepting or rolling back; it cannot remove a successor
+registration or undo shutdown. Existing registration, durable metadata, execution
+orchestration and terminal-barrier authorities remain unchanged.
+
+`AgentSessionMCPRuntime.ControlActivationCancellation` retains the originating
+runtime scope and concrete run-service cancellation command independently of a
+presenter. Cancellation during setup prevents control publication. Publication
+also refuses a retiring scope. Installed control can still drain during binding
+transition/deactivation, but cannot cancel a replacement persistent binding or
+another activation/registration. Domain cleanup releases the retained scope.
+Deactivation already removes its handler even when keeping the registration; the
+legacy install API remains because direct/headless composition still uses it.
+This is not a claim that the direct/headless startup path or full saved host has
+completed the same cutover.
+
+Regression witnesses cover cancellation at the real pre-publication activation
+seam, scope lifetime without a VM/window, installed drain during retirement and
+binding preparation, same-ID rebinding refusal, cancellation of a pending
+activation without touching prior control, and a real persisted resumable claim
+held before CAS while a successor registration replaces it. No sleeps, increased
+timeouts, weakened identity checks or parallel cancellation registry were added.
+Review prompted the split between setup eligibility and installed drain ownership.
+Incidental formatter changes to the domain target's existing Sendable declarations
+were reverted; the target's concurrency contracts are unchanged.
+
+Initial ticket `242e0ad2-584c-4979-973a-f4f57af1678c` passed **81 tests** before
+review refinements. Expanded ticket `7742ea8d-feaa-4103-bfa4-bf925b115d4c` passed
+**182 tests**. Final ticket `c021386e-963a-437f-b304-150618d6d1fd` passed the same
+**182 tests** after the retirement fence: MCP steer/resume 27, start budgets 6,
+first save 47, runtime MCP 8, Codex resume/wedge 74 and workspace-scoped routing 20.
+Lint `647dc8ad-edc6-4d24-817c-16fd4333d0c4` passed the pre-retirement-fence tree;
+final lint `3d241768-2718-4a77-99c3-196ed098a8d7` passed the final Swift tree.
+
+Independent writer admission, canonical catalog-backed saved execution, remaining
+provider/input composition, runtime-addressed MCP/admin/link commands and
+presentation-preserving host handoff/drain remain M9 gates. This checkpoint does
+not qualify the final full suite, products/compiler index, warning ratchet or live
+smoke. M10 is untouched. No push, PR edit or visible app lifecycle action occurred.

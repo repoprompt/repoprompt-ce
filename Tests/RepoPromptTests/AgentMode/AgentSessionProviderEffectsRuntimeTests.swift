@@ -349,6 +349,133 @@ final class AgentSessionStreamRuntimeTests: XCTestCase {
 
 @MainActor
 final class AgentSessionMCPRuntimeTests: XCTestCase {
+    func testRegistrationRetainsExactRuntimeCancellationUntilCleanupWithoutPresentation() async throws {
+        let store = makeCancellationStore()
+        var scope: AgentSessionRuntimeStore.Scope? = AgentSessionRuntimeStore().makeScope()
+        weak let retainedScope = scope
+        let session = AgentTabSession(tabID: UUID())
+        let sessionID = UUID(), activationID = UUID()
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: UUID()))
+        scope?.replaceSessions([session.tabID: session])
+        var cancellations = 0
+        let registration: AgentRunSessionStore.Registration
+        do {
+            let capability = try AgentSessionMCPRuntime.ControlActivationCancellation(
+                scope: XCTUnwrap(scope), session: session, activationID: activationID
+            ) { exact in
+                XCTAssertIdentical(exact, session)
+                cancellations += 1
+            }
+            registration = await store.register(sessionID: sessionID) { await capability.cancel(registration: $0) }
+        }
+        session.mcpControlContext = .init(
+            sessionID: sessionID, activationID: activationID, registration: registration,
+            currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
+            originatingConnectionID: nil, interactionTransport: .mcp(sessionID: sessionID, originatingConnectionID: nil),
+            suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: nil
+        )
+        session.waitingPrompt = "Waiting for exact runtime cancellation"
+        scope = nil
+        XCTAssertNotNil(retainedScope, "Domain cancellation owns the runtime even without a presenter")
+        let invoked = await store.test_invokeCancellationHandler(registration: registration)
+        XCTAssertTrue(invoked)
+        XCTAssertEqual(cancellations, 1)
+        XCTAssertNil(session.waitingPrompt)
+        retainedScope?.beginRetirement()
+        _ = session.beginPersistentBindingTransition()
+        session.mcpControlActivationGeneration &+= 1
+        session.waitingPrompt = "Original run awaiting drain"
+        _ = await store.test_invokeCancellationHandler(registration: registration)
+        XCTAssertEqual(cancellations, 2, "Transition preparation cannot suppress the original run's shutdown drain")
+        XCTAssertNil(session.waitingPrompt)
+        let original = try XCTUnwrap(session.persistentSessionBindingIdentity)
+        session.installPersistentSessionBinding(.init(tabID: original.tabID, sessionID: original.sessionID, workspaceID: original.workspaceID))
+        session.waitingPrompt = "Successor instruction"
+        _ = await store.test_invokeCancellationHandler(registration: registration)
+        XCTAssertEqual(cancellations, 2, "A same-ID rebound incarnation cannot be cancelled")
+        XCTAssertEqual(session.waitingPrompt, "Successor instruction")
+        await store.cleanup(registration: registration)
+        XCTAssertNil(retainedScope, "The domain registration must not permanently retain the scope")
+        _ = await store.shutdown()
+    }
+
+    func testPendingActivationCancellationDoesNotCancelPreviouslyInstalledControl() async throws {
+        let f = try await makeFixture()
+        let previous = f.session.mcpControlContext
+        var cancellations = 0
+        let pending = AgentSessionMCPRuntime.ControlActivationCancellation(
+            scope: f.scope, session: f.session, activationID: UUID()
+        ) { _ in cancellations += 1 }
+        XCTAssertTrue(pending.permitsPublication)
+        f.scope.beginRetirement()
+        XCTAssertFalse(pending.permitsPublication, "Retirement blocks new control without suppressing an installed run's drain")
+        await pending.cancel(registration: f.registration)
+        XCTAssertFalse(pending.permitsPublication)
+        XCTAssertEqual(cancellations, 0)
+        XCTAssertEqual(f.session.mcpControlContext, previous)
+        XCTAssertTrue(f.session.runState.isActive)
+    }
+
+    func testResumableClaimInstallsCancellationBeforePersistenceAndPreservesReplacement() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let original = makeCancellationStore(root: root)
+        let sessionID = UUID()
+        _ = await original.register(sessionID: sessionID)
+        _ = await original.shutdown()
+        let store = makeCancellationStore(root: root)
+        await store.bootstrap()
+        let release = TestReleaseFence(name: "resumable claim persistence")
+        defer { release.release() }
+        await store.test_setMetadataFlushBeforeCAS { await release.enterAndWait() }
+        let cancelled = expectation(description: "pending resume cancellation")
+        let claim = Task {
+            await store.claimResumableSession(sessionID: sessionID) { _ in cancelled.fulfill() }
+        }
+        await release.waitUntilEntered()
+        let pendingRegistration = await store.currentRegistration(for: sessionID)
+        let pending = try XCTUnwrap(pendingRegistration)
+        let state = await store.test_shutdownOwnedState()
+        XCTAssertEqual(state.recordCount, 1)
+        XCTAssertEqual(state.cancellationHandlerCount, 1)
+        let refused = await store.registerIfMissing(sessionID: sessionID) { _ in
+            XCTFail("A rejected admission must not replace the pending cancellation capability")
+        }
+        XCTAssertNil(refused)
+        let invoked = await store.test_invokeCancellationHandler(registration: pending)
+        XCTAssertTrue(invoked)
+        await fulfillment(of: [cancelled], timeout: 1)
+        let successorCancelled = expectation(description: "replacement cancellation")
+        let successor = await store.register(sessionID: sessionID) { registration in
+            XCTAssertNotEqual(registration, pending)
+            successorCancelled.fulfill()
+        }
+        await store.test_setMetadataFlushBeforeCAS(nil)
+        release.release()
+        let result = await claim.value
+        XCTAssertEqual(result, .alreadyActive)
+        await store.cleanup(registration: pending)
+        let current = await store.currentRegistration(for: sessionID)
+        XCTAssertEqual(current, successor, "The suspended claim cannot roll back a replacement")
+        _ = await store.shutdown()
+        await fulfillment(of: [successorCancelled], timeout: 1)
+    }
+
+    private func makeCancellationStore(root: URL? = nil) -> DomainAgentRunSessionStore {
+        let directory = root ?? FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        if root == nil { addTeardownBlock { try? FileManager.default.removeItem(at: directory) } }
+        let identity = DomainRuntimeIdentity(runtimeID: UUID(), lifecycleGeneration: 1, processID: 42, mode: .standalone, createdAt: Date())
+        let configuration = DomainRuntimeConfiguration(
+            mode: .standalone, profileIdentifier: "M9 cancellation test", storageDirectory: directory,
+            eventDirectory: directory.appendingPathComponent("Events"), temporaryDirectory: directory.appendingPathComponent("Temporary"),
+            externalReloadInterval: nil
+        )
+        return DomainAgentRunSessionStore(
+            identity: identity, persistence: DomainPersistenceCoordinator(configuration: configuration, identity: identity),
+            profileIdentifier: configuration.profileIdentifier
+        )
+    }
+
     func testWindowFreeSnapshotAndInstructionPublicationUseExistingDomainRegistration() async throws {
         let f = try await makeFixture()
         let runtime = f.scope.mcp

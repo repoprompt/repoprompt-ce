@@ -11102,13 +11102,31 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.mcpControlCleanupTask?.cancel()
         session.mcpControlActivationGeneration &+= 1
         let activationGeneration = session.mcpControlActivationGeneration
+        let cancellation = AgentSessionMCPRuntime.ControlActivationCancellation(
+            scope: runtimeSessionStore, session: session, activationID: activationID
+        ) { [runService] session in
+            await runService.cancelRun(
+                tabID: session.tabID, session: session,
+                intent: .runtimeShutdown, completion: .terminalTeardownCompleted
+            )
+        }
+        let cancellationHandler: DomainAgentRunSessionStore.RegistrationCancellationHandler = { registration in
+            await cancellation.cancel(registration: registration)
+        }
         let registration: AgentRunSessionStore.Registration
-        switch await AgentRunSessionStore.claimResumableSession(sessionID: sessionID) {
+        switch await AgentRunSessionStore.claimResumableSession(
+            sessionID: sessionID, cancellationHandler: cancellationHandler
+        ) {
         case let .accepted(claimed):
             registration = claimed
         case .unavailable, .alreadyActive:
             try requireActivationOwner()
-            registration = await AgentRunSessionStore.register(sessionID: sessionID)
+            guard cancellation.permitsPublication else {
+                throw MCPError.invalidParams("The MCP control activation was cancelled or superseded during registration.")
+            }
+            registration = await AgentRunSessionStore.register(
+                sessionID: sessionID, cancellationHandler: cancellationHandler
+            )
         case .shuttingDown:
             throw MCPError.internalError(
                 "The Agent session runtime is shutting down and cannot activate a control session."
@@ -11123,7 +11141,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             await AgentRunSessionStore.cleanup(registration: registration)
             throw error
         }
-        guard sessions[tabID] === session,
+        guard registration.generation != 0 else {
+            throw MCPError.internalError(
+                "The Agent session runtime is shutting down and cannot activate a control session."
+            )
+        }
+        guard cancellation.permitsPublication,
+              sessions[tabID] === session,
               session.activeAgentSessionID == sessionID,
               !session.bindingTransitionInProgress,
               session.mcpControlActivationGeneration == activationGeneration
@@ -11201,32 +11225,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             await AgentRunSessionStore.cleanup(registration: registration)
         }
-        let cancellationInstalled = await AgentRunSessionStore.installCancellationHandler(
-            registration: registration
-        ) { [weak self] in
-            await self?.mcpCancelControlRunIfCurrent(
-                tabID: tabID,
-                sessionID: sessionID,
-                activationID: activationID,
-                registration: registration
-            )
-        }
         #if DEBUG
             await test_afterMCPControlSetupAwait?(session)
         #endif
-        guard sessions[tabID] === session,
+        guard cancellation.permitsPublication,
+              sessions[tabID] === session,
               session.currentRestorationBindingToken == activationBindingToken,
               session.mcpControlActivationGeneration == activationGeneration,
               session.mcpControlContext == activatedContext
         else {
             await releaseFailedInstalledActivation()
             throw MCPError.invalidParams("The MCP control activation was superseded during setup.")
-        }
-        guard cancellationInstalled else {
-            await releaseFailedInstalledActivation()
-            throw MCPError.internalError(
-                "The Agent session runtime stopped before its cancellation handler could be installed."
-            )
         }
         do { try requireActivationOwner() } catch {
             await releaseFailedInstalledActivation()
@@ -11267,7 +11276,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 await test_afterMCPControlSetupAwait?(session)
             #endif
         }
-        guard sessions[tabID] === session,
+        guard cancellation.permitsPublication,
+              sessions[tabID] === session,
               session.currentRestorationBindingToken == activationBindingToken,
               session.mcpControlActivationGeneration == activationGeneration,
               session.mcpControlContext == activatedContext
@@ -12032,30 +12042,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             && session.mcpControlActivationGeneration == deactivationGeneration
             && session.mcpControlContext == nil
             && !session.runState.isActive
-    }
-
-    private func mcpCancelControlRunIfCurrent(
-        tabID: UUID,
-        sessionID: UUID,
-        activationID: UUID,
-        registration: AgentRunSessionStore.Registration
-    ) async {
-        guard let session = sessions[tabID],
-              session.activeAgentSessionID == sessionID,
-              let context = session.mcpControlContext,
-              context.sessionID == sessionID,
-              context.activationID == activationID,
-              context.registration == registration
-        else {
-            return
-        }
-        cancelPendingInstruction(for: session)
-        await runService.cancelRun(
-            tabID: tabID,
-            session: session,
-            intent: .runtimeShutdown,
-            completion: .terminalTeardownCompleted
-        )
     }
 
     @discardableResult

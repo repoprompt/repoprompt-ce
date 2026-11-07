@@ -803,6 +803,38 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         XCTAssertFalse(session.isMCPOriginated)
     }
 
+    func testCancellationIsInstalledBeforeControlVisibilityAndPendingCancellationRefusesPublication() async throws {
+        let window = try await makeWindow()
+        let viewModel = window.agentModeViewModel
+        let sessionID = UUID()
+        let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+        var observedRegistration = false
+        viewModel.test_afterMCPControlRegistration = { _ in
+            observedRegistration = true
+            XCTAssertNil(session.mcpControlContext, "The registration boundary precedes observer visibility")
+            guard let registration = await AgentRunSessionStore.currentRegistration(for: sessionID) else {
+                return XCTFail("Expected pending registration")
+            }
+            let cancelled = await AgentRunSessionStore.shared.test_invokeCancellationHandler(registration: registration)
+            XCTAssertTrue(cancelled, "Cancellation must already be owned by the domain store")
+            XCTAssertNil(session.mcpControlContext)
+        }
+        defer { viewModel.test_afterMCPControlRegistration = nil }
+        do {
+            _ = try await viewModel.mcpActivateControlContext(
+                forTabID: session.tabID, sessionID: sessionID,
+                originatingConnectionID: nil, startPending: true
+            )
+            XCTFail("A cancelled pending activation cannot publish control")
+        } catch { XCTAssertTrue(error is MCPError) }
+        XCTAssertTrue(observedRegistration)
+        XCTAssertNil(session.mcpControlContext)
+        XCTAssertFalse(session.mcpFollowUpRunPending)
+        XCTAssertFalse(session.isMCPOriginated)
+        let remaining = await AgentRunSessionStore.currentRegistration(for: sessionID)
+        XCTAssertNil(remaining)
+    }
+
     func testLateRealGrantRefusesInstallationAndSurvivesEligibilityAudit() async throws {
         let window = try await makeWindow()
         let viewModel = window.agentModeViewModel
