@@ -45,6 +45,21 @@ class PathSelectionTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, expected_returncode)
 
+    def test_m8_provider_sources_select_root_tests_and_app_build(self) -> None:
+        paths = tuple(
+            (f"Sources/{target}/Runtime.swift", 0)
+            for target in (
+                "RepoPromptAIContracts", "RepoPromptAgentProviderContracts",
+                "RepoPromptClaudeProvider", "RepoPromptCodexProvider",
+                "RepoPromptACPProviders", "RepoPromptHTTPProviders",
+            )
+        )
+        for selector in ("root_test_paths_pattern", "repoprompt_product_paths_pattern"):
+            self._assert_path_selection(selector, paths + (
+                ("Sources/RepoPromptClaudeProviderOther/Runtime.swift", 1),
+                ("docs/RepoPromptClaudeProvider/Runtime.md", 1),
+            ))
+
     def test_conductor_test_family_selects_selftests(self) -> None:
         self._assert_path_selection("control_plane_paths_pattern", (
             ("Scripts/test_conductor_diagnostics.py", 0),

@@ -1,8 +1,24 @@
 import Foundation
+import RepoPromptACPProviders
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 final class GrokBuildACPEventNormalizerTests: XCTestCase {
+    func testInjectedToolNameAuthorityControlsServerProvenance() {
+        let names = ACPToolNameResolution(
+            isRepoPromptServerIdentifier: { $0 == "trusted" },
+            canonicalRepoPromptToolName: { $0 == "alias" ? "read_file" : nil },
+            isRepoPromptToolNameWithServerPrefix: { _ in false }
+        )
+        let trusted = GrokBuildACPEventNormalizer.normalize(["sessionUpdate": "tool_call", "toolCallId": "one", "title": "alias (trusted)"], toolNames: names)
+        let foreign = GrokBuildACPEventNormalizer.normalize(["sessionUpdate": "tool_call", "toolCallId": "two", "title": "alias (foreign)"], toolNames: names)
+        guard case let .stream(trustedResult) = trusted.first,
+              case let .stream(foreignResult) = foreign.first else { return XCTFail("Missing tool events") }
+        XCTAssertEqual(trustedResult.toolName, "mcp__RepoPromptCE__read_file")
+        XCTAssertNotEqual(foreignResult.toolName, trustedResult.toolName)
+    }
+
     func testAgentMessageChunkProducesContentStream() {
         let events = GrokBuildACPEventNormalizer.normalize([
             "sessionUpdate": "agent_message_chunk",

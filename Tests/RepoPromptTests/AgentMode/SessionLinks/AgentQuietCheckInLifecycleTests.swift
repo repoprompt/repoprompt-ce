@@ -1,4 +1,8 @@
 import Foundation
+import RepoPromptACPProviders
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
+import RepoPromptClaudeProvider
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import XCTest
@@ -220,7 +224,7 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
         ]
         for wire in cases {
             let (h, s, owner, runID) = fixture()
-            var translator = ClaudeSDKNDJSONTranslator()
+            var translator = ClaudeSDKNDJSONTranslator(isRepoPromptToolName: { MCPIntegrationHelper.isRepoPromptToolName($0) })
             let events = wire.flatMap { translator.parseNDJSONLine(Data($0.utf8)) }.map { NativeAgentRuntimeEvent.stream($0) }
             let runner = ClaudeIntegratedAgentModeRunner(claudeCoordinator: h.host.claudeCoordinator, hooks: h.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier())
             await runner.testConsumeQuietEvents(events, session: s, runID: runID, owner: owner)
@@ -245,6 +249,7 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
         ] {
             let (h, s, owner, runID) = fixture()
             let controller = ClaudeNativeProcessSessionController(
+                host: ClaudeNativeSessionAppHost(),
                 runID: runID, tabID: s.tabID, windowID: -1, workspacePath: nil,
                 config: .agentMode(commandName: "/usr/bin/false")
             )
@@ -513,6 +518,7 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
         let (h, s, owner, runID) = fixture()
         XCTAssertNotNil(s.quietLedger.candidateStartKey(owner: owner), file: file, line: line)
         let controller = ClaudeNativeProcessSessionController(
+            host: ClaudeNativeSessionAppHost(),
             runID: runID, tabID: s.tabID, windowID: -1, workspacePath: nil,
             config: .agentMode(commandName: "/usr/bin/false")
         )
@@ -703,7 +709,7 @@ extension AgentQuietCheckInLifecycleTests {
         for (label, wire) in cases {
             let (h, s, owner, runID) = fixture()
             defer { s.saveDebounceTask?.cancel() }
-            var translator = ClaudeSDKNDJSONTranslator()
+            var translator = ClaudeSDKNDJSONTranslator(isRepoPromptToolName: { MCPIntegrationHelper.isRepoPromptToolName($0) })
             let normalized = translator.parseNDJSONLine(Data(wire.utf8))
             XCTAssertEqual(normalized.map(\.type), ["event"], label)
             XCTAssertNil(normalized.first?.text, "No new model-facing text: \(label)")

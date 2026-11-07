@@ -4,6 +4,7 @@ import Combine
 import Foundation
 import KeyboardShortcuts
 import MCP
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptPersistence

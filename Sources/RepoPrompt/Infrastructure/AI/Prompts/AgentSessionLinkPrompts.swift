@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 
 /// Canonical RepoPrompt-authored oversight guidance.

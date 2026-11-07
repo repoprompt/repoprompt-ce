@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptSettingsCore
 
 /// Auto Workflow shares Model Router's service, but has independent enablement and cancellation.

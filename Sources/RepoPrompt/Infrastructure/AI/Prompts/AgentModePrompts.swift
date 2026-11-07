@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 
 // SEARCH-HELPER: agent mode prompt, explore prompt, engineer prompt, role-specific prompt, export delegation audience, oracle export guidance

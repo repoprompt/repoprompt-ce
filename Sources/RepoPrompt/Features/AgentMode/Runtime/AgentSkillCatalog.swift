@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptWorkspaceContext
 
 struct AgentSkillDefinition: Equatable, Hashable, Identifiable {

@@ -201,9 +201,9 @@ run_pr_ready_path_validations() {
   local control_plane_paths_pattern='^(Scripts/conductor\.py|Scripts/conductor_diagnostics\.py|Scripts/guardrails\.sh|Scripts/test_conductor_[^/]+\.py|Scripts/test_contribution_preflight\.py|Scripts/test_fast_check\.py|\.agents/skills/rpce-contribution-check/scripts/preflight(_timing\.py|\.sh)|Makefile)$'
   local ci_app_test_runner_paths_pattern='^(Scripts/ci_(admission|recovery|job_diagnostics|app_test_runner|process_session|resolve_packages|status_report|test_coverage)\.py|Scripts/test_ci_(admission|recovery|job_diagnostics|app_test_runner|resolve_packages|test_coverage)\.py|Scripts/modularization_ci_(artifact|build)\.py|\.github/workflows/ci(-integration-products|-recovery)?\.yml)$'
   local swift_paths_pattern='\.swift$'
-  local root_test_paths_pattern='^(Sources/RepoPrompt/|Tests/RepoPrompt[^/]*Tests/|Tests/RepoPromptTestSupport/)'
+  local root_test_paths_pattern='^(Sources/RepoPrompt(AIContracts|AgentProviderContracts|ClaudeProvider|CodexProvider|ACPProviders|HTTPProviders)?/|Tests/RepoPrompt[^/]*Tests/|Tests/RepoPromptTestSupport/)'
   local provider_package_paths_pattern='^Packages/RepoPromptAgentProviders/'
-  local repoprompt_product_paths_pattern='^Sources/RepoPrompt/'
+  local repoprompt_product_paths_pattern='^Sources/RepoPrompt(AIContracts|AgentProviderContracts|ClaudeProvider|CodexProvider|ACPProviders|HTTPProviders)?/'
   local mcp_product_paths_pattern='^(Sources/RepoPromptMCP/|Sources/RepoPromptMCPCore/|Sources/RepoPromptShared/)'
   local xcode_full_validation_paths_pattern='^(Package\.swift|Package\.resolved|Makefile|Scripts/generate_xcode_workspace\.py|Scripts/xcode_developer_workflow\.sh|\.github/workflows/xcode-workspace\.yml)$'
 

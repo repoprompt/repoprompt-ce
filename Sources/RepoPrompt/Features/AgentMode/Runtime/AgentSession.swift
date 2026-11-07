@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptSettingsCore
 
 /// Present-but-unreadable delivery evidence must never become legacy resend authority.

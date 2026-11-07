@@ -1,6 +1,9 @@
 #if DEBUG
     import Foundation
     import MCP
+    import RepoPromptAIContracts
+    import RepoPromptCodexProvider
+    import RepoPromptDomainRuntime
     import SwiftUI
 
     struct AgentChatStressTelemetrySnapshot: Codable, Equatable {

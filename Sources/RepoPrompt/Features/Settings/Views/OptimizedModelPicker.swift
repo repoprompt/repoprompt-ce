@@ -1,3 +1,4 @@
+import RepoPromptAIContracts
 import SwiftUI
 
 /// An optimized model picker that caches grouped models and only updates when the model list changes.

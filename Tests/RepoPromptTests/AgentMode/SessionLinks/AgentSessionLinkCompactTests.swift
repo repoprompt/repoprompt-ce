@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime

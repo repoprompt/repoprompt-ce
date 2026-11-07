@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptAIContracts
 import RepoPromptSettingsCore
 import RepoPromptVCS
 @testable import RepoPromptWorkspaceContext

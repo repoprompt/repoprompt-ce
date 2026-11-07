@@ -533,7 +533,7 @@ configuration committed synchronously. A concurrent composer claim wins. Revocat
 that hop cannot substitute a new grant; later revocation does not undo an already admitted commit.
 Busy/loading/settling refusals are retryable, never queued. Even identical selections pass every gate.
 
-`AgentAdvertisedModelCatalog` indexes full compound IDs when ordinary catalogue producers run.
+`AgentModelCatalogRuntime` indexes full compound IDs when ordinary catalogue producers run.
 Admission performs bounded memory lookups only: no persistence warming, full catalogue flattening,
 provider discovery, or legacy resolver fallback. Registry/backend changes invalidate the index;
 a cold index tells the caller to refresh `agent_manage.list_agents` in the destination window.

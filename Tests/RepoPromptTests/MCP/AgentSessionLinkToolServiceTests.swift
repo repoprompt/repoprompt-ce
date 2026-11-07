@@ -2,6 +2,7 @@ import Combine
 import Darwin
 import Foundation
 import MCP
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
@@ -1653,7 +1654,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertNil(conflict["workspace"])
         XCTAssertEqual(fixture.host.laneCreationCount, 1)
 
-        AgentAdvertisedModelCatalog.shared.record([
+        AgentModelCatalogRuntime.shared.record([
             AgentModelOption(
                 rawValue: "explicit-model:high",
                 displayName: "Explicit",
@@ -1661,8 +1662,8 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 isPlaceholderDefault: false,
                 isProviderDefault: false
             )
-        ], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
-        defer { AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode) }
+        ], for: .claudeCode, generation: AgentModelCatalogRuntime.shared.productionGeneration(for: .claudeCode))
+        defer { AgentModelCatalogRuntime.shared.invalidate(.claudeCode) }
         var explicit = args
         explicit["workspace"] = .string(workspace.id.uuidString)
         explicit["idempotency_key"] = .string("explicit-model")
@@ -4774,7 +4775,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             defer {
                 observer.saveDebounceTask?.cancel()
                 target.saveDebounceTask?.cancel()
-                AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode)
+                AgentModelCatalogRuntime.shared.invalidate(.claudeCode)
             }
             await manager.installClientConnectionPolicy(
                 for: transport.clientName, windowID: window.windowID,

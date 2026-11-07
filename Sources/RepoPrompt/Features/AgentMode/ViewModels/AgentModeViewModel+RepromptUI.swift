@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptSettingsCore
 
 /// V4 acknowledges one rewrite billing route, attachment names, and the optional recent-chat exposure.

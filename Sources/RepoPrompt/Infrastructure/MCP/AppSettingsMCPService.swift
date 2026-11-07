@@ -1,6 +1,7 @@
 import Foundation
 import JSONSchema
 import MCP
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptSettingsCore

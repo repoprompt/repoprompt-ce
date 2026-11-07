@@ -1,5 +1,7 @@
 import Foundation
 import MCP
+import RepoPromptACPProviders
+import RepoPromptAIContracts
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptSettingsCore
 import RepoPromptShared
@@ -833,7 +835,7 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
     }
 
     func testContextBuilderGrokOptionsUseKnownModelsWithoutClaimingAvailability() async throws {
-        let registry = AgentACPModelRegistry.shared
+        let registry = AgentModelCatalogRuntime.shared.acpRegistry
         registry.test_reset(providerID: .grokBuild)
         defer { registry.test_reset(providerID: .grokBuild) }
 
@@ -868,7 +870,7 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
     }
 
     func testContextBuilderCursorOptionsFollowDiscoveredCatalogWithoutClaimingAvailability() async throws {
-        let registry = AgentACPModelRegistry.shared
+        let registry = AgentModelCatalogRuntime.shared.acpRegistry
         registry.test_reset(providerID: .cursor)
         defer { registry.test_reset(providerID: .cursor) }
 

@@ -1,6 +1,8 @@
 import Foundation
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptFoundation
+import RepoPromptHTTPProviders
 import XCTest
 
 final class ZAIProviderEndpointTests: XCTestCase {
@@ -12,20 +14,6 @@ final class ZAIProviderEndpointTests: XCTestCase {
         let zAIModels = AIModel.modelsForProvider(.zAI)
         XCTAssertTrue(zAIModels.contains(.zaiGLM52))
         XCTAssertTrue(zAIModels.contains(.zaiGLM5))
-    }
-
-    func testDefaultProviderUsesGeneralZAIEndpoint() {
-        let provider = ZAIProvider(apiKey: "test-key")
-
-        XCTAssertEqual(provider.endpoint, .generalAPI)
-        XCTAssertEqual(provider.endpoint.baseURL.absoluteString, "https://api.z.ai/api/paas")
-    }
-
-    func testCodingPlanProviderUsesDedicatedCodingEndpoint() {
-        let provider = ZAIProvider(apiKey: "test-key", endpoint: .codingPlan)
-
-        XCTAssertEqual(provider.endpoint, .codingPlan)
-        XCTAssertEqual(provider.endpoint.baseURL.absoluteString, "https://api.z.ai/api/coding/paas")
     }
 }
 
@@ -52,7 +40,7 @@ final class ProviderEndpointConsentTests: XCTestCase {
     func testCustomCredentialSinksRejectBeforeTransportIncludingCustomHeaders() async throws {
         let client = RecordingClient()
         for (key, headers) in [("test-only-token", [:]), ("", ["X-Provider-Token": "test-only-token"])] {
-            let provider = CustomOpenAIProvider(baseURL: "http://provider.example", apiKey: key, defaultModel: "test", customHeaders: headers, httpClient: client, streamingHttpClient: client)
+            let provider = CustomOpenAIProvider(host: CustomOpenAIAppHost(), baseURL: "http://provider.example", apiKey: key, defaultModel: "test", customHeaders: headers, httpClient: client, streamingHttpClient: client)
             do {
                 _ = try await provider.getAvailableModels()
                 XCTFail("Discovery must require consent")
@@ -81,7 +69,7 @@ final class ProviderEndpointConsentTests: XCTestCase {
         let endpoint = "http://provider.example"
         for (key, consent) in [("test-only-token", Optional(endpoint)), ("", nil)] {
             let client = RecordingClient()
-            let provider = CustomOpenAIProvider(baseURL: endpoint, apiKey: key, defaultModel: "test", httpCredentialConsentEndpoint: consent, httpClient: client)
+            let provider = CustomOpenAIProvider(host: CustomOpenAIAppHost(), baseURL: endpoint, apiKey: key, defaultModel: "test", httpCredentialConsentEndpoint: consent, httpClient: client)
             do {
                 _ = try await provider.getAvailableModels()
                 XCTFail("The injected transport must terminate the request")
@@ -97,9 +85,9 @@ final class ProviderEndpointConsentTests: XCTestCase {
 
     func testSDKAndAzureDiscoveryRejectUnapprovedInitialRequests() async throws {
         let url = try XCTUnwrap(URL(string: "http://provider.example"))
-        XCTAssertThrowsError(try OpenAIProvider(apiKey: "test-only-token", baseURL: url).getService())
-        XCTAssertNoThrow(try OpenAIProvider(apiKey: "test-only-token", baseURL: url, httpCredentialConsentEndpoint: url.absoluteString).getService())
-        let azure = AzureOpenAIProvider(configuration: AzureOpenAIConfiguration(baseURL: url, apiKey: "test-only-token", apiVersion: "test"))
+        XCTAssertThrowsError(try OpenAIProvider(host: OpenAIProviderAppHost(), apiKey: "test-only-token", baseURL: url).getService())
+        XCTAssertNoThrow(try OpenAIProvider(host: OpenAIProviderAppHost(), apiKey: "test-only-token", baseURL: url, httpCredentialConsentEndpoint: url.absoluteString).getService())
+        let azure = AzureOpenAIProvider(configuration: AzureOpenAIConfiguration(baseURL: url, apiKey: "test-only-token", apiVersion: "test"), host: AzureOpenAIAppHost())
         do {
             _ = try await azure.fetchResponse(id: "test")
             XCTFail("SDK request must require consent before creating a service")
@@ -107,7 +95,7 @@ final class ProviderEndpointConsentTests: XCTestCase {
             guard case ProviderEndpointConsent.ValidationError.consentRequired = error else { return XCTFail("Wrong error: \(error)") }
         }
         do {
-            _ = try await AzureOpenAIProvider.discoverDeployments(baseURL: url, apiKey: "test-only-token", apiVersions: [])
+            _ = try await AzureOpenAIProvider.discoverDeployments(baseURL: url, apiKey: "test-only-token", apiVersions: [], host: AzureOpenAIAppHost())
             XCTFail("Discovery must check consent even before iterating versions")
         } catch {
             guard case ProviderEndpointConsent.ValidationError.consentRequired = error else { return XCTFail("Wrong error: \(error)") }

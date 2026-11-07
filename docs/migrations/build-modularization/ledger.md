@@ -117,6 +117,10 @@ commit reporter returns. App-owned runtime/store ownership and canonical durable
 authority remain unchanged. This owner only tracks process-local workers, awareness,
 and drain completion. The exception authorizes no other global owner.
 
+## Catalog runtime consolidation (2026-10-29)
+
+`AgentModelCatalogRuntime` replaces the independent advertised, ACP and Codex registry singletons with one application-owned runtime. It owns the existing memory-only admission index and lazily retains the same ACP and Codex registry implementations; provider locks, caches, persistence, warm/reset fences, and invalidation order remain unchanged. Registry-only access does not install the compatible-backend handler. The first advertised operation installs it before proceeding, without holding a runtime slot or activation lock across the registrar. Admission remains exact-ID and memory-only; producers capture generations before reading source snapshots. The existing ACP warm-to-advertised and backend-store-to-invalidation lock order is preserved, and the runtime does not acquire a registry while holding its index lock. The previous exception above is historical: the measured `app_static_shared_declarations` ratchet decreases from 89 to 87. Polling-service lifetimes and app-owned configuration/persistence are not retired by this change.
+
 ## Decisions
 
 | ID | Decision | Status |
@@ -1330,6 +1334,141 @@ separately owned reliability source was modified.
 
 
 **2026-10-13 upstream validation reconciliation.** Unmodified upstream `39b496ab26a39002cdabe90fce8794d9c2355107` contains 333 files with the exact App-test import counted by the ratchet, against a recorded limit of 332. The Ultrafast contribution adds coverage to existing suites and introduces no new App-importing test file. Align only `tests_testable_import_app_files` to the existing 333-file tree; counts above 333 still fail, and every other baseline and policy stays unchanged. Update the stale sidebar builder and self-compact reservation test calls to the current interfaces without removing assertions. These prerequisite repairs are kept separate from the Ultrafast implementation for review.
+
+## PR 8 (M8) — AI contracts and provider families to their own targets (2026-11-06)
+
+Delivers completion-plan milestone 8 (wave E: E1 contracts + E2 providers). Six new
+library targets in the root package, none of which depends on `RepoPromptApp`, UI
+pickers, or `AgentModeViewModel`:
+
+- **`RepoPromptAIContracts`** (~3.1k lines) — E1: provider-neutral `AIModel`
+  identity and raw values, `AIProviderType`, `AgentModelOption`/effort variants,
+  `AgentProviderKind` and task-label kinds (`explore` etc. stay typed, not
+  positional strings), reasoning-effort values, Claude/Codex/ACP model-identity
+  normalization, `CodexModelSpecifier`, `CodexServiceTierVariantCatalog`,
+  `ModelCatalogSemantics`, `CodexDynamicModelMapper`, `AgentCLIToolContext`, and `AIProviderError`.
+- **`RepoPromptAgentProviderContracts`** (~0.5k) — the native runtime seam:
+  `NativeAgentRuntimeControlling` plus its event/status/error/session values
+  (`NativeAgentRuntimeEvent`, `…RuntimeInitStatus`, `…TurnStatus`,
+  `…InterruptOutcome`, `…ControllerError`, `…EventStreamHandle`).
+- **Provider families (E2):** `RepoPromptClaudeProvider` (~5.1k:
+  `ClaudeCodeProvider`, `ClaudeCodeAgentProvider`, `ClaudeNativeProcessSessionController`,
+  turn correlation, CLI stream decoding, the package-facing half of the
+  compatible-provider bridge), `RepoPromptCodexProvider` (~4.1k:
+  `CodexAppServerClient`, the injected `AgentCodexModelRegistry`, Codex exec
+  contracts), `RepoPromptACPProviders` (~14.1k: ACP session controller and
+  headless bridge, Grok/Devin/Antigravity/Cursor/OpenCode providers, launch
+  resolvers and model polling), and `RepoPromptHTTPProviders` (~4.0k: OpenAI,
+  Anthropic and custom HTTP engines plus shared liveness).
+
+Each target has an owning test target (~8.2k test lines total) that builds and
+runs without the app. `RepoPromptDomainRuntime` gained only a downward
+`RepoPromptAIContracts` dependency; nothing moved out of it and it still has no
+app dependency. `ProviderContent` and `Diffing` remain the shared owners rather
+than moving upward into a concrete provider target. This is not a claim that
+DomainRuntime is unchanged: against main `21a31933e`, M8 adds the shared diffing
+implementation (`ChangeApplier`, `ChangeManager`, `DiffParser`, `DiffParserFileSource`,
+`FileChange`, `OptimalLineFinderUtility`) and provider-content values for approval,
+context usage, JSON, run state, payload retention, Codex request/interaction identity,
+normalized events, transport activity, MCP configuration and stable interaction
+identity. It also adds `AgentModelCatalogRuntime` and
+`AgentOracleAuthoritativeChatIDPolicy`. These include relocations and extracted
+values; file additions alone do not measure new behavior.
+
+**Retired machinery.** The registry singletons (`AgentACPModelRegistry.shared`,
+`AgentCodexModelRegistry.shared`) and direct advertised-catalog access are gone;
+the one application-owned `AgentModelCatalogRuntime` (2026-10-29 entry above) is
+the only composition point, and registries are constructed with injected storage,
+option policy, and invalidation. App-local nested controller types and capability
+projections (`ClaudeNativeProcessSessionController.{TurnStatus,RuntimeInitStatus,Event,SessionRef,InterruptOutcome,ControllerError}`)
+are replaced by the contract values; the Claude/Codex/ACP/HTTP providers take
+app policy (model selection, prompt delivery, environment filtering, launch
+hosts, approval overlays) through package initializers instead of reaching into
+app state, separating construction from consumption. No second model catalog was
+introduced; provider-specific persistence destinations (`CodexDynamicModelStore`,
+`ACPDynamicModelStore`, backend stores) remain app-owned and behavior-identical.
+
+**Reconciliation with main (53 commits since the integration branch's base).**
+The extraction was rebuilt on current main and the following upstream semantics
+were preserved inside the moved code: one-snapshot Codex catalog projection
+(#1590 — the records snapshot now threads through the registry dependencies,
+`AgentCodexModelPolicy`, mapper, and `AIModel` wrappers; cache keyed by records,
+remote/stored inputs with identical canonical records share one entry);
+provider-initiated turn tracking (#1565/#1611 — `providerTurnStarted`, provider
+output ownership, event-stream generations and the `eventStreamSnapshot`
+protocol requirement); the auto-compact window (#1594/#1620 —
+`autoCompactWindowTokens` on the contract init status); native Claude terminal
+usage normalization (#1582 — `CompletionUsageMode` is provider-owned and decided
+by the injected compatible-backend/model-selection policy); the unified
+`CLIProcessRunner` output-drain hook API (#1580) over the branch's split
+streaming/non-streaming hooks, keeping the DispatchIO-owned bounded drain; Codex
+`optOutNotificationMethods` and exact response usage (#1601). Correlation tests
+moved to `RepoPromptClaudeProviderTests` were refreshed from main's updated
+versions; the registry ownership tests now assert the single-snapshot contract
+instead of the retired remote/stored cache split.
+
+**Aggregate effect against merged main `3fd8a9027`.** The integration snapshot
+is parent `b9500dea0` plus main `3fd8a9027` and the review remediation described
+here (final publication SHA and receipts are in PR #1642): 616 files,
++23,202/−12,706; net +10,496 lines. App-target Swift lines
+681,246 → 650,378 (−30,868). This is relocation out of the app target, not a
+net reduction in aggregate implementation. `modules.json` carries six new target
+rows and placement rules; the import-check matrix and per-target guards cover them.
+
+**Separate lexical and compiler-index evidence.** The earlier 1,048 → 947
+wrong-way-file-edge comparison is a lexical/source-layout metric, **not** a
+compiler-index result. At head `b9500dea0`, CI run `42233157014`, build job
+`127945262805`, recorded **1,268 measured wrong-way edges (ceiling 1,360)** and
+**largest cycle 63 measured components (ceiling 66)**. This is not a before/after
+comparison. This older receipt does not validate the subsequent `3fd8a9027` merge
+plus review fixes; final-head results are recorded separately in PR #1642.
+A stale or freshness-unproven graph is not a pass.
+The 47 → 43 large-file threshold and 89 → 87 shared-declaration threshold are
+separate source ratchets. No compiler-index ceiling was raised.
+
+**Not only a move: shared process I/O.** `CLIProcessRunner` also contains a real
+nonstreaming I/O rewrite: concurrent `ShellOutputCapture` output readers,
+DispatchIO-owned stdin, a bounded post-exit drain, and coordinated cancellation
+cleanup replace the previous blocking-file-handle path. The streaming hook API
+was reconciled with #1580. At M8 head `b9500dea0`, the file was byte-identical to #1415 head
+`e8a86685c` (blob `8faa24a4e74ca2e634a70781d0d6bb93c1570f61`). Shared presence
+in two PRs is neither a pure-move claim nor evidence of unchanged runtime behavior.
+
+**Validation boundaries.** Detailed command/ticket/head receipts and failure
+attribution are recorded in draft PR #1642. At `b9500dea0`, hosted CI and Xcode
+passed, while the complete local suite had 8,338 passes, one source-authority
+failure, and 16 skips. Its focused CodeMap follow-up had 10 passes and a different
+graph-completion timeout. At revision `b9500dea0`, these failures are
+`WorkspaceCodemapGraphIncrementalIndexTests.testPathScopedReconcileWorkIsIndependentOfLiveLayerSize`
+(line 563) and `testGraphIndexCompletionImpliesGraphCoverageWhilePullLoopIsPaused`
+(the `waitForGraphCompletion` throw at line 791). They are not failures in
+`CodemapAutomaticSelectionGraphNativeTests`; #1415's cited synchronization repair
+does not modify these tests. Hosted root shards executed the class; Xcode validation
+is not a test result. Hosted green does not clear the local failures. Their causes
+remain unresolved for those historical observations. The review diagnostic run
+(`4f12794b`, 242 passed / 1 failed) exposed a separate setup-ordering
+problem in the completion test's setup: its root-wide admission hold can prevent
+the first graph publication, yet the test waits for that publication's pull pause
+before releasing the hold. The test now admits page one and gates following catalog
+pages until the pause is observed, preserving the coverage assertions and deadlines.
+This repairs that observed setup ordering; it does not establish the cause of the
+historical completion timeout or nil token. The revised class passed all 11 tests
+(ticket `f4a526a0`; completion 5.123s, token issuance 6.204s). Failure records now
+retain the authority rejection reason and timed-out root state for future attribution.
+
+**Missing milestone performance evidence.** A matched before/after focused-build
+comparison has **not** been performed. Existing conductor durations span different
+source/cache states and shared-host load, so they are not a valid comparison and
+support no speedup claim. Acceptance remains open until an identical focused
+product/target workload is measured on the pre-extraction and extracted trees with
+matched toolchain, cache policy and host conditions. This repair does not substitute
+unmatched timings or queue time for that experiment.
+
+**Unperformed assembled/live validation.** No visible app launch/relaunch,
+credentialed live-provider journey, or local release/packaged-provider smoke was
+performed. Module/focused tests and hosted Sentry packaging do not establish those
+assembled runtime behaviors. They require separate approval and matching artifact
+receipts; #1404 acceptance remains pending.
 
 ## M6 / #1403 — Stage 0 implementation checkpoint (2026-10-18)
 
@@ -2693,3 +2832,27 @@ Publication uses the mandatory commit and push preflights and a fast-forward
 push to `wt/1401-milestone-1`; the PR remains Draft. Exact-head hosted CI is a
 separate gate after publication, not implied by these local passes. Required
 independent review remains open, including this new integration delta.
+
+## M8 integration after M6 landed (2026-11-07)
+
+M6 / #1415 landed first at main `21a31933e80fd3b0e347e1517187f6c621654c47`.
+M8 normally merges that head after its review repairs at `c6e6ee54d`.
+Both milestones' target/dependency declarations and historical ledger entries are
+retained. Earlier M8 aggregate counts and compiler-index receipts describe their
+named pre-M6 snapshots, not this integration. Fresh integration validation is
+required; the historical CodeMap incremental-index causes, large-history timing,
+blocked-writer timing and suite `29b71307` unexplained stop remain open. The detailed
+historical receipts are in [PR #1642](https://github.com/repoprompt/repoprompt-ce/pull/1642):
+
+- Large-history timing: main run `41976958973` observed 15.4414s; M8 `b9500dea0`
+  hosted shard job `127970362986` passed at 10.961936667s with all 1,996 deliveries.
+  This establishes neither event loss nor an M8-specific cause.
+- Blocked-writer quit: the `4275e53e2` full run observed 1.083509s against a <1s
+  assertion; the same-head focused case passed in 0.368s. The cause is unknown.
+- Full-suite ticket `29b71307-6043-41b3-bb4e-41d25ffce98a` at `e436b6635`
+  exited 1 after 2,065.44s, with 4,987 passes, 10 skips and no recorded XCTest
+  assertion failure. The app test process stopped before completing its tests;
+  later module tests ran. Neither a causal signal nor a crash report was found.
+  The last-started test does not establish causation.
+
+No deadline or assertion is relaxed to dispose of these observations. M6 landing does not retroactively explain those failures.

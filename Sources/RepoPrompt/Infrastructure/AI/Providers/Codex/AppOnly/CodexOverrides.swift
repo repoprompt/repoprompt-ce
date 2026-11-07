@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCodexProvider
 
 enum CodexOverrides {
     private static let forcedDisabledConfig: [String: Bool] = [
@@ -17,45 +18,8 @@ enum CodexOverrides {
         "features.computer_use": true
     ]
 
-    enum ReasoningSummary: String {
-        case auto
-        case concise
-        case detailed
-        case none
-    }
-
-    struct FeaturePolicy: Equatable {
-        var goalsEnabled: Bool
-        var memoriesEnabled: Bool
-        var computerUseEnabled: Bool
-        var capabilities: CodexCapabilitySettings
-
-        static let defaultDisabled = FeaturePolicy(
-            goalsEnabled: false,
-            memoriesEnabled: false,
-            computerUseEnabled: false,
-            capabilities: .disabled
-        )
-        static let enabledForGoals = FeaturePolicy(
-            goalsEnabled: true,
-            memoriesEnabled: false,
-            computerUseEnabled: false,
-            capabilities: .disabled
-        )
-        static func resolved(
-            goalsEnabled: Bool,
-            memoriesEnabled: Bool,
-            computerUseEnabled: Bool,
-            capabilities: CodexCapabilitySettings = .disabled
-        ) -> FeaturePolicy {
-            FeaturePolicy(
-                goalsEnabled: goalsEnabled,
-                memoriesEnabled: memoriesEnabled,
-                computerUseEnabled: computerUseEnabled,
-                capabilities: capabilities
-            )
-        }
-    }
+    typealias ReasoningSummary = CodexProcessConfiguration.ReasoningSummary
+    typealias FeaturePolicy = CodexProcessConfiguration.FeaturePolicy
 
     struct ToolPolicy {
         var toolOutputTokenLimit: Int

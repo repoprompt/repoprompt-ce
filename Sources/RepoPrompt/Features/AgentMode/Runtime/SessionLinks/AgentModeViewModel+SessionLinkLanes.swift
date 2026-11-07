@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 
 /// A fresh lane has already published its durable tab binding. The idempotency key must be spent

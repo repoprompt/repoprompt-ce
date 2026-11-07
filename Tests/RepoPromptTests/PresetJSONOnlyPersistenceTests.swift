@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptShared
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp

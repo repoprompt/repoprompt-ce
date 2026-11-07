@@ -1,5 +1,7 @@
 import Combine
 import Foundation
+import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 
 struct AgentExecutionLocationProps: Equatable {
