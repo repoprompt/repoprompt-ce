@@ -1,3 +1,7 @@
+// Exported Swift 5 package values need explicit cross-module Sendable contracts.
+// swiftformat:disable redundantSendable
+import RepoPromptShared
+
 //
 //  MCPBootstrapMessages.swift
 //  RepoPrompt

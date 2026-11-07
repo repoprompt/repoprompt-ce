@@ -4,6 +4,7 @@ import RepoPromptACPProviders
 import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+@testable import RepoPromptMCPServer
 import XCTest
 
 private actor AutoWakeCatalogAuthorityGate {

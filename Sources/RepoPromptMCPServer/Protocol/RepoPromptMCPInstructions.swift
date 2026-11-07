@@ -1,3 +1,5 @@
+import RepoPromptShared
+
 //
 //  RepoPromptMCPInstructions.swift
 //  RepoPrompt
@@ -9,12 +11,12 @@ import Foundation
 
 /// Instructions text returned in the MCP Initialize response.
 /// Tailored per `MCPRunPurpose` so each connection only sees guidance for its available tools.
-enum RepoPromptMCPInstructions {
+package enum RepoPromptMCPInstructions {
     /// Returns instructions text appropriate for the given run purpose.
     /// - Parameters:
     ///   - purpose: Connection/run purpose used to tailor guidance.
     ///   - codeMapsDisabled: When true, omit Code Map tools from instructions.
-    static func text(for purpose: MCPRunPurpose = .unknown, codeMapsDisabled: Bool = false) -> String {
+    package static func text(for purpose: MCPRunPurpose = .unknown, codeMapsDisabled: Bool = false) -> String {
         switch purpose {
         case .agentModeRun:
             agentModeText(codeMapsDisabled: codeMapsDisabled)

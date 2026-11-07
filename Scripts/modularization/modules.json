@@ -38,7 +38,8 @@
         "RepoPromptShared",
         "RepoPromptWorkspaceCore",
         "Sparkle",
-        "RepoPromptWorkspaceContext"
+        "RepoPromptWorkspaceContext",
+        "RepoPromptMCPServer"
       ],
       "test_target": "RepoPromptTests"
     },
@@ -348,7 +349,8 @@
         "RepoPromptTestSupport",
         "RepoPromptWorkspaceCore",
         "RepoPromptWorkspaceContext",
-        "RepoPromptWorkspaceContextTestSupport"
+        "RepoPromptWorkspaceContextTestSupport",
+        "RepoPromptMCPServer"
       ]
     },
     "RepoPromptWorkspaceCore": {
@@ -430,6 +432,25 @@
         "RepoPromptFoundation",
         "RepoPromptPersistence",
         "RepoPromptWorkspaceCore"
+      ]
+    },
+    "RepoPromptMCPServer": {
+      "source_root": "Sources/RepoPromptMCPServer",
+      "allowed_dependencies": [
+        "RepoPromptDomainRuntime",
+        "RepoPromptShared",
+        "RepoPromptInstrumentation"
+      ],
+      "test_target": "RepoPromptMCPServerTests",
+      "app_free_tests": true
+    },
+    "RepoPromptMCPServerTests": {
+      "source_root": "Tests/RepoPromptMCPServerTests",
+      "allowed_dependencies": [
+        "RepoPromptMCPServer",
+        "RepoPromptDomainRuntime",
+        "RepoPromptShared",
+        "RepoPromptInstrumentation"
       ]
     }
   },
@@ -875,6 +896,22 @@
         "Sources/RepoPrompt/Infrastructure/VCS/GitWorkspacePolicyCanonicalizationDiagnostics.swift",
         "Sources/RepoPrompt/Infrastructure/VCS/GitWorkspaceStateAuthority.swift",
         "Sources/RepoPrompt/Infrastructure/VCS/GitWorktreeInitializationModels.swift"
+      ]
+    },
+    "MCPServerTransport": {
+      "owner": "RepoPromptMCPServer",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/MCP/UnixSocketMCPTransport.swift",
+        "Sources/RepoPrompt/Infrastructure/MCP/MCPDiagnostics.swift",
+        "Sources/RepoPrompt/Infrastructure/MCP/AppShared/NewlineDelimitedSocketReader.swift",
+        "Sources/RepoPrompt/Infrastructure/MCP/MCPRequestTimelineRegistry.swift",
+        "Sources/RepoPrompt/Infrastructure/MCP/MCPLifecycleDiagnostics.swift",
+        "Sources/RepoPrompt/Infrastructure/MCP/MCPToolExecutionDiagnosticMapping.swift",
+        "Sources/RepoPrompt/Infrastructure/MCP/BootstrapSocketConnectionManager.swift",
+        "Sources/RepoPrompt/Infrastructure/MCP/BootstrapSocketServer.swift",
+        "Sources/RepoPrompt/Infrastructure/MCP/BootstrapSocketOwnership.swift",
+        "Sources/RepoPrompt/Infrastructure/MCP/AppShared/MCPBootstrapMessages.swift",
+        "Sources/RepoPrompt/Infrastructure/MCP/RepoPromptMCPInstructions.swift"
       ]
     }
   }

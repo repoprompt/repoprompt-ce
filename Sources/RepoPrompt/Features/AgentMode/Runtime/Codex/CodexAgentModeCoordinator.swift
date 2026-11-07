@@ -5,6 +5,7 @@ import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
 import RepoPromptInstrumentation
+import RepoPromptMCPServer
 import RepoPromptSettingsCore
 #if canImport(Darwin)
     import Darwin

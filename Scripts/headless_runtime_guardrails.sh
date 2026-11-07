@@ -128,4 +128,40 @@ if ! grep -q 'protectedMutationProvider.protectedBinding' "$runtime_sources/MCPD
   exit 1
 fi
 
+# App admission adapts client facts only; canonical classifications, lane selection and
+# capacity construction must not acquire another manager-owned projection layer.
+app_admission_policy="Sources/RepoPrompt/Infrastructure/MCP/Policies/MCPToolAdmissionPolicy.swift"
+connection_manager="Sources/RepoPrompt/Infrastructure/MCP/MCPConnectionManager.swift"
+for admission_source in "$app_admission_policy" "$connection_manager"; do
+  if [[ ! -f "$admission_source" ]]; then
+    echo "error: missing app admission guard input: $admission_source" >&2
+    exit 1
+  fi
+done
+if grep -n -E 'static (let classifications|func classification\()|var connectionLane:|static let [[:alnum:]]+Limit[[:space:]]*=' "$app_admission_policy" \
+  || grep -n -E 'func (admissionClass\(forCanonicalToolName|callLane\(forCanonicalToolName|([[:alnum:]]*Limiter|limiter)Limit\(for)|static let [[:alnum:]]+CallLaneLimit[[:space:]]*=' "$connection_manager"; then
+  echo "error: retired app admission projection; use the domain catalog and connection limiter defaults" >&2
+  exit 1
+fi
+
+server_sources="Sources/RepoPromptMCPServer"
+if [[ ! -d "$server_sources" || ! -d Tests/RepoPromptMCPServerTests ]]; then
+  echo "error: missing M7 server module or app-free tests" >&2
+  exit 1
+fi
+if grep -R -n --include='*.swift' -E '(@MainActor|import[[:space:]]+(AppKit|SwiftUI|Combine|RepoPromptApp)([[:space:]]|$)|UserDefaults[.]standard|Bundle[.]main|ServerNetworkManager|MCPServerViewModel|WindowState)' "$server_sources" Tests/RepoPromptMCPServerTests; then
+  echo "error: server transport/execution module must not acquire app authority" >&2
+  exit 1
+fi
+if grep -n -E '(MCPToolExecutionWatchdog[.]run|domainHost[.]invoke|func dispatchResolvedProvider|private struct PromptExportExecutionEnvelope)' "$connection_manager"; then
+  echo "error: retired manager-owned execution orchestration has returned" >&2
+  exit 1
+fi
+for retired_transport in UnixSocketMCPTransport BootstrapSocketServer BootstrapSocketConnectionManager MCPRequestTimelineRegistry; do
+  if [[ -e "Sources/RepoPrompt/Infrastructure/MCP/$retired_transport.swift" ]]; then
+    echo "error: server implementation returned to app: $retired_transport" >&2
+    exit 1
+  fi
+done
+
 echo "Headless runtime guardrails passed."

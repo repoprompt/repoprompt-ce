@@ -3,6 +3,7 @@ import Foundation
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 import RepoPromptClaudeProvider
+import RepoPromptMCPServer
 
 extension MCPConfigLease: ClaudeNativeConfigLease {}
 

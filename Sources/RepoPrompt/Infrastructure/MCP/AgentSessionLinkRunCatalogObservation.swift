@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptMCPServer
 
 // The exact client-shaped oversight catalog for one run, projected onto the MainActor.
 // Owns its route token, monotonic revision, expected/returned surface evidence and wait outcome.
@@ -9,21 +10,7 @@ import RepoPromptDomainRuntime
 // bootstrap and same-name schema changes. Unknown evidence proves neither mismatch nor healing.
 // `isReady` remains exact-route + tool presence + outbound membership, never activation authority.
 
-/// Exact server-owned route identity that a returned MCP catalog was observed against.
-struct AgentSessionLinkRunCatalogRouteToken: Equatable, Hashable {
-    let runID: UUID
-    let observerEndpoint: DomainAgentSessionLinkEndpointIdentity
-    let connectionID: UUID
-    let routingAuthorityGeneration: UInt64
-    let connectionLifecycleGeneration: UInt64
-
-    /// An offer may survive a benign policy renewal, never another client or observer incarnation.
-    func hasSameClientIncarnation(as other: Self) -> Bool {
-        runID == other.runID && observerEndpoint == other.observerEndpoint
-            && connectionID == other.connectionID
-            && connectionLifecycleGeneration == other.connectionLifecycleGeneration
-    }
-}
+// Exact server-owned route identity that a returned MCP catalog was observed against.
 
 /// MainActor projection of the server's latest exact catalog observation for one run.
 struct AgentSessionLinkRunCatalogProjection: Equatable {

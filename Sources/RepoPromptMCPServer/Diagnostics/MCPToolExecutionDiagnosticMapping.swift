@@ -1,7 +1,7 @@
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 
-extension MCPToolExecutionDiagnosticEvent.ContractKind {
+package extension MCPToolExecutionDiagnosticEvent.ContractKind {
     init(_ kind: MCPToolExecutionContract.Kind) {
         self = switch kind {
         case .bounded: .bounded
@@ -13,7 +13,7 @@ extension MCPToolExecutionDiagnosticEvent.ContractKind {
     }
 }
 
-extension MCPToolExecutionDiagnosticEvent.CleanupDisposition {
+package extension MCPToolExecutionDiagnosticEvent.CleanupDisposition {
     init(_ disposition: MCPToolExecutionCleanupDisposition) {
         self = switch disposition {
         case .forceDisconnect: .forceDisconnect
@@ -22,7 +22,7 @@ extension MCPToolExecutionDiagnosticEvent.CleanupDisposition {
     }
 }
 
-extension MCPToolExecutionDiagnosticEvent.CancellationOrigin {
+package extension MCPToolExecutionDiagnosticEvent.CancellationOrigin {
     init(_ origin: MCPToolExecutionCancellationOrigin) {
         self = switch origin {
         case .watchdogDeadline: .watchdogDeadline
@@ -33,7 +33,7 @@ extension MCPToolExecutionDiagnosticEvent.CancellationOrigin {
     }
 }
 
-extension MCPToolExecutionDiagnosticEvent.Outcome {
+package extension MCPToolExecutionDiagnosticEvent.Outcome {
     init(_ outcome: MCPToolExecutionSettlement) {
         self = switch outcome {
         case .success: .success

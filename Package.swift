@@ -44,6 +44,7 @@ var packageDependencies: [Package.Dependency] = [
 ]
 
 var repoPromptAppDependencies: [Target.Dependency] = [
+    "RepoPromptMCPServer",
     "RepoPromptClaudeProvider",
     "RepoPromptAgentProviderContracts",
     "RepoPromptHTTPProviders",
@@ -91,6 +92,7 @@ var repoPromptSettingsCoreSwiftSettings: [SwiftSetting] = [
 ]
 
 var repoPromptTestDependencies: [Target.Dependency] = [
+    "RepoPromptMCPServer",
     "RepoPromptClaudeProvider",
     "RepoPromptAgentProviderContracts",
     "RepoPromptHTTPProviders",
@@ -407,6 +409,22 @@ let package = Package(
                 "RepoPromptPersistence", "RepoPromptWorkspaceCore"
             ],
             path: "Tests/RepoPromptWorkspaceContextTests",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
+        .target(
+            name: "RepoPromptMCPServer",
+            dependencies: [
+                "RepoPromptDomainRuntime", "RepoPromptShared", "RepoPromptInstrumentation",
+                .product(name: "MCP", package: "swift-sdk"),
+                .product(name: "Logging", package: "swift-log")
+            ],
+            path: "Sources/RepoPromptMCPServer",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
+        .testTarget(
+            name: "RepoPromptMCPServerTests",
+            dependencies: ["RepoPromptMCPServer", "RepoPromptDomainRuntime", "RepoPromptShared", "RepoPromptInstrumentation", .product(name: "MCP", package: "swift-sdk"), .product(name: "Logging", package: "swift-log")],
+            path: "Tests/RepoPromptMCPServerTests",
             swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
         ),
         .target(

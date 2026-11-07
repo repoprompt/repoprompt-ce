@@ -30,6 +30,8 @@ STYLE_PATHS=(
     "Sources/RepoPromptExecutable"
     "Sources/RepoPromptMCP"
     "Sources/RepoPromptMCPCore"
+    "Sources/RepoPromptMCPServer"
+    "Tests/RepoPromptMCPServerTests"
     "Sources/RepoPromptShared"
     "Sources/RepoPromptFileSystem"
     "Sources/RepoPromptVCS"
