@@ -205,6 +205,11 @@ final class CodeBlockTextView: NSTextView {
             height: .greatestFiniteMagnitude
         )
         if let container = textContainer {
+            #if DEBUG
+                if layoutManager != nil {
+                    AgentTranscriptTailRenderProbe.sink?(.native(.ensureLayout, nil, self))
+                }
+            #endif
             layoutManager?.ensureLayout(for: container)
         }
         let used = layoutManager?.usedRect(for: textContainer!).size ?? .zero
@@ -245,6 +250,9 @@ final class CodeBlockTextView: NSTextView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
+        #if DEBUG
+            AgentTranscriptTailRenderProbe.sink?(.native(.draw, nil, self))
+        #endif
         // Draw code block backgrounds first, then inline code chips
         drawCodeBlockBackgrounds()
         drawInlineCodeBackgrounds()
@@ -438,6 +446,9 @@ enum AttributedTextMeasurementWidthResolver {
 
 struct AttributedTextView: NSViewRepresentable {
     @Environment(\.windowIsPresentationVisible) private var windowIsPresentationVisible
+    #if DEBUG
+        @Environment(\.agentTranscriptProbeRowID) private var probeRowID
+    #endif
     let attributedString: NSAttributedString
     let isEditable: Bool
     let allowsTextSelection: Bool
@@ -473,10 +484,16 @@ struct AttributedTextView: NSViewRepresentable {
     func makeNSView(context: Context) -> CodeBlockTextView {
         let tv = CodeBlockTextView()
         configure(textView: tv, context: context)
+        #if DEBUG
+            AgentTranscriptTailRenderProbe.sink?(.native(.make, probeRowID, tv))
+        #endif
         return tv
     }
 
     func updateNSView(_ textView: CodeBlockTextView, context: Context) {
+        #if DEBUG
+            AgentTranscriptTailRenderProbe.sink?(.native(.update, probeRowID, textView))
+        #endif
         updateTextView(textView, coordinator: context.coordinator, presentationVisible: windowIsPresentationVisible)
     }
 
@@ -484,6 +501,9 @@ struct AttributedTextView: NSViewRepresentable {
         coordinator.opener = linkOpener
         // Detect attribute changes (not just the raw string).
         if presentationVisible || isEditable, !textView.attributedString().isEqual(to: attributedString) {
+            #if DEBUG
+                AgentTranscriptTailRenderProbe.sink?(.native(.replacement, probeRowID, textView))
+            #endif
             let wasFirstResponder = (textView.window?.firstResponder as? NSTextView) == textView
             let previousSelection = textView.selectedRange()
             let shouldScrollSelectionToVisible = TextViewSelectionRestorePolicy
@@ -526,6 +546,9 @@ struct AttributedTextView: NSViewRepresentable {
         nsView textView: CodeBlockTextView,
         context: Context
     ) -> CGSize? {
+        #if DEBUG
+            AgentTranscriptTailRenderProbe.sink?(.native(.size, probeRowID, textView))
+        #endif
         // Resolve a measurement width from the proposal, the last successful
         // measurement, an explicit fallback width, or the view's current bounds.
         //

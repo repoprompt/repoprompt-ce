@@ -336,6 +336,13 @@ package struct OracleConversationOwner: Hashable, Codable {
         self.identifier = identifier
     }
 
+    package static func appTab(workspaceID: UUID?, tabID: UUID) throws -> Self {
+        try OracleConversationOwner(
+            kind: "app-tab",
+            identifier: "workspace:\(workspaceID?.uuidString ?? "none"):tab:\(tabID.uuidString)"
+        )
+    }
+
     package init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         try self.init(
@@ -985,6 +992,18 @@ package enum OracleTurnState: String, Codable {
     case terminal
 }
 
+package struct OracleBackgroundExecution: Codable, Equatable, Sendable {
+    package let agentSessionID: UUID
+    package let agentRunID: UUID
+    package let invocationID: UUID
+
+    package init(agentSessionID: UUID, agentRunID: UUID, invocationID: UUID) {
+        self.agentSessionID = agentSessionID
+        self.agentRunID = agentRunID
+        self.invocationID = invocationID
+    }
+}
+
 package struct OracleTurnRecord: Codable, Equatable {
     package let id: OracleTurnID
     package let input: OracleInput
@@ -994,6 +1013,7 @@ package struct OracleTurnRecord: Codable, Equatable {
     package let status: OracleGroupStatus?
     package let warnings: [OracleGroupWarning]
     package let results: [OracleLaneResult]
+    package let backgroundExecution: OracleBackgroundExecution?
 
     package init(
         id: OracleTurnID = OracleTurnID(),
@@ -1003,7 +1023,8 @@ package struct OracleTurnRecord: Codable, Equatable {
         finishedAt: Date? = nil,
         status: OracleGroupStatus? = nil,
         warnings: [OracleGroupWarning] = [],
-        results: [OracleLaneResult] = []
+        results: [OracleLaneResult] = [],
+        backgroundExecution: OracleBackgroundExecution? = nil
     ) {
         self.id = id
         self.input = input
@@ -1013,6 +1034,7 @@ package struct OracleTurnRecord: Codable, Equatable {
         self.status = status
         self.warnings = warnings
         self.results = results
+        self.backgroundExecution = backgroundExecution
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -1024,6 +1046,7 @@ package struct OracleTurnRecord: Codable, Equatable {
         case status
         case warnings
         case results
+        case backgroundExecution
     }
 
     package init(from decoder: Decoder) throws {
@@ -1036,7 +1059,8 @@ package struct OracleTurnRecord: Codable, Equatable {
             finishedAt: container.decodeIfPresent(Date.self, forKey: .finishedAt),
             status: container.decodeIfPresent(OracleGroupStatus.self, forKey: .status),
             warnings: container.decodeIfPresent([OracleGroupWarning].self, forKey: .warnings) ?? [],
-            results: container.decode([OracleLaneResult].self, forKey: .results)
+            results: container.decode([OracleLaneResult].self, forKey: .results),
+            backgroundExecution: container.decodeIfPresent(OracleBackgroundExecution.self, forKey: .backgroundExecution)
         )
     }
 }
@@ -1147,7 +1171,8 @@ package extension OracleGroupDocument {
             finishedAt: finishedAt,
             status: result.status,
             warnings: result.warnings,
-            results: result.oracleResults
+            results: result.oracleResults,
+            backgroundExecution: turn.backgroundExecution
         )
         return try Self(
             schemaVersion: schemaVersion,

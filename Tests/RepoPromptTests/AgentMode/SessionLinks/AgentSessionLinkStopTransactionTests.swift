@@ -714,17 +714,38 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
     }
 
     func testClaimLostBeforeCancellationReportsTargetChanged() async throws {
-        let fixture = try makeFixture()
-        fixture.session.runState = .running
-        fixture.session.installRunID(UUID())
-        _ = fixture.session.beginRunAttempt(source: "target-changed-before-task-entry")
-        let outcome = await stop(fixture, beforeCleanupTask: {
+        for heldOracleDrain in [false, true] {
+            let fixture = try makeFixture()
+            fixture.session.runState = .running
             fixture.session.installRunID(UUID())
-        })
-        guard case let .settled(receipt) = outcome else { return XCTFail("expected receipt") }
-        XCTAssertEqual(receipt.result, .stopFailed)
-        XCTAssertEqual(receipt.failureReason, .targetChanged)
-        XCTAssertEqual(receipt.stopRequested, false)
+            _ = fixture.session.beginRunAttempt(source: "target-changed-before-task-entry")
+            let releaseOracle = AgentSessionLinkStopSignal<Void>()
+            let cleanupEntered = AgentSessionLinkStopSignal<Void>()
+            defer { releaseOracle.finish(()) }
+            if heldOracleDrain {
+                fixture.session.oracleBackgroundDrain = Task { await releaseOracle.value() }
+            }
+            let outcome = await stop(fixture, teardownDeadlineSeconds: heldOracleDrain ? 0 : 1, deadlineSleep: { _ in
+                // The deadline may win only after cleanup owns the claim; otherwise the
+                // never-started-task recovery could hide an unbounded Oracle join.
+                await cleanupEntered.value()
+            }, beforeCleanupTask: {
+                fixture.session.installRunID(UUID())
+                cleanupEntered.finish(())
+            })
+            guard case let .settled(receipt) = outcome else { return XCTFail("expected receipt") }
+            XCTAssertEqual(receipt.result, .stopFailed)
+            XCTAssertEqual(receipt.failureReason, .targetChanged)
+            XCTAssertEqual(receipt.stopRequested, false)
+            if heldOracleDrain {
+                try await AsyncTestWait.waitUntil("bounded Oracle waiter releases managed Stop claim", timeout: 1) {
+                    !fixture.session.stopState.isStopping(binding: fixture.session.persistentSessionBindingIdentity)
+                }
+                XCTAssertNotNil(fixture.session.oracleBackgroundDrain, "A timeout must retain the cleanup ticket")
+                releaseOracle.finish(())
+                await fixture.session.oracleBackgroundDrain?.value
+            }
+        }
     }
 
     func testTerminalReplacementBeforeCleanupCannotMasqueradeAsNaturalCompletion() async throws {

@@ -1188,7 +1188,10 @@ final class AgentTabSession: ObservableObject {
     var contextCompactedAt: Date? {
         didSet {
             // A compaction invalidates the count; the window is unchanged.
-            if contextCompactedAt != oldValue { vouchedContextCount = nil }
+            if contextCompactedAt != oldValue {
+                vouchedContextCount = nil
+                oracleBackgroundAwareness.resetContext()
+            }
         }
     }
 
@@ -1581,6 +1584,10 @@ final class AgentTabSession: ObservableObject {
     // Persistence
     /// Synchronous derived-index maintenance for the runtime store owning this live object.
     var persistentSessionBindingDidChange: (() -> Void)?
+    /// Process-local Oracle lifetime is independent of run attempts and parent provider teardown.
+    var oracleBackgroundOwner: OracleBackgroundInvocationRegistry.Owner?
+    var oracleBackgroundDrain: Task<Void, Never>?
+    var oracleBackgroundAwareness = OracleBackgroundAwareness()
     private(set) var persistentSessionBindingIdentity: AgentPersistentSessionBindingIdentity?
     var activeAgentSessionID: UUID? {
         persistentSessionBindingIdentity?.sessionID

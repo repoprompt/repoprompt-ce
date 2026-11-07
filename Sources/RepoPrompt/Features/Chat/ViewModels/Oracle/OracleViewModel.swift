@@ -1079,6 +1079,12 @@ class OracleViewModel: ObservableObject {
     let workspaceManager: WorkspaceManagerViewModel // Changed from private to let for MCP access
 
     private let finalisationHub = MessageFinalisationHub()
+    var oracleHistoryDeletingGroups: Set<OracleGroupID> = []
+    var oracleHistoryClearingWorkspaces: Set<UUID> = []
+
+    func oracleBackgroundHistoryAdmissionIsOpen(workspaceID: UUID?, groupID: OracleGroupID?) -> Bool {
+        !(workspaceID.map(oracleHistoryClearingWorkspaces.contains) ?? false) && !(groupID.map(oracleHistoryDeletingGroups.contains) ?? false)
+    }
 
     // Dependencies
     let aiQueriesService: AIQueriesService
@@ -1726,6 +1732,31 @@ class OracleViewModel: ObservableObject {
         }
     }
 
+    @MainActor
+    func backgroundOracleQueryIdentity(sessionID: UUID, queryID: UUID) -> OracleBackgroundInvocationRegistry.QueryIdentity {
+        .init(sessionID: sessionID, queryID: queryID)
+    }
+
+    @MainActor
+    func backgroundOracleQueryIsCurrent(_ query: OracleBackgroundInvocationRegistry.QueryIdentity) -> Bool {
+        activeQueryId(for: query.sessionID) == query.queryID
+    }
+
+    @MainActor
+    func backgroundOracleQuerySnapshot(_ query: OracleBackgroundInvocationRegistry.QueryIdentity) async -> (OracleMessageFinalizationOutcome?, AIChatMessage?) {
+        let outcome = await finalisationHub.outcome(for: query.queryID)
+        guard canCommitContextBuilderLane(nil, backgroundQuery: query) else { return (nil, nil) }
+        return (outcome, messageStore[query.sessionID]?.first(where: { $0.id == query.queryID && !$0.isUser }))
+    }
+
+    @MainActor
+    func backgroundOracleCompletedResponse(_ query: OracleBackgroundInvocationRegistry.QueryIdentity) async -> String? {
+        let (outcome, message) = await backgroundOracleQuerySnapshot(query)
+        guard case .providerCompleted? = outcome, let message, message.isFinalized,
+              !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return message.content
+    }
+
     nonisolated func waitUntilMessageFinalised(_ id: UUID) async throws {
         let messageState = await MainActor.run { () -> Bool? in
             guard let sessionID = self.sessionIDByMessageId[id],
@@ -1849,8 +1880,12 @@ class OracleViewModel: ObservableObject {
             return
         }
 
+        guard oracleHistoryClearingWorkspaces.insert(activeWS.id).inserted else { return }
+        defer { oracleHistoryClearingWorkspaces.remove(activeWS.id) }
         let invalidateDeletedSnapshot = captureChatSessionCatalogDeletionFence(for: activeWS.id)
+        await OracleBackgroundInvocationRegistry.shared.closeAll(workspaceID: activeWS.id).value
         await cancelAllActiveSessionStreams(cleanupOwnerIsCurrent: invalidateDeletedSnapshot.isCurrent)
+        await drainTrackedAutosaves(for: activeWS.id)
         guard invalidateDeletedSnapshot.isCurrent(), isActiveChatWorkspace(activeWS) else { return }
 
         // 2) Delete chat JSON files only for this workspace
@@ -1869,6 +1904,7 @@ class OracleViewModel: ObservableObject {
             return
         }
         sessionOperationError = nil
+        OracleBackgroundInvocationRegistry.shared.removeSettledWorkspace(activeWS.id)
 
         // 3) An obsolete deletion must not clear a successor workspace/root's runtime state.
         guard invalidateDeletedSnapshot.isCurrent(), isActiveChatWorkspace(activeWS) else { return }
@@ -3258,7 +3294,9 @@ class OracleViewModel: ObservableObject {
         completionPolicy: OracleResponseCompletionPolicy = .interactive,
         contextBuilderScope: ContextBuilderOracleLaneScope? = nil,
         onQueryCreated: ((UUID) -> Void)? = nil,
-        onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
+        onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil,
+        backgroundJob: OracleBackgroundInvocationRegistry.Job? = nil,
+        backgroundLaneIndex: Int = 0
     ) async -> UUID? {
         guard !newUserMessage.isEmpty, contextBuilderScope?.isLive != false else { return nil }
         _ = true
@@ -3406,6 +3444,7 @@ class OracleViewModel: ObservableObject {
         }
         setSessionStreaming(targetSessionID, queryId: aiResponseId, streamId: nil)
         onQueryCreated?(aiResponseId)
+        let backgroundQuery = backgroundJob.map { _ in backgroundOracleQueryIdentity(sessionID: targetSessionID, queryID: aiResponseId) }
 
         if currentSessionID == targetSessionID {
             updateLatestTokenCounts()
@@ -3416,7 +3455,7 @@ class OracleViewModel: ObservableObject {
             do {
                 let shouldContinueStreaming: () async -> Bool = {
                     await MainActor.run {
-                        contextBuilderScope?.isLive != false &&
+                        contextBuilderScope?.isLive != false && backgroundJob?.isCancellationRequested != true &&
                             self.runStateBySession[targetSessionID]?.activeQueryId == aiResponseId &&
                             self.streamingSessions.contains(targetSessionID)
                     }
@@ -3490,7 +3529,7 @@ class OracleViewModel: ObservableObject {
                 }
 
                 await MainActor.run {
-                    guard self.canCommitContextBuilderLane(contextBuilderScope) else { return }
+                    guard self.canCommitContextBuilderLane(contextBuilderScope, backgroundQuery: backgroundQuery) else { return }
                     self.streamIDsByQueryId[aiResponseId] = streamID
                     self.setSessionStreaming(targetSessionID, queryId: aiResponseId, streamId: streamID)
                 }
@@ -3502,13 +3541,13 @@ class OracleViewModel: ObservableObject {
                 var didFinalize = false
 
                 for try await output in stream {
-                    if contextBuilderScope != nil {
+                    if contextBuilderScope != nil || backgroundJob != nil {
                         guard await shouldContinueStreaming() else { throw CancellationError() }
                     }
                     let activityKind = Self.lifecycleActivityKind(for: output)
                     if output.isTransportActivity {
                         await MainActor.run {
-                            guard self.canCommitContextBuilderLane(contextBuilderScope) else { return }
+                            guard self.canCommitContextBuilderLane(contextBuilderScope, backgroundQuery: backgroundQuery) else { return }
                             if activityKind != nil {
                                 guard self.recordObservedStreamActivity(for: aiResponseId, at: self.streamWatchdogNow) else { return }
                             }
@@ -3538,7 +3577,7 @@ class OracleViewModel: ObservableObject {
                     reasoningBuffer = ReasoningTextFormatter.normalize(reasoningBuffer)
 
                     await MainActor.run {
-                        guard self.canCommitContextBuilderLane(contextBuilderScope) else { return }
+                        guard self.canCommitContextBuilderLane(contextBuilderScope, backgroundQuery: backgroundQuery) else { return }
                         let sawText = !delta.isEmpty
                         let sawReasoning = !(reasoningDelta?.isEmpty ?? true)
                         let now = self.streamWatchdogNow
@@ -3574,7 +3613,7 @@ class OracleViewModel: ObservableObject {
 
                         // Store token counts and cost when stream is finalized
                         await MainActor.run {
-                            guard self.canCommitContextBuilderLane(contextBuilderScope) else { return }
+                            guard self.canCommitContextBuilderLane(contextBuilderScope, backgroundQuery: backgroundQuery) else { return }
                             self.withSessionMessages(targetSessionID) { msgs in
                                 if let idx = msgs.firstIndex(where: { $0.id == aiResponseId }) {
                                     msgs[idx].updateTokenInfo(tokenInfo)
@@ -3586,7 +3625,7 @@ class OracleViewModel: ObservableObject {
                         }
 
                         await MainActor.run {
-                            guard self.canCommitContextBuilderLane(contextBuilderScope) else { return }
+                            guard self.canCommitContextBuilderLane(contextBuilderScope, backgroundQuery: backgroundQuery) else { return }
                             self.providerStopSeen.insert(aiResponseId)
                             self.emitMessageLifecycleActivity(.providerStopObserved, for: aiResponseId)
                             self.cancelStreamInactivityWatchdog(for: aiResponseId)
@@ -3600,13 +3639,15 @@ class OracleViewModel: ObservableObject {
                                 sessionID: targetSessionID,
                                 partialBuffer: partialBuffer,
                                 outcome: .providerCompleted,
-                                contextBuilderScope: contextBuilderScope
+                                contextBuilderScope: contextBuilderScope,
+                                backgroundQuery: backgroundQuery
                             )
                             if contextBuilderScope == nil {
                                 await self.cleanupOracleProviderConversation(cleanupHandle, model: model)
                             }
                         }
                         contextBuilderScope?.retain(finalizer)
+                        backgroundJob?.retainQueryWork(laneIndex: backgroundLaneIndex, task: finalizer)
                         if contextBuilderScope != nil {
                             self.scheduleUnownedProviderCleanup(cleanupHandle, model: model, after: finalizer)
                         }
@@ -3614,7 +3655,7 @@ class OracleViewModel: ObservableObject {
                 }
 
                 if !didFinalize {
-                    guard self.canCommitContextBuilderLane(contextBuilderScope) else {
+                    guard self.canCommitContextBuilderLane(contextBuilderScope, backgroundQuery: backgroundQuery) else {
                         self.scheduleUnownedProviderCleanup(providerCleanupHandle, model: model)
                         return
                     }
@@ -3622,7 +3663,7 @@ class OracleViewModel: ObservableObject {
                         self.cancelStreamInactivityWatchdog(for: aiResponseId)
                     }
                     await MainActor.run {
-                        guard self.canCommitContextBuilderLane(contextBuilderScope) else { return }
+                        guard self.canCommitContextBuilderLane(contextBuilderScope, backgroundQuery: backgroundQuery) else { return }
                         self.withSessionMessages(targetSessionID) { msgs in
                             if let idx = msgs.firstIndex(where: { $0.id == aiResponseId }) {
                                 msgs[idx].updateTokenInfo(latestTokenInfo)
@@ -3645,13 +3686,15 @@ class OracleViewModel: ObservableObject {
                             sessionID: targetSessionID,
                             partialBuffer: partialBuffer,
                             outcome: outcome,
-                            contextBuilderScope: contextBuilderScope
+                            contextBuilderScope: contextBuilderScope,
+                            backgroundQuery: backgroundQuery
                         )
                         if contextBuilderScope == nil {
                             await self.cleanupOracleProviderConversation(cleanupHandle, model: model)
                         }
                     }
                     contextBuilderScope?.retain(finalizer)
+                    backgroundJob?.retainQueryWork(laneIndex: backgroundLaneIndex, task: finalizer)
                     if contextBuilderScope != nil {
                         self.scheduleUnownedProviderCleanup(cleanupHandle, model: model, after: finalizer)
                     }
@@ -3661,27 +3704,34 @@ class OracleViewModel: ObservableObject {
                     OracleReviewPackagingDiagnostics.recordFailure(error)
                 #endif
                 await MainActor.run {
-                    if contextBuilderScope == nil { self.clearSessionStreaming(targetSessionID) }
+                    if contextBuilderScope == nil, self.canCommitContextBuilderLane(nil, backgroundQuery: backgroundQuery) { self.clearSessionStreaming(targetSessionID) }
                 }
                 let cleanupHandle = providerCleanupHandle
                 if contextBuilderScope != nil { providerCleanupHandle = nil }
                 let errorWork = Task {
-                    await handleSendMessageError(error, aiResponseId: aiResponseId, sessionID: targetSessionID, contextBuilderScope: contextBuilderScope)
+                    await handleSendMessageError(error, aiResponseId: aiResponseId, sessionID: targetSessionID, contextBuilderScope: contextBuilderScope, backgroundQuery: backgroundQuery)
                     if contextBuilderScope == nil {
                         await self.cleanupOracleProviderConversation(cleanupHandle, model: model)
                     }
                 }
                 contextBuilderScope?.retain(errorWork)
+                backgroundJob?.retainQueryWork(laneIndex: backgroundLaneIndex, task: errorWork)
                 if contextBuilderScope != nil {
                     self.scheduleUnownedProviderCleanup(cleanupHandle, model: model, after: errorWork)
                 }
             }
         }
         contextBuilderScope?.retain(producerTask)
+        backgroundJob?.retainQueryWork(laneIndex: backgroundLaneIndex, task: producerTask, cancelOnStop: true)
         return aiResponseId
     }
 
-    private func canCommitContextBuilderLane(_ scope: ContextBuilderOracleLaneScope?) -> Bool {
+    private func canCommitContextBuilderLane(_ scope: ContextBuilderOracleLaneScope?, backgroundQuery: OracleBackgroundInvocationRegistry.QueryIdentity? = nil) -> Bool {
+        if let backgroundQuery {
+            guard runStateBySession[backgroundQuery.sessionID]?.activeQueryId == nil || runStateBySession[backgroundQuery.sessionID]?.activeQueryId == backgroundQuery.queryID,
+                  messageStore[backgroundQuery.sessionID]?.contains(where: { $0.id == backgroundQuery.queryID && !$0.isUser }) == true
+            else { return false }
+        }
         guard let scope else { return true }
         guard scope.isLive else { return false }
         guard let queryID = scope.queryID else { return true }
@@ -3770,9 +3820,10 @@ class OracleViewModel: ObservableObject {
         sessionID: UUID,
         partialBuffer: String,
         outcome: OracleMessageFinalizationOutcome,
-        contextBuilderScope: ContextBuilderOracleLaneScope? = nil
+        contextBuilderScope: ContextBuilderOracleLaneScope? = nil,
+        backgroundQuery: OracleBackgroundInvocationRegistry.QueryIdentity? = nil
     ) async {
-        guard canCommitContextBuilderLane(contextBuilderScope) else { return }
+        guard canCommitContextBuilderLane(contextBuilderScope, backgroundQuery: backgroundQuery) else { return }
         // Single-flight finalisation: provider stop, watchdogs, and cancellation can
         // all race to finalize the same message.
         if finalizingAIResponses.contains(aiResponseId) {
@@ -3787,7 +3838,7 @@ class OracleViewModel: ObservableObject {
 
         // Cancel any watchdog to prevent duplicate finalization
         await MainActor.run {
-            guard self.canCommitContextBuilderLane(contextBuilderScope) else { return }
+            guard self.canCommitContextBuilderLane(contextBuilderScope, backgroundQuery: backgroundQuery) else { return }
             self.cancelFinalizationWatchdog(for: aiResponseId)
             self.clearStreamActivityTracking(for: aiResponseId)
             self.streamIDsByQueryId.removeValue(forKey: aiResponseId)
@@ -3803,7 +3854,7 @@ class OracleViewModel: ObservableObject {
             let incompleteContent = finalContent + "\n\n--\nError:\n\(error.localizedDescription)"
             finalContent = incompleteContent
             await MainActor.run {
-                guard self.canCommitContextBuilderLane(contextBuilderScope) else { return }
+                guard self.canCommitContextBuilderLane(contextBuilderScope, backgroundQuery: backgroundQuery) else { return }
                 self.withSessionMessages(sessionID) { msgs in
                     if let idx = msgs.firstIndex(where: { $0.id == aiResponseId }) {
                         msgs[idx].updateContent(incompleteContent)
@@ -3816,12 +3867,12 @@ class OracleViewModel: ObservableObject {
             if let contextBuilderScope { await contextBuilderBeforeFinalizationForTesting?(contextBuilderScope) }
         #endif
         // 2️⃣ Process final display content before toggling the finished flags that external tools poll for.
-        await processAIResponse(finalContent, forQueryId: aiResponseId, sessionID: sessionID, contextBuilderScope: contextBuilderScope)
-        guard canCommitContextBuilderLane(contextBuilderScope) else { return }
+        await processAIResponse(finalContent, forQueryId: aiResponseId, sessionID: sessionID, contextBuilderScope: contextBuilderScope, backgroundQuery: backgroundQuery)
+        guard canCommitContextBuilderLane(contextBuilderScope, backgroundQuery: backgroundQuery) else { return }
 
         // 3️⃣ Now – and only now – mark the message / chat turn as complete.
         await MainActor.run {
-            guard self.canCommitContextBuilderLane(contextBuilderScope) else { return }
+            guard self.canCommitContextBuilderLane(contextBuilderScope, backgroundQuery: backgroundQuery) else { return }
             self.withSessionMessages(sessionID) { msgs in
                 if let idx = msgs.firstIndex(where: { $0.id == aiResponseId }) {
                     msgs[idx].setIsFinalized(true)
@@ -3842,7 +3893,7 @@ class OracleViewModel: ObservableObject {
             )
         }
 
-        guard canCommitContextBuilderLane(contextBuilderScope) else { return }
+        guard canCommitContextBuilderLane(contextBuilderScope, backgroundQuery: backgroundQuery) else { return }
         // 4️⃣ Persist the fully‑processed session state
         // When finalizing after a delegate‑edit retry, force autosave so XML results persist
         // even if the assistant message text hasn't changed (avoids "no meaningful changes" skip).
@@ -3873,9 +3924,10 @@ class OracleViewModel: ObservableObject {
     @MainActor
     private func handleSendMessageError(
         _ error: Error, aiResponseId: UUID, sessionID: UUID,
-        contextBuilderScope: ContextBuilderOracleLaneScope? = nil
+        contextBuilderScope: ContextBuilderOracleLaneScope? = nil,
+        backgroundQuery: OracleBackgroundInvocationRegistry.QueryIdentity? = nil
     ) async {
-        guard canCommitContextBuilderLane(contextBuilderScope) else { return }
+        guard canCommitContextBuilderLane(contextBuilderScope, backgroundQuery: backgroundQuery) else { return }
         // Clear MCP model info on error
         clearMCPSessionUIState(for: sessionID)
 
@@ -3919,10 +3971,12 @@ class OracleViewModel: ObservableObject {
                     sessionID: sessionID,
                     partialBuffer: finalContent,
                     outcome: .cancelled,
-                    contextBuilderScope: contextBuilderScope
+                    contextBuilderScope: contextBuilderScope,
+                    backgroundQuery: backgroundQuery
                 )
             }
             contextBuilderScope?.retain(finalizer)
+            if backgroundQuery != nil { await finalizer.value }
             return
         }
 
@@ -4056,6 +4110,10 @@ class OracleViewModel: ObservableObject {
     @MainActor
     func clearChat() async {
         if messages.isEmpty { return }
+        if let session = currentSession, session.oracleGroupID != nil {
+            await deleteSession(session)
+            return
+        }
         if let sessionID = currentSessionID {
             await cancelAIResponse(in: sessionID, skipPartialParseAndSave: true)
         }
@@ -4094,6 +4152,9 @@ class OracleViewModel: ObservableObject {
     @MainActor
     private func handleComposeTabsWillClose(_ tabIDs: Set<UUID>) async {
         for tabID in tabIDs {
+            if let workspaceID = workspaceManager.activeWorkspaceID {
+                await OracleBackgroundInvocationRegistry.shared.closeAll(workspaceID: workspaceID, tabID: tabID).value
+            }
             // 1. Cancel headless stream (plan/question generation) for this tab
             if headlessRuntime.hasActiveStream(for: tabID) {
                 await cancelHeadlessStream(forTabID: tabID)
@@ -4116,7 +4177,8 @@ class OracleViewModel: ObservableObject {
     func cancelAIResponse(
         in sessionID: UUID, skipPartialParseAndSave: Bool = false,
         contextBuilderSuccessor: ContextBuilderOracleLaneScope? = nil,
-        cleanupOwnerIsCurrent: (@MainActor () -> Bool)? = nil
+        cleanupOwnerIsCurrent: (@MainActor () -> Bool)? = nil,
+        preserveGlobalRetryTask: Bool = false
     ) async {
         guard cleanupOwnerIsCurrent?() != false else { return }
         runStateBySession[sessionID]?.pendingAttachmentPreparationID = nil
@@ -4125,7 +4187,7 @@ class OracleViewModel: ObservableObject {
             return
         }
         // A grouped lane never owns the unrelated global retry task.
-        if contextBuilderSuccessor == nil {
+        if contextBuilderSuccessor == nil, !preserveGlobalRetryTask {
             activeRetryTask?.cancel()
             activeRetryTask = nil
         }
@@ -4272,10 +4334,11 @@ class OracleViewModel: ObservableObject {
         forQueryId queryId: UUID,
         sessionID: UUID,
         contextBuilderScope: ContextBuilderOracleLaneScope? = nil,
-        contextBuilderExpectedQueryID: UUID? = nil
+        contextBuilderExpectedQueryID: UUID? = nil,
+        backgroundQuery: OracleBackgroundInvocationRegistry.QueryIdentity? = nil
     ) async {
         let canCommit = {
-            self.canCommitContextBuilderLane(contextBuilderScope) &&
+            self.canCommitContextBuilderLane(contextBuilderScope, backgroundQuery: backgroundQuery) &&
                 (
                     contextBuilderExpectedQueryID == nil || self.runStateBySession[sessionID]?.activeQueryId == nil ||
                         self.runStateBySession[sessionID]?.activeQueryId == contextBuilderExpectedQueryID

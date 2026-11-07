@@ -26,6 +26,7 @@ struct AgentComposerActions {
     let claimSubmit: (_ attempt: AgentComposerSubmitAttempt) -> AgentModeViewModel.AgentComposerSubmitClaimResult
     let executeSubmit: (_ claim: AgentModeViewModel.AgentComposerSubmitClaim, _ text: String) async -> AgentModeViewModel.UserTurnSubmissionResult
     let cancelRun: (_ target: AgentRunCancelTarget) async -> Void
+    let cancelBackground: (_ target: OracleBackgroundCancelTarget) async -> Void
     let cancelRouting: (_ tabID: UUID) async -> Void
     let attachFiles: (_ tabID: UUID, _ urls: [URL]) async -> Void
     let reportAttachmentFailures: (_ tabID: UUID, _ failures: [AgentAttachmentFailure]) -> Void
@@ -160,6 +161,7 @@ struct AgentInputBar: View {
                 await agentModeVM.executePresentedComposerSubmitAttempt(text: text, claim: claim)
             },
             cancelRun: { target in _ = await agentModeVM.cancelAgentRun(target: target) },
+            cancelBackground: { target in _ = await agentModeVM.cancelOracleBackground(target: target) },
             cancelRouting: { tabID in await agentModeVM.cancelFreshTaskRouting(tabID: tabID) },
             attachFiles: { tabID, urls in
                 guard attachmentAdmission(tabID) else { return }
@@ -1016,6 +1018,11 @@ struct AgentComposerView: View, Equatable {
                     CancelButton(action: { Task { await actions.cancelRouting(tabID) } })
                 } else if let cancelTarget = props.cancelTarget {
                     CancelButton(action: { cancelRun(cancelTarget) })
+                } else if let target = props.backgroundStopTarget(inputText: localInputText) {
+                    CancelButton(source: .agentInput, tooltip: "Stop background Oracle requests") {
+                        Task { await actions.cancelBackground(target) }
+                    }
+                    .accessibilityLabel("Stop background Oracle requests")
                 } else {
                     SendOrResendButton(
                         inputText: localInputText,

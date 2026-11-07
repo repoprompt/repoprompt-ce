@@ -1441,6 +1441,7 @@ final class AgentModeRunService {
         let withdrawingProviderAdoption = dependencies.claudeCoordinator.hasPendingProviderAdoption(for: session)
             && session.activeRunOwnership == nil
         let providerTeardown = hooks.prepareForCancellation(session, intent, origin)
+        let oracleDrain = intent == .userStop && origin == .explicitStop ? hooks.oracleCancellationDrain(session) : nil
         if withdrawingProviderAdoption {
             if intent == .userStop, origin == .explicitStop {
                 withdrawQueuedWorkForManagedStop(tabID: tabID, session: session)
@@ -1454,6 +1455,7 @@ final class AgentModeRunService {
                 }
             }
             if completion == .terminalTeardownCompleted { await providerTeardown?() }
+            if let oracleDrain { _ = await OracleBackgroundInvocationRegistry.awaitDrain(oracleDrain, timeout: 30) }
             return
         }
         if session.runState == .cancelled,
@@ -1489,6 +1491,12 @@ final class AgentModeRunService {
                 // retiring; teardown completion must include it.
                 await providerTeardown?()
             }
+            if let oracleDrain { _ = await OracleBackgroundInvocationRegistry.awaitDrain(oracleDrain, timeout: 30) }
+            return
+        }
+        if oracleDrain != nil, !session.runState.isActive, session.activeRunOwnership == nil {
+            withdrawQueuedWorkForManagedStop(tabID: tabID, session: session)
+            if let oracleDrain { _ = await OracleBackgroundInvocationRegistry.awaitDrain(oracleDrain, timeout: 30) }
             return
         }
         hooks.interactions.cancelPendingQuestion(session)
@@ -1622,12 +1630,14 @@ final class AgentModeRunService {
                 )
             }
         ))
+        let oracleDrained: Bool = if let oracleDrain { await OracleBackgroundInvocationRegistry.awaitDrain(oracleDrain, timeout: 30) }
+        else { true }
         if completion == .terminalTeardownCompleted {
             await terminalCommitBarrier.awaitTerminalTeardown(
                 for: ownership,
                 lifecycle: cancellationLifecycle
             )
-            if committedRevision?.ownership == ownership {
+            if committedRevision?.ownership == ownership, oracleDrained {
                 outcomeRecorder?.recordTeardownCompleted()
             }
         }

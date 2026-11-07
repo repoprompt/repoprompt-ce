@@ -563,6 +563,14 @@ enum AgentTranscriptToolStatusSemantics {
         "timeout", "timed_out", "killed", "interrupted"
     ]
 
+    static func isBackgroundOracleResult(_ object: [String: Any]?) -> Bool {
+        guard let object else { return false }
+        if let code = object["code"] as? String, code.hasPrefix("oracle_background_") { return true }
+        if object["scope"] as? String == "current_process", object["turns"] is [Any] { return true }
+        guard let group = object["oracle_group_id"] as? String, let turn = object["oracle_turn_id"] as? String else { return false }
+        return UUID(uuidString: group) != nil && UUID(uuidString: turn) != nil
+    }
+
     static func normalizedStatusWord(_ raw: String?) -> String? {
         guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
               !raw.isEmpty
@@ -1604,6 +1612,11 @@ enum AgentTranscriptToolNormalizer {
             return .pending
         }
         let normalizedToolName = normalizedToolName(item.toolName) ?? ""
+        if ["ask_oracle", "oracle_chat_log"].contains(normalizedToolName),
+           AgentTranscriptToolStatusSemantics.isBackgroundOracleResult(resultObject), resultObject?["oracle_results"] == nil
+        {
+            return item.toolIsError == true ? .failed : .success
+        }
         if normalizedToolName == "agent_run" || normalizedToolName == "agent_explore" {
             if let status = transcriptStatusForAgentRunStatusWord(
                 stringValue(resultObject, keys: ["status"])
@@ -2974,6 +2987,7 @@ enum AgentTranscriptIO {
         else {
             return nil
         }
+        if AgentTranscriptToolStatusSemantics.isBackgroundOracleResult(object) { return nil }
         switch rawStatus {
         case "running", "in_progress", "pending":
             return rawStatus

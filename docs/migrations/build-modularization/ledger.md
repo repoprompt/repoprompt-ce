@@ -102,6 +102,21 @@ provider lifecycle, or persistence ownership; independently constructed instance
 tests. Future catalogue-service extraction should absorb this projection and remove this singleton,
 not duplicate it in individual registries. No other new global owner is authorized by this exception.
 
+## Ratchet exception — background Oracle invocations (2026-11-06)
+
+This is an explicit one-owner exception for `OracleBackgroundInvocationRegistry.shared`.
+After the M6 module extraction, `python3 Scripts/modularization_metrics.py check` measures
+**88** `app_static_shared_declarations`, within main's existing ceiling of **89**.
+The existing `ratchets.json` baseline is retained.
+
+The owner is the process-memory index of background Oracle invocations used by
+`ask_oracle`/`oracle_chat_log`, provider awareness, and session deletion, independent of
+window and run lifetimes. No existing initializer or hook supplies the registry to
+deletion after writer and attachment drains but before file removal, and after the
+commit reporter returns. App-owned runtime/store ownership and canonical durable result
+authority remain unchanged. This owner only tracks process-local workers, awareness,
+and drain completion. The exception authorizes no other global owner.
+
 ## Catalog runtime consolidation (2026-10-29)
 
 `AgentModelCatalogRuntime` replaces the independent advertised, ACP and Codex registry singletons with one application-owned runtime. It owns the existing memory-only admission index and lazily retains the same ACP and Codex registry implementations; provider locks, caches, persistence, warm/reset fences, and invalidation order remain unchanged. Registry-only access does not install the compatible-backend handler. The first advertised operation installs it before proceeding, without holding a runtime slot or activation lock across the registrar. Admission remains exact-ID and memory-only; producers capture generations before reading source snapshots. The existing ACP warm-to-advertised and backend-store-to-invalidation lock order is preserved, and the runtime does not acquire a registry while holding its index lock. The previous exception above is historical: the measured `app_static_shared_declarations` ratchet decreases from 89 to 87. Polling-service lifetimes and app-owned configuration/persistence are not retired by this change.
