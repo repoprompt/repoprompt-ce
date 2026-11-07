@@ -87,7 +87,7 @@ final class AgentSessionPresentationRuntimeTests: XCTestCase {
         let runtime = AgentSessionPresentationRuntime()
         let session = AgentTabSession(tabID: UUID())
         var presenter: Events? = Events()
-        weak var weakPresenter = presenter
+        weak let weakPresenter = presenter
         _ = try runtime.attach(session, sink: XCTUnwrap(presenter?.sink))
         let hooks = runtime.makeRunHooks()
         hooks.setAgentRunActive(session, true)

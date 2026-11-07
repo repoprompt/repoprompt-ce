@@ -53,8 +53,8 @@ final class AgentSessionRuntimeStoreTests: XCTestCase {
     func testBindingCallbackDoesNotRetainStoreOrSession() throws {
         var store: AgentSessionRuntimeStore.Scope? = AgentSessionRuntimeStore().makeScope()
         var session: AgentTabSession? = AgentTabSession(tabID: UUID())
-        weak var weakStore = store
-        weak var weakSession = session
+        weak let weakStore = store
+        weak let weakSession = session
         try store?.replaceSessions([XCTUnwrap(session?.tabID): XCTUnwrap(session)])
         let callback = session?.persistentSessionBindingDidChange
         session = nil
@@ -94,7 +94,7 @@ final class AgentSessionRuntimeStoreTests: XCTestCase {
     func testUnscopedBindingCannotAdmitWriterAndLeaseRetainsScope() throws {
         let store = AgentSessionRuntimeStore()
         var scope: AgentSessionRuntimeStore.Scope? = store.makeScope()
-        weak var retainedScope = scope
+        weak let retainedScope = scope
         let session = AgentTabSession(tabID: UUID())
         let workspaceID = UUID(), sessionID = UUID()
         session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID))

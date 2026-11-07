@@ -12,7 +12,7 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
         let runtime = try XCTUnwrap(fixture?.scope.persistence)
         let session = try XCTUnwrap(fixture?.session)
         let workspace = try XCTUnwrap(fixture?.placement.workspace)
-        weak var scope = fixture?.scope
+        weak let scope = fixture?.scope
         let entered = expectation(description: "Debounce admitted")
         var release: CheckedContinuation<Void, Never>?
         runtime.debounce = {

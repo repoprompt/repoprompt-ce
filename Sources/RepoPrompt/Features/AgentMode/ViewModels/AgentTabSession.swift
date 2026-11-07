@@ -1581,7 +1581,7 @@ final class AgentTabSession: ObservableObject {
         hasSentFirstMessage && !pendingHandoff.defersProviderLockUntilSend
     }
 
-    // Persistence
+    /// Persistence
     /// Synchronous derived-index maintenance for the runtime store owning this live object.
     var persistentSessionBindingDidChange: (() -> Void)?
     /// Process-local Oracle lifetime is independent of run attempts and parent provider teardown.

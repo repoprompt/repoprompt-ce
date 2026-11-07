@@ -18,7 +18,7 @@ final class AgentSessionAttachmentRuntimeTests: XCTestCase {
         let store = f.store
         let attachment = f.attachment
         let sessionID = try XCTUnwrap(session.activeAgentSessionID)
-        weak var scope = f.scope
+        weak let scope = f.scope
         let gate = TestReleaseFence(name: "runtime retention without presenter")
         await AgentSessionDataService.shared.test_setBeforeAttachmentRetentionHook { _ in await gate.enterAndWait() }
         addTeardownBlock {
@@ -64,7 +64,7 @@ final class AgentSessionAttachmentRuntimeTests: XCTestCase {
         let runtime = try XCTUnwrap(fixture?.scope.attachments)
         let session = try XCTUnwrap(fixture?.session)
         let attachment = try XCTUnwrap(fixture?.attachment)
-        weak var scope = fixture?.scope
+        weak let scope = fixture?.scope
         let gate = TestReleaseFence(name: "retention scope lifetime")
         await AgentSessionDataService.shared.test_setBeforeAttachmentRetentionHook { _ in await gate.enterAndWait() }
         addTeardownBlock {
@@ -259,7 +259,7 @@ final class AgentSessionStreamRuntimeTests: XCTestCase {
             var fixture: Fixture? = Fixture()
             let session = try XCTUnwrap(fixture?.session)
             let runtime = try XCTUnwrap(fixture?.scope.stream)
-            weak var scope = fixture?.scope
+            weak let scope = fixture?.scope
             let gate = TestReleaseFence(name: "runtime assistant delta")
             defer { gate.release() }
             runtime.assistantFlushDelay = { await gate.enterAndWait() }
@@ -581,7 +581,7 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         scope?.replaceSessions([session.tabID: session])
         let store = ApplyEditsApprovalStore()
         let runtime = try XCTUnwrap(scope).interactions(routeID: 42, approvalStore: store)
-        weak var retainedScope = scope
+        weak let retainedScope = scope
         let address = runtime.approvalScope(for: session)
         let (subscription, stream) = await store.subscribe(scope: address)
         var iterator = stream.makeAsyncIterator()
@@ -815,7 +815,7 @@ final class AgentSessionCodexRuntimeEffectsTests: XCTestCase {
 final class AgentSessionHandoffRuntimeTests: XCTestCase {
     func testWindowFreeRecoveryRetainsExactScopeAndDoesNotOverwriteAnotherPreparation() throws {
         var scope: AgentSessionRuntimeStore.Scope? = AgentSessionRuntimeStore().makeScope()
-        weak var weakScope = scope
+        weak let weakScope = scope
         let session = AgentTabSession(tabID: UUID())
         scope?.replaceSessions([session.tabID: session])
         let runtime = try XCTUnwrap(scope?.handoff)
@@ -873,7 +873,7 @@ final class AgentSessionHandoffRuntimeTests: XCTestCase {
 
     func testCancelledContextWaitCannotStageAndReleasesScopeAfterCompletion() async throws {
         var scope: AgentSessionRuntimeStore.Scope? = AgentSessionRuntimeStore().makeScope()
-        weak var weakScope = scope
+        weak let weakScope = scope
         let session = AgentTabSession(tabID: UUID())
         scope?.replaceSessions([session.tabID: session])
         let runtime = try XCTUnwrap(scope?.handoff)

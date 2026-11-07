@@ -6,7 +6,7 @@ import XCTest
 final class AgentSessionUsageRuntimeTests: XCTestCase {
     func testRunHooksRetainAccountingWithoutPresentationAndSaveOnlyAppendedTurn() throws {
         var runtime: AgentSessionUsageRuntime? = AgentSessionUsageRuntime()
-        weak var retained = runtime
+        weak let retained = runtime
         let session = AgentTabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.selectedModelRaw = "sonnet"

@@ -4314,3 +4314,48 @@ VM fallback publication also captures whether a runtime existed before the callb
 Final corrected ticket `01b26cec-fa0f-45d3-82ec-811e9fbc3e1c` passed **201 tests**
 (the same suites above, draft restoration now 12, with both route integration cases
 included). Final lint `2ccb656a-316a-44d2-8ded-9b937c83fa13` passed this Swift tree.
+
+### M9 CI repair and main reconciliation (2026-11-08)
+
+Merged current main `58e3e33de449e80e3b9a372d49bbf9be1d7bec53` without rewriting
+history (`c1c9fd5c4`). The sole textual conflict was the persistence-owner comment
+in `AgentTabSession`; runtime-store ownership and main's Oracle-background fields
+were both retained. Main's Oracle cancellation/drain and transcript-rendering
+changes remain intact. The user redirected work to this merge and CI repair;
+clean-build ticket `8e55d34d-9949-4157-bd3b-76d3a46c7aa7` was cancelled, not passed.
+
+The full artifact for hosted run `42373863311`, job `128407913364`, shows a
+successful compilation and passing type-check counts (6/10 bodies, 3/6
+expressions), followed by a **439/430 first-party warning-ratchet failure**.
+Nine diagnostics were introduced by M9's never-reassigned weak local lifetime
+witnesses. These, plus three equivalent witnesses in the subsequent local M9
+commits, now use `weak let`. Weak ownership, deallocation assertions, cancellation
+checks and runtime behavior are unchanged; no warning limit was increased.
+Independent review found no issues with this bounded test correction.
+
+The merged tree's clean enforcing build `f93f3640-40e7-4786-a3ae-00604ae952a7`
+compiled successfully and removed all targeted diagnostics, but **did not pass**
+the aggregate warning gate: 449/430 on local Xcode 27.0 / Swift 6.4, versus the
+hosted job's Xcode 26.6 / Swift 6.3.3. A normalized diagnostic comparison shows
+additional diagnostics outside these test edits, including newer capture,
+SwiftUI macro and C conversion diagnostics. Type-check counts passed at 5/10
+bodies and 2/6 expressions. This is not a clean-warning receipt; hosted-toolchain
+confirmation remains necessary. No unrelated warning cleanup or suppression was
+added to make the newer local compiler fit the older budget.
+
+Product ticket `9eaa842b-5d1a-4f19-abe0-131f26b12374` passed both products. Its
+fresh compiler-index check passed at **1,225/1,360 wrong-way file edges** and
+**53/66 cycle components**. Focused ticket
+`e5249b2c-f9e6-46b9-a7fd-dab38af83ef9` passed **141 tests** across the runtime
+lifetime/effect suites, managed Stop, Claude approval/resume and Oracle-group
+cancellation integration. Initial lint `fd296860-25ed-4285-adfb-885a378ff239`
+found one merged documentation-comment formatting issue; the pinned formatter
+corrected only that comment after the build/test receipts. No test rerun is
+claimed for the comment-only correction. Final lint
+`01fb3aeb-2426-46eb-bba6-1c139fdb7750` passed. The merge commit passed the mandatory
+staged preflight; the repair commit and push use the same staged/outgoing safety
+gates. Hosted CI must confirm the new published head.
+
+M9 is still partial: independent writer admission and window-free execution/
+handoff remain open, along with complete-suite and live-smoke qualification.
+This repair does not claim M9 completion. No visible app lifecycle action occurred.
