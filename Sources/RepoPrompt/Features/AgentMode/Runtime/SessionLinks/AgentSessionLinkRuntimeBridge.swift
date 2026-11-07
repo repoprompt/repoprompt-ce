@@ -9028,7 +9028,9 @@ final class AgentSessionLinkRuntimeBridge {
             guard !host.agentSessionLinkHasActiveChildSessions(parentSessionID: targetSessionID) else {
                 return false
             }
-            let live = host.agentSessionLinkCandidates().filter { $0.sessionID == targetSessionID }
+            let live = host.agentSessionLinkCandidates(
+                forSessionIDs: [targetSessionID], includeLocation: false
+            )[targetSessionID] ?? []
             return live.count == 1 && live[0].domainEndpoint == endpoint
         }
         // Preflight performs the required-session flush, the stash cascade's claim checks, and the
