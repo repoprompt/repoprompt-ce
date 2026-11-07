@@ -3233,6 +3233,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     var mcpRuntime: AgentSessionMCPRuntime {
         let runtime = runtimeSessionStore.mcp
+        if let mcpServer { runtime.installRunRoute(id: windowID, bindings: mcpServer.runRouteBindings) }
         if runtime.metadata == nil {
             runtime.metadata = .init(
                 sessionName: { [weak self] session, sessionID in
@@ -16051,8 +16052,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ token: AgentSessionLinkRunCatalogRouteToken,
         tabID: UUID
     ) -> Bool {
-        guard token.observerEndpoint.windowID == windowID else { return false }
-        return mcpServer?.hasCurrentRunCatalogRouteToken(token, expectedTabID: tabID) == true
+        mcpRuntime.hasCurrentRunCatalogRouteToken(token, tabID: tabID)
     }
 
     /// Submit a user message to the agent

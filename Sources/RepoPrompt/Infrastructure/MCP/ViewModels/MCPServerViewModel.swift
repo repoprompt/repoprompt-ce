@@ -2316,9 +2316,19 @@ final class MCPServerViewModel: ObservableObject {
         )
     }
 
-    /// Presentation snapshot cache. Domain routing remains the only routing authority.
+    /// Shared mapping storage. The legacy server still owns route availability until
+    /// runtime-host composition replaces it; retained maps alone never authorize dispatch.
     @MainActor
-    var tabContextByConnectionID: [UUID: TabContextSnapshot] = [:]
+    private let runRouteOwnerLifetime = MCPRunRouteBindings.OwnerLifetime()
+    @MainActor
+    lazy var runRouteBindings = MCPRunRouteBindings(ownerLifetime: runRouteOwnerLifetime)
+    @MainActor
+    var tabContextByConnectionID: [UUID: TabContextSnapshot] {
+        get { runRouteBindings.tabContextByConnectionID }
+        set { runRouteBindings.tabContextByConnectionID = newValue }
+        _modify { yield &runRouteBindings.tabContextByConnectionID }
+    }
+
     @MainActor
     var detachedContextBuilderTabContextByRunID: [UUID: DetachedContextBuilderTabContext] = [:]
     @MainActor
@@ -2336,13 +2346,33 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     var pendingRunScopedTabContexts = PendingRunScopedContextStore()
     @MainActor
-    var connectionIDByRunID: [UUID: UUID] = [:]
+    var connectionIDByRunID: [UUID: UUID] {
+        get { runRouteBindings.connectionIDByRunID }
+        set { runRouteBindings.connectionIDByRunID = newValue }
+        _modify { yield &runRouteBindings.connectionIDByRunID }
+    }
+
     @MainActor
-    var connectionIDToRunID: [UUID: UUID] = [:]
+    var connectionIDToRunID: [UUID: UUID] {
+        get { runRouteBindings.connectionIDToRunID }
+        set { runRouteBindings.connectionIDToRunID = newValue }
+        _modify { yield &runRouteBindings.connectionIDToRunID }
+    }
+
     @MainActor
-    var pendingPolicyRunIDMappingTokenIDByRunID: [UUID: UUID] = [:]
+    var pendingPolicyRunIDMappingTokenIDByRunID: [UUID: UUID] {
+        get { runRouteBindings.pendingPolicyTokenIDByRunID }
+        set { runRouteBindings.pendingPolicyTokenIDByRunID = newValue }
+        _modify { yield &runRouteBindings.pendingPolicyTokenIDByRunID }
+    }
+
     @MainActor
-    var presentationWindowByConnection: [UUID: Int] = [:]
+    var presentationWindowByConnection: [UUID: Int] {
+        get { runRouteBindings.presentationWindowByConnection }
+        set { runRouteBindings.presentationWindowByConnection = newValue }
+        _modify { yield &runRouteBindings.presentationWindowByConnection }
+    }
+
     let domainRoutingCoordinator: DomainRoutingCoordinator?
     let domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient?
     let domainReadSideEffectCoordinator: DomainReadSideEffectCoordinator

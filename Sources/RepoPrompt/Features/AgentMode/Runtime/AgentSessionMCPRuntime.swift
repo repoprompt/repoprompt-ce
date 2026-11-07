@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
+import RepoPromptMCPServer
 
 /// Runtime-owned remote projections and publication. DomainAgentRunSessionStore and the
 /// terminal commit barrier remain the only lifecycle/terminal authorities. Presentation
@@ -73,6 +74,23 @@ final class AgentSessionMCPRuntime {
 
     private weak var scope: AgentSessionRuntimeStore.Scope?
     var metadata: Metadata?
+    /// Retains the actual mapping projection, never its presentation model. Cleanup
+    /// shares this storage; transport and owner-availability fences reject stale maps.
+    private var runRoute: (id: Int, bindings: MCPRunRouteBindings)?
+
+    func installRunRoute(id: Int, bindings: MCPRunRouteBindings) {
+        if let runRoute {
+            precondition(runRoute.id == id && runRoute.bindings === bindings)
+            return
+        }
+        runRoute = (id, bindings)
+    }
+
+    func hasCurrentRunCatalogRouteToken(_ token: AgentSessionLinkRunCatalogRouteToken, tabID: UUID) -> Bool {
+        guard let runRoute, token.observerEndpoint.windowID == runRoute.id else { return false }
+        return runRoute.bindings.hasCurrentCatalogRouteToken(token, expectedTabID: tabID)
+    }
+
     weak var codexCoordinator: CodexAgentModeCoordinator?
     weak var claudeCoordinator: ClaudeAgentModeCoordinator?
     var pendingAgentRunOracleReviewContextsBySessionID: [UUID: PendingAgentRunOracleReviewContext] = [:]

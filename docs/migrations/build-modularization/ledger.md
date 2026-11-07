@@ -4460,3 +4460,62 @@ runtime-addressed commands, presentation-preserving handoff/drain, and final who
 qualification remain open. This receipt does not qualify the full app product, a fresh
 compiler index, the aggregate warning ratchet, the full test suite, or live smoke.
 M10 is untouched. No push, PR edit or visible app lifecycle action occurred.
+
+### M9 continuation — runtime-owned route mappings and saved-target CI fixture (2026-11-08)
+
+Retired MCPServerViewModel's storage ownership of the five synchronous run/connection
+projection maps. `MCPRunRouteBindings` owns their actual storage, registration,
+replacement, pending-policy token capture and generation-fenced rollback. Existing
+view-model accessors use `_modify` to mutate the same dictionaries without a copied
+mirror or per-mutation copy-on-write cost. Context promotion, domain publication,
+read-selection handover and transport replacement effects retain their existing owners
+and ordering. DomainRoutingCoordinator remains the routing authority.
+
+AgentSessionMCPRuntime now retains the concrete mapping owner, not the MCP view model,
+and performs the final exact route/tab, bidirectional mapping and live-connection fence.
+A composition-owned availability witness preserves refusal when the legacy server is
+gone: retaining a stale map cannot by itself authorize dispatch. This witness grants
+no domain authority and does not choose a session writer. The legacy server still owns
+route availability; the actual independent host and canonical endpoint routing remain
+unfinished. Rollback checks its token before running synchronous context cleanup, so
+an obsolete token cannot clean up a successor or resurrect a displaced pending policy.
+
+Three standalone tests construct no window or view model and cover exact mapping,
+replacement/rollback generations and retained storage with owner loss. Existing real
+transport-removal tests now call the runtime fence and check absent/wrong-route hosts,
+then prove removal refuses physical provider dispatch while the mapping still exists.
+The change received one independent review. The review's lifetime finding prompted the
+availability witness; existing per-VM scope and immutable route composition were verified.
+
+Initial `07ea97b3-04e9-454b-be30-baeb53c9adee` failed compilation before tests because
+new files lacked the explicit MCPServer token import; imports were corrected.
+`8515640a-436c-4f0b-a942-372600aede24` ran 102 tests with two failing cases (six
+assertions): clearing the fixture's final-fence hook enabled its synthetic-route test
+bypass. The corrected fixture explicitly calls the real runtime fence rather than a
+simulated boolean. `5dbfad89-717a-4c50-b049-058abd9afb1b` then passed all 102 routing
+cases and reproduced the separate hosted inventory failure with its exact refusal.
+
+Published-head CI run `42400768704` at `24521f822` completed: build/static gates and
+shards 1–3 passed; shard 4 failed the reduced-consent approval test. The Style job was
+an aggregate prerequisite failure, not a formatter failure. Local reproduction showed
+`target_not_preparable / target_missing`: that fixture created only an in-memory index
+row, not the saved target required before requesting consent. It now saves the exact
+target through AgentSessionDataService, explicitly disables global auto-approval for
+this card-flow test, cleans up its scope, and also asserts no management link was made.
+Production missing-target and capability guards are unchanged; no timeout was increased.
+
+Final `010e53ab-0562-44f4-85ce-d8ea0bc55a43` passed **178 tests**: Codex adapters 41,
+native/headless adapters 31, runtime MCP 8, Context Builder transactions 19, route
+bindings 3, and the complete inventory-read suite 76. The apparent drain-test stall
+was not established: the process finished before a read-only sample could attach,
+and that case passed in 5.6 seconds. No job was cancelled. Lint
+`49dbdc5d-ccff-4e9a-8f49-22ea5a609e2c` passed the intermediate tree; final lint
+`047d27bd-365f-4301-80b5-b6d673445815` passed after the fixture corrections. Subsequent
+source edits only clarify ownership comments. Scoped formatting, direct diff review
+and mandatory staged contribution preflight apply to this checkpoint.
+
+M9 still needs independent writer admission, canonical window-free saved execution,
+remaining provider-input/command composition and presentation-preserving handoff/drain.
+Fresh final products/index, aggregate warning enforcement, full-suite and live-smoke
+qualification are not supplied by these focused receipts. The hosted fix is local and
+unpublished. No push, PR edit, merge, visible app lifecycle action or M10 target move.

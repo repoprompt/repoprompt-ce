@@ -8979,6 +8979,15 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             }
             try observerFixture.installCarriers()
             try targetFixture.installCarriers()
+            // This test exercises reduced consent for a saved target, not the earlier
+            // missing-target refusal. An in-memory inventory row is not saved authority.
+            let targetTab = try XCTUnwrap(targetFixture.carriers?.composeTabs.first)
+            let targetWorkspace = try XCTUnwrap(targetFixture.window.workspaceManager.activeWorkspace)
+            let targetID = try XCTUnwrap(targetTab.activeAgentSessionID)
+            _ = try await AgentSessionDataService.shared.saveAgentSession(
+                AgentSession(id: targetID, workspaceID: targetWorkspace.id, composeTabID: targetTab.id, name: targetTab.name),
+                for: targetWorkspace
+            )
             let vm = observerFixture.window.agentModeViewModel
             let tab = try XCTUnwrap(observerFixture.carriers?.composeTabs.first)
             let sessionID = try XCTUnwrap(tab.activeAgentSessionID)
@@ -8990,13 +8999,23 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             let target = try XCTUnwrap(targetFixture.carriers?.composeTabs.first?.activeAgentSessionID)
             let bridge = AgentSessionLinkRuntimeBridge.shared
             var notices: [String] = []
+            let previousGlobal = bridge.delegationScopes.isGlobalAutoApproveEnabled
+            bridge.delegationScopes.isGlobalAutoApproveEnabled = { false }
             bridge.delegationScopes.test_scopeDecision = { _, text in notices.append(text) }
-            addTeardownBlock { @MainActor in bridge.delegationScopes.test_scopeDecision = nil }
+            addTeardownBlock { @MainActor in
+                bridge.delegationScopes.test_scopeDecision = nil
+                for scope in bridge.delegationScopes.allLiveScopes() where scope.grant.granteeSessionID == sessionID {
+                    bridge.delegationScopes.revoke(scopeID: scope.id)
+                }
+                bridge.delegationScopes.isGlobalAutoApproveEnabled = previousGlobal
+            }
             let response = await bridge.requestTargetedOversight(observer: endpoint, targetSessionID: target, message: "say hi", idempotencyKey: UUID().uuidString)
-            guard case let .string(rawID) = response.objectValue?["request_id"], let id = UUID(uuidString: rawID) else { return XCTFail("Expected one card") }
+            guard case let .string(rawID) = response.objectValue?["request_id"], let id = UUID(uuidString: rawID) else { return XCTFail("Expected one card; received \(response)") }
             _ = try bridge.delegationScopes.approve(requestID: id, capabilities: [.observe]).get()
             try await AsyncTestWait.waitUntil("precise reduced-consent notice") { notices.contains { $0.contains("missing_capabilities=control,restructure") } }
             XCTAssertFalse(notices.contains { $0.contains("task_delivered") || $0.contains("caller_changed_or_scope_revoked") })
+            let link = await bridge.delegationActiveLink(observerSessionID: sessionID, targetSessionID: target)
+            XCTAssertNil(link, "Reduced consent must not establish a management link")
         }
     }
 
