@@ -27,7 +27,7 @@ extension AgentModeViewModel {
               !oracleBackgroundRegistry.admissionIsClosed(for: owner),
               oracleBackgroundRegistry.awarenessVersion(for: owner).epoch == epoch
         else { return nil }
-        return .init(owner: owner, epoch: epoch, session: session)
+        return .init(owner: owner, epoch: epoch, session: session, parentTerminalCommitID: session.lastTerminalCommitRevision?.commitID)
     }
 
     @discardableResult

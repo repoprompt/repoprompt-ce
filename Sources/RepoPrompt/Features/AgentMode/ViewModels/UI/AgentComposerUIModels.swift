@@ -131,9 +131,11 @@ struct OracleBackgroundCancelTarget: Equatable {
     let owner: OracleBackgroundInvocationRegistry.Owner
     let epoch: UUID
     weak var session: AgentTabSession?
+    var parentTerminalCommitID: UUID?
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.owner == rhs.owner && lhs.epoch == rhs.epoch && lhs.session === rhs.session
+            && lhs.parentTerminalCommitID == rhs.parentTerminalCommitID
     }
 }
 
