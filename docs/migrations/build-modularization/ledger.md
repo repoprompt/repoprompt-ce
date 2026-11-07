@@ -4108,3 +4108,47 @@ not this new integration. Full-suite qualification and live smoke remain unclaim
 General independent writer admission, real run-host/input/factory/continuation
 composition, window-free saved execution and presentation-preserving close remain
 open. No push, PR-state mutation, merge, or app lifecycle action was performed.
+
+### M9 continuation — self-compaction consumes the runtime writer (2026-11-08)
+
+Retired self-compaction's same-VM/all-windows competing-writer scan. Admission and
+its deferred compact/note owner fences now resolve the process-owned exact writer,
+including scopes with no window or view model. Workspace, session, exact live object,
+tab and binding generation must match. A retiring scope refuses new admission and
+provider dispatch without revoking its originating final-save capability. A same-key
+replay of an already acknowledged reservation remains a query and can report its
+existing receipt during retirement; it does not admit or dispatch new work.
+
+Failing-first ticket `089a822e-e9a6-4ce5-b6e1-6d65a7d2a792` reproduced the old
+window-census defect (one test, three assertion failures): a window-free competitor
+was missed, a reservation/key was spent, and required save then failed before IO;
+removing the competitor could no longer admit a fresh retry with that key. The
+regression now distinguishes pre-admission refusal from the separately covered
+post-write indeterminate receipt. Coverage also exercises retirement before admission,
+retirement during required save, and a window-free competitor or retirement after an
+acknowledged receipt but before deferred provider dispatch.
+
+Ticket `701ff66e-9197-4c6e-9938-b1bf8175c6b1` failed before tests: the deferred-owner
+fence still referenced the deleted helper. Review caught the same remaining caller;
+it now uses the exact runtime authority too. No duplicate window scan remains in this
+self-compaction path. Ticket `f3a6ca02-c4e9-4405-b500-a156742146a5` executed 45 tests
+with three retirement-fixture failures. The ordinary test VM is not a prepared workspace
+projection, so its guarded prepared-window retirement adapter correctly did nothing.
+The fixtures now enter retirement through their exact runtime writer's scope; no
+production guard or timeout was loosened. Lint `e9ef7ea8-87bf-410b-9a0c-987fb6a90705`
+passed before that fixture correction. Corrected broader validation receipts follow;
+this is a consumer cutover, not completion of general first-mutation admission or the
+window-free execution host.
+
+Corrected expanded ticket `165239bf-b387-4d05-8f99-a5a6565eca74`
+(`m9-compact-writer-v4`) passed **169 tests**: 168 selected app tests across native/ACP
+self-compaction state, scheduler, completion, actual transactions and related link
+consumers, plus one domain tool-catalog policy case. This includes all 30 compaction
+transaction tests (four new admission/retirement cases), nine runtime-store cases,
+four real payload-writer cases and both Codex runtime-effects cases. The regex also
+selects individual compaction-related methods in other link suites; this is not a
+claim that those entire suites ran. Final lint
+`c360db7f-bbbe-426c-9aa2-22ca5a3c7cfa` passed the same Swift tree. No baseline increase,
+push, PR change or visible-app lifecycle action occurred. General writer admission and
+the actual window-free run-host/routing replacement remain open; the incomplete full
+suite recorded above has not been converted into a passing receipt.
