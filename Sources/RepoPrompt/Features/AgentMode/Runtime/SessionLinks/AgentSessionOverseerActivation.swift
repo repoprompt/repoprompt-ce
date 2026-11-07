@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 
 /// Explicit opt-in belongs to one session object and exact binding, never to a run/controller or UUID.

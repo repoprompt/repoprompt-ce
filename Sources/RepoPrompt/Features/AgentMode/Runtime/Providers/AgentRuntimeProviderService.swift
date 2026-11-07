@@ -1,5 +1,10 @@
 import Foundation
 import Logging
+import RepoPromptACPProviders
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
+import RepoPromptClaudeProvider
+import RepoPromptCodexProvider
 import RepoPromptProcess
 import RepoPromptSettingsCore
 
@@ -50,15 +55,10 @@ final class AgentRuntimeProviderService {
             )
             processConfig.ensureAdditionalPaths(config.additionalPathHints)
             let runner = CLIProcessRunner(config: processConfig)
-            let wrappedProvider = ClaudeCodeAgentProvider(runner: runner, config: config)
-            let runtimeConfig = ClaudeCompatiblePluginBridge.runtimeConfig(from: config, mode: .discovery)
             if Self.enableDebugLogging {
-                Self.logger.debug("Created ClaudeCompatibleHeadlessProviderAdapter")
+                Self.logger.debug("Created ClaudeCodeAgentProvider")
             }
-            return ClaudeCompatibleHeadlessProviderAdapter(
-                runtimeConfig: runtimeConfig,
-                wrappedProvider: wrappedProvider
-            )
+            return ClaudeCodeAgentProvider(runner: runner, config: config)
         case .codexExec:
             let config = CodexExecAgentConfig(
                 modelString: modelString,

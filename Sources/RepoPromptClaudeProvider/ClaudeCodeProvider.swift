@@ -1,0 +1,802 @@
+import CoreFoundation
+import Foundation
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
+import RepoPromptDomainRuntime
+import RepoPromptProcess
+
+package typealias ClaudeCLIConfigLease = LaunchConfigLease
+
+package protocol ClaudeCLIConfigPreparing: Actor {
+    func prepareClaudeEmptyLaunchConfig() throws -> any ClaudeCLIConfigLease
+}
+
+package struct ClaudeCLIPromptDelivery {
+    package let sendsRepoPromptAsUserMessage: () -> Bool
+    package let nativeSystemPromptOverride: (String) -> String?
+
+    package init(sendsRepoPromptAsUserMessage: @escaping () -> Bool, nativeSystemPromptOverride: @escaping (String) -> String?) {
+        self.sendsRepoPromptAsUserMessage = sendsRepoPromptAsUserMessage
+        self.nativeSystemPromptOverride = nativeSystemPromptOverride
+    }
+}
+
+package struct ClaudeCLICompatibleDescriptor {
+    package let variant: ClaudeCodeRuntimeVariant
+    package let requestedModel: String?
+
+    package init(variant: ClaudeCodeRuntimeVariant, requestedModel: String?) {
+        self.variant = variant
+        self.requestedModel = requestedModel
+    }
+}
+
+package struct ClaudeCodeCLIModelSelection: Equatable {
+    package let modelArgument: String?
+    package let effortLevel: ClaudeCodeEffortLevel?
+
+    package init(modelArgument: String?, effortLevel: ClaudeCodeEffortLevel?) {
+        self.modelArgument = modelArgument
+        self.effortLevel = effortLevel
+    }
+}
+
+package struct ClaudeCLIOptions {
+    package init() {}
+    var printMode: Bool = true
+    var verbose: Bool = false
+    var maxTurns: Int?
+    var allowedTools: [String] = []
+    var disallowedTools: [String] = []
+    var permissionMode: String?
+    var permissionPromptToolName: String?
+    var model: String?
+    var effortLevel: ClaudeCodeEffortLevel?
+    var mcpConfigPath: String?
+    var systemPromptOverride: String?
+    var inputFormat: String?
+    var timeout: TimeInterval?
+    var environmentOverrides: [String: String] = [:]
+    var removedEnvironmentKeys: Set<String> = []
+
+    var additionalEnvironment: [String: String] {
+        var environment = environmentOverrides
+        if let effortLevel {
+            environment["CLAUDE_CODE_EFFORT_LEVEL"] = effortLevel.envValue
+        }
+        return environment
+    }
+
+    package func toTokens() -> [String] {
+        var tokens: [String] = []
+        if printMode { tokens.append("-p") }
+        if verbose { tokens.append("--verbose") }
+        if let maxTurns { tokens.append(contentsOf: ["--max-turns", String(maxTurns)]) }
+        if !allowedTools.isEmpty { tokens.append(contentsOf: ["--allowedTools", allowedTools.joined(separator: ",")]) }
+        if !disallowedTools.isEmpty { tokens.append(contentsOf: ["--disallowedTools", disallowedTools.joined(separator: ",")]) }
+        if let permissionPromptToolName { tokens.append(contentsOf: ["--permission-prompt-tool", permissionPromptToolName]) }
+        if let permissionMode { tokens.append(contentsOf: ["--permission-mode", permissionMode]) }
+        if let model { tokens.append(contentsOf: ["--model", model]) }
+        if let systemPromptOverride { tokens.append(contentsOf: ["--system-prompt", systemPromptOverride]) }
+        if let inputFormat { tokens.append(contentsOf: ["--input-format", inputFormat]) }
+        if let mcpConfigPath {
+            tokens.append(contentsOf: ["--mcp-config", mcpConfigPath])
+            // Use strict mode to ignore project-level MCP configs from ~/.claude.json
+            // This prevents the CLI from trying to start stale MCP servers based on working directory
+            tokens.append("--strict-mcp-config")
+        }
+        return tokens
+    }
+}
+
+package final class ClaudeCodeProvider: AIProvider {
+    package enum CompletionUsageMode {
+        case raw
+        case nativeClaudeTerminal
+    }
+
+    private let runner: CLIProcessRunner
+    private let decoder: JSONDecoder
+    private let configService: any ClaudeCLIConfigPreparing
+    private let resolveModelSelection: (AIModel) throws -> ClaudeCodeCLIModelSelection
+    private let environmentFilter: (AgentProviderKind) -> CLIProcessConfiguration.EnvironmentFilter
+    private let currentPromptDelivery: () -> ClaudeCLIPromptDelivery
+    private let decorateUserMessage: (String, String) -> String
+    private let compatibleDescriptor: (AIModel) -> ClaudeCLICompatibleDescriptor?
+    private let makeLaunchResolver: () -> any ClaudeCodeLaunchEnvironmentResolving
+    private let disallowedTools: [String] = [
+        "Bash",
+        "BashOutput",
+        "KillShell",
+        "Monitor",
+        "Read",
+        "Write",
+        "Edit",
+        "Glob",
+        "Grep",
+        "Agent",
+        "Task",
+        "TaskOutput",
+        "TaskStop",
+        "Workflow",
+        "ListAgents",
+        "SendMessage",
+        "WebFetch",
+        "WebSearch",
+        "SlashCommand",
+        "NotebookEdit",
+        "TodoWrite",
+        "EnterPlanMode",
+        "ExitPlanMode",
+        "EnterWorktree",
+        "ExitWorktree",
+        "Skill",
+        "CronCreate",
+        "CronDelete",
+        "CronList",
+        "RemoteTrigger",
+        "AskUserQuestion",
+        "ScheduleWakeup",
+        "PushNotification"
+    ]
+
+    private let defaultRequestTimeout: TimeInterval
+    private let testRequestTimeout: TimeInterval
+    private let maxRetries: Int
+    private let livenessHeartbeatInterval: TimeInterval
+    private let initialBackoff: TimeInterval = 1.0
+    private let maxBackoff: TimeInterval = 8.0
+
+    /// Required inputs for app-free provider composition.
+    package init(
+        composedRunner: CLIProcessRunner,
+        configService: any ClaudeCLIConfigPreparing,
+        resolveModelSelection: @escaping (AIModel) throws -> ClaudeCodeCLIModelSelection,
+        environmentFilter: @escaping (AgentProviderKind) -> CLIProcessConfiguration.EnvironmentFilter,
+        currentPromptDelivery: @escaping () -> ClaudeCLIPromptDelivery,
+        decorateUserMessage: @escaping (String, String) -> String,
+        compatibleDescriptor: @escaping (AIModel) -> ClaudeCLICompatibleDescriptor?,
+        makeLaunchResolver: @escaping () -> any ClaudeCodeLaunchEnvironmentResolving,
+        defaultRequestTimeout: TimeInterval,
+        testRequestTimeout: TimeInterval,
+        maxRetries: Int,
+        livenessHeartbeatInterval: TimeInterval
+    ) {
+        runner = composedRunner
+        self.configService = configService
+        self.resolveModelSelection = resolveModelSelection
+        self.environmentFilter = environmentFilter
+        self.currentPromptDelivery = currentPromptDelivery
+        self.decorateUserMessage = decorateUserMessage
+        self.compatibleDescriptor = compatibleDescriptor
+        self.makeLaunchResolver = makeLaunchResolver
+        decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        self.defaultRequestTimeout = defaultRequestTimeout
+        self.testRequestTimeout = testRequestTimeout
+        self.maxRetries = maxRetries
+        self.livenessHeartbeatInterval = livenessHeartbeatInterval
+    }
+
+    /// The CLI returns its JSON only after the child exits, so the stream reports
+    /// transport liveness while that request is still in flight (#803).
+    package func streamMessage(_ aiMessage: RepoPromptDomainRuntime.AIMessage, model: AIModel, maxTokens: Int? = nil) async throws -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
+        ProviderPendingCompletionStream.make(heartbeatInterval: livenessHeartbeatInterval) { [self] in
+            try await completeMessage(aiMessage, model: model, maxTokens: maxTokens)
+        }
+    }
+
+    /// Genuine request-scoped print streaming. No tools, workspace, inherited MCP or global preference mutation.
+    package func streamMessage(
+        _ aiMessage: RepoPromptDomainRuntime.AIMessage, model: AIModel,
+        promptDelivery: ClaudeCLIPromptDelivery
+    ) async throws -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task { [self] in
+                do {
+                    let lease = try await configService.prepareClaudeEmptyLaunchConfig()
+                    defer { lease.release() }
+                    var options = try await makeOptions(for: aiMessage, model: model, emptyConfigURL: lease.url)
+                    options.verbose = true
+                    options.systemPromptOverride = promptDelivery.nativeSystemPromptOverride(aiMessage.systemPrompt)
+                    let prompt = buildPrompt(from: aiMessage)
+                    let stream = try await runner.runStreaming(
+                        args: options.toTokens() + ["--include-partial-messages", "--tools", ""],
+                        stdin: promptDelivery.sendsRepoPromptAsUserMessage()
+                            ? decorateUserMessage(prompt, aiMessage.systemPrompt) : prompt,
+                        outputMode: .auto(.streamJson), timeout: options.timeout,
+                        additionalEnvironment: options.additionalEnvironment, additionalRemovedKeys: options.removedEnvironmentKeys
+                    )
+                    var decoder = ClaudeCLITextStreamDecoder()
+                    var terminated = false
+                    for try await event in stream {
+                        try Task.checkCancellation()
+                        switch event {
+                        case let .stdout(data):
+                            for text in try decoder.append(data) {
+                                continuation.yield(.init(type: "content", text: text))
+                            }
+                        case let .terminated(status, timedOut):
+                            guard status == 0, !timedOut else { throw AIProviderError.invalidResponse(detail: "Claude stream did not exit successfully") }
+                            terminated = true
+                        case .stderr: break
+                        }
+                    }
+                    for text in try decoder.finish() {
+                        continuation.yield(.init(type: "content", text: text))
+                    }
+                    guard terminated else { throw CancellationError() }
+                    continuation.yield(.init(type: "message_stop", text: nil))
+                    continuation.finish()
+                } catch is ClaudeCLITextStreamFailure {
+                    continuation.yield(.init(type: AIStreamResult.incompleteType, text: nil))
+                    continuation.finish()
+                } catch { continuation.finish(throwing: error) }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    package func completeMessage(_ aiMessage: RepoPromptDomainRuntime.AIMessage, model: AIModel, maxTokens: Int? = nil) async throws -> RepoPromptDomainRuntime.AICompletionResult {
+        try await completeMessage(
+            aiMessage, model: model, maxTokens: maxTokens,
+            promptDelivery: currentPromptDelivery()
+        )
+    }
+
+    /// Request-scoped delivery; isolated callers must not mutate the user's preference.
+    func completeMessage(
+        _ aiMessage: AIMessage, model: AIModel, maxTokens: Int?,
+        promptDelivery nativePromptMode: ClaudeCLIPromptDelivery
+    ) async throws -> AICompletionResult {
+        let basePrompt = buildPrompt(from: aiMessage)
+        let prompt = nativePromptMode.sendsRepoPromptAsUserMessage()
+            ? decorateUserMessage(basePrompt, aiMessage.systemPrompt)
+            : basePrompt
+        let emptyConfigLease = try await configService.prepareClaudeEmptyLaunchConfig()
+        defer { emptyConfigLease.release() }
+        var options = try await makeOptions(for: aiMessage, model: model, emptyConfigURL: emptyConfigLease.url)
+        let usageMode = try completionUsageMode(for: model)
+        options.systemPromptOverride = nativePromptMode.nativeSystemPromptOverride(aiMessage.systemPrompt)
+        if options.timeout == nil {
+            options.timeout = defaultRequestTimeout
+        }
+        // Preserve every assistant message, including replies continued after max_tokens.
+        options.verbose = true
+        let planned = try AttachmentEncoding.plan(aiMessage.attachments, route: .claudeCodeStreamJSON)
+        let usesStreamJSONOutput = planned.contains { $0.inlineTextBlock == nil }
+        let stdin: String
+        if usesStreamJSONOutput {
+            Self.applyStreamJSONImageTransport(to: &options)
+            stdin = try Self.makeStreamJSONInput(prompt: prompt, attachments: aiMessage.attachments)
+        } else {
+            stdin = AttachmentEncoding.prependingInlineText(of: planned, to: prompt)
+        }
+        let args = options.toTokens()
+
+        var attempt = 0
+        var delay = initialBackoff
+
+        while true {
+            let result: CLIProcessRunner.Result
+            do {
+                result = try await runner.run(
+                    args: args,
+                    stdin: stdin,
+                    outputMode: .auto(.streamJson),
+                    timeout: options.timeout,
+                    additionalEnvironment: options.additionalEnvironment,
+                    additionalRemovedKeys: options.removedEnvironmentKeys,
+                    environmentFilter: environmentFilter(filteringProvider(for: model)),
+                    cancelChildOnTaskCancellation: true
+                )
+            } catch {
+                throw mapProcessError(error)
+            }
+
+            if result.status == 0 {
+                guard !result.stdout.isEmpty else {
+                    throw AIProviderError.invalidResponse(detail: "Claude CLI returned no output")
+                }
+                do {
+                    return try parseStreamJSONCompletionPayload(result.stdout, usageMode: usageMode)
+                } catch {
+                    throw AIProviderError.apiError(source: error)
+                }
+            }
+
+            if let humanMessage = extractCLIErrorDetail(
+                fromStdout: result.stdout,
+                isStreamJSON: true
+            ) {
+                // Check for credit balance error and provide helpful guidance
+                let lowerMessage = humanMessage.lowercased()
+                if lowerMessage.contains("credit balance") || lowerMessage.contains("balance too low") || lowerMessage.contains("api balance") {
+                    throw AIProviderError.invalidConfiguration(detail: "Credit balance is too low. To use Claude Code with your Max plan via RepoPrompt, remove the ANTHROPIC_API_KEY from your environment variables and restart the app. The CLI will then use your Max plan subscription instead of the API key.")
+                }
+                throw AIProviderError.invalidConfiguration(detail: humanMessage)
+            }
+
+            let stderrString = String(data: result.stderr, encoding: .utf8) ?? ""
+            let exitCode = result.status
+            let canRetry = shouldRetry(exitCode: exitCode, stderr: stderrString, timedOut: result.timedOut, attempt: attempt)
+
+            if canRetry, attempt < maxRetries {
+                let jitter = Double.random(in: 0.8 ... 1.2)
+                let sleepSeconds = min(delay, maxBackoff) * jitter
+                try? await Task.sleep(nanoseconds: UInt64(sleepSeconds * 1_000_000_000))
+                delay = min(delay * 2, maxBackoff)
+                attempt += 1
+                continue
+            }
+
+            throw mapProcessFailure(exitCode: exitCode, stderr: stderrString, timedOut: result.timedOut, timeoutValue: options.timeout)
+        }
+    }
+
+    package func dispose() async {
+        await runner.cancelAll()
+    }
+
+    // MARK: - Private Helpers
+
+    /// stream-json input requires `--verbose` alongside `--input-format`/`--output-format
+    /// stream-json` in print mode, matching the Agent Mode Claude session runner.
+    package static func applyStreamJSONImageTransport(to options: inout ClaudeCLIOptions) {
+        options.inputFormat = "stream-json"
+        options.verbose = true
+    }
+
+    package static func makeStreamJSONInput(prompt: String, attachments: [OracleAttachment]) throws -> String {
+        do {
+            return try ClaudeStreamJSONTransport.input(prompt: prompt, attachments: attachments)
+        } catch let error as AttachmentAdmissionError {
+            throw error
+        } catch let error as AttachmentEncodingInvariant {
+            throw error
+        } catch {
+            throw AIProviderError.invalidConfiguration(detail: "Unable to encode Claude attachment input.")
+        }
+    }
+
+    private func makeOptions(for aiMessage: AIMessage, model: AIModel, emptyConfigURL: URL) async throws -> ClaudeCLIOptions {
+        var options = ClaudeCLIOptions()
+        options.disallowedTools = disallowedTools
+        // Use empty MCP config to prevent CLI from loading user's default config (which may include RepoPrompt)
+        options.mcpConfigPath = emptyConfigURL.path
+        if let descriptor = compatibleDescriptor(model) {
+            let resolver = makeLaunchResolver()
+            let launchEnvironment = try await resolver.resolve(
+                variant: descriptor.variant,
+                requestedModel: descriptor.requestedModel
+            )
+            options.model = launchEnvironment.effectiveModel
+            options.environmentOverrides = launchEnvironment.environmentOverrides
+            options.removedEnvironmentKeys = launchEnvironment.removedEnvironmentKeys
+            options.timeout = defaultRequestTimeout
+            return options
+        }
+        let selection = try resolveModelSelection(model)
+        options.model = selection.modelArgument
+        options.effortLevel = selection.effortLevel
+        options.timeout = defaultRequestTimeout
+        return options
+    }
+
+    private func mapProcessError(_ error: Error) -> Error {
+        if let runnerError = error as? CLIProcessRunnerError {
+            switch runnerError {
+            case let .commandNotFound(command):
+                return AIProviderError.invalidConfiguration(detail: "Command not found: \(command)")
+            case let .spawnFailed(message):
+                return AIProviderError.apiError(source: NSError(domain: "ClaudeCLI", code: -1, userInfo: [NSLocalizedDescriptionKey: message]))
+            case .inputEncodingFailed:
+                return AIProviderError.apiError(source: NSError(domain: "ClaudeCLI", code: -2, userInfo: [NSLocalizedDescriptionKey: "Unable to encode prompt for Claude CLI"]))
+            case let .inputWriteFailed(message):
+                return AIProviderError.apiError(source: NSError(domain: "ClaudeCLI", code: -3, userInfo: [NSLocalizedDescriptionKey: message]))
+            case let .waitFailed(message):
+                return AIProviderError.apiError(source: NSError(domain: "ClaudeCLI", code: -4, userInfo: [NSLocalizedDescriptionKey: message]))
+            }
+        }
+        return AIProviderError.apiError(source: error)
+    }
+
+    private func shouldRetry(exitCode: Int32, stderr: String, timedOut: Bool, attempt _: Int) -> Bool {
+        if timedOut { return true }
+        let lower = stderr.lowercased()
+        if lower.contains("429") || lower.contains("rate limit") || lower.contains("too many requests") { return true }
+        if lower.contains("overload") || lower.contains("overloaded") || lower.contains("busy") { return true }
+        if lower.contains("502") || lower.contains("503") || lower.contains("504") || lower.contains("gateway") { return true }
+        if lower.contains("timeout") || lower.contains("timed out") || lower.contains("context deadline exceeded") { return true }
+        if lower.contains("econnreset") || lower.contains("connection reset") { return true }
+        if lower.contains("network") || lower.contains("unreachable") { return true }
+        if exitCode == 1 { return true }
+        return false
+    }
+
+    private func mapProcessFailure(exitCode: Int32, stderr: String, timedOut: Bool, timeoutValue: TimeInterval?) -> Error {
+        if timedOut {
+            let seconds = Int(timeoutValue ?? defaultRequestTimeout)
+            return AIProviderError.invalidConfiguration(detail: "Claude Code timed out after \(seconds)s. Servers may be busy—please try again.")
+        }
+        let lower = stderr.lowercased()
+        if lower.contains("no such file or directory") || lower.contains("command not found") {
+            return AIProviderError.invalidConfiguration(detail: "Claude CLI is not installed or not in PATH. Install it and run `claude login`.")
+        }
+        if lower.contains("unauthorized") || lower.contains("not authenticated") || lower.contains("authentication") {
+            return AIProviderError.invalidConfiguration(detail: "Claude Code is not authenticated. Please run `claude login` in your terminal.")
+        }
+        if lower.contains("rate limit") || lower.contains("too many requests") || lower.contains("429") {
+            return AIProviderError.invalidConfiguration(detail: "Rate limited by Anthropic. We tried retries—please wait a moment and try again.")
+        }
+        if lower.contains("overload") || lower.contains("overloaded") || lower.contains("busy") || lower.contains("503") {
+            return AIProviderError.invalidConfiguration(detail: "Anthropic servers look overloaded. We attempted automatic retries; please try again shortly.")
+        }
+        if stderr.isEmpty {
+            return AIProviderError.apiError(source: NSError(domain: "ClaudeCLI", code: Int(exitCode), userInfo: [NSLocalizedDescriptionKey: "Claude Code failed (exit \(exitCode))."]))
+        }
+        return AIProviderError.apiError(source: NSError(domain: "ClaudeCLI", code: Int(exitCode), userInfo: [NSLocalizedDescriptionKey: stderr]))
+    }
+
+    private func buildPrompt(from aiMessage: AIMessage) -> String {
+        let tail = aiMessage.buildTail(embedSystemPrompt: false)
+        var prompt = ""
+        let lastUserIndex = aiMessage.conversationMessages.lastIndex { $0.role == .user }
+        for (index, message) in aiMessage.conversationMessages.enumerated() {
+            if !prompt.isEmpty {
+                prompt += "\n\n"
+            }
+            if message.role == .user {
+                if index == lastUserIndex, !tail.isEmpty {
+                    prompt += "User: \(tail)\n\n\(message.content)"
+                } else {
+                    prompt += "User: \(message.content)"
+                }
+            } else {
+                prompt += "Assistant: \(message.content)"
+            }
+        }
+        if aiMessage.conversationMessages.isEmpty, !tail.isEmpty {
+            prompt = "User: \(tail)"
+        }
+        return prompt
+    }
+
+    /// Compatible backends may already report inclusive input counts, so they keep raw usage.
+    /// The injected model policy rejects non-Claude models exactly like the app's CLI selection.
+    package func completionUsageMode(for model: AIModel) throws -> CompletionUsageMode {
+        if compatibleDescriptor(model) != nil {
+            return .raw
+        }
+        _ = try resolveModelSelection(model)
+        return .nativeClaudeTerminal
+    }
+
+    package func parseCompletionPayload(_ data: Data) throws -> RepoPromptDomainRuntime.AICompletionResult {
+        if let message = try? decoder.decode(ClaudeResultMessage.self, from: data) {
+            return AICompletionResult(
+                text: message.result ?? "",
+                promptTokens: message.usage?.inputTokens,
+                completionTokens: message.usage?.outputTokens,
+                cost: message.totalCostUsd
+            )
+        }
+        let json = try JSONSerialization.jsonObject(with: data)
+        if let dict = json as? [String: Any] {
+            return parseCompletionDictionary(dict)
+        } else if let array = json as? [Any] {
+            for element in array.reversed() {
+                if let dict = element as? [String: Any] {
+                    let completion = parseCompletionDictionary(dict)
+                    if !completion.text.isEmpty {
+                        return completion
+                    }
+                }
+            }
+            throw AIProviderError.invalidResponse(detail: "Claude CLI returned JSON array without completion payload")
+        } else {
+            throw AIProviderError.invalidResponse(detail: "Claude CLI returned unsupported JSON payload")
+        }
+    }
+
+    package func parseStreamJSONCompletionPayload(_ data: Data, usageMode: CompletionUsageMode) throws -> AICompletionResult {
+        // Decode complete events, not token deltas; counting both would duplicate text.
+        // Ignore non-JSON CLI diagnostics, but fail closed on malformed/truncated JSON events.
+        let events = try data.split(separator: 0x0A).compactMap { line -> [String: Any]? in
+            let payload = line.drop(while: { $0 == 0x20 || $0 == 0x09 || $0 == 0x0D })
+            guard payload.first == 0x7B else { return nil }
+            guard let event = try JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else {
+                throw AIProviderError.invalidResponse(detail: "Claude CLI returned unsupported JSON payload")
+            }
+            return event
+        }
+        guard let terminal = events.last(where: { event in
+            let type = event["type"] as? String
+            return type == "result" || type == "error"
+        }) else {
+            throw AIProviderError.invalidResponse(detail: "Claude CLI returned stream JSON without completion payload")
+        }
+        if ClaudeStreamJSONTransport.indicatesError(terminal) {
+            let detail = ClaudeStreamJSONTransport.errorMessage(from: terminal) ?? "Claude CLI returned an error"
+            throw AIProviderError.invalidResponse(detail: detail)
+        }
+        let texts = events.compactMap { event -> String? in
+            guard event["type"] as? String == "assistant",
+                  event["parent_tool_use_id"] == nil || event["parent_tool_use_id"] is NSNull,
+                  let message = event["message"] as? [String: Any],
+                  let content = message["content"] as? [[String: Any]]
+            else { return nil }
+            let text = content.compactMap { block -> String? in
+                guard block["type"] as? String == "text" else { return nil }
+                return block["text"] as? String
+            }.joined()
+            return text.isEmpty ? nil : text
+        }
+        let usage = terminal["usage"] as? [String: Any]
+        let rawInput = reportedTokenCount(usage?["input_tokens"]) ?? reportedTokenCount(usage?["inputTokens"])
+        let output = reportedTokenCount(usage?["output_tokens"]) ?? reportedTokenCount(usage?["outputTokens"])
+        var input = rawInput
+        // Native Claude terminal usage follows the documented producer contract of
+        // disjoint uncached, cache-read and cache-creation input categories. Compatible
+        // backends retain raw input because they may already report inclusive counts.
+        if case .nativeClaudeTerminal = usageMode,
+           let uncached = reportedTokenCount(usage?["input_tokens"]),
+           let cacheRead = reportedTokenCount(usage?["cache_read_input_tokens"]),
+           let cacheCreation = reportedTokenCount(usage?["cache_creation_input_tokens"])
+        {
+            let partial = uncached.addingReportingOverflow(cacheRead)
+            let total = partial.partialValue.addingReportingOverflow(cacheCreation)
+            if !partial.overflow, !total.overflow {
+                input = total.partialValue
+            }
+        }
+        let text = extractString(terminal["result"]) ?? extractString(terminal["content"]) ?? ""
+        return AICompletionResult(
+            text: texts.isEmpty ? text : texts.joined(),
+            promptTokens: input,
+            completionTokens: output,
+            cost: terminal["total_cost_usd"] as? Double
+        )
+    }
+
+    /// JSON numbers only: reject booleans, fractions and values outside Int without
+    /// converting through Double for integer-backed NSNumber values.
+    private func reportedTokenCount(_ value: Any?) -> Int? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID()
+        else { return nil }
+        let count: Int? = switch String(cString: number.objCType) {
+        case "f", "d":
+            Int(exactly: number.doubleValue)
+        default:
+            Int(number.stringValue)
+        }
+        guard let count, count >= 0 else { return nil }
+        // JSONSerialization can retain high-precision fractional numbers as Decimal;
+        // their rounded Double representation must not turn them into integer counts.
+        if let decimal = number as? NSDecimalNumber,
+           decimal.compare(NSDecimalNumber(value: count)) != .orderedSame
+        {
+            return nil
+        }
+        return count
+    }
+
+    private func parseCompletionDictionary(_ dict: [String: Any]) -> AICompletionResult {
+        let usageDict = dict["usage"] as? [String: Any]
+        let usage = parseUsage(usageDict)
+        let text = extractString(dict["result"]) ?? extractString(dict["content"]) ?? ""
+        let cost = dict["total_cost_usd"] as? Double
+        return AICompletionResult(
+            text: text,
+            promptTokens: usage?.inputTokens,
+            completionTokens: usage?.outputTokens,
+            cost: cost
+        )
+    }
+
+    private func extractString(_ value: Any?) -> String? {
+        switch value {
+        case let string as String:
+            return string
+        case let dict as [String: Any]:
+            if let text = dict["text"] as? String { return text }
+            return nil
+        case let array as [Any]:
+            return array.compactMap { extractString($0) }.joined(separator: "")
+        default:
+            return nil
+        }
+    }
+
+    private func parseUsage(_ value: [String: Any]?) -> TokenUsage? {
+        guard let value else { return nil }
+        let input = numberToInt(value["input_tokens"]) ?? numberToInt(value["inputTokens"])
+        let output = numberToInt(value["output_tokens"]) ?? numberToInt(value["outputTokens"])
+        if let input, let output {
+            return TokenUsage(inputTokens: input, outputTokens: output)
+        }
+        return nil
+    }
+
+    private func numberToInt(_ value: Any?) -> Int? {
+        switch value {
+        case let int as Int:
+            int
+        case let double as Double:
+            Int(double)
+        case let string as String:
+            Int(string)
+        default:
+            nil
+        }
+    }
+
+    package func testCompatibleBackendConnection(
+        variant: ClaudeCodeRuntimeVariant,
+        requestedModel: () -> String?,
+        timeout: TimeInterval? = nil
+    ) async throws -> Bool {
+        let resolver = makeLaunchResolver()
+        let launchEnvironment = try await resolver.resolve(
+            variant: variant,
+            requestedModel: requestedModel()
+        )
+        let emptyConfigLease = try await configService.prepareClaudeEmptyLaunchConfig()
+        defer { emptyConfigLease.release() }
+        var options = ClaudeCLIOptions()
+        options.disallowedTools = disallowedTools
+        options.mcpConfigPath = emptyConfigLease.url.path
+        options.model = launchEnvironment.effectiveModel
+        options.systemPromptOverride = currentPromptDelivery().nativeSystemPromptOverride("")
+        options.timeout = timeout ?? testRequestTimeout
+        let args = options.toTokens()
+        let additionalEnvironment = options.additionalEnvironment.merging(
+            launchEnvironment.environmentOverrides
+        ) { _, resolverValue in resolverValue }
+
+        let result: CLIProcessRunner.Result
+        do {
+            result = try await runner.run(
+                args: args,
+                stdin: "User: Say OK\n",
+                outputMode: .auto(.json),
+                timeout: options.timeout,
+                additionalEnvironment: additionalEnvironment,
+                additionalRemovedKeys: launchEnvironment.removedEnvironmentKeys,
+                environmentFilter: environmentFilter(variant.agentKind)
+            )
+        } catch {
+            throw mapProcessError(error)
+        }
+        if result.status != 0 {
+            if let humanMessage = extractCLIErrorDetail(fromStdout: result.stdout) {
+                throw AIProviderError.invalidConfiguration(detail: humanMessage)
+            }
+            let stderrString = String(data: result.stderr, encoding: .utf8) ?? ""
+            throw mapProcessFailure(exitCode: result.status, stderr: stderrString, timedOut: result.timedOut, timeoutValue: options.timeout)
+        }
+        guard !result.stdout.isEmpty else {
+            let stderrPreview = String(data: result.stderr.prefix(500), encoding: .utf8) ?? "<non-UTF8>"
+            throw AIProviderError.invalidResponse(detail: "Claude Code CLI returned empty output. STDERR: \(stderrPreview)")
+        }
+        do {
+            let completion = try parseCompletionPayload(result.stdout)
+            return !completion.text.isEmpty
+        } catch let error as AIProviderError {
+            throw error
+        } catch {
+            let stdoutPreview = String(data: result.stdout.prefix(500), encoding: .utf8) ?? "<non-UTF8>"
+            let stderrPreview = String(data: result.stderr.prefix(500), encoding: .utf8) ?? "<non-UTF8>"
+            throw AIProviderError.invalidResponse(detail: "Failed to decode Claude Code CLI response: \(error.localizedDescription). STDOUT (first 500 bytes): \(stdoutPreview). STDERR: \(stderrPreview)")
+        }
+    }
+
+    private func filteringProvider(for model: AIModel) -> AgentProviderKind {
+        guard let descriptor = compatibleDescriptor(model) else { return .claudeCode }
+        return descriptor.variant.agentKind
+    }
+
+    package func testConnection(timeout: TimeInterval? = nil) async throws -> Bool {
+        // First try with a specific model (haiku - fast and cheap)
+        do {
+            return try await testConnectionWithModel(.claudeCodeHaiku, timeout: timeout)
+        } catch {
+            // If the first attempt fails, retry without specifying a model
+            // This supports users with custom CLI configurations that may not have
+            // the standard models available
+            return try await testConnectionWithModel(.claudeCode, timeout: timeout)
+        }
+    }
+
+    private func testConnectionWithModel(_ model: AIModel, timeout: TimeInterval?) async throws -> Bool {
+        let emptyConfigLease = try await configService.prepareClaudeEmptyLaunchConfig()
+        defer { emptyConfigLease.release() }
+        var options = try await makeOptions(
+            for: AIMessage(systemPrompt: "", userMessage: ""),
+            model: model,
+            emptyConfigURL: emptyConfigLease.url
+        )
+        options.systemPromptOverride = currentPromptDelivery().nativeSystemPromptOverride("")
+        options.timeout = timeout ?? testRequestTimeout
+        let args = options.toTokens()
+        let result: CLIProcessRunner.Result
+        do {
+            result = try await runner.run(
+                args: args,
+                stdin: "User: Say OK\n",
+                outputMode: .auto(.json),
+                timeout: options.timeout,
+                additionalEnvironment: options.additionalEnvironment,
+                environmentFilter: environmentFilter(filteringProvider(for: model))
+            )
+        } catch {
+            throw mapProcessError(error)
+        }
+        if result.status != 0 {
+            if let humanMessage = extractCLIErrorDetail(fromStdout: result.stdout) {
+                // Check for credit balance error and provide helpful guidance
+                let lowerMessage = humanMessage.lowercased()
+                if lowerMessage.contains("credit balance") || lowerMessage.contains("balance too low") || lowerMessage.contains("api balance") {
+                    throw AIProviderError.invalidConfiguration(detail: "Credit balance is too low. To use Claude Code with your Max plan via RepoPrompt, remove the ANTHROPIC_API_KEY from your environment variables and restart the app. The CLI will then use your Max plan subscription instead of the API key.")
+                }
+                throw AIProviderError.invalidConfiguration(detail: humanMessage)
+            }
+            let stderrString = String(data: result.stderr, encoding: .utf8) ?? ""
+            throw mapProcessFailure(exitCode: result.status, stderr: stderrString, timedOut: result.timedOut, timeoutValue: options.timeout)
+        }
+        guard !result.stdout.isEmpty else {
+            let stderrPreview = String(data: result.stderr.prefix(500), encoding: .utf8) ?? "<non-UTF8>"
+            throw AIProviderError.invalidResponse(detail: "Claude Code CLI returned empty output. STDERR: \(stderrPreview)")
+        }
+        do {
+            // Use parseCompletionPayload to handle both single objects and arrays
+            let completion = try parseCompletionPayload(result.stdout)
+            return !completion.text.isEmpty
+        } catch let error as AIProviderError {
+            throw error
+        } catch {
+            let stdoutPreview = String(data: result.stdout.prefix(500), encoding: .utf8) ?? "<non-UTF8>"
+            let stderrPreview = String(data: result.stderr.prefix(500), encoding: .utf8) ?? "<non-UTF8>"
+            throw AIProviderError.invalidResponse(detail: "Failed to decode Claude Code CLI response: \(error.localizedDescription). STDOUT (first 500 bytes): \(stdoutPreview). STDERR: \(stderrPreview)")
+        }
+    }
+
+    /// Attempts to decode a human-readable error exposed by the Claude CLI when it exits non-zero.
+    /// Returns nil if stdout is empty or decoding fails.
+    package func extractCLIErrorDetail(fromStdout data: Data, isStreamJSON: Bool = false) -> String? {
+        guard !data.isEmpty else { return nil }
+        if isStreamJSON {
+            return ClaudeStreamJSONTransport.errorDetail(in: data)
+        }
+
+        // First pass: look for structured JSON errors
+        if let message = try? decoder.decode(ClaudeResultMessage.self, from: data),
+           let text = message.result?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !text.isEmpty
+        {
+            return text
+        }
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let text = (json["result"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
+                return text
+            }
+            if let text = (json["error"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
+                return text
+            }
+            if let text = (json["message"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
+                return text
+            }
+        }
+
+        // Second pass: if no JSON found, return plain-text diagnostics (common when CLI fails before JSON mode)
+        if let plainText = String(data: data, encoding: .utf8) {
+            let cleaned = plainText.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Skip empty strings and JSON noise
+            if !cleaned.isEmpty, !cleaned.hasPrefix("{"), !cleaned.hasPrefix("[") {
+                return cleaned
+            }
+        }
+        return nil
+    }
+}

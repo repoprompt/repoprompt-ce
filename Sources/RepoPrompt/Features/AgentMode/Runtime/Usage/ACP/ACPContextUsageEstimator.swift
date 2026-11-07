@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 
 /// Telemetry-only context-usage capture for ACP-backed providers (Devin, Cursor, OpenCode,
 /// Grok Build, Antigravity). Records the provider's own reported figures so the context ring and

@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptACPProviders
+import RepoPromptAIContracts
 import RepoPromptSettingsCore
 
 /// Cursor runtime membership and parameter authority, with legacy offline metadata.
@@ -27,7 +29,7 @@ enum CursorAIModelCatalog {
     }
 
     static var options: [AgentModelOption] {
-        AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor)?.options
+        AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .cursor)?.options
             ?? referenceOptions.filter { $0.rawValue == AgentModel.cursorAuto.rawValue }
     }
 
@@ -44,10 +46,7 @@ enum CursorAIModelCatalog {
     }
 
     struct ModelSpecifier {
-        struct Override {
-            let configID: String
-            let valueRaw: String
-        }
+        typealias Override = CursorModelOverride
 
         let baseModelRaw: String
         let overrides: [Override]
@@ -128,7 +127,7 @@ enum CursorAIModelCatalog {
         if let exact = options.first(where: { $0.rawValue == modelRaw }) { return exact }
         if let specifier = try? ModelSpecifier(raw: modelRaw), !specifier.overrides.isEmpty,
            let base = option(matching: specifier.baseModelRaw),
-           let selections = try? specifier.selections(in: AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor))
+           let selections = try? specifier.selections(in: AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .cursor))
         {
             let labels = selections.map { selection in
                 parameterSet(for: base.rawValue)?.definition(configID: selection.configID)?.choices.first(where: { $0.rawValue == selection.valueRaw })?.displayName ?? selection.valueRaw
@@ -144,7 +143,7 @@ enum CursorAIModelCatalog {
     }
 
     static func parameterSet(for modelRaw: String) -> ACPModelParameterSet? {
-        if let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor),
+        if let snapshot = AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .cursor),
            snapshot.hasModelParameterMetadata
         {
             guard let option = option(matching: modelRaw) else { return nil }

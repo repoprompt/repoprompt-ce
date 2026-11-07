@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 /// Structured tags for model discovery. Helps callers programmatically
 /// choose the right model for their task without parsing descriptions.

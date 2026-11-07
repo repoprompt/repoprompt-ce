@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCodexProvider
 
 protocol CodexModelListingClient: Sendable {
     func listModels(limit: Int) async throws -> [CodexAppServerClient.RemoteModel]
@@ -154,7 +155,7 @@ actor CodexModelPollingService {
         guard !isShutdown else { return }
         isSuspendedForManagedSignOut = true
         latest = nil
-        _ = AgentCodexModelRegistry.shared.updateLiveModels([])
+        _ = AgentModelCatalogRuntime.shared.codexRegistry.updateLiveModels([])
         pollingTask?.cancel()
         pollingTask = nil
         let refresh = inFlightRefresh
@@ -297,7 +298,7 @@ actor CodexModelPollingService {
             guard CodexManagedSessionFence.shared.allowsAuthenticationPublication(snapshot.authPublicationToken) else {
                 return .skipped
             }
-            let didChange = AgentCodexModelRegistry.shared.updateLiveModels(snapshot.models)
+            let didChange = AgentModelCatalogRuntime.shared.codexRegistry.updateLiveModels(snapshot.models)
             return didChange ? .updated : .unchanged
         }
         guard outcome == .updated else { return outcome }

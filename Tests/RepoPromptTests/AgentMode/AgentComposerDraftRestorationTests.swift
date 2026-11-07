@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentProviderContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import UniformTypeIdentifiers

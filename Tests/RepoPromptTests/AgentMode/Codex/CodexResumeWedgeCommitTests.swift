@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptAIContracts
+import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
@@ -3527,6 +3529,13 @@ extension CodexResumeWedgeCommitTests {
                 for (name, payload, malformed) in cases {
                     let label = "\(method) \(name) ack=\(ack)"
                     let f = makeFixture([])
+                    // This synthetic unbound attempt tests event decoding, not first-save rebinding.
+                    f.viewModel.test_setSuppressesAgentSessionPersistence(true)
+                    f.session.saveDebounceTask?.cancel()
+                    defer {
+                        f.session.saveDebounceTask?.cancel()
+                        f.viewModel.test_setSuppressesAgentSessionPersistence(nil)
+                    }
                     f.viewModel.test_initializeRunService()
                     let runID = UUID()
                     f.session.installRunID(runID)
@@ -3555,6 +3564,8 @@ extension CodexResumeWedgeCommitTests {
                         switch event {
                         case .canonicalAssistantDelta, .reasoningDelta: deltas += 1
                         case .turnCompleted:
+                            XCTAssertNil(f.session.activeAgentSessionID, "\(label): fixture must remain unbound")
+                            XCTAssertTrue(f.session.isCurrentRunAttemptForCurrentBinding(owner), "\(label): fixture owner must remain current")
                             XCTAssertEqual(f.session.quietLedger.candidateStartKey(owner: owner) == nil, ack || malformed, label)
                         default: break
                         }
