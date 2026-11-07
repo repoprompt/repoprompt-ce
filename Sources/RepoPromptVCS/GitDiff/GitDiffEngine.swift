@@ -1,6 +1,9 @@
-import CryptoKit
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
 import Foundation
-import RepoPromptFileSystem
 import RepoPromptFoundation
 
 package actor GitDiffEngine {

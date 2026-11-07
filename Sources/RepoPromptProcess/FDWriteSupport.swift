@@ -1,5 +1,9 @@
-import Darwin
-import Darwin.POSIX.fcntl
+import RepoPromptShared
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 
 package enum FDWriteError: Error, Equatable {
@@ -39,7 +43,7 @@ package enum FDWriteSupport {
 
             var offset = 0
             while offset < rawBuffer.count {
-                let written = Darwin.write(fd, baseAddress.advanced(by: offset), rawBuffer.count - offset)
+                let written = POSIXSystem.write(fd, baseAddress.advanced(by: offset), rawBuffer.count - offset)
                 if written > 0 {
                     offset += written
                     continue

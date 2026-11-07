@@ -1,6 +1,5 @@
 import Foundation
 import MCP
-import os
 @testable import RepoPromptDomainRuntime
 import XCTest
 
@@ -316,7 +315,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             authorizedCanonicalRoots: [canonicalRoot.path], ephemeralGrantedToolNames: ["manage_worktree"]
         )
         let operationID = "refused-receipt-write-failure"
-        let settlementState = OSAllocatedUnfairLock<DomainProtectedMutationState?>(initialState: nil)
+        let settlementState = DomainTestLockedState<DomainProtectedMutationState?>(initialState: nil)
         do {
             _ = try await MCPDomainProtectedMutationSettlementContext.$observer.withValue({ settlement in
                 settlementState.withLock { $0 = settlement.state }
@@ -381,7 +380,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
                 authorizedCanonicalRoots: [canonicalRoot.path],
                 ephemeralGrantedToolNames: ["manage_worktree"]
             )
-            let settlementState = OSAllocatedUnfairLock<DomainProtectedMutationState?>(initialState: nil)
+            let settlementState = DomainTestLockedState<DomainProtectedMutationState?>(initialState: nil)
             await XCTAssertThrowsErrorAsync(
                 try await MCPDomainProtectedMutationSettlementContext.$observer.withValue({ settlement in
                     settlementState.withLock { $0 = settlement.state }
@@ -910,7 +909,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
         )
         let protectedBinding = fixture.runtime.protectedMutationProvider.protectedBinding(binding)
 
-        let settlementState = OSAllocatedUnfairLock<DomainProtectedMutationState?>(initialState: nil)
+        let settlementState = DomainTestLockedState<DomainProtectedMutationState?>(initialState: nil)
         await XCTAssertThrowsErrorAsync(
             try await MCPDomainProtectedMutationSettlementContext.$observer.withValue({ settlement in
                 settlementState.withLock { $0 = settlement.state }

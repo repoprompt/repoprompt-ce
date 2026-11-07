@@ -1,4 +1,8 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 
 /// Shared filesystem and stable-name authority for RepoPrompt MCP products.
@@ -68,16 +72,27 @@ public struct MCPFilesystemIdentity: Equatable, Sendable {
     }
 
     public var applicationSupportDirectoryName: String {
-        "RepoPrompt CE"
+        #if os(Linux)
+            "repoprompt-ce"
+        #else
+            "RepoPrompt CE"
+        #endif
     }
 
     /// Mutable session/settings state must not share the release app's files.
     /// Already flavor-namespaced MCP discovery and installation paths stay stable.
     public var applicationStateDirectoryName: String {
-        switch (product, buildFlavor) {
-        case (.repoPromptCE, .release): "RepoPrompt CE"
-        case (.repoPromptCE, .debug): "RepoPrompt CE Debug"
-        }
+        #if os(Linux)
+            switch (product, buildFlavor) {
+            case (.repoPromptCE, .release): "repoprompt-ce"
+            case (.repoPromptCE, .debug): "repoprompt-ce-debug"
+            }
+        #else
+            switch (product, buildFlavor) {
+            case (.repoPromptCE, .release): "RepoPrompt CE"
+            case (.repoPromptCE, .debug): "RepoPrompt CE Debug"
+            }
+        #endif
     }
 
     public var killSignalsDirectoryName: String {
@@ -152,8 +167,27 @@ public struct MCPFilesystemIdentity: Equatable, Sendable {
     }
 
     public func applicationSupportRootURL(fileManager: FileManager = .default) -> URL {
-        fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent(applicationSupportDirectoryName, isDirectory: true)
+        #if os(Linux)
+            Self.applicationDataDirectoryURL(homeDirectory: fileManager.homeDirectoryForCurrentUser)
+                .appendingPathComponent(applicationSupportDirectoryName, isDirectory: true)
+        #else
+            fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent(applicationSupportDirectoryName, isDirectory: true)
+        #endif
+    }
+
+    public static func applicationDataDirectoryURL(
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> URL {
+        #if os(Linux)
+            if let dataHome = environment["XDG_DATA_HOME"], dataHome.hasPrefix("/") {
+                return URL(fileURLWithPath: dataHome, isDirectory: true)
+            }
+            return homeDirectory.appendingPathComponent(".local/share", isDirectory: true)
+        #else
+            return homeDirectory.appendingPathComponent("Library/Application Support", isDirectory: true)
+        #endif
     }
 
     public func temporaryRootURL(fileManager: FileManager = .default) -> URL {

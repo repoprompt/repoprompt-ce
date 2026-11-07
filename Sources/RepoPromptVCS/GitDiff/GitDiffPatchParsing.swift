@@ -1,5 +1,4 @@
 import Foundation
-import RepoPromptFileSystem
 
 /// Utilities for parsing unified diff patches and managing truncation.
 package enum GitDiffPatchParsing {

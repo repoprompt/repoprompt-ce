@@ -16,7 +16,7 @@ package enum ProviderProcessLaunchPolicy {
 
     package static func check(allowsLaunchInTests: Bool = false) throws {
         // Check at the launch boundary: XCTest can load after an earlier non-test lookup.
-        if NSClassFromString("XCTestCase") != nil, !allowsLaunchInTests, !allowsLaunchForTesting {
+        if NSClassFromString("XCTestCase") != nil || NSClassFromString("XCTest.XCTestCase") != nil, !allowsLaunchInTests, !allowsLaunchForTesting {
             throw Refusal()
         }
     }

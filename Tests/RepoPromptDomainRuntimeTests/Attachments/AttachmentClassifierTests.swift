@@ -1,7 +1,9 @@
 import Foundation
-import ImageIO
 import RepoPromptDomainRuntime
-import UniformTypeIdentifiers
+#if canImport(ImageIO)
+    import ImageIO
+    import UniformTypeIdentifiers
+#endif
 import XCTest
 
 final class AttachmentClassifierTests: XCTestCase {
@@ -24,34 +26,37 @@ final class AttachmentClassifierTests: XCTestCase {
         XCTAssertEqual(try AttachmentClassifier.classify(bytes: webp, fileName: "a.webp"), .image(.webp, webp))
     }
 
-    func testFormatsNoTransportAcceptsAreConvertedToJpegOrPng() throws {
-        let sources: [(UTType, String)] = [(.heic, "photo.heic"), (.tiff, "scan.tiff"), (.bmp, "icon.bmp")]
-        for (type, name) in sources {
-            let original = try AttachmentTestFixtures.requireEncodedImage(type)
-            let payload = try AttachmentClassifier.classify(bytes: original, fileName: name)
+    #if canImport(ImageIO)
+        func testFormatsNoTransportAcceptsAreConvertedToJpegOrPng() throws {
+            let sources: [(UTType, String)] = [(.heic, "photo.heic"), (.tiff, "scan.tiff"), (.bmp, "icon.bmp")]
+            for (type, name) in sources {
+                let original = try AttachmentTestFixtures.requireEncodedImage(type)
+                let payload = try AttachmentClassifier.classify(bytes: original, fileName: name)
 
-            guard case let .image(mediaType, converted) = payload else {
-                return XCTFail("\(name) classified as \(payload.kind), expected image")
-            }
-            XCTAssertNotEqual(converted, original, name)
-            switch mediaType {
-            case .png: XCTAssertTrue(converted.starts(with: AttachmentTestFixtures.pngSignature), name)
-            case .jpeg: XCTAssertTrue(converted.starts(with: AttachmentTestFixtures.jpegSignature), name)
-            case .gif, .webp: XCTFail("\(name) converted to \(mediaType.rawValue)")
+                guard case let .image(mediaType, converted) = payload else {
+                    return XCTFail("\(name) classified as \(payload.kind), expected image")
+                }
+                XCTAssertNotEqual(converted, original, name)
+                switch mediaType {
+                case .png: XCTAssertTrue(converted.starts(with: AttachmentTestFixtures.pngSignature), name)
+                case .jpeg: XCTAssertTrue(converted.starts(with: AttachmentTestFixtures.jpegSignature), name)
+                case .gif, .webp: XCTFail("\(name) converted to \(mediaType.rawValue)")
+                }
             }
         }
-    }
 
-    func testConvertedImageStillDecodesWithItsOriginalDimensions() throws {
-        let original = try AttachmentTestFixtures.requireEncodedImage(.tiff, width: 40, height: 30)
-        guard case let .image(_, converted) = try AttachmentClassifier.classify(bytes: original, fileName: "a.tiff"),
-              let source = CGImageSourceCreateWithData(converted as CFData, nil),
-              let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
-        else { return XCTFail("converted TIFF did not decode") }
+        func testConvertedImageStillDecodesWithItsOriginalDimensions() throws {
+            let original = try AttachmentTestFixtures.requireEncodedImage(.tiff, width: 40, height: 30)
+            guard case let .image(_, converted) = try AttachmentClassifier.classify(bytes: original, fileName: "a.tiff"),
+                  let source = CGImageSourceCreateWithData(converted as CFData, nil),
+                  let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
+            else { return XCTFail("converted TIFF did not decode") }
 
-        XCTAssertEqual(image.width, 40)
-        XCTAssertEqual(image.height, 30)
-    }
+            XCTAssertEqual(image.width, 40)
+            XCTAssertEqual(image.height, 30)
+        }
+
+    #endif
 
     func testUndecodableConvertibleImageThrowsInsteadOfFallingToBinary() {
         var avif = Data([0, 0, 0, 0x18])
@@ -61,9 +66,10 @@ final class AttachmentClassifierTests: XCTestCase {
         avif.append(Data(repeating: 0xAB, count: 64))
 
         XCTAssertThrowsError(try AttachmentClassifier.classify(bytes: avif, fileName: "broken.avif")) { error in
-            XCTAssertEqual(
-                error as? AttachmentClassificationError,
-                .imageConversionFailed(fileName: "broken.avif", format: "AVIF")
+            let failure = error as? AttachmentClassificationError
+            XCTAssertTrue(
+                failure == .imageConversionFailed(fileName: "broken.avif", format: "AVIF")
+                    || failure == .imageConverterUnavailable(fileName: "broken.avif", format: "AVIF")
             )
             XCTAssertTrue(error.localizedDescription.contains("broken.avif"))
         }

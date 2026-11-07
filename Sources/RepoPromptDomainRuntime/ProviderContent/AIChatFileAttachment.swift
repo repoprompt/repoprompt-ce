@@ -57,7 +57,11 @@ package extension AIChatFileAttachment {
         let worker = Task.detached(priority: .userInitiated) {
             var attachments: [AIChatFileAttachment] = []
             for oracleAttachment in oracleAttachments {
-                let data = try autoreleasepool { try AttachmentPreviewRenderer.jpegData(from: oracleAttachment) }
+                #if canImport(ObjectiveC)
+                    let data = try autoreleasepool { try AttachmentPreviewRenderer.jpegData(from: oracleAttachment) }
+                #else
+                    let data = try AttachmentPreviewRenderer.jpegData(from: oracleAttachment)
+                #endif
                 attachments.append(AIChatFileAttachment(
                     thumbnailData: data ?? Data(),
                     kind: oracleAttachment.kind,

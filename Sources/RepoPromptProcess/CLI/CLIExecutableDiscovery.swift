@@ -1,4 +1,8 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 
 /// Filesystem-only discovery of installed CLI executables.
@@ -7,7 +11,7 @@ import Foundation
 /// candidate paths; it never launches a process, never recurses, and scans a bounded set of
 /// directories derived from the login-shell PATH plus shared native path defaults.
 package enum CLIExecutableDiscovery {
-    package struct DetectedExecutable: Equatable, Sendable {
+    package struct DetectedExecutable: Equatable {
         /// Candidate path as found (`<search directory>/<name>`).
         package let path: String
         /// Fully resolved real path with all symlink components resolved. Used for dedupe.

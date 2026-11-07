@@ -7,12 +7,18 @@ import XCTest
 final class AppProfileLocationsTests: XCTestCase {
     func testReleaseLocationsStayStableAndDebugUsesSiblingNamespaces() {
         let home = URL(fileURLWithPath: "/Users/profile-fixture", isDirectory: true)
-        let release = AppProfileLocations(identity: .repoPromptCE(.release), homeDirectory: home)
-        let debug = AppProfileLocations(identity: .repoPromptCE(.debug), homeDirectory: home)
-        XCTAssertEqual(release.applicationSupportRoot.path, "/Users/profile-fixture/Library/Application Support/RepoPrompt CE")
-        XCTAssertEqual(debug.applicationSupportRoot.path, "/Users/profile-fixture/Library/Application Support/RepoPrompt CE Debug")
+        let release = AppProfileLocations(identity: .repoPromptCE(.release), homeDirectory: home, environment: [:])
+        let debug = AppProfileLocations(identity: .repoPromptCE(.debug), homeDirectory: home, environment: [:])
+        #if os(Linux)
+            XCTAssertEqual(release.applicationSupportRoot.path, "/Users/profile-fixture/.local/share/repoprompt-ce")
+            XCTAssertEqual(debug.applicationSupportRoot.path, "/Users/profile-fixture/.local/share/repoprompt-ce-debug")
+            XCTAssertEqual(release.savedPromptsRoot.lastPathComponent, "SavedPrompts")
+        #else
+            XCTAssertEqual(release.applicationSupportRoot.path, "/Users/profile-fixture/Library/Application Support/RepoPrompt CE")
+            XCTAssertEqual(debug.applicationSupportRoot.path, "/Users/profile-fixture/Library/Application Support/RepoPrompt CE Debug")
+            XCTAssertEqual(release.savedPromptsRoot.lastPathComponent, "com.pvncher.repoprompt")
+        #endif
         XCTAssertFalse(debug.applicationSupportRoot.pathComponents.starts(with: release.applicationSupportRoot.pathComponents))
-        XCTAssertEqual(release.savedPromptsRoot.lastPathComponent, "com.pvncher.repoprompt")
         XCTAssertEqual(debug.savedPromptsRoot.deletingLastPathComponent(), debug.applicationSupportRoot)
         XCTAssertNotEqual(debug.preferencesDomain, release.preferencesDomain)
         // Harmless flavor-namespaced discovery/install files do not move.
@@ -129,7 +135,7 @@ final class AppProfileLocationsTests: XCTestCase {
     func testDomainWriterRejectsReleaseRootBeforeCreatingLocksOrChangingData() async throws {
         let fixture = FileManager.default.temporaryDirectory.appendingPathComponent("rpce-domain-profile-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: fixture) }
-        let locations = AppProfileLocations(identity: .repoPromptCE(.debug), homeDirectory: fixture)
+        let locations = AppProfileLocations(identity: .repoPromptCE(.debug), homeDirectory: fixture, environment: [:])
         let release = locations.releaseStateRoots[0]
         try FileManager.default.createDirectory(at: release, withIntermediateDirectories: true)
         let sentinel = release.appendingPathComponent("sentinel.json")
@@ -159,7 +165,8 @@ final class AppProfileLocationsTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
         try body(directory, AppProfileLocations(
             identity: .repoPromptCE(.debug),
-            homeDirectory: directory.appendingPathComponent("home", isDirectory: true)
+            homeDirectory: directory.appendingPathComponent("home", isDirectory: true),
+            environment: [:]
         ))
     }
 }

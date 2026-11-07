@@ -1,4 +1,8 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 import RepoPromptShared
 
@@ -45,9 +49,9 @@ enum MCPAppSocketAvailabilityProbe {
               (try? directory.validateSocket(at: socketURL)) != nil
         else { return false }
 
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        let fd = socket(AF_UNIX, POSIXSystem.streamSocketType, 0)
         guard fd >= 0 else { return false }
-        defer { Darwin.close(fd) }
+        defer { POSIXSystem.close(fd) }
 
         do {
             try POSIXDescriptorSupport.setCloseOnExec(fd)
@@ -76,7 +80,7 @@ enum MCPAppSocketAvailabilityProbe {
 
         let result = withUnsafePointer(to: &address) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                POSIXSystem.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
         if result == 0 {

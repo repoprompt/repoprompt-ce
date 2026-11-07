@@ -1,4 +1,9 @@
-import Darwin
+import RepoPromptShared
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 import RepoPromptDomainRuntime
 @testable import RepoPromptMCPCore
@@ -44,7 +49,7 @@ final class MCPStdioServerTransportTests: XCTestCase {
                 var wire = Data()
                 var bytes = [UInt8](repeating: 0, count: expectedWire.count)
                 while wire.count < expectedWire.count {
-                    let count = Darwin.read(outputDescriptors[0], &bytes, expectedWire.count - wire.count)
+                    let count = POSIXSystem.read(outputDescriptors[0], &bytes, expectedWire.count - wire.count)
                     guard count > 0 else {
                         throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
                     }
@@ -198,7 +203,7 @@ final class MCPStdioServerTransportTests: XCTestCase {
 
     private func makePipe() throws -> [Int32] {
         var descriptors = [Int32](repeating: -1, count: 2)
-        guard Darwin.pipe(&descriptors) == 0 else {
+        guard pipe(&descriptors) == 0 else {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
         }
         return descriptors
@@ -211,7 +216,7 @@ final class MCPStdioServerTransportTests: XCTestCase {
         line: UInt = #line
     ) {
         let written = data.withUnsafeBytes { bytes in
-            Darwin.write(descriptor, bytes.baseAddress, bytes.count)
+            POSIXSystem.write(descriptor, bytes.baseAddress, bytes.count)
         }
         XCTAssertEqual(written, data.count, file: file, line: line)
     }
@@ -222,7 +227,7 @@ final class MCPStdioServerTransportTests: XCTestCase {
         line: UInt = #line
     ) {
         guard descriptor >= 0 else { return }
-        XCTAssertEqual(Darwin.close(descriptor), 0, file: file, line: line)
+        XCTAssertEqual(POSIXSystem.close(descriptor), 0, file: file, line: line)
         descriptor = -1
     }
 }

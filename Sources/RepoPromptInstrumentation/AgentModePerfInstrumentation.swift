@@ -1,7 +1,8 @@
+import CoreFoundation
 import Foundation
 
 /// Only bounded identifiers, counters, and pre-redacted diagnostic fields cross this seam.
-package struct AgentPerfSidebarDeleteBeginContext: Sendable {
+package struct AgentPerfSidebarDeleteBeginContext {
     package let tabID: UUID
     package let sessionID: UUID?
     package let source: String
@@ -29,7 +30,7 @@ package struct AgentPerfSidebarDeleteBeginContext: Sendable {
     }
 }
 
-package enum AgentPerfSnapshotValue: Sendable, ExpressibleByStringLiteral, ExpressibleByIntegerLiteral,
+package enum AgentPerfSnapshotValue: ExpressibleByStringLiteral, ExpressibleByIntegerLiteral,
     ExpressibleByFloatLiteral, ExpressibleByBooleanLiteral
 {
     case string(String)
@@ -39,19 +40,45 @@ package enum AgentPerfSnapshotValue: Sendable, ExpressibleByStringLiteral, Expre
     case boolean(Bool)
     case null
 
-    package init(stringLiteral value: String) { self = .string(value) }
-    package init(integerLiteral value: Int) { self = .integer(value) }
-    package init(floatLiteral value: Double) { self = .double(value) }
-    package init(booleanLiteral value: Bool) { self = .boolean(value) }
-    package init(_ value: String) { self = .string(value) }
-    package init(_ value: Int) { self = .integer(value) }
-    package init(_ value: UInt64) { self = .unsigned(value) }
-    package init(_ value: Double) { self = .double(value) }
-    package init(_ value: Bool) { self = .boolean(value) }
+    package init(stringLiteral value: String) {
+        self = .string(value)
+    }
+
+    package init(integerLiteral value: Int) {
+        self = .integer(value)
+    }
+
+    package init(floatLiteral value: Double) {
+        self = .double(value)
+    }
+
+    package init(booleanLiteral value: Bool) {
+        self = .boolean(value)
+    }
+
+    package init(_ value: String) {
+        self = .string(value)
+    }
+
+    package init(_ value: Int) {
+        self = .integer(value)
+    }
+
+    package init(_ value: UInt64) {
+        self = .unsigned(value)
+    }
+
+    package init(_ value: Double) {
+        self = .double(value)
+    }
+
+    package init(_ value: Bool) {
+        self = .boolean(value)
+    }
 }
 
 /// Replay telemetry contains only aggregate counts and fixed category labels, never transcript content.
-package struct AgentPerfConversationReplayEvent: Sendable {
+package struct AgentPerfConversationReplayEvent {
     package let mode: String
     package let fields: [String: String]
     package let truncatedToolCallCount: Int
@@ -73,7 +100,7 @@ package struct AgentPerfConversationReplayEvent: Sendable {
     }
 }
 
-package enum AgentPerfCodexLifecyclePhase: String, CaseIterable, Sendable {
+package enum AgentPerfCodexLifecyclePhase: String, CaseIterable {
     case runtimeResolution = "runtime_resolution"
     case provisioning
     case spawnInitialize = "spawn_initialize"
@@ -83,7 +110,7 @@ package enum AgentPerfCodexLifecyclePhase: String, CaseIterable, Sendable {
     case shutdown
 }
 
-package enum AgentPerfCodexLifecycleOutcome: String, CaseIterable, Sendable {
+package enum AgentPerfCodexLifecycleOutcome: String, CaseIterable {
     case succeeded
     case failed
     case cancelled
@@ -120,13 +147,29 @@ package protocol AgentModePerfRecording: Sendable {
 }
 
 package extension AgentModePerfRecording {
-    func increment(_ key: String) { increment(key, tabID: nil, by: 1) }
-    func increment(_ key: String, tabID: UUID?) { increment(key, tabID: tabID, by: 1) }
-    func increment(_ key: String, by amount: Int) { increment(key, tabID: nil, by: amount) }
+    func increment(_ key: String) {
+        increment(key, tabID: nil, by: 1)
+    }
 
-    func event(_ name: String) { event(name, tabID: nil, fields: [:]) }
-    func event(_ name: String, tabID: UUID?) { event(name, tabID: tabID, fields: [:]) }
-    func event(_ name: String, fields: [String: String]) { event(name, tabID: nil, fields: fields) }
+    func increment(_ key: String, tabID: UUID?) {
+        increment(key, tabID: tabID, by: 1)
+    }
+
+    func increment(_ key: String, by amount: Int) {
+        increment(key, tabID: nil, by: amount)
+    }
+
+    func event(_ name: String) {
+        event(name, tabID: nil, fields: [:])
+    }
+
+    func event(_ name: String, tabID: UUID?) {
+        event(name, tabID: tabID, fields: [:])
+    }
+
+    func event(_ name: String, fields: [String: String]) {
+        event(name, tabID: nil, fields: fields)
+    }
 
     func durationEvent(_ name: String, startMS: Double?) {
         durationEvent(name, startMS: startMS, tabID: nil, fields: [:])
@@ -163,13 +206,34 @@ package extension AgentModePerfRecording {
 
 package struct NoopAgentModePerfRecorder: AgentModePerfRecording {
     package init() {}
-    package var isEnabled: Bool { false }
-    package func timestampMSIfEnabled() -> Double? { nil }
-    package func timestampMS() -> Double { CFAbsoluteTimeGetCurrent() * 1000 }
-    package func elapsedMS(since startMS: Double) -> Double { timestampMS() - startMS }
-    package func formatMS(_ value: Double) -> String { String(format: "%.1fms", value) }
-    package func formatElapsedMS(since startMS: Double) -> String { formatMS(elapsedMS(since: startMS)) }
-    package func shortID(_ id: UUID?) -> String { id?.uuidString.prefix(8).description ?? "nil" }
+    package var isEnabled: Bool {
+        false
+    }
+
+    package func timestampMSIfEnabled() -> Double? {
+        nil
+    }
+
+    package func timestampMS() -> Double {
+        CFAbsoluteTimeGetCurrent() * 1000
+    }
+
+    package func elapsedMS(since startMS: Double) -> Double {
+        timestampMS() - startMS
+    }
+
+    package func formatMS(_ value: Double) -> String {
+        String(format: "%.1fms", value)
+    }
+
+    package func formatElapsedMS(since startMS: Double) -> String {
+        formatMS(elapsedMS(since: startMS))
+    }
+
+    package func shortID(_ id: UUID?) -> String {
+        id?.uuidString.prefix(8).description ?? "nil"
+    }
+
     package func counterKey(_ base: String, source: String?) -> String {
         let normalized = source?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -180,12 +244,16 @@ package struct NoopAgentModePerfRecorder: AgentModePerfRecording {
         guard let normalized, !normalized.isEmpty else { return "\(base).source.unknown" }
         return "\(base).source.\(normalized)"
     }
+
     package func increment(_: String, tabID _: UUID?, by _: Int) {}
     package func event(_: String, tabID _: UUID?, fields _: [String: String]) {}
     package func durationEvent(_: String, startMS _: Double?, tabID _: UUID?, fields _: [String: String]) {}
     package func recordStoreUpdate(_: String, published _: Bool, details _: [String: String]) {}
     package func recordConversationReplay(_: AgentPerfConversationReplayEvent, startMS _: Double?) {}
-    package func beginSidebarDelete(_: AgentPerfSidebarDeleteBeginContext) -> UUID { UUID() }
+    package func beginSidebarDelete(_: AgentPerfSidebarDeleteBeginContext) -> UUID {
+        UUID()
+    }
+
     package func markSidebarDeleteVisibleRemoved(tabID _: UUID, source _: String, fields _: [String: String]) {}
     package func markSidebarDeleteAgentCleanupComplete(tabID _: UUID, source _: String, fields _: [String: String]) {}
     package func markSidebarDeleteFullCleanupComplete(tabID _: UUID, source _: String, fields _: [String: String]) {}

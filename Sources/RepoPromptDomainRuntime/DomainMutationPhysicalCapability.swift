@@ -1,5 +1,11 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
+import RepoPromptC
+import RepoPromptShared
 
 package enum DomainMutationPhysicalCapabilityError: Error, Equatable, LocalizedError {
     case scopeUnavailable
@@ -101,12 +107,11 @@ package final class DomainMutationPhysicalCapability: @unchecked Sendable {
             throw DomainMutationPhysicalCapabilityError.destinationExists(destination.absolutePath)
         }
 
-        let result = renameatx_np(
+        let result = repo_rename_exclusive(
             sourceParent.fd,
             source.leaf,
             destinationParent.fd,
-            destination.leaf,
-            UInt32(RENAME_EXCL)
+            destination.leaf
         )
         guard result == 0 else {
             let code = errno
@@ -370,7 +375,7 @@ package final class DomainMutationPhysicalCapability: @unchecked Sendable {
                 code: errno
             )
         }
-        return status.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG)
+        return status.st_mode & mode_t(RepoPromptC.S_IFMT) == mode_t(RepoPromptC.S_IFREG)
     }
 
     private func permissionMode(of descriptor: Int32) throws -> mode_t {
@@ -432,7 +437,7 @@ package final class DomainMutationPhysicalCapability: @unchecked Sendable {
         while offset < data.count {
             let count = data.withUnsafeBytes { buffer -> Int in
                 guard let base = buffer.baseAddress else { return 0 }
-                return Darwin.write(descriptor, base.advanced(by: offset), data.count - offset)
+                return POSIXSystem.write(descriptor, base.advanced(by: offset), data.count - offset)
             }
             guard count > 0 else {
                 let code = count == 0 ? EIO : errno
@@ -523,7 +528,7 @@ private final class DomainMutationPhysicalLease: @unchecked Sendable {
         }
         guard status.st_dev == dev_t(identity.device),
               status.st_ino == ino_t(identity.inode),
-              status.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR)
+              status.st_mode & mode_t(RepoPromptC.S_IFMT) == mode_t(RepoPromptC.S_IFDIR)
         else {
             throw DomainMutationPhysicalCapabilityError.scopeUnavailable
         }
@@ -680,7 +685,7 @@ private final class DomainMutationPhysicalDescriptor: @unchecked Sendable {
     }
 
     deinit {
-        Darwin.close(fd)
+        close(fd)
     }
 }
 
@@ -688,10 +693,10 @@ private struct DomainMutationPhysicalFileIdentity {
     let mode: mode_t
 
     init(_ status: stat) {
-        mode = status.st_mode & mode_t(S_IFMT)
+        mode = status.st_mode & mode_t(RepoPromptC.S_IFMT)
     }
 
     var isRegular: Bool {
-        mode == mode_t(S_IFREG)
+        mode == mode_t(RepoPromptC.S_IFREG)
     }
 }

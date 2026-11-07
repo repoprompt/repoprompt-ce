@@ -1,7 +1,11 @@
-import CryptoKit
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
 import Foundation
 
-package enum CodeMapCanonicalIdentityError: Error, Equatable, Sendable {
+package enum CodeMapCanonicalIdentityError: Error, Equatable {
     case inputTooLarge
     case truncated(field: String)
     case invalidDomain
@@ -19,7 +23,7 @@ package enum CodeMapCanonicalIdentityError: Error, Equatable, Sendable {
     case nonCanonicalEncoding
 }
 
-package struct CodeMapSHA256Digest: Hashable, Sendable {
+package struct CodeMapSHA256Digest: Hashable {
     package static let byteCount = 32
 
     package let bytes: Data
@@ -36,7 +40,7 @@ package struct CodeMapSHA256Digest: Hashable, Sendable {
     }
 }
 
-package struct CodeMapSemanticVersion: Hashable, Sendable {
+package struct CodeMapSemanticVersion: Hashable {
     package let major: UInt32
     package let minor: UInt32
     package let patch: UInt32
@@ -48,7 +52,7 @@ package struct CodeMapSemanticVersion: Hashable, Sendable {
     }
 }
 
-package enum CodeMapPipelineLanguageID: String, CaseIterable, Hashable, Sendable {
+package enum CodeMapPipelineLanguageID: String, CaseIterable, Hashable {
     case swift
     case javascript
     case cSharp = "c-sharp"
@@ -64,7 +68,7 @@ package enum CodeMapPipelineLanguageID: String, CaseIterable, Hashable, Sendable
     case ruby
 }
 
-package struct CodeMapPipelineNamedLimit: Hashable, Sendable {
+package struct CodeMapPipelineNamedLimit: Hashable {
     package let name: String
     package let value: UInt64
 
@@ -74,7 +78,7 @@ package struct CodeMapPipelineNamedLimit: Hashable, Sendable {
     }
 }
 
-package struct CodeMapPipelineNamedFlag: Hashable, Sendable {
+package struct CodeMapPipelineNamedFlag: Hashable {
     package let name: String
     package let enabled: Bool
 
@@ -84,7 +88,7 @@ package struct CodeMapPipelineNamedFlag: Hashable, Sendable {
     }
 }
 
-package struct CodeMapPipelineIdentity: Hashable, Sendable {
+package struct CodeMapPipelineIdentity: Hashable {
     package static let domain = "codemap-pipeline-identity-v1"
 
     package static let requiredLimitNames = [
@@ -292,7 +296,7 @@ package struct CodeMapPipelineIdentity: Hashable, Sendable {
     }
 }
 
-package struct CodeMapArtifactKey: Hashable, Sendable {
+package struct CodeMapArtifactKey: Hashable {
     package static let domain = "codemap-artifact-key-v1"
 
     private static let maximumCanonicalByteCount = 32 * 1024

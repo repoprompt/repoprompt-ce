@@ -1,11 +1,24 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
-import OSLog
+import RepoPromptC
+#if canImport(OSLog)
+    import OSLog
+#else
+    import Logging
+#endif
 
 /// Cross-process FIFO admission. A locked claim is a live waiter; unlocked claims are
 /// crash leftovers. Registration/pruning use one short turnstile lock, never held for I/O.
 package enum MCPDomainHeadlessReadSlots {
-    private static let logger = Logger(subsystem: "com.repoprompt.ce", category: "HeadlessReadAdmission")
+    #if canImport(OSLog)
+        private static let logger = Logger(subsystem: "com.repoprompt.ce", category: "HeadlessReadAdmission")
+    #else
+        private static let logger = Logger(label: "com.repoprompt.ce.HeadlessReadAdmission")
+    #endif
     private static let warnings = WarningState()
 
     package static func deadline(timeout: Duration = .seconds(15)) -> MCPDomainAdmissionDeadline {
@@ -63,12 +76,16 @@ package enum MCPDomainHeadlessReadSlots {
     }
 
     private static func defaultDirectory() throws -> URL {
-        let length = confstr(_CS_DARWIN_USER_TEMP_DIR, nil, 0)
-        guard length > 1 else { throw POSIXError(.EPERM) }
-        var buffer = [CChar](repeating: 0, count: length)
-        guard confstr(_CS_DARWIN_USER_TEMP_DIR, &buffer, buffer.count) == length else { throw POSIXError(.EPERM) }
-        return URL(fileURLWithPath: String(decoding: buffer.dropLast().map { UInt8(bitPattern: $0) }, as: UTF8.self), isDirectory: true)
-            .appendingPathComponent("repoprompt-ce-headless-file-reads", isDirectory: true)
+        #if os(Linux)
+            return URL(fileURLWithPath: "/tmp/repoprompt-ce-headless-file-reads-\(getuid())", isDirectory: true)
+        #else
+            let length = confstr(_CS_DARWIN_USER_TEMP_DIR, nil, 0)
+            guard length > 1 else { throw POSIXError(.EPERM) }
+            var buffer = [CChar](repeating: 0, count: length)
+            guard confstr(_CS_DARWIN_USER_TEMP_DIR, &buffer, buffer.count) == length else { throw POSIXError(.EPERM) }
+            return URL(fileURLWithPath: String(decoding: buffer.dropLast().map { UInt8(bitPattern: $0) }, as: UTF8.self), isDirectory: true)
+                .appendingPathComponent("repoprompt-ce-headless-file-reads", isDirectory: true)
+        #endif
     }
 
     private static func failure() -> POSIXError {
@@ -110,7 +127,7 @@ package enum MCPDomainHeadlessReadSlots {
     }
 
     private static func tryLock(_ fd: Int32) throws -> Bool {
-        if flock(fd, LOCK_EX | LOCK_NB) == 0 { return true }
+        if repo_flock(fd, LOCK_EX | LOCK_NB) == 0 { return true }
         guard errno == EWOULDBLOCK || errno == EAGAIN else { throw failure() }
         return false
     }
@@ -195,16 +212,16 @@ package enum MCPDomainHeadlessReadSlots {
                 throw error
             }
         } catch {
-            flock(turnstile, LOCK_UN)
+            repo_flock(turnstile, LOCK_UN)
             throw error
         }
-        flock(turnstile, LOCK_UN)
+        repo_flock(turnstile, LOCK_UN)
         defer {
             // Do not race a directory scan or block cancellation on cleanup. If the
             // turnstile is occupied, closing leaves an unlocked claim for its next holder.
             if (try? tryLock(turnstile)) == true {
                 unlinkat(directoryFD, claim.name, 0)
-                flock(turnstile, LOCK_UN)
+                repo_flock(turnstile, LOCK_UN)
             }
             close(claim.fd)
         }
@@ -216,9 +233,9 @@ package enum MCPDomainHeadlessReadSlots {
             let isHead: Bool
             do {
                 isHead = try firstLiveClaim(directory: directoryFD, ownName: claim.name) == claim.name
-                flock(turnstile, LOCK_UN)
+                repo_flock(turnstile, LOCK_UN)
             } catch {
-                flock(turnstile, LOCK_UN)
+                repo_flock(turnstile, LOCK_UN)
                 throw error
             }
             if isHead { break }
@@ -249,7 +266,7 @@ package enum MCPDomainHeadlessReadSlots {
         defer { closedir(scan) }
         var names: [String] = []
         while let entry = readdir(scan) {
-            let capacity = Int(entry.pointee.d_namlen) + 1
+            let capacity = MemoryLayout.size(ofValue: entry.pointee.d_name)
             let name = withUnsafePointer(to: &entry.pointee.d_name) {
                 $0.withMemoryRebound(to: CChar.self, capacity: capacity) { String(cString: $0) }
             }

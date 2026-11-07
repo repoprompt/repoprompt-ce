@@ -124,6 +124,39 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 
 ## Platform extraction boundaries
 
+`Apps/RepoPromptLinux` owns the optional native Linux Qt/Python frontend and its
+desktop tests. It is an independent Python package over a long-lived stdio MCP
+connection to `repoprompt-mcp`, not a second Swift runtime. Qt's read-only
+filesystem model supplies lazy directory presentation, with symlinks excluded;
+file contents, searches, CodeMaps, root confinement, and durable selection/prompt
+state remain owned by the production engine. Markdown clipboard assembly is a
+presentation export of those engine reads. The frontend starts no HTTP listener
+and exposes no source-file mutation UI. `Scripts/install_linux_gui.py` owns the
+optional user-prefix package/desktop-entry installer; it does not change SwiftPM
+product or target membership. The macOS application and its ownership map remain
+under `Sources/RepoPrompt`.
+
+The Linux manifest exposes only the production `repoprompt-mcp` executable.
+`RepoPromptMCP` retains its thin entry over `RepoPromptMCPCore`; the domain,
+workspace, CodeMap, regex, process, VCS, instrumentation, foundation, shared and C
+owners remain the same source directories on both platforms. Linux excludes the
+macOS application, its tests, Sparkle, Keychain-backed secure storage, app
+settings/persistence and the FSEvents filesystem target together with their
+Apple-only package dependencies. Linux uses the pinned Swift Crypto `Crypto`
+product for cryptographic operations; macOS continues using CryptoKit. There is
+no second runtime, catalog, policy or workspace implementation.
+
+`RepoPromptC` owns the narrow native POSIX capabilities needed by the Linux
+closure, including peer credentials, entropy, atomic no-replace moves, spawn
+file actions and file metadata operations. Shared, process and VCS owners consume the
+C module directly on both platforms.
+The reusable `LRUCache` now belongs to
+`RepoPromptFoundation/Utilities/Collections`, so VCS does not depend on the
+macOS filesystem watcher merely to obtain a collection. Linux user-facing
+installation and feature boundaries are documented in [`linux.md`](../linux.md).
+The source-layout guardrails validate the Linux product's actual dependency
+closure and Crypto edges while retaining the macOS app-graph checks on macOS.
+
 `RepoPromptFileSystem` owns filesystem and ignore mechanics, neutral catalog/file values, FSEvents, secure removal, and a policy-injected disk writer. The app retains repository topology/defaults migration, diagnostic-hook composition, authenticated seed-plan adaptation, and workspace decoding/selection merge policy. One process-owned writer is injected across workspace managers; the library has no singleton.
 
 `RepoPromptVCS` owns reusable query contracts/values, pure repository resolution, GitDiff substrate, and process/clone mechanics. `GitService` remains intact in the app alongside backends, workspace authority/receipt/metadata orchestration, and materialization/merge presentation. App adapters translate loaded roots and provide existing backend operations; no second Git authority is introduced.

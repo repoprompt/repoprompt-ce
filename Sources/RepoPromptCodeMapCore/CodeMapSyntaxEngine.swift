@@ -1,4 +1,8 @@
-import CryptoKit
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
 import Foundation
 import SwiftTreeSitter
 import TreeSitterC
@@ -15,7 +19,7 @@ import TreeSitterSwift
 import TreeSitterTSX
 import TreeSitterTypeScript
 
-package enum LanguageType: String, CaseIterable, Comparable, Codable, Sendable {
+package enum LanguageType: String, CaseIterable, Comparable, Codable {
     case swift, js, c_sharp, python, c, rust, cpp, go, java, ts, tsx, php, ruby
 
     package var displayName: String {
@@ -41,20 +45,20 @@ package enum LanguageType: String, CaseIterable, Comparable, Codable, Sendable {
     }
 }
 
-package enum CodeMapSyntaxQueryOutcome: Sendable {
+package enum CodeMapSyntaxQueryOutcome {
     case captures([NamedRange])
     case oversize(CodeMapSyntaxOversizeReason)
     case parseFailed(CodeMapSyntaxParseFailure)
 }
 
-package struct CodeMapLanguagePipelineDescriptor: Sendable {
+package struct CodeMapLanguagePipelineDescriptor {
     package let stableLanguageID: CodeMapPipelineLanguageID
     package let grammarRevision: String
     package let treeSitterABIVersion: UInt32
     package let queryBytes: Data
 }
 
-package struct CodeMapGrammarDescriptor: Sendable {
+package struct CodeMapGrammarDescriptor {
     package let languageType: LanguageType
     package let stableLanguageID: CodeMapPipelineLanguageID
     package let displayName: String
@@ -63,7 +67,7 @@ package struct CodeMapGrammarDescriptor: Sendable {
     package let queryBytes: Data
 }
 
-package enum CodeMapSyntaxEngineError: Error, Equatable, Sendable {
+package enum CodeMapSyntaxEngineError: Error, Equatable {
     case missingGrammar(language: LanguageType)
     case invalidGrammarABI(language: LanguageType)
     case queryCompilation(language: LanguageType, diagnostic: String)
@@ -81,10 +85,10 @@ package protocol CodeMapSyntaxPerformanceQuerying: CodeMapSyntaxQuerying {
     ) throws -> CodeMapSyntaxQueryOutcome
 }
 
-package struct CodeMapSyntaxEngine: CodeMapSyntaxPerformanceQuerying, Sendable {
+package struct CodeMapSyntaxEngine: CodeMapSyntaxPerformanceQuerying {
     package static let shared = CodeMapSyntaxEngine()
 
-    package static let parseLineLimit = 25_000
+    package static let parseLineLimit = 25000
     package static let parseUTF16Limit = 1_500_000
     package static let parseUTF8Limit = 5_000_000
 
@@ -586,7 +590,7 @@ private enum QueryStore {
     ) -> Result<Query, CodeMapSyntaxEngineError> {
         do {
             let descriptor = try RegisteredLanguageStore.lookup(for: languageType)
-            return .success(try Query(language: descriptor.language, data: descriptor.queryBytes))
+            return try .success(Query(language: descriptor.language, data: descriptor.queryBytes))
         } catch let error as CodeMapSyntaxEngineError {
             return .failure(error)
         } catch {

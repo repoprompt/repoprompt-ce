@@ -3,6 +3,7 @@ import CoreServices
 import Dispatch
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptFoundation
 #if DEBUG || EDIT_FLOW_PERF
     import os
 #endif

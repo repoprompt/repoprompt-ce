@@ -1,4 +1,8 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 
 /// Pins the owner-only directory controlling bootstrap socket and lock names.
@@ -40,11 +44,11 @@ public final class MCPBootstrapDirectory: @unchecked Sendable {
         if createIfMissing, mkdir(canonicalURL.path, mode_t(0o700)) != 0, errno != EEXIST {
             throw DirectoryError(path: url.path, code: errno)
         }
-        let fd = Darwin.open(canonicalURL.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        let fd = POSIXSystem.open(canonicalURL.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else { throw DirectoryError(path: url.path, code: errno) }
         var info = stat()
         guard fstat(fd, &info) == 0, isPrivateDirectory(info) else {
-            Darwin.close(fd)
+            close(fd)
             throw DirectoryError(path: url.path)
         }
         let directory = MCPBootstrapDirectory(descriptor: fd, url: canonicalURL, originalURL: url, info: info)
@@ -60,7 +64,7 @@ public final class MCPBootstrapDirectory: @unchecked Sendable {
         inode = info.st_ino
     }
 
-    deinit { Darwin.close(descriptor) }
+    deinit { close(descriptor) }
 
     public func validateCurrentPath() throws {
         var descriptorInfo = stat()

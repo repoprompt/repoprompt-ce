@@ -45,6 +45,10 @@ package actor ExecMCPService: Service {
         )
         self.session = session
 
+        #if os(Linux)
+            await session.setLocalHeadlessSingleCommandMode(true)
+        #endif
+
         // Enable raw JSON mode if requested
         await session.setRawJSONEnabled(options.rawJSON)
         await session.setDefaultToolCallTimeout(Self.timeoutPolicy(from: options.toolCallTimeoutSeconds))

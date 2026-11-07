@@ -1,4 +1,8 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 
 /// Application-state locations, not repository editing authority. Build flavor is
@@ -8,16 +12,22 @@ public struct AppProfileLocations: Sendable {
     public let profileName: String
     public let homeDirectory: URL
     private let protectedCustomRoots: [URL]
+    private let applicationDataDirectory: URL
 
     public init(
         identity: MCPFilesystemIdentity,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
         profileName: String = "default",
-        releaseCustomStorageRoots: [URL]? = nil
+        releaseCustomStorageRoots: [URL]? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) {
         self.identity = identity
         self.profileName = profileName
         self.homeDirectory = homeDirectory
+        applicationDataDirectory = MCPFilesystemIdentity.applicationDataDirectoryURL(
+            homeDirectory: homeDirectory,
+            environment: environment
+        )
         // Capture read-only release preferences at profile composition, not on
         // every workspace/session write. A changed selection is picked up by
         // the next runtime composition; canonical/symlink checks still run per IO.
@@ -32,7 +42,7 @@ public struct AppProfileLocations: Sendable {
     }
 
     public var applicationSupportRoot: URL {
-        homeDirectory.appendingPathComponent("Library/Application Support", isDirectory: true)
+        applicationDataDirectory
             .appendingPathComponent(identity.applicationStateDirectoryName, isDirectory: true)
     }
 
@@ -41,9 +51,13 @@ public struct AppProfileLocations: Sendable {
     }
 
     public var savedPromptsRoot: URL {
-        identity.buildFlavor == .release
-            ? homeDirectory.appendingPathComponent("Library/Application Support/com.pvncher.repoprompt", isDirectory: true)
-            : applicationSupportRoot.appendingPathComponent("SavedPrompts", isDirectory: true)
+        #if os(Linux)
+            applicationSupportRoot.appendingPathComponent("SavedPrompts", isDirectory: true)
+        #else
+            identity.buildFlavor == .release
+                ? homeDirectory.appendingPathComponent("Library/Application Support/com.pvncher.repoprompt", isDirectory: true)
+                : applicationSupportRoot.appendingPathComponent("SavedPrompts", isDirectory: true)
+        #endif
     }
 
     public var preferencesDomain: String {
@@ -52,7 +66,11 @@ public struct AppProfileLocations: Sendable {
 
     /// Read-only legacy sources are never a fallback write destination.
     public var releaseStateRoots: [URL] {
-        let release = Self(identity: .repoPromptCE(.release), homeDirectory: homeDirectory)
+        let release = Self(
+            identity: .repoPromptCE(.release),
+            homeDirectory: homeDirectory,
+            environment: ["XDG_DATA_HOME": applicationDataDirectory.path]
+        )
         return [
             release.applicationSupportRoot,
             release.savedPromptsRoot

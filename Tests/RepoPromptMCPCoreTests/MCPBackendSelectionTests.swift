@@ -1,4 +1,9 @@
-import Darwin
+import RepoPromptShared
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 @testable import RepoPromptMCPCore
 import XCTest
@@ -9,9 +14,9 @@ final class MCPBackendSelectionTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         defer { try? FileManager.default.removeItem(at: directory) }
         let socketURL = directory.appendingPathComponent("probe.sock")
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        let fd = socket(AF_UNIX, POSIXSystem.streamSocketType, 0)
         XCTAssertGreaterThanOrEqual(fd, 0)
-        defer { Darwin.close(fd) }
+        defer { POSIXSystem.close(fd) }
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
         let bytes = socketURL.path.utf8CString
@@ -24,7 +29,7 @@ final class MCPBackendSelectionTests: XCTestCase {
         }
         let result = withUnsafePointer(to: &address) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                POSIXSystem.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
         XCTAssertEqual(result, 0)

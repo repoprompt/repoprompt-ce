@@ -1,3 +1,8 @@
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Dispatch
 import Foundation
 import Logging
@@ -30,8 +35,8 @@ private let enableSocketDebugLog: Bool = ProcessInfo.processInfo.environment["MC
     UserDefaults.standard.bool(forKey: "enableSocketDebugLog")
 
 private let debugLogURL: URL = {
-    let url = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/RepoPrompt CE/socket-proxy-debug.log")
+    let url = AppProfileLocations.current.applicationSupportRoot
+        .appendingPathComponent("socket-proxy-debug.log")
     guard enableSocketDebugLog else { return url }
     // Create directory if needed
     try? FileManager.default.createDirectory(
@@ -188,28 +193,34 @@ enum CLIEventLogger {
     static func detectClientName() -> String? {
         let parentPID = getppid()
         debugLog("detectClientName: parentPID=\(parentPID)")
-        var name = [CChar](repeating: 0, count: 1024)
-        var size = name.count
+        #if os(Linux)
+            guard let name = try? String(contentsOfFile: "/proc/\(parentPID)/comm", encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty else { return nil }
+            return name
+        #else
+            var name = [CChar](repeating: 0, count: 1024)
+            var size = name.count
 
-        var mib = [CTL_KERN, KERN_PROCARGS2, parentPID]
-        guard sysctl(&mib, 3, &name, &size, nil, 0) == 0 else {
-            debugLog("detectClientName: sysctl failed for parentPID=\(parentPID), errno=\(errno)")
-            return nil
-        }
+            var mib = [CTL_KERN, KERN_PROCARGS2, parentPID]
+            guard sysctl(&mib, 3, &name, &size, nil, 0) == 0 else {
+                debugLog("detectClientName: sysctl failed for parentPID=\(parentPID), errno=\(errno)")
+                return nil
+            }
 
-        let pathStart = name.dropFirst(4).firstIndex(where: { $0 != 0 }) ?? 4
-        let execPath = name.withUnsafeBufferPointer { buffer in
-            String(cString: buffer.baseAddress!.advanced(by: pathStart))
-        }
-        guard !execPath.isEmpty else {
-            debugLog("detectClientName: execPath empty for parentPID=\(parentPID)")
-            return nil
-        }
+            let pathStart = name.dropFirst(4).firstIndex(where: { $0 != 0 }) ?? 4
+            let execPath = name.withUnsafeBufferPointer { buffer in
+                String(cString: buffer.baseAddress!.advanced(by: pathStart))
+            }
+            guard !execPath.isEmpty else {
+                debugLog("detectClientName: execPath empty for parentPID=\(parentPID)")
+                return nil
+            }
 
-        // Return raw executable name - let MCP protocol name be authoritative
-        let result = URL(fileURLWithPath: execPath).lastPathComponent
-        debugLog("detectClientName: execPath='\(execPath)' result='\(result)'")
-        return result
+            // Return raw executable name - let MCP protocol name be authoritative
+            let result = URL(fileURLWithPath: execPath).lastPathComponent
+            debugLog("detectClientName: execPath='\(execPath)' result='\(result)'")
+            return result
+        #endif
     }
 
     /// Determines if an error should be persisted as an event file.
@@ -960,7 +971,7 @@ actor BootstrapSocketProxy {
             throw SocketProxyError.connectFailed(errno: ENOENT)
         }
         // Create socket
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        let fd = socket(AF_UNIX, POSIXSystem.streamSocketType, 0)
         guard fd >= 0 else {
             throw SocketProxyError.socketCreationFailed(errno: errno)
         }
@@ -968,13 +979,15 @@ actor BootstrapSocketProxy {
         do {
             try POSIXDescriptorSupport.setCloseOnExec(fd)
         } catch let error as POSIXDescriptorConfigurationError {
-            Darwin.close(fd)
+            POSIXSystem.close(fd)
             throw SocketProxyError.descriptorConfigurationFailed(errno: error.errnoValue)
         }
 
         // Disable SIGPIPE
-        var noSigPipe: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        #if canImport(Darwin)
+            var noSigPipe: Int32 = 1
+            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        #endif
 
         // Set up socket address
         var addr = sockaddr_un()
@@ -982,7 +995,7 @@ actor BootstrapSocketProxy {
 
         let path = socketURL.path
         guard path.utf8.count < MemoryLayout.size(ofValue: addr.sun_path) else {
-            Darwin.close(fd)
+            POSIXSystem.close(fd)
             throw SocketProxyError.pathTooLong
         }
 
@@ -996,13 +1009,13 @@ actor BootstrapSocketProxy {
         let addrLen = socklen_t(MemoryLayout<sockaddr_un>.size)
         let result = withUnsafePointer(to: &addr) { addrPtr in
             addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
-                Darwin.connect(fd, sockaddrPtr, addrLen)
+                POSIXSystem.connect(fd, sockaddrPtr, addrLen)
             }
         }
 
         if result < 0 {
             let err = errno
-            Darwin.close(fd)
+            POSIXSystem.close(fd)
             if err == ECONNREFUSED {
                 let socketPath = socketURL.path
                 if FileManager.default.fileExists(atPath: socketPath),
@@ -1022,7 +1035,7 @@ actor BootstrapSocketProxy {
         do {
             try directory.validateSocket(at: socketURL)
         } catch {
-            Darwin.close(fd)
+            POSIXSystem.close(fd)
             throw error
         }
         socketFD = fd
@@ -1032,7 +1045,7 @@ actor BootstrapSocketProxy {
     private func closeSocket() {
         if socketFD >= 0 {
             POSIXDescriptorSupport.shutdownSocketReadWrite(socketFD)
-            Darwin.close(socketFD)
+            POSIXSystem.close(socketFD)
             socketFD = -1
         }
     }
@@ -1103,7 +1116,7 @@ actor BootstrapSocketProxy {
                 throw SocketProxyError.connectionReset
             }
 
-            let bytesRead = Darwin.read(socketFD, readBuffer, 4096)
+            let bytesRead = POSIXSystem.read(socketFD, readBuffer, 4096)
             if bytesRead <= 0 {
                 if bytesRead < 0, errno == EAGAIN || errno == EINTR {
                     continue
@@ -1257,7 +1270,7 @@ extension BootstrapSocketProxy {
 
             var byte: UInt8 = 0
             let bytesRead = withUnsafeMutablePointer(to: &byte) { ptr in
-                Darwin.read(socketFD, ptr, 1)
+                POSIXSystem.read(socketFD, ptr, 1)
             }
             if bytesRead < 0 {
                 if errno == EAGAIN || errno == EINTR { continue }
@@ -1516,7 +1529,7 @@ extension BootstrapSocketProxy {
             }
 
             let bytesRead = buffer.withUnsafeMutableBufferPointer { ptr in
-                Darwin.read(stdinFD, ptr.baseAddress!, ptr.count)
+                POSIXSystem.read(stdinFD, ptr.baseAddress!, ptr.count)
             }
 
             if bytesRead < 0 {
@@ -1826,7 +1839,7 @@ extension BootstrapSocketProxy {
             }
 
             let bytesRead = buffer.withUnsafeMutableBufferPointer { ptr in
-                Darwin.read(socketFD, ptr.baseAddress!, ptr.count)
+                POSIXSystem.read(socketFD, ptr.baseAddress!, ptr.count)
             }
 
             if bytesRead < 0 {
@@ -1992,13 +2005,13 @@ extension BootstrapSocketProxy {
                 throw SocketProxyError.cancelled
             }
             if Date() > deadline {
-                shutdown(socketFD, SHUT_RDWR)
+                shutdown(socketFD, POSIXSystem.shutdownReadWrite)
                 throw SocketProxyError.connectionTimeout
             }
 
             let written = data.withUnsafeBytes { buf in
                 let ptr = buf.baseAddress!.advanced(by: totalWritten)
-                return Darwin.write(socketFD, ptr, data.count - totalWritten)
+                return POSIXSystem.write(socketFD, ptr, data.count - totalWritten)
             }
 
             if written > 0 {
@@ -2012,7 +2025,7 @@ extension BootstrapSocketProxy {
                 if err == EAGAIN || err == EWOULDBLOCK {
                     let remainingMs = Int32(deadline.timeIntervalSinceNow * 1000)
                     if remainingMs <= 0 {
-                        shutdown(socketFD, SHUT_RDWR)
+                        shutdown(socketFD, POSIXSystem.shutdownReadWrite)
                         throw SocketProxyError.connectionTimeout
                     }
                     var pfd = pollfd(fd: socketFD, events: Int16(POLLOUT), revents: 0)
@@ -2073,7 +2086,7 @@ package actor MCPService: Service {
 
     // Kill signal watcher state
     private var killSignalFD: Int32 = -1
-    private var killSignalSource: DispatchSourceFileSystemObject?
+    private var killSignalSource: (any DispatchSourceProtocol)?
     private var killSignalContinuation: CheckedContinuation<CLIKillSignal.SignalContent?, Never>?
 
     package init() {
@@ -2096,25 +2109,31 @@ package actor MCPService: Service {
         // Ensure directory exists
         try? fm.createDirectory(at: signalsDir, withIntermediateDirectories: true)
 
-        let fd = open(signalsDir.path, O_EVTONLY)
-        guard fd >= 0 else {
-            log.warning("Failed to open kill signals directory for watching")
-            return
-        }
-        do {
-            try POSIXDescriptorSupport.setCloseOnExec(fd)
-        } catch {
-            close(fd)
-            log.warning("Failed to configure kill signals directory watcher descriptor: \(error)")
-            return
-        }
-        killSignalFD = fd
+        #if canImport(Darwin)
+            let fd = open(signalsDir.path, O_EVTONLY)
+            guard fd >= 0 else {
+                log.warning("Failed to open kill signals directory for watching")
+                return
+            }
+            do {
+                try POSIXDescriptorSupport.setCloseOnExec(fd)
+            } catch {
+                close(fd)
+                log.warning("Failed to configure kill signals directory watcher descriptor: \(error)")
+                return
+            }
+            killSignalFD = fd
 
-        let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: fd,
-            eventMask: [.write, .rename],
-            queue: .global(qos: .utility)
-        )
+            let source = DispatchSource.makeFileSystemObjectSource(
+                fileDescriptor: fd,
+                eventMask: [.write, .rename],
+                queue: .global(qos: .utility)
+            )
+
+        #else
+            let source = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+            source.schedule(deadline: .now(), repeating: .milliseconds(100), leeway: .milliseconds(20))
+        #endif
 
         source.setEventHandler { [weak self, sessionToken] in
             // Check if our kill signal file exists
@@ -2125,9 +2144,11 @@ package actor MCPService: Service {
             }
         }
 
-        source.setCancelHandler {
-            close(fd)
-        }
+        #if canImport(Darwin)
+            source.setCancelHandler {
+                close(fd)
+            }
+        #endif
 
         killSignalSource = source
         source.resume()
@@ -2610,7 +2631,11 @@ package func parseCLIMode(arguments: [String] = CommandLine.arguments) -> CLIMod
     var execOptions = ExecOptions()
     var isInteractive = false
     var isExec = false
-    var backend = MCPBackend.app
+    #if os(Linux)
+        var backend = MCPBackend.headless
+    #else
+        var backend = MCPBackend.app
+    #endif
     var backendOptionWasExplicit = false
 
     var i = args.startIndex
@@ -2931,10 +2956,17 @@ package func parseCLIMode(arguments: [String] = CommandLine.arguments) -> CLIMod
         i = args.index(after: i)
     }
 
-    if backendOptionWasExplicit, backend != .app, isExec || isInteractive {
-        fputs("Error: --backend \(backend.rawValue) is available only for MCP stdio server mode; interactive and exec remain app-backed.\n", stderr)
-        exit(2)
-    }
+    #if os(Linux)
+        if backendOptionWasExplicit, backend == .app {
+            fputs("Error: the native macOS app backend is unavailable on Linux; use --backend headless or --backend auto.\n", stderr)
+            exit(2)
+        }
+    #else
+        if backendOptionWasExplicit, backend != .app, isExec || isInteractive {
+            fputs("Error: --backend \(backend.rawValue) is available only for MCP stdio server mode; interactive and exec remain app-backed.\n", stderr)
+            exit(2)
+        }
+    #endif
 
     // Exec mode takes precedence if any exec flags were used
     if isExec {
@@ -2989,6 +3021,10 @@ package func cliDisplayCommand() -> String {
 }
 
 func printUsage() {
+    #if os(Linux)
+        printLinuxUsage()
+        return
+    #endif
     let usage = """
     RepoPrompt MCP CLI - Execute commands against RepoPrompt workspaces
 
@@ -3492,30 +3528,35 @@ private let repoPromptCEBundleIdentifier: String = {
 
 /// Launches the RepoPrompt app that contains this CLI, falling back to Launch Services.
 func launchRepoPromptApp() {
-    let executableURL = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
-    let appURL = executableURL
-        .deletingLastPathComponent() // MacOS
-        .deletingLastPathComponent() // Contents
-        .deletingLastPathComponent() // RepoPrompt.app
+    #if os(Linux)
+        fputs("RepoPrompt CE's native macOS interface is unavailable on Linux. Use -i for the local REPL, -e for commands, or --backend headless for an MCP client.\n", stderr)
+        exit(2)
+    #else
+        let executableURL = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+        let appURL = executableURL
+            .deletingLastPathComponent() // MacOS
+            .deletingLastPathComponent() // Contents
+            .deletingLastPathComponent() // RepoPrompt.app
 
-    let targetPath: String = if appURL.pathExtension == "app" && FileManager.default.fileExists(atPath: appURL.path) {
-        appURL.path
-    } else {
-        "-b \(repoPromptCEBundleIdentifier)"
-    }
+        let targetPath: String = if appURL.pathExtension == "app" && FileManager.default.fileExists(atPath: appURL.path) {
+            appURL.path
+        } else {
+            "-b \(repoPromptCEBundleIdentifier)"
+        }
 
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-    process.arguments = targetPath.hasPrefix("-b ")
-        ? ["-b", String(targetPath.dropFirst(3))]
-        : [targetPath]
-    do {
-        try process.run()
-        process.waitUntilExit()
-    } catch {
-        fputs("Error: Failed to launch RepoPrompt CE app: \(error)\n", stderr)
-        exit(1)
-    }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = targetPath.hasPrefix("-b ")
+            ? ["-b", String(targetPath.dropFirst(3))]
+            : [targetPath]
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            fputs("Error: Failed to launch RepoPrompt CE app: \(error)\n", stderr)
+            exit(1)
+        }
+    #endif
 }
 
 // MARK: - Debug Helpers

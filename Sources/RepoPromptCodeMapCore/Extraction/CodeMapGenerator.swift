@@ -5,8 +5,9 @@
 //  Created by Eric Provencher on 2025-02-08.
 //
 
+import CoreFoundation
 import Foundation
-#if CODEMAP_PERF_SIGNPOSTS
+#if CODEMAP_PERF_SIGNPOSTS && canImport(os)
     import os
 #endif
 import SwiftTreeSitter
@@ -26,20 +27,20 @@ struct CodeMapGenerator {
 
     // MARK: - Perf Signposts
 
-    #if CODEMAP_PERF_SIGNPOSTS
+    #if CODEMAP_PERF_SIGNPOSTS && canImport(os)
         private typealias SignpostToken = OSSignpostID
     #else
         private typealias SignpostToken = UInt8
     #endif
 
     private enum Signpost {
-        #if CODEMAP_PERF_SIGNPOSTS
+        #if CODEMAP_PERF_SIGNPOSTS && canImport(os)
             static let log = OSLog(subsystem: "com.repoprompt", category: "codemap")
         #endif
 
         @inline(__always)
         static func begin(_ name: StaticString) -> SignpostToken {
-            #if CODEMAP_PERF_SIGNPOSTS
+            #if CODEMAP_PERF_SIGNPOSTS && canImport(os)
                 let id = OSSignpostID(log: log)
                 os_signpost(.begin, log: log, name: name, signpostID: id)
                 return id
@@ -50,7 +51,7 @@ struct CodeMapGenerator {
 
         @inline(__always)
         static func end(_ name: StaticString, _ token: SignpostToken) {
-            #if CODEMAP_PERF_SIGNPOSTS
+            #if CODEMAP_PERF_SIGNPOSTS && canImport(os)
                 os_signpost(.end, log: log, name: name, signpostID: token)
             #endif
         }

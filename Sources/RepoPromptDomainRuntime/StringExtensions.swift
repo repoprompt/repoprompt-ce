@@ -5,7 +5,11 @@
 //  Created by Eric Provencher on 2024-07-25.
 //
 
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 import RepoPromptC
 

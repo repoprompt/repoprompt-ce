@@ -2,12 +2,15 @@ import Foundation
 
 package enum AttachmentClassificationError: Error, Equatable, LocalizedError {
     case imageConversionFailed(fileName: String, format: String)
+    case imageConverterUnavailable(fileName: String, format: String)
     case imageTooLarge(fileName: String, format: String)
 
     package var errorDescription: String? {
         switch self {
         case let .imageConversionFailed(fileName, format):
             "\(fileName) is a \(format) image that could not be converted to JPEG or PNG."
+        case let .imageConverterUnavailable(fileName, format):
+            "\(fileName) is a \(format) image. Install ImageMagick with support for this format to convert it to JPEG or PNG."
         case let .imageTooLarge(fileName, format):
             "\(fileName) is a \(format) image whose dimensions are too large to convert."
         }

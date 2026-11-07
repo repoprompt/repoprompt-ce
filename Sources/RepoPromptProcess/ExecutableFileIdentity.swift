@@ -1,4 +1,10 @@
-import Darwin
+import RepoPromptC
+import RepoPromptShared
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 
 package struct ExecutableFileIdentity: Equatable {
@@ -31,22 +37,30 @@ package struct ExecutableFileIdentity: Equatable {
         guard stat(canonicalPath, &info) == 0 else {
             throw ExecutableFileIdentityError.unavailable(canonicalPath)
         }
-        guard info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else {
+        guard info.st_mode & POSIXSystem.fileTypeMask == mode_t(POSIXSystem.regularFileType) else {
             throw ExecutableFileIdentityError.notRegularFile(canonicalPath)
         }
         guard access(canonicalPath, X_OK) == 0 else {
             throw ExecutableFileIdentityError.notExecutable(canonicalPath)
         }
 
+        #if os(Linux)
+            let modificationTime = info.st_mtim
+            let changeTime = info.st_ctim
+        #else
+            let modificationTime = info.st_mtimespec
+            let changeTime = info.st_ctimespec
+        #endif
+
         return ExecutableFileIdentity(
             canonicalPath: canonicalPath,
             device: UInt64(bitPattern: Int64(info.st_dev)),
             inode: UInt64(info.st_ino),
             size: Int64(info.st_size),
-            modificationSeconds: Int64(info.st_mtimespec.tv_sec),
-            modificationNanoseconds: Int64(info.st_mtimespec.tv_nsec),
-            statusChangeSeconds: Int64(info.st_ctimespec.tv_sec),
-            statusChangeNanoseconds: Int64(info.st_ctimespec.tv_nsec)
+            modificationSeconds: Int64(modificationTime.tv_sec),
+            modificationNanoseconds: Int64(modificationTime.tv_nsec),
+            statusChangeSeconds: Int64(changeTime.tv_sec),
+            statusChangeNanoseconds: Int64(changeTime.tv_nsec)
         )
     }
 
@@ -82,27 +96,31 @@ package struct ExecutableFileIdentity: Equatable {
         groupGID: gid_t,
         effectiveUID: uid_t
     ) -> Bool {
-        guard mode & mode_t(S_IWGRP) != 0,
-              mode & mode_t(S_IWOTH) == 0,
-              ownerUID == 0 || ownerUID == effectiveUID,
-              groupGID == 80
-        else {
+        #if os(Linux)
             return false
-        }
+        #else
+            guard mode & mode_t(S_IWGRP) != 0,
+                  mode & mode_t(S_IWOTH) == 0,
+                  ownerUID == 0 || ownerUID == effectiveUID,
+                  groupGID == 80
+            else {
+                return false
+            }
 
-        let homebrewLocations = [
-            (prefix: "/opt/homebrew", cellar: "/opt/homebrew/Cellar"),
-            (prefix: "/usr/local", cellar: "/usr/local/Cellar")
-        ]
+            let homebrewLocations = [
+                (prefix: "/opt/homebrew", cellar: "/opt/homebrew/Cellar"),
+                (prefix: "/usr/local", cellar: "/usr/local/Cellar")
+            ]
 
-        return homebrewLocations.contains { location in
-            canonicalPath.hasPrefix(location.cellar + "/")
-                && (
-                    directoryPath == location.prefix
-                        || directoryPath == location.cellar
-                        || directoryPath.hasPrefix(location.cellar + "/")
-                )
-        }
+            return homebrewLocations.contains { location in
+                canonicalPath.hasPrefix(location.cellar + "/")
+                    && (
+                        directoryPath == location.prefix
+                            || directoryPath == location.cellar
+                            || directoryPath.hasPrefix(location.cellar + "/")
+                    )
+            }
+        #endif
     }
 
     package static func directoryHasNoExtendedACL(atPath directoryPath: String) -> Bool {
@@ -110,20 +128,24 @@ package struct ExecutableFileIdentity: Equatable {
         guard descriptor >= 0 else { return false }
         defer { close(descriptor) }
 
-        errno = 0
-        guard let acl = acl_get_fd_np(descriptor, ACL_TYPE_EXTENDED) else {
-            let aclErrno = errno
-            return aclErrno == ENOENT
-        }
-        defer { acl_free(UnsafeMutableRawPointer(acl)) }
+        #if os(Linux)
+            return repo_fd_has_extended_acl(descriptor) == 0
+        #else
+            errno = 0
+            guard let acl = acl_get_fd_np(descriptor, ACL_TYPE_EXTENDED) else {
+                let aclErrno = errno
+                return aclErrno == ENOENT
+            }
+            defer { acl_free(UnsafeMutableRawPointer(acl)) }
 
-        guard acl_valid(acl) == 0 else { return false }
+            guard acl_valid(acl) == 0 else { return false }
 
-        var entry: acl_entry_t?
-        errno = 0
-        let entryResult = acl_get_entry(acl, Int32(ACL_FIRST_ENTRY.rawValue), &entry)
-        let entryErrno = errno
-        return entryResult == -1 && entryErrno == EINVAL
+            var entry: acl_entry_t?
+            errno = 0
+            let entryResult = acl_get_entry(acl, Int32(ACL_FIRST_ENTRY.rawValue), &entry)
+            let entryErrno = errno
+            return entryResult == -1 && entryErrno == EINVAL
+        #endif
     }
 
     private static func validateTrustedOwnershipAndPermissions(atCanonicalPath canonicalPath: String) throws {
@@ -144,7 +166,7 @@ package struct ExecutableFileIdentity: Equatable {
         while true {
             var directoryInfo = stat()
             guard stat(directoryPath, &directoryInfo) == 0,
-                  directoryInfo.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR)
+                  directoryInfo.st_mode & POSIXSystem.fileTypeMask == mode_t(POSIXSystem.directoryFileType)
             else {
                 throw ExecutableFileIdentityError.unavailable(directoryPath)
             }
@@ -154,7 +176,7 @@ package struct ExecutableFileIdentity: Equatable {
 
             let isGroupOrWorldWritable = directoryInfo.st_mode & mode_t(S_IWGRP | S_IWOTH) != 0
             let isRootOwnedStickyDirectory = directoryInfo.st_uid == 0
-                && directoryInfo.st_mode & mode_t(S_ISVTX) != 0
+                && directoryInfo.st_mode & POSIXSystem.stickyBit != 0
             let isPermittedHomebrewDirectory =
                 permitsHomebrewAdminGroupWritableDirectory(
                     canonicalPath: canonicalPath,

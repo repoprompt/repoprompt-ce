@@ -207,7 +207,7 @@ public actor BootstrapSocketMCPTransport: Transport {
             try POSIXDescriptorSupport.setCloseOnExec(connectedFD)
         } catch {
             POSIXDescriptorSupport.shutdownSocketReadWrite(connectedFD)
-            Darwin.close(connectedFD)
+            POSIXSystem.close(connectedFD)
             throw error
         }
 
@@ -248,8 +248,10 @@ public actor BootstrapSocketMCPTransport: Transport {
             try Self.ensureNonBlocking(fd: socketFD)
 
             // Disable SIGPIPE on this socket
-            var noSigPipe: Int32 = 1
-            setsockopt(socketFD, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+            #if canImport(Darwin)
+                var noSigPipe: Int32 = 1
+                setsockopt(socketFD, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+            #endif
 
             try startReadSource(fd: socketFD)
             isConnected = true
@@ -342,7 +344,7 @@ public actor BootstrapSocketMCPTransport: Transport {
             }
 
             let written = remaining.withUnsafeBytes { buffer in
-                Darwin.write(socketFD, buffer.baseAddress!, buffer.count)
+                POSIXSystem.write(socketFD, buffer.baseAddress!, buffer.count)
             }
 
             if written < 0 {
@@ -691,7 +693,7 @@ public actor BootstrapSocketMCPTransport: Transport {
         guard !socketClosed else { return }
         socketClosed = true
         POSIXDescriptorSupport.shutdownSocketReadWrite(socketFD)
-        Darwin.close(socketFD)
+        POSIXSystem.close(socketFD)
         #if DEBUG
             debugDescriptorCloseCount += 1
         #endif

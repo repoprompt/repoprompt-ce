@@ -1,6 +1,11 @@
-import Darwin
-import Darwin.POSIX.fcntl
+#if canImport(Darwin)
+    import Darwin
+    import Darwin.POSIX.fcntl
+#else
+    import Glibc
+#endif
 import Foundation
+import RepoPromptC
 
 /// Best-effort raw file-descriptor writer for diagnostic output on MCP stdio
 /// transports.
@@ -10,7 +15,7 @@ import Foundation
 /// is broken, and Swift `do/catch` cannot intercept that exception, so a
 /// failed diagnostic write aborts the whole process. Transport diagnostics
 /// must never be able to crash the MCP helper, so this writer uses
-/// `Darwin.write` directly and silently drops the payload when the destination
+/// a SIGPIPE-safe POSIX write and silently drops the payload when the destination
 /// is unavailable (`EPIPE`, `EBADF`, `EINVAL`, or any other write failure).
 public enum BestEffortStderrWriter {
     private static let writeLock = NSLock()
@@ -32,7 +37,7 @@ public enum BestEffortStderrWriter {
             guard let baseAddress = rawBuffer.baseAddress else { return false }
             var offset = 0
             while offset < rawBuffer.count {
-                let written = Darwin.write(descriptor, baseAddress + offset, rawBuffer.count - offset)
+                let written = repo_write_no_sigpipe(descriptor, baseAddress + offset, rawBuffer.count - offset)
                 if written > 0 {
                     offset += written
                     continue
@@ -63,23 +68,28 @@ public enum BestEffortStderrWriter {
         defer { writeLock.unlock() }
 
         let lockedStandardError = descriptor == STDERR_FILENO
-        if lockedStandardError, ftrylockfile(stderr) != 0 {
+        if lockedStandardError, repo_try_lock_stderr() != 0 {
             return false
         }
         defer {
-            if lockedStandardError { funlockfile(stderr) }
+            if lockedStandardError { repo_unlock_stderr() }
         }
 
         let originalFlags = fcntl(descriptor, F_GETFL)
         guard originalFlags >= 0 else { return false }
-        let rawNoSIGPIPE = fcntl(descriptor, F_GETNOSIGPIPE)
-        let originalNoSIGPIPE = rawNoSIGPIPE >= 0 ? rawNoSIGPIPE : nil
-        let needsNoSIGPIPE = originalNoSIGPIPE == 0
-        if needsNoSIGPIPE,
-           fcntl(descriptor, F_SETNOSIGPIPE, 1) < 0
-        {
-            return false
-        }
+        #if canImport(Darwin)
+            let rawNoSIGPIPE = fcntl(descriptor, F_GETNOSIGPIPE)
+            let originalNoSIGPIPE = rawNoSIGPIPE >= 0 ? rawNoSIGPIPE : nil
+            let needsNoSIGPIPE = originalNoSIGPIPE == 0
+            if needsNoSIGPIPE,
+               fcntl(descriptor, F_SETNOSIGPIPE, 1) < 0
+            {
+                return false
+            }
+        #else
+            let originalNoSIGPIPE: Int32? = nil
+            let needsNoSIGPIPE = false
+        #endif
 
         let needsNonBlocking = originalFlags & O_NONBLOCK == 0
         if needsNonBlocking,
@@ -96,7 +106,7 @@ public enum BestEffortStderrWriter {
 
         let writeSucceeded = data.withUnsafeBytes { rawBuffer in
             guard let baseAddress = rawBuffer.baseAddress else { return false }
-            let written = Darwin.write(descriptor, baseAddress, rawBuffer.count)
+            let written = repo_write_no_sigpipe(descriptor, baseAddress, rawBuffer.count)
             return written == rawBuffer.count
         }
 
@@ -134,14 +144,20 @@ public enum BestEffortStderrWriter {
             restoredFlags = true
         }
 
-        guard let noSIGPIPE else { return restoredFlags }
-        let restoredSIGPIPE = fcntl(descriptor, F_SETNOSIGPIPE, noSIGPIPE) >= 0
-        return restoredFlags && restoredSIGPIPE
+        #if canImport(Darwin)
+            guard let noSIGPIPE else { return restoredFlags }
+            let restoredSIGPIPE = fcntl(descriptor, F_SETNOSIGPIPE, noSIGPIPE) >= 0
+            return restoredFlags && restoredSIGPIPE
+        #else
+            return restoredFlags
+        #endif
     }
 
     private static func suppressSIGPIPE(on descriptor: Int32) {
         // Failure is acceptable: callers also ignore SIGPIPE process-wide, and
         // the write still fails softly when descriptor configuration is unavailable.
-        _ = fcntl(descriptor, F_SETNOSIGPIPE, 1)
+        #if canImport(Darwin)
+            _ = fcntl(descriptor, F_SETNOSIGPIPE, 1)
+        #endif
     }
 }

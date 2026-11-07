@@ -1,4 +1,11 @@
 import Foundation
+#if canImport(FoundationNetworking)
+    import FoundationNetworking
+
+    package typealias HTTPBytes = AsyncThrowingStream<UInt8, Error>
+#else
+    package typealias HTTPBytes = URLSession.AsyncBytes
+#endif
 
 package struct HTTPResponse {
     package let data: Data
@@ -7,7 +14,7 @@ package struct HTTPResponse {
 
 package protocol HTTPClient: Sendable {
     func data(for request: URLRequest) async throws -> HTTPResponse
-    func bytes(for request: URLRequest) async throws -> (bytes: URLSession.AsyncBytes, http: HTTPURLResponse)
+    func bytes(for request: URLRequest) async throws -> (bytes: HTTPBytes, http: HTTPURLResponse)
 }
 
 package final class DefaultHTTPClient: HTTPClient, @unchecked Sendable {
@@ -30,19 +37,25 @@ package final class DefaultHTTPClient: HTTPClient, @unchecked Sendable {
         return HTTPResponse(data: data, http: http)
     }
 
-    package func bytes(for request: URLRequest) async throws -> (bytes: URLSession.AsyncBytes, http: HTTPURLResponse) {
-        let (bytes, response) = try await session.bytes(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            throw URLError(.badServerResponse)
-        }
-        return (bytes: bytes, http: http)
+    package func bytes(for request: URLRequest) async throws -> (bytes: HTTPBytes, http: HTTPURLResponse) {
+        #if canImport(FoundationNetworking)
+            return try await LinuxHTTPByteStream.open(request: request, configuration: session.configuration)
+        #else
+            let (bytes, response) = try await session.bytes(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                throw URLError(.badServerResponse)
+            }
+            return (bytes: bytes, http: http)
+        #endif
     }
 
     private static func makeConfiguration(requestTimeout: TimeInterval, resourceTimeout: TimeInterval) -> URLSessionConfiguration {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = requestTimeout
         config.timeoutIntervalForResource = resourceTimeout
-        config.waitsForConnectivity = false
+        #if !canImport(FoundationNetworking)
+            config.waitsForConnectivity = false
+        #endif
         return config
     }
 }

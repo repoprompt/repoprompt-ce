@@ -1,4 +1,9 @@
-import Darwin
+import RepoPromptShared
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 @testable import MCP
 @testable import RepoPromptMCPCore
@@ -418,6 +423,12 @@ private final class ScriptedStdioSink: MCPStdioOutputSink, @unchecked Sendable {
         self.prefixBytes = prefixBytes
         var descriptors = [Int32](repeating: -1, count: 2)
         guard pipe(&descriptors) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        let flags = fcntl(descriptors[0], F_GETFL)
+        guard flags >= 0, fcntl(descriptors[0], F_SETFL, flags | O_NONBLOCK) == 0 else {
+            let code = errno
+            descriptors.forEach { _ = close($0) }
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(code))
+        }
         self.descriptors = descriptors
     }
 
@@ -453,7 +464,7 @@ private final class ScriptedStdioSink: MCPStdioOutputSink, @unchecked Sendable {
     private func writePipe(_ bytes: UnsafeRawBufferPointer, count: Int) -> Int {
         let descriptor = failNextWrite ? -1 : descriptors[1]
         failNextWrite = false
-        return Darwin.write(descriptor, bytes.baseAddress, count)
+        return POSIXSystem.write(descriptor, bytes.baseAddress, count)
     }
 
     func failNextWriteWithBadDescriptor() {
@@ -557,8 +568,15 @@ private final class ScriptedStdioSink: MCPStdioOutputSink, @unchecked Sendable {
 
     func readWire() throws -> Data {
         var bytes = [UInt8](repeating: 0, count: written)
-        guard Darwin.read(descriptors[0], &bytes, bytes.count) == written else {
-            throw NSError(domain: "ScriptedStdioSink", code: 1)
+        // Callers await all sends before inspecting the wire. Missing bytes must
+        // fail the assertion instead of blocking indefinitely on the fixture pipe.
+        let received = POSIXSystem.read(descriptors[0], &bytes, bytes.count)
+        guard received == written else {
+            let code = received < 0 ? errno : EIO
+            throw NSError(
+                domain: "ScriptedStdioSink", code: Int(code),
+                userInfo: [NSLocalizedDescriptionKey: "Expected \(written) available wire bytes; read returned \(received) (errno \(code))."]
+            )
         }
         return Data(bytes)
     }
@@ -577,13 +595,13 @@ private final class StdioInputFixture {
     }
 
     func write(_ data: Data) throws {
-        let count = data.withUnsafeBytes { Darwin.write(descriptors[1], $0.baseAddress, $0.count) }
+        let count = data.withUnsafeBytes { POSIXSystem.write(descriptors[1], $0.baseAddress, $0.count) }
         guard count == data.count else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
     }
 
     func closeWriter() throws {
         guard descriptors[1] >= 0 else { return }
-        guard Darwin.close(descriptors[1]) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        guard POSIXSystem.close(descriptors[1]) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
         descriptors[1] = -1
     }
 

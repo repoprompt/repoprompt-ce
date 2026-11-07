@@ -1,5 +1,13 @@
-import CryptoKit
-import Darwin
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 import MCP
 import RepoPromptDomainRuntime

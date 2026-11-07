@@ -2,9 +2,9 @@
 
 Original RepoPrompt CE code is released under the Apache License, Version 2.0, as provided in [`LICENSE`](LICENSE). Third-party components remain subject to their own copyright notices and license terms.
 
-This file records attribution material for bundled source and the resolved root
-SwiftPM dependency graph. It is not legal advice or a substitute for legal
-review.
+This file records attribution material for bundled source, the resolved root
+SwiftPM dependency graph, and embedded Linux Swift runtime components. It is
+not legal advice or a substitute for legal review.
 
 ## Sparkle
 
@@ -53,6 +53,18 @@ package graph. Its machine-checkable
 [`inventory.tsv`](ThirdPartyLicenses/swiftpm/inventory.tsv) maps each exact
 resolved version or revision to its upstream repository and copied notice
 bundle. Tree-sitter packages refer to the separately curated bundle above.
+
+## Linux Swift runtime
+
+Linux release archives built with static Swift runtime linkage include the
+Swift standard library, Foundation/CoreFoundation, FoundationICU, Dispatch,
+and BlocksRuntime. Their unchanged upstream license files, Foundation notice,
+and the complete ICU 74.1 license are preserved under
+[`ThirdPartyLicenses/swift-runtime/`](ThirdPartyLicenses/swift-runtime/).
+The bundle records the official Swift 6.2.3 component release commits, source
+URLs, and checksums. It retains the Swift Runtime Library Exception and the
+separate ICU source/data notices; the Tree-sitter ICU subset notice does not
+stand in for FoundationICU attribution.
 
 ## Markdownosaur
 
@@ -148,3 +160,13 @@ SUCH DAMAGE.
    @(#)fnmatch.h    8.1 (Berkeley) 6/2/93
    $OpenBSD: fnmatch.h,v 1.4 1997/09/22 05:25:32 millert Exp $
 ```
+## Optional Linux desktop dependencies
+
+The optional `repoprompt-ce-gui` Python package depends on Qt for Python
+(PySide6 Essentials 6.10.3), Shiboken6, and the Qt libraries provided by their official PyPI
+wheels. These are separately installed LGPL-3.0 dependencies, not linked into
+the headless Swift executable. Their upstream license files and third-party
+notices remain in the installed wheels. See
+[Qt for Python licensing](https://doc.qt.io/qtforpython-6/licenses.html),
+[PySide6 on PyPI](https://pypi.org/project/PySide6/6.10.3/), and
+[Qt source repositories](https://code.qt.io/).

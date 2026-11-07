@@ -1,8 +1,10 @@
-import CoreGraphics
+#if canImport(ImageIO)
+    import CoreGraphics
+    import ImageIO
+    import UniformTypeIdentifiers
+#endif
 import Foundation
-import ImageIO
 import RepoPromptDomainRuntime
-import UniformTypeIdentifiers
 import XCTest
 
 final class AgentSessionAttachmentStoreTests: XCTestCase {
@@ -51,34 +53,36 @@ final class AgentSessionAttachmentStoreTests: XCTestCase {
         XCTAssertEqual(result.evictedPaths, [])
     }
 
-    func testGenericFileFactsSurviveRetentionRepairAndHandoffWithoutImageConversion() throws {
-        let limits = AgentSessionAttachmentStore.Limits(
-            maxRetainedImageBytes: 1, downscaledLongEdgePixels: 1, maxSessionFolderBytes: .max
-        )
-        let store = AgentSessionAttachmentStore(agentSessionsFolder: agentSessionsFolder, limits: limits)
-        let parentID = UUID()
-        let childID = UUID()
-        let source = temporaryRoot.appendingPathComponent("document.pdf")
-        // ImageIO-readable bytes deliberately exercise the kind fence, not decoder failure.
-        try writeNoisePNG(to: source, width: 16, height: 16)
-        let bytes = try Data(contentsOf: source)
-        let attachment = AgentFileAttachment(
-            source: .localFile(path: source.path), title: "Document",
-            kind: .pdf, fileName: "document.pdf", byteCount: bytes.count
-        )
-        let retained = try XCTUnwrap(store.retain([attachment], sessionID: parentID, temporaryRoot: temporaryRoot).retained[attachment.id])
-        let repaired = try XCTUnwrap(store.repairMissingPaths([attachment], sessionID: parentID)[attachment.id])
-        let copied = try XCTUnwrap(store.copyForHandoff(
-            [attachment], sourceSessionID: parentID, destinationSessionID: childID, temporaryRoot: temporaryRoot
-        )[attachment.id])
-        for result in [retained, repaired, copied] {
-            XCTAssertEqual(result.kind, .pdf)
-            XCTAssertEqual(result.fileName, attachment.fileName)
-            XCTAssertEqual(result.byteCount, bytes.count)
-            guard case let .localFile(path) = result.source else { return XCTFail("Expected local copy") }
-            XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), bytes)
+    #if canImport(ImageIO)
+        func testGenericFileFactsSurviveRetentionRepairAndHandoffWithoutImageConversion() throws {
+            let limits = AgentSessionAttachmentStore.Limits(
+                maxRetainedImageBytes: 1, downscaledLongEdgePixels: 1, maxSessionFolderBytes: .max
+            )
+            let store = AgentSessionAttachmentStore(agentSessionsFolder: agentSessionsFolder, limits: limits)
+            let parentID = UUID()
+            let childID = UUID()
+            let source = temporaryRoot.appendingPathComponent("document.pdf")
+            // ImageIO-readable bytes deliberately exercise the kind fence, not decoder failure.
+            try writeNoisePNG(to: source, width: 16, height: 16)
+            let bytes = try Data(contentsOf: source)
+            let attachment = AgentFileAttachment(
+                source: .localFile(path: source.path), title: "Document",
+                kind: .pdf, fileName: "document.pdf", byteCount: bytes.count
+            )
+            let retained = try XCTUnwrap(store.retain([attachment], sessionID: parentID, temporaryRoot: temporaryRoot).retained[attachment.id])
+            let repaired = try XCTUnwrap(store.repairMissingPaths([attachment], sessionID: parentID)[attachment.id])
+            let copied = try XCTUnwrap(store.copyForHandoff(
+                [attachment], sourceSessionID: parentID, destinationSessionID: childID, temporaryRoot: temporaryRoot
+            )[attachment.id])
+            for result in [retained, repaired, copied] {
+                XCTAssertEqual(result.kind, .pdf)
+                XCTAssertEqual(result.fileName, attachment.fileName)
+                XCTAssertEqual(result.byteCount, bytes.count)
+                guard case let .localFile(path) = result.source else { return XCTFail("Expected local copy") }
+                XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), bytes)
+            }
         }
-    }
+    #endif
 
     func testRetainNeverMovesFilesOutsideTheTemporaryRoot() throws {
         let store = AgentSessionAttachmentStore(agentSessionsFolder: agentSessionsFolder)
@@ -321,31 +325,57 @@ final class AgentSessionAttachmentStoreTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: temporary.path))
     }
 
-    func testOversizedImageIsKeptAsDownscaledCopy() throws {
-        let limits = AgentSessionAttachmentStore.Limits(
-            maxRetainedImageBytes: 1024,
-            downscaledLongEdgePixels: 64,
-            maxSessionFolderBytes: .max
-        )
-        let store = AgentSessionAttachmentStore(agentSessionsFolder: agentSessionsFolder, limits: limits)
-        let sessionID = UUID()
-        let temporaryFile = temporaryRoot.appendingPathComponent("\(UUID().uuidString).png")
-        try writeNoisePNG(to: temporaryFile, width: 256, height: 128)
-        let originalSize = try XCTUnwrap(fileSize(temporaryFile))
-        XCTAssertGreaterThan(originalSize, limits.maxRetainedImageBytes)
-        let attachment = AgentFileAttachment(source: .localFile(path: temporaryFile.path))
+    #if canImport(ImageIO)
+        func testOversizedImageIsKeptAsDownscaledCopy() throws {
+            let limits = AgentSessionAttachmentStore.Limits(
+                maxRetainedImageBytes: 1024,
+                downscaledLongEdgePixels: 64,
+                maxSessionFolderBytes: .max
+            )
+            let store = AgentSessionAttachmentStore(agentSessionsFolder: agentSessionsFolder, limits: limits)
+            let sessionID = UUID()
+            let temporaryFile = temporaryRoot.appendingPathComponent("\(UUID().uuidString).png")
+            try writeNoisePNG(to: temporaryFile, width: 256, height: 128)
+            let originalSize = try XCTUnwrap(fileSize(temporaryFile))
+            XCTAssertGreaterThan(originalSize, limits.maxRetainedImageBytes)
+            let attachment = AgentFileAttachment(source: .localFile(path: temporaryFile.path))
 
-        let result = store.retain([attachment], sessionID: sessionID, temporaryRoot: temporaryRoot)
+            let result = store.retain([attachment], sessionID: sessionID, temporaryRoot: temporaryRoot)
 
-        guard case let .localFile(path)? = result.retained[attachment.id]?.source else {
-            return XCTFail("Oversized image must still be retained")
+            guard case let .localFile(path)? = result.retained[attachment.id]?.source else {
+                return XCTFail("Oversized image must still be retained")
+            }
+            let pixelSize = try XCTUnwrap(pixelSize(of: URL(fileURLWithPath: path)))
+            XCTAssertEqual(max(pixelSize.width, pixelSize.height), 64)
+            XCTAssertEqual(pixelSize.width / pixelSize.height, 2, accuracy: 0.05)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: temporaryFile.path))
+            XCTAssertTrue(store.isRetainedPath(path, sessionID: sessionID))
         }
-        let pixelSize = try XCTUnwrap(pixelSize(of: URL(fileURLWithPath: path)))
-        XCTAssertEqual(max(pixelSize.width, pixelSize.height), 64)
-        XCTAssertEqual(pixelSize.width / pixelSize.height, 2, accuracy: 0.05)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: temporaryFile.path))
-        XCTAssertTrue(store.isRetainedPath(path, sessionID: sessionID))
-    }
+    #else
+        func testOversizedImageIsKeptVerbatimWithoutAnImageDecoderOnLinux() throws {
+            let limits = AgentSessionAttachmentStore.Limits(
+                maxRetainedImageBytes: 4,
+                downscaledLongEdgePixels: 64,
+                maxSessionFolderBytes: .max
+            )
+            let store = AgentSessionAttachmentStore(agentSessionsFolder: agentSessionsFolder, limits: limits)
+            let sessionID = UUID()
+            let temporaryFile = temporaryRoot.appendingPathComponent("\(UUID().uuidString).png")
+            let bytes = Data("oversized image without a decoder".utf8)
+            try bytes.write(to: temporaryFile)
+            let attachment = AgentFileAttachment(source: .localFile(path: temporaryFile.path))
+
+            let result = store.retain([attachment], sessionID: sessionID, temporaryRoot: temporaryRoot)
+
+            guard case let .localFile(path)? = result.retained[attachment.id]?.source else {
+                return XCTFail("Oversized image must still be retained")
+            }
+            XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), bytes)
+            XCTAssertEqual(URL(fileURLWithPath: path).pathExtension, "png")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: temporaryFile.path))
+            XCTAssertTrue(store.isRetainedPath(path, sessionID: sessionID))
+        }
+    #endif
 
     func testSessionCapEvictsOldestImagesFirst() throws {
         let limits = AgentSessionAttachmentStore.Limits(
@@ -497,40 +527,42 @@ final class AgentSessionAttachmentStoreTests: XCTestCase {
         try (FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value
     }
 
-    private func pixelSize(of url: URL) -> CGSize? {
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-              let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.doubleValue,
-              let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue
-        else { return nil }
-        return CGSize(width: width, height: height)
-    }
+    #if canImport(ImageIO)
+        private func pixelSize(of url: URL) -> CGSize? {
+            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+                  let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+                  let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.doubleValue,
+                  let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue
+            else { return nil }
+            return CGSize(width: width, height: height)
+        }
 
-    /// Writes a noisy (poorly compressible) opaque PNG so its size exceeds a small byte limit.
-    private func writeNoisePNG(to url: URL, width: Int, height: Int) throws {
-        let bytesPerRow = width * 4
-        var pixels = [UInt8](repeating: 255, count: bytesPerRow * height)
-        var seed: UInt32 = 0x1234_5678
-        for index in pixels.indices where index % 4 != 3 {
-            seed = seed &* 1_103_515_245 &+ 12345
-            pixels[index] = UInt8(truncatingIfNeeded: seed >> 16)
+        /// Writes a noisy (poorly compressible) opaque PNG so its size exceeds a small byte limit.
+        private func writeNoisePNG(to url: URL, width: Int, height: Int) throws {
+            let bytesPerRow = width * 4
+            var pixels = [UInt8](repeating: 255, count: bytesPerRow * height)
+            var seed: UInt32 = 0x1234_5678
+            for index in pixels.indices where index % 4 != 3 {
+                seed = seed &* 1_103_515_245 &+ 12345
+                pixels[index] = UInt8(truncatingIfNeeded: seed >> 16)
+            }
+            let image: CGImage? = pixels.withUnsafeMutableBytes { buffer in
+                CGContext(
+                    data: buffer.baseAddress,
+                    width: width,
+                    height: height,
+                    bitsPerComponent: 8,
+                    bytesPerRow: bytesPerRow,
+                    space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+                )?.makeImage()
+            }
+            let cgImage = try XCTUnwrap(image)
+            let destination = try XCTUnwrap(
+                CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil)
+            )
+            CGImageDestinationAddImage(destination, cgImage, nil)
+            XCTAssertTrue(CGImageDestinationFinalize(destination))
         }
-        let image: CGImage? = pixels.withUnsafeMutableBytes { buffer in
-            CGContext(
-                data: buffer.baseAddress,
-                width: width,
-                height: height,
-                bitsPerComponent: 8,
-                bytesPerRow: bytesPerRow,
-                space: CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
-            )?.makeImage()
-        }
-        let cgImage = try XCTUnwrap(image)
-        let destination = try XCTUnwrap(
-            CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil)
-        )
-        CGImageDestinationAddImage(destination, cgImage, nil)
-        XCTAssertTrue(CGImageDestinationFinalize(destination))
-    }
+    #endif
 }

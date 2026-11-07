@@ -11,11 +11,11 @@ import RepoPromptShared
 #if canImport(Darwin)
     import Darwin
 
-    private let systemWrite = Darwin.write
+    private let systemWrite = POSIXSystem.write
 #elseif canImport(Glibc)
     import Glibc
 
-    private let systemWrite = Glibc.write
+    private let systemWrite = POSIXSystem.write
 #endif
 
 enum NonBlockingFDWriteError: Swift.Error, CustomStringConvertible, Equatable {
