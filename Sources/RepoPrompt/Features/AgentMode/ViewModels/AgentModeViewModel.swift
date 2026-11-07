@@ -824,7 +824,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     let perfRecorder: any AgentModePerfRecording
     let claudeCoordinator: ClaudeAgentModeCoordinator
     let providerBindingService: AgentModeProviderBindingService
-    private weak var runInteractionStateObserver: (any AgentModeRunInteractionStateObserving)?
     private let shouldManageCodexTooling: Bool
     private let usesProductionAgentDefaultsAndModelPolling: Bool
     let clearConsumedAttachmentsAfterProviderConsumption: Bool
@@ -2052,6 +2051,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 binding: { [weak self] session in
                     guard let self, sessions[session.tabID] === session else { return }
                     updateBindingsFromSession(session)
+                },
+                permissions: { [weak self] session in
+                    guard let self, sessions[session.tabID] === session, currentTabID == session.tabID else { return }
+                    refreshAutoEditPermissionGuidanceForActiveSession()
+                },
+                worktreeOperations: { [weak self] session in
+                    guard let self, sessions[session.tabID] === session else { return }
+                    publishWorktreeMergeOperationsChange(in: session)
                 }
             ))
         }
@@ -2893,7 +2900,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             makeClaudeCoordinatorHostCapabilities(),
             providerBindingService: providerBindingService
         )
-        runInteractionStateObserver = codexCoordinator
         mcpServer.registerAgentWorktreeBindingsProvider { [weak self] sessionID, tabID in
             guard let self else { return .unavailable }
             return worktreeBindingState(forAgentSessionID: sessionID, tabID: tabID)
@@ -3132,7 +3138,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 makeClaudeCoordinatorHostCapabilities(),
                 providerBindingService: providerBindingService
             )
-            runInteractionStateObserver = codexCoordinator
             testMCPServer?.registerAgentWorktreeBindingsProvider { [weak self] sessionID, tabID in
                 guard let self else { return .unavailable }
                 return worktreeBindingState(forAgentSessionID: sessionID, tabID: tabID)
@@ -3175,6 +3180,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         initialSystemWorkspaceSessionListRefreshDeferralFallbackTask?.cancel()
         sessionListCacheTask?.cancel()
         sessionListCacheGeneration &+= 1
+    }
+
+    var interactionRuntime: AgentSessionInteractionRuntime {
+        let runtime = runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore)
+        runtime.observer = codexCoordinator
+        _ = persistenceRuntime
+        return runtime
     }
 
     var usageRuntime: AgentSessionUsageRuntime {
@@ -3694,20 +3706,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     return agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatchID, claim: claim, proof: proof)
                 }
             ),
-            interactions: .init(
-                cancelPendingQuestion: { [weak self] session in
-                    self?.cancelPendingQuestion(for: session)
-                },
-                cancelPendingApproval: { [weak self] session in
-                    self?.cancelPendingApproval(for: session)
-                },
-                cancelPendingApplyEditsReview: { [weak self] session, reason in
-                    self?.cancelPendingApplyEditsReview(for: session, reason: reason)
-                },
-                cancelPendingWorktreeMergeReview: { [weak self] session, reason in
-                    self?.cancelPendingWorktreeMergeReview(for: session, reason: reason)
-                }
-            ),
+            interactions: interactionRuntime.makeRunHooks(),
             terminalSettlement: .init(
                 prepareTerminalPublication: { [weak self] session in
                     self?.prepareTerminalPublication(for: session)
@@ -5021,6 +5020,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         activeTranscriptPresentationScope = nil
         codexCoordinator.stop()
         claudeCoordinator.stop()
+        await interactionRuntime.drainPendingEffects()
         await applyEditsApprovalStore.cleanupWindowScopes(
             windowID: windowID,
             reason: "Cancelled because window is closing"
@@ -5735,95 +5735,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func ensureApplyEditsApprovalSessionSync(for session: TabSession) {
-        guard session.applyEditsApprovalSubscriptionTask == nil else { return }
-        let tabID = session.tabID
-        let scope = applyEditsScope(for: tabID)
-        let initialAutoEditEnabled = session.autoEditEnabled
-        let approvalStore = applyEditsApprovalStore
-        session.applyEditsApprovalSubscriptionTask = Task { [weak self] in
-            await approvalStore.setAutoEditEnabled(
-                initialAutoEditEnabled,
-                for: scope,
-                updateGlobalDefault: false
-            )
-            let (subscriptionID, stream) = await approvalStore.subscribe(scope: scope)
-            await MainActor.run { [weak self] in
-                guard let self, let liveSession = sessions[tabID] else { return }
-                liveSession.applyEditsApprovalSubscriptionID = subscriptionID
-            }
-            for await snapshot in stream {
-                await MainActor.run { [weak self] in
-                    guard let self, let liveSession = sessions[tabID] else { return }
-                    applyEditsApprovalSnapshot(snapshot, to: liveSession)
-                }
-            }
-            await MainActor.run { [weak self] in
-                guard let self, let liveSession = sessions[tabID] else { return }
-                liveSession.applyEditsApprovalSubscriptionID = nil
-                liveSession.applyEditsApprovalSubscriptionTask = nil
-            }
-        }
-    }
-
-    private func applyEditsApprovalSnapshot(
-        _ snapshot: ApplyEditsApprovalSnapshot,
-        to session: TabSession
-    ) {
-        let autoEditChanged = session.autoEditEnabled != snapshot.autoEditEnabled
-        session.autoEditEnabled = snapshot.autoEditEnabled
-        if autoEditChanged, session.mcpControlContext == nil {
-            session.isDirty = true
-            scheduleSave(for: session.tabID)
-        }
-        if session.tabID == currentTabID {
-            refreshAutoEditPermissionGuidanceForActiveSession()
-        }
-
-        session.pendingApplyEditsReview = snapshot.pendingReview
-        reconcileInteractiveRunState(session)
-
-        requestUIRefresh(tabID: session.tabID, urgent: true)
+        interactionRuntime.ensureApprovalSync(for: session)
     }
 
     func reconcileInteractiveRunState(_ session: TabSession) {
-        let nextState: AgentSessionRunState? = if session.pendingApplyEditsReview != nil || session.pendingWorktreeMergeReview != nil || session.pendingApproval != nil || session.hasPendingCodexHookReviewRequest || session.pendingPermissionsRequest != nil || session.pendingMCPElicitationRequest != nil {
-            .waitingForApproval
-        } else if session.hasPendingQuestionUI {
-            .waitingForQuestion
-        } else if session.waitingPrompt != nil || session.instructionContinuation != nil {
-            .waitingForUser
-        } else if session.runState.isActive,
-                  session.runState == .waitingForApproval
-                  || session.runState == .waitingForQuestion
-                  || session.runState == .waitingForUser
-        {
-            .running
-        } else {
-            nil
-        }
-
-        guard let nextState else { return }
-        session.runState = nextState
-        if nextState == .waitingForApproval || nextState == .waitingForQuestion || nextState == .waitingForUser {
-            session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
-            session.setRunningStatus(nil, source: nil)
-        }
+        AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
     }
 
     private func teardownApplyEditsApprovalSessionSync(
         for session: TabSession,
         cleanupScope: Bool
     ) async {
-        session.applyEditsApprovalSubscriptionTask?.cancel()
-        session.applyEditsApprovalSubscriptionTask = nil
-        let scope = applyEditsScope(for: session.tabID)
-        if let subscriptionID = session.applyEditsApprovalSubscriptionID {
-            session.applyEditsApprovalSubscriptionID = nil
-            await applyEditsApprovalStore.unsubscribe(scope: scope, id: subscriptionID)
-        }
-        if cleanupScope {
-            await applyEditsApprovalStore.cleanupScope(scope)
-        }
+        await interactionRuntime.teardownApprovalSync(for: session, cleanupScope: cleanupScope)
     }
 
     private func handleSidebarRefreshBindingMutation(
@@ -8006,11 +7929,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         for session: TabSession,
         reason: RunInteractionStateChangeReason
     ) {
-        runInteractionStateObserver?.agentModeViewModel(
-            self,
-            didChangeRunInteractionStateFor: session,
-            reason: reason
-        )
+        interactionRuntime.publishRunInteractionStateChange(for: session, reason: reason)
     }
 
     func handleObservedMCPStateChange(for session: TabSession) {
@@ -21158,13 +21077,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func invalidatePendingAskUserTimeout(for session: TabSession) {
-        session.pendingAskUserTimeoutGeneration &+= 1
-        session.askUserTimeoutTask?.cancel()
-        session.askUserTimeoutTask = nil
-        if var pending = session.pendingAskUser {
-            pending.timeoutStartedAt = nil
-            session.pendingAskUser = pending
-        }
+        AgentSessionInteractionRuntime.invalidatePendingAskUserTimeout(for: session)
     }
 
     @discardableResult
@@ -21292,37 +21205,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func cancelPendingQuestion(for session: TabSession) {
-        invalidatePendingAskUserTimeout(for: session)
-        let continuation = session.askUserContinuation
-        session.askUserContinuation = nil
-        session.pendingAskUser = nil
-        session.pendingPermissionsRequest = nil
-        session.pendingMCPElicitationRequest = nil
-        session.queuedUserInputRequests.removeAll()
-        session.queuedMCPElicitationRequests.removeAll()
-        reconcileInteractiveRunState(session)
-        continuation?.resume(throwing: CancellationError())
-        publishRunInteractionStateChange(for: session, reason: .pendingQuestionCancelled)
+        interactionRuntime.cancelPendingQuestion(for: session)
     }
 
     private func cancelPendingApproval(for session: TabSession) {
-        session.pendingApproval = nil
-        if session.hasActiveCodexHookGateOperation {
-            session.resetCodexHookGateBinding()
-        }
-        session.pendingPermissionsRequest = nil
-        session.pendingMCPElicitationRequest = nil
-        session.queuedMCPElicitationRequests.removeAll()
-        reconcileInteractiveRunState(session)
-        publishRunInteractionStateChange(for: session, reason: .pendingApprovalCancelled)
+        interactionRuntime.cancelPendingApproval(for: session)
     }
 
     private func cancelPendingApplyEditsReview(for session: TabSession, reason: String) {
-        session.pendingApplyEditsReview = nil
-        let scope = applyEditsScope(for: session.tabID)
-        Task { [applyEditsApprovalStore] in
-            await applyEditsApprovalStore.cancelPendingReview(scope: scope, reason: reason)
-        }
+        interactionRuntime.cancelPendingApplyEditsReview(for: session, reason: reason)
     }
 
     #if DEBUG
@@ -21400,14 +21291,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func cancelPendingInstruction(for session: TabSession) {
-        session.instructionTimeoutTask?.cancel()
-        session.instructionTimeoutTask = nil
-        if let continuation = session.instructionContinuation {
-            continuation.resume(throwing: CancellationError())
-        }
-        session.instructionContinuation = nil
-        session.instructionWaitID = nil
-        session.waitingPrompt = nil
+        AgentSessionInteractionRuntime.cancelPendingInstruction(for: session)
     }
 
     // MARK: - Helpers

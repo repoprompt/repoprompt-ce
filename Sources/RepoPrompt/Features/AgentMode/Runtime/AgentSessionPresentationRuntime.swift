@@ -13,6 +13,8 @@ final class AgentSessionPresentationRuntime {
         var assistantDelta: ((AgentTabSession, Int, UInt64) -> Void)?
         var derivedTranscript: ((AgentTabSession) -> Void)?
         var binding: ((AgentTabSession) -> Void)?
+        var permissions: ((AgentTabSession) -> Void)?
+        var worktreeOperations: ((AgentTabSession) -> Void)?
     }
 
     struct Attachment: Equatable {
@@ -47,6 +49,14 @@ final class AgentSessionPresentationRuntime {
 
     func assistantDeltaApplied(_ session: AgentTabSession, sourceItemsRevision: Int, flushGeneration: UInt64) {
         sink(for: session)?.assistantDelta?(session, sourceItemsRevision, flushGeneration)
+    }
+
+    func permissionsChanged(_ session: AgentTabSession) {
+        sink(for: session)?.permissions?(session)
+    }
+
+    func worktreeOperationsChanged(_ session: AgentTabSession) {
+        sink(for: session)?.worktreeOperations?(session)
     }
 
     func bindingChanged(_ session: AgentTabSession) {

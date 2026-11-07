@@ -11,19 +11,23 @@ struct PendingApplyEditsReview: Identifiable, Hashable {
     let path: String
     let unifiedDiff: String
     let createdAt: Date
+    /// Process-local admission ordering, never wall-clock cancellation or persisted identity.
+    let admissionTime: ContinuousClock.Instant
 
     init(
         id: UUID = UUID(),
         scope: ApplyEditsApprovalScope,
         path: String,
         unifiedDiff: String,
-        createdAt: Date = Date()
+        createdAt: Date = Date(),
+        admissionTime: ContinuousClock.Instant = .now
     ) {
         self.id = id
         self.scope = scope
         self.path = path
         self.unifiedDiff = unifiedDiff
         self.createdAt = createdAt
+        self.admissionTime = admissionTime
     }
 }
 
@@ -161,8 +165,13 @@ actor ApplyEditsApprovalStore: Sendable {
         resolvePendingReviewIfMatching(scope: scope, reviewID: reviewID, decision: decision)
     }
 
-    func cancelPendingReview(scope: ApplyEditsApprovalScope, reason: String) {
-        guard let record = pendingByScope[scope] else { return }
+    func cancelPendingReview(
+        scope: ApplyEditsApprovalScope,
+        reason: String,
+        admittedAtOrBefore cutoff: ContinuousClock.Instant? = nil
+    ) {
+        guard let record = pendingByScope[scope],
+              cutoff.map({ record.review.admissionTime <= $0 }) != false else { return }
         finishPendingReview(scope: scope, record: record, decision: .cancelled(reason: reason))
     }
 

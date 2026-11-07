@@ -34,14 +34,15 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         XCTAssertTrue(session.items.isEmpty, "Approval must not interrupt the active turn")
         var deliveredText: String?
         let resumed = Task { @MainActor in
-            let response = try await withCheckedThrowingContinuation { session.instructionContinuation = $0 }
+            let response = try await withCheckedThrowingContinuation { continuation in
+                // Match awaitNextInstruction: install the wait identity before publishing the
+                // continuation/readiness, never rotate it while delivery is being prepared.
+                session.instructionWaitID = UUID()
+                session.instructionContinuation = continuation
+                session.runState = .waitingForUser
+            }
             deliveredText = response.text
         }
-        try await AsyncTestWait.waitUntil("decision instruction continuation") {
-            await MainActor.run { session.instructionContinuation != nil }
-        }
-        session.instructionWaitID = UUID()
-        session.runState = .waitingForUser
         try await AsyncTestWait.waitUntil("scope decision delivered") {
             await MainActor.run { deliveredText != nil }
         }

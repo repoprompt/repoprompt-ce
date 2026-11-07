@@ -109,15 +109,6 @@ struct AgentSidebarRenderedActiveRow: Identifiable {
     }
 }
 
-@MainActor
-protocol AgentModeRunInteractionStateObserving: AnyObject {
-    func agentModeViewModel(
-        _ viewModel: AgentModeViewModel,
-        didChangeRunInteractionStateFor session: AgentModeViewModel.TabSession,
-        reason: AgentModeViewModel.RunInteractionStateChangeReason
-    )
-}
-
 extension AgentModeViewModel {
     enum UserTurnSubmissionResult: Equatable {
         case submitted
@@ -161,14 +152,7 @@ extension AgentModeViewModel {
         case rejected(AgentComposerSubmitClaimRejection)
     }
 
-    enum RunInteractionStateChangeReason: String, Equatable {
-        case userInputResponseSubmitted
-        case pendingQuestionCancelled
-        case pendingApprovalCancelled
-        case approvalResponseSubmitted
-        case permissionsResponseSubmitted
-        case mcpElicitationResponseSubmitted
-    }
+    typealias RunInteractionStateChangeReason = AgentRunInteractionStateChangeReason
 
     typealias AgentInteractionTransport = AgentRunInteractionTransport
 

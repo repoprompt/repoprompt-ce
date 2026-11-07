@@ -3932,3 +3932,58 @@ M9 is still incomplete: terminal preparation/post-settlement continuation, provi
 input and interaction cancellation, workspace-rooted execution routing, domain
 catalog composition, saved runtime host adoption and bounded retirement remain.
 The new runtime does not claim that detaching today's window leaves its run alive.
+
+### M9 continuation — runtime interactions and joined cancellation (2026-11-07)
+
+Moved the actual question/approval/instruction cancellation and interaction-state
+reconciliation into `AgentSessionInteractionRuntime`. The scope now owns approval
+subscriptions and their cancellation effects, using the existing approval store and
+its existing route/tab namespace, not a window or a new approval authority. Codex's
+observer protocol no longer requires a view-model argument, and its reconciliation
+calls no longer depend on a weak view model. Worktree review cancellation retains
+its operation-state mutation and persistence; sidebar/permission projection is an
+optional exact-object presentation sink.
+
+Subscriptions apply only to the original object and join unsubscribe during teardown.
+Admitted approval cancellation retains the original scope through the store effect;
+a cancelled drain waiter does not acknowledge that work early. The production terminal
+binding joins that exact session's cancellation effects before domain publication.
+The legacy window-close path also joins them before clearing approval namespaces.
+The route ID is immutable in this composition; presentation attachment is not permission
+to replace an existing approval namespace.
+
+Review identified two different cancellation races. A detached old object with no
+known review cannot cancel its replacement's whole namespace. Conversely, an exact
+review ID from a stale UI snapshot cannot identify all work already admitted by the
+stopping run. Current exact owners now cancel through a monotonic admission cutoff
+in the existing approval store; detached owners may only settle a known exact ID.
+Buffered pre-cutoff review snapshots cannot resurrect a finished run. Reviews admitted
+after the cutoff remain untouched. The admission instant is process-local, not a
+persisted identity or a wall-clock deadline.
+
+Initial conductor `e5529124-e7e4-4cac-82a4-a021283e95c1` passed **127 tests** before
+review fixes. Its misspelled MCP steer/resume filter matched no tests in that suite;
+it is not an MCP integration receipt. Expanded post-review
+`a14512cd-4517-42a1-b8a3-16cc19fa6ebe` ran **156 tests with one failure**: the
+scope-decision fixture's delivery wait timed out. The four new runtime tests passed.
+Diagnostic tickets `4a640734-126c-4134-bd7a-8bdd9109771e` and
+`2bed34b0-f55c-4707-85ec-44164f0d5d5b` reproduced it: the notice was admitted and
+submission returned, but the fixture changed its wait identity while delivery was
+being prepared. Production `awaitNextInstruction` installs the wait ID before its
+continuation; the fixture now does likewise in one actor pass. No deadline, delivery
+assertion, production refusal, or retry budget was weakened; temporary tracing was
+removed.
+
+Final conductor `a20e8837-742f-4869-bea8-d7ce088cbed0`
+(`m9-interaction-runtime-v3`) passed **156 tests**: MCP steer/resume 25,
+standalone interaction runtime 4, worktree persistence 3, Claude approval/resume 38,
+Codex resume/wedge commit 74, approval response binding 3, worktree review state 9.
+Final lint `f01e97fc-843a-4196-a947-cb2da6017024`
+(`m9-interaction-runtime-lint-v2`) passed on the same Swift tree. Earlier lint
+`b8ebb982-195d-45c3-80fc-fecf7c6228fc` passed before the fixture correction.
+
+This is still a runtime-composition transition, not completed M9 acceptance. Independent
+writer admission/adoption, provider-input and remaining continuation composition,
+window-free saved execution and routing, presentation handoff, bounded host retirement,
+and final product/index/full-suite qualification remain open. No app lifecycle action
+or publication was performed for this continuation.

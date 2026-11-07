@@ -529,3 +529,189 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
         }
     }
 }
+
+@MainActor
+final class AgentSessionInteractionRuntimeTests: XCTestCase {
+    func testCancellationHooksResumeQuestionOnceWithoutViewModelAndPreserveStatePriority() async {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        scope.replaceSessions([session.tabID: session])
+        let runtime = scope.interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
+        let observer = Observer()
+        runtime.observer = observer
+        let hooks = runtime.makeRunHooks()
+        session.runState = .waitingForQuestion
+        let generation = session.pendingAskUserTimeoutGeneration
+        do {
+            let _: AgentAskUserResponse = try await withCheckedThrowingContinuation { continuation in
+                session.askUserContinuation = continuation
+                hooks.cancelPendingQuestion(session)
+                hooks.cancelPendingQuestion(session)
+            }
+            XCTFail("Cancelled question must throw")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertNil(session.askUserContinuation)
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertEqual(session.pendingAskUserTimeoutGeneration, generation + 2)
+        XCTAssertEqual(observer.reasons, [.pendingQuestionCancelled, .pendingQuestionCancelled])
+        session.pendingApplyEditsReview = .init(scope: runtime.approvalScope(for: session), path: "file", unifiedDiff: "diff")
+        session.waitingPrompt = "next instruction"
+        AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
+        XCTAssertEqual(session.runState, .waitingForApproval)
+        hooks.cancelPendingApproval(session)
+        XCTAssertEqual(session.runState, .waitingForApproval, "An independent apply-edits review still owns the wait")
+        session.pendingApplyEditsReview = nil
+        AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
+        XCTAssertEqual(session.runState, .waitingForUser)
+        AgentSessionInteractionRuntime.cancelPendingInstruction(for: session)
+        XCTAssertNil(session.waitingPrompt)
+    }
+
+    func testLateApprovalCancellationDrainsOriginalEffectWithoutCancellingSuccessorReview() async throws {
+        var scope: AgentSessionRuntimeStore.Scope? = AgentSessionRuntimeStore().makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        scope?.replaceSessions([session.tabID: session])
+        let store = ApplyEditsApprovalStore()
+        let runtime = try XCTUnwrap(scope).interactions(routeID: 42, approvalStore: store)
+        weak var retainedScope = scope
+        let address = runtime.approvalScope(for: session)
+        let (subscription, stream) = await store.subscribe(scope: address)
+        var iterator = stream.makeAsyncIterator()
+        _ = await iterator.next()
+        let original = Task { await store.requestReview(scope: address, path: "first", unifiedDiff: "diff", timeoutSeconds: 60) }
+        let firstSnapshot = await iterator.next()
+        let first = try XCTUnwrap(firstSnapshot?.pendingReview)
+        session.pendingApplyEditsReview = first
+        let gate = TestReleaseFence(name: "interaction cancellation drain")
+        runtime.test_beforeApprovalCancellation = { await gate.enterAndWait() }
+        addTeardownBlock {
+            gate.release()
+            await runtime.drainPendingEffects()
+            await store.cleanupScope(address)
+            await store.unsubscribe(scope: address, id: subscription)
+            _ = await original.value
+        }
+        runtime.makeRunHooks().cancelPendingApplyEditsReview(session, "Stopped")
+        guard await gate.waitUntilEntered() else { return }
+        scope = nil
+        XCTAssertNotNil(retainedScope, "An admitted store effect keeps its exact runtime owner alive")
+        let successor = Task { await store.requestReview(scope: address, path: "second", unifiedDiff: "diff", timeoutSeconds: 60) }
+        var nextReview: PendingApplyEditsReview?
+        while nextReview == nil {
+            let received = await iterator.next()
+            let snapshot = try XCTUnwrap(received)
+            if let review = snapshot.pendingReview, review.id != first.id { nextReview = review }
+        }
+        let next = try XCTUnwrap(nextReview)
+        var drained = false
+        let drainStarted = expectation(description: "Cancelled waiter entered the drain")
+        let drain = Task {
+            drainStarted.fulfill()
+            await runtime.drainPendingEffects()
+            drained = true
+        }
+        drain.cancel()
+        await fulfillment(of: [drainStarted], timeout: 5)
+        XCTAssertFalse(drained)
+        gate.release()
+        await drain.value
+        XCTAssertTrue(drained)
+        XCTAssertNil(retainedScope)
+        let (_, currentStream) = await store.subscribe(scope: address)
+        var currentIterator = currentStream.makeAsyncIterator()
+        let current = await currentIterator.next()
+        XCTAssertEqual(current?.pendingReview?.id, next.id)
+        await store.resolveReview(scope: address, reviewID: next.id, decision: .accept)
+        let result = await successor.value
+        XCTAssertEqual(result, .accept)
+    }
+
+    func testStopCancelsUndisplayedReviewButStaleOwnerCannotCancelReplacement() async throws {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        scope.replaceSessions([session.tabID: session])
+        let store = ApplyEditsApprovalStore()
+        let runtime = scope.interactions(routeID: 42, approvalStore: store)
+        let address = runtime.approvalScope(for: session)
+        let (subscription, stream) = await store.subscribe(scope: address)
+        var iterator = stream.makeAsyncIterator()
+        _ = await iterator.next()
+        addTeardownBlock { await store.cleanupScope(address) }
+        let first = Task { await store.requestReview(scope: address, path: "displayed", unifiedDiff: "diff", timeoutSeconds: 60) }
+        let displayed = await iterator.next()
+        session.pendingApplyEditsReview = try XCTUnwrap(displayed?.pendingReview)
+        let second = Task { await store.requestReview(scope: address, path: "not yet displayed", unifiedDiff: "diff", timeoutSeconds: 60) }
+        _ = await iterator.next() // cancellation of first
+        let buffered = await iterator.next()
+        let bufferedSnapshot = try XCTUnwrap(buffered)
+        XCTAssertNotEqual(bufferedSnapshot.pendingReview?.id, session.pendingApplyEditsReview?.id)
+        runtime.cancelPendingApplyEditsReview(for: session, reason: "Stopping original run")
+        session.runState = .completed
+        await runtime.drainPendingEffects(for: session)
+        let secondResult = await second.value
+        XCTAssertEqual(secondResult, .cancelled(reason: "Stopping original run"))
+        runtime.applyApprovalSnapshot(bufferedSnapshot, to: session)
+        XCTAssertNil(session.pendingApplyEditsReview, "A buffered pre-stop review cannot resurrect the stopped run")
+        XCTAssertEqual(session.runState, .completed)
+        _ = await first.value
+        _ = await iterator.next() // cancellation of second
+
+        let replacement = AgentTabSession(tabID: session.tabID)
+        scope.replaceSessions([replacement.tabID: replacement])
+        let third = Task { await store.requestReview(scope: address, path: "replacement", unifiedDiff: "diff", timeoutSeconds: 60) }
+        let thirdSnapshot = await iterator.next()
+        let thirdReview = try XCTUnwrap(thirdSnapshot?.pendingReview)
+        XCTAssertNil(session.pendingApplyEditsReview)
+        runtime.cancelPendingApplyEditsReview(for: session, reason: "Late old terminal")
+        await runtime.drainPendingEffects(for: session)
+        await store.resolveReview(scope: address, reviewID: thirdReview.id, decision: .accept)
+        let thirdResult = await third.value
+        XCTAssertEqual(thirdResult, .accept, "An old object without a known review has no namespace-wide cancellation authority")
+        await store.unsubscribe(scope: address, id: subscription)
+    }
+
+    func testApprovalSubscriptionRejectsRecycledTabAndJoinsBeforeTeardown() async throws {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        session.autoEditEnabled = true
+        scope.replaceSessions([session.tabID: session])
+        let store = ApplyEditsApprovalStore()
+        let runtime = scope.interactions(routeID: 42, approvalStore: store)
+        let subscribed = expectation(description: "Initial approval projection")
+        var refreshes = 0
+        let attachment = scope.presentation.attach(session, sink: .init(
+            activityChanged: { _, _ in },
+            refresh: { _, _ in refreshes += 1
+                if refreshes == 1 { subscribed.fulfill() }
+            },
+            turnComplete: { _ in }, turnFailed: { _, _ in }
+        ))
+        runtime.ensureApprovalSync(for: session)
+        await fulfillment(of: [subscribed], timeout: 5)
+        let task = try XCTUnwrap(session.applyEditsApprovalSubscriptionTask)
+        let replacement = AgentTabSession(tabID: session.tabID)
+        replacement.autoEditEnabled = true
+        scope.replaceSessions([replacement.tabID: replacement])
+        scope.presentation.detach(attachment)
+        await store.setAutoEditEnabled(false, for: runtime.approvalScope(for: replacement), updateGlobalDefault: false)
+        await task.value
+        XCTAssertTrue(replacement.autoEditEnabled)
+        XCTAssertNil(replacement.pendingApplyEditsReview)
+        XCTAssertNil(session.applyEditsApprovalSubscriptionTask)
+        XCTAssertNil(session.applyEditsApprovalSubscriptionID)
+        await runtime.teardownApprovalSync(for: session, cleanupScope: true)
+        let value = await store.autoEditEnabled(for: runtime.approvalScope(for: replacement))
+        XCTAssertFalse(value, "Old teardown must not clean the replacement's approval namespace")
+        await store.cleanupScope(runtime.approvalScope(for: replacement))
+    }
+
+    @MainActor
+    private final class Observer: AgentRunInteractionStateObserving {
+        var reasons: [AgentRunInteractionStateChangeReason] = []
+        func runInteractionStateChanged(for session: AgentTabSession, reason: AgentRunInteractionStateChangeReason) {
+            reasons.append(reason)
+        }
+    }
+}

@@ -206,6 +206,7 @@ extension AgentModeRunService {
         let cancelPendingApproval: (AgentTabSession) -> Void
         let cancelPendingApplyEditsReview: (AgentTabSession, String) -> Void
         let cancelPendingWorktreeMergeReview: (AgentTabSession, String) -> Void
+        var drainPendingEffects: (AgentTabSession) async -> Void = { _ in }
     }
 
     /// Adapter into the canonical durable terminal settlement authority
@@ -345,7 +346,8 @@ extension AgentModeRunService.Hooks {
                     persistence.scheduleSave(session)
                 },
                 publishTerminalCommit: { revision, successorKind in
-                    await terminalSettlement.publishTerminalCommit(
+                    await interactions.drainPendingEffects(session)
+                    return await terminalSettlement.publishTerminalCommit(
                         session,
                         revision,
                         successorKind

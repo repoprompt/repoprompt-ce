@@ -119,6 +119,18 @@ final class AgentSessionRuntimeStore {
         fileprivate let store: AgentSessionRuntimeStore
         let presentation = AgentSessionPresentationRuntime()
         let usage = AgentSessionUsageRuntime()
+        private var interactionRuntime: AgentSessionInteractionRuntime?
+
+        func interactions(routeID: Int, approvalStore: ApplyEditsApprovalStore) -> AgentSessionInteractionRuntime {
+            if let interactionRuntime {
+                precondition(interactionRuntime.routeID == routeID && interactionRuntime.approvalStore === approvalStore)
+                return interactionRuntime
+            }
+            let runtime = AgentSessionInteractionRuntime(scope: self, routeID: routeID, approvalStore: approvalStore)
+            interactionRuntime = runtime
+            return runtime
+        }
+
         lazy var stream = AgentSessionStreamRuntime(scope: self)
         lazy var mcp = AgentSessionMCPRuntime(scope: self)
         lazy var persistence = AgentSessionPersistenceRuntime(scope: self)

@@ -686,19 +686,7 @@ extension AgentModeViewModel {
     }
 
     func cancelPendingWorktreeMergeReview(for session: TabSession, reason: String) {
-        let operationID = session.pendingWorktreeMergeReview?.operationID
-        guard let continuation = session.worktreeMergeReviewContinuation else {
-            finishPendingWorktreeMergeReview(session: session)
-            if let operationID {
-                markWorktreeMergeOperationCancelled(operationID: operationID, session: session, reason: reason)
-            }
-            return
-        }
-        finishPendingWorktreeMergeReview(session: session)
-        if let operationID {
-            markWorktreeMergeOperationCancelled(operationID: operationID, session: session, reason: reason)
-        }
-        continuation.resume(returning: .cancelled(reason: reason))
+        interactionRuntime.cancelPendingWorktreeMergeReview(for: session, reason: reason)
     }
 
     private func requestWorktreeMergeReview(
@@ -744,12 +732,7 @@ extension AgentModeViewModel {
     }
 
     private func finishPendingWorktreeMergeReview(session: TabSession) {
-        session.worktreeMergeReviewTimeoutTask?.cancel()
-        session.worktreeMergeReviewTimeoutTask = nil
-        session.worktreeMergeReviewContinuation = nil
-        session.pendingWorktreeMergeReview = nil
-        reconcileInteractiveRunState(session)
-        requestUIRefresh(tabID: session.tabID, urgent: true)
+        interactionRuntime.finishPendingWorktreeMergeReview(session: session)
     }
 
     private func worktreeMergePreview(from operation: AgentSessionWorktreeMergeOperation) async throws -> GitWorktreeMergePreview {
@@ -864,6 +847,13 @@ extension AgentModeViewModel {
 
     private func persistWorktreeMergeOperationsChange(in session: TabSession) {
         session.isDirty = true
+        publishWorktreeMergeOperationsChange(in: session)
+        publishMCPStateChange(for: session)
+        updateBindingsFromSession(session)
+        scheduleSave(for: session.tabID)
+    }
+
+    func publishWorktreeMergeOperationsChange(in session: TabSession) {
         updateWorktreeMergeSummariesInIndex(for: session)
         syncSidebarUIState(refresh: true, reason: .metadataUpdated)
         // Surface conflict/awaiting-commit attention in the blocker stack and
@@ -871,9 +861,6 @@ extension AgentModeViewModel {
         if session.tabID == currentTabID {
             syncRunInteractionUIState()
         }
-        publishMCPStateChange(for: session)
-        updateBindingsFromSession(session)
-        scheduleSave(for: session.tabID)
     }
 
     private func worktreeMergeEndpoint(from binding: AgentSessionWorktreeBinding) async throws -> GitWorktreeMergeEndpoint {
