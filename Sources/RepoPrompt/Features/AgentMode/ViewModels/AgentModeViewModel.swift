@@ -513,6 +513,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) async -> AsyncThrowingStream<AgentSessionSidebarBuildBatch, Error>
 
     private let runtimeSessionStore = AgentSessionRuntimeStore.shared.makeScope()
+    private var runPresentationAttachments: [ObjectIdentifier: AgentSessionPresentationRuntime.Attachment] = [:]
     private(set) var sessions: [UUID: TabSession] {
         get { runtimeSessionStore.sessions }
         set {
@@ -520,6 +521,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             // Preserve @Published's will-change ordering without a second stored dictionary.
             objectWillChange.send()
             runtimeSessionStore.replaceSessions(newValue)
+            synchronizeRunPresentationAttachments(previous: previous)
             rebuildAgentSessionLinkSubagentCensus(reconcileLiveObservers: true)
             syncSidebarUIState(refresh: true, reason: .sessionList)
             // One eager revocation hook covering every live-session removal path (tab close, stash,
@@ -1483,6 +1485,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             sessions.removeValue(forKey: tabID)
         }
 
+        func test_runPresentationHooks() -> AgentModeRunService.RunPresentationHooks {
+            runtimeSessionStore.presentation.makeRunHooks()
+        }
+
         func test_bindingResolution(sessionID: UUID) -> PersistentBindingResolution {
             persistentBindingResolution(for: sessionID)
         }
@@ -1996,9 +2002,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     func setAgentRunActive(_ tabID: UUID, isActive: Bool) {
         let session = session(for: tabID, createIfNeeded: false)
+        if let session { AgentSessionPresentationRuntime.applyRunActivity(to: session, isActive: isActive) }
+        publishAgentRunActivity(tabID: tabID, session: session, isActive: isActive)
+    }
+
+    private func publishAgentRunActivity(tabID: UUID, session: TabSession?, isActive: Bool) {
         if isActive {
             tabsWithActiveAgentRun.insert(tabID)
-            applyAgentRunActivity(to: session, isActive: true)
             // A new/resumed run clears any stale "completed in background"
             // badge the user hasn't acknowledged yet. The run-state transition
             // observer also handles this on .running, but some provider paths
@@ -2007,7 +2017,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             acknowledgeSidebarRunAttention(tabID: tabID)
         } else {
             tabsWithActiveAgentRun.remove(tabID)
-            applyAgentRunActivity(to: session, isActive: false)
             // Intentionally do NOT clear/mark attention here. Provider paths
             // sometimes call setAgentRunActive(false) before session.runState
             // has been mutated to its terminal/waiting value — detection must
@@ -2021,23 +2030,45 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Applies run-activity projection only to the exact supplied session.
     /// A recycled tab identifier must not let a predecessor update its successor.
     func setAgentRunActive(_ session: TabSession, isActive: Bool) {
-        let tabID = session.tabID
-        guard sessions[tabID] === session else {
-            applyAgentRunActivity(to: session, isActive: isActive)
-            return
-        }
-        setAgentRunActive(tabID, isActive: isActive)
+        AgentSessionPresentationRuntime.applyRunActivity(to: session, isActive: isActive)
+        guard sessions[session.tabID] === session else { return }
+        publishAgentRunActivity(tabID: session.tabID, session: session, isActive: isActive)
     }
 
-    private func applyAgentRunActivity(to session: TabSession?, isActive: Bool) {
-        if isActive {
-            if session?.activeAgentRunStartedAt == nil {
-                session?.activeAgentRunStartedAt = Date()
+    private func synchronizeRunPresentationAttachments(previous: [UUID: TabSession]) {
+        for (tabID, session) in previous where sessions[tabID] !== session {
+            if let attachment = runPresentationAttachments.removeValue(forKey: ObjectIdentifier(session)) {
+                runtimeSessionStore.presentation.detach(attachment)
             }
-        } else {
-            session?.activeAgentRunStartedAt = nil
-            session?.deferredActiveAgentRunTimerRollback = nil
         }
+        guard !hasPreparedForWindowClose else { return }
+        for (tabID, session) in sessions where previous[tabID] !== session {
+            runPresentationAttachments[ObjectIdentifier(session)] = runtimeSessionStore.presentation.attach(session, sink: .init(
+                activityChanged: { [weak self] session, isActive in
+                    guard let self, sessions[session.tabID] === session else { return }
+                    publishAgentRunActivity(tabID: session.tabID, session: session, isActive: isActive)
+                },
+                refresh: { [weak self] session, urgent in
+                    guard let self, sessions[session.tabID] === session else { return }
+                    requestUIRefresh(tabID: session.tabID, urgent: urgent)
+                },
+                turnComplete: { [weak self] session in
+                    guard let self, sessions[session.tabID] === session else { return }
+                    notifyAgentTurnComplete(for: session)
+                },
+                turnFailed: { [weak self] session, error in
+                    guard let self, sessions[session.tabID] === session else { return }
+                    notifyAgentTurnFailed(for: session, errorText: error)
+                }
+            ))
+        }
+    }
+
+    private func detachRunPresentation() {
+        for attachment in runPresentationAttachments.values {
+            runtimeSessionStore.presentation.detach(attachment)
+        }
+        runPresentationAttachments.removeAll()
     }
 
     private func publishActiveAgentRunStartedAt(for tabID: UUID, session: TabSession?) {
@@ -3583,20 +3614,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     self?.finalizeAttachmentsForTurn(for: session, reservationID: reservationID, disposition: disposition)
                 }
             ),
-            presentation: .init(
-                setAgentRunActive: { [weak self] session, isActive in
-                    self?.setAgentRunActive(session, isActive: isActive)
-                },
-                requestUIRefresh: { [weak self] tabID, urgent in
-                    self?.requestUIRefresh(tabID: tabID, urgent: urgent)
-                },
-                notifyAgentTurnComplete: { [weak self] session in
-                    self?.notifyAgentTurnComplete(for: session)
-                },
-                notifyAgentTurnFailed: { [weak self] session, errorText in
-                    self?.notifyAgentTurnFailed(for: session, errorText: errorText)
-                }
-            ),
+            presentation: runtimeSessionStore.presentation.makeRunHooks(),
             bindingObservation: .init(
                 updateBindings: { [weak self] session in
                     guard let self else { return }
@@ -5050,6 +5068,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         windowClosePreparationTask = task
         await task.value
+        // Preserve the legacy close path's terminal notifications/activity projection until
+        // its existing drain finishes. Runtime-host detachment need not cancel that drain.
+        detachRunPresentation()
     }
 
     private func performWindowClosePreparation() async {
@@ -17845,19 +17866,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                   sessionSaveWorkspaceDirectoryPath(for: workspace) == token.workspaceDirectoryPath
             else { return false }
         }
-        guard let session = sessions[token.tabID],
-              ObjectIdentifier(session) == token.sessionIdentity,
-              session.persistentSessionBindingIdentity == token.binding,
-              session.bindingTransitionGeneration == token.bindingTransitionGeneration,
-              !session.bindingTransitionInProgress,
-              session.sourceItemsRevision == token.sourceItemsRevision,
-              session.persistenceMutationGeneration == token.persistenceMutationGeneration,
-              session.saveRequestGeneration == token.saveRequestGeneration,
-              session.permitsBoundOperationAndSave || creationHandle.map({ session.creationHandleIsCurrent($0) }) == true
-        else {
-            return false
-        }
-        return true
+        guard let session = sessions[token.tabID] else { return false }
+        return token.matches(session, creationHandle: creationHandle)
     }
 
     private func requestFreshSaveForCurrentOwner(
@@ -18357,11 +18367,41 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return .deferred("The session or its storage location changed before persistence could commit.")
         }
 
+        guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+            workspaceID: workspace.id, sessionID: sessionID
+        ), writer.session === session else {
+            // Unknown placement and conflicting identities are not transient save retries.
+            // Keep dirty state and fail required flushes honestly; do not guess a workspace,
+            // bypass writer admission, or spin a debounce loop while the conflict remains.
+            return .deferred("The session does not have a unique runtime writer for this workspace.")
+        }
         do {
-            observingPhase?(.writeMayHaveCommitted)
-            let fileURL = try await agentSessionSaver(agentSession, workspace, canonicalItemCount)
-            observingPhase?(.writeReturned)
-            agentSession.fileURL = fileURL
+            let outcome = try await AgentSessionPayloadWriter.write(
+                agentSession,
+                workspace: workspace,
+                canonicalItemCount: canonicalItemCount,
+                writer: writer,
+                token: saveToken,
+                creationHandle: effectiveCreationSave?.handle,
+                storageIsCurrent: { [weak workspaceManager] in
+                    guard let current = workspaceManager?.workspace(withID: workspace.id) else { return false }
+                    return WorkspaceSessionSidecarMigration.workspaceDirectory(
+                        for: current, root: AgentSessionDataService.defaultWorkspaceRootURL()
+                    ).standardizedFileURL.path == saveToken.workspaceDirectoryPath
+                },
+                observingPhase: observingPhase,
+                saver: agentSessionSaver
+            )
+            switch outcome {
+            case .rejectedBeforeWrite:
+                requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
+                return .deferred("The session writer or its storage location changed before persistence could commit.")
+            case .supersededAfterWrite:
+                requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
+                return .deferred("The session writer or its storage location changed while persistence was committing.")
+            case let .written(fileURL):
+                agentSession.fileURL = fileURL
+            }
             guard isSaveCommitTokenCurrent(saveToken, creationHandle: effectiveCreationSave?.handle) else {
                 requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
                 return .deferred("The session or its storage location changed while persistence was committing.")

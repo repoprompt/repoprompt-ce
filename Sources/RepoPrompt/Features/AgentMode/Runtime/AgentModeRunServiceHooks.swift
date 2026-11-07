@@ -11,9 +11,9 @@ import RepoPromptDomainRuntime
 // - Canonical lifecycle/durable settlement stays owned by the domain layer
 //   (`DomainAgentRunSessionStore`); `TerminalSettlementHooks` only adapts into
 //   that authority and must remain exactly-once per run attempt ownership.
-// - Presentation, binding-observation, queued-work recovery, and persistence
-//   hooks are host projections. They must never become backend authority: a
-//   headless host may implement them as no-ops without changing run semantics.
+// - Presentation is optional. Binding observation, queued-work recovery, and
+//   persistence are not optional UI effects: a window-free host must provide
+//   their runtime implementations rather than silently dropping durable/user work.
 // - `AgentTabSession` remains at broader app-host orchestration
 //   hooks because the app is the only adopter today. Terminal settlement does
 //   not receive that type: `bindTerminalSession(_:)` partially applies the
@@ -46,7 +46,7 @@ extension AgentModeRunService {
     /// Authority: presentation projection.
     struct RunPresentationHooks {
         let setAgentRunActive: (AgentTabSession, Bool) -> Void
-        let requestUIRefresh: (UUID, Bool) -> Void
+        let requestUIRefresh: (AgentTabSession, Bool) -> Void
         let notifyAgentTurnComplete: (AgentTabSession) -> Void
         /// Defaulted so hosts and test doubles that predate failure notifications stay source-compatible.
         var notifyAgentTurnFailed: (AgentTabSession, String?) -> Void = { _, _ in }

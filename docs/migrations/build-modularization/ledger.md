@@ -3552,3 +3552,64 @@ payload hosting, presentation attachment and settlement-driven handoff/drain.
 Inspection confirms the MCP agent tool services still require `WindowState`, and
 Codex coordination reaches 46 distinct VM members; replacing these with a protocol
 that merely forwards to the VM would not satisfy the requested outcome.
+
+### M9 completion continuation — durable payload effect and optional presentation
+
+The next local transition starts from `40858d5e9`. `AgentSessionPayloadWriter`
+now performs the actual saver invocation for an exact runtime writer, with payload
+session/workspace/tab identity, frozen storage placement, binding incarnation and
+source/save revisions checked before and after suspension. The save token and
+request-local effect-phase vocabulary are runtime-owned, with VM compatibility
+aliases. A returned URL is explicitly not a configured-first-save or terminal
+acknowledgment: those remain with their existing authorities. Rebinding, competing
+writers, changed source revisions and storage moves after a real disk effect return
+superseded-after-write; a thrown cancellation after the disk effect retains
+write-may-have-committed evidence. Dirty state is not cleared by this service.
+
+`AgentSessionPresentationRuntime` owns optional exact-object presentation attachment
+and run-activity timestamp bookkeeping. Run hooks retain this router rather than
+the VM. Attachments have generations, so a late detach cannot disconnect a newer
+presenter. ACP refresh callbacks now carry the exact originating session instead
+of a recyclable tab UUID. The VM attaches/detaches sinks through its existing
+session-map mutation; predecessor completion cannot clear successor activity.
+The existing window close path keeps its sink through its current drain, then
+detaches. This does **not** yet claim that window close leaves managed execution
+running: the broader provider/host teardown transition remains outstanding.
+
+Retired responsibilities in this transition: VM-owned save-token implementation,
+direct unqualified saver invocation in `saveSessionCore`, VM callback capture in
+the run service's presentation hook group, and VM-owned activity timestamp mutation.
+The hook documentation no longer incorrectly permits a headless host to silently
+no-op persistence, binding observation or queued-user-work recovery.
+
+Execution receipts:
+
+- `dc8646a5-124d-40bf-81fa-47051e25758b` (`m9-payload-writer-v1`): **51 tests passed**
+  (47 existing first-save, 4 payload-writer tests including real persistence).
+- `c9da21f5-4829-4387-9ee4-729595b21485` (`m9-presentation-payload-v1`): failed one
+  new test's immediate full-VM deallocation assumption. The corrected integration
+  test awaits existing close preparation; a separate router/presenter lifetime
+  test checks the intended ownership boundary without asserting unrelated VM work
+  has already drained. No production timeout or retry was changed.
+- `076d3ae9-536c-4ad4-874f-fe62fc921121` (`m9-presentation-payload-v2`): **117 tests
+  passed**: ACP execution 11, quiet check-in 14, first-save 47, payload writer 4,
+  presentation runtime 4, runtime store 8, administration/worktree recovery 29.
+- `ea3d34e1-d1c5-4f45-839c-cefcbdb205de`: conductor lint passed.
+
+The transition review prompted frozen-directory verification and preserving
+terminal presentation effects until legacy close preparation finishes. The
+suggested active-workspace/catalog mismatch was checked against source:
+`activeWorkspace` delegates to `workspace(withID:)`, and prepared projections install
+their borrowed workspace in that same catalog. There is no alternate active-only
+workspace in that path. The suggested bypass/automatic retry for unscoped or
+conflicting writers was not adopted: those identities cannot safely authorize a
+write or a timer retry loop. Required flush fails honestly and retains dirty state;
+a new real-disk VM integration test verifies zero writes during conflict and one
+successful explicit retry after the competing claim is removed. Binding-transition
+rejection already occurs in the preceding save-token check.
+
+M9 is still in progress. Payload construction/save serialization, full saved-target
+hydration and execution hosting, remaining provider/VM execution callbacks,
+settlement-driven presentation handoff and bounded writer retirement still require
+integration. The optional presentation router is not a second lifecycle authority.
+Final product/index/full-suite validation and live smoke are not claimed here.

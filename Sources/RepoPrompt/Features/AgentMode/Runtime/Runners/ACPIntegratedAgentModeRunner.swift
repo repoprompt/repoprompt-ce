@@ -767,7 +767,7 @@ final class ACPIntegratedAgentModeRunner {
             }
             if let dispatchID = carry.dispatchID {
                 if AgentSelfCompactParkedPrefix.markAccepted(dispatchID, session: session) {
-                    hooks.presentation.requestUIRefresh(session.tabID, true)
+                    hooks.presentation.requestUIRefresh(session, true)
                     hooks.bindingObservation.updateBindings(session)
                 }
                 hooks.persistence.scheduleSave(session)
@@ -1275,7 +1275,7 @@ final class ACPIntegratedAgentModeRunner {
             }
             if let dispatchID = carry.dispatchID {
                 if AgentSelfCompactParkedPrefix.markAccepted(dispatchID, session: session) {
-                    hooks.presentation.requestUIRefresh(session.tabID, true)
+                    hooks.presentation.requestUIRefresh(session, true)
                     hooks.bindingObservation.updateBindings(session)
                 }
                 hooks.persistence.scheduleSave(session)
@@ -1946,14 +1946,14 @@ final class ACPIntegratedAgentModeRunner {
         guard session.runningStatusText != value || session.runningStatusSource != normalizedSource else {
             if urgent {
                 hooks.bindingObservation.updateBindings(session)
-                hooks.presentation.requestUIRefresh(session.tabID, true)
+                hooks.presentation.requestUIRefresh(session, true)
             }
             return
         }
         session.runningStatusText = value
         session.runningStatusSource = normalizedSource
         hooks.bindingObservation.updateBindings(session)
-        hooks.presentation.requestUIRefresh(session.tabID, urgent)
+        hooks.presentation.requestUIRefresh(session, urgent)
     }
 
     private func initialTransportStatusText(for _: AgentProviderKind) -> String {

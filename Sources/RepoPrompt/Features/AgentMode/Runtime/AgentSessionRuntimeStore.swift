@@ -94,6 +94,7 @@ final class AgentSessionRuntimeStore {
     final class Scope {
         fileprivate let id = UUID()
         fileprivate let store: AgentSessionRuntimeStore
+        let presentation = AgentSessionPresentationRuntime()
         private(set) var sessions: [UUID: AgentTabSession] = [:]
         private var liveClaimByTabID: [UUID: UUID] = [:]
         private var liveTabIDsBySessionID: [UUID: Set<UUID>] = [:]

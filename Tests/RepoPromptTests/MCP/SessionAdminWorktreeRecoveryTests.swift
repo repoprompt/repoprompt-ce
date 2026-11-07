@@ -11,6 +11,37 @@ import XCTest
 
 @MainActor
 final class SessionAdminWorktreeRecoveryTests: XCTestCase {
+    func testRequiredSaveRejectsConflictingWriterWithoutLosingDirtyStateThenRetriesExactly() async throws {
+        try await withFixture(canonicalHost: true) { fixture in
+            let viewModel = fixture.window.agentModeViewModel
+            var writes = 0
+            viewModel.test_setAgentSessionSaver { payload, workspace, count in
+                writes += 1
+                return try await AgentSessionDataService.shared.saveAgentSession(
+                    payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count
+                )
+            }
+            var competitorScope: AgentSessionRuntimeStore.Scope? = AgentSessionRuntimeStore.shared.makeScope()
+            let competitor = AgentTabSession(tabID: fixture.session.tabID)
+            competitor.installPersistentSessionBinding(.init(
+                tabID: competitor.tabID, sessionID: fixture.sessionID, workspaceID: fixture.workspaceID
+            ))
+            competitorScope?.replaceSessions([competitor.tabID: competitor])
+            fixture.session.isDirty = true
+            let refused = await viewModel.flushSaveRequired(for: fixture.session.tabID, workspaceID: fixture.workspaceID)
+            if case .success = refused { XCTFail("Conflicting identities must never authorize a durable write") }
+            XCTAssertEqual(writes, 0)
+            XCTAssertTrue(fixture.session.isDirty)
+            competitorScope = nil
+            try await viewModel.flushSaveRequired(for: fixture.session.tabID, workspaceID: fixture.workspaceID).get()
+            XCTAssertEqual(writes, 1)
+            XCTAssertFalse(fixture.session.isDirty)
+            let saved = try await fixture.savedSession()
+            XCTAssertEqual(saved?.id, fixture.sessionID)
+            XCTAssertEqual(saved?.workspaceID, fixture.workspaceID)
+        }
+    }
+
     func testUnopenedLaneModelAndEffortUseItsWriterDespiteEarlierWorkspaceReplica() async throws {
         for fullAccess in [true, false] {
             try await withFixture(fullAccess: fullAccess, canonicalHost: true) { fixture in

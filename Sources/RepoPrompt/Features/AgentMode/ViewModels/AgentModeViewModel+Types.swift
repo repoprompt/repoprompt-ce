@@ -211,17 +211,7 @@ extension AgentModeViewModel {
         let saveRequestGeneration: UInt64
     }
 
-    struct SessionSaveCommitToken: Equatable {
-        let tabID: UUID
-        let sessionIdentity: ObjectIdentifier
-        let workspaceID: UUID
-        let workspaceDirectoryPath: String
-        let binding: AgentPersistentSessionBindingIdentity
-        let bindingTransitionGeneration: UInt64
-        let sourceItemsRevision: Int
-        let persistenceMutationGeneration: UInt64
-        let saveRequestGeneration: UInt64
-    }
+    typealias SessionSaveCommitToken = AgentSessionSaveCommitToken
 
     enum PersistentBindingResolution: Equatable {
         case unique(tabID: UUID)
@@ -672,15 +662,7 @@ extension AgentModeViewModel {
         let shouldEnableCodexComputerUse: Bool
     }
 
-    /// Request-local save-phase evidence. A thrown saver or later currency failure is NOT proof
-    /// of no write. Switch apply may roll back only while this remains beforeWrite.
-    enum RequiredSavePhase: Equatable {
-        case beforeWrite
-        case writeMayHaveCommitted
-        /// The frozen payload's saver returned, but its live-owner currency may still fail.
-        case writeReturned
-        case durablySaved(AgentSessionRestorationBindingToken)
-    }
+    typealias RequiredSavePhase = AgentSessionRequiredSavePhase
 
     struct PendingHandoffState: Equatable {
         var payload: String?
