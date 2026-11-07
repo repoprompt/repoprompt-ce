@@ -148,6 +148,10 @@ final class AgentSessionAttachmentRuntime {
         retentionTasks[token] = Retention(task: task, sessionID: sessionID, attachments: attachments)
     }
 
+    var hasPendingRetention: Bool {
+        !retentionTasks.isEmpty
+    }
+
     /// Cancellation of a waiter is not completion of the admitted disk operation.
     func waitForRetention() async {
         while let operation = retentionTasks.values.first {

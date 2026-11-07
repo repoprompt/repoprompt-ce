@@ -73,6 +73,15 @@ final class AgentSessionRuntimeStore {
         return .unique(Writer(scope: scope, session: session, binding: binding, restoration: restoration))
     }
 
+    /// Admission is distinct from the originating writer capability: final IO must keep its
+    /// exact writer while retirement refuses a successor, even with no presentation or registry row.
+    func hasRetiringWriter(sessionID: UUID) -> Bool {
+        scopes.values.contains { reference in
+            guard let scope = reference.value else { return false }
+            return scope.isRetiring && !scope.liveSessionTabIDs(for: sessionID).isEmpty
+        }
+    }
+
     /// Includes window-free owners and pending operations that keep a scope alive. Neither a
     /// selected window nor writer election may make live files eligible for garbage collection.
     func attachmentSweepProtection() -> (sessionIDs: Set<UUID>, temporaryPaths: Set<String>) {
@@ -139,6 +148,29 @@ final class AgentSessionRuntimeStore {
             persistence.queue
         }
 
+        private(set) var isRetiring = false
+        private(set) var hasReleasedWriterClaims = false
+
+        /// Called before yielding to teardown. This does not invalidate originating IO tokens.
+        func beginRetirement() {
+            isRetiring = true
+        }
+
+        /// The host has joined provider, interaction and attachment effects and acknowledged
+        /// its final save. Release claims explicitly; a retained presentation cannot keep them live.
+        @discardableResult
+        func releaseWriterClaimsAfterDrain() -> Bool {
+            guard isRetiring, saveQueue.inFlightSessionIDs.isEmpty, !attachments.hasPendingRetention,
+                  sessions.values.allSatisfy({ session in
+                      !session.runState.isActive && !session.terminalCommitInProgress && (!session.isDirty || session.activeAgentSessionID.map {
+                          AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: $0)
+                      } == true)
+                  }) else { return false }
+            replaceSessions([:])
+            hasReleasedWriterClaims = true
+            return true
+        }
+
         private(set) var sessions: [UUID: AgentTabSession] = [:]
         private var liveClaimByTabID: [UUID: UUID] = [:]
         private var liveTabIDsBySessionID: [UUID: Set<UUID>] = [:]
@@ -148,6 +180,7 @@ final class AgentSessionRuntimeStore {
         }
 
         func replaceSessions(_ replacement: [UUID: AgentTabSession]) {
+            guard !hasReleasedWriterClaims || replacement.isEmpty else { return }
             let previous = sessions
             sessions = replacement
             for (tabID, session) in previous where sessions[tabID] !== session {
@@ -158,6 +191,13 @@ final class AgentSessionRuntimeStore {
                 store.refreshBindingObservation(for: session)
                 updateLiveSessionBindingIndex(tabID: tabID)
             }
+        }
+
+        func permitsBinding(_ sessionID: UUID, on session: AgentTabSession) -> Bool {
+            if sessions[session.tabID] === session, session.activeAgentSessionID == sessionID {
+                return !hasReleasedWriterClaims
+            }
+            return !isRetiring && !store.hasRetiringWriter(sessionID: sessionID)
         }
 
         func resolveWriter(workspaceID: UUID, sessionID: UUID) -> WriterResolution {

@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import MCP
 import RepoPromptAIContracts
@@ -46,6 +47,62 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         try await AsyncTestWait.waitUntil("scope decision delivered") {
             await MainActor.run { deliveredText != nil }
         }
+        try await resumed.value
+        XCTAssertTrue(deliveredText?.contains("RepoPrompt delegation decision: granted") == true)
+        XCTAssertEqual(viewModel.retrieveDraftText(for: session.tabID), "Keep my draft")
+        XCTAssertNil(session.mcpControlContext)
+    }
+
+    func testScopeDecisionResumesOnRuntimeTerminalSettlementWithoutUIChange() async throws {
+        let window = try await makeWindow()
+        let viewModel = window.agentModeViewModel
+        let sessionID = UUID()
+        let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+        session.isMCPOriginated = false
+        session.selectedAgent = .codexExec
+        session.installRunID(UUID())
+        _ = session.beginRunAttempt(source: "scope-decision-terminal-settlement")
+        XCTAssertTrue(session.runLifecycle.beginTerminalCommit())
+        viewModel.storeDraftText(for: session.tabID, "Keep my draft")
+        var deliveredText: String?
+        let resumed = Task { @MainActor in
+            let response = try await withCheckedThrowingContinuation { continuation in
+                session.instructionWaitID = UUID()
+                session.instructionContinuation = continuation
+                session.runState = .waitingForUser
+            }
+            deliveredText = response.text
+        }
+        defer {
+            session.instructionContinuation?.resume(throwing: CancellationError())
+            session.instructionContinuation = nil
+            resumed.cancel()
+        }
+        try await AsyncTestWait.waitUntil("exact instruction waiter installed") { session.instructionContinuation != nil }
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, windows: { [window] }, notifyCatalogChanged: { _ in })
+        defer { withExtendedLifetime(runtime) {} }
+        runtime.test_suppressDecisionDelivery = false
+        let refusedDuringPublication = expectation(description: "decision waits for terminal publication")
+        refusedDuringPublication.assertForOverFulfill = false
+        runtime.test_decisionDeliveryAttempted = { result in
+            if result == .retry { refusedDuringPublication.fulfill() }
+        }
+        let request = try runtime.requestScope(
+            requesterSessionID: sessionID, requesterTabID: session.tabID,
+            kind: .tree(rootSessionID: sessionID), capabilities: [.observe],
+            guardrails: .init(), reason: nil, idempotencyKey: nil
+        ).get()
+        _ = try runtime.approve(requestID: request.id).get()
+        await fulfillment(of: [refusedDuringPublication], timeout: 3)
+        runtime.test_decisionDeliveryAttempted = nil
+        XCTAssertNil(deliveredText)
+        XCTAssertEqual(runtime.test_pendingDecisionCount, 1)
+        var uiChanges = 0
+        let observation = session.objectWillChange.sink { uiChanges += 1 }
+        session.runLifecycle.completeTerminalCommit()
+        XCTAssertEqual(uiChanges, 0, "Lifecycle settlement is not a presentation publication")
+        observation.cancel()
+        try await AsyncTestWait.waitUntil("settlement releases the queued decision") { deliveredText != nil }
         try await resumed.value
         XCTAssertTrue(deliveredText?.contains("RepoPrompt delegation decision: granted") == true)
         XCTAssertEqual(viewModel.retrieveDraftText(for: session.tabID), "Keep my draft")

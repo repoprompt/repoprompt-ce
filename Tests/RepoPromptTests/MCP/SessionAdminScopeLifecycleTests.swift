@@ -9117,6 +9117,22 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         try await assertExactTargetFlow(placement: "historical", retirement: "retire")
     }
 
+    func testPreparedOwnerRetirementBlocksAdmissionAndResumesLatestVisitAfterDrain() async throws {
+        try await assertExactTargetFlow(placement: "historical", retirement: "retire-during-visit")
+    }
+
+    func testPreparedOwnerFailedFinalSaveRetainsWriterAndVisitUntilExplicitRetry() async throws {
+        try await assertExactTargetFlow(placement: "historical", retirement: "retire-save-failure")
+    }
+
+    func testPreparedOwnerHandoffSaveFailureRetainsWriterWithoutCleanupRetryLoop() async throws {
+        try await assertExactTargetFlow(placement: "historical", retirement: "handoff-save-failure")
+    }
+
+    func testPreparedOwnerDeletionCommitReleasesPreviouslyBlockedDrain() async throws {
+        try await assertExactTargetFlow(placement: "historical", retirement: "delete-during-drain")
+    }
+
     func testPreparedSavedOwnerIsReleasedAfterTargetDeletion() async throws {
         try await assertExactTargetFlow(placement: "historical", retirement: "delete")
     }
@@ -9874,6 +9890,116 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     manager.schedulePreparedOversightCleanup()
                     XCTAssertNotNil(manager.preparedOversightWindows[targetID], "UI binding changes do not withdraw live consent")
                     _ = bridge.delegationScopes.revoke(scopeID: granted.id)
+                case "retire-during-visit", "retire-save-failure":
+                    let owner = try XCTUnwrap(manager.preparedOversightWindows[targetID])
+                    let ownedSession = try XCTUnwrap(targetVM.sessions[targetTab.id])
+                    var release: CheckedContinuation<Void, Never>?
+                    var holdNextSave = true
+                    var failNextSave = retirement == "retire-save-failure"
+                    defer { release?.resume() }
+                    targetVM.test_setAgentSessionSaver { payload, borrowedWorkspace, counts in
+                        if holdNextSave {
+                            holdNextSave = false
+                            await withCheckedContinuation { release = $0 }
+                        }
+                        if failNextSave {
+                            failNextSave = false
+                            throw CocoaError(.fileWriteNoPermission)
+                        }
+                        return try await AgentSessionDataService.shared.saveAgentSession(payload, for: borrowedWorkspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: counts)
+                    }
+                    ownedSession.isDirty = true
+                    _ = bridge.delegationScopes.revoke(scopeID: granted.id)
+                    manager.schedulePreparedOversightCleanup()
+                    try await AsyncTestWait.waitUntil("retiring owner is held inside final storage") { release != nil }
+                    XCTAssertNil(manager.preparedOversightWindows[targetID])
+                    XCTAssertTrue(manager.retiringPreparedOversightWindows[targetID] === owner)
+                    XCTAssertTrue(manager.hasPreparedRuntime(targetID))
+                    let prematureVisit = await manager.releasePreparedOversightOwnerForVisit(sessionID: targetID)
+                    XCTAssertFalse(prematureVisit)
+                    let prematurePrepare = await manager.prepareSavedOversightTarget(targetID, isStillAuthorized: { true })
+                    guard case .failure(.changed) = prematurePrepare else { return XCTFail("Draining owner cannot be replaced") }
+                    var visits: [String] = []
+                    manager.queuePreparedRuntimeVisit(targetID) { visits.append("obsolete") }
+                    manager.queuePreparedRuntimeVisit(targetID) {
+                        XCTAssertFalse(manager.hasPreparedRuntime(targetID))
+                        guard case .unavailable(.absent) = AgentSessionRuntimeStore.shared.resolveWriter(workspaceID: workspace.id, sessionID: targetID) else {
+                            return XCTFail("The old exact writer must be released before a successor visit")
+                        }
+                        visits.append("latest")
+                    }
+                    XCTAssertTrue(visits.isEmpty)
+                    release?.resume()
+                    release = nil
+                    await manager.preparedOversightCleanupTask?.value
+                    if retirement == "retire-save-failure" {
+                        XCTAssertTrue(visits.isEmpty, "Failed durability must not run the queued visit")
+                        XCTAssertTrue(manager.hasPreparedRuntime(targetID))
+                        XCTAssertTrue(ownedSession.isDirty)
+                        XCTAssertTrue(manager.retiringPreparedOversightWindows[targetID] === owner)
+                        let retried = await manager.releasePreparedOversightOwnerForVisit(sessionID: targetID)
+                        XCTAssertTrue(retried, "An explicit visit retries the actual final save")
+                    }
+                    XCTAssertEqual(visits, retirement == "retire-save-failure" ? [] : ["latest"], "An explicit retry owns its activation and supersedes a queued visit")
+                    XCTAssertNil(manager.preparedOversightPendingVisits[targetID])
+                    XCTAssertFalse(ownedSession.isDirty)
+                    XCTAssertNil(manager.retiringPreparedOversightWindows[targetID])
+                    XCTAssertTrue(owner.agentModeViewModel.sessions.isEmpty, "Retained presentation cannot retain a writer claim")
+                case "handoff-save-failure":
+                    let owner = try XCTUnwrap(manager.preparedOversightWindows[targetID])
+                    let ownedSession = try XCTUnwrap(targetVM.sessions[targetTab.id])
+                    let readinessChanged = AgentSessionLinkCandidateReadinessSignal.onChange
+                    var injectDirtyClose = true
+                    AgentSessionLinkCandidateReadinessSignal.onChange = {
+                        if owner.isClosing, injectDirtyClose {
+                            injectDirtyClose = false
+                            ownedSession.isDirty = true
+                        }
+                        readinessChanged?()
+                    }
+                    defer { AgentSessionLinkCandidateReadinessSignal.onChange = readinessChanged }
+                    var failedSaves = 0
+                    targetVM.test_setAgentSessionSaver { [weak owner] payload, borrowedWorkspace, counts in
+                        if owner?.isClosing == true, failedSaves == 0 {
+                            failedSaves += 1
+                            throw CocoaError(.fileWriteNoPermission)
+                        }
+                        return try await AgentSessionDataService.shared.saveAgentSession(payload, for: borrowedWorkspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: counts)
+                    }
+                    let released = await manager.releasePreparedOversightOwnerForVisit(sessionID: targetID)
+                    XCTAssertFalse(released)
+                    XCTAssertEqual(failedSaves, 1)
+                    XCTAssertNil(manager.preparedOversightWindows[targetID])
+                    XCTAssertTrue(manager.retiringPreparedOversightWindows[targetID] === owner)
+                    XCTAssertTrue(ownedSession.isDirty)
+                    var visitRan = false
+                    manager.queuePreparedRuntimeVisit(targetID) { visitRan = true }
+                    await manager.preparedOversightCleanupTask?.value
+                    XCTAssertFalse(visitRan)
+                    XCTAssertTrue(ownedSession.isDirty, "Cleanup must not retry a failed handoff save")
+                    let retry = await manager.releasePreparedOversightOwnerForVisit(sessionID: targetID)
+                    XCTAssertTrue(retry)
+                    XCTAssertFalse(visitRan, "The explicit caller owns the new visit")
+                    XCTAssertNil(manager.preparedOversightPendingVisits[targetID])
+                case "delete-during-drain":
+                    let owner = try XCTUnwrap(manager.preparedOversightWindows[targetID])
+                    let ownedSession = try XCTUnwrap(targetVM.sessions[targetTab.id])
+                    ownedSession.isDirty = true
+                    let registry = AgentSessionDeletionRegistry.shared
+                    let token = try registry.beginDurableDeletion(sessionID: targetID)
+                    manager.schedulePreparedOversightCleanup()
+                    await manager.preparedOversightCleanupTask?.value
+                    XCTAssertTrue(manager.retiringPreparedOversightWindows[targetID] === owner)
+                    XCTAssertTrue(manager.hasPreparedRuntime(targetID))
+                    var visited = false
+                    manager.queuePreparedRuntimeVisit(targetID) { visited = true }
+                    try FileManager.default.removeItem(at: savedURL)
+                    await registry.didCommitDurableDeletion(token)
+                    await manager.preparedOversightCleanupTask?.value
+                    XCTAssertNil(manager.retiringPreparedOversightWindows[targetID])
+                    XCTAssertFalse(manager.hasPreparedRuntime(targetID))
+                    XCTAssertFalse(visited, "A deleted target must not be hydrated by a deferred visit")
+                    XCTAssertNil(manager.preparedOversightPendingVisits[targetID])
                 case "blocked-termination":
                     var release: CheckedContinuation<Void, Never>?
                     var shouldBlock = true

@@ -80,7 +80,8 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     }
 
     func hasPreparedRuntime(_ sessionID: UUID) -> Bool {
-        preparedOversightWindows[sessionID] != nil
+        preparedOversightWindows[sessionID] != nil || retiringPreparedOversightWindows[sessionID] != nil
+            || AgentSessionRuntimeStore.shared.hasRetiringWriter(sessionID: sessionID)
     }
 
     func claimPreparedRuntimeVisit(_ sessionID: UUID) -> Bool {
@@ -92,6 +93,8 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         notifyAgentSessionLinkTopologyChanged()
     }
 
+    /// Latest guarded UI intent wins. These closures schedule activation, not waiter completion;
+    /// a newer explicit visit supersedes an older queued one without running both.
     func queuePreparedRuntimeVisit(_ sessionID: UUID, resume: @escaping @MainActor () async -> Void) {
         preparedOversightPendingVisits[sessionID] = resume
         schedulePreparedOversightCleanup()
@@ -211,13 +214,17 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     func prepareSavedOversightTarget(
         _ target: UUID, isStillAuthorized: @escaping @MainActor () -> Bool
     ) async -> Result<WindowState, SavedOversightPreparationFailure> {
-        guard isStillAuthorized(), !Task.isCancelled, !preparedOversightUIVisits.contains(target) else { return .failure(.changed) }
+        guard isStillAuthorized(), !Task.isCancelled, !preparedOversightUIVisits.contains(target),
+              retiringPreparedOversightWindows[target] == nil,
+              !AgentSessionRuntimeStore.shared.hasRetiringWriter(sessionID: target) else { return .failure(.changed) }
         let resolution = await resolveSavedOversightLocation(target)
         guard case let .success(location) = resolution else {
             if case let .failure(reason) = resolution { return .failure(reason) }
             return .failure(.missing)
         }
-        guard isStillAuthorized(), location.isCurrent, let source = location.window else { return .failure(.changed) }
+        guard isStillAuthorized(), location.isCurrent, let source = location.window,
+              retiringPreparedOversightWindows[target] == nil,
+              !AgentSessionRuntimeStore.shared.hasRetiringWriter(sessionID: target) else { return .failure(.changed) }
         if preparedOversightWindows[target] != nil,
            preparedOversightOwnerLocations[target]?.isCurrent != true
            || preparedOversightOwnerLocations[target]?.agreesOnCarrierAndProvenance(with: location) != true
@@ -264,7 +271,17 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     /// A UI visit may take over an idle saved runtime, but never creates a second writer or
     /// cancels an accepted managed task. Active ownership is the ordinary binding-transition block.
     func releasePreparedOversightOwnerForVisit(sessionID: UUID, preparingReplacement: Bool = false) async -> Bool {
-        guard let owner = preparedOversightWindows[sessionID] else { return true }
+        if let retiring = retiringPreparedOversightWindows[sessionID] {
+            // An explicit visit may retry a failed final save, but never joins a still-running
+            // drain on the UI path. That visit will be queued and resumed by the drain owner.
+            guard !preparedOversightHandoffs.contains(sessionID), !retiring.isPreparedSessionTeardownInFlight else { return false }
+            let released = await finishRetiringPreparedOversightOwner(sessionID: sessionID, owner: retiring)
+            if released { preparedOversightPendingVisits.removeValue(forKey: sessionID) }
+            return released
+        }
+        guard let owner = preparedOversightWindows[sessionID] else {
+            return !AgentSessionRuntimeStore.shared.hasRetiringWriter(sessionID: sessionID)
+        }
         guard preparedOversightPreparationInFlight[sessionID, default: 0] <= (preparingReplacement ? 1 : 0),
               owner.agentModeViewModel.sessions.values.allSatisfy({ !$0.runState.isActive }),
               await !(AgentRunSessionStore.hasActiveRegistration(sessionID: sessionID)),
@@ -281,28 +298,35 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
               preparedOversightWindows[sessionID] === owner else { return false }
         // Withdraw and capture the old exact endpoint before yielding to its final save. This parks
         // the durable link for re-establishment at the newly visited binding, rather than relinking.
+        movePreparedOwnerToRetirement(sessionID: sessionID, owner: owner)
         owner.beginClose()
-        await owner.tearDownPreparedSessionOwner()
-        if preparedOversightWindows[sessionID] === owner {
-            preparedOversightWindows.removeValue(forKey: sessionID)
-            preparedOversightOwnerLocations.removeValue(forKey: sessionID)
-            preparedOversightCarrierSubscriptions.removeValue(forKey: sessionID)
-            preparedOversightConsentPairs.removeValue(forKey: sessionID)
-            preparedOversightRunObservations.removeValue(forKey: sessionID)?.invalidate()
-        }
+        guard await owner.tearDownPreparedSessionOwner() else { return false }
+        guard retiringPreparedOversightWindows[sessionID] === owner else { return false }
+        retiringPreparedOversightWindows.removeValue(forKey: sessionID)
+        // This caller owns the visit/replacement. Do not execute another activation recursively.
+        preparedOversightPendingVisits.removeValue(forKey: sessionID)
         return true
     }
 
     /// Event-driven lifetime, not a polling timer or an independent link authority. The bridge's
     /// committed live links retain an owner; a saved intent alone does not keep a revoked run alive.
     func schedulePreparedOversightCleanup() {
-        guard !isTerminating, !preparedOversightWindows.isEmpty else { return }
+        guard !isTerminating, !preparedOversightWindows.isEmpty || !retiringPreparedOversightWindows.isEmpty else { return }
         preparedOversightCleanupDirty = true
         guard preparedOversightCleanupTask == nil else { return }
         preparedOversightCleanupTask = Task { @MainActor [weak self] in
             defer { self?.preparedOversightCleanupTask = nil }
             while let self, preparedOversightCleanupDirty, !isTerminating, !Task.isCancelled {
                 preparedOversightCleanupDirty = false
+                // A durable tombstone is a new settlement fact, not a storage retry. It can
+                // release an owner whose earlier drain met an in-progress deletion.
+                for (id, owner) in retiringPreparedOversightWindows
+                    where AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: id)
+                    && !preparedOversightHandoffs.contains(id)
+                {
+                    preparedOversightPendingVisits.removeValue(forKey: id)
+                    _ = await finishRetiringPreparedOversightOwner(sessionID: id, owner: owner)
+                }
                 let bridge = AgentSessionLinkRuntimeBridge.shared
                 let inventory = await bridge.oversightInventory(includeLocation: false)
                 let consent = bridge.delegationScopes.linkConsent
@@ -324,11 +348,10 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
                         pair.sourceScopeID.map { !consent.permits(scopeID: $0, observer: pair.observerSessionID, target: id, at: Date()) } ?? false
                     }
                     if deleted || revoked {
-                        let visit = preparedOversightPendingVisits.removeValue(forKey: id)
+                        if deleted { preparedOversightPendingVisits.removeValue(forKey: id) }
                         await retirePreparedOversightOwner(sessionID: id, preservingIntent: false)
-                        // Revocation cancels managed authority, not the user's own pending UI
-                        // visit. A deleted target, in contrast, must never be hydrated again.
-                        if !deleted { await visit?() }
+                        // The drain owner consumes the latest queued visit after acknowledged
+                        // retirement, including visits arriving while its final save is suspended.
                         continue
                     }
                     // UI placement is not authority. Refresh the witness without replacing the
@@ -353,24 +376,53 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         }
     }
 
-    private func retirePreparedOversightOwner(sessionID: UUID, preservingIntent: Bool) async {
-        guard let owner = preparedOversightWindows.removeValue(forKey: sessionID) else { return }
+    private func movePreparedOwnerToRetirement(sessionID: UUID, owner: WindowState) {
+        precondition(preparedOversightWindows[sessionID] === owner)
+        owner.agentModeViewModel.beginPreparedOversightRetirement()
+        preparedOversightWindows.removeValue(forKey: sessionID)
         preparedOversightOwnerLocations.removeValue(forKey: sessionID)
         preparedOversightCarrierSubscriptions.removeValue(forKey: sessionID)
         preparedOversightConsentPairs.removeValue(forKey: sessionID)
         preparedOversightRunObservations.removeValue(forKey: sessionID)?.invalidate()
         retiringPreparedOversightWindows[sessionID] = owner
-        defer { retiringPreparedOversightWindows.removeValue(forKey: sessionID) }
+    }
+
+    private func retirePreparedOversightOwner(sessionID: UUID, preservingIntent: Bool) async {
+        guard let owner = preparedOversightWindows[sessionID] else { return }
+        movePreparedOwnerToRetirement(sessionID: sessionID, owner: owner)
         owner.beginClose(preservingOversightIntent: preservingIntent)
+        guard await finishRetiringPreparedOversightOwner(sessionID: sessionID, owner: owner) else { return }
+        // Read only after drain: a newer visit may have arrived during invalidation or IO.
+        let visit = preparedOversightPendingVisits.removeValue(forKey: sessionID)
+        let deletion = AgentSessionDeletionRegistry.shared
+        if !isTerminating, !deletion.isPermanentlyDeleted(sessionID: sessionID), !deletion.isDeletionInProgress(sessionID: sessionID) {
+            await visit?()
+        }
+    }
+
+    /// Failed durability retains the old writer and the deferred visit. Only an explicit visit
+    /// (or shutdown) retries; no cleanup loop silently drops the response or spins on storage.
+    private func finishRetiringPreparedOversightOwner(sessionID: UUID, owner: WindowState) async -> Bool {
+        guard retiringPreparedOversightWindows[sessionID] === owner,
+              preparedOversightHandoffs.insert(sessionID).inserted else { return false }
+        defer { preparedOversightHandoffs.remove(sessionID) }
+        // Own the entire drain before the first await, including link invalidation.
         if !isTerminating {
             await AgentSessionLinkRuntimeBridge.shared.invalidateWindow(owner.windowID, reason: .windowClosed)
         }
-        if await !owner.tearDownPreparedSessionOwner(), !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID) {
-            AgentSessionLinkRuntimeBridge.shared.launchCoordinatorReportWarning(
-                id: "prepared-runtime-unsettled",
-                message: "A retired background managed session could not finish saving. Its final write was not acknowledged as durable. Check storage before relying on restart continuity."
-            )
+        guard await owner.tearDownPreparedSessionOwner() else {
+            let deletion = AgentSessionDeletionRegistry.shared
+            if !deletion.isPermanentlyDeleted(sessionID: sessionID), !deletion.isDeletionInProgress(sessionID: sessionID) {
+                AgentSessionLinkRuntimeBridge.shared.launchCoordinatorReportWarning(
+                    id: "prepared-runtime-unsettled",
+                    message: "A background managed session could not finish saving or draining its owned effects. Retirement was not acknowledged. Its in-memory writer is retained; check storage before relying on restart continuity."
+                )
+            }
+            return false
         }
+        guard retiringPreparedOversightWindows[sessionID] === owner else { return false }
+        retiringPreparedOversightWindows.removeValue(forKey: sessionID)
+        return true
     }
 
     /// Quit joins nonvisual owners under one absolute budget, independent of filesystem/provider
@@ -400,7 +452,13 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
             Task { @MainActor in
                 let settled = await withTaskGroup(of: Bool.self, returning: Bool.self) { group in
                     for owner in owners {
-                        group.addTask { @MainActor in await owner.tearDownPreparedSessionOwner() }
+                        group.addTask { @MainActor in
+                            let saved = await owner.tearDownPreparedSessionOwner()
+                            if saved {
+                                self.retiringPreparedOversightWindows = self.retiringPreparedOversightWindows.filter { $0.value !== owner }
+                            }
+                            return saved
+                        }
                     }
                     var saved = true
                     for await result in group {
@@ -553,6 +611,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
 
     func agentSessionLinkForgetDeletedSubagent(_ sessionID: UUID) {
         guard !isTerminating else { return }
+        schedulePreparedOversightCleanup()
         for window in sessionRuntimeWindows where !window.isClosing {
             window.agentModeViewModel.agentSessionLinkForgetDeletedSubagent(sessionID)
         }

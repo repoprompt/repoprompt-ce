@@ -5807,19 +5807,31 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     /// An explicitly authorized, targeted load for oversight. Unlike sidebar presentation, this
     /// may materialize just this saved session, but never selects a tab or reconnects a provider.
+    func beginPreparedOversightRetirement() {
+        guard workspaceManager?.isSessionRuntimeProjection == true else { return }
+        runtimeSessionStore.beginRetirement()
+    }
+
     func finishPreparedOversightRuntime() async -> Bool {
         guard workspaceManager?.isSessionRuntimeProjection == true else { return false }
+        runtimeSessionStore.beginRetirement()
         for session in sessions.values {
             session.saveDebounceTask?.cancel()
             session.saveDebounceTask = nil
             flushPendingAssistantDelta(session)
         }
         await prepareForWindowClose()
+        // Provider cleanup may have admitted attachment retention. Its canonical path repair
+        // must precede the final payload write, not outlive released writer claims.
+        await attachmentRuntime.waitForRetention()
         var saved = true
         for session in sessions.values {
             if let id = session.activeAgentSessionID, AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: id) {
                 continue
             }
+            session.saveDebounceTask?.cancel()
+            session.saveDebounceTask = nil
+            if let id = session.activeAgentSessionID { await runtimeSessionStore.saveQueue.waitForInFlightSave(sessionID: id) }
             switch await saveSession(for: session.tabID) {
             case .saved, .notRequired: saved = saved && !session.isDirty
             case .deferred, .failed: saved = false
@@ -5828,10 +5840,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return saved
     }
 
+    func releasePreparedOversightWriterAfterDrain() -> Bool {
+        guard workspaceManager?.isSessionRuntimeProjection == true else { return false }
+        return runtimeSessionStore.releaseWriterClaimsAfterDrain()
+    }
+
     /// Transfer only a settled idle runtime. A failed save keeps the original in-memory owner;
     /// visiting a tab must never discard a managed response that has not reached disk.
     func settlePreparedOversightHandoff() async -> Bool {
         guard workspaceManager?.isSessionRuntimeProjection == true else { return false }
+        await attachmentRuntime.waitForRetention()
         for session in sessions.values {
             guard !session.runState.isActive, session.permitsBoundOperationAndSave else { return false }
             flushPendingAssistantDelta(session)
@@ -5906,6 +5924,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         invalidateAsyncWork: Bool,
         freshCreation: AgentSessionCreationClaim? = nil
     ) -> AgentPersistentSessionBindingIdentity? {
+        if let sessionID, !runtimeSessionStore.permitsBinding(sessionID, on: session) { return nil }
         if let sessionID, workspaceManager?.isSessionRuntimeProjection != true,
            preparedSessionRuntimes?.hasPreparedRuntime(sessionID) == true
         {

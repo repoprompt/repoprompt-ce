@@ -31,6 +31,9 @@ final class AgentSessionAttachmentRuntimeTests: XCTestCase {
         hooks.stageConsumedAttachmentFilesForDeferredCleanup([attachment], session)
         hooks.finalizeAttachmentsForTurn(session, reservation, .deleteFiles)
         guard await gate.waitUntilEntered() else { return }
+        f.scope.beginRetirement()
+        session.isDirty = false
+        XCTAssertFalse(f.scope.releaseWriterClaimsAfterDrain(), "An admitted attachment move must settle before writer release")
         fixture = nil
         XCTAssertNotNil(scope)
         XCTAssertTrue(store.attachmentSweepProtection().sessionIDs.contains(sessionID))
@@ -47,6 +50,7 @@ final class AgentSessionAttachmentRuntimeTests: XCTestCase {
         XCTAssertTrue(try FileManager.default.fileExists(atPath: XCTUnwrap(AgentImageAttachmentAvailabilityResolver.path(for: kept))))
         XCTAssertFalse(try FileManager.default.fileExists(atPath: XCTUnwrap(AgentImageAttachmentAvailabilityResolver.path(for: attachment))))
         XCTAssertTrue(session.isDirty)
+        XCTAssertFalse(f.scope.releaseWriterClaimsAfterDrain(), "Repaired attachment paths still need a final payload save")
         XCTAssertEqual(runtime.sweepProtection.sessionIDs, [])
         // f deliberately remains in this scope; a separate test below checks final scope release.
         withExtendedLifetime(f) {}

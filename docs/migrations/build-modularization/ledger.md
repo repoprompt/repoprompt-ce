@@ -3987,3 +3987,75 @@ writer admission/adoption, provider-input and remaining continuation composition
 window-free saved execution and routing, presentation handoff, bounded host retirement,
 and final product/index/full-suite qualification remain open. No app lifecycle action
 or publication was performed for this continuation.
+
+### M9 continuation — retirement admission and acknowledged handoff (2026-11-07)
+
+The runtime scope now marks retirement independently of a window registry entry.
+New bindings are refused while the originating writer retains its exact capability
+for final IO. Once the host has joined owned effects and acknowledged its final save,
+writer claims are released explicitly; retaining an old presentation cannot retain
+or resurrect those claims. Dirty sessions, in-flight writes, pending attachment retention
+and unsettled terminal publication cannot be released. Final-save orchestration joins
+retention and an already admitted write before freezing the last payload.
+This is an admission/drain correction, not the completed window-free host cutover.
+
+The prepared-owner registry no longer treats moving an owner to its retiring map
+as permission to admit a successor. It owns the entire drain before link invalidation's
+first await. Teardown callers join one task. Failed final saves retain the in-memory
+owner and pending visit, including failures during a direct UI handoff; cleanup does
+not automatically retry storage. An explicit visit can retry the final save and owns
+its activation, superseding an older deferred visit. An automatic retirement instead
+reads the latest queued visit after acknowledged drain. Durable deletion is a new
+settlement fact which releases a previously deletion-blocked drain without hydrating
+its queued visit. Shutdown still uses the existing absolute budget and cannot claim
+that a timed-out write completed.
+
+Review identified and corrected failed-handoff state placement, the pre-teardown
+invalidation gap, recursive duplicate visits and deletion-settlement cleanup. Existing
+lifecycle, link, deletion and persistence authorities remain unchanged; no second
+host manager or durable-ack shortcut was introduced. Added a window-free scope
+regression and production saved-target cases for mid-drain visits, failed retirement
+and direct-handoff saves, explicit retry and in-progress deletion.
+
+The first conductor ticket `b77d76b1-7b7c-4f01-8539-b83ec63bb8c6` passed **9
+runtime-store tests** before review fixes. The prepared-owner filter used the file's
+wrong XCTest class and matched no integration tests. Expanded
+`dd9299e3-13cd-409d-84a0-53d13fbeae8c` passed **109 tests** (handoff inheritance 100,
+runtime store 9), still without the intended saved-target integration suite. Lint
+`ba227228-b011-44d1-bc6d-ce625da4cf82` passed that Swift tree.
+
+Corrected integration ticket `e692bec1-4caa-4c15-a2bb-79921420e4b8` was cancelled
+after three completed tests failed before the retirement branch: the requester never
+received the target's terminal result. Diagnostic
+`4e55eb68-ed4e-4057-bb68-31135f38baf9` reproduced the failure in one case. The result
+notice was queued and retried while the requester was running, then retried while
+terminal publication remained in progress. No retry followed settlement. The scope
+decision owner observed only `objectWillChange`, but runtime terminal/composer/hydration
+settlement uses the existing `monitorReadinessChangePublisher`. It now observes that
+channel too, retaining the same decision queue, stop fences and delivery transaction.
+A causal regression holds terminal publication, witnesses the refusal, and releases
+it without a UI publication; no timeout or delivery assertion is weakened. Temporary
+tracing was removed. Targeted confirmation `098d2f20-3562-4a33-b482-80c6ed0f9c43`
+passed **3 tests**: both scope-decision regressions and the held final-save retirement
+integration. Expanded ticket `29654cff-6ad5-49b0-a8ef-cdeb43436d7b` executed **159 tests**
+with one failure: the direct-handoff failure fixture's injected saver strongly retained
+its owner, so the final lifetime assertion timed out after the save/retry assertions
+passed. The fixture now captures that owner weakly; production drain guards and test
+timeouts are unchanged. Lint `a67b99e3-11df-4ab2-b696-30e270d998c1` passed before
+that capture-only fixture correction.
+
+Corrected ticket `4fb36955-d86b-4802-8b61-4ce139654638`
+(`m9-writer-retirement-v6`) passed **159 tests**: MCP steer/resume 26, standalone
+attachment runtime 6, handoff inheritance 100, runtime store 9, and prepared-owner /
+managed-run inventory integration 18. Final lint
+`030c1342-9105-430c-afe8-79b4221dc6f6` passed the same Swift tree. Both products
+(`RepoPrompt` and `repoprompt-mcp`) passed conductor ticket
+`bf41842e-f6f6-48ec-8cb4-41abe2c9fee3`. The immediately following fresh compiler-index
+check passed at **1,226/1,360 wrong-way file edges** and **53/66 largest-cycle
+components**, with no baseline increase (`.build/modularization-index-m9-retirement.json`).
+
+These receipts qualify this checkpoint, not completed M9. General writer admission
+with agreeing UI replicas, actual window-free run-host/input/continuation composition,
+MCP/admin/scope/link runtime routing, and replacing the prepared `WindowState` factory
+remain open. Full-suite qualification and live smoke are not claimed. No app lifecycle
+action, publication, push or PR-state change was performed.

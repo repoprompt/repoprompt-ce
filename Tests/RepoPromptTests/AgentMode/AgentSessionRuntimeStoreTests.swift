@@ -158,6 +158,39 @@ final class AgentSessionRuntimeStoreTests: XCTestCase {
         XCTAssertEqual(second.liveSessionTabIDs(for: oldID), [session.tabID])
     }
 
+    func testRetirementBlocksSuccessorButPreservesOriginatingWriterUntilAcknowledgedDrain() {
+        let store = AgentSessionRuntimeStore()
+        let scope = store.makeScope(), successor = store.makeScope()
+        let workspaceID = UUID(), sessionID = UUID()
+        let session = AgentTabSession(tabID: UUID())
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: workspaceID))
+        scope.replaceSessions([session.tabID: session])
+        guard case let .unique(writer) = store.resolveWriter(workspaceID: workspaceID, sessionID: sessionID) else {
+            return XCTFail("Expected exact originating writer")
+        }
+        let replacement = AgentTabSession(tabID: session.tabID)
+        scope.beginRetirement()
+        XCTAssertTrue(store.hasRetiringWriter(sessionID: sessionID))
+        XCTAssertFalse(successor.permitsBinding(sessionID, on: replacement))
+        XCTAssertTrue(scope.permitsBinding(sessionID, on: session), "Originating final save keeps its capability")
+        XCTAssertTrue(writer.isCurrent)
+        session.isDirty = true
+        XCTAssertFalse(scope.releaseWriterClaimsAfterDrain(), "A failed save must retain the claim")
+        session.isDirty = false
+        XCTAssertTrue(session.runLifecycle.beginTerminalCommit())
+        XCTAssertFalse(scope.releaseWriterClaimsAfterDrain(), "An unsettled terminal publication still owns the session")
+        session.runLifecycle.completeTerminalCommit()
+        XCTAssertTrue(scope.saveQueue.begin(sessionID: sessionID))
+        XCTAssertFalse(scope.releaseWriterClaimsAfterDrain(), "A possible durable effect must finish first")
+        _ = scope.saveQueue.finish(sessionID: sessionID)
+        XCTAssertTrue(scope.releaseWriterClaimsAfterDrain())
+        XCTAssertFalse(writer.isCurrent, "Even a retained old scope cannot compete with the successor")
+        XCTAssertFalse(store.hasRetiringWriter(sessionID: sessionID))
+        XCTAssertTrue(successor.permitsBinding(sessionID, on: replacement))
+        scope.replaceSessions([session.tabID: session])
+        XCTAssertTrue(scope.sessions.isEmpty, "A released scope cannot resurrect its old writer")
+    }
+
     func testViewModelPublishesBeforeStorageChangesAndUsesRuntimeIndex() {
         let vm = AgentModeViewModel(
             testWindowID: -1406,
