@@ -49,6 +49,9 @@ final class AgentSessionInteractionRuntime {
     let approvalStore: ApplyEditsApprovalStore
     weak var observer: (any AgentRunInteractionStateObserving)?
     private var subscriptions: [ObjectIdentifier: UUID] = [:]
+    // Request-lifetime identities fence delayed caller cancellation from a subsequent question,
+    // even when a caller reuses its public interaction ID on the same session object.
+    var questionWaitIDs: [ObjectIdentifier: UUID] = [:]
     private struct CancellationCutoff {
         weak var session: AgentTabSession?
         let instant: ContinuousClock.Instant

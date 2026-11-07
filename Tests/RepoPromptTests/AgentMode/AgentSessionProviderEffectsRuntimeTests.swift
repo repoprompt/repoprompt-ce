@@ -665,6 +665,143 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
 
 @MainActor
 final class AgentSessionInteractionRuntimeTests: XCTestCase {
+    private func questionSession(in scope: AgentSessionRuntimeStore.Scope, tabID: UUID = UUID()) -> AgentTabSession {
+        let session = AgentTabSession(tabID: tabID)
+        session.installPersistentSessionBinding(.init(tabID: tabID, sessionID: UUID(), workspaceID: UUID()))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        scope.replaceSessions([tabID: session])
+        return session
+    }
+
+    private func runtimeQuestion() -> AgentAskUserInteraction {
+        AgentAskUserInteraction(title: "Runtime question", timeoutSeconds: 600, questions: [
+            AgentAskUserQuestion(id: "answer", question: "Which files?", options: [], allowsMultiple: false, allowsCustom: true)
+        ])
+    }
+
+    private func observeQuestionInstallation(
+        scope: AgentSessionRuntimeStore.Scope, session: AgentTabSession, installed: XCTestExpectation
+    ) -> AgentSessionPresentationRuntime.Attachment {
+        scope.presentation.attach(session, sink: .init(
+            activityChanged: { _, _ in }, refresh: { _, _, _ in }, turnComplete: { _ in }, turnFailed: { _, _ in },
+            binding: { session in
+                if session.pendingAskUser != nil {
+                    XCTAssertNotNil(session.askUserContinuation, "Publication must not precede its response/cancellation capability")
+                    installed.fulfill()
+                }
+            }
+        ))
+    }
+
+    func testQuestionCreationRetainsScopeUntilResponseWithoutPresentation() async throws {
+        var scope: AgentSessionRuntimeStore.Scope? = AgentSessionRuntimeStore().makeScope()
+        let session = try questionSession(in: XCTUnwrap(scope))
+        let runtime = try XCTUnwrap(scope).interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
+        let question = runtimeQuestion()
+        let installed = expectation(description: "runtime question published")
+        let attachment = try observeQuestionInstallation(scope: XCTUnwrap(scope), session: session, installed: installed)
+        weak let owner = scope
+        let task = Task { try await runtime.askUser(session: session, interaction: question) }
+        await fulfillment(of: [installed], timeout: 3)
+        scope?.presentation.detach(attachment)
+        do { _ = try await runtime.askUser(session: session, interaction: runtimeQuestion())
+            XCTFail("A second question must not replace the admitted request")
+        } catch { XCTAssertTrue(String(describing: error).contains("already waiting")) }
+        XCTAssertEqual(session.pendingAskUser?.interaction.id, question.id)
+        scope = nil
+        XCTAssertNotNil(owner, "An admitted question owns its runtime, not its presentation")
+        runtime.skipAskUser(session: session, interactionID: question.id)
+        let response = try await task.value
+        XCTAssertTrue(response.skipped)
+        XCTAssertNil(session.pendingAskUser)
+        XCTAssertNil(session.askUserContinuation)
+        XCTAssertNil(session.askUserTimeoutTask)
+        XCTAssertTrue(runtime.questionWaitIDs.isEmpty)
+        XCTAssertNil(owner)
+    }
+
+    func testCallerCancellationSettlesOriginalQuestionNotRecycledTabWithSameInteractionID() async throws {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let original = questionSession(in: scope)
+        let runtime = scope.interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
+        let question = runtimeQuestion()
+        let firstInstalled = expectation(description: "original question")
+        let firstAttachment = observeQuestionInstallation(scope: scope, session: original, installed: firstInstalled)
+        let first = Task { try await runtime.askUser(session: original, interaction: question) }
+        await fulfillment(of: [firstInstalled], timeout: 3)
+        scope.presentation.detach(firstAttachment)
+        let replacement = questionSession(in: scope, tabID: original.tabID)
+        let secondInstalled = expectation(description: "replacement question")
+        let secondAttachment = observeQuestionInstallation(scope: scope, session: replacement, installed: secondInstalled)
+        let second = Task { try await runtime.askUser(session: replacement, interaction: question) }
+        await fulfillment(of: [secondInstalled], timeout: 3)
+        scope.presentation.detach(secondAttachment)
+        first.cancel()
+        do { _ = try await first.value
+            XCTFail("Cancelled original request must throw")
+        } catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertNil(original.askUserContinuation)
+        XCTAssertEqual(replacement.pendingAskUser?.interaction.id, question.id)
+        XCTAssertNotNil(replacement.askUserContinuation)
+        runtime.skipAskUser(session: replacement, interactionID: question.id)
+        let response = try await second.value
+        XCTAssertTrue(response.skipped)
+        XCTAssertTrue(runtime.questionWaitIDs.isEmpty)
+    }
+
+    func testQuestionTimeoutRearmRejectsOldGenerationAndReturnsDraftAfterDetach() async throws {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = questionSession(in: scope)
+        let runtime = scope.interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
+        let question = runtimeQuestion()
+        let installed = expectation(description: "question before timeout rearm")
+        let attachment = observeQuestionInstallation(scope: scope, session: session, installed: installed)
+        let task = Task { try await runtime.askUser(session: session, interaction: question) }
+        await fulfillment(of: [installed], timeout: 3)
+        scope.presentation.detach(attachment)
+        runtime.updateAskUserDraft(session: session, interactionID: question.id, questionID: "answer", draft: .init(customResponse: "Sources only"))
+        let oldGeneration = session.pendingAskUserTimeoutGeneration
+        runtime.noteAskUserCardActivity(session: session, interactionID: question.id)
+        let currentGeneration = session.pendingAskUserTimeoutGeneration
+        XCTAssertNotEqual(oldGeneration, currentGeneration)
+        runtime.expireAskUserTimeout(for: session, interactionID: question.id, generation: oldGeneration)
+        XCTAssertNotNil(session.askUserContinuation)
+        scope.replaceSessions([:])
+        runtime.expireAskUserTimeout(for: session, interactionID: question.id, generation: currentGeneration)
+        let response = try await task.value
+        XCTAssertTrue(response.timedOut)
+        XCTAssertEqual(response.answersByQuestionID["answer"]?.customResponse, "Sources only")
+        XCTAssertNil(session.askUserTimeoutTask)
+        XCTAssertFalse(runtime.cancelAskUserInteraction(session: session, interactionID: question.id))
+        XCTAssertTrue(runtime.questionWaitIDs.isEmpty)
+        scope.replaceSessions([session.tabID: session])
+        let immediate = AgentAskUserInteraction(id: question.id, timeoutSeconds: 0, questions: question.questions)
+        let immediateResponse = try await runtime.askUser(session: session, interaction: immediate)
+        XCTAssertTrue(immediateResponse.timedOut, "Exercise the actual scheduled timer as well as the stale-generation fence")
+        XCTAssertNil(session.askUserTimeoutTask)
+        XCTAssertTrue(runtime.questionWaitIDs.isEmpty)
+    }
+
+    func testQuestionCancellationBeforeAdmissionOrRetirementCannotPublishPendingState() async throws {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = questionSession(in: scope)
+        let runtime = scope.interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
+        let question = runtimeQuestion()
+        let task = Task { try await runtime.askUser(session: session, interaction: question) }
+        task.cancel()
+        do { _ = try await task.value
+            XCTFail("An already cancelled request must not be installed")
+        } catch { XCTAssertTrue(error is CancellationError) }
+        scope.beginRetirement()
+        do { _ = try await runtime.askUser(session: session, interaction: question)
+            XCTFail("Retiring owner must refuse a new question")
+        } catch { XCTAssertTrue(String(describing: error).contains("unavailable")) }
+        XCTAssertNil(session.pendingAskUser)
+        XCTAssertNil(session.askUserContinuation)
+        XCTAssertNil(session.askUserTimeoutTask)
+        XCTAssertTrue(runtime.questionWaitIDs.isEmpty)
+    }
+
     func testRetainedInteractionRuntimeDoesNotRetainProviderCommandOwnersThroughTerminalHooks() async throws {
         var viewModel: AgentModeViewModel? = AgentModeViewModel(
             testWindowID: -1406, testWorkspacePath: nil, shouldManageCodexTooling: false,

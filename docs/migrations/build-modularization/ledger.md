@@ -4563,3 +4563,40 @@ remaining provider-input/continuation composition, runtime-addressed routing and
 handoff/drain still require their production cutover. These receipts are not full-product,
 fresh-index, aggregate-warning, full-suite or live-smoke qualification. No publication,
 visible app lifecycle action or M10 target move occurred.
+
+### M9 continuation — runtime-owned question lifetime (2026-11-08)
+
+Retired the view model's `ask_user` creation, timeout/rearm, draft/index mutation and
+caller-cancellation implementations. The existing interaction runtime now installs the
+response/cancellation continuation before publishing waiting state and retains the exact
+scope through settlement. Caller cancellation captures the original session object rather
+than resolving a possibly recycled tab UUID. A transient per-call identity prevents delayed
+cancellation from consuming a later question with a reused public interaction ID; it is not
+a new run lifecycle or persistence authority. Timeout settlement keeps the existing generation
+fence and releases its original caller after presentation detaches. The existing optional
+presentation sink handles UI projection; the VM still performs hydration/lifecycle admission.
+No persisted schema, link authority, provider lifecycle or permission decision changed.
+
+Four standalone regression tests cover scope retention/release without presentation,
+conflicting question refusal, original-caller cancellation versus a replacement object with
+the same tab and interaction IDs, timeout rearm and retained draft response after detachment,
+the actual zero-delay timeout task, and cancellation-before-admission/retirement refusal.
+These tests construct no WindowState, PromptVM or WorkspaceVM. An independent review found
+no correctness regression. Its duplicated card-activity guard was consolidated into the
+runtime's result, and the cancellation-before-admission test name now states its precise
+coverage; it does not claim to control an external cancellation race between synchronous
+statements. No test sleeps, retry budgets or timeout limits were inflated.
+
+Initial `bd3e9267-8ef2-4d12-85d1-594975aef798` passed **81 tests**. Final
+`b27bbdab-42a1-4c9c-b06a-38ee0fb7b558` passed **353 tests**: link runtime bridge 234,
+Claude approval/resume 38, MCP steer/resume 27, notification action resolver 22,
+notification eligibility 16, interaction runtime 12, Context Builder ask-user 2 and
+interactive lifecycle contracts 2. Final lint `2af2d0a9-1b8e-44b9-8760-3ba7413678e6`
+passed the same Swift tree. Scoped formatting, final diff review and staged contribution
+preflight apply; the focused results do not replace aggregate warning enforcement.
+
+M9 remains incomplete. Independent canonical writer admission, real window-free saved-run
+host construction, provider-input/continuation composition, runtime-addressed routing and
+presentation-preserving handoff/drain still need their production cutover. No new final-product,
+fresh-index, full-suite or live-smoke qualification is supplied by this checkpoint. No push,
+PR edit, merge, visible app lifecycle action or M10 target move occurred.

@@ -20695,162 +20695,30 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if let lifecycleTarget {
             _ = try requireCurrentAgentSessionLifecycleTarget(lifecycleTarget, intent: .askUser)
         }
-        try interaction.validate()
-        try rejectAskUserIfBlockingInteractionExists(in: session)
-
-        let pending = AgentAskUserPendingState(
-            interaction: interaction,
-            timeoutStartedAt: interaction.askedAt
-        )
-        session.pendingAskUser = pending
-        reconcileInteractiveRunState(session)
-        updateBindingsFromSession(session)
-
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                guard !Task.isCancelled else {
-                    session.pendingAskUser = nil
-                    reconcileInteractiveRunState(session)
-                    updateBindingsFromSession(session)
-                    continuation.resume(throwing: CancellationError())
-                    return
-                }
-                session.askUserContinuation = continuation
-                schedulePendingAskUserTimeout(
-                    for: session,
-                    interactionID: interaction.id,
-                    timeoutSeconds: interaction.timeoutSeconds,
-                    startedAt: interaction.askedAt
-                )
-            }
-        } onCancel: {
-            Task { @MainActor [weak self] in
-                self?.cancelAskUserInteraction(tabID: tabID, interactionID: interaction.id)
-            }
-        }
-    }
-
-    private func rejectAskUserIfBlockingInteractionExists(in session: TabSession) throws {
-        if session.pendingAskUser != nil {
-            throw MCPError.invalidParams("ask_user is already waiting for a response in this session.")
-        }
-        if session.pendingApproval != nil || session.hasPendingCodexHookReviewWait || session.pendingPermissionsRequest != nil || session.pendingApplyEditsReview != nil || session.pendingWorktreeMergeReview != nil {
-            throw MCPError.invalidParams("ask_user cannot be shown while an approval is pending.")
-        }
-        if session.pendingMCPElicitationRequest != nil || !session.queuedMCPElicitationRequests.isEmpty {
-            throw MCPError.invalidParams("ask_user cannot be shown while an MCP elicitation is pending.")
-        }
-        if session.pendingUserInputRequest != nil || !session.queuedUserInputRequests.isEmpty {
-            throw MCPError.invalidParams("ask_user cannot be shown while native user input is pending.")
-        }
+        return try await interactionRuntime.askUser(session: session, interaction: interaction)
     }
 
     func updateAskUserDraft(tabID: UUID, interactionID: UUID, questionID: String, draft: AgentAskUserDraft) {
-        guard let session = sessions[tabID],
-              var pending = session.pendingAskUser,
-              pending.interaction.id == interactionID,
-              pending.interaction.questions.contains(where: { $0.id == questionID })
-        else { return }
-        guard pending.draftsByQuestionID[questionID] != draft else { return }
-        pending.draftsByQuestionID[questionID] = draft
-        session.pendingAskUser = pending
-        updateBindingsFromSession(session)
+        guard let session = sessions[tabID] else { return }
+        interactionRuntime.updateAskUserDraft(session: session, interactionID: interactionID, questionID: questionID, draft: draft)
     }
 
     func updateAskUserQuestionIndex(tabID: UUID, interactionID: UUID, index: Int) {
-        guard let session = sessions[tabID],
-              var pending = session.pendingAskUser,
-              pending.interaction.id == interactionID,
-              pending.interaction.questions.indices.contains(index)
-        else { return }
-        guard pending.currentQuestionIndex != index else { return }
-        pending.currentQuestionIndex = index
-        session.pendingAskUser = pending
-        updateBindingsFromSession(session)
+        guard let session = sessions[tabID] else { return }
+        interactionRuntime.updateAskUserQuestionIndex(session: session, interactionID: interactionID, index: index)
     }
 
-    /// Reset the pending Agent Mode ask_user timeout after visible card activity.
+    /// Card activity changes the existing runtime timeout, not presentation ownership.
     func noteAskUserCardActivity(tabID: UUID, interactionID: UUID) {
         guard let session = sessions[tabID],
-              let pending = session.pendingAskUser,
-              pending.interaction.id == interactionID,
-              session.askUserContinuation != nil
-        else { return }
-
-        schedulePendingAskUserTimeout(
-            for: session,
-            interactionID: interactionID,
-            timeoutSeconds: pending.interaction.timeoutSeconds,
-            startedAt: Date()
-        )
-
-        if tabID == currentTabID {
-            syncRunInteractionUIState()
-        }
-    }
-
-    private func schedulePendingAskUserTimeout(
-        for session: TabSession,
-        interactionID: UUID,
-        timeoutSeconds: TimeInterval,
-        startedAt: Date
-    ) {
-        session.askUserTimeoutTask?.cancel()
-        session.pendingAskUserTimeoutGeneration &+= 1
-        let generation = session.pendingAskUserTimeoutGeneration
-        if var pending = session.pendingAskUser, pending.interaction.id == interactionID {
-            pending.timeoutStartedAt = startedAt
-            session.pendingAskUser = pending
-        }
-        let sleepNanoseconds = UInt64(max(0, timeoutSeconds) * 1_000_000_000)
-
-        session.askUserTimeoutTask = Task { @MainActor [weak self, weak session] in
-            do {
-                try await Task.sleep(nanoseconds: sleepNanoseconds)
-            } catch {
-                return
-            }
-
-            guard let self,
-                  let session,
-                  session.pendingAskUserTimeoutGeneration == generation,
-                  let pending = session.pendingAskUser,
-                  pending.interaction.id == interactionID,
-                  let continuation = session.askUserContinuation
-            else { return }
-
-            invalidatePendingAskUserTimeout(for: session)
-            session.pendingAskUser = nil
-            session.askUserContinuation = nil
-            reconcileInteractiveRunState(session)
-            updateBindingsFromSession(session)
-
-            let elapsedSeconds = max(0, Int(Date().timeIntervalSince(pending.interaction.askedAt)))
-            let response = pending.interaction.buildTimedOutResponse(
-                drafts: pending.draftsByQuestionID,
-                elapsedSeconds: elapsedSeconds
-            )
-            continuation.resume(returning: response)
-        }
-    }
-
-    private func invalidatePendingAskUserTimeout(for session: TabSession) {
-        AgentSessionInteractionRuntime.invalidatePendingAskUserTimeout(for: session)
+              interactionRuntime.noteAskUserCardActivity(session: session, interactionID: interactionID) else { return }
+        if tabID == currentTabID { syncRunInteractionUIState() }
     }
 
     @discardableResult
     func cancelAskUserInteraction(tabID: UUID, interactionID: UUID) -> Bool {
-        guard let session = sessions[tabID],
-              session.pendingAskUser?.interaction.id == interactionID,
-              let continuation = session.askUserContinuation
-        else { return false }
-        invalidatePendingAskUserTimeout(for: session)
-        session.pendingAskUser = nil
-        session.askUserContinuation = nil
-        reconcileInteractiveRunState(session)
-        updateBindingsFromSession(session)
-        continuation.resume(throwing: CancellationError())
-        return true
+        guard let session = sessions[tabID] else { return false }
+        return interactionRuntime.cancelAskUserInteraction(session: session, interactionID: interactionID)
     }
 
     func submitAskUserResponse(tabID: UUID, interactionID: UUID) {
