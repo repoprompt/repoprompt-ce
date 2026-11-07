@@ -3091,12 +3091,15 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             try await withFixture { fixture in
                 let vm = fixture.viewModel
                 let session = fixture.sourceSession
+                session.installRunID(UUID())
+                session.beginRunAttempt(source: "test.forceSwitchInteraction")
                 session.waitingPrompt = "answer?"
                 session.pendingApproval = AgentApprovalRequest(
                     requestID: .codex(.int(1)),
                     method: "item/commandExecution/requestApproval",
                     kind: .commandExecution, threadID: "t", turnID: "t", itemID: "i"
                 )
+                vm.reconcileInteractiveRunState(session)
                 var saves = 0
                 vm.test_setAgentSessionSaver { _, _, _ in
                     saves += 1
@@ -3361,9 +3364,14 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             try await withFixture { fixture in
                 let vm = fixture.viewModel
                 let session = fixture.sourceSession
+                session.installRunID(UUID())
+                session.beginRunAttempt(source: "test.forceSwitchInteraction")
                 session.waitingPrompt = "answer?"
-                vm.test_providerSwitchStopDeadlineSeconds = 0.01
+                vm.reconcileInteractiveRunState(session)
                 vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("forced-deadline.json") }
+                let deadline = SwitchGate()
+                vm.test_providerSwitchDeadlineGates[.retirementTail] = { await deadline.wait() }
+                defer { deadline.open() }
                 let retirement = TestReleaseFence(name: "forced switch retirement")
                 var retirementEntered = false
                 var retirementFinished = false
@@ -3383,6 +3391,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 }
                 do {
                     try await AsyncTestWait.waitUntil("forced switch retirement entered", timeout: 2) { retirementEntered }
+                    deadline.open()
                     try await AsyncTestWait.waitUntil("forced switch completes while retirement is held", timeout: 1) { applyFinished }
                     XCTAssertFalse(retirementFinished, "Outstanding retirement must remain running, not be cancelled to escape the wait")
                     XCTAssertEqual(session.selectedAgent, .openCode)
