@@ -142,14 +142,16 @@ struct CancelButton: View {
     @Environment(\.agentModePerfRecorder) private var perfRecorder
     let source: CancelButtonSource
     let action: () -> Void
+    let tooltip: String
     @State private var isHovered = false
     #if DEBUG
         @State private var visibleStartMS: Double?
     #endif
 
-    init(source: CancelButtonSource = .unknown, action: @escaping () -> Void) {
+    init(source: CancelButtonSource = .unknown, tooltip: String = "Cancel AI Response", action: @escaping () -> Void) {
         self.source = source
         self.action = action
+        self.tooltip = tooltip
     }
 
     var body: some View {
@@ -172,7 +174,7 @@ struct CancelButton: View {
                 isHovered = hovering
             }
         }
-        .hoverTooltip("Cancel AI Response")
+        .hoverTooltip(tooltip)
     }
 
     private func recordAppear() {

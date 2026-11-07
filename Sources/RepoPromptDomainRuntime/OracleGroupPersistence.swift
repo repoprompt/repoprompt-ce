@@ -1025,7 +1025,8 @@ private struct OracleStorageFiles: @unchecked Sendable {
                 finishedAt: turn.finishedAt,
                 status: status,
                 warnings: turn.warnings,
-                results: turn.results
+                results: turn.results,
+                backgroundExecution: turn.backgroundExecution
             )
         }
         return try OracleGroupDocument(
@@ -1077,6 +1078,9 @@ private struct OracleStorageFiles: @unchecked Sendable {
         }
         for (index, turn) in group.turns.enumerated() {
             try validateInput(turn.input)
+            guard turn.backgroundExecution == nil || group.owner.kind == "app-tab" else {
+                throw OraclePersistenceError.invalidDocument("invalid_group_topology")
+            }
             switch turn.state {
             case .prepared:
                 guard index == group.turns.count - 1,
@@ -1140,6 +1144,7 @@ private struct OracleStorageFiles: @unchecked Sendable {
                   next.turns.last?.id == current.turns.last?.id,
                   next.turns.last?.input == current.turns.last?.input,
                   next.turns.last?.startedAt == current.turns.last?.startedAt,
+                  next.turns.last?.backgroundExecution == current.turns.last?.backgroundExecution,
                   next.turns.last?.state == .terminal
             else {
                 throw OraclePersistenceError.invalidDocument("invalid_terminal_transition")

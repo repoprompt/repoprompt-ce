@@ -2474,7 +2474,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
     }
 
     func testPendingProviderCancellationWaitsForWithdrawnControllerTeardown() async throws {
-        for hasSettledPredecessor in [false, true] {
+        for (hasSettledPredecessor, explicitStop) in [(false, false), (true, false), (false, true), (true, true)] {
             let (h, session, controller, listener) = try await spyFixture()
             if hasSettledPredecessor {
                 let predecessorID = UUID()
@@ -2504,11 +2504,13 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
             let shutdownGate = Gate()
             await controller.setShutdownSuspension { await shutdownGate.wait() }
             let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+            // A retained settled Oracle drain must not bypass pending provider-adoption teardown.
+            if explicitStop { session.oracleBackgroundDrain = Task {} }
             var returned = false
             let cancellation = Task { @MainActor in
                 await service.cancelRun(
-                    tabID: session.tabID, session: session, intent: .runtimeShutdown,
-                    completion: .terminalTeardownCompleted
+                    tabID: session.tabID, session: session, intent: explicitStop ? .userStop : .runtimeShutdown,
+                    completion: .terminalTeardownCompleted, origin: explicitStop ? .explicitStop : .internalLifecycle
                 )
                 returned = true
             }

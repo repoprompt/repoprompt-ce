@@ -33,6 +33,13 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
         }
     }()
 
+    private static let askOracleInputSchema: JSONSchema = {
+        guard let definition = MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.askOracle),
+              let schema = try? JSONDecoder().decode(JSONSchema.self, from: JSONEncoder().encode(definition.inputSchema))
+        else { preconditionFailure("Canonical ask_oracle schema must decode as JSONSchema") }
+        return schema
+    }()
+
     private let runtime: MCPAppToolBinder
     private let dependencies: MCPAppPhysicalCapabilityAdapters.Execution
 
@@ -89,38 +96,14 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
 
             Pass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.
 
-            Use `oracle_chat_log` after compaction to recover recent oracle messages. In app-backed Agent Mode, continuing a chat and reading it with `oracle_chat_log` work only for chats created by the current Agent run; chats from an earlier run (for example before Stop, Clear chat, or an app relaunch) are refused, so start a new chat instead. The direct headless backend does not apply this run limit.
+            Use `oracle_chat_log` after compaction to recover recent oracle messages. In app-backed Agent Mode, continuing a chat and legacy reading with `oracle_chat_log` work only for chats created by the current Agent run; chats from an earlier run (for example before Stop, Clear chat, or an app relaunch) are refused, so start a new chat instead. The direct headless backend does not apply this run limit.
+
+            \(OracleBackgroundContract.startDescription)
+
+            \(OracleBackgroundContract.cancelDescription)
             """,
             annotations: .repoPromptLocalEphemeralState,
-            inputSchema: .object(
-                properties: [
-                    "message": .string(
-                        description: "Your message to send",
-                        minLength: 1
-                    ),
-                    "mode": .string(
-                        description: "Operation mode",
-                        default: "chat",
-                        enum: ["chat", "plan", "review"]
-                    ),
-                    "chat_id": .string(
-                        description: "Continue a specific chat in the current agent tab"
-                    ),
-                    "new_chat": .boolean(
-                        description: "Start a new conversation. Omitted chat_id also selects the start route; false with chat_id continues that conversation."
-                    ),
-                    "model": .string(
-                        description: "Optional primary-model override for a new conversation; rejected on continuation.",
-                        maxLength: OracleRosterContract.maximumModelIdentifierLength
-                    ),
-                    OracleAdditionalOraclesContract.argumentName: Self.additionalOraclesInputSchema,
-                    OracleAttachmentContract.argumentName: Self.oracleAttachmentsSchema,
-                    "export_response": .boolean(
-                        description: "When true, export the response to a file and return `oracle_export_path` plus `oracle_export_instruction`. Include `oracle_export_path` inside the `message` you send on your next delegation call; the specific delegation tool is named by your system prompt."
-                    )
-                ],
-                required: ["message"]
-            )
+            inputSchema: Self.askOracleInputSchema
         ) { [dependencies] _, args in
             try await dependencies.executeAskOracle(args)
         }

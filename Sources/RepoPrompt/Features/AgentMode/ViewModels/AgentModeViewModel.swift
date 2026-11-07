@@ -1062,6 +1062,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     var tabDraftText: [UUID: String] = [:]
     var draftRestorationLedger = AgentComposerDraftRestorationLedger()
     private var cancellables = Set<AnyCancellable>()
+    // Derived UI availability; execution authority stays in the registry and live binding.
+    var oracleBackgroundLiveEpochs: [OracleBackgroundInvocationRegistry.Owner: UUID] = [:]
+    var oracleBackgroundRegistry: OracleBackgroundInvocationRegistry {
+        OracleBackgroundInvocationRegistry.shared
+    }
+
     private let listeners = ListenerRegistry()
     private(set) var isAgentModeActive = false
     /// Observation state feeding `AgentNotificationCoordinator` (see `+AttentionNotifications`).
@@ -3843,7 +3849,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             ),
             prepareForCancellation: { [weak self] session, intent, origin in
                 self?.prepareAgentRunCancellation(session: session, intent: intent, origin: origin)
-            }
+            },
+            oracleCancellationDrain: { $0.oracleBackgroundDrain }
         )
         let toolTrackingHooks = makeToolTrackingHooks()
         // Wire hooks so per-tab Claude handlers get proper viewmodel callbacks.
@@ -4146,6 +4153,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func setupObservers() {
+        OracleBackgroundInvocationRegistry.shared.availabilityChanges
+            .sink { [weak self] owner in self?.refreshOracleBackgroundCancelTarget(owner: owner) }
+            .store(in: &cancellables)
         guard let promptManager else { return }
         installPromptManagerCascadeResolvers(promptManager)
         installAgentSessionLifecycleProjectionAuthority()
@@ -5077,6 +5087,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         guard !hasPreparedForWindowClose else { return }
         hasPreparedForWindowClose = true
+        closeOracleBackgroundWindowAdmission()
         let task = Task<Void, Never> { @MainActor [weak self] in
             guard let self else { return }
             await performWindowClosePreparation()
@@ -5170,6 +5181,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func prepareSessionForWindowClose(_ session: TabSession) async {
+        if let drain = closeOracleBackground(for: session), !OracleBackgroundInvocationRegistry.shared.isShuttingDown {
+            await drain.value
+        }
         removePendingUIRefresh(for: session.tabID)
         cancelPersistedLoad(for: session)
         // cancelEphemeralRuntimeState() cancels and nils agentTask before the
@@ -6086,6 +6100,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return session.persistentSessionBindingIdentity
         }
 
+        if let owner = session.oracleBackgroundOwner {
+            closeOracleBackground(for: session)
+            guard OracleBackgroundInvocationRegistry.shared.isDrained(owner) else { return nil }
+            session.oracleBackgroundOwner = nil
+            session.oracleBackgroundDrain = nil
+            session.oracleBackgroundAwareness.resetContext()
+        }
         let previousSessionID = session.activeAgentSessionID
         let previousBinding = session.persistentSessionBindingIdentity
         var deferredCreationWorkspaceID: UUID?
@@ -6591,6 +6612,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         {
             return binding
         }
+        guard await awaitOracleBackgroundDrain(for: targetSession) else { throw PersistentBindingMutationError.blockedByOwnership }
 
         let existingSourceTabID: UUID? = switch persistentBindingResolution(for: requestedSessionID) {
         case let .unique(tabID): tabID
@@ -6598,6 +6620,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         case .ambiguous: throw ambiguousAgentSessionError()
         }
         let sourceSession = existingSourceTabID.flatMap { sessions[$0] }
+        if let sourceSession, sourceSession !== targetSession {
+            guard await awaitOracleBackgroundDrain(for: sourceSession) else { throw PersistentBindingMutationError.blockedByOwnership }
+        }
         let targetCurrentSessionID = targetSession.activeAgentSessionID
 
         let targetToken: PersistentBindingTransitionToken
@@ -9962,6 +9987,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         }
 
+        if executionRootsChanged {
+            guard await awaitOracleBackgroundDrain(for: session) else { throw ExecutionLocationTransitionError.stale }
+        }
         if executionRootsChanged, case .externalManagement = intent {
             try requireIdleWorktreeBindingTransition(session)
             // Reuse the existing execution-location gate so composer, managed sends, and
@@ -16871,6 +16899,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let teardownStartMS = restorePerfRecorder.timestampMSIfEnabled()
             let teardownSessionCount = sessions.count
         #endif
+        let oracleDrains = sessions.values.compactMap { closeOracleBackground(for: $0) }
+        for drain in oracleDrains {
+            await drain.value
+        }
+        guard sessionIndexStore.isOwnerCurrent(owner) else { return }
         let discardContexts = sessions.values.map {
             prepareWorkspaceSwitchSessionDiscard(
                 $0,
@@ -23425,6 +23458,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if let operation = repromptOperations[tabID] {
             operation.invalidate(reason: "The run was stopped.")
             if !session.runState.isActive {
+                if origin == .explicitStop { _ = await awaitOracleBackgroundDrain(for: session) }
                 return
             }
         }
@@ -23503,6 +23537,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return false
         }
         retireTimedOutManagedStopIfEligible(session)
+        if !session.runState.isActive,
+           target.expectedActiveAgentSessionID == session.activeAgentSessionID,
+           let revision = session.lastTerminalCommitRevision,
+           revision.expectedRunID == target.expectedRunID,
+           revision.ownership.attemptID == target.expectedRunAttemptID,
+           let owner = session.oracleBackgroundOwner,
+           OracleBackgroundInvocationRegistry.shared.hasLiveOwner(owner)
+        {
+            prepareAgentRunCancellation(session: session, intent: .userStop, origin: .explicitStop)
+            _ = await awaitOracleBackgroundDrain(for: session)
+            return true
+        }
         if let rejectionReason = cancelTargetRejectionReason(target, session: session) {
             logRejectedCancelTarget(target, session: session, reason: rejectionReason)
             resyncAfterRejectedCancelTarget(target)
@@ -24583,6 +24629,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     #endif
 
     func withdrawQueuedWorkForManagedStop(session: TabSession) {
+        closeOracleBackground(for: session)
         runService.withdrawQueuedWorkForManagedStop(tabID: session.tabID, session: session)
         updateBindingsFromSession(session)
         scheduleSave(for: session.tabID)
@@ -24600,6 +24647,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.stopState.invalidateScheduledStarts()
         // Overseer-facing withdrawal belongs to an explicit user or managed Stop only.
         guard intent == .userStop, origin == .explicitStop else { return providerTeardown }
+        closeOracleBackground(for: session)
         session.stopState.invalidateQueuedDeliveries()
         session.mcpFollowUpRunPending = false
         agentSessionLinkRetractAutoWakeForUserStop(session)
@@ -24940,6 +24988,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Clear the chat transcript for a specific tab
     func clearChat(tabID: UUID) {
         guard let session = sessions[tabID] else { return }
+        closeOracleBackground(for: session)
 
         session.setItemsSilently([], reason: .clearedChat)
         session.clearDerivedTranscriptCaches()
@@ -25289,6 +25338,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         #endif
         let sessionID = boundSessionID(for: tabID)
         let liveSession = sessions[tabID]
+        if let liveSession {
+            guard await awaitOracleBackgroundDrain(for: liveSession) else { throw CancellationError() }
+            guard sessions[tabID] === liveSession, liveSession.activeAgentSessionID == sessionID else { throw CancellationError() }
+        }
         if let sessionID {
             liveSession?.saveDebounceTask?.cancel()
             liveSession?.saveDebounceTask = nil
@@ -26514,5 +26567,87 @@ extension AgentModeViewModel: WorkspaceSwitchSessionProviderDelegate {
             explicitRunID: explicitRunID,
             reason: reason
         )
+    }
+}
+
+extension AgentModeViewModel {
+    @discardableResult
+    func closeOracleBackground(for session: AgentTabSession) -> Task<Void, Never>? {
+        guard let owner = session.oracleBackgroundOwner else { return nil }
+        let drain = OracleBackgroundInvocationRegistry.shared.close(owner)
+        session.oracleBackgroundDrain = drain
+        session.oracleBackgroundAwareness.resetContext()
+        return drain
+    }
+
+    @discardableResult
+    func awaitOracleBackgroundDrain(for session: AgentTabSession, timeout: TimeInterval = 30) async -> Bool {
+        guard let owner = session.oracleBackgroundOwner else { return true }
+        let registry = OracleBackgroundInvocationRegistry.shared
+        guard let drain = closeOracleBackground(for: session) else { return true }
+        if registry.isDrained(owner) { return true }
+        let settled = await OracleBackgroundInvocationRegistry.awaitDrain(drain, timeout: timeout)
+        return settled && sessions[session.tabID] === session && session.persistentSessionBindingIdentity == owner.binding
+    }
+
+    func closeOracleBackgroundWindowAdmission() {
+        for session in sessions.values {
+            closeOracleBackground(for: session)
+        }
+    }
+
+    func joinOracleBackgroundWindowDrain() async {
+        let drains = sessions.values.compactMap { closeOracleBackground(for: $0) }
+        guard !OracleBackgroundInvocationRegistry.shared.isShuttingDown else { return }
+        for drain in drains {
+            await drain.value
+        }
+    }
+}
+
+@MainActor
+struct OracleBackgroundCaller {
+    let window: WindowState
+    let session: AgentTabSession
+    let owner: OracleBackgroundInvocationRegistry.Owner
+    let runID: UUID
+    let bindingTransitionGeneration: UInt64
+    let stopFence: AgentRunStartStopFence
+
+    var isCurrent: Bool {
+        !window.isClosing && !WindowStatesManager.shared.isTerminating && !window.workspaceManager.isSwitchingWorkspace
+            && !session.bindingTransitionInProgress && !session.worktreeBindingTransitionInProgress && !session.isChangingExecutionLocation
+            && !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: owner.binding.sessionID)
+            && !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: owner.binding.sessionID)
+            && window.workspaceManager.activeWorkspaceID == owner.workspaceID
+            && window.agentModeViewModel.session(for: owner.binding.tabID, createIfNeeded: false) === session
+            && session.persistentSessionBindingIdentity == owner.binding
+    }
+
+    var admitsStart: Bool {
+        isCurrent && session.bindingTransitionGeneration == bindingTransitionGeneration
+            && session.runID == runID && session.runState.isActive && stopFence.permitsStart(of: session)
+    }
+}
+
+extension MCPOracleToolService {
+    func backgroundCaller(args: [String: Value], invocation: ToolInvocationContext, tool: String) async throws -> OracleBackgroundCaller? {
+        guard let connectionID = invocation.connectionID, await liveRunPurpose(connectionID) == .agentModeRun else { return nil }
+        guard let context = try? await requireCurrentTabContext(tool),
+              let tabID = try? await resolveTabIDForAgentMode(args, connectionID),
+              let window = try? requireTargetWindow()
+        else { return nil }
+        guard context.tabID == tabID, let workspaceID = context.workspaceID,
+              window.workspaceManager.activeWorkspaceID == workspaceID,
+              let sessionID = context.activeAgentSessionID, let runID = context.runID,
+              let session = window.agentModeViewModel.session(for: tabID, createIfNeeded: false),
+              session.activeAgentSessionID == sessionID, session.runID == runID,
+              session.permitsBoundOperationAndSave, !session.bindingTransitionInProgress,
+              let binding = session.persistentSessionBindingIdentity,
+              session.authoritativeHydratedBinding == binding,
+              session.authoritativeHydratedBindingTransitionGeneration == session.bindingTransitionGeneration
+        else { return nil }
+        let owner = OracleBackgroundInvocationRegistry.Owner(workspaceID: workspaceID, binding: binding)
+        return OracleBackgroundCaller(window: window, session: session, owner: owner, runID: runID, bindingTransitionGeneration: session.bindingTransitionGeneration, stopFence: .init(session: session))
     }
 }
