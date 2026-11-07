@@ -115,11 +115,7 @@ extension AgentModeViewModel {
         case blocked(message: String)
     }
 
-    struct AgentComposerSubmitClaim {
-        let attempt: AgentComposerSubmitAttempt
-        let sourceSession: TabSession
-        let draftMutationGeneration: UInt64
-    }
+    typealias AgentComposerSubmitClaim = AgentSessionComposerSubmitClaim
 
     enum AgentComposerSubmitClaimRejection: Equatable {
         case missingSession

@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
 
 /// Process-owned live-object authority. Scopes retain objects; the store keeps weak scope
 /// references so presentation disposal cannot leave phantom claims. A runtime host can retain
@@ -137,6 +138,20 @@ final class AgentSessionRuntimeStore {
             }
             let runtime = AgentSessionInteractionRuntime(scope: self, routeID: routeID, approvalStore: approvalStore)
             interactionRuntime = runtime
+            return runtime
+        }
+
+        private(set) var linkExecution: AgentSessionLinkExecutionRuntime?
+
+        func makeLinkExecution(
+            commands: AgentSessionLinkExecutionRuntime.Commands,
+            diagnostics: any AgentSessionLinkCatalogEventSink
+        ) -> AgentSessionLinkExecutionRuntime {
+            // Host composition installs once. Presentation attachment must use `linkExecution`,
+            // never replace its command authority or reset pending claims/tasks.
+            precondition(linkExecution == nil, "Link execution is installed once by its runtime host.")
+            let runtime = AgentSessionLinkExecutionRuntime(scope: self, commands: commands, diagnostics: diagnostics)
+            linkExecution = runtime
             return runtime
         }
 

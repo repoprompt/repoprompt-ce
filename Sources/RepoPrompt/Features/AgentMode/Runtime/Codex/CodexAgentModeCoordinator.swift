@@ -498,6 +498,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         installMCPRuntime(viewModel.mcpRuntime)
         installUsageRuntime(viewModel.usageRuntime)
         installPresentationRuntime(viewModel.presentationRuntime)
+        installLinkExecutionRuntime(viewModel.linkExecutionRuntime)
     }
 
     func installUsageRuntime(_ runtime: AgentSessionUsageRuntime) {
@@ -514,6 +515,12 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
 
     func installAttachmentRuntime(_ runtime: AgentSessionAttachmentRuntime) {
         attachmentRuntime = runtime
+    }
+
+    private var linkExecutionRuntime: AgentSessionLinkExecutionRuntime?
+
+    func installLinkExecutionRuntime(_ runtime: AgentSessionLinkExecutionRuntime) {
+        linkExecutionRuntime = runtime
     }
 
     func installPersistenceRuntime(_ runtime: AgentSessionPersistenceRuntime) {
@@ -3619,7 +3626,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         guard let controller = session.codexController,
               ObjectIdentifier(controller) == head.originControllerInstanceID
         else {
-            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+            linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                 for: session,
                 dispatchID: .codexFallback(queueID: head.id)
             )
@@ -3637,7 +3644,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         let dispatchAttemptID = session.activeRunAttemptID
         // A fallback successor bypasses normal session readiness, including its attempt-scoped observer registration.
         await ensureCodexToolTrackingForReadySessionIfNeeded(for: session, runID: head.originRunID)
-        let qualification = await viewModel?.qualifyProviderInputRoute(for: session) ?? .unavailable
+        let qualification = await linkExecutionRuntime?.qualifyProviderInputRoute(for: session) ?? .unavailable
         // Qualification suspends. A replaced run/head/controller may not spend this old entry or
         // terminalize its successor; the queue's exact owner handles its own cancellation.
         guard session.codexFallbackDispatchInFlight?.id == head.id,
@@ -3647,15 +3654,15 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
               session.codexControllerGeneration == head.originControllerGeneration,
               session.codexConversationID == head.originThreadID
         else {
-            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
+            linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
             return false
         }
         guard !Task.isCancelled,
               head.stopFence?.permitsStart(of: session) ?? true,
               qualification.allowsDispatch,
-              viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: qualification) == true
+              linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: qualification) == true
         else {
-            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
+            linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
             await failCodexFallbackDispatch(
                 session: session, entry: head,
                 message: Task.isCancelled ? nil : "Codex queued follow-up lost its exact RepoPrompt MCP route before dispatch."
@@ -3668,7 +3675,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             await failCodexFallbackDispatch(session: session, entry: head, message: nil)
             return false
         }
-        let monitoring = viewModel?.agentSessionLinkDecoratedProviderText(
+        let monitoring = linkExecutionRuntime?.agentSessionLinkDecoratedProviderText(
             head.providerText,
             session: session,
             dispatchID: promptDispatchID
@@ -3677,7 +3684,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         let requiredLaneUnavailable = monitoring?.mustAbortDispatch == true
             || (monitoring == nil && AgentModeViewModel.dispatchRequiresLaneBatch(session, promptDispatchID))
         guard !requiredLaneUnavailable else {
-            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+            linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                 for: session,
                 dispatchID: promptDispatchID
             )
@@ -3685,7 +3692,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             return false
         }
         session.noteAcceptedTaskInput() // Fallback replay on reused/new ownership remains ordinary.
-        let inputProof = await viewModel?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
+        let inputProof = await linkExecutionRuntime?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
         // Managed metadata and quiet qualification can suspend too, even without local input.
         guard session.codexFallbackDispatchInFlight?.id == head.id,
               session.activeRunAttemptID == dispatchAttemptID, session.runID == head.originRunID,
@@ -3693,13 +3700,13 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
               session.codexControllerGeneration == head.originControllerGeneration,
               session.codexConversationID == head.originThreadID
         else {
-            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
+            linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
             return false
         }
         guard !Task.isCancelled, head.stopFence?.permitsStart(of: session) ?? true,
-              viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: qualification) == true
+              linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: qualification) == true
         else {
-            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
+            linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
             await failCodexFallbackDispatch(
                 session: session, entry: head,
                 message: Task.isCancelled || !(head.stopFence?.permitsStart(of: session) ?? true)
@@ -3707,12 +3714,12 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             )
             return false
         }
-        let acquiredPhysicalDispatch = viewModel?.agentSessionLinkAcquirePhysicalDispatch(
+        let acquiredPhysicalDispatch = linkExecutionRuntime?.agentSessionLinkAcquirePhysicalDispatch(
             for: session,
             dispatchID: promptDispatchID
         ) ?? !AgentModeViewModel.dispatchRequiresLaneBatch(session, promptDispatchID)
         guard acquiredPhysicalDispatch else {
-            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+            linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                 for: session,
                 dispatchID: promptDispatchID
             )
@@ -3729,7 +3736,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 session.updateAutomationAudit(turnID: auditTurnID) { $0.recordCodexDispatch(.fallbackStart) }
                 persistenceRuntime?.scheduleSave(for: session)
             }
-            let released = inputProof.flatMap { viewModel?.agentSessionLinkHandoffProviderInput(for: session, dispatchID: promptDispatchID, claim: monitoring?.claim, proof: $0) }
+            let released = inputProof.flatMap { linkExecutionRuntime?.agentSessionLinkHandoffProviderInput(for: session, dispatchID: promptDispatchID, claim: monitoring?.claim, proof: $0) }
             guard released?.mustAbortDispatch != true else { throw CancellationError() }
             let oracle = session.oracleBackgroundAwareness.reserve(session: session, providerID: ObjectIdentifier(controller))
             defer { session.oracleBackgroundAwareness.release(oracle) }
@@ -3753,7 +3760,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 }
                 persistenceRuntime?.scheduleSave(for: session)
             }
-            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: released == nil ? monitoring?.claim : released?.claim)
+            linkExecutionRuntime?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: released == nil ? monitoring?.claim : released?.claim)
             guard var inFlight = session.codexFallbackDispatchInFlight,
                   inFlight.id == head.id,
                   session.codexController.map(ObjectIdentifier.init) == head.originControllerInstanceID
@@ -3779,7 +3786,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             }
             return true
         } catch {
-            viewModel?.agentSessionLinkRecordPhysicalDispatchFailure(
+            linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchFailure(
                 for: session,
                 dispatchID: promptDispatchID
             )
@@ -3904,7 +3911,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             }
         }
         if let (wakeID, dispatchID) = abandonedWake, session.oversight.pendingAutoWake?.wakeID == wakeID {
-            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+            linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                 for: session,
                 dispatchID: dispatchID
             )
@@ -6020,21 +6027,21 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             guard replayTurn.expectedTurnID == nil else {
                 return false
             }
-            let routeReadiness = await viewModel?.qualifyProviderInputRoute(for: session) ?? .unavailable
+            let routeReadiness = await linkExecutionRuntime?.qualifyProviderInputRoute(for: session) ?? .unavailable
             guard routeReadiness.allowsDispatch else {
-                viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+                linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                     for: session,
                     dispatchID: replayDispatchID
                 )
                 return false
             }
-            let inputRouteWasCurrent = viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
+            let inputRouteWasCurrent = linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
             guard session.runID == runID,
                   let activeController = session.codexController,
                   Self.sameCodexControllerInstance(activeController, controller),
                   inputRouteWasCurrent
             else {
-                viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+                linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                     for: session,
                     dispatchID: replayDispatchID
                 )
@@ -6054,20 +6061,20 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 }
             }
             let finalReadiness = if routeReadiness == .notRequired,
-                                    viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) != true
+                                    linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) != true
             {
-                await viewModel?.qualifyProviderInputRoute(for: session) ?? .unavailable
+                await linkExecutionRuntime?.qualifyProviderInputRoute(for: session) ?? .unavailable
             } else {
                 routeReadiness
             }
-            let inputRouteIsCurrent = viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) == true
+            let inputRouteIsCurrent = linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) == true
             guard session.runState.isActive,
                   session.runID == runID,
                   let activeController = session.codexController,
                   Self.sameCodexControllerInstance(activeController, controller),
                   inputRouteIsCurrent
             else {
-                viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+                linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                     for: session,
                     dispatchID: replayDispatchID
                 )
@@ -6090,7 +6097,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             var acceptedReplayClaim: AgentSessionLinkOutboundPromptClaim?
             if replayTurn.monitoringDispatchContext?.isPeriodic == true {
                 guard let endpoint = viewModel?.agentSessionLinkObserverEndpoint(tabID: session.tabID),
-                      viewModel?.agentSessionLinkPeriodicWakeIsEligible(session, endpoint: endpoint) == true else { return false }
+                      linkExecutionRuntime?.agentSessionLinkPeriodicWakeIsEligible(session, endpoint: endpoint) == true else { return false }
                 if var attempt = session.oversight.pendingAutoWake {
                     guard attempt.isPeriodic,
                           attempt.wakeID == replayTurn.monitoringDispatchContext?.dispatchID.autoWakeID,
@@ -6103,7 +6110,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                     text: replayTurn.text, claim: nil, mustAbortDispatch: false
                 )
                 if let claim = replayTurn.monitoringClaim {
-                    guard viewModel?.agentSessionLinkCanReuseAcceptedPromptClaim(
+                    guard linkExecutionRuntime?.agentSessionLinkCanReuseAcceptedPromptClaim(
                         claim, for: session, dispatchID: claim.dispatchID
                     ) == true else { return false }
                     acceptedReplayClaim = claim
@@ -6115,13 +6122,13 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                       originalMonitoringDispatchID.isAutoWakeFamily
             {
                 guard let acknowledged = replayTurn.monitoringClaim,
-                      viewModel?.agentSessionLinkCanReuseAcceptedPromptClaim(
+                      linkExecutionRuntime?.agentSessionLinkCanReuseAcceptedPromptClaim(
                           acknowledged,
                           for: session,
                           dispatchID: originalMonitoringDispatchID
                       ) == true
                 else {
-                    viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+                    linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                         for: session,
                         dispatchID: originalMonitoringDispatchID
                     )
@@ -6134,14 +6141,14 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 monitoring = nil
                 let requiredLaneUnavailable = AgentModeViewModel.dispatchRequiresLaneBatch(session, replayDispatchID)
                 guard !requiredLaneUnavailable else {
-                    viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+                    linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                         for: session,
                         dispatchID: replayDispatchID
                     )
                     return false
                 }
                 if let acknowledged = replayTurn.monitoringClaim,
-                   viewModel?.agentSessionLinkCanReuseAcceptedPromptClaim(
+                   linkExecutionRuntime?.agentSessionLinkCanReuseAcceptedPromptClaim(
                        acknowledged,
                        for: session,
                        dispatchID: replayDispatchID
@@ -6172,12 +6179,12 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             // Ordinary auth replay may compose against an existing dispatching wake. Its local
             // wrapper must retain that cohort through acceptance just like the native send path.
             defer { withExtendedLifetime(monitoring?.quietMarkerProducerLifetime) {} }
-            let acquiredPhysicalDispatch = viewModel?.agentSessionLinkAcquirePhysicalDispatch(
+            let acquiredPhysicalDispatch = linkExecutionRuntime?.agentSessionLinkAcquirePhysicalDispatch(
                 for: session,
                 dispatchID: replayDispatchID
             ) ?? !AgentModeViewModel.dispatchRequiresLaneBatch(session, replayDispatchID)
             guard acquiredPhysicalDispatch else {
-                viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+                linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                     for: session,
                     dispatchID: replayDispatchID
                 )
@@ -6202,13 +6209,13 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                           session.runID == runID,
                           session.activeRunAttemptID == computerUseRecoveryAttemptID,
                           session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(controller),
-                          viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) == true else { throw CancellationError() }
+                          linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) == true else { throw CancellationError() }
                 }
                 var finalReplayText = replayText
                 if let replayClaim {
                     let requiresLaneBatch = replayTurn.monitoringDispatchContext?.isPeriodic != true
                         && originalMonitoringDispatchID?.isAutoWakeFamily == true
-                    guard let released = viewModel?.agentSessionLinkHandoffAcceptedReplay(
+                    guard let released = linkExecutionRuntime?.agentSessionLinkHandoffAcceptedReplay(
                         for: session, claim: replayClaim, proof: replayProof, requiresLaneBatch: requiresLaneBatch
                     ), !released.mustAbortDispatch else { throw CancellationError() }
                     finalReplayText = released.text(replayTurn.text)
@@ -6235,7 +6242,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 return receipt
             }
             dispatched = true
-            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext ?? replayDispatchContext, claim: nil)
+            linkExecutionRuntime?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext ?? replayDispatchContext, claim: nil)
             await applySuccessfulCodexNativeSend(
                 for: session,
                 runID: runID,
@@ -6246,7 +6253,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             return true
         } catch {
             if acquiredAgentSessionLinkPhysicalDispatch {
-                viewModel?.agentSessionLinkRecordPhysicalDispatchFailure(
+                linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchFailure(
                     for: session,
                     dispatchID: replayDispatchID
                 )
@@ -6506,7 +6513,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         // can be spent much later, at a terminal commit that never passes through the projection
         // reconciler's own gate. Disabled oversight alone does not withdraw independently granted
         // session administration; both paths use the same current-surface decision.
-        guard viewModel?.agentSessionLinkCatalogRepairIsEnabled(for: session) == true else {
+        guard linkExecutionRuntime?.agentSessionLinkCatalogRepairIsEnabled(for: session) == true else {
             session.codexSessionLinkCatalogRepairCycle = nil
             logCodex("[AgentModeVM][CodexSessionLinkRepair] closed tab=\(session.tabID) reason=tool-disabled")
             catalogDiagnosticsSink.record(.repairTransition(
@@ -6548,7 +6555,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             } else {
                 logCodex("[AgentModeVM][CodexSessionLinkRepair] consumed tab=\(session.tabID)")
             }
-            viewModel?.agentSessionLinkRedriveCurrentPassiveSnapshot(for: session)
+            linkExecutionRuntime?.agentSessionLinkRedriveCurrentPassiveSnapshot(for: session)
         case .pending:
             guard let expectedController = session.codexController else { return }
             // The expected controller is read and compared inside this one synchronous MainActor
@@ -6567,7 +6574,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 tabID: session.tabID,
                 outcome: .spentReplaced
             ))
-            viewModel?.agentSessionLinkRedriveCurrentPassiveSnapshot(for: session)
+            linkExecutionRuntime?.agentSessionLinkRedriveCurrentPassiveSnapshot(for: session)
         }
     }
 
@@ -7408,7 +7415,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                     // Scope validation suspends after the lease's final route check. Revalidate
                     // that exact process/run route before publishing a companion-enabled thread.
                     if computerUseActivationID != nil {
-                        let readiness = await viewModel?.qualifyProviderInputRoute(for: session) ?? .unavailable
+                        let readiness = await linkExecutionRuntime?.qualifyProviderInputRoute(for: session) ?? .unavailable
                         let routeIsOwned = await routeOwnerValidator(expectedController, runID, windowID, session.tabID)
                         guard !Task.isCancelled, computerUseStartupStopFence.permitsStart(of: session), routeIsOwned,
                               session.runID == runID, session.activeRunAttemptID == runAttemptIDAtEntry,
@@ -7416,7 +7423,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                               session.codexControllerGeneration == pendingStart.controllerGeneration,
                               session.pendingCodexComputerUseActivation?.id == computerUseActivationID,
                               computerUseAdmissionMessage(session: session) == nil,
-                              viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: readiness) == true
+                              linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: readiness) == true
                         else {
                             discardPendingCodexStart(for: session, controllerID: expectedControllerID)
                             await lease.failAndCleanup()
@@ -8075,10 +8082,10 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         var routeReadiness: AgentModeViewModel.ProviderInputRouteReadiness = if isSelfNote {
             .notRequired
         } else {
-            await viewModel?.qualifyProviderInputRoute(for: session) ?? .unavailable
+            await linkExecutionRuntime?.qualifyProviderInputRoute(for: session) ?? .unavailable
         }
         guard routeReadiness.allowsDispatch else {
-            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+            linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                 for: session,
                 dispatchID: promptDispatchID
             )
@@ -8120,16 +8127,16 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             }
         #endif
         if !isSelfNote, routeReadiness == .notRequired,
-           viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) != true
+           linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) != true
         {
-            routeReadiness = await viewModel?.qualifyProviderInputRoute(for: session) ?? .unavailable
+            routeReadiness = await linkExecutionRuntime?.qualifyProviderInputRoute(for: session) ?? .unavailable
         }
-        let inputRouteIsCurrent = isSelfNote || viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
+        let inputRouteIsCurrent = isSelfNote || linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
         guard session.runID == sendRunID,
               session.codexController.map(ObjectIdentifier.init) == expectedControllerID,
               inputRouteIsCurrent
         else {
-            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+            linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                 for: session,
                 dispatchID: promptDispatchID
             )
@@ -8192,17 +8199,17 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             // Hook review can suspend after a link-less qualification. Upgrade only when
             // current exact membership now needs a route; never wait for tool discovery.
             let finalReadiness = if routeReadiness == .notRequired,
-                                    self.viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) != true
+                                    self.linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) != true
             {
-                await self.viewModel?.qualifyProviderInputRoute(for: session) ?? .unavailable
+                await self.linkExecutionRuntime?.qualifyProviderInputRoute(for: session) ?? .unavailable
             } else {
                 routeReadiness
             }
-            let inputRouteIsCurrent = self.viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) == true
+            let inputRouteIsCurrent = self.linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) == true
             let providerRouteIsCurrent = session.runID == sendRunID
                 && session.codexController.map(ObjectIdentifier.init) == expectedControllerID
             guard providerRouteIsCurrent, inputRouteIsCurrent else {
-                self.viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+                self.linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                     for: session,
                     dispatchID: promptDispatchID
                 )
@@ -8237,7 +8244,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             }
 
             routeReadiness = finalReadiness
-            let candidate = self.viewModel?.agentSessionLinkDecoratedProviderText(
+            let candidate = self.linkExecutionRuntime?.agentSessionLinkDecoratedProviderText(
                 text,
                 session: session,
                 dispatchID: promptDispatchID
@@ -8245,7 +8252,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             let requiredLaneUnavailable = candidate?.mustAbortDispatch == true
                 || (candidate == nil && AgentModeViewModel.dispatchRequiresLaneBatch(session, promptDispatchID))
             guard !requiredLaneUnavailable else {
-                self.viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+                self.linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                     for: session,
                     dispatchID: promptDispatchID
                 )
@@ -8278,13 +8285,13 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
 
         func acquireFinalizedAgentSessionLinkDispatch() -> Bool {
             guard !isSelfNote else { return true }
-            let acquired = viewModel?.agentSessionLinkAcquirePhysicalDispatch(
+            let acquired = linkExecutionRuntime?.agentSessionLinkAcquirePhysicalDispatch(
                 for: session, dispatchID: promptDispatchID
             ) ?? !AgentModeViewModel.dispatchRequiresLaneBatch(session, promptDispatchID)
             if acquired {
                 acquiredAgentSessionLinkPhysicalDispatch = true
             } else {
-                viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
+                linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
             }
             return acquired
         }
@@ -8298,7 +8305,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 && session.runID == sendRunID
                 && session.activeRunAttemptID == sendRunAttemptIDAtEntry
                 && session.codexController.map(ObjectIdentifier.init) == expectedControllerID
-                && viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
+                && linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
         }
 
         do {
@@ -8357,14 +8364,14 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                         guard viewModel?.providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: promptDispatchID)
                             ?? (session.pendingHandoff.providerSwitchDelivery == nil)
                         else { throw CancellationError() }
-                        let proof = await viewModel?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
+                        let proof = await linkExecutionRuntime?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
                         guard !Task.isCancelled, effectiveStopFence.permitsStart(of: session),
                               session.runID == sendRunID, session.activeRunAttemptID == sendRunAttemptIDAtEntry,
                               session.codexController.map(ObjectIdentifier.init) == expectedControllerID,
                               session.pendingCodexComputerUseActivation?.id == computerUseActivationID,
                               computerUseActivationID != nil || session.codexControllerFeatureState?.computerUseEnabled != true,
                               computerUseActivationID == nil || (session.codexControllerFeatureState?.computerUseEnabled == true && computerUseAdmissionMessage(session: session) == nil),
-                              isSelfNote || viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
+                              isSelfNote || linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
                         else { throw CancellationError() }
                         // Read proof can suspend after acquisition. Assert the same frozen switch
                         // evidence again at this final synchronous release fence, never re-fit it.
@@ -8387,7 +8394,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                         }
                         let receipt: CodexTurnStartReceipt
                         do {
-                            let released = proof.flatMap { viewModel?.agentSessionLinkHandoffProviderInput(for: session, dispatchID: promptDispatchID, claim: monitoring?.claim, proof: $0) }
+                            let released = proof.flatMap { linkExecutionRuntime?.agentSessionLinkHandoffProviderInput(for: session, dispatchID: promptDispatchID, claim: monitoring?.claim, proof: $0) }
                             guard released?.mustAbortDispatch != true else {
                                 if let noteDispatchID {
                                     var state = session.selfCompactState
@@ -8459,14 +8466,14 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                     persistenceRuntime?.scheduleSave(for: session)
                 }
                 do {
-                    let proof = await viewModel?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
+                    let proof = await linkExecutionRuntime?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
                     guard !Task.isCancelled, effectiveStopFence.permitsStart(of: session),
                           session.runID == sendRunID, session.activeRunAttemptID == sendRunAttemptIDAtEntry,
                           session.codexController.map(ObjectIdentifier.init) == expectedControllerID,
                           session.pendingCodexComputerUseActivation?.id == computerUseActivationID,
                           computerUseActivationID != nil || session.codexControllerFeatureState?.computerUseEnabled != true,
                           computerUseActivationID == nil || (session.codexControllerFeatureState?.computerUseEnabled == true && computerUseAdmissionMessage(session: session) == nil),
-                          viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
+                          linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
                     else { throw CancellationError() }
                     guard acquireFinalizedAgentSessionLinkDispatch() else { throw CancellationError() }
                     if let parkedNote {
@@ -8478,7 +8485,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                         session.selfCompactState = state
                         persistenceRuntime?.scheduleSave(for: session)
                     }
-                    let released = proof.flatMap { viewModel?.agentSessionLinkHandoffProviderInput(for: session, dispatchID: promptDispatchID, claim: monitoring?.claim, proof: $0) }
+                    let released = proof.flatMap { linkExecutionRuntime?.agentSessionLinkHandoffProviderInput(for: session, dispatchID: promptDispatchID, claim: monitoring?.claim, proof: $0) }
                     guard released?.mustAbortDispatch != true else {
                         if let parkedNote {
                             var state = session.selfCompactState
@@ -8613,7 +8620,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             // `startUserTurn`, or a `steerUserTurn` receipt carrying an accepted turn ID. Acknowledge
             // before the staleness guard below, because a dispatch the provider accepted after the
             // local run changed still delivered the supplement exactly once.
-            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: releasedMonitoringClaim)
+            linkExecutionRuntime?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: releasedMonitoringClaim)
             // Managed-auth recovery can still replay this exact turn after acceptance. Hand it the
             // acknowledged claim so the replay can re-attach the identical fragment instead of
             // shipping the bare stored text and silently dropping the revision forever.
@@ -8673,7 +8680,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             return .sent
         } catch let steerError as CodexTurnSteerError {
             if acquiredAgentSessionLinkPhysicalDispatch {
-                viewModel?.agentSessionLinkRecordPhysicalDispatchFailure(
+                linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchFailure(
                     for: session,
                     dispatchID: promptDispatchID
                 )
@@ -8716,7 +8723,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             )
         } catch {
             if acquiredAgentSessionLinkPhysicalDispatch {
-                viewModel?.agentSessionLinkRecordPhysicalDispatchFailure(
+                linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchFailure(
                     for: session,
                     dispatchID: promptDispatchID
                 )

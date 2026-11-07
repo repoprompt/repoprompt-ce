@@ -687,15 +687,27 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ///
     /// Each entry carries the exact incarnation it was published to, so a rebound tab reusing the
     /// same session UUID is refused the previous incarnation's inventory rather than inheriting it.
-    var agentSessionLinkPromptInventoryBySessionID: [UUID: AgentSessionLinkPublishedPromptInventory] = [:]
+    var agentSessionLinkPromptInventoryBySessionID: [UUID: AgentSessionLinkPublishedPromptInventory] {
+        get { linkExecutionRuntime.agentSessionLinkPromptInventoryBySessionID }
+        set { linkExecutionRuntime.agentSessionLinkPromptInventoryBySessionID = newValue }
+        _modify { yield &linkExecutionRuntime.agentSessionLinkPromptInventoryBySessionID }
+    }
 
     /// Latest server-observed MCP catalog projection for each exact observer incarnation.
-    var agentSessionLinkRunCatalogProjectionByEndpoint:
-        [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkRunCatalogProjection] = [:]
+    var agentSessionLinkRunCatalogProjectionByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkRunCatalogProjection] {
+        get { linkExecutionRuntime.agentSessionLinkRunCatalogProjectionByEndpoint }
+        set { linkExecutionRuntime.agentSessionLinkRunCatalogProjectionByEndpoint = newValue }
+        _modify { yield &linkExecutionRuntime.agentSessionLinkRunCatalogProjectionByEndpoint }
+    }
 
     #if DEBUG
         /// W0 observes the actual scheduled idle dispatch and refuses before any provider work.
-        var test_beforeRoutineIdleFollowUpStart: ((TabSession, UUID) -> Bool)?
+        var test_beforeRoutineIdleFollowUpStart: ((TabSession, UUID) -> Bool)? {
+            get { linkExecutionRuntime.test_beforeRoutineIdleFollowUpStart }
+            set { linkExecutionRuntime.test_beforeRoutineIdleFollowUpStart = newValue }
+            _modify { yield &linkExecutionRuntime.test_beforeRoutineIdleFollowUpStart }
+        }
+
         var test_afterClaudeAttachmentSelfCancel: (@MainActor () async -> Void)?
         var test_claudeAttachmentRestartFinished: (@MainActor () -> Void)?
         var test_afterProviderInputAugmentation: (@MainActor () async -> Void)?
@@ -706,27 +718,57 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var test_selfWorktreeRelocationContinuationStarter: (@MainActor (TabSession, String) async -> Void)?
 
         /// Test-only live-authority seam for prompt readiness orchestration.
-        var test_agentSessionLinkHasActiveOutboundLink:
-            ((DomainAgentSessionLinkEndpointIdentity) async -> Bool)?
+        var test_agentSessionLinkHasActiveOutboundLink: ((DomainAgentSessionLinkEndpointIdentity) async -> Bool)? {
+            get { linkExecutionRuntime.test_agentSessionLinkHasActiveOutboundLink }
+            set { linkExecutionRuntime.test_agentSessionLinkHasActiveOutboundLink = newValue }
+            _modify { yield &linkExecutionRuntime.test_agentSessionLinkHasActiveOutboundLink }
+        }
+
         /// Test-only exact route-token seam for synthetic catalog publications.
-        var test_agentSessionLinkAuthoritativeRunCatalogRouteToken:
-            ((UUID, Int, UUID) async -> AgentSessionLinkRunCatalogRouteToken?)?
+        var test_agentSessionLinkAuthoritativeRunCatalogRouteToken: ((UUID, Int, UUID) async -> AgentSessionLinkRunCatalogRouteToken?)? {
+            get { linkExecutionRuntime.test_agentSessionLinkAuthoritativeRunCatalogRouteToken }
+            set { linkExecutionRuntime.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = newValue }
+            _modify { yield &linkExecutionRuntime.test_agentSessionLinkAuthoritativeRunCatalogRouteToken }
+        }
+
         /// Test-only bounded route-token wait seam (run, window, tab, timeout seconds); mirrors the
         /// immediate seam above for `ProviderInputRouteWait`. Must honor the timeout. When only the
         /// immediate seam is installed, waits re-check it until it yields a token or time runs out.
-        var test_agentSessionLinkAwaitAuthoritativeRunCatalogRouteToken:
-            ((UUID, Int, UUID, TimeInterval) async -> AgentSessionLinkRunCatalogRouteToken?)?
+        var test_agentSessionLinkAwaitAuthoritativeRunCatalogRouteToken: ((UUID, Int, UUID, TimeInterval) async -> AgentSessionLinkRunCatalogRouteToken?)? {
+            get { linkExecutionRuntime.test_agentSessionLinkAwaitAuthoritativeRunCatalogRouteToken }
+            set { linkExecutionRuntime.test_agentSessionLinkAwaitAuthoritativeRunCatalogRouteToken = newValue }
+            _modify { yield &linkExecutionRuntime.test_agentSessionLinkAwaitAuthoritativeRunCatalogRouteToken }
+        }
+
         /// Test-only synchronous route fence for synthetic Codex catalog projections.
-        var test_agentSessionLinkCurrentRunCatalogRouteToken:
-            ((AgentSessionLinkRunCatalogRouteToken, UUID) -> Bool)?
+        var test_agentSessionLinkCurrentRunCatalogRouteToken: ((AgentSessionLinkRunCatalogRouteToken, UUID) -> Bool)? {
+            get { linkExecutionRuntime.test_agentSessionLinkCurrentRunCatalogRouteToken }
+            set { linkExecutionRuntime.test_agentSessionLinkCurrentRunCatalogRouteToken = newValue }
+            _modify { yield &linkExecutionRuntime.test_agentSessionLinkCurrentRunCatalogRouteToken }
+        }
+
         /// Test-only suspension point after async route qualification and before Codex's final route fence.
         var test_agentSessionLinkAfterProviderInputRouteReadiness: (() async -> Void)?
         /// Supplies an optional frozen claim component for real native-adapter release tests.
-        var test_agentSessionLinkLocalInputDecoration: ((AgentSessionLinkPromptRenderResult) -> AgentSessionLinkLocalInputDecoration?)?
+        var test_agentSessionLinkLocalInputDecoration: ((AgentSessionLinkPromptRenderResult) -> AgentSessionLinkLocalInputDecoration?)? {
+            get { linkExecutionRuntime.test_agentSessionLinkLocalInputDecoration }
+            set { linkExecutionRuntime.test_agentSessionLinkLocalInputDecoration = newValue }
+            _modify { yield &linkExecutionRuntime.test_agentSessionLinkLocalInputDecoration }
+        }
+
         /// Gates only the Read proof, retaining the production claim and synchronous handoff owners.
-        var test_agentSessionLinkLocalInputReadProof: ((AgentSessionLinkLocalInputDecoration) async -> Bool)?
+        var test_agentSessionLinkLocalInputReadProof: ((AgentSessionLinkLocalInputDecoration) async -> Bool)? {
+            get { linkExecutionRuntime.test_agentSessionLinkLocalInputReadProof }
+            set { linkExecutionRuntime.test_agentSessionLinkLocalInputReadProof = newValue }
+            _modify { yield &linkExecutionRuntime.test_agentSessionLinkLocalInputReadProof }
+        }
+
         /// Routes isolated native fixtures to their real authority; final Manage fences remain production-owned.
-        var test_agentSessionLinkManagedMetadataProof: ((DomainAgentSessionLinkEndpointIdentity, [DomainAgentSessionManagedObservationRequirement]) async -> [DomainAgentSessionLinkCommitAuthorization]?)?
+        var test_agentSessionLinkManagedMetadataProof: ((DomainAgentSessionLinkEndpointIdentity, [DomainAgentSessionManagedObservationRequirement]) async -> [DomainAgentSessionLinkCommitAuthorization]?)? {
+            get { linkExecutionRuntime.test_agentSessionLinkManagedMetadataProof }
+            set { linkExecutionRuntime.test_agentSessionLinkManagedMetadataProof = newValue }
+            _modify { yield &linkExecutionRuntime.test_agentSessionLinkManagedMetadataProof }
+        }
     #endif
 
     /// Endpoints whose prompt inventory is fenced while one or more membership writes that will change
@@ -736,13 +778,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// to *every* publisher: the bridge's ordinary projection refresh publishes an inventory it read
     /// from the authority before the fence went up, and a fence that is only a local variable in the
     /// writing function cannot stop it.
-    var agentSessionLinkPromptInventoryHoldsByEndpoint:
-        [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkPromptInventoryHold] = [:]
+    var agentSessionLinkPromptInventoryHoldsByEndpoint: [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkPromptInventoryHold] {
+        get { linkExecutionRuntime.agentSessionLinkPromptInventoryHoldsByEndpoint }
+        set { linkExecutionRuntime.agentSessionLinkPromptInventoryHoldsByEndpoint = newValue }
+        _modify { yield &linkExecutionRuntime.agentSessionLinkPromptInventoryHoldsByEndpoint }
+    }
 
     /// Monotonic, never reset: it only has to distinguish the concurrent participants in one
     /// endpoint's fence, so no writer can settle another's participation or lower a fence others are
     /// still relying on.
-    var agentSessionLinkNextPromptInventoryHoldToken: UInt64 = 0
+    var agentSessionLinkNextPromptInventoryHoldToken: UInt64 {
+        get { linkExecutionRuntime.agentSessionLinkNextPromptInventoryHoldToken }
+        set { linkExecutionRuntime.agentSessionLinkNextPromptInventoryHoldToken = newValue }
+        _modify { yield &linkExecutionRuntime.agentSessionLinkNextPromptInventoryHoldToken }
+    }
 
     /// Latest passive status-notice queue per endpoint session, published by the same bridge pass
     /// that rebuilds `agentSessionLinkPromptInventoryBySessionID`.
@@ -753,14 +802,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ///
     /// Each snapshot carries the exact incarnation it was reduced for, so a rebound tab reusing the
     /// same session UUID is refused the previous incarnation's queue rather than inheriting it.
-    var agentSessionLinkPassiveNoticesBySessionID: [UUID: AgentSessionLinkPassiveStatusNotices.Snapshot] = [:]
+    var agentSessionLinkPassiveNoticesBySessionID: [UUID: AgentSessionLinkPassiveStatusNotices.Snapshot] {
+        get { linkExecutionRuntime.agentSessionLinkPassiveNoticesBySessionID }
+        set { linkExecutionRuntime.agentSessionLinkPassiveNoticesBySessionID = newValue }
+        _modify { yield &linkExecutionRuntime.agentSessionLinkPassiveNoticesBySessionID }
+    }
 
     /// Ephemeral per-observer claim bookkeeping for the oversight prompt supplement.
-    let agentSessionLinkPromptClaimStore = AgentSessionLinkOutboundPromptClaimStore()
+    var agentSessionLinkPromptClaimStore: AgentSessionLinkOutboundPromptClaimStore {
+        linkExecutionRuntime.agentSessionLinkPromptClaimStore
+    }
 
     /// Host liveness is read synchronously at every periodic admission/fence; injectable for clock tests.
-    var agentSessionLinkPeriodicObserverIsLive: (DomainAgentSessionLinkEndpointIdentity) -> Bool = {
-        AgentSessionLinkRuntimeBridge.shared.isPeriodicWakeObserverLive(for: $0)
+    var agentSessionLinkPeriodicObserverIsLive: (DomainAgentSessionLinkEndpointIdentity) -> Bool {
+        get { linkExecutionRuntime.agentSessionLinkPeriodicObserverIsLive }
+        set { linkExecutionRuntime.agentSessionLinkPeriodicObserverIsLive = newValue }
+        _modify { yield &linkExecutionRuntime.agentSessionLinkPeriodicObserverIsLive }
     }
 
     // MARK: - Dependencies
@@ -3212,6 +3269,64 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessionListCacheGeneration &+= 1
     }
 
+    /// Transitional app composition for the scope-owned link executor. Only the remaining
+    /// canonical admission/start/switch commands depend on this adapter; inventories, claims,
+    /// route proof, wake tasks, snoozes and physical settlement live in the runtime.
+    lazy var linkExecutionRuntime: AgentSessionLinkExecutionRuntime = {
+        let runtime = runtimeSessionStore.makeLinkExecution(commands: .init(
+            isAvailable: { [weak self] in self != nil },
+            endpoint: { [weak self] tabID in self?.agentSessionLinkObserverEndpoint(tabID: tabID) },
+            prepareSwitch: { [weak self] session, input, includesSupplement, supplement, wakeID, isCurrent in
+                guard let self, sessions[session.tabID] === session else { return .failure(.targetStopped) }
+                return await providerSwitchSendAdmission(
+                    session: session, input: input, skipsAugmentation: true,
+                    inputAlreadyIncludesSupplement: includesSupplement, supplementalInput: supplement, autoWakeID: wakeID, isCurrent: isCurrent
+                )
+            },
+            acquireSwitch: { [weak self] session, dispatchID in
+                self?.providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: dispatchID) == true
+            },
+            acceptSwitch: { [weak self] session, context in
+                self?.providerSwitchRecordPhysicalAcceptance(session: session, context: context)
+            },
+            start: { [weak self] session, text, options, preparation in
+                guard let self, sessions[session.tabID] === session else { return nil }
+                return await startAgentRun(
+                    tabID: session.tabID,
+                    initialMessage: text,
+                    directStartOptions: options,
+                    providerSwitchPreparation: preparation
+                )
+            },
+            resume: { [weak self] session, text, claim, origin, proof, undecorated in
+                guard let self, sessions[session.tabID] === session else { return false }
+                return resumeWaitingInstructionContinuation(
+                    session: session,
+                    providerText: text,
+                    claim: claim,
+                    origin: origin,
+                    inputProof: proof,
+                    undecoratedProviderText: undecorated
+                )
+            },
+            settleSelfCompact: { [weak self] session in self?.agentSelfCompactSettleStaleParkedNote(session) },
+            selfCompactBlocksWake: { [weak self] session in self?.agentSelfCompactBlocksNotificationWake(session) ?? true },
+            composerTarget: { [weak self] tabID, session in self?.makeComposerSubmitTarget(tabID: tabID, session: session) },
+            claimComposer: { [weak self] attempt in
+                guard let self, case let .claimed(claim) = claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: false) else { return nil }
+                return claim
+            },
+            composerIsCurrent: { [weak self] claim in self?.composerSubmitClaimIsCurrent(claim) == true },
+            releaseComposer: { [weak self] claim in self?.releaseComposerSubmitClaim(claim) == true }
+        ), diagnostics: catalogDiagnosticsSink)
+        runtime.codexCoordinator = codexCoordinator
+        runtime.perfRecorder = perfRecorder
+        runtime.displayProps = { [weak self] endpoint in self?.monitorPillPropsByEndpoint[endpoint] }
+        _ = mcpRuntime
+        _ = persistenceRuntime
+        return runtime
+    }()
+
     var interactionRuntime: AgentSessionInteractionRuntime {
         let runtime = runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore)
         runtime.observer = codexCoordinator
@@ -3697,38 +3812,26 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 recordPendingHandoffSendOutcome: { [handoff = handoffRuntime] session, didSend in
                     handoff.recordSendOutcome(for: session, didSend: didSend)
                 },
-                claimAgentSessionLinkPrompt: { [weak self] session, dispatchID in
-                    guard let self else {
-                        return Self.dispatchRequiresLaneBatch(session, dispatchID)
-                            ? .requiredLaneBatchUnavailable
-                            : .nothingOwed
-                    }
-                    return agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatchID)
+                claimAgentSessionLinkPrompt: { [links = linkExecutionRuntime] session, dispatchID in
+                    links.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatchID)
                 },
-                acquireAgentSessionLinkPhysicalDispatch: { [weak self] session, dispatchID in
-                    guard let self else {
-                        return !Self.dispatchRequiresLaneBatch(session, dispatchID)
-                    }
-                    return agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: dispatchID)
+                acquireAgentSessionLinkPhysicalDispatch: { [links = linkExecutionRuntime] session, dispatchID in
+                    links.agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: dispatchID)
                 },
-                recordAgentSessionLinkPhysicalDispatchNotAttempted: { [weak self] session, dispatchID in
-                    self?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
+                recordAgentSessionLinkPhysicalDispatchNotAttempted: { [links = linkExecutionRuntime] session, dispatchID in
+                    links.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
                 },
-                recordAgentSessionLinkPhysicalDispatchFailure: { [weak self] session, dispatchID in
-                    self?.agentSessionLinkRecordPhysicalDispatchFailure(for: session, dispatchID: dispatchID)
+                recordAgentSessionLinkPhysicalDispatchFailure: { [links = linkExecutionRuntime] session, dispatchID in
+                    links.agentSessionLinkRecordPhysicalDispatchFailure(for: session, dispatchID: dispatchID)
                 },
-                acceptAgentSessionLinkPrompt: { [weak self] session, context, claim in
-                    self?.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
+                acceptAgentSessionLinkPrompt: { [links = linkExecutionRuntime] session, context, claim in
+                    links.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
                 },
-                proveAgentSessionLinkProviderInput: { [weak self] session, claim in
-                    guard let self else { return await AgentSessionLinkProviderInputRelease.prove(claim) { _ in false } }
-                    return await agentSessionLinkProveProviderInput(for: session, claim: claim)
+                proveAgentSessionLinkProviderInput: { [links = linkExecutionRuntime] session, claim in
+                    await links.agentSessionLinkProveProviderInput(for: session, claim: claim)
                 },
-                handoffAgentSessionLinkProviderInput: { [weak self] session, dispatchID, claim, proof in
-                    guard let self else {
-                        return AgentSessionLinkProviderInputRelease.handoff(original: claim, proof: proof, current: { .nothingOwed }, isPending: { _ in false }, consume: { _ in false })
-                    }
-                    return agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatchID, claim: claim, proof: proof)
+                handoffAgentSessionLinkProviderInput: { [links = linkExecutionRuntime] session, dispatchID, claim, proof in
+                    links.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatchID, claim: claim, proof: proof)
                 }
             ),
             interactions: interactionRuntime.makeRunHooks(),

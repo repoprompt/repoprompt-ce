@@ -4600,3 +4600,56 @@ host construction, provider-input/continuation composition, runtime-addressed ro
 presentation-preserving handoff/drain still need their production cutover. No new final-product,
 fresh-index, full-suite or live-smoke qualification is supplied by this checkpoint. No push,
 PR edit, merge, visible app lifecycle action or M10 target move occurred.
+
+### M9 continuation — runtime-owned link execution and wake scheduling (2026-11-08)
+
+Moved the actual prompt inventory/hold maps, catalog projections, passive snapshots and claim
+store, provider-input proof/handoff/receipt algorithms, auto-wake scheduling and tombstones,
+and periodic scheduling into one scope-owned `AgentSessionLinkExecutionRuntime`. The VM's
+compatibility accessors reference the same storage (including `_modify`), not a mirror.
+The four existing link, passive-delivery, prompt-claim and wake-reservation authorities remain
+separate. Run-service hooks and 66 native Codex call sites now invoke the concrete runtime.
+Required canonical endpoint, run-start, provider-switch, composer and self-compaction commands
+remain explicit legacy composition inputs; optional presentation handles only UI projection.
+This relocation alone does not make the host window-free or grant independent writer admission.
+
+Mechanical comparison found 89 of 92 moved method bodies identical apart from whitespace;
+the other three adapt optional display/weak coordinator access and the required composer-claim
+result. Review identified late legacy command-owner loss: retained runtime hooks must preserve
+the old all-or-nothing weak-VM behavior, not partly consume a wake receipt. An explicit owner
+availability witness now preserves ordinary-dispatch fallback while refusing wake dispatch and
+leaving receipt/provenance state untouched. It is not a consent or endpoint-currency shortcut;
+a future nonvisual host must supply its own command lifetime. Installation is once per scope,
+not a presentation reattachment operation. No lifecycle, persisted schema or permission owner
+was duplicated.
+
+Four standalone tests cover overlapping inventory holds and highest committed revision,
+claim acknowledgement/rebinding, repeated Stop tombstones and the physical dispatch fence,
+route qualification across an exact-object replacement, and command-owner release without
+partial receipt application. They construct no WindowState, PromptVM or WorkspaceVM. The
+source-layout snooze guard now reads the new owning file, with all assertions preserved.
+
+Execution receipts:
+
+- `bd2891f5-ea7c-4c36-ba4a-f576790ffc70` failed compilation before tests: missing supplemental
+  input parameter and performance recorder wiring; both were wired through the actual composition.
+- `48715d24-5b65-4939-aebe-575cf76cda5c` ran 223 tests, one new assertion failed. The test had
+  mistaken rendered unpaid content for physical dispatch permission; it now checks the actual
+  dispatch fence and unchanged unpaid queue/provenance. No production guard was weakened.
+- `915a3ff2-6285-4692-96c5-38b24f5a7e0a` ran 559 tests, one source-path guard failed because it
+  still inspected the former owner file. Only that path was corrected.
+- Final `8660e67e-91ca-4647-ae7b-15f760b74663` passed **559 tests**: runtime bridge 234,
+  auto-wake 127, Codex resume/wedge 74, Codex prompt adapter 41, native/headless adapter 31,
+  interactions 12, ACP runner adapter 11, headless runner adapter 10, snooze projection 8,
+  auto-wake persistence 7 and new link execution runtime 4.
+- Final lint `51a30a98-541f-4135-8060-0534b477ee71` passed; both products built successfully
+  with `412a80ff-56dd-43c9-b58a-0a0be7c004fb`. Fresh compiler-index dump/check after that build
+  passed at **1234/1360** wrong-way file edges and **53/66** cycle components (1122 files,
+  156012 symbols). No ratchet baseline was raised.
+
+One independent review, scoped formatting, final direct diff review and staged contribution
+preflight apply. Full-suite, aggregate-warning and live-smoke qualification remain open.
+Independent canonical writer admission, real saved execution host construction, remaining
+command composition, runtime-addressed routing and presentation-preserving handoff/drain still
+need their production cutover. No push, PR edit, merge, visible app lifecycle action or M10
+move occurred.

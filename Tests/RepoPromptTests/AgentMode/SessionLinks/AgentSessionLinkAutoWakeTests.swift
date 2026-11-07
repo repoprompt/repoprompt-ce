@@ -4,6 +4,7 @@ import RepoPromptACPProviders
 import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
 @testable import RepoPromptMCPServer
 import XCTest
 
@@ -38,6 +39,167 @@ private actor AutoWakeCatalogAuthorityGate {
         let waiters = openWaiters
         openWaiters.removeAll()
         waiters.forEach { $0.resume(returning: true) }
+    }
+}
+
+/// Runtime ownership without constructing a presentation or a window-backed execution host.
+@MainActor
+final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
+    private struct Fixture {
+        let scope: AgentSessionRuntimeStore.Scope
+        let session: AgentTabSession
+        let runtime: AgentSessionLinkExecutionRuntime
+        let endpoint: DomainAgentSessionLinkEndpointIdentity
+    }
+
+    /// Exact value-only placement for these runtime tests. Required execution commands explicitly
+    /// refuse provider starts; none delegates through a window, workspace VM or agent VM.
+    private func fixture(isAvailable: @escaping @MainActor () -> Bool = { true }) throws -> Fixture {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        let workspaceID = UUID(), sessionID = UUID()
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: workspaceID))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        session.hasLoadedPersistedState = true
+        session.installRunID(UUID())
+        session.selectedAgent = .openCode
+        session.oversight.autoWakeOnUpdates = false
+        session.oversight.routineWakeIntervalEnabled = false
+        scope.replaceSessions([session.tabID: session])
+        let binding = try XCTUnwrap(session.persistentSessionBindingIdentity)
+        let endpoint = DomainAgentSessionLinkEndpointIdentity(
+            windowID: 401, workspaceID: workspaceID, tabID: session.tabID, sessionID: sessionID,
+            persistentBindingGeneration: binding.generation, bindingTransitionGeneration: session.bindingTransitionGeneration
+        )
+        let runtime = scope.makeLinkExecution(commands: .init(
+            isAvailable: isAvailable,
+            endpoint: { [weak scope, weak session] tabID in
+                guard let session, scope?.sessions[tabID] === session,
+                      session.persistentSessionBindingIdentity == binding,
+                      session.bindingTransitionGeneration == endpoint.bindingTransitionGeneration else { return nil }
+                return endpoint
+            },
+            prepareSwitch: { _, _, _, _, _, _ in .failure(.targetStopped) },
+            acquireSwitch: { session, _ in session.pendingHandoff.providerSwitchDelivery == nil },
+            acceptSwitch: { session, _ in XCTAssertNil(session.pendingHandoff.providerSwitchDelivery) },
+            start: { _, _, _, _ in XCTFail("This fixture must never launch a provider")
+                return nil
+            },
+            resume: { _, _, _, _, _, _ in XCTFail("No waiting continuation is installed")
+                return false
+            },
+            settleSelfCompact: { session in XCTAssertNil(session.selfCompactState.active) },
+            selfCompactBlocksWake: { $0.selfCompactState.blocksAutomaticWake },
+            composerTarget: { _, _ in nil }, claimComposer: { _ in nil },
+            composerIsCurrent: { _ in false }, releaseComposer: { _ in false }
+        ), diagnostics: NoopAgentSessionLinkCatalogEventSink())
+        return Fixture(scope: scope, session: session, runtime: runtime, endpoint: endpoint)
+    }
+
+    func testWindowFreeInventoryHoldsAndClaimsRetainOneOwnerWithoutPresentation() throws {
+        let f = try fixture()
+        func inventory(_ revision: UInt64) -> AgentSessionLinkPromptInventory {
+            AgentSessionLinkAutoWakeTests.inventory(observerSessionID: f.endpoint.sessionID, revision: revision)
+        }
+        f.runtime.agentSessionLinkPublishPromptInventory(inventory(1), to: f.endpoint)
+        let a = f.runtime.agentSessionLinkWithholdPromptInventory(for: f.endpoint)
+        let b = f.runtime.agentSessionLinkWithholdPromptInventory(for: f.endpoint)
+        f.runtime.agentSessionLinkReleasePromptInventoryHold(a, for: f.endpoint, publishing: inventory(3))
+        XCTAssertNil(f.runtime.agentSessionLinkPromptContext(for: f.session))
+        f.runtime.agentSessionLinkPublishPromptInventory(inventory(2), to: f.endpoint)
+        XCTAssertNil(f.runtime.agentSessionLinkPromptContext(for: f.session))
+        f.runtime.agentSessionLinkReleasePromptInventoryHold(b, for: f.endpoint, publishing: nil)
+        XCTAssertEqual(f.runtime.agentSessionLinkPromptContext(for: f.session)?.inventory.linkSetRevision, 3)
+        let dispatch = AgentSessionLinkPromptDispatchID.headlessRun(runID: UUID())
+        let claim = try XCTUnwrap(f.runtime.agentSessionLinkPromptClaim(for: f.session, dispatchID: dispatch))
+        XCTAssertEqual(f.runtime.agentSessionLinkPromptClaim(for: f.session, dispatchID: dispatch), claim)
+        f.runtime.acceptAgentSessionLinkPromptClaim(claim)
+        XCTAssertNil(f.runtime.agentSessionLinkPromptClaim(for: f.session, dispatchID: .headlessRun(runID: UUID())))
+        f.session.installPersistentSessionBinding(.init(tabID: f.session.tabID, sessionID: f.endpoint.sessionID, workspaceID: f.endpoint.workspaceID))
+        XCTAssertNil(f.runtime.agentSessionLinkPromptContext(for: f.session))
+        XCTAssertFalse(f.runtime.agentSessionLinkCanReuseAcceptedPromptClaim(claim, for: f.session, dispatchID: dispatch))
+    }
+
+    func testWindowFreeRepeatedStopTombstoneFencesPhysicalDispatchAndKeepsUnpaidBatch() throws {
+        let f = try fixture()
+        f.runtime.agentSessionLinkPublishPromptInventory(
+            AgentSessionLinkAutoWakeTests.inventory(observerSessionID: f.endpoint.sessionID, revision: 1), to: f.endpoint
+        )
+        f.session.oversight.autoWakeOnUpdates = true
+        f.session.runState = .running
+        f.runtime.agentSessionLinkPublishPassiveStatusNotices(
+            AgentSessionLinkAutoWakeTests.laneSnapshot(observerEndpoint: f.endpoint), to: f.endpoint
+        )
+        var attempt = try XCTUnwrap(f.session.oversight.pendingAutoWake)
+        attempt.task?.cancel()
+        attempt.phase = .preparingDispatch
+        f.session.oversight.pendingAutoWake = attempt
+        for reason: AgentSessionLinkAutoWakeCancellationReason in [.localUserWon, .localUserWon, .endpointInvalidated] {
+            f.runtime.cancelAgentSessionLinkAutoWake(for: f.endpoint, reason: reason)
+        }
+        let dispatch = AgentSessionLinkPromptDispatchID.headlessRun(runID: UUID())
+        XCTAssertEqual(f.session.oversight.pendingAutoWake?.phase, .cancelledBeforeDispatch)
+        XCTAssertEqual(f.runtime.agentSessionLinkEffectiveDispatchID(for: f.session, dispatchID: dispatch).autoWakeID, attempt.wakeID)
+        let decorated = f.runtime.agentSessionLinkDecoratedProviderText("", session: f.session, dispatchID: dispatch)
+        let acquired = f.runtime.agentSessionLinkAcquirePhysicalDispatch(for: f.session, dispatchID: dispatch)
+        // Rendering may retain the unpaid claim; only the physical fence determines dispatch.
+        XCTAssertFalse(!decorated.mustAbortDispatch && acquired)
+        XCTAssertFalse(acquired)
+        f.runtime.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: f.session, dispatchID: dispatch)
+        XCTAssertNil(f.session.oversight.pendingAutoWake)
+        XCTAssertFalse(try XCTUnwrap(f.runtime.agentSessionLinkPassiveNoticesBySessionID[f.endpoint.sessionID]).entries.isEmpty)
+        XCTAssertTrue(f.session.items.isEmpty)
+    }
+
+    func testLosingCommandOwnerPreservesOrdinaryFallbackButCannotPartiallyConsumeWakeReceipt() throws {
+        final class Owner {}
+        var owner: Owner? = Owner()
+        weak let weakOwner = owner
+        let f = try fixture(isAvailable: { [weak owner] in owner != nil })
+        f.runtime.agentSessionLinkPublishPromptInventory(
+            AgentSessionLinkAutoWakeTests.inventory(observerSessionID: f.endpoint.sessionID, revision: 1), to: f.endpoint
+        )
+        f.session.runState = .running
+        f.session.oversight.autoWakeOnUpdates = true
+        f.runtime.agentSessionLinkPublishPassiveStatusNotices(
+            AgentSessionLinkAutoWakeTests.laneSnapshot(observerEndpoint: f.endpoint), to: f.endpoint
+        )
+        var attempt = try XCTUnwrap(f.session.oversight.pendingAutoWake)
+        attempt.task?.cancel()
+        attempt.phase = .preparingDispatch
+        f.session.oversight.pendingAutoWake = attempt
+        let dispatch = AgentSessionLinkPromptDispatchID.headlessRun(runID: UUID())
+        let claim = try XCTUnwrap(f.runtime.agentSessionLinkPromptClaim(for: f.session, dispatchID: dispatch))
+        XCTAssertNotNil(claim.passive)
+        let before = f.runtime.agentSessionLinkPassiveNoticesBySessionID[f.endpoint.sessionID]
+        owner = nil
+        XCTAssertNil(weakOwner, "Runtime command closures must not retain the presentation adapter")
+        XCTAssertFalse(f.runtime.agentSessionLinkAcquirePhysicalDispatch(for: f.session, dispatchID: dispatch))
+        f.runtime.acceptAgentSessionLinkDispatch(session: f.session, context: nil, claim: claim)
+        XCTAssertTrue(f.runtime.agentSessionLinkPromptClaimStore.isPending(claim))
+        XCTAssertEqual(f.session.oversight.pendingAutoWake?.wakeID, attempt.wakeID)
+        XCTAssertEqual(f.runtime.agentSessionLinkPassiveNoticesBySessionID[f.endpoint.sessionID], before)
+        XCTAssertTrue(f.session.items.isEmpty)
+        f.session.oversight.pendingAutoWake = nil
+        XCTAssertTrue(f.runtime.agentSessionLinkAcquirePhysicalDispatch(for: f.session, dispatchID: dispatch), "Keep the old ordinary-run fallback until independent execution command composition replaces the legacy adapter")
+        XCTAssertTrue(f.runtime.agentSessionLinkPromptClaimStore.isPending(claim))
+    }
+
+    func testWindowFreeRouteQualificationRejectsRecycledObjectAfterAuthorityHop() async throws {
+        let f = try fixture()
+        f.session.selectedAgent = .codexExec
+        let gate = AutoWakeCatalogAuthorityGate()
+        f.runtime.test_agentSessionLinkHasActiveOutboundLink = { _ in await gate.requirement() }
+        let waiting = Task { @MainActor in await f.runtime.qualifyProviderInputRoute(for: f.session) }
+        await gate.waitUntilEntered()
+        let successor = AgentTabSession(tabID: f.session.tabID)
+        try successor.installPersistentSessionBinding(XCTUnwrap(f.session.persistentSessionBindingIdentity))
+        f.scope.replaceSessions([successor.tabID: successor])
+        await gate.open()
+        let result = await waiting.value
+        XCTAssertEqual(result, .unavailable)
+        XCTAssertFalse(result.allowsDispatch)
+        XCTAssertNil(f.runtime.agentSessionLinkPromptContext(for: successor))
     }
 }
 
