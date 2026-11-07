@@ -3365,9 +3365,15 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 let vm = fixture.viewModel
                 let session = fixture.sourceSession
                 session.waitingPrompt = "answer?"
-                vm.test_providerSwitchStopDeadlineSeconds = 0.01
                 vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("forced-deadline.json") }
                 let retirement = TestReleaseFence(name: "forced switch retirement")
+                let deadline = SwitchGate()
+                // Exercise only the retirement-tail deadline. A shared short stop deadline can
+                // refuse the switch during source quiescence before retirement ever starts.
+                vm.test_providerSwitchDeadlineGates[.retirementTail] = { await deadline.wait() }
+                defer { retirement.release()
+                    deadline.open()
+                }
                 var retirementEntered = false
                 var retirementFinished = false
                 vm.test_providerSwitchRetirement = { _ in
@@ -3386,6 +3392,8 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 }
                 do {
                     try await AsyncTestWait.waitUntil("forced switch retirement entered", timeout: 2) { retirementEntered }
+                    XCTAssertFalse(applyFinished, "The switch must await retirement or its deadline")
+                    deadline.open()
                     try await AsyncTestWait.waitUntil("forced switch completes while retirement is held", timeout: 1) { applyFinished }
                     XCTAssertFalse(retirementFinished, "Outstanding retirement must remain running, not be cancelled to escape the wait")
                     XCTAssertEqual(session.selectedAgent, .openCode)
@@ -3394,6 +3402,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     XCTAssertNil(vm.providerSwitchMutation)
                 } catch {
                     retirement.release()
+                    deadline.open()
                     _ = await apply.value
                     throw error
                 }
