@@ -340,3 +340,192 @@ final class AgentSessionStreamRuntimeTests: XCTestCase {
         }
     }
 }
+
+@MainActor
+final class AgentSessionMCPRuntimeTests: XCTestCase {
+    func testWindowFreeSnapshotAndInstructionPublicationUseExistingDomainRegistration() async throws {
+        let f = try await makeFixture()
+        let runtime = f.scope.mcp
+        f.session.waitingPrompt = "Continue?"
+        let snapshot = try XCTUnwrap(runtime.mcpSnapshot(for: f.session))
+        XCTAssertEqual(snapshot.status, .waitingForInput)
+        XCTAssertEqual(snapshot.interaction?.prompt, "Continue?")
+        XCTAssertEqual(snapshot.sessionName, "Runtime fixture")
+        await runtime.signalMCPInstructionDelivered(for: f.session)
+        let published = await AgentRunSessionStore.snapshot(for: f.registration)
+        XCTAssertEqual(published?.interaction, snapshot.interaction)
+        XCTAssertEqual(published?.sessionID, f.sessionID)
+        await AgentRunSessionStore.cleanup(registration: f.registration)
+    }
+
+    func testTerminalCommitPublishesAndAdvancesEpochWithoutPresentation() async throws {
+        let f = try await makeFixture()
+        let revision = try f.revision()
+        let result = await f.scope.mcp.publishTerminalCommit(revision, successorKind: .relatedFollowUp, for: f.session)
+        XCTAssertTrue(result.isResolved)
+        let successor = try XCTUnwrap(result.successorEpoch)
+        XCTAssertNotEqual(successor, f.epoch)
+        XCTAssertEqual(f.session.mcpControlContext?.currentEpoch, successor)
+        XCTAssertEqual(f.session.mcpControlContext?.preparedEpoch, successor)
+        XCTAssertNotNil(f.session.mcpControlCleanupTask)
+        let domainEpoch = await AgentRunSessionStore.currentEpoch(for: f.registration)
+        XCTAssertEqual(domainEpoch, successor)
+        await AgentRunSessionStore.cleanup(registration: f.registration)
+    }
+
+    func testCommittedDomainEffectCannotStampReboundIncarnationAfterSuspension() async throws {
+        let f = try await makeFixture()
+        let release = TestReleaseFence(name: "domain publication committed")
+        defer { release.release() }
+        f.scope.mcp.test_afterDomainTerminalPublication = { await release.enterAndWait() }
+        let revision = try f.revision()
+        let publication = Task { await f.scope.mcp.publishTerminalCommit(revision, successorKind: .relatedFollowUp, for: f.session) }
+        await release.waitUntilEntered()
+        let original = try XCTUnwrap(f.session.persistentSessionBindingIdentity)
+        f.session.installPersistentSessionBinding(.init(tabID: original.tabID, sessionID: original.sessionID, workspaceID: original.workspaceID))
+        XCTAssertNotEqual(f.session.persistentSessionBindingIdentity, original)
+        release.release()
+        let result = await publication.value
+        XCTAssertTrue(result.isResolved, "A completed domain effect must not be reported as no effect")
+        XCTAssertNotNil(result.successorEpoch)
+        XCTAssertEqual(f.session.mcpControlContext?.currentEpoch, f.epoch, "Do not stamp the rebound incarnation")
+        XCTAssertNil(f.session.mcpControlContext?.preparedEpoch)
+        XCTAssertNil(f.session.mcpControlCleanupTask)
+        await AgentRunSessionStore.cleanup(registration: f.registration)
+    }
+
+    func testRemovedScopeObjectStillPublishesOwnedTerminalWithoutTouchingReplacement() async throws {
+        let f = try await makeFixture()
+        let revision = try f.revision()
+        let replacement = AgentTabSession(tabID: f.session.tabID)
+        replacement.mcpControlContext = f.session.mcpControlContext
+        try replacement.installPersistentSessionBinding(XCTUnwrap(f.session.persistentSessionBindingIdentity))
+        f.scope.replaceSessions([replacement.tabID: replacement])
+        let result = await f.scope.mcp.publishTerminalCommit(revision, successorKind: nil, for: f.session)
+        XCTAssertEqual(result, .accepted(successorEpoch: nil))
+        let before = await AgentRunSessionStore.snapshot(for: f.registration)
+        XCTAssertEqual(before?.status, .completed)
+        f.session.waitingPrompt = "stale question"
+        await f.scope.mcp.signalMCPInstructionDelivered(for: f.session)
+        let after = await AgentRunSessionStore.snapshot(for: f.registration)
+        XCTAssertEqual(after, before)
+        XCTAssertNil(replacement.mcpControlContext?.preparedEpoch)
+        await AgentRunSessionStore.cleanup(registration: f.registration)
+    }
+
+    func testBarrierPreservesQueuedAndProviderSuccessorsWhenPublicationOutlivesBinding() async throws {
+        for providerSpecific in [false, true] {
+            let f = try await makeFixture()
+            let session = f.session
+            let ownership = session.beginRunAttempt(source: "runtime publication fence")
+            let fence = AgentRunStartStopFence(session: session)
+            if !providerSpecific { session.pendingInstructions = ["undelivered follow-up"] }
+            var starts = 0
+            var consumedProviderSuccessors = 0
+            let release = TestReleaseFence(name: "barrier domain publication")
+            defer { release.release() }
+            f.scope.mcp.test_afterDomainTerminalPublication = { await release.enterAndWait() }
+            let hooks = AgentRunTerminalSessionBinding.Hooks(
+                flushPendingAssistantDelta: {}, finalizeStreamingItems: {}, finalizePendingToolCalls: { _ in },
+                finalizeNonCodexTurnUsage: {}, cancelPendingInteractions: { _ in }, finalizeAttachments: { _, _ in },
+                setAgentRunInactive: {}, prepareTerminalPublication: {},
+                makeTerminalPublicationEnvelope: { owner, state, runID, failure in
+                    f.scope.mcp.makeTerminalPublicationEnvelope(for: session, ownership: owner, terminalState: state, providerRunID: runID, failureReason: failure)
+                },
+                updateBindings: {}, notifyAgentTurnComplete: {}, scheduleSave: {},
+                publishTerminalCommit: { revision, successor in
+                    await f.scope.mcp.publishTerminalCommit(revision, successorKind: successor, for: session)
+                },
+                permitsTerminalSuccessor: { revision, result in
+                    f.scope.sessions[session.tabID] === session
+                        && fence.permitsTerminalSuccessor(of: session, revision: revision, publication: result)
+                },
+                startFollowUpRun: { _ in starts += 1 }
+            )
+            let binding = AgentRunTerminalSessionBinding(
+                tabID: session.tabID, lifecycle: session.runLifecycle, hooks: hooks,
+                validatesOwnership: { owner, runID in session.isCurrentRunAttemptForCurrentBinding(owner, expectedRunID: runID) },
+                providerDrainGeneration: { 0 }, terminalTurnID: { nil },
+                queuedFollowUp: { session.pendingInstructions.first?.providerText },
+                setFollowUpPending: { session.mcpFollowUpRunPending = $0 },
+                removeFirstQueuedFollowUp: { session.pendingInstructions.isEmpty ? nil : session.pendingInstructions.removeFirst() },
+                appendError: { _ in },
+                finishActiveState: { owner, state, source in
+                    _ = session.endRunAttempt(ifCurrent: owner, source: source)
+                    session.runState = state
+                },
+                retainProcessRunIdentity: { _, _ in }, sourceItemsRevision: { session.sourceItemsRevision },
+                assistantDeltaFlushGeneration: { session.assistantDeltaFlushGeneration }, latestFailureText: { nil }
+            )
+            let successor: AgentRunTerminalCommitBarrier.ProviderSuccessor? = providerSpecific ? .init(
+                id: UUID(), transitionKind: .relatedFollowUp,
+                consumeAfterPublication: { _, _ in consumedProviderSuccessors += 1
+                    return true
+                }
+            ) : nil
+            let request = AgentRunTerminalCommitBarrier.Request(
+                binding: binding, ownership: ownership, expectedRunID: session.runID, terminalState: .completed,
+                source: "test.runtime-publication", attachmentDisposition: .deleteFiles,
+                finalizeNonCodexUsage: false, supportsFollowUp: !providerSpecific,
+                providerSuccessor: successor, notifyTurnComplete: false
+            )
+            let barrier = AgentRunTerminalCommitBarrier()
+            let commit = Task { await barrier.commit(request) }
+            await release.waitUntilEntered()
+            let oldBinding = try XCTUnwrap(session.persistentSessionBindingIdentity)
+            session.installPersistentSessionBinding(.init(tabID: oldBinding.tabID, sessionID: oldBinding.sessionID, workspaceID: oldBinding.workspaceID))
+            release.release()
+            let revision = await commit.value
+            XCTAssertNotNil(revision)
+            XCTAssertTrue(session.runLifecycle.lastTerminalPublicationResult?.isResolved == true)
+            XCTAssertEqual(starts, 0)
+            XCTAssertEqual(consumedProviderSuccessors, 0)
+            XCTAssertTrue(session.mcpFollowUpRunPending)
+            XCTAssertEqual(session.pendingInstructions.count, providerSpecific ? 0 : 1)
+            _ = await barrier.commit(request)
+            XCTAssertEqual(starts, 0, "A repeated commit cannot bypass the successor fence")
+            XCTAssertEqual(consumedProviderSuccessors, 0)
+            XCTAssertEqual(session.pendingInstructions.count, providerSpecific ? 0 : 1)
+        }
+    }
+
+    private func makeFixture() async throws -> Fixture {
+        let fixture = try await Fixture.make()
+        let registration = fixture.registration
+        addTeardownBlock { await AgentRunSessionStore.cleanup(registration: registration) }
+        return fixture
+    }
+
+    @MainActor
+    private struct Fixture {
+        let scope: AgentSessionRuntimeStore.Scope
+        let session: AgentTabSession
+        let sessionID: UUID
+        let registration: AgentRunSessionStore.Registration
+        let epoch: AgentRunTurnEpoch
+
+        static func make() async throws -> Fixture {
+            let scope = AgentSessionRuntimeStore().makeScope()
+            let session = AgentTabSession(tabID: UUID())
+            let sessionID = UUID(), activationID = UUID()
+            session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: UUID()))
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            session.installRunID(UUID())
+            session.runState = .running
+            scope.replaceSessions([session.tabID: session])
+            scope.mcp.metadata = .init(sessionName: { _, _ in "Runtime fixture" }, parentIsWorktreeBound: { _ in nil })
+            let registration = await AgentRunSessionStore.register(sessionID: sessionID)
+            guard case let .accepted(epoch) = await AgentRunSessionStore.beginEpoch(registration: registration, activationID: activationID, expectedCurrentEpoch: nil, transitionKind: .initial) else {
+                throw NSError(domain: "MCP runtime fixture epoch", code: 1)
+            }
+            session.mcpControlContext = .init(sessionID: sessionID, activationID: activationID, registration: registration, currentEpoch: epoch, preparedEpoch: nil, pendingEpochTransition: nil, originatingConnectionID: nil, interactionTransport: .mcp(sessionID: sessionID, originatingConnectionID: nil), suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: .pair)
+            return .init(scope: scope, session: session, sessionID: sessionID, registration: registration, epoch: epoch)
+        }
+
+        func revision() throws -> AgentRunTerminalCommitRevision {
+            let owner = AgentRunOwnership(binding: .init(tabID: session.tabID, persistentSessionID: sessionID), turnEpoch: epoch)
+            let envelope = try XCTUnwrap(scope.mcp.makeTerminalPublicationEnvelope(for: session, ownership: owner, terminalState: .completed, providerRunID: session.runID, failureReason: nil))
+            return .init(commitID: UUID(), ownership: owner, terminalState: .completed, failureReason: nil, expectedRunID: session.runID, sourceItemsRevision: session.sourceItemsRevision, assistantDeltaFlushGeneration: session.assistantDeltaFlushGeneration, providerDrainGeneration: 0, mcpPublicationEnvelope: envelope, successorKind: .relatedFollowUp, providerSuccessorID: nil)
+        }
+    }
+}

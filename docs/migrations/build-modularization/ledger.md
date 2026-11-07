@@ -3889,3 +3889,46 @@ This is still not final M9 acceptance. Provider input, binding/MCP interaction,
 queued-work and terminal/handoff services, exact domain catalog composition, the
 saved execution host and bounded retirement remain in M9. The prepared-window
 factory and close-cancels-run path still exist; M10's target move is untouched.
+
+### M9 continuation — runtime MCP publication (2026-11-07)
+
+Moved actual MCP snapshot/interaction projection, instruction/observation signalling,
+terminal domain publication and Oracle delegation promotion/removal into scope-owned
+`AgentSessionMCPRuntime`. Run hooks and Codex use the concrete runtime; optional
+presentation binding updates no longer gate remote state publication. Session names
+and parent-worktree metadata remain catalog composition inputs. The domain session
+store, attempt lifecycle and terminal barrier remain the existing authorities.
+
+Review distinguished a committed domain effect from permission to start its successor.
+A terminal publication may settle after presentation removes the originating object;
+its activation/registration still owns publication, but only the current scope/object/
+binding may receive the successor epoch. The barrier now also checks its bound
+successor capability before consuming a queued follow-up or provider successor, on
+both first completion and duplicate-commit paths. A rebind or Stop cannot reinterpret
+a successful domain publication as permission to start work on a new incarnation.
+The committed result is retained rather than mislabeled as no effect or stale.
+
+First conductor ticket `e3e2c0c8-5570-4bb5-ab83-cead31e008eb`
+(`m9-mcp-runtime-v1`) failed compilation before tests: the new metadata adapter's
+nested closure needed explicit `self`. The adapter now takes the authoritative
+control-context session ID directly, also preserving the former index lookup key.
+Post-review conductor ticket `74fd2273-c075-4eb8-8205-5ff8182fb538`
+(`m9-mcp-runtime-v2`) passed **125 tests**: lifecycle contracts 4, MCP steer/resume
+25, start budget 6, standalone attachment 6, standalone MCP runtime 5, standalone
+stream 5, Codex resume/wedge commit 74. The barrier fixture exercises both queued
+and provider-specific successors across a held, real domain publication followed
+by a binding rotation, including duplicate commit. Another fixture verifies an
+object removed from the scope still publishes its owned terminal result without
+updating the replacement or sending a stale instruction wake. These fixtures
+construct no window, prompt VM or workspace VM. Lint ticket
+`f931d0f2-1505-4472-ae26-75dbc3867e11` passed on the same Swift tree.
+
+This is a user-requested **draft PR checkpoint**, not full M9 or PR-ready acceptance.
+All prior receipts above remain scoped to their recorded checkpoints. A full-suite
+run, fresh final-head product/compiler-index qualification and live MCP smoke have
+not been performed for this draft head. No visible app lifecycle action was taken.
+
+M9 is still incomplete: terminal preparation/post-settlement continuation, provider
+input and interaction cancellation, workspace-rooted execution routing, domain
+catalog composition, saved runtime host adoption and bounded retirement remain.
+The new runtime does not claim that detaching today's window leaves its run alive.

@@ -120,6 +120,7 @@ final class AgentSessionRuntimeStore {
         let presentation = AgentSessionPresentationRuntime()
         let usage = AgentSessionUsageRuntime()
         lazy var stream = AgentSessionStreamRuntime(scope: self)
+        lazy var mcp = AgentSessionMCPRuntime(scope: self)
         lazy var persistence = AgentSessionPersistenceRuntime(scope: self)
         lazy var attachments = AgentSessionAttachmentRuntime(scope: self)
         var saveQueue: AgentSessionSaveQueue {

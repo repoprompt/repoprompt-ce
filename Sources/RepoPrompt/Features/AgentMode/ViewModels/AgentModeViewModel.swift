@@ -551,14 +551,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private var provisionalParentSessionIDBySessionID: [UUID: UUID] = [:]
 
-    private struct AgentRunOracleReviewKey: Hashable {
-        let sessionID: UUID
-        let runID: UUID
-    }
+    private typealias AgentRunOracleReviewKey = AgentSessionMCPRuntime.AgentRunOracleReviewKey
 
     /// Ephemeral launch snapshots. They are intentionally outside TabSession persistence.
-    private var pendingAgentRunOracleReviewContextsBySessionID: [UUID: PendingAgentRunOracleReviewContext] = [:]
-    private var delegatedAgentRunOracleReviewContextsByKey: [AgentRunOracleReviewKey: DelegatedAgentRunOracleReviewContext] = [:]
+    private var pendingAgentRunOracleReviewContextsBySessionID: [UUID: PendingAgentRunOracleReviewContext] {
+        get { runtimeSessionStore.mcp.pendingAgentRunOracleReviewContextsBySessionID }
+        set { runtimeSessionStore.mcp.pendingAgentRunOracleReviewContextsBySessionID = newValue }
+    }
+
+    private var delegatedAgentRunOracleReviewContextsByKey: [AgentRunOracleReviewKey: DelegatedAgentRunOracleReviewContext] {
+        get { runtimeSessionStore.mcp.delegatedAgentRunOracleReviewContextsByKey }
+        set { runtimeSessionStore.mcp.delegatedAgentRunOracleReviewContextsByKey = newValue }
+    }
 
     /// Session index entries for the active workspace. Owned by
     /// `sessionIndexStore`; this projection keeps existing call sites working.
@@ -1080,7 +1084,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             AgentRunTerminalCommitRevision,
             AgentRunEpochTransitionKind?,
             TabSession
-        ) async -> AgentRunTerminalPublicationResult)?
+        ) async -> AgentRunTerminalPublicationResult)? {
+            get { runtimeSessionStore.mcp.test_terminalPublicationOverride }
+            set { runtimeSessionStore.mcp.test_terminalPublicationOverride = newValue }
+        }
     #endif
     weak var preparedSessionRuntimes: (any PreparedAgentSessionRuntimeRegistry)?
     var providerSwitchExactOwnerProbe: (@MainActor (TabSession) -> Bool)?
@@ -2041,6 +2048,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 derivedTranscript: { [weak self] session in
                     guard let self, sessions[session.tabID] === session else { return }
                     publishDerivedTranscriptState(for: session)
+                },
+                binding: { [weak self] session in
+                    guard let self, sessions[session.tabID] === session else { return }
+                    updateBindingsFromSession(session)
                 }
             ))
         }
@@ -3174,6 +3185,25 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         runtimeSessionStore.stream
     }
 
+    var mcpRuntime: AgentSessionMCPRuntime {
+        let runtime = runtimeSessionStore.mcp
+        if runtime.metadata == nil {
+            runtime.metadata = .init(
+                sessionName: { [weak self] session, sessionID in
+                    guard let self else { return nil }
+                    return workspaceManager?.composeTabName(with: session.tabID)
+                        ?? ownerValidatedSessionIndex[sessionID]?.name
+                },
+                parentIsWorktreeBound: { [weak self] sessionID in
+                    self?.worktreeBindingState(forAgentSessionID: sessionID).bindings.map { !$0.isEmpty }
+                }
+            )
+            runtime.codexCoordinator = codexCoordinator
+            runtime.claudeCoordinator = claudeCoordinator
+        }
+        return runtime
+    }
+
     func slashSkillSuggestions(for query: String) async -> [MentionSuggestion] {
         let sourceTabID = currentTabID
         let sourceSession = activeSession
@@ -3528,6 +3558,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         connectionPolicyInstaller: ConnectionPolicyInstaller? = nil,
         expectedPIDPolicyArmer: ((MCPBootstrapLeaseSpec) async -> Bool)? = nil
     ) -> AgentModeRunService {
+        let publication = mcpRuntime
         let dependencies = AgentModeRunService.Dependencies(
             windowID: windowID,
             headlessProviderFactory: headlessProviderFactory,
@@ -3555,8 +3586,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             providerRuntimePermissionResolver: { [providerBindingService] agent, profile in
                 providerBindingService.runtimePermission(for: agent, profile: profile)
             },
-            bindPendingOracleReviewContext: { [weak self] tabID, runID in
-                self?.mcpBindPendingAgentRunOracleReviewContext(tabID: tabID, runID: runID)
+            bindPendingOracleReviewContext: { tabID, runID in
+                publication.mcpBindPendingAgentRunOracleReviewContext(tabID: tabID, runID: runID)
             },
             cancelMCPToolsForRun: { [weak self] runID, reason in
                 self?.cancelActiveToolsForRun(runID: runID, reason: reason)
@@ -3584,13 +3615,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }),
             attachments: attachmentRuntime.makeRunHooks(),
             presentation: runtimeSessionStore.presentation.makeRunHooks(),
-            bindingObservation: .init(
-                updateBindings: { [weak self] session in
-                    guard let self else { return }
-                    updateBindingsFromSession(session)
-                    handleObservedMCPStateChange(for: session)
-                }
-            ),
+            bindingObservation: mcpRuntime.makeBindingObservationHooks(),
             queuedWorkRecovery: .init(
                 restoreDraftText: { [weak self] tabID, text, message, strategy in
                     self?.restoreComposerDraft(tabID: tabID, text: text, message: message, strategy: strategy)
@@ -3687,8 +3712,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 prepareTerminalPublication: { [weak self] session in
                     self?.prepareTerminalPublication(for: session)
                 },
-                makeTerminalPublicationEnvelope: { [weak self] session, ownership, terminalState, providerRunID, failureReason in
-                    self?.makeTerminalPublicationEnvelope(
+                makeTerminalPublicationEnvelope: { session, ownership, terminalState, providerRunID, failureReason in
+                    publication.makeTerminalPublicationEnvelope(
                         for: session,
                         ownership: ownership,
                         terminalState: terminalState,
@@ -3696,20 +3721,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         failureReason: failureReason
                     )
                 },
-                publishTerminalCommit: { [weak self] session, revision, successorKind in
-                    guard let self else { return .rejected(reason: "view_model_deallocated") }
-                    let result = await publishTerminalCommit(
-                        revision,
-                        successorKind: successorKind,
-                        for: session
-                    )
-                    if result.isResolved,
-                       let sessionID = session.activeAgentSessionID,
-                       let runID = revision.expectedRunID
-                    {
-                        mcpRemoveAgentRunOracleReviewContext(sessionID: sessionID, runID: runID)
-                    }
-                    return result
+                publishTerminalCommit: { session, revision, successorKind in
+                    await publication.publishTerminalCommit(revision, successorKind: successorKind, for: session)
                 },
                 onSelfCompactTerminalSettled: { [weak self] session, revision, result, teardownSettled in
                     self?.agentSelfCompactTerminalSettled(
@@ -3751,8 +3764,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         capturedStopFence: instruction.stopFence
                     )
                 },
-                signalMCPInstructionDelivered: { [weak self] session in
-                    await self?.signalMCPInstructionDelivered(for: session)
+                signalMCPInstructionDelivered: { session in
+                    await publication.signalMCPInstructionDelivered(for: session)
                 }
             ),
             prepareForCancellation: { [weak self] session, intent, origin in
@@ -8001,43 +8014,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func handleObservedMCPStateChange(for session: TabSession) {
-        guard !session.terminalCommitInProgress else { return }
-        // Terminal waiter publication is owned exclusively by AgentRunTerminalCommitBarrier.
-        // Legacy/special-purpose state changes without a canonical revision must not race it.
-        if session.runState.isTerminalForCommit {
-            return
-        }
-        guard let snapshot = mcpSnapshot(for: session),
-              let context = session.mcpControlContext
-        else {
-            return
-        }
-        let tabID = session.tabID
-
-        let cursor = AgentRunSessionStore.WaitCursor(
-            registration: context.registration,
-            epoch: context.currentEpoch
-        )
-        Task { [weak self] in
-            guard self?.mcpControlContextMatches(
-                tabID: tabID,
-                sessionID: snapshot.sessionID,
-                activationID: context.activationID,
-                registration: context.registration
-            ) == true else {
-                return
-            }
-            await AgentRunSessionStore.signalSnapshot(snapshot, cursor: cursor)
-        }
-
-        if snapshot.status.isTerminal {
-            if session.mcpControlCleanupTask == nil {
-                session.mcpControlCleanupTask = Task {}
-            }
-        } else {
-            session.mcpControlCleanupTask?.cancel()
-            session.mcpControlCleanupTask = nil
-        }
+        mcpRuntime.handleObservedMCPStateChange(for: session)
     }
 
     private func prepareTerminalPublication(for session: TabSession) {
@@ -8058,21 +8035,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         providerRunID: UUID?,
         failureReason: AgentRunMCPSnapshot.FailureReason?
     ) -> AgentRunTerminalPublicationEnvelope? {
-        guard let epoch = ownership.turnEpoch,
-              let context = session.mcpControlContext,
-              context.sessionID == epoch.sessionID,
-              context.activationID == epoch.activationID,
-              context.registration.generation == epoch.registrationGeneration,
-              let snapshot = mcpSnapshot(
-                  for: session,
-                  canonicalTerminalState: terminalState,
-                  canonicalProviderRunID: providerRunID,
-                  canonicalFailureReason: failureReason
-              )
-        else {
-            return nil
-        }
-        return AgentRunTerminalPublicationEnvelope(epoch: epoch, snapshot: snapshot)
+        mcpRuntime.makeTerminalPublicationEnvelope(
+            for: session,
+            ownership: ownership,
+            terminalState: terminalState,
+            providerRunID: providerRunID,
+            failureReason: failureReason
+        )
     }
 
     private func publishTerminalCommit(
@@ -8080,102 +8049,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         successorKind: AgentRunEpochTransitionKind?,
         for session: TabSession
     ) async -> AgentRunTerminalPublicationResult {
-        #if DEBUG
-            if let test_terminalPublicationOverride {
-                return await test_terminalPublicationOverride(
-                    revision,
-                    successorKind,
-                    session
-                )
-            }
-        #endif
-        guard let envelope = revision.mcpPublicationEnvelope else {
-            return session.mcpControlContext == nil
-                ? .accepted(successorEpoch: nil)
-                : .rejected(reason: "missing_terminal_publication_envelope")
-        }
-        guard let context = session.mcpControlContext,
-              context.sessionID == envelope.epoch.sessionID,
-              context.activationID == envelope.epoch.activationID,
-              context.registration.generation == envelope.epoch.registrationGeneration
-        else {
-            return .rejected(reason: "activation_replaced")
-        }
-        var result = await AgentRunSessionStore.publishTerminal(
-            envelope,
-            registration: context.registration,
-            commitID: revision.commitID,
-            successorKind: successorKind
-        )
-        if successorKind != nil,
-           case .accepted(successorEpoch: nil) = result
-        {
-            result = .rejected(reason: "missing_successor_epoch")
-        }
-        if let successorEpoch = result.successorEpoch,
-           var liveContext = session.mcpControlContext,
-           liveContext.activationID == context.activationID,
-           liveContext.registration == context.registration
-        {
-            liveContext.currentEpoch = successorEpoch
-            liveContext.preparedEpoch = successorEpoch
-            session.mcpControlContext = liveContext
-        }
-        if result.isResolved, session.mcpControlCleanupTask == nil {
-            session.mcpControlCleanupTask = Task {}
-        }
-        return result
+        await mcpRuntime.publishTerminalCommit(revision, successorKind: successorKind, for: session)
     }
 
     private func signalMCPInstructionDelivered(for session: TabSession) async {
-        guard let snapshot = mcpSnapshot(for: session),
-              let context = session.mcpControlContext
-        else {
-            Self.steeringDebugLog("[AgentRunSteeringWake] skip delivered signal: missing snapshot/control context tab=\(session.tabID) runState=\(session.runState.rawValue)")
-            return
-        }
-        guard mcpControlContextMatches(
-            tabID: session.tabID,
-            sessionID: snapshot.sessionID,
-            activationID: context.activationID,
-            registration: context.registration
-        ) else {
-            Self.steeringDebugLog("[AgentRunSteeringWake] skip delivered signal: control context mismatch sessionID=\(snapshot.sessionID) tab=\(session.tabID)")
-            return
-        }
-        Self.steeringDebugLog("[AgentRunSteeringWake] signal delivered sessionID=\(snapshot.sessionID) tab=\(session.tabID) status=\(snapshot.status.rawValue) runState=\(session.runState.rawValue)")
-        await AgentRunSessionStore.signalSnapshotAndWakeWaiters(
-            snapshot,
-            cursor: .init(registration: context.registration, epoch: context.currentEpoch),
-            reason: .instructionDelivered
-        )
+        await mcpRuntime.signalMCPInstructionDelivered(for: session)
     }
 
     private func signalMCPInstructionDeliveredFireAndForget(for session: TabSession) {
-        guard let snapshot = mcpSnapshot(for: session),
-              let context = session.mcpControlContext
-        else {
-            Self.steeringDebugLog("[AgentRunSteeringWake] skip delivered signal fire-and-forget: missing snapshot/control context tab=\(session.tabID) runState=\(session.runState.rawValue)")
-            return
-        }
-        let tabID = session.tabID
-        Task { @MainActor [weak self] in
-            guard self?.mcpControlContextMatches(
-                tabID: tabID,
-                sessionID: snapshot.sessionID,
-                activationID: context.activationID,
-                registration: context.registration
-            ) == true else {
-                Self.steeringDebugLog("[AgentRunSteeringWake] skip delivered signal fire-and-forget: control context mismatch sessionID=\(snapshot.sessionID) tab=\(tabID)")
-                return
-            }
-            Self.steeringDebugLog("[AgentRunSteeringWake] fire delivered signal sessionID=\(snapshot.sessionID) tab=\(tabID) status=\(snapshot.status.rawValue)")
-            await AgentRunSessionStore.signalSnapshotAndWakeWaiters(
-                snapshot,
-                cursor: .init(registration: context.registration, epoch: context.currentEpoch),
-                reason: .instructionDelivered
-            )
-        }
+        mcpRuntime.signalMCPInstructionDeliveredFireAndForget(for: session)
     }
 
     private func wakeCurrentMCPWaitersForSteeringRequestFireAndForget(
@@ -8256,15 +8138,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         activationID: UUID,
         registration: AgentRunSessionStore.Registration
     ) -> Bool {
-        guard let session = sessions[tabID],
-              let context = session.mcpControlContext
-        else {
-            return false
-        }
-        return context.sessionID == sessionID
-            && context.activationID == activationID
-            && context.registration == registration
-            && session.activeAgentSessionID == sessionID
+        mcpRuntime.mcpControlContextMatches(tabID: tabID, sessionID: sessionID, activationID: activationID, registration: registration)
     }
 
     /// Whether the given tab is currently MCP-controlled (reactive via `mcpControlledTabIDs`).
@@ -8508,230 +8382,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         canonicalProviderRunID: UUID? = nil,
         canonicalFailureReason: AgentRunMCPSnapshot.FailureReason? = nil
     ) -> AgentRunMCPSnapshot? {
-        guard let context = session.mcpControlContext else { return nil }
-        let interaction = canonicalTerminalState == nil ? mcpPendingInteraction(for: session) : nil
-        let status: AgentRunMCPSnapshot.Status = {
-            if let canonicalTerminalState {
-                switch canonicalTerminalState {
-                case .completed:
-                    return .completed
-                case .failed:
-                    return .failed
-                case .cancelled:
-                    return .cancelled
-                case .idle, .running, .waitingForUser, .waitingForQuestion, .waitingForApproval:
-                    return .completed
-                }
-            }
-            if interaction != nil {
-                return .waitingForInput
-            }
-            let terminalStatus: AgentRunMCPSnapshot.Status? = {
-                switch session.runState {
-                case .completed:
-                    return .completed
-                case .failed:
-                    return .failed
-                case .cancelled:
-                    return .cancelled
-                case .idle:
-                    if let terminalState = session.transcript.turns.last?.terminalState {
-                        switch terminalState {
-                        case .completed:
-                            return .completed
-                        case .failed:
-                            return .failed
-                        case .cancelled:
-                            return .cancelled
-                        case .idle, .running, .waitingForUser, .waitingForQuestion, .waitingForApproval:
-                            break
-                        }
-                    }
-                    return .completed
-                case .running, .waitingForUser, .waitingForQuestion, .waitingForApproval:
-                    return nil
-                }
-            }()
-            let now = Date()
-            let followUpMaskIsStale = session.mcpFollowUpRunPending
-                && session.mcpFollowUpRunPendingUpdatedAt.map { now.timeIntervalSince($0) > 15 } == true
-            let supersedingMaskIsStale = session.pendingSupersedingTurnCompletions > 0
-                && session.pendingSupersedingTurnCompletionsUpdatedAt.map { now.timeIntervalSince($0) > 15 } == true
-            if let terminalStatus,
-               context.currentEpoch != nil,
-               followUpMaskIsStale || supersedingMaskIsStale,
-               session.agentTask == nil,
-               session.pendingInstructions.isEmpty,
-               session.claudeSteeringFlushTask == nil,
-               session.acpSteeringFlushTask == nil,
-               !claudeCoordinator.hasPendingProviderWork(for: session)
-            {
-                Self.steeringDebugLog("[AgentRunSteeringWake] clearing stale MCP running mask sessionID=\(context.sessionID) tab=\(session.tabID) runState=\(session.runState.rawValue) terminal=\(terminalStatus.rawValue) followUp=\(session.mcpFollowUpRunPending) superseding=\(session.pendingSupersedingTurnCompletions)")
-                session.mcpFollowUpRunPending = false
-                session.pendingSupersedingTurnCompletions = 0
-            }
-            if session.mcpFollowUpRunPending || session.pendingSupersedingTurnCompletions > 0 {
-                if let terminalStatus {
-                    Self.steeringDebugLog("[AgentRunSteeringWake] MCP snapshot preserving active running mask over terminal state sessionID=\(context.sessionID) terminal=\(terminalStatus.rawValue) followUp=\(session.mcpFollowUpRunPending) superseding=\(session.pendingSupersedingTurnCompletions)")
-                }
-                return .running
-            }
-            if let terminalStatus {
-                return terminalStatus
-            }
-            switch session.runState {
-            case .running:
-                return .running
-            case .waitingForUser, .waitingForQuestion, .waitingForApproval:
-                return .waitingForInput
-            case .completed, .failed, .cancelled, .idle:
-                return .completed
-            }
-        }()
-        let transcriptItemCount = max(
-            session.transcriptProjectionCounts.canonicalVisibleRowCount,
-            session.items.count
-        )
-        let resolvedStatusText: String? = {
-            if canonicalTerminalState == nil,
-               let existing = session.runningStatusText?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !existing.isEmpty
-            {
-                return existing
-            }
-            if canonicalTerminalState == nil, session.mcpFollowUpRunPending {
-                return AgentRunMCPSnapshot.startupPendingStatusText
-            }
-            switch status {
-            case .failed:
-                return AgentTranscriptIO.latestErrorText(from: session.transcript, latestTurnOnly: true)
-                    ?? AgentTranscriptIO.latestErrorText(from: session.transcript, latestTurnOnly: false)
-                    ?? "Run failed without additional error details."
-            case .cancelled:
-                return "Run cancelled."
-            default:
-                return nil
-            }
-        }()
-        let resolvedSessionID = context.sessionID
-        let resolvedSessionName: String? = {
-            if let name = workspaceManager?.composeTabName(with: session.tabID) {
-                return name
-            }
-            if let name = ownerValidatedSessionIndex[resolvedSessionID]?.name {
-                return name
-            }
-            return "Agent Session"
-        }()
-        let providerRunID: UUID? = if canonicalTerminalState != nil {
-            canonicalProviderRunID ?? AgentModeProcessRunIdentity.mostRecentTranscriptProcessRunID(for: session)
-        } else if status.isTerminal {
-            session.runID ?? AgentModeProcessRunIdentity.mostRecentTranscriptProcessRunID(for: session)
-        } else {
-            session.runID
-        }
-        let failureReason: AgentRunMCPSnapshot.FailureReason? = {
-            if let canonicalFailureReason {
-                return canonicalFailureReason
-            }
-            // Live post-terminal polls reuse the reason stamped by the terminal
-            // commit barrier; the terminal-state and run-identity guards keep a
-            // stale revision from another terminal state/attempt from
-            // contaminating this snapshot. Text classification remains only as
-            // the restored/legacy fallback.
-            if canonicalTerminalState == nil,
-               let revision = session.lastTerminalCommitRevision,
-               let stampedReason = revision.failureReason,
-               revision.terminalState.mcpTerminalSnapshotStatus == status,
-               revision.expectedRunID == providerRunID
-            {
-                return stampedReason
-            }
-            return AgentRunMCPSnapshot.FailureReason.classify(status: status, statusText: resolvedStatusText)
-        }()
-        return AgentRunMCPSnapshot(
-            sessionID: resolvedSessionID,
-            runID: providerRunID,
-            tabID: session.tabID,
-            sessionName: resolvedSessionName,
-            agentRaw: session.selectedAgent.rawValue,
-            agentDisplayName: session.selectedAgent.displayName,
-            modelRaw: session.selectedModelRaw,
-            reasoningEffortRaw: session.selectedReasoningEffortRaw,
-            modelParameterSelections: AgentMCPModelParameterSupport.effectiveSelections(
-                session.acpModelParameterSelections,
-                agentRaw: session.selectedAgent.rawValue,
-                modelRaw: session.selectedModelRaw
-            ).map {
-                AgentRunMCPSnapshot.ModelParameterSelection(
-                    providerID: $0.providerID.rawValue,
-                    baseModelRaw: $0.baseModelRaw,
-                    kind: $0.kind.rawValue,
-                    configID: $0.configID,
-                    valueRaw: $0.valueRaw
-                )
-            },
-            status: status,
-            statusText: resolvedStatusText,
-            latestAssistantPreview: mcpResolvedAssistantPreview(session: session, status: status),
-            interaction: interaction,
-            hookGate: session.codexHookGateAudit.map { AgentRunMCPSnapshot.HookGate(audit: $0) },
-            transcriptItemCount: transcriptItemCount,
-            updatedAt: Date(),
-            parentSessionID: session.parentSessionID,
-            failureReason: failureReason,
-            worktreeBindings: session.worktreeBindings.map { AgentRunMCPSnapshot.WorktreeBinding(binding: $0) },
-            appActiveWorktreeMerges: session.worktreeMergeOperations.activeWorktreeMergeSummaries,
-            // Publishes whether the parent holds bindings so an unbound task-aware child can be
-            // flagged in start/poll responses (#400). Unresolvable parents stay `nil`.
-            parentIsWorktreeBound: session.parentSessionID.flatMap { parentSessionID in
-                worktreeBindingState(forAgentSessionID: parentSessionID).bindings.map { !$0.isEmpty }
-            }
+        mcpRuntime.mcpSnapshot(
+            for: session,
+            canonicalTerminalState: canonicalTerminalState,
+            canonicalProviderRunID: canonicalProviderRunID,
+            canonicalFailureReason: canonicalFailureReason
         )
     }
 
     private func mcpApprovalDecisionOptions(for approval: AgentApprovalRequest, session: TabSession) -> [AgentRunMCPSnapshot.Interaction.Option] {
-        mcpApprovalDecisionLabels(for: approval, session: session, includeAliases: false).map { label in
-            let description: String? = switch label {
-            case "accept":
-                "Allow this action"
-            case "accept_for_session":
-                approval.sessionApprovalScope == .editsSession
-                    ? "Allow edits for the rest of this session" : "Allow this action for the rest of the session"
-            case "accept_with_amendment":
-                "Allow with exec policy amendment (provide amendment field)"
-            case "decline":
-                "Reject this action"
-            case "cancel":
-                "Cancel the run"
-            default:
-                nil
-            }
-            return .init(label: label, description: description)
-        }
+        mcpRuntime.mcpApprovalDecisionOptions(for: approval, session: session)
     }
 
     private func mcpApprovalDecisionLabels(for approval: AgentApprovalRequest, session: TabSession, includeAliases: Bool = true) -> [String] {
-        func allows(_ decision: AgentApprovalDecision) -> Bool {
-            CodexAgentModeCoordinator.allowsApprovalDecision(decision, request: approval, session: session)
-        }
-        var labels = allows(.accept) ? ["accept"] : []
-        if allows(.acceptForSession) {
-            labels.append("accept_for_session")
-        }
-        // Legacy requests permit caller-supplied amendments; present lists require an advertised payload.
-        let allowsRememberedDecision: Bool = if case .codex = approval.requestID {
-            CodexAgentModeCoordinator.computerUseAllowsDecision(.acceptForSession, session: session)
-        } else { true }
-        if approval.supportsExecpolicyAmendment, allowsRememberedDecision {
-            labels.append("accept_with_amendment")
-        }
-        if allows(.decline) {
-            labels.append("decline")
-            if includeAliases { labels.append("reject") }
-        }
-        if allows(.cancel) { labels.append("cancel") }
-        return labels
+        mcpRuntime.mcpApprovalDecisionLabels(for: approval, session: session, includeAliases: includeAliases)
     }
 
     private func mcpCanonicalApprovalResponse(from payload: MCPInteractionResponsePayload) throws -> String {
@@ -8761,106 +8425,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
-    private enum MCPCodexHookAction: String {
-        case approveSelected = "approve_selected"
-        case trustAll = "trust_all"
-        case continueWithoutHooks = "continue_without_hooks"
-        case retry
-
-        var option: AgentRunMCPSnapshot.Interaction.Option {
-            switch self {
-            case .approveSelected:
-                .init(label: rawValue, description: "Trust only the hook_keys answer and continue")
-            case .trustAll:
-                .init(label: rawValue, description: "Trust every hook shown and continue")
-            case .continueWithoutHooks:
-                .init(
-                    label: rawValue,
-                    description: "Continue this Codex session without enabling the shown project hooks"
-                )
-            case .retry:
-                .init(label: rawValue, description: "Retry project-hook discovery")
-            }
-        }
-    }
+    private typealias MCPCodexHookAction = AgentSessionMCPRuntime.MCPCodexHookAction
 
     private func mcpCodexHookDecisionOptions(
         for request: AgentCodexHookReviewRequest,
         strictModeEnabled: Bool
     ) -> [AgentRunMCPSnapshot.Interaction.Option] {
-        var actions = [MCPCodexHookAction]()
-        if request.phase.allowsTrustDecision {
-            actions.append(contentsOf: [.approveSelected, .trustAll])
-        }
-        if request.phase.allowsDiscoveryRetry {
-            actions.append(.retry)
-        }
-        if request.phase.allowsContinueWithoutHooks, !strictModeEnabled {
-            actions.append(.continueWithoutHooks)
-        }
-        return actions.map(\.option)
+        mcpRuntime.mcpCodexHookDecisionOptions(for: request, strictModeEnabled: strictModeEnabled)
     }
 
     private func mcpCodexHookInteraction(
         for request: AgentCodexHookReviewRequest,
         strictModeEnabled: Bool
     ) -> AgentRunMCPSnapshot.Interaction {
-        var details: [AgentRunMCPSnapshot.Interaction.Detail] = [
-            .init(label: "Execution Directory", value: request.executionCWD, isCode: true),
-            .init(label: "Phase", value: request.phase.rawValue, isCode: false)
-        ]
-        if let errorMessage = request.errorMessage, !errorMessage.isEmpty {
-            details.append(.init(label: "Error", value: errorMessage, isCode: false))
-        }
-        for warning in request.warnings {
-            details.append(.init(label: "Warning", value: warning, isCode: false))
-        }
-        for (index, hook) in request.hooks.enumerated() {
-            let prefix = "Hook \(index + 1)"
-            details.append(.init(label: "\(prefix) Key", value: hook.key, isCode: true))
-            details.append(.init(label: "\(prefix) Event", value: hook.eventName, isCode: false))
-            details.append(.init(label: "\(prefix) Source", value: hook.sourcePath, isCode: true))
-            details.append(.init(label: "\(prefix) Enabled", value: hook.enabled ? "true" : "false", isCode: false))
-            details.append(.init(label: "\(prefix) Trust", value: hook.trustStatus.rawValue, isCode: false))
-            details.append(.init(label: "\(prefix) Current Hash", value: hook.currentHash, isCode: true))
-            if let command = hook.commandOrHandler, !command.isEmpty {
-                details.append(.init(label: "\(prefix) Command / Handler", value: command, isCode: true))
-            }
-        }
-        let fields: [AgentRunMCPSnapshot.Interaction.Field] = if request.hooks.isEmpty {
-            []
-        } else {
-            [
-                .init(
-                    id: "hook_keys",
-                    prompt: "Hooks to approve",
-                    context: "Provide exact hook keys only when response is approve_selected.",
-                    isSecret: false,
-                    allowsOther: false,
-                    allowsMultiple: true,
-                    allowsCustom: false,
-                    emitAllowsOther: false,
-                    options: request.hooks.map { hook in
-                        .init(
-                            label: hook.key,
-                            description: "\(hook.eventName) · \(hook.sourcePath) · \(hook.trustStatus.rawValue)"
-                        )
-                    }
-                )
-            ]
-        }
-        return .init(
-            id: request.id,
-            kind: .hookApproval,
-            responseType: .decision,
-            title: "Project Hook Approval",
-            prompt: "The initial Codex turn is blocked pending project-hook trust.",
-            context: "Execution directory: \(request.executionCWD)",
-            allowsMultiple: nil,
-            options: mcpCodexHookDecisionOptions(for: request, strictModeEnabled: strictModeEnabled),
-            fields: fields,
-            details: details
-        )
+        mcpRuntime.mcpCodexHookInteraction(for: request, strictModeEnabled: strictModeEnabled)
     }
 
     private func mcpCanonicalCodexHookResponse(from payload: MCPInteractionResponsePayload) throws -> String {
@@ -8903,205 +8481,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Single source for the current pending interaction a remote responder may see: `agent_run`
     /// snapshots and the managed oversight `poll`/`wait` projection both start from this value.
     func mcpPendingInteraction(for session: TabSession) -> AgentRunMCPSnapshot.Interaction? {
-        if let request = session.pendingCodexHookReview {
-            return mcpCodexHookInteraction(
-                for: request,
-                strictModeEnabled: codexCoordinator.isCodexHookApprovalStrictModeEnabled()
-            )
-        }
-        if let review = session.pendingWorktreeMergeReview {
-            var details: [AgentRunMCPSnapshot.Interaction.Detail] = [
-                .init(label: "Operation ID", value: review.operationID, isCode: false),
-                .init(label: "Source", value: "\(review.sourceLabel) @ \(review.sourcePath)", isCode: false),
-                .init(label: "Target", value: "\(review.targetLabel) @ \(review.targetPath)", isCode: false),
-                .init(label: "Source HEAD", value: review.sourceHead, isCode: true),
-                .init(label: "Target HEAD", value: review.targetHead, isCode: true),
-                .init(label: "Merge Base", value: review.mergeBase, isCode: true),
-                .init(label: "Visualization", value: review.visualization, isCode: true)
-            ]
-            if let summary = review.summary {
-                details.append(.init(label: "Summary", value: "\(summary.commits) commits, \(summary.files) files (+\(summary.insertions) -\(summary.deletions))", isCode: false))
-            }
-            if let artifacts = review.artifacts {
-                details.append(.init(label: "Preview Artifacts", value: artifacts.snapshotDirectory, isCode: true))
-            }
-            return .init(
-                id: review.id,
-                kind: .approval,
-                responseType: .decision,
-                title: "Worktree Merge Review",
-                prompt: "Review and approve merging \(review.sourceLabel) into \(review.targetLabel).",
-                context: nil,
-                allowsMultiple: nil,
-                options: [
-                    .init(label: "accept", description: "Apply the merge after stale validation"),
-                    .init(label: "decline", description: "Reject without mutating the target worktree"),
-                    .init(label: "cancel", description: "Cancel without mutating the target worktree")
-                ],
-                fields: [],
-                details: details
-            )
-        }
-        // Note: pendingApplyEditsReview is not surfaced here because MCP-controlled sessions
-        // always have autoEditEnabled=true, so apply_edits reviews never appear on this path.
-        if let approval = session.pendingApproval {
-            var details: [AgentRunMCPSnapshot.Interaction.Detail] = []
-            details.append(.init(label: "Approval Type", value: approval.kind.rawValue, isCode: false))
-            if let command = approval.command, !command.isEmpty {
-                details.append(.init(label: "Command", value: command, isCode: true))
-            }
-            if let cwd = approval.cwd, !cwd.isEmpty {
-                details.append(.init(label: "Working Directory", value: cwd, isCode: false))
-            }
-            if let grantRoot = approval.grantRoot, !grantRoot.isEmpty {
-                details.append(.init(label: "Requested Scope", value: grantRoot, isCode: false))
-            }
-            if let amendment = approval.presentedExecpolicyAmendmentJSON, !amendment.isEmpty {
-                details.append(.init(label: "Suggested Amendment", value: amendment, isCode: true))
-            }
-            for detail in approval.details {
-                details.append(.init(label: detail.label, value: detail.value, isCode: detail.isCode))
-            }
-            return .init(
-                id: approval.id,
-                kind: .approval,
-                responseType: .decision,
-                title: approval.title,
-                prompt: approval.reason,
-                context: nil,
-                allowsMultiple: nil,
-                options: mcpApprovalDecisionOptions(for: approval, session: session),
-                fields: [],
-                details: details
-            )
-        }
-        if let request = session.pendingPermissionsRequest {
-            var details: [AgentRunMCPSnapshot.Interaction.Detail] = [
-                .init(label: "Approval Type", value: "permissions", isCode: false),
-                .init(label: "Working Directory", value: request.cwd, isCode: true)
-            ]
-            if let reason = request.reason, !reason.isEmpty {
-                details.append(.init(label: "Reason", value: reason, isCode: false))
-            }
-            details.append(.init(label: "Requested Permissions", value: request.permissionsJSON, isCode: true))
-            return .init(
-                id: request.id,
-                kind: .approval,
-                responseType: .decision,
-                title: request.title,
-                prompt: request.reason,
-                context: nil,
-                allowsMultiple: nil,
-                options: [
-                    .init(label: "accept", description: "Allow these permissions for this turn"),
-                    .init(label: "accept_for_session", description: "Allow these permissions for the rest of the session"),
-                    .init(label: "decline", description: "Reject these permissions"),
-                    .init(label: "cancel", description: "Reject these permissions and cancel the run")
-                ],
-                fields: [],
-                details: details
-            )
-        }
-        if let request = session.pendingMCPElicitationRequest {
-            var details: [AgentRunMCPSnapshot.Interaction.Detail] = []
-            if let serverName = request.serverName, !serverName.isEmpty {
-                details.append(.init(label: "Server", value: serverName, isCode: false))
-            }
-            if let toolName = request.toolName, !toolName.isEmpty {
-                details.append(.init(label: "Tool", value: toolName, isCode: false))
-            }
-            for detail in request.details {
-                details.append(.init(label: detail.label, value: detail.value, isCode: detail.isCode))
-            }
-            return .init(
-                id: request.id,
-                kind: .mcpElicitation,
-                responseType: .elicitation,
-                title: request.title,
-                prompt: request.prompt ?? request.message,
-                context: "Codex requested input or approval from MCP server \(request.serverName ?? "unknown").",
-                allowsMultiple: nil,
-                options: [
-                    .init(label: "accept", description: "Accept this MCP elicitation and send content"),
-                    .init(label: "decline", description: "Decline this MCP elicitation"),
-                    .init(label: "cancel", description: "Cancel the run")
-                ],
-                fields: [],
-                details: details
-            )
-        }
-        if let request = session.pendingUserInputRequest {
-            return .init(
-                id: request.id,
-                kind: .userInput,
-                responseType: .structured,
-                title: "User Input Requested",
-                prompt: request.questions.count == 1
-                    ? request.questions[0].question
-                    : "Provide the requested structured input to continue.",
-                context: nil,
-                allowsMultiple: nil,
-                options: [],
-                fields: request.questions.map { question in
-                    .init(
-                        id: question.id,
-                        header: question.header,
-                        prompt: question.question,
-                        isSecret: question.isSecret,
-                        allowsOther: question.isOtherOptionEnabled,
-                        options: question.options.map {
-                            .init(label: $0.label, description: $0.description)
-                        }
-                    )
-                },
-                details: []
-            )
-        }
-        if let pendingAskUser = session.pendingAskUser {
-            let interaction = pendingAskUser.interaction
-            return .init(
-                id: interaction.id,
-                kind: .question,
-                responseType: .structured,
-                title: interaction.title ?? "Questions",
-                prompt: interaction.questions.count == 1
-                    ? interaction.questions[0].question
-                    : "Provide the requested answers to continue.",
-                context: interaction.context,
-                allowsMultiple: nil,
-                options: [],
-                fields: interaction.questions.map { question in
-                    .init(
-                        id: question.id,
-                        header: question.header,
-                        prompt: question.question,
-                        context: question.context,
-                        isSecret: false,
-                        allowsOther: question.allowsCustom,
-                        allowsMultiple: question.allowsMultiple,
-                        allowsCustom: question.allowsCustom,
-                        emitAllowsOther: false,
-                        options: question.options.map { .init(label: $0.label, description: $0.description) }
-                    )
-                },
-                details: []
-            )
-        }
-        if session.instructionContinuation != nil || session.waitingPrompt != nil {
-            return .init(
-                id: session.instructionWaitID ?? session.mcpControlContext?.sessionID ?? UUID(),
-                kind: .instruction,
-                responseType: .text,
-                title: "Awaiting Instruction",
-                prompt: session.waitingPrompt ?? "What would you like me to do next?",
-                context: nil,
-                allowsMultiple: nil,
-                options: [],
-                fields: [],
-                details: []
-            )
-        }
-        return nil
+        mcpRuntime.mcpPendingInteraction(for: session)
     }
 
     /// Resolves a session reference (UUID string only) against live sessions first,
@@ -11563,56 +10943,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         tabID: UUID,
         runID: UUID
     ) -> DelegatedAgentRunOracleReviewContext? {
-        guard let session = sessions[tabID],
-              let sessionID = session.activeAgentSessionID,
-              let controlContext = session.mcpControlContext,
-              controlContext.sessionID == sessionID
-        else { return nil }
-
-        let key = AgentRunOracleReviewKey(sessionID: sessionID, runID: runID)
-        if let existing = delegatedAgentRunOracleReviewContextsByKey[key],
-           existing.target.tabID == tabID,
-           existing.target.activationID == controlContext.activationID
-        {
-            return existing
-        }
-        guard let pending = pendingAgentRunOracleReviewContextsBySessionID[sessionID] else {
-            return nil
-        }
-
-        var validationFailure = pending.target.validationFailure
-        if pending.target.tabID != tabID
-            || pending.target.activationID != controlContext.activationID
-            || pending.target.agentSessionID != sessionID
-        {
-            validationFailure = .targetActivationMismatch
-        }
-        if delegatedAgentRunOracleReviewContextsByKey.contains(where: {
-            $0.key.sessionID == sessionID && $0.key.runID != runID
-        }) {
-            validationFailure = .pendingContextAlreadyConsumed
-        }
-
-        let target = AgentRunOracleReviewTargetSnapshot(
-            tabID: pending.target.tabID,
-            workspaceID: pending.target.workspaceID,
-            agentSessionID: pending.target.agentSessionID,
-            activationID: pending.target.activationID,
-            expectedParentSessionID: pending.target.expectedParentSessionID,
-            worktreeBindings: pending.target.worktreeBindings,
-            validationFailure: validationFailure
-        )
-        let delegated = DelegatedAgentRunOracleReviewContext(
-            source: pending.source,
-            target: target,
-            targetRunID: runID
-        )
-        pendingAgentRunOracleReviewContextsBySessionID.removeValue(forKey: sessionID)
-        delegatedAgentRunOracleReviewContextsByKey = delegatedAgentRunOracleReviewContextsByKey.filter {
-            $0.key.sessionID != sessionID
-        }
-        delegatedAgentRunOracleReviewContextsByKey[key] = delegated
-        return delegated
+        mcpRuntime.mcpBindPendingAgentRunOracleReviewContext(tabID: tabID, runID: runID)
     }
 
     /// Resolves only an exact child tab/workspace/session/run delegation. A pending, stale, or
@@ -11667,16 +10998,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func mcpRemoveAgentRunOracleReviewContexts(sessionID: UUID) {
-        pendingAgentRunOracleReviewContextsBySessionID.removeValue(forKey: sessionID)
-        delegatedAgentRunOracleReviewContextsByKey = delegatedAgentRunOracleReviewContextsByKey.filter {
-            $0.key.sessionID != sessionID
-        }
+        mcpRuntime.mcpRemoveAgentRunOracleReviewContexts(sessionID: sessionID)
     }
 
     func mcpRemoveAgentRunOracleReviewContext(sessionID: UUID, runID: UUID) {
-        delegatedAgentRunOracleReviewContextsByKey.removeValue(
-            forKey: AgentRunOracleReviewKey(sessionID: sessionID, runID: runID)
-        )
+        mcpRuntime.mcpRemoveAgentRunOracleReviewContext(sessionID: sessionID, runID: runID)
     }
 
     private static func agentRunOracleReviewBindingsMatch(
@@ -22297,44 +21623,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Status-aware assistant preview: active runs only show text from the current turn,
     /// terminal runs show the logical trailing response from the latest turn.
     private func mcpResolvedAssistantPreview(session: TabSession, status: AgentRunMCPSnapshot.Status) -> String? {
-        switch status {
-        case .expired:
-            return nil
-        case .running, .waitingForInput:
-            if session.mcpFollowUpRunPending {
-                return nil
-            }
-            guard let lastTurn = session.transcript.turns.last else {
-                // Fallback for transcriptless sessions: only use items if latest assistant is newer than latest user
-                let latestAssistant = session.items.reversed().first(where: { $0.hasDisplayableAssistantBody })
-                let latestUser = session.items.reversed().first(where: { $0.kind == .user })
-                guard let assistant = latestAssistant else { return nil }
-                if let user = latestUser, user.timestamp >= assistant.timestamp {
-                    return nil
-                }
-                return assistant.text
-            }
-            if lastTurn.isCompleted, status == .running {
-                return nil
-            }
-            return AgentTranscriptIO.latestAssistantPreviewText(in: lastTurn)
-        case .completed, .failed, .cancelled:
-            let transcriptPreview = session.transcript.turns.last.flatMap {
-                AgentTranscriptIO.terminalAssistantResponseText(in: $0)
-            }
-            let sourcePreview = AgentTranscriptIO.terminalAssistantResponseText(from: session.items)
-            let projectionProtection = transcriptProjectionProtection(
-                for: session,
-                transcript: session.transcript
-            )
-            if canReuseDerivedTranscriptForSave(
-                for: session,
-                projectionProtection: projectionProtection
-            ) {
-                return transcriptPreview ?? sourcePreview
-            }
-            return session.items.isEmpty ? transcriptPreview : sourcePreview
-        }
+        mcpRuntime.mcpResolvedAssistantPreview(session: session, status: status)
     }
 
     /// Check if a tab has an active agent run

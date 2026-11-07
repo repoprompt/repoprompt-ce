@@ -12,6 +12,7 @@ final class AgentSessionPresentationRuntime {
         let turnFailed: (AgentTabSession, String?) -> Void
         var assistantDelta: ((AgentTabSession, Int, UInt64) -> Void)?
         var derivedTranscript: ((AgentTabSession) -> Void)?
+        var binding: ((AgentTabSession) -> Void)?
     }
 
     struct Attachment: Equatable {
@@ -46,6 +47,10 @@ final class AgentSessionPresentationRuntime {
 
     func assistantDeltaApplied(_ session: AgentTabSession, sourceItemsRevision: Int, flushGeneration: UInt64) {
         sink(for: session)?.assistantDelta?(session, sourceItemsRevision, flushGeneration)
+    }
+
+    func bindingChanged(_ session: AgentTabSession) {
+        sink(for: session)?.binding?(session)
     }
 
     func derivedTranscriptChanged(_ session: AgentTabSession) {

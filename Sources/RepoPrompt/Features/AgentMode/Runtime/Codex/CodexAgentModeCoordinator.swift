@@ -264,6 +264,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private weak var viewModel: AgentModeViewModel?
     private var persistenceRuntime: AgentSessionPersistenceRuntime?
     private var attachmentRuntime: AgentSessionAttachmentRuntime?
+    private var mcpRuntime: AgentSessionMCPRuntime?
     private var terminalCommitBarrier: AgentRunTerminalCommitBarrier?
     private var terminalSessionBinder: (@MainActor (AgentTabSession) -> AgentRunTerminalSessionBinding)?
     #if DEBUG
@@ -492,6 +493,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         self.viewModel = viewModel
         installPersistenceRuntime(viewModel.persistenceRuntime)
         installAttachmentRuntime(viewModel.attachmentRuntime)
+        installMCPRuntime(viewModel.mcpRuntime)
+    }
+
+    func installMCPRuntime(_ runtime: AgentSessionMCPRuntime) {
+        mcpRuntime = runtime
     }
 
     func installAttachmentRuntime(_ runtime: AgentSessionAttachmentRuntime) {
@@ -691,7 +697,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         guard clearCodexPendingInteractions(in: session) else { return }
         viewModel?.reconcileInteractiveRunState(session)
-        viewModel?.publishMCPStateChange(for: session)
+        mcpRuntime?.handleObservedMCPStateChange(for: session)
         handleRunInteractionStateChange(for: session, reason: .pendingQuestionCancelled)
         logCodex("[AgentModeVM][CodexUI] cleared stale pending Codex interactions for tab \(session.tabID) before new turn \(turnID)")
     }
@@ -796,7 +802,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         viewModel?.reconcileInteractiveRunState(session)
         updateCodexStallWatchdogState(for: session)
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-        viewModel?.publishMCPStateChange(for: session)
+        mcpRuntime?.handleObservedMCPStateChange(for: session)
     }
 
     private func finishCodexHookReviewAttempt(
@@ -3395,9 +3401,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 state: .durablyQueued(queueID: submission.queueID)
             )
         } else if session.mcpControlContext != nil {
-            Task { @MainActor [weak viewModel, weak session] in
-                guard let viewModel, let session else { return }
-                await viewModel.signalCodexInstructionDelivered(for: session)
+            Task { @MainActor [mcpRuntime, weak session] in
+                guard let session else { return }
+                await mcpRuntime?.signalMCPInstructionDelivered(for: session)
             }
         }
         session.isDirty = true
@@ -3540,7 +3546,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session.mcpFollowUpRunPending = false
         }
         viewModel?.setAgentRunActive(session.tabID, isActive: true)
-        viewModel?.publishMCPStateChange(for: session)
+        mcpRuntime?.handleObservedMCPStateChange(for: session)
         beginTrackedCodexUserTurn(session)
         let dispatchStartedAt = Date()
         session.codexLastEventAt = dispatchStartedAt
@@ -3887,7 +3893,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 dispatchID: dispatchID
             )
         }
-        viewModel?.publishMCPStateChange(for: session)
+        mcpRuntime?.handleObservedMCPStateChange(for: session)
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
         persistenceRuntime?.scheduleSave(for: session)
     }
@@ -4220,7 +4226,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         )
                         return false
                     }
-                    viewModel?.publishMCPStateChange(for: session)
+                    mcpRuntime?.handleObservedMCPStateChange(for: session)
                     return false
                 case .stale:
                     session.mcpFollowUpRunPending = false
@@ -4228,14 +4234,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         session: session,
                         reason: "Codex queued follow-up was cancelled because terminal publication became stale."
                     )
-                    viewModel?.publishMCPStateChange(for: session)
+                    mcpRuntime?.handleObservedMCPStateChange(for: session)
                     return false
                 }
                 guard session.codexFallbackQueue.first?.id == head.id,
                       session.codexFallbackQueue.first?.state == .eligibleForSuccessor(completedTurnID: turnID)
                 else {
                     session.mcpFollowUpRunPending = false
-                    viewModel?.publishMCPStateChange(for: session)
+                    mcpRuntime?.handleObservedMCPStateChange(for: session)
                     return false
                 }
                 guard let claimedHead = claimCodexFallbackHead(
@@ -4243,7 +4249,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     expectedQueueID: head.id,
                     beginsSuccessorAttempt: true
                 ) else {
-                    viewModel?.publishMCPStateChange(for: session)
+                    mcpRuntime?.handleObservedMCPStateChange(for: session)
                     return false
                 }
                 Task { @MainActor [weak self, weak session, claimedHead] in
@@ -7124,7 +7130,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         session.codexEventTaskRunID = nil
                         viewModel?.reconcileInteractiveRunState(session)
                         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-                        viewModel?.publishMCPStateChange(for: session)
+                        mcpRuntime?.handleObservedMCPStateChange(for: session)
                         await ensureCodexNativeSession(
                             session: session,
                             policyAlreadyInstalled: true,
@@ -8608,7 +8614,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 } else if fallbackContext?.origin == .manual,
                           session.mcpControlContext != nil
                 {
-                    await viewModel?.signalCodexInstructionDelivered(for: session)
+                    await mcpRuntime?.signalMCPInstructionDelivered(for: session)
                 }
                 logCodex("[AgentModeVM] sendCodexNativeMessage: provider accepted typed dispatch after the local run/controller changed")
                 return .sent
@@ -8633,7 +8639,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             } else if fallbackContext?.origin == .manual,
                       session.mcpControlContext != nil
             {
-                await viewModel?.signalCodexInstructionDelivered(for: session)
+                await mcpRuntime?.signalMCPInstructionDelivered(for: session)
             }
             return .sent
         } catch let steerError as CodexTurnSteerError {
@@ -9954,7 +9960,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session.pendingApproval = request
             viewModel?.reconcileInteractiveRunState(session)
             viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-            viewModel?.publishMCPStateChange(for: session)
+            mcpRuntime?.handleObservedMCPStateChange(for: session)
         case let .permissionsRequest(request):
             guard session.runState.isActive else { return }
             clearCodexPendingAuthRetryTurn(session)
@@ -9962,7 +9968,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session.pendingPermissionsRequest = request
             viewModel?.reconcileInteractiveRunState(session)
             viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-            viewModel?.publishMCPStateChange(for: session)
+            mcpRuntime?.handleObservedMCPStateChange(for: session)
         case let .mcpElicitationRequest(request):
             guard session.runState.isActive else { return }
             clearCodexPendingAuthRetryTurn(session)
@@ -9977,7 +9983,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
             viewModel?.reconcileInteractiveRunState(session)
             viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-            viewModel?.publishMCPStateChange(for: session)
+            mcpRuntime?.handleObservedMCPStateChange(for: session)
         case let .requestUserInput(request):
             guard session.runState.isActive else { return }
             clearCodexPendingAuthRetryTurn(session)
@@ -10488,7 +10494,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 setRunningStatus(nil, source: nil, session: session)
                 clearCodexPendingInteractions(in: session)
                 viewModel?.reconcileInteractiveRunState(session)
-                viewModel?.publishMCPStateChange(for: session)
+                mcpRuntime?.handleObservedMCPStateChange(for: session)
                 viewModel?.setAgentRunActive(session.tabID, isActive: false)
                 viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
                 persistenceRuntime?.scheduleSave(for: session)
@@ -12345,7 +12351,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         viewModel?.reconcileInteractiveRunState(session)
         handleRunInteractionStateChange(for: session, reason: .mcpElicitationResponseSubmitted)
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-        viewModel?.publishMCPStateChange(for: session)
+        mcpRuntime?.handleObservedMCPStateChange(for: session)
         let authoritativeTurnID = session.codexAuthoritativeActiveTurn?.turnID
         Task { [controller] in
             await controller.respondToServerRequest(id: request.requestID, result: response.jsonObject)

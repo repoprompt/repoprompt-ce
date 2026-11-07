@@ -204,6 +204,7 @@ final class AgentRunTerminalCommitBarrier {
             {
                 notifyProviderSuccessor(
                     providerSuccessor,
+                    binding: binding,
                     revision: existingRevision,
                     publicationResult: publicationResult
                 )
@@ -392,6 +393,7 @@ final class AgentRunTerminalCommitBarrier {
         {
             notifyProviderSuccessor(
                 providerSuccessor,
+                binding: binding,
                 revision: revision,
                 publicationResult: publicationResult
             )
@@ -450,10 +452,12 @@ final class AgentRunTerminalCommitBarrier {
 
     private func notifyProviderSuccessor(
         _ providerSuccessor: ProviderSuccessor,
+        binding: AgentRunTerminalSessionBinding,
         revision: AgentRunTerminalCommitRevision,
         publicationResult: AgentRunTerminalPublicationResult
     ) {
         if case .accepted = publicationResult {
+            guard binding.hooks.permitsTerminalSuccessor(revision, publicationResult) else { return }
             guard !consumedProviderSuccessorIDs.contains(providerSuccessor.id) else {
                 return
             }
@@ -482,6 +486,7 @@ final class AgentRunTerminalCommitBarrier {
         else { return nil }
         switch publicationResult {
         case let .accepted(successorEpoch):
+            guard binding.hooks.permitsTerminalSuccessor(revision, publicationResult) else { return nil }
             if revision.mcpPublicationEnvelope != nil, successorEpoch == nil {
                 return nil
             }

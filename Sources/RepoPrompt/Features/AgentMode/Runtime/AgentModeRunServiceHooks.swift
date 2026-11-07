@@ -278,6 +278,7 @@ extension AgentModeRunService.Hooks {
         _ session: AgentTabSession
     ) -> AgentRunTerminalSessionBinding {
         let tabID = session.tabID
+        let successorFence = AgentRunStartStopFence(session: session)
         #if DEBUG
             let observationFlush = session.test_flushQuietToolObservations
             let observationCheck = session.test_quietToolObservationsAreComplete
@@ -349,6 +350,10 @@ extension AgentModeRunService.Hooks {
                         revision,
                         successorKind
                     )
+                },
+                permitsTerminalSuccessor: { revision, result in
+                    queuedWorkRecovery.isCurrentSessionBinding(session, successorFence)
+                        && successorFence.permitsTerminalSuccessor(of: session, revision: revision, publication: result)
                 },
                 startFollowUpRun: { instruction in
                     continuation.startFollowUpRun(session, instruction)
