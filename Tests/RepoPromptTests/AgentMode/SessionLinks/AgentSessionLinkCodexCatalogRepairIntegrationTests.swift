@@ -8,6 +8,7 @@ import RepoPromptAIContracts
 import RepoPromptClaudeProvider
 import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
+@testable import RepoPromptMCPServer
 import RepoPromptSettingsCore
 import RepoPromptShared
 import XCTest

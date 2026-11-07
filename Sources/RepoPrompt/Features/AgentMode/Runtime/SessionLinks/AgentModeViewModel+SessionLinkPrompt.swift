@@ -3,6 +3,7 @@ import MCP
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
+import RepoPromptMCPServer
 
 /// Window-local seam between the authoritative link inventory and the provider dispatch adapters.
 ///

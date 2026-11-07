@@ -5,12 +5,12 @@
     /// DEBUG diagnostics registry that joins raw transport frames to SDK tool handlers without
     /// modifying JSON-RPC payloads. The registry is lock-based because frame acceptance occurs
     /// on the transport read queue while SDK callbacks execute on cooperative tasks.
-    final class MCPRequestTimelineRegistry: @unchecked Sendable {
-        static let shared = MCPRequestTimelineRegistry()
+    package final class MCPRequestTimelineRegistry: @unchecked Sendable {
+        package static let shared = MCPRequestTimelineRegistry()
 
-        struct RecordedMessage {
-            let metadata: JSONRPCBridgeMessageMetadata
-            let identity: MCPRequestTimelineIdentity
+        package struct RecordedMessage {
+            package let metadata: JSONRPCBridgeMessageMetadata
+            package let identity: MCPRequestTimelineIdentity
         }
 
         private struct ConnectionKey: Hashable {
@@ -35,7 +35,7 @@
 
         private init() {}
 
-        func recordAcceptedFrame(
+        package func recordAcceptedFrame(
             _ frame: Data,
             connectionID: String,
             correlationConnectionID: String,
@@ -89,7 +89,7 @@
             return recorded
         }
 
-        func claimToolRequest(connectionID: String, originalToolName: String) -> MCPRequestTimelineIdentity? {
+        package func claimToolRequest(connectionID: String, originalToolName: String) -> MCPRequestTimelineIdentity? {
             lock.lock()
             defer { lock.unlock() }
             let keys = pendingToolRequestsByConnection.keys
@@ -105,7 +105,7 @@
             return nil
         }
 
-        func recordedResponses(
+        package func recordedResponses(
             in frame: Data,
             connectionID: String,
             connectionGeneration: UInt64
@@ -132,7 +132,7 @@
             }
         }
 
-        func removeConnection(connectionID: String, connectionGeneration: UInt64) {
+        package func removeConnection(connectionID: String, connectionGeneration: UInt64) {
             lock.lock()
             defer { lock.unlock() }
             let connection = ConnectionKey(
@@ -144,7 +144,7 @@
             identitiesByResponseKey = identitiesByResponseKey.filter { $0.key.connection != connection }
         }
 
-        func completeResponses(
+        package func completeResponses(
             _ messages: [RecordedMessage],
             connectionID: String,
             connectionGeneration: UInt64

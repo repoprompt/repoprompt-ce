@@ -1,3 +1,4 @@
+@testable import RepoPromptMCPServer
 #if DEBUG
     import Foundation
     import MCP

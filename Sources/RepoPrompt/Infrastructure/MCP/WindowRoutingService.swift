@@ -4,6 +4,7 @@ import MCP
 import Ontology
 import RepoPromptDomainRuntime
 import RepoPromptFileSystem
+import RepoPromptMCPServer
 import RepoPromptShared
 import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore

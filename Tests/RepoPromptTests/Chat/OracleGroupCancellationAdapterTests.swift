@@ -4,6 +4,7 @@ import MCP
 import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptMCPServer
 import RepoPromptSettingsCore
 @testable import RepoPromptWorkspaceContext
 import XCTest

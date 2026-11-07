@@ -4,36 +4,36 @@ import RepoPromptShared
 
 /// Retained ownership of one well-known UNIX-domain socket pathname.
 /// The same-directory lock descriptor remains held for the listener lifetime.
-final class BootstrapSocketOwnership: @unchecked Sendable {
-    static let boundIdentityRecordPrefix = "repoprompt-ce-socket-identity-v1"
+package final class BootstrapSocketOwnership: @unchecked Sendable {
+    package static let boundIdentityRecordPrefix = "repoprompt-ce-socket-identity-v1"
 
-    struct FileIdentity: Equatable {
-        let device: dev_t
-        let inode: ino_t
-        let owner: uid_t
-        let mode: mode_t
+    package struct FileIdentity: Equatable {
+        package let device: dev_t
+        package let inode: ino_t
+        package let owner: uid_t
+        package let mode: mode_t
 
-        var fileType: mode_t {
+        package var fileType: mode_t {
             mode & mode_t(S_IFMT)
         }
 
-        var isSocket: Bool {
+        package var isSocket: Bool {
             fileType == mode_t(S_IFSOCK)
         }
 
-        var isRegularFile: Bool {
+        package var isRegularFile: Bool {
             fileType == mode_t(S_IFREG)
         }
     }
 
-    enum PathStatus: Equatable {
+    package enum PathStatus: Equatable {
         case owned
         case missing
         case replaced(FileIdentity)
         case lockLost
     }
 
-    enum OwnershipError: LocalizedError, Equatable {
+    package enum OwnershipError: LocalizedError, Equatable {
         case lockOpenFailed(path: String, errno: Int32)
         case lockInvalid(path: String)
         case lockUnavailable(path: String, errno: Int32)
@@ -45,7 +45,7 @@ final class BootstrapSocketOwnership: @unchecked Sendable {
         case boundIdentityMissing(path: String)
         case boundIdentityRecordWriteFailed(path: String, errno: Int32)
 
-        var errorDescription: String? {
+        package var errorDescription: String? {
             switch self {
             case let .lockOpenFailed(path, code):
                 "Could not open socket ownership lock at \(path) (errno \(code))"
@@ -71,8 +71,8 @@ final class BootstrapSocketOwnership: @unchecked Sendable {
         }
     }
 
-    let socketURL: URL
-    let lockURL: URL
+    package let socketURL: URL
+    package let lockURL: URL
 
     private let directory: MCPBootstrapDirectory
     private let lockFD: Int32
@@ -81,7 +81,7 @@ final class BootstrapSocketOwnership: @unchecked Sendable {
     private var released = false
     private var boundIdentity: FileIdentity?
 
-    static func acquire(socketURL: URL) throws -> BootstrapSocketOwnership {
+    package static func acquire(socketURL: URL) throws -> BootstrapSocketOwnership {
         let directory = try MCPBootstrapDirectory.open(at: socketURL.deletingLastPathComponent(), createIfMissing: true)
         let lockURL = socketURL.appendingPathExtension("lock")
         let flags = O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW
@@ -138,7 +138,7 @@ final class BootstrapSocketOwnership: @unchecked Sendable {
     }
 
     /// Removes only a socket proven stale while the exclusive ownership lock is held.
-    func preparePathForBinding() throws {
+    package func preparePathForBinding() throws {
         try directory.validateCurrentPath()
         guard let existing = Self.identity(in: directory, name: socketURL.lastPathComponent) else { return }
         guard existing.owner == getuid() else {
@@ -162,11 +162,11 @@ final class BootstrapSocketOwnership: @unchecked Sendable {
         }
     }
 
-    func validateDirectoryForBinding() throws {
+    package func validateDirectoryForBinding() throws {
         try directory.validateCurrentPath()
     }
 
-    func captureBoundSocketIdentity() throws {
+    package func captureBoundSocketIdentity() throws {
         try directory.validateCurrentPath()
         guard let unsecuredIdentity = Self.identity(in: directory, name: socketURL.lastPathComponent),
               unsecuredIdentity.isSocket, unsecuredIdentity.owner == getuid(),
@@ -213,7 +213,7 @@ final class BootstrapSocketOwnership: @unchecked Sendable {
         }
     }
 
-    func pathStatus() -> PathStatus {
+    package func pathStatus() -> PathStatus {
         guard lockFileStillMatches() else { return .lockLost }
         stateLock.lock()
         let expected = boundIdentity
@@ -225,7 +225,7 @@ final class BootstrapSocketOwnership: @unchecked Sendable {
     }
 
     @discardableResult
-    func removeOwnedSocketIfCurrent() -> Bool {
+    package func removeOwnedSocketIfCurrent() -> Bool {
         stateLock.lock()
         let expected = boundIdentity
         stateLock.unlock()
@@ -236,7 +236,7 @@ final class BootstrapSocketOwnership: @unchecked Sendable {
         return unlinkat(directory.descriptor, socketURL.lastPathComponent, 0) == 0 || errno == ENOENT
     }
 
-    func release() {
+    package func release() {
         stateLock.lock()
         guard !released else {
             stateLock.unlock()
@@ -249,13 +249,13 @@ final class BootstrapSocketOwnership: @unchecked Sendable {
     }
 
     #if DEBUG
-        func debugLockHasCloseOnExec() -> Bool {
+        package func debugLockHasCloseOnExec() -> Bool {
             let flags = fcntl(lockFD, F_GETFD)
             return flags >= 0 && (flags & FD_CLOEXEC) != 0
         }
     #endif
 
-    static func identity(atPath path: String) -> FileIdentity? {
+    package static func identity(atPath path: String) -> FileIdentity? {
         var info = stat()
         guard lstat(path, &info) == 0 else { return nil }
         return FileIdentity(device: info.st_dev, inode: info.st_ino, owner: info.st_uid, mode: info.st_mode)

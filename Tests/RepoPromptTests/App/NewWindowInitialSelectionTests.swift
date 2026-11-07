@@ -8,6 +8,7 @@ import RepoPromptAIContracts
 import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
 import RepoPromptFileSystem
+@testable import RepoPromptMCPServer
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
 import RepoPromptShared

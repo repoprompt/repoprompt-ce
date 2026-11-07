@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptMCPServer
 
 #if DEBUG
     /// Checked, payload-free Item 0 baseline and cross-cutting seam inventory.

@@ -3,6 +3,7 @@ import JSONSchema
 import MCP
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
+import RepoPromptMCPServer
 import RepoPromptSettingsCore
 import RepoPromptVCS
 import RepoPromptWorkspaceContext
