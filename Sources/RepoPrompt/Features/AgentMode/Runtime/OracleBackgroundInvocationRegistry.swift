@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import os
 import RepoPromptDomainRuntime
@@ -90,6 +91,9 @@ final class OracleBackgroundHandoff: Sendable {
 @MainActor
 final class OracleBackgroundInvocationRegistry {
     static let shared = OracleBackgroundInvocationRegistry()
+
+    /// UI availability changes only at lifecycle boundaries, never on token progress.
+    let availabilityChanges = PassthroughSubject<Owner, Never>()
 
     static let activeLimit = 4
     static let inactiveSessionLimit = 64
@@ -362,6 +366,7 @@ final class OracleBackgroundInvocationRegistry {
         }
         entry.task = worker
         job.handoff.install(worker)
+        availabilityChanges.send(owner)
         let handoff = job.handoff
         return try await withTaskCancellationHandler {
             do {
@@ -391,6 +396,7 @@ final class OracleBackgroundInvocationRegistry {
         state.closed = true
         state.epoch = UUID()
         changed(owner)
+        availabilityChanges.send(owner)
         let owned = entries.values.filter { $0.job.owner == owner && $0.phase.isLive }
         for entry in owned {
             cancel(entry)
@@ -605,6 +611,7 @@ final class OracleBackgroundInvocationRegistry {
             entries.removeValue(forKey: job.provenance.invocationID)
         }
         prune()
+        availabilityChanges.send(job.owner)
     }
 
     private func older(_ lhs: Entry, _ rhs: Entry) -> Bool {

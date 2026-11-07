@@ -127,6 +127,16 @@ struct AgentStagedSlashCommandProps: Equatable {
     let appliesSelectedWorkflowContext: Bool
 }
 
+struct OracleBackgroundCancelTarget: Equatable {
+    let owner: OracleBackgroundInvocationRegistry.Owner
+    let epoch: UUID
+    weak var session: AgentTabSession?
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.owner == rhs.owner && lhs.epoch == rhs.epoch && lhs.session === rhs.session
+    }
+}
+
 struct AgentRunCancelTarget: Equatable {
     let tabID: UUID
     let expectedRunID: UUID?
@@ -355,6 +365,7 @@ struct AgentComposerProps: Equatable {
     let attachments: AgentAttachmentStripSnapshot
     let runState: AgentSessionRunState
     let cancelTarget: AgentRunCancelTarget?
+    let backgroundCancelTarget: OracleBackgroundCancelTarget?
     let isAgentBusy: Bool
     let isWaitingForInstruction: Bool
     let canUseLinkedAgentSession: Bool
@@ -383,6 +394,14 @@ struct AgentComposerProps: Equatable {
     let draftRestorationEvent: AgentDraftRestorationProps?
     let fileTagLookupContextIdentity: AgentWorkspaceLookupContextIdentity
 
+    func backgroundStopTarget(inputText: String) -> OracleBackgroundCancelTarget? {
+        guard cancelTarget == nil, !isRoutingFreshTask,
+              inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !attachments.hasAttachments, !attachments.hasTaggedFiles, stagedSlashCommand == nil
+        else { return nil }
+        return backgroundCancelTarget
+    }
+
     static let empty = AgentComposerProps(
         currentTabID: nil,
         submitTarget: nil,
@@ -392,6 +411,7 @@ struct AgentComposerProps: Equatable {
         ),
         runState: .idle,
         cancelTarget: nil,
+        backgroundCancelTarget: nil,
         isAgentBusy: false,
         isWaitingForInstruction: false,
         canUseLinkedAgentSession: false,
