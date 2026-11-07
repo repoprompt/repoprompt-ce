@@ -1657,7 +1657,7 @@ final class AgentTabSession: ObservableObject {
 
     var sourceItemsRevision: Int = 0
     var pendingSourceItemsMutationSummary: AgentModeViewModel.PendingSourceItemsMutationSummary?
-    var pendingDerivedTranscriptRefreshReason: AgentModeViewModel.DerivedTranscriptRefreshReason?
+    var pendingDerivedTranscriptRefreshReason: AgentDerivedTranscriptRefreshReason?
     var derivedTranscriptRefreshTask: Task<Void, Never>?
     var derivedTranscriptRefreshGeneration: UInt64 = 0
     var derivedTranscriptSyncState: AgentDerivedTranscriptSyncState?

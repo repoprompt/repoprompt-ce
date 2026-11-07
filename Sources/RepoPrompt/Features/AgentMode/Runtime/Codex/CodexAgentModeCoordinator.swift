@@ -2301,21 +2301,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         from session: AgentTabSession,
         to agentSession: inout AgentSession
     ) {
-        agentSession.codexConversationID = session.codexConversationID
-        agentSession.codexRolloutPath = session.codexRolloutPath
-        agentSession.providerCleanupHandle = ProviderConversationCleanupHandle.resolved(
-            provider: session.selectedAgent.rawValue,
-            explicit: session.providerCleanupHandle,
-            providerSessionID: session.providerSessionID,
-            codexConversationID: session.codexConversationID,
-            codexRolloutPath: session.codexRolloutPath
-        )
-        agentSession.codexModel = session.codexModel
-        agentSession.codexReasoningEffort = session.codexReasoningEffort
-        agentSession.codexContextWindow = session.codexContextUsage?.modelContextWindow
-        agentSession.contextWindowCapacity = session.contextWindowCapacity
-        agentSession.codexLastTotalTokens = session.codexContextUsage?.lastTotalTokens
-        agentSession.codexTotalTotalTokens = session.codexContextUsage?.totalTotalTokens
+        AgentSessionPayloadBuilder.applyCodexPersistence(from: session, to: &agentSession)
     }
 
     func nativeSlashCommand(named name: String, session: AgentTabSession) -> NativeSlashCommand? {

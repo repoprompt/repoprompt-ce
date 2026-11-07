@@ -1,5 +1,4 @@
 import Combine
-import CryptoKit
 import Foundation
 import MCP
 import RepoPromptACPProviders
@@ -949,9 +948,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ sessionID: UUID,
         _ workspace: WorkspaceModel
     ) async throws -> Void
-    private var saveInFlightSessionIDs: Set<UUID> = []
-    private var saveRequestedWhileInFlightSessionIDs: Set<UUID> = []
-    private var saveCompletionWaitersBySessionID: [UUID: [CheckedContinuation<Void, Never>]] = [:]
+    private var saveInFlightSessionIDs: Set<UUID> {
+        runtimeSessionStore.saveQueue.inFlightSessionIDs
+    }
+
     private var workspaceSaveFlushTasks: [UUID: Task<Void, Never>] = [:]
     private var bypassesAgentSessionPersistenceSuppressionForTesting = false
     private var agentSessionSaver: AgentSessionSaver = { session, workspace, canonicalItemCount in
@@ -1126,7 +1126,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     nonisolated static let transcriptVisibleItemLimit = 50
     private nonisolated static let detachedTranscriptVisibleItemBuffer = 5
     private nonisolated static let detachedTranscriptEvictionChunkSize = 5
-    private nonisolated static let pendingToolFinalizationNonToolBoundary = 200
+    private nonisolated static let pendingToolFinalizationNonToolBoundary = AgentSessionTranscriptRefreshRuntime.pendingToolFinalizationNonToolBoundary
     nonisolated static let staleComposerSubmitTargetMessage = "This composer changed before the message could be sent. Please try again."
     private nonisolated static let childAgentRunWaitDrainTimeoutSeconds: TimeInterval = 2.0
 
@@ -15088,348 +15088,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         reason: DerivedTranscriptRefreshReason = .manualRefresh,
         publishActivePresentation: Bool = true
     ) {
-        session.derivedTranscriptRefreshGeneration &+= 1
-        session.derivedTranscriptRefreshTask?.cancel()
-        session.derivedTranscriptRefreshTask = nil
-        let pendingMutationSummary = reason == .liveMutation ? session.pendingSourceItemsMutationSummary : nil
-        session.pendingSourceItemsMutationSummary = nil
-        session.pendingDerivedTranscriptRefreshReason = nil
-        #if DEBUG || EDIT_FLOW_PERF
-            let refreshStartedAt = CFAbsoluteTimeGetCurrent()
-        #endif
-        let refreshSignpost = EditFlowPerf.begin(
-            EditFlowPerf.Stage.Transcript.refreshTotal,
-            EditFlowPerf.Dimensions(
-                status: reason.rawValue,
-                sourceItemCount: session.items.count
-            )
-        )
-        let workingItemsSnapshot = session.items
-        let existingTranscript = session.transcript
-        let projectionProtection = transcriptProjectionProtection(
-            for: session,
-            transcript: existingTranscript
-        )
-        #if DEBUG
-            let debugMetricsEnabled = AgentTranscriptDebugInstrumentation.isEnabled
-            let debugPendingMutationSummary: String?
-            var debugIncrementalPath: String?
-            let debugRefreshInputSignature: String?
-            if debugMetricsEnabled {
-                debugPendingMutationSummary = pendingMutationSummary.map {
-                    [
-                        "earliest=\($0.earliestChangedIndex)",
-                        "latest=\($0.latestChangedIndex)",
-                        "removal=\($0.containsRemoval)",
-                        "replaceAll=\($0.containsReplaceAll)",
-                        "user=\($0.containsUserMutation)",
-                        "structural=\($0.containsStructuralMutation)",
-                        "allowsIncremental=\($0.allowsIncrementalFinalTurnRebuild)"
-                    ].joined(separator: ",")
-                } ?? "nil"
-                debugIncrementalPath = {
-                    guard reason == .liveMutation else { return "full-rebuild:reason-\(reason.rawValue)" }
-                    guard session.pendingAskUser == nil else { return "full-rebuild:pending-question" }
-                    guard let pendingMutationSummary else { return "full-rebuild:missing-mutation-summary" }
-                    guard pendingMutationSummary.allowsIncrementalFinalTurnRebuild else {
-                        return "full-rebuild:mutation-disallows-incremental"
-                    }
-                    return "incremental-attempt"
-                }()
-                debugRefreshInputSignature = AgentTranscriptDebugInstrumentation.stableDigest([
-                    AgentTranscriptDebugInstrumentation.itemIdentitySignature(workingItemsSnapshot),
-                    "sourceRevision=\(session.sourceItemsRevision)",
-                    "nextSequence=\(session.nextSequenceIndex)",
-                    "runState=\(session.runState.rawValue)",
-                    "agent=\(session.selectedAgent.rawValue)",
-                    "hidePendingQuestion=\(session.hasPendingQuestionUI)",
-                    "projectionProtection=\(String(describing: projectionProtection))",
-                    "compressedRevealed=\(session.isCompressedHistoryRevealed)"
-                ])
-            } else {
-                debugPendingMutationSummary = nil
-                debugIncrementalPath = nil
-                debugRefreshInputSignature = nil
-            }
-        #endif
-        #if DEBUG || EDIT_FLOW_PERF
-            var performanceSnapshot = session.transcriptPerformanceSnapshot
-            performanceSnapshot.lastSourceItemCount = workingItemsSnapshot.count
-        #endif
-        let importPolicy = AgentTranscriptImportPolicy.liveSession(
-            hidePendingQuestionToolCall: session.hasPendingQuestionUI
-        )
-        Self.logCodexDebug(
-            "[AgentModeVM][TranscriptOrder] refreshDerived tab=\(session.tabID) selectedAgent=\(session.selectedAgent.rawValue) sourceTail=\(Self.transcriptRowDebugWindow(workingItemsSnapshot))"
-        )
-        #if DEBUG || EDIT_FLOW_PERF
-            let importStartedAt = CFAbsoluteTimeGetCurrent()
-        #endif
-        let importSignpost = EditFlowPerf.begin(
-            EditFlowPerf.Stage.Transcript.importTranscript,
-            EditFlowPerf.Dimensions(status: reason.rawValue, sourceItemCount: workingItemsSnapshot.count)
-        )
-        let importedTranscript: AgentTranscript
-        var trustedIncrementalFinalTurnStartSequenceIndex: Int?
-        if reason == .liveMutation,
-           session.pendingAskUser == nil,
-           let mutationSummary = pendingMutationSummary,
-           mutationSummary.allowsIncrementalFinalTurnRebuild
-        {
-            #if DEBUG || EDIT_FLOW_PERF
-                let incrementalImportStartedAt = CFAbsoluteTimeGetCurrent()
-                var incrementalImportOutcome = "fallback"
-            #endif
-            let incrementalImportSignpost = EditFlowPerf.begin(
-                EditFlowPerf.Stage.Transcript.incrementalImport,
-                EditFlowPerf.Dimensions(sourceItemCount: workingItemsSnapshot.count)
-            )
-            let usesDurableFrontier = (existingTranscript.compactionFrontier?.frozenPrefixTurnCount ?? 0) > 0
-            #if DEBUG || EDIT_FLOW_PERF
-                performanceSnapshot.incrementalImportAttemptCount += 1
-                if usesDurableFrontier {
-                    performanceSnapshot.frontierReuseAttemptCount += 1
-                }
-            #endif
-            if let incrementallyUpdatedTranscript = AgentTranscriptIO.incrementallyUpdatedTranscriptForFinalTurn(
-                existingTranscript: existingTranscript,
-                items: workingItemsSnapshot,
-                earliestChangedIndex: mutationSummary.earliestChangedIndex,
-                terminalState: session.runState,
-                nextSequenceIndex: session.nextSequenceIndex,
-                policy: importPolicy,
-                protection: projectionProtection
-            ) {
-                importedTranscript = incrementallyUpdatedTranscript
-                if workingItemsSnapshot.indices.contains(mutationSummary.earliestChangedIndex) {
-                    trustedIncrementalFinalTurnStartSequenceIndex =
-                        workingItemsSnapshot[mutationSummary.earliestChangedIndex].sequenceIndex
-                }
-                #if DEBUG
-                    debugIncrementalPath = usesDurableFrontier ? "incremental-success:frontier" : "incremental-success:no-frontier"
-                #endif
-                #if DEBUG || EDIT_FLOW_PERF
-                    incrementalImportOutcome = "success"
-                    performanceSnapshot.incrementalImportSuccessCount += 1
-                    if usesDurableFrontier {
-                        performanceSnapshot.frontierReuseSuccessCount += 1
-                    }
-                #endif
-            } else {
-                importedTranscript = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
-                    existingTranscript: existingTranscript,
-                    workingItems: workingItemsSnapshot,
-                    terminalState: session.runState,
-                    nextSequenceIndex: session.nextSequenceIndex,
-                    policy: importPolicy,
-                    protection: projectionProtection
-                )
-                #if DEBUG
-                    debugIncrementalPath = usesDurableFrontier ? "incremental-fallback:frontier-rejected" : "incremental-fallback:no-frontier-rejected"
-                #endif
-                #if DEBUG || EDIT_FLOW_PERF
-                    performanceSnapshot.incrementalImportFallbackCount += 1
-                    if usesDurableFrontier {
-                        performanceSnapshot.frontierReuseFallbackCount += 1
-                    }
-                #endif
-            }
-            #if DEBUG || EDIT_FLOW_PERF
-                EditFlowPerf.end(
-                    EditFlowPerf.Stage.Transcript.incrementalImport,
-                    incrementalImportSignpost,
-                    EditFlowPerf.Dimensions(
-                        outcome: incrementalImportOutcome,
-                        sourceItemCount: workingItemsSnapshot.count
-                    )
-                )
-                let incrementalImportDurationMS = max(0, (CFAbsoluteTimeGetCurrent() - incrementalImportStartedAt) * 1000)
-                performanceSnapshot.lastIncrementalImportDurationMS = incrementalImportDurationMS
-                performanceSnapshot.maxIncrementalImportDurationMS = max(
-                    performanceSnapshot.maxIncrementalImportDurationMS ?? 0,
-                    incrementalImportDurationMS
-                )
-            #else
-                EditFlowPerf.end(EditFlowPerf.Stage.Transcript.incrementalImport, incrementalImportSignpost)
-            #endif
-        } else {
-            #if DEBUG || EDIT_FLOW_PERF
-                performanceSnapshot.lastIncrementalImportDurationMS = nil
-            #endif
-            importedTranscript = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
-                existingTranscript: existingTranscript,
-                workingItems: workingItemsSnapshot,
-                terminalState: session.runState,
-                nextSequenceIndex: session.nextSequenceIndex,
-                policy: importPolicy,
-                protection: projectionProtection
-            )
-        }
-        #if DEBUG
-            if let debugPendingMutationSummary,
-               let debugIncrementalPath,
-               let debugRefreshInputSignature
-            {
-                AgentTranscriptDebugInstrumentation.emitRefreshAttempt(
-                    tabID: session.tabID,
-                    reason: reason.rawValue,
-                    sourceItemsRevision: session.sourceItemsRevision,
-                    itemCount: workingItemsSnapshot.count,
-                    nextSequenceIndex: session.nextSequenceIndex,
-                    runState: session.runState.rawValue,
-                    selectedAgent: session.selectedAgent.rawValue,
-                    projectionProtection: String(describing: projectionProtection),
-                    pendingMutationSummary: debugPendingMutationSummary,
-                    incrementalPath: debugIncrementalPath,
-                    inputSignature: debugRefreshInputSignature
-                )
-            }
-        #endif
-        EditFlowPerf.end(
-            EditFlowPerf.Stage.Transcript.importTranscript,
-            importSignpost,
-            EditFlowPerf.Dimensions(status: reason.rawValue, sourceItemCount: workingItemsSnapshot.count)
-        )
-        #if DEBUG || EDIT_FLOW_PERF
-            let importDurationMS = max(0, (CFAbsoluteTimeGetCurrent() - importStartedAt) * 1000)
-            performanceSnapshot.lastImportDurationMS = importDurationMS
-            performanceSnapshot.maxImportDurationMS = max(
-                performanceSnapshot.maxImportDurationMS ?? 0,
-                importDurationMS
-            )
-        #endif
-        #if DEBUG || EDIT_FLOW_PERF
-            let previousPerformanceSnapshotForBuild = performanceSnapshot
-        #else
-            let previousPerformanceSnapshotForBuild = AgentTranscriptPerformanceSnapshot.empty
-        #endif
-        let builtPresentation = Self.buildTranscriptPresentation(
-            from: importedTranscript,
-            sourceItems: workingItemsSnapshot,
-            precomputedEphemeralPayloadByItemID: session.ephemeralToolResultPayloadByItemID,
-            precomputedEphemeralPayloadRevisionByItemID: session.ephemeralToolResultPayloadRevisionByItemID,
-            selectedAgent: session.selectedAgent,
-            previousPerformanceSnapshot: previousPerformanceSnapshotForBuild,
-            trackedLocalInputIDs: Set(session.localInputIndex.records.map(\.itemID)),
-            previousSanitizedTranscript: existingTranscript,
-            previousBaseProjection: session.baseTranscriptProjection,
-            previousTurnProjectionCaches: session.turnProjectionCaches,
-            previousProjectionProtection: session.transcriptProjectionProtection,
-            projectionProtection: projectionProtection,
-            isCompressedHistoryRevealed: session.isCompressedHistoryRevealed,
-            isColdLoad: reason == .coldLoad,
-            trustedIncrementalFinalTurnStartSequenceIndex: trustedIncrementalFinalTurnStartSequenceIndex,
-            quietDisplayCandidate: session.quietDisplayCandidate
-        )
-        let fullDetailTurnEnvelopeChanged = AgentTranscriptIO.fullDetailTurnEnvelopeChanged(
-            from: existingTranscript,
-            to: builtPresentation.transcript
-        )
-        applyBuiltTranscriptPresentation(
-            builtPresentation,
-            sourceItems: workingItemsSnapshot,
-            reconcilesQuietSourceRetirement: pendingMutationSummary?.containsStructuralMutation != false
-                || fullDetailTurnEnvelopeChanged || builtPresentation.sanitizedActivityCount > 0,
-            isLiveRefresh: reason == .liveMutation,
-            to: session
-        )
-        let hasCompactedTranscriptPrefix = builtPresentation.transcript.turns.contains { $0.retentionTier != .full }
-        let canReconcileForStandardRetention = (!session.runState.isActive || hasCompactedTranscriptPrefix)
-            && (session.runState != .completed || hasCompactedTranscriptPrefix)
-        let containsExcludedLegacyItems = AgentTranscriptIO.containsExcludedLegacyItems(
-            workingItemsSnapshot,
-            policy: importPolicy
-        )
-        let shouldReconcileWorkingItems: Bool = {
-            guard session.items == workingItemsSnapshot,
-                  canReconcileForStandardRetention
-            else {
-                return false
-            }
-            return containsExcludedLegacyItems
-                || fullDetailTurnEnvelopeChanged
-                || builtPresentation.sanitizedActivityCount > 0
-        }()
-        let mayCompactActiveSummaryOnlyToolResults = !shouldReconcileWorkingItems
-            && session.items == workingItemsSnapshot
-            && session.runState.isActive
-            && !hasCompactedTranscriptPrefix
-            && builtPresentation.sanitizedActivityCount > 0
-        let didApplyIncrementalSummaryOnlyCompaction: Bool = {
-            guard builtPresentation.sanitizedActivityCount > 0,
-                  !containsExcludedLegacyItems,
-                  !fullDetailTurnEnvelopeChanged,
-                  let mutationSummary = pendingMutationSummary,
-                  mutationSummary.earliestChangedIndex == mutationSummary.latestChangedIndex,
-                  workingItemsSnapshot.indices.contains(mutationSummary.earliestChangedIndex)
-            else {
-                return false
-            }
-            let changedIndex = mutationSummary.earliestChangedIndex
-            let sourceItem = workingItemsSnapshot[changedIndex]
-            guard let compactedItem = Self.transcriptItem(
-                in: builtPresentation.transcript,
-                matching: sourceItem
-            ),
-                let retainedRawPayload = session.ephemeralToolResultPayloadByItemID[sourceItem.id],
-                Self.canApplyActiveSummaryOnlyToolResultCompaction(
-                    from: sourceItem,
-                    to: compactedItem,
-                    retainedPayload: retainedRawPayload
-                ),
-                session.replaceItemSilentlyForRetentionCompaction(
-                    at: changedIndex,
-                    with: compactedItem,
-                    retainedRawPayload: retainedRawPayload
-                )
-            else {
-                return false
-            }
-            markDerivedTranscriptSynchronized(
-                for: session,
-                projectionProtection: builtPresentation.projectionProtection
-            )
-            return true
-        }()
-        if !didApplyIncrementalSummaryOnlyCompaction,
-           shouldReconcileWorkingItems || mayCompactActiveSummaryOnlyToolResults
-        {
-            let trimmedWorkingItems = AgentTranscriptIO.workingSourceItems(from: builtPresentation.transcript)
-            let canApplyWorkingItems = shouldReconcileWorkingItems
-                || Self.canApplyActiveSummaryOnlyToolResultCompaction(
-                    from: workingItemsSnapshot,
-                    to: trimmedWorkingItems,
-                    retainedPayloadByItemID: session.ephemeralToolResultPayloadByItemID
-                )
-            if canApplyWorkingItems, trimmedWorkingItems != session.items {
-                session.setItemsSilentlyForRetentionCompaction(trimmedWorkingItems)
-                markDerivedTranscriptSynchronized(
-                    for: session,
-                    projectionProtection: builtPresentation.projectionProtection
-                )
-            }
-        }
-        #if DEBUG || EDIT_FLOW_PERF
-            var finalPerformanceSnapshot = session.transcriptPerformanceSnapshot
-            let refreshDurationMS = max(0, (CFAbsoluteTimeGetCurrent() - refreshStartedAt) * 1000)
-            finalPerformanceSnapshot.lastRefreshTotalDurationMS = refreshDurationMS
-            finalPerformanceSnapshot.maxRefreshTotalDurationMS = max(
-                finalPerformanceSnapshot.maxRefreshTotalDurationMS ?? 0,
-                refreshDurationMS
-            )
-            finalPerformanceSnapshot.lastSourceItemCount = session.items.count
-            session.transcriptPerformanceSnapshot = finalPerformanceSnapshot
-        #endif
-        EditFlowPerf.end(
-            EditFlowPerf.Stage.Transcript.refreshTotal,
-            refreshSignpost,
-            EditFlowPerf.Dimensions(
-                status: reason.rawValue,
-                lineCount: session.transcriptCanonicalVisibleRowCount,
-                sourceItemCount: session.items.count
-            )
-        )
-        if publishActivePresentation, canBuildOrPublishActiveTranscriptBindings(for: session) {
+        AgentSessionTranscriptRefreshRuntime.refreshDerivedTranscriptState(for: session, reason: reason)
+        if publishActivePresentation { publishDerivedTranscriptState(for: session) }
+    }
+
+    private func publishDerivedTranscriptState(for session: TabSession) {
+        if canBuildOrPublishActiveTranscriptBindings(for: session) {
             let publishSignpost = EditFlowPerf.begin(
                 EditFlowPerf.Stage.Transcript.publish,
                 EditFlowPerf.Dimensions(lineCount: session.transcriptCanonicalVisibleRowCount)
@@ -15440,7 +15104,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 publishSignpost,
                 EditFlowPerf.Dimensions(lineCount: session.transcriptCanonicalVisibleRowCount)
             )
-        } else if publishActivePresentation {
+        } else {
             // Retained cancelled-drift scope: publish this already-built local projection (§4.3).
             publishRetainedLocalProjection(session)
         }
@@ -15454,25 +15118,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         AgentSessionTranscriptBuilder.rebuildEphemeralToolResultPayloadMap(from: items, context: context, diagnosticContext: diagnosticContext)
     }
 
-    nonisolated static func transcriptProjectionProtection(
-        for transcript: AgentTranscript,
-        viewportState: AgentTranscriptViewportState
-    ) -> AgentTranscriptProjectionProtection {
-        guard !transcript.turns.isEmpty else { return .none }
-        return AgentTranscriptProjectionBuilder.projectionProtection(
-            for: transcript,
-            viewportState: viewportState
-        )
+    nonisolated static func transcriptProjectionProtection(for transcript: AgentTranscript, viewportState: AgentTranscriptViewportState) -> AgentTranscriptProjectionProtection {
+        AgentSessionTranscriptRefreshRuntime.transcriptProjectionProtection(for: transcript, viewportState: viewportState)
     }
 
-    func transcriptProjectionProtection(
-        for session: TabSession,
-        transcript: AgentTranscript? = nil
-    ) -> AgentTranscriptProjectionProtection {
-        Self.transcriptProjectionProtection(
-            for: transcript ?? session.transcript,
-            viewportState: session.transcriptViewportState
-        )
+    func transcriptProjectionProtection(for session: TabSession, transcript: AgentTranscript? = nil) -> AgentTranscriptProjectionProtection {
+        AgentSessionTranscriptRefreshRuntime.transcriptProjectionProtection(for: session, transcript: transcript)
     }
 
     static func makeDerivedTranscriptSyncState(
@@ -15553,85 +15204,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return presentedRowCount < expectedCounts.defaultPresentedRowCount
     }
 
-    private nonisolated static func persistableSnapshot(
-        from transcript: AgentTranscript,
-        previousSanitizedTranscript: AgentTranscript?,
-        workingItems: [AgentChatItem]
-    ) -> PersistableTranscriptSnapshot {
-        let sanitizeReusableTurnCount = commonEqualTurnPrefixCount(
-            in: transcript,
-            previousTranscript: previousSanitizedTranscript
-        )
-        let sanitizeMetrics = AgentToolResultPersistencePolicy.sanitizeTranscriptWithMetrics(
-            transcript,
-            previousSanitizedTranscript: previousSanitizedTranscript,
-            reusablePrefixTurnCount: sanitizeReusableTurnCount > 0 ? sanitizeReusableTurnCount : nil,
-            context: AgentToolResultProcessingContext(),
-            purpose: .runtimePresentation
-        )
-        let sanitizedTranscript = AgentTranscriptProjectionBuilder.refreshCompletedFullTurnGroupedHistoryCaches(
-            in: sanitizeMetrics.transcript
-        )
-        let projectionCounts = AgentTranscriptProjectionBuilder.projectionCounts(for: sanitizedTranscript)
-        return PersistableTranscriptSnapshot(
-            transcript: sanitizedTranscript,
-            projectionCounts: projectionCounts,
-            canonicalVisibleRowCount: projectionCounts.canonicalVisibleRowCount,
-            lastUserMessageAt: AgentTranscriptIO.lastUserInteractionDate(in: sanitizedTranscript)
-                ?? AgentTranscriptIO.lastUserInteractionDate(in: workingItems)
-        )
-    }
-
-    private func persistableTranscriptSnapshot(
-        for session: TabSession,
-        workingItems: [AgentChatItem],
-        existingTranscript: AgentTranscript,
-        importPolicy: AgentTranscriptImportPolicy,
-        projectionProtection: AgentTranscriptProjectionProtection
-    ) -> PersistableTranscriptSnapshot {
-        let transcriptSnapshot = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
-            existingTranscript: existingTranscript,
-            workingItems: workingItems,
-            terminalState: session.runState,
-            nextSequenceIndex: session.nextSequenceIndex,
-            policy: importPolicy,
-            protection: projectionProtection
-        )
-        return Self.persistableSnapshot(
-            from: transcriptSnapshot,
-            previousSanitizedTranscript: existingTranscript,
-            workingItems: workingItems
-        )
-    }
-
-    func canReuseDerivedTranscriptForSave(
-        for session: TabSession,
-        projectionProtection: AgentTranscriptProjectionProtection
-    ) -> Bool {
-        session.derivedTranscriptSyncState == Self.makeDerivedTranscriptSyncState(
-            for: session,
-            projectionProtection: projectionProtection
-        )
-    }
-
-    private func builtTranscriptPresentationSnapshot(for session: TabSession) -> BuiltTranscriptPresentation {
-        BuiltTranscriptPresentation(
-            transcript: session.transcript,
-            baseProjection: session.baseTranscriptProjection,
-            fullProjection: session.fullTranscriptProjection,
-            workingProjection: session.workingTranscriptProjection,
-            projection: session.transcriptProjection,
-            turnProjectionCaches: session.turnProjectionCaches,
-            archivedSnapshot: session.archivedTranscriptSnapshot,
-            reusesPreviousArchive: false,
-            projectionProtection: session.transcriptProjectionProtection,
-            canonicalVisibleRowCount: session.transcriptCanonicalVisibleRowCount,
-            projectionCounts: session.transcriptProjectionCounts,
-            analyticsSnapshot: session.transcriptAnalyticsSnapshot,
-            sanitizedActivityCount: 0,
-            performanceSnapshot: session.transcriptPerformanceSnapshot,
-            rawToolResultPayloadRenderRevisionByItemID: session.rawToolResultPayloadRenderRevisionByItemID
-        )
+    func canReuseDerivedTranscriptForSave(for session: TabSession, projectionProtection: AgentTranscriptProjectionProtection) -> Bool {
+        AgentSessionTranscriptRefreshRuntime.canReuseDerivedTranscriptForSave(for: session, projectionProtection: projectionProtection)
     }
 
     nonisolated static func buildTranscriptPresentation(
@@ -15655,127 +15229,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         AgentSessionTranscriptBuilder.buildTranscriptPresentation(from: transcript, sourceItems: sourceItems, precomputedEphemeralPayloadByItemID: precomputedEphemeralPayloadByItemID, precomputedEphemeralPayloadRevisionByItemID: precomputedEphemeralPayloadRevisionByItemID, selectedAgent: selectedAgent, previousPerformanceSnapshot: previousPerformanceSnapshot, trackedLocalInputIDs: trackedLocalInputIDs, previousSanitizedTranscript: previousSanitizedTranscript, previousBaseProjection: previousBaseProjection, previousTurnProjectionCaches: previousTurnProjectionCaches, previousProjectionProtection: previousProjectionProtection, projectionProtection: projectionProtection, isCompressedHistoryRevealed: isCompressedHistoryRevealed, isColdLoad: isColdLoad, trustedIncrementalFinalTurnStartSequenceIndex: trustedIncrementalFinalTurnStartSequenceIndex, quietDisplayCandidate: quietDisplayCandidate)
     }
 
-    private nonisolated static func commonEqualTurnPrefixCount(
-        in transcript: AgentTranscript,
-        previousTranscript: AgentTranscript?
-    ) -> Int {
-        AgentSessionTranscriptBuilder.commonEqualTurnPrefixCount(in: transcript, previousTranscript: previousTranscript)
-    }
-
-    private nonisolated static func canApplyActiveSummaryOnlyToolResultCompaction(
-        from sourceItems: [AgentChatItem],
-        to compactedItems: [AgentChatItem],
-        retainedPayloadByItemID: [UUID: String]
-    ) -> Bool {
-        guard sourceItems.count == compactedItems.count else { return false }
-        var foundSummaryOnlyToolResultCompaction = false
-        for (sourceItem, compactedItem) in zip(sourceItems, compactedItems) {
-            guard sourceItem != compactedItem else { continue }
-            let retainedPayload = retainedPayloadByItemID[sourceItem.id]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            guard canApplyActiveSummaryOnlyToolResultCompaction(
-                from: sourceItem,
-                to: compactedItem,
-                retainedPayload: retainedPayload
-            ) else { return false }
-            foundSummaryOnlyToolResultCompaction = true
-        }
-        return foundSummaryOnlyToolResultCompaction
-    }
-
-    private nonisolated static func canApplyActiveSummaryOnlyToolResultCompaction(
-        from sourceItem: AgentChatItem,
-        to compactedItem: AgentChatItem,
-        retainedPayload: String
-    ) -> Bool {
-        guard sourceItem.id == compactedItem.id,
-              sourceItem.timestamp == compactedItem.timestamp,
-              sourceItem.kind == compactedItem.kind,
-              sourceItem.attachments == compactedItem.attachments,
-              sourceItem.taggedFileAttachments == compactedItem.taggedFileAttachments,
-              sourceItem.toolName == compactedItem.toolName,
-              sourceItem.toolInvocationID == compactedItem.toolInvocationID,
-              sourceItem.toolArgsJSON == compactedItem.toolArgsJSON,
-              sourceItem.reasoning == compactedItem.reasoning,
-              sourceItem.sequenceIndex == compactedItem.sequenceIndex,
-              sourceItem.isStreaming == compactedItem.isStreaming,
-              sourceItem.workflow == compactedItem.workflow,
-              sourceItem.codexGoalMode == compactedItem.codexGoalMode,
-              sourceItem.isLocalControlPlaneEcho == compactedItem.isLocalControlPlaneEcho,
-              sourceItem.kind == .toolResult,
-              !sourceItem.isStreaming
-        else {
-            return false
-        }
-        let sourceResultJSON = sourceItem.toolResultJSON?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let compactedResultJSON = compactedItem.toolResultJSON?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !sourceResultJSON.isEmpty,
-              sourceResultJSON != compactedResultJSON,
-              retainedPayload.trimmingCharacters(in: .whitespacesAndNewlines) == sourceResultJSON,
-              AgentTranscriptToolNormalizer.isSummaryOnly(raw: compactedResultJSON)
-        else {
-            return false
-        }
-        var expectedCompactedItem = sourceItem
-        expectedCompactedItem.text = compactedItem.text
-        expectedCompactedItem.toolResultJSON = compactedItem.toolResultJSON
-        expectedCompactedItem.toolIsError = compactedItem.toolIsError
-        return expectedCompactedItem == compactedItem
-    }
-
-    private nonisolated static func transcriptItem(
-        in transcript: AgentTranscript,
-        matching sourceItem: AgentChatItem
-    ) -> AgentChatItem? {
-        guard let finalTurn = transcript.turns.last else { return nil }
-        for span in finalTurn.responseSpans.reversed() {
-            guard let firstSequenceIndex = span.activities.first?.sequenceIndex,
-                  let lastSequenceIndex = span.activities.last?.sequenceIndex,
-                  sourceItem.sequenceIndex >= firstSequenceIndex,
-                  sourceItem.sequenceIndex <= lastSequenceIndex
-            else {
-                continue
-            }
-            var lowerBound = span.activities.startIndex
-            var upperBound = span.activities.endIndex
-            while lowerBound < upperBound {
-                let midpoint = lowerBound + (upperBound - lowerBound) / 2
-                if span.activities[midpoint].sequenceIndex < sourceItem.sequenceIndex {
-                    lowerBound = midpoint + 1
-                } else {
-                    upperBound = midpoint
-                }
-            }
-            guard lowerBound < span.activities.endIndex,
-                  span.activities[lowerBound].sequenceIndex == sourceItem.sequenceIndex,
-                  span.activities[lowerBound].id == sourceItem.id
-            else {
-                continue
-            }
-            return span.activities[lowerBound].toItem()
-        }
-        return nil
-    }
-
-    private func applyBuiltTranscriptPresentation(
-        _ presentation: BuiltTranscriptPresentation,
-        sourceItems: [AgentChatItem]? = nil,
-        reconcilesQuietSourceRetirement: Bool = true,
-        isLiveRefresh: Bool = false,
-        to session: TabSession
-    ) {
-        guard AgentSessionTranscriptRuntime.apply(
-            presentation, sourceItems: sourceItems,
-            reconcilesQuietSourceRetirement: reconcilesQuietSourceRetirement,
-            isLiveRefresh: isLiveRefresh, to: session
-        ) else {
-            Self.logCodexDebug(
-                "[AgentModeVM][Transcript] skip applying stale built presentation tab=\(session.tabID) sourceItems=\(sourceItems?.count ?? 0) liveItems=\(session.items.count)"
-            )
-            return
-        }
-        Self.logCodexDebug(
-            "[AgentModeVM][TranscriptOrder] applyStructured tab=\(session.tabID) turns=\(presentation.transcript.turns.count) workingRowTail=\(Self.transcriptRowDebugWindow(presentation.workingProjection.workingRows)) workingBlockTail=\(Self.transcriptBlockDebugWindow(presentation.workingProjection.workingBlocks))"
-        )
+    private func applyBuiltTranscriptPresentation(_ presentation: BuiltTranscriptPresentation, sourceItems: [AgentChatItem]? = nil, reconcilesQuietSourceRetirement: Bool = true, isLiveRefresh: Bool = false, to session: TabSession) {
+        AgentSessionTranscriptRefreshRuntime.applyBuiltTranscriptPresentation(presentation, sourceItems: sourceItems, reconcilesQuietSourceRetirement: reconcilesQuietSourceRetirement, isLiveRefresh: isLiveRefresh, to: session)
     }
 
     #if DEBUG
@@ -15786,40 +15241,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     #endif
 
     @discardableResult
-    func applyTranscriptPresentation(
-        _ transcript: AgentTranscript,
-        sourceItems: [AgentChatItem]? = nil,
-        to session: TabSession,
-        isColdLoad: Bool = false
-    ) -> BuiltTranscriptPresentation {
-        let canonicalSourceItems = sourceItems ?? session.items
-        let projectionProtection = transcriptProjectionProtection(
-            for: session,
-            transcript: transcript
-        )
-        let builtPresentation = Self.buildTranscriptPresentation(
-            from: transcript,
-            sourceItems: canonicalSourceItems,
-            precomputedEphemeralPayloadByItemID: canonicalSourceItems == session.items ? session.ephemeralToolResultPayloadByItemID : nil,
-            precomputedEphemeralPayloadRevisionByItemID: canonicalSourceItems == session.items ? session.ephemeralToolResultPayloadRevisionByItemID : nil,
-            selectedAgent: session.selectedAgent,
-            previousPerformanceSnapshot: session.transcriptPerformanceSnapshot,
-            trackedLocalInputIDs: Set(session.localInputIndex.records.map(\.itemID)),
-            previousSanitizedTranscript: session.transcript,
-            previousBaseProjection: session.baseTranscriptProjection,
-            previousTurnProjectionCaches: session.turnProjectionCaches,
-            previousProjectionProtection: session.transcriptProjectionProtection,
-            projectionProtection: projectionProtection,
-            isCompressedHistoryRevealed: session.isCompressedHistoryRevealed,
-            isColdLoad: isColdLoad,
-            quietDisplayCandidate: session.quietDisplayCandidate
-        )
-        applyBuiltTranscriptPresentation(
-            builtPresentation,
-            sourceItems: canonicalSourceItems,
-            to: session
-        )
-        return builtPresentation
+    func applyTranscriptPresentation(_ transcript: AgentTranscript, sourceItems: [AgentChatItem]? = nil, to session: TabSession, isColdLoad: Bool = false) -> BuiltTranscriptPresentation {
+        AgentSessionTranscriptRefreshRuntime.applyTranscriptPresentation(transcript, sourceItems: sourceItems, to: session, isColdLoad: isColdLoad)
     }
 
     @discardableResult
@@ -15871,26 +15294,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         AgentSessionRestoreSupport.normalizedSessionTitle(raw)
     }
 
-    private static func transcriptRowDebugSummary(_ item: AgentChatItem) -> String {
-        let label = item.toolName ?? item.kind.rawValue
-        return "\(item.sequenceIndex):\(item.kind.rawValue):\(label):stream=\(item.isStreaming)"
-    }
-
     private static func transcriptRowDebugWindow(_ items: [AgentChatItem], limit: Int = 8) -> String {
-        guard !items.isEmpty else { return "[]" }
-        let rows = Array(items.suffix(limit)).map(transcriptRowDebugSummary)
-        return "[\(rows.joined(separator: ", "))]"
-    }
-
-    private static func transcriptBlockDebugSummary(_ block: AgentTranscriptRenderBlock) -> String {
-        let rowSummary = block.rows.map { "\($0.sequenceIndex):\($0.kind.rawValue)" }.joined(separator: ",")
-        return "\(block.kind.rawValue){\(rowSummary)}"
+        AgentSessionTranscriptRefreshRuntime.transcriptRowDebugWindow(items, limit: limit)
     }
 
     private static func transcriptBlockDebugWindow(_ blocks: [AgentTranscriptRenderBlock], limit: Int = 8) -> String {
-        guard !blocks.isEmpty else { return "[]" }
-        let tail = Array(blocks.suffix(limit)).map(transcriptBlockDebugSummary)
-        return "[\(tail.joined(separator: " | "))]"
+        AgentSessionTranscriptRefreshRuntime.transcriptBlockDebugWindow(blocks, limit: limit)
     }
 
     func upsertSessionIndex(
@@ -17307,10 +16716,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let currentOwner = try? authoritativeLiveSession(for: sessionID)
         if let currentOwner {
             currentOwner.isDirty = true
-            saveRequestedWhileInFlightSessionIDs.insert(sessionID)
+            runtimeSessionStore.saveQueue.requestFollowUp(sessionID: sessionID)
         } else if fallbackSession.activeAgentSessionID == sessionID {
             fallbackSession.isDirty = true
-            saveRequestedWhileInFlightSessionIDs.insert(sessionID)
+            runtimeSessionStore.saveQueue.requestFollowUp(sessionID: sessionID)
         }
     }
 
@@ -17390,70 +16799,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
-    private enum SessionCreationSave {
-        case configured(AgentSessionCreationHandle)
-        case recovery(AgentSessionCreationHandle)
-
-        var handle: AgentSessionCreationHandle {
-            switch self { case let .configured(handle), let .recovery(handle): handle }
-        }
-    }
-
-    /// Freeze the actual initial payload. Write bookkeeping is excluded; unordered UUID targets
-    /// are normalized. The receipt pins this payload; post-write checks separately cover runtime
-    /// configuration and the existing transcript/persistence source revisions.
-    private func creationConfigurationStamp(for payload: AgentSession) throws -> Data {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        guard var object = try JSONSerialization.jsonObject(with: encoder.encode(payload)) as? [String: Any] else {
-            throw MCPError.internalError("The prepared session could not be encoded as a configuration object.")
-        }
-        object.removeValue(forKey: "savedAt")
-        object.removeValue(forKey: "fileURL")
-        if let targets = object["agentSessionLinkAutoWakeTargetSessionIDs"] as? [String] {
-            object["agentSessionLinkAutoWakeTargetSessionIDs"] = targets.sorted()
-        }
-        let canonical = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
-        return Data(SHA256.hash(data: canonical))
-    }
-
-    /// Source revision fences protect the transcript. Explicitly reread persisted configuration
-    /// after the writer awaits, since ordinary UI property setters do not all advance that revision.
-    private func refreshCreationConfiguration(from session: TabSession, payload: inout AgentSession) {
-        payload.name = resolvedSessionDisplayName(for: session.tabID)
-        payload.agentKind = session.selectedAgent.rawValue
-        payload.agentModel = session.selectedModelRaw
-        payload.agentReasoningEffort = session.persistedReasoningEffortRaw
-        payload.acpModelParameterSelections = ACPModelParameterSelection.normalized(session.acpModelParameterSelections)
-        payload.lastRunState = session.runState.rawValue
-        payload.providerSessionID = session.providerSessionID
-        payload.providerCleanupHandle = providerCleanupHandle(
-            provider: session.selectedAgent.rawValue, explicit: session.providerCleanupHandle,
-            providerSessionID: session.providerSessionID, codexConversationID: session.codexConversationID,
-            codexRolloutPath: session.codexRolloutPath
-        )
-        payload.autoEditEnabled = session.autoEditEnabled
-        payload.autoWakeOnOversightUpdates = session.oversight.autoWakeOnUpdates
-        payload.agentSessionLinkAutoWakeTargetSessionIDs = session.oversight.autoWakeTargetSessionIDs
-        payload.routineWakeIntervalEnabled = session.oversight.routineWakeIntervalEnabled
-        payload.routineWakeIntervalSeconds = AgentSessionLinkRoutineWakeInterval.normalized(session.oversight.routineWakeIntervalSeconds)
-        payload.periodicIdleWakeEnabled = session.oversight.periodicIdleWakeEnabled
-        payload.periodicIdleWakeIntervalSeconds = AgentSessionLinkPeriodicWakeInterval.normalized(session.oversight.periodicIdleWakeIntervalSeconds)
-        payload.parentSessionID = session.parentSessionID
-        payload.createdByOverseerSessionID = session.createdByOverseerSessionID
-        payload.organizationalParentID = session.organizationalParentID
-        payload.delegationScopeID = session.delegationScopeID
-        payload.isMCPOriginated = session.isMCPOriginated
-        payload.worktreeBindings = session.worktreeBindings
-        payload.worktreeMergeOperations = session.worktreeMergeOperations
-        payload.pendingHandoffProviderSwitchDelivery = session.pendingHandoff.providerSwitchDelivery
-        payload.pendingHandoffPayload = session.pendingHandoff.payload
-        payload.pendingHandoffCreatedAt = session.pendingHandoff.createdAt
-        payload.pendingHandoffSourceItemID = session.pendingHandoff.sourceItemID
-        payload.pendingHandoffDefersProviderLockUntilSend = session.pendingHandoff.defersProviderLockUntilSend
-        payload.pendingHandoffExecutionLocationFailure = session.pendingHandoff.executionLocationFailure
-        codexCoordinator.applyCodexPersistence(from: session, to: &payload)
-    }
+    private typealias SessionCreationSave = AgentSessionCreationSave
 
     private func saveSessionCore(
         for tabID: UUID, creationSave: SessionCreationSave? = nil,
@@ -17520,18 +16866,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return .failed(.init(operation: .save, tabID: tabID, message: "A required session binding could not be established."))
         }
         session.saveRequestGeneration &+= 1
-        if saveInFlightSessionIDs.contains(sessionID) {
-            saveRequestedWhileInFlightSessionIDs.insert(sessionID)
+        let saveQueue = runtimeSessionStore.saveQueue
+        guard saveQueue.begin(sessionID: sessionID) else {
             return .deferred("A save for this session is already in flight.")
         }
-        saveInFlightSessionIDs.insert(sessionID)
         defer {
-            saveInFlightSessionIDs.remove(sessionID)
-            let completionWaiters = saveCompletionWaitersBySessionID.removeValue(forKey: sessionID) ?? []
-            for waiter in completionWaiters {
-                waiter.resume()
-            }
-            if saveRequestedWhileInFlightSessionIDs.remove(sessionID) != nil {
+            if saveQueue.finish(sessionID: sessionID) {
                 if let currentOwner = try? authoritativeLiveSession(for: sessionID) {
                     scheduleSave(for: currentOwner.tabID)
                 } else if sessions[tabID] === session,
@@ -17541,150 +16881,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
             }
         }
-        var workingItemsSnapshot = session.items
-        var shouldRefreshAfterPreparation = false
-        let existingTranscript = session.transcript
-        let previousBaseProjection = session.baseTranscriptProjection
-        let previousProjection = session.transcriptProjection
-        let previousProjectionProtection = session.transcriptProjectionProtection
         let isActiveOwnedForSave = canBuildOrPublishActiveTranscriptBindings(for: session)
-        if !session.runState.isActive {
-            let repairedCount = AgentTranscriptIO.finalizePendingToolCalls(
-                in: &workingItemsSnapshot,
-                terminalState: session.runState,
-                includeExplicitRepoPromptToolCalls: session.selectedAgent == .codexExec || session.selectedAgent.acpProviderID != nil,
-                nonToolBoundary: Self.pendingToolFinalizationNonToolBoundary
-            )
-            if repairedCount > 0 {
-                session.setItemsSilentlyForPendingToolFinalizationRepair(workingItemsSnapshot)
-                session.isDirty = true
-                refreshDerivedTranscriptState(for: session, reason: .saveSession)
-                #if DEBUG
-                    perfRecorder.increment("save.session.localPendingToolRepair", tabID: tabID)
-                    perfRecorder.event(
-                        "save.session.localPendingToolRepair",
-                        tabID: tabID,
-                        fields: [
-                            "activeOwned": String(isActiveOwnedForSave),
-                            "repairedCount": String(repairedCount)
-                        ]
-                    )
-                #endif
-            }
-        }
-        var projectionProtection = transcriptProjectionProtection(
-            for: session,
-            transcript: session.transcript
+        let preparation = AgentSessionTranscriptRefreshRuntime.prepareSave(
+            for: session, isActiveOwnedForSave: isActiveOwnedForSave,
+            perfRecorder: perfRecorder, diagnosticPresentationID: perfRecorder.shortID(currentTabID),
+            didRefreshDerivedState: { [self] session in publishDerivedTranscriptState(for: session) }
         )
-        let importPolicy = AgentTranscriptImportPolicy.liveSession(
-            hidePendingQuestionToolCall: session.hasPendingQuestionUI
-        )
-        if !isActiveOwnedForSave,
-           session.derivedTranscriptRefreshTask != nil || session.pendingDerivedTranscriptRefreshReason != nil
-        {
-            let scheduledReason = session.pendingDerivedTranscriptRefreshReason ?? .liveMutation
-            refreshDerivedTranscriptState(for: session, reason: scheduledReason)
-            projectionProtection = transcriptProjectionProtection(
-                for: session,
-                transcript: session.transcript
-            )
-        }
-        let canReusePresentation = !shouldRefreshAfterPreparation
-            && canReuseDerivedTranscriptForSave(
-                for: session,
-                projectionProtection: projectionProtection
-            )
-        let builtPresentation: BuiltTranscriptPresentation?
-        let persistableSnapshot: PersistableTranscriptSnapshot
-        if canReusePresentation {
-            let reusedPresentation = builtTranscriptPresentationSnapshot(for: session)
-            builtPresentation = reusedPresentation
-            persistableSnapshot = PersistableTranscriptSnapshot(
-                transcript: reusedPresentation.transcript,
-                projectionCounts: reusedPresentation.projectionCounts,
-                canonicalVisibleRowCount: reusedPresentation.canonicalVisibleRowCount,
-                lastUserMessageAt: AgentTranscriptIO.lastUserInteractionDate(in: reusedPresentation.transcript)
-                    ?? AgentTranscriptIO.lastUserInteractionDate(in: workingItemsSnapshot)
-            )
-        } else if isActiveOwnedForSave {
-            let transcriptSnapshot = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
-                existingTranscript: existingTranscript,
-                workingItems: workingItemsSnapshot,
-                terminalState: session.runState,
-                nextSequenceIndex: session.nextSequenceIndex,
-                policy: importPolicy,
-                protection: projectionProtection
-            )
-            let appliedPresentation = applyTranscriptPresentation(
-                transcriptSnapshot,
-                sourceItems: workingItemsSnapshot,
-                to: session
-            )
-            builtPresentation = appliedPresentation
-            persistableSnapshot = PersistableTranscriptSnapshot(
-                transcript: appliedPresentation.transcript,
-                projectionCounts: appliedPresentation.projectionCounts,
-                canonicalVisibleRowCount: appliedPresentation.canonicalVisibleRowCount,
-                lastUserMessageAt: AgentTranscriptIO.lastUserInteractionDate(in: appliedPresentation.transcript)
-                    ?? AgentTranscriptIO.lastUserInteractionDate(in: workingItemsSnapshot)
-            )
-        } else {
-            builtPresentation = nil
-            persistableSnapshot = persistableTranscriptSnapshot(
-                for: session,
-                workingItems: workingItemsSnapshot,
-                existingTranscript: existingTranscript,
-                importPolicy: importPolicy,
-                projectionProtection: projectionProtection
-            )
-            #if DEBUG
-                perfRecorder.increment("save.session.persistenceOnlySnapshot", tabID: tabID)
-                perfRecorder.event(
-                    "save.session.persistenceOnlySnapshot",
-                    tabID: tabID,
-                    fields: [
-                        "currentTabID": perfRecorder.shortID(currentTabID),
-                        "sourceItemsRevision": String(session.sourceItemsRevision)
-                    ]
-                )
-            #endif
-        }
-        let presentationChanged = isActiveOwnedForSave && !canReusePresentation && builtPresentation != nil && (
-            session.transcript != existingTranscript
-                || session.baseTranscriptProjection != previousBaseProjection
-                || session.transcriptProjection != previousProjection
-                || session.transcriptProjectionProtection != previousProjectionProtection
-        )
-        if isActiveOwnedForSave, let builtPresentation {
-            let shouldReconcileWorkingItems = session.items == workingItemsSnapshot
-                && (
-                    AgentTranscriptIO.containsExcludedLegacyItems(workingItemsSnapshot, policy: importPolicy)
-                        || AgentTranscriptIO.fullDetailTurnEnvelopeChanged(
-                            from: existingTranscript,
-                            to: builtPresentation.transcript
-                        )
-                        || (!canReusePresentation && builtPresentation.sanitizedActivityCount > 0)
-                )
-            if shouldReconcileWorkingItems {
-                let trimmedWorkingItems = AgentTranscriptIO.workingSourceItems(from: builtPresentation.transcript)
-                if trimmedWorkingItems != session.items {
-                    session.setItemsSilentlyForRetentionCompaction(trimmedWorkingItems)
-                    markDerivedTranscriptSynchronized(
-                        for: session,
-                        projectionProtection: builtPresentation.projectionProtection
-                    )
-                    workingItemsSnapshot = trimmedWorkingItems
-                    shouldRefreshAfterPreparation = true
-                }
-            } else if session.items != workingItemsSnapshot {
-                workingItemsSnapshot = session.items
-            }
-        } else if session.items != workingItemsSnapshot {
-            workingItemsSnapshot = session.items
-        }
-        if presentationChanged {
-            shouldRefreshAfterPreparation = true
-        }
+        let persistableSnapshot = preparation.snapshot
+        let shouldRefreshAfterPreparation = preparation.shouldRefreshPresentation
         if shouldRefreshAfterPreparation {
             // Only refresh sessions that can publish active bindings now. Inactive
             // persistence-only saves must not feed back into UI projection work.
@@ -17713,83 +16917,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let lastUserMessageAt = persistableSnapshot.lastUserMessageAt
         let canonicalItemCount = persistableSnapshot.canonicalVisibleRowCount
         let sessionName = resolvedSessionDisplayName(for: tabID)
-        var agentSession = AgentSession(
-            id: sessionID,
-            workspaceID: workspace.id,
-            composeTabID: tabID,
-            name: sessionName,
-            items: [],
-            transcript: persistableSnapshot.transcript,
-            itemCount: canonicalItemCount,
-            transcriptProjectionCounts: persistableSnapshot.projectionCounts,
-            lastUserMessageAt: lastUserMessageAt,
-            agentKind: session.selectedAgent.rawValue,
-            agentModel: session.selectedModelRaw,
-            agentReasoningEffort: session.persistedReasoningEffortRaw,
-            acpModelParameterSelections: session.acpModelParameterSelections,
-            lastRunState: session.runState.rawValue,
-            providerSessionID: session.providerSessionID,
-            providerCleanupHandle: providerCleanupHandle(
-                provider: session.selectedAgent.rawValue,
-                explicit: session.providerCleanupHandle,
-                providerSessionID: session.providerSessionID,
-                codexConversationID: session.codexConversationID,
-                codexRolloutPath: session.codexRolloutPath
-            ),
-            autoEditEnabled: session.autoEditEnabled,
-            autoWakeOnOversightUpdates: session.oversight.autoWakeOnUpdates,
-            agentSessionLinkAutoWakeTargetSessionIDs: session.oversight.autoWakeTargetSessionIDs,
-            routineWakeIntervalEnabled: session.oversight.routineWakeIntervalEnabled,
-            routineWakeIntervalSeconds: session.oversight.routineWakeIntervalSeconds,
-            periodicIdleWakeEnabled: session.oversight.periodicIdleWakeEnabled,
-            periodicIdleWakeIntervalSeconds: session.oversight.periodicIdleWakeIntervalSeconds,
-            providerTokenUsageByTurn: session.providerTokenUsageByTurn,
-            automationTurnAudit: session.automationTurnAudit,
-            parentSessionID: session.parentSessionID,
-            createdByOverseerSessionID: session.createdByOverseerSessionID,
-            organizationalParentID: session.organizationalParentID,
-            delegationScopeID: session.delegationScopeID,
-            pendingHandoffProviderSwitchDelivery: session.pendingHandoff.providerSwitchDelivery,
-            pendingHandoffPayload: session.pendingHandoff.payload,
-            pendingHandoffCreatedAt: session.pendingHandoff.createdAt,
-            pendingHandoffSourceItemID: session.pendingHandoff.sourceItemID,
-            pendingHandoffDefersProviderLockUntilSend: session.pendingHandoff.defersProviderLockUntilSend,
-            pendingHandoffExecutionLocationFailure: session.pendingHandoff.executionLocationFailure,
-            selfCompactState: session.selfCompactState.active == nil && session.selfCompactState.latest == nil
-                ? nil : session.selfCompactState,
-            isMCPOriginated: session.isMCPOriginated,
-            worktreeBindings: session.worktreeBindings,
-            worktreeMergeOperations: session.worktreeMergeOperations
+        var agentSession = AgentSessionPayloadBuilder.makePayload(
+            session: session, sessionID: sessionID, workspaceID: workspace.id,
+            name: sessionName, snapshot: persistableSnapshot
         )
-        codexCoordinator.applyCodexPersistence(from: session, to: &agentSession)
-        let creationStamp: Data?
-        do {
-            switch effectiveCreationSave {
-            case let .configured(handle):
-                let stamp = try creationConfigurationStamp(for: agentSession)
-                guard session.markCreationReady(handle, configurationStamp: stamp) else {
-                    return .failed(.init(
-                        operation: .save,
-                        tabID: tabID,
-                        message: "Initial session configuration changed after it was prepared. Create a new session instead of retrying this save."
-                    ))
-                }
-                creationStamp = stamp
-            case .recovery:
-                guard agentSession.pendingHandoffExecutionLocationFailure != nil else {
-                    return .failed(.init(
-                        operation: .save,
-                        tabID: tabID,
-                        message: "An incomplete session can only save an explicitly blocked recovery payload."
-                    ))
-                }
-                creationStamp = nil
-            case nil:
-                creationStamp = nil
-            }
-        } catch {
-            return .failed(.init(operation: .save, tabID: tabID, message: error.localizedDescription))
-        }
         guard let saveToken = makeSaveCommitToken(for: session, workspace: workspace),
               isSaveCommitTokenCurrent(saveToken, creationHandle: effectiveCreationSave?.handle)
         else {
@@ -17805,53 +16936,47 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             // bypass writer admission, or spin a debounce loop while the conflict remains.
             return .deferred("The session does not have a unique runtime writer for this workspace.")
         }
+        let preparedWrite: AgentSessionSaveRuntime.PreparedWrite
         do {
-            let outcome = try await AgentSessionPayloadWriter.write(
-                agentSession,
+            preparedWrite = try AgentSessionSaveRuntime.prepare(
+                payload: agentSession, session: session, creation: effectiveCreationSave
+            )
+        } catch {
+            return .failed(.init(operation: .save, tabID: tabID, message: error.localizedDescription))
+        }
+        do {
+            let outcome = try await AgentSessionSaveRuntime.commit(
+                preparedWrite,
                 workspace: workspace,
                 canonicalItemCount: canonicalItemCount,
                 writer: writer,
                 token: saveToken,
-                creationHandle: effectiveCreationSave?.handle,
-                storageIsCurrent: { [weak workspaceManager] in
-                    guard let current = workspaceManager?.workspace(withID: workspace.id) else { return false }
+                storageIsCurrent: { [weak self, weak workspaceManager] in
+                    guard self?.isSaveCommitTokenCurrent(saveToken, creationHandle: effectiveCreationSave?.handle) == true,
+                          let current = workspaceManager?.workspace(withID: workspace.id) else { return false }
                     return WorkspaceSessionSidecarMigration.workspaceDirectory(
                         for: current, root: AgentSessionDataService.defaultWorkspaceRootURL()
                     ).standardizedFileURL.path == saveToken.workspaceDirectoryPath
                 },
+                currentName: { [self] in resolvedSessionDisplayName(for: tabID) },
                 observingPhase: observingPhase,
                 saver: agentSessionSaver
             )
+            let receipt: AgentSessionSaveRuntime.Receipt
             switch outcome {
-            case .rejectedBeforeWrite:
-                requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
-                return .deferred("The session writer or its storage location changed before persistence could commit.")
-            case .supersededAfterWrite:
-                requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
-                return .deferred("The session writer or its storage location changed while persistence was committing.")
-            case let .written(fileURL):
-                agentSession.fileURL = fileURL
-            }
-            guard isSaveCommitTokenCurrent(saveToken, creationHandle: effectiveCreationSave?.handle) else {
-                requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
-                return .deferred("The session or its storage location changed while persistence was committing.")
-            }
-            if case let .configured(handle) = effectiveCreationSave, let creationStamp {
-                var currentConfiguration = agentSession
-                refreshCreationConfiguration(from: session, payload: &currentConfiguration)
-                guard try creationConfigurationStamp(for: currentConfiguration) == creationStamp,
-                      session.acknowledgeConfiguredCreationSave(handle, configurationStamp: creationStamp)
-                else {
-                    return .deferred("The prepared session configuration changed while its initial payload was saving.")
+            case let .deferred(message, requestFreshSave):
+                if requestFreshSave {
+                    requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
                 }
-                // A new zero-link session has no oversight observation to repaint its loading
-                // snapshot. Publish the earned readiness at its configured-save boundary.
-                if sessions[tabID] === session, currentTabID == tabID {
-                    syncStatusPillsUIStateIfMonitorStale()
-                }
+                return .deferred(message)
+            case let .committed(committed):
+                receipt = committed
+                agentSession = committed.payload
             }
-            session.isDirty = false
-            session.lastUserMessageAt = lastUserMessageAt
+            if receipt.acknowledgedCreation, sessions[tabID] === session, currentTabID == tabID {
+                // A zero-link new session needs a repaint at its configured-save boundary.
+                syncStatusPillsUIStateIfMonitorStale()
+            }
             if let lastUserMessageAt {
                 sessionIndexStore.setSortDate(lastUserMessageAt, forTabID: tabID)
             } else {
@@ -17896,10 +17021,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     )
                 }
             #endif
-            let durableBindingToken = AgentSessionRestorationBindingToken(
-                bindingIdentity: saveToken.binding,
-                bindingTransitionGeneration: saveToken.bindingTransitionGeneration
-            )
+            let durableBindingToken = receipt.binding
             guard session.currentRestorationBindingToken == durableBindingToken else {
                 requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
                 return .deferred("The session binding changed after persistence committed.")
@@ -17921,14 +17043,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func waitForInFlightSave(sessionID: UUID) async {
-        guard saveInFlightSessionIDs.contains(sessionID) else { return }
-        await withCheckedContinuation { continuation in
-            guard saveInFlightSessionIDs.contains(sessionID) else {
-                continuation.resume()
-                return
-            }
-            saveCompletionWaitersBySessionID[sessionID, default: []].append(continuation)
-        }
+        await runtimeSessionStore.saveQueue.waitForInFlightSave(sessionID: sessionID)
     }
 
     func flushSave(for tabID: UUID) async {
@@ -24731,7 +23846,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             liveSession?.saveDebounceTask?.cancel()
             liveSession?.saveDebounceTask = nil
             liveSession?.saveRequestGeneration &+= 1
-            saveRequestedWhileInFlightSessionIDs.remove(sessionID)
+            runtimeSessionStore.saveQueue.discardFollowUp(sessionID: sessionID)
             do {
                 try await dataService.deleteAgentSession(id: sessionID, for: workspace)
             } catch {

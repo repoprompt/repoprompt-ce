@@ -3687,3 +3687,71 @@ are included in this passing tree. No app was launched or stopped. M9 remains
 in progress: complete save-core ownership, window-free execution composition and
 MCP/link/admin routing, presentation handoff and bounded retirement/drain remain
 required; this receipt is not acceptance of those unfinished paths.
+
+### M9 completion continuation — runtime save preparation and configured commit
+
+Starting at `33487157b`, the runtime scope owns save admission/coalescing/drain
+bookkeeping through `AgentSessionSaveQueue`. Deletion withdraws follow-up intent
+without claiming that an admitted write has drained. Cancellation of a waiter does
+not invent a durable-drain acknowledgment. The VM's three parallel queue collections
+are retired; existing close, required flush and fresh-creation callers use the same
+scope queue.
+
+`AgentSessionPayloadBuilder` owns the actual payload field construction, canonical
+configuration stamp, post-await configuration reread and Codex persistence fields.
+`AgentSessionSaveRuntime` prepares the configured/recovery write and performs the
+existing exact payload write and configured-creation acknowledgment. Preparation
+pins the exact object, binding and source/save revisions; a later token cannot
+relabel an older prepared payload as current. The existing session restoration
+state remains the only first-save authority. A URL from storage is not an
+acknowledgment. Runtime receipts carry the exact durable binding; the caller still
+publishes index and terminal effects in their existing order.
+
+The synchronous transcript refresh, incremental import, quiet-retirement,
+summary-only compaction and persistence snapshot algorithms now live in
+`AgentSessionTranscriptRefreshRuntime`. Save preparation uses those implementations,
+not VM callbacks. Optional presentation publication follows each refresh at the
+same call boundary. Existing VM APIs forward for their remaining callers; obsolete
+private snapshot/compaction implementations are removed. The refresh reason and
+persistable snapshot are neutral values with compatibility aliases; neither is a
+persisted or Codable type. Their raw values and persisted payload fields are
+unchanged.
+
+Four standalone runtime tests cover real-disk transcript preparation and configured
+first save without presentation models; held writes with configuration, name,
+incarnation and request-revision changes; cancellation after a durable effect; and
+coalescing/drain/deletion intent. The review compared moved transcript and payload
+bodies against the old hunks. It identified an admission-order regression: the new
+prepare guard could turn an unscoped writer's deferral into a failure. Writer/token
+admission now precedes preparation, preserving the fail-closed deferral path and
+preventing invalid preparation from marking creation ready. A VM regression checks
+that an unscoped binding reaches no saver, retains dirty state and does not spin a
+retry loop. The rebind fixture explicitly verifies its incarnation changed.
+
+Receipts so far:
+
+- `30a1dc22-3729-49d3-91af-5fbc1c6d16a4` (`m9-save-runtime-v1`): failed
+  compilation before tests on one deletion path still naming the retired queue
+  field; routed it through `discardFollowUp`.
+- `169f0818-f380-4c0f-8ed3-ccd004e0a797` (`m9-save-runtime-v2`): **117 tests
+  passed** (quiet display 14, retention 12, first-save 47, payload writer 4,
+  save runtime 4, transcript runtime 7, worktree recovery 29). This predates the
+  admission-order review fix. The filter also named a transcript file rather than
+  its actual suite names; those suites did not run under that name.
+
+This is not final M9 acceptance. The existing VM still composes admission/storage
+currency, debounce scheduling and index publication. Runtime host composition,
+window-free MCP/link/admin routing, presentation handoff, and bounded retirement
+must consume these runtime services before obsolete prepared-window ownership can
+be removed. No new lifecycle authority or target move is introduced here.
+
+Final receipt for this transition: `45776ab8-2590-4a07-8c50-e41e526f2f23`
+(`m9-save-runtime-v3`) **242 tests passed**: quiet display 14, retention 12,
+first-save 47, payload writer 4, save runtime 4, transcript runtime 7, sidebar
+restore stability 14, pane presentation 42, pane snapshot publication 4,
+restoration lifecycle 64, worktree recovery 30. This includes the admission-order
+fix, the unscoped-writer VM test and the actual restoration/publication suites.
+Conductor lint `0d525fa2-7d2e-4d13-8388-5010030ee5c9`
+(`m9-save-runtime-lint-v1`) passed on the same Swift tree. No live app action,
+publishing or target move occurred. Final product/index/full-suite evidence remains
+open until the remaining host/routing transition is implemented.

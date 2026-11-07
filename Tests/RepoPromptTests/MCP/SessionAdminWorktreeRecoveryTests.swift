@@ -11,6 +11,29 @@ import XCTest
 
 @MainActor
 final class SessionAdminWorktreeRecoveryTests: XCTestCase {
+    func testUnscopedWriterDefersBeforeConfiguredPayloadPreparation() async throws {
+        try await withFixture(canonicalHost: true) { fixture in
+            let viewModel = fixture.window.agentModeViewModel
+            var writes = 0
+            viewModel.test_setAgentSessionSaver { _, _, _ in
+                writes += 1
+                throw CancellationError()
+            }
+            let original = try XCTUnwrap(fixture.session.persistentSessionBindingIdentity)
+            fixture.session.installPersistentSessionBinding(.init(
+                tabID: original.tabID, sessionID: original.sessionID, generation: original.generation
+            ))
+            fixture.session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            fixture.session.isDirty = true
+            let result = await viewModel.flushSaveRequired(for: fixture.session.tabID, workspaceID: fixture.workspaceID)
+            guard case let .failure(failure) = result else { return XCTFail("An unscoped binding cannot write") }
+            XCTAssertEqual(failure.message, "The session does not have a unique runtime writer for this workspace.")
+            XCTAssertEqual(writes, 0)
+            XCTAssertTrue(fixture.session.isDirty)
+            XCTAssertTrue(fixture.session.saveDebounceTask?.isCancelled ?? true, "Unscoped identities must not spin a save retry loop")
+        }
+    }
+
     func testRequiredSaveRejectsConflictingWriterWithoutLosingDirtyStateThenRetriesExactly() async throws {
         try await withFixture(canonicalHost: true) { fixture in
             let viewModel = fixture.window.agentModeViewModel

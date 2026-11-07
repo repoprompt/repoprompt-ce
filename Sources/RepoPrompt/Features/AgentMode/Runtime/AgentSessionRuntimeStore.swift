@@ -95,6 +95,7 @@ final class AgentSessionRuntimeStore {
         fileprivate let id = UUID()
         fileprivate let store: AgentSessionRuntimeStore
         let presentation = AgentSessionPresentationRuntime()
+        let saveQueue = AgentSessionSaveQueue()
         private(set) var sessions: [UUID: AgentTabSession] = [:]
         private var liveClaimByTabID: [UUID: UUID] = [:]
         private var liveTabIDsBySessionID: [UUID: Set<UUID>] = [:]

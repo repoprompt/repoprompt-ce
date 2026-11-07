@@ -891,12 +891,7 @@ extension AgentModeViewModel {
 
     typealias DerivedTranscriptSyncState = AgentDerivedTranscriptSyncState
 
-    struct PersistableTranscriptSnapshot {
-        let transcript: AgentTranscript
-        let projectionCounts: AgentTranscriptProjectionCounts
-        let canonicalVisibleRowCount: Int
-        let lastUserMessageAt: Date?
-    }
+    typealias PersistableTranscriptSnapshot = AgentPersistableTranscriptSnapshot
 
     struct ActiveTranscriptFollowBindingState: Equatable {
         var tabID: UUID?
@@ -1017,12 +1012,7 @@ extension AgentModeViewModel {
 
     typealias BuiltTranscriptPresentation = AgentBuiltTranscriptPresentation
 
-    enum DerivedTranscriptRefreshReason: String {
-        case liveMutation
-        case saveSession
-        case coldLoad
-        case manualRefresh
-    }
+    typealias DerivedTranscriptRefreshReason = AgentDerivedTranscriptRefreshReason
 
     /// Internal for cross-file AgentModeViewModel extension access after the mechanical file split.
     struct SessionTreeNode {
