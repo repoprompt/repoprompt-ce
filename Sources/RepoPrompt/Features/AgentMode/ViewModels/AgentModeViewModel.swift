@@ -905,34 +905,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private var activeSessionIndexRefreshPrioritizedEntries: [UUID: AgentSessionIndexEntry] = [:]
     private var activeSessionIndexRefreshFullEntries: [UUID: AgentSessionIndexEntry] = [:]
     private var activeSessionIndexRefreshHasPublishedFullBatch = false
-    struct AgentSessionPersistenceFailure: Error, Equatable {
-        enum Operation: String, Equatable {
-            case save
-            case delete
-        }
-
-        let operation: Operation
-        let tabID: UUID
-        let message: String
-    }
-
-    private enum AgentSessionSaveResult {
-        case saved
-        case notRequired
-        case deferred(String)
-        case failed(AgentSessionPersistenceFailure)
-    }
-
-    /// Binding-qualified result from the normal save transaction.
-    ///
-    /// A durable token is emitted only after the saver succeeds, the save commit token is still
-    /// current, and restoration readiness has been updated for that exact binding.
-    private enum AgentSessionSaveCoreResult {
-        case durablySaved(AgentSessionRestorationBindingToken)
-        case notRequired
-        case deferred(String)
-        case failed(AgentSessionPersistenceFailure)
-    }
+    typealias AgentSessionPersistenceFailure = RepoPromptApp.AgentSessionPersistenceFailure
 
     typealias AgentSessionSaver = @MainActor (
         _ session: AgentSession,
@@ -961,6 +934,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             preparation: .alreadyCanonicalTranscript,
             trustedCanonicalItemCount: canonicalItemCount
         )
+    } {
+        didSet { runtimeSessionStore.persistence.saver = agentSessionSaver }
     }
 
     private var agentSessionsBatchDeleter: AgentSessionsBatchDeleter = { tabIDs, workspace in
@@ -3593,9 +3568,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             },
             childAgentRunWaitDrainTimeoutSeconds: Self.childAgentRunWaitDrainTimeoutSeconds
         )
+        let persistence = persistenceRuntime
         let hooks = AgentModeRunService.Hooks(
-            usage: usageRuntime.makeRunHooks(scheduleSave: { [weak self] session in
-                self?.scheduleSave(for: session)
+            usage: usageRuntime.makeRunHooks(scheduleSave: { session in
+                persistence.scheduleSave(for: session)
             }),
             attachments: .init(
                 reserveAttachmentsForTurn: { [weak self] attachments, session in
@@ -3634,11 +3610,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     _ = self?.restoreRouteRefusedUnsentTurn(session: session, userItemID: userItemID, message: message)
                 }
             ),
-            persistence: .init(
-                scheduleSave: { [weak self] session in
-                    self?.scheduleSave(for: session)
-                }
-            ),
+            persistence: persistence.makeRunHooks(),
             transcript: .init(
                 handleHeadlessStreamResult: { [weak self] result, session, runID, runAttemptID in
                     await self?.handleStreamResult(result, session: session, runID: runID, runAttemptID: runAttemptID)
@@ -16663,454 +16635,132 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
-    private func makeSaveCommitToken(
-        for session: TabSession,
-        workspace: WorkspaceModel
-    ) -> SessionSaveCommitToken? {
-        guard let binding = session.persistentSessionBindingIdentity,
-              binding.sessionID == session.activeAgentSessionID,
-              !session.bindingTransitionInProgress
-        else {
-            return nil
-        }
-        return SessionSaveCommitToken(
-            tabID: session.tabID,
-            sessionIdentity: ObjectIdentifier(session),
-            workspaceID: workspace.id,
-            workspaceDirectoryPath: sessionSaveWorkspaceDirectoryPath(for: workspace),
-            binding: binding,
-            bindingTransitionGeneration: session.bindingTransitionGeneration,
-            sourceItemsRevision: session.sourceItemsRevision,
-            persistenceMutationGeneration: session.persistenceMutationGeneration,
-            saveRequestGeneration: session.saveRequestGeneration
+    var persistenceRuntime: AgentSessionPersistenceRuntime {
+        let runtime = runtimeSessionStore.persistence
+        if runtime.composition == nil { installPersistenceComposition(runtime) }
+        return runtime
+    }
+
+    private func installPersistenceComposition(_ runtime: AgentSessionPersistenceRuntime) {
+        runtime.perfRecorder = perfRecorder
+        runtime.saver = agentSessionSaver
+        runtime.composition = .init(
+            workspace: { [weak self] in self?.workspaceManager?.activeWorkspace },
+            workspaceWithID: { [weak self] id in self?.workspaceManager?.workspace(withID: id) },
+            displayName: { [weak self] id in self?.resolvedSessionDisplayName(for: id) ?? AgentSessionRestoreSupport.normalizedSessionTitle(nil) },
+            isSuppressed: { [weak self] in self?.suppressesAgentSessionPersistence ?? false },
+            bypassesSuppression: { [weak self] in self?.bypassesAgentSessionPersistenceSuppressionForTesting ?? false },
+            isPreparedSavedHost: { [weak self] in self?.workspaceManager?.isSessionRuntimeProjection == true },
+            saveAdmission: { [weak self] session in
+                guard let self else { return "The session owner is unavailable." }
+                if let mutation = providerSwitchMutation, mutation.session === session, !mutation.allowsSave {
+                    return AgentSessionLinkSendFailure.targetBusy.rawValue
+                }
+                return nil
+            },
+            creationIsCurrent: { [weak self] handle in self?.freshSessionCreationIsCurrent(handle) == true },
+            admitBinding: { [weak self] session in
+                guard let self else { return nil }
+                var creation: AgentSessionCreationHandle?
+                guard let id = ensureSessionBoundToTab(session, onCreated: { creation = $0 }) else { return nil }
+                return .init(sessionID: id, creation: creation)
+            }
+        )
+        runtime.presentation = .init(
+            currentTabID: { [weak self] in self?.currentTabID },
+            isActivelyPresenting: { [weak self] in self?.canBuildOrPublishActiveTranscriptBindings(for: $0) == true },
+            didRefreshDerivedState: { [weak self] in self?.publishDerivedTranscriptState(for: $0) },
+            requestRefresh: { [weak self] in self?.requestUIRefresh(tabID: $0.tabID) },
+            didCommit: { [weak self] session, receipt, count in
+                self?.publishSessionSave(session, receipt: receipt, canonicalItemCount: count)
+            }
         )
     }
 
-    private func sessionSaveWorkspaceDirectoryPath(for workspace: WorkspaceModel) -> String {
-        WorkspaceSessionSidecarMigration.workspaceDirectory(
-            for: workspace, root: AgentSessionDataService.defaultWorkspaceRootURL()
-        ).standardizedFileURL.path
+    private func makeSaveCommitToken(for session: TabSession, workspace: WorkspaceModel) -> SessionSaveCommitToken? {
+        persistenceRuntime.makeSaveCommitToken(for: session, workspace: workspace)
     }
 
-    private func isSaveCommitTokenCurrent(
-        _ token: SessionSaveCommitToken,
-        requireWorkspaceMatch: Bool = true,
-        creationHandle: AgentSessionCreationHandle? = nil
-    ) -> Bool {
-        if requireWorkspaceMatch {
-            // A storage move can preserve every session/binding identity. The completed write
-            // only acknowledges the placement captured from the workspace passed to its saver.
-            guard let workspace = workspaceManager?.activeWorkspace,
-                  workspace.id == token.workspaceID,
-                  sessionSaveWorkspaceDirectoryPath(for: workspace) == token.workspaceDirectoryPath
-            else { return false }
-        }
-        guard let session = sessions[token.tabID] else { return false }
-        return token.matches(session, creationHandle: creationHandle)
-    }
-
-    private func requestFreshSaveForCurrentOwner(
-        sessionID: UUID,
-        fallbackSession: TabSession
-    ) {
-        let currentOwner = try? authoritativeLiveSession(for: sessionID)
-        if let currentOwner {
-            currentOwner.isDirty = true
-            runtimeSessionStore.saveQueue.requestFollowUp(sessionID: sessionID)
-        } else if fallbackSession.activeAgentSessionID == sessionID {
-            fallbackSession.isDirty = true
-            runtimeSessionStore.saveQueue.requestFollowUp(sessionID: sessionID)
-        }
+    private func isSaveCommitTokenCurrent(_ token: SessionSaveCommitToken, requireWorkspaceMatch: Bool = true, creationHandle: AgentSessionCreationHandle? = nil) -> Bool {
+        persistenceRuntime.isSaveCommitTokenCurrent(token, requireWorkspaceMatch: requireWorkspaceMatch, creationHandle: creationHandle)
     }
 
     func scheduleSave(for tabID: UUID) {
-        guard !suppressesAgentSessionPersistence else { return }
-        guard let session = sessions[tabID], session.creationState == nil else { return }
-        session.saveRequestGeneration &+= 1
-        guard !session.isInstallingHandoffWorktreeBindings else {
-            // Handoff saves the destination explicitly once its inherited bindings are installed.
-            session.saveDebounceTask?.cancel()
-            session.saveDebounceTask = nil
-            return
-        }
-        #if DEBUG
-            let replacedPendingSave = session.saveDebounceTask != nil
-            perfRecorder.increment("save.schedule", tabID: tabID)
-            if replacedPendingSave {
-                perfRecorder.increment("save.schedule.replaced", tabID: tabID)
-            }
-            perfRecorder.event("save.schedule", tabID: tabID, fields: ["replaced": String(replacedPendingSave), "dirty": String(session.isDirty)])
-        #endif
-        session.saveDebounceTask?.cancel()
-        session.saveDebounceTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second debounce
-            guard !Task.isCancelled,
-                  self?.sessions[tabID]?.isInstallingHandoffWorktreeBindings != true
-            else { return }
-            await self?.saveSession(for: tabID)
-        }
+        persistenceRuntime.scheduleSave(for: tabID)
     }
 
-    /// Schedules persistence only while the supplied object is still the live
-    /// owner of its tab identifier. Stale predecessors must not save successors.
     func scheduleSave(for session: TabSession) {
-        guard sessions[session.tabID] === session else { return }
-        scheduleSave(for: session.tabID)
+        persistenceRuntime.scheduleSave(for: session)
     }
 
     func scheduleSaveForCommandOutput(tabID: UUID, minInterval: TimeInterval = 5.0) {
-        guard let session = sessions[tabID] else { return }
-        let now = Date()
-        if let lastSaveAt = session.lastCommandOutputSaveAt,
-           now.timeIntervalSince(lastSaveAt) < minInterval
-        {
-            #if DEBUG
-                perfRecorder.increment("save.commandOutput.skipped", tabID: tabID)
-                perfRecorder.event(
-                    "save.commandOutput.skipped",
-                    tabID: tabID,
-                    fields: [
-                        "elapsed": String(format: "%.2fs", now.timeIntervalSince(lastSaveAt)),
-                        "minInterval": String(format: "%.2fs", minInterval)
-                    ]
-                )
-            #endif
-            return
-        }
-        session.lastCommandOutputSaveAt = now
-        #if DEBUG
-            perfRecorder.increment("save.commandOutput.scheduled", tabID: tabID)
-            perfRecorder.event("save.commandOutput.scheduled", tabID: tabID, fields: ["minInterval": String(format: "%.2fs", minInterval)])
-        #endif
-        scheduleSave(for: tabID)
+        persistenceRuntime.scheduleSaveForCommandOutput(tabID: tabID, minInterval: minInterval)
     }
 
     @discardableResult
     private func saveSession(for tabID: UUID, observingPhase: ((RequiredSavePhase) -> Void)? = nil) async -> AgentSessionSaveResult {
-        switch await saveSessionCore(for: tabID, observingPhase: observingPhase) {
-        case .durablySaved:
-            .saved
-        case .notRequired:
-            .notRequired
-        case let .deferred(message):
-            .deferred(message)
-        case let .failed(failure):
-            .failed(failure)
-        }
+        await persistenceRuntime.saveSession(for: tabID, observingPhase: observingPhase)
     }
 
     private typealias SessionCreationSave = AgentSessionCreationSave
-
-    private func saveSessionCore(
-        for tabID: UUID, creationSave: SessionCreationSave? = nil,
-        observingPhase: ((RequiredSavePhase) -> Void)? = nil
-    ) async -> AgentSessionSaveCoreResult {
-        #if DEBUG
-            let diagnosticsStartMS = perfRecorder.timestampMSIfEnabled()
-            perfRecorder.increment("save.session.invoked", tabID: tabID)
-        #endif
-        guard !suppressesAgentSessionPersistence
-            || bypassesAgentSessionPersistenceSuppressionForTesting
-        else {
-            #if DEBUG
-                perfRecorder.event("save.session.skipped", tabID: tabID, fields: ["reason": "suppressed"])
-            #endif
-            return .notRequired
-        }
-        guard let session = sessions[tabID] else {
-            #if DEBUG
-                perfRecorder.event("save.session.skipped", tabID: tabID, fields: ["reason": "missing"])
-            #endif
-            return .notRequired
-        }
-        if workspaceManager?.isSessionRuntimeProjection == true,
-           let id = session.activeAgentSessionID, AgentSessionDeletionRegistry.shared.blocksNewOversight(sessionID: id)
-        {
-            return .deferred("The saved target is being deleted or has been deleted; its retired runtime cannot write it back.")
-        }
-        if let mutation = providerSwitchMutation, mutation.session === session, !mutation.allowsSave {
-            return .deferred(AgentSessionLinkSendFailure.targetBusy.rawValue)
-        }
-        var effectiveCreationSave = creationSave
-        if let handle = creationSave?.handle {
-            guard handle.session === session, freshSessionCreationIsCurrent(handle),
-                  session.creationHandleIsCurrent(handle)
-            else {
-                return .deferred("The session creation owner changed before persistence.")
-            }
-        } else if let message = session.restorationAdmissionFailureMessage {
-            return .failed(.init(operation: .save, tabID: tabID, message: message))
-        }
-        guard !session.isInstallingHandoffWorktreeBindings else {
-            // Any save path (debounce, flush, required flush) would persist the provisional,
-            // unbound Handoff destination; Handoff saves it explicitly once installation settles.
-            return .deferred("Handoff is still preparing this chat's worktree execution location.")
-        }
-        guard session.isDirty || session.activeAgentSessionID == nil else {
-            #if DEBUG
-                perfRecorder.event("save.session.skipped", tabID: tabID, fields: ["reason": "clean"])
-            #endif
-            return .notRequired
-        }
-        guard let workspace = workspaceManager?.activeWorkspace else {
-            return .failed(.init(operation: .save, tabID: tabID, message: "Active workspace is unavailable."))
-        }
-
-        let hasConversationContent = !session.items.isEmpty || !session.transcript.turns.isEmpty || session.runState.isActive || session.hasPendingQuestionUI || session.pendingApproval != nil || session.hasPendingCodexHookReviewWait || session.pendingPermissionsRequest != nil || session.pendingApplyEditsReview != nil || session.pendingWorktreeMergeReview != nil || session.worktreeMergeOperations.contains { $0.status.isActive }
-        if session.activeAgentSessionID == nil, !hasConversationContent {
-            return .notRequired
-        }
-        guard let sessionID = ensureSessionBoundToTab(session, onCreated: { handle in
-            effectiveCreationSave = .configured(handle)
-        }) else {
-            return .failed(.init(operation: .save, tabID: tabID, message: "A required session binding could not be established."))
-        }
-        session.saveRequestGeneration &+= 1
-        let saveQueue = runtimeSessionStore.saveQueue
-        guard saveQueue.begin(sessionID: sessionID) else {
-            return .deferred("A save for this session is already in flight.")
-        }
-        defer {
-            if saveQueue.finish(sessionID: sessionID) {
-                if let currentOwner = try? authoritativeLiveSession(for: sessionID) {
-                    scheduleSave(for: currentOwner.tabID)
-                } else if sessions[tabID] === session,
-                          session.activeAgentSessionID == sessionID
-                {
-                    scheduleSave(for: tabID)
-                }
-            }
-        }
-        let isActiveOwnedForSave = canBuildOrPublishActiveTranscriptBindings(for: session)
-        let preparation = AgentSessionTranscriptRefreshRuntime.prepareSave(
-            for: session, isActiveOwnedForSave: isActiveOwnedForSave,
-            perfRecorder: perfRecorder, diagnosticPresentationID: perfRecorder.shortID(currentTabID),
-            didRefreshDerivedState: { [self] session in publishDerivedTranscriptState(for: session) }
-        )
-        let persistableSnapshot = preparation.snapshot
-        let shouldRefreshAfterPreparation = preparation.shouldRefreshPresentation
-        if shouldRefreshAfterPreparation {
-            // Only refresh sessions that can publish active bindings now. Inactive
-            // persistence-only saves must not feed back into UI projection work.
-            if isActiveOwnedForSave {
-                #if DEBUG
-                    perfRecorder.increment("save.session.innerRefresh", tabID: tabID)
-                    perfRecorder.event("save.session.innerRefresh", tabID: tabID)
-                #endif
-                requestUIRefresh(tabID: tabID)
-            } else {
-                #if DEBUG
-                    perfRecorder.increment("save.session.innerRefreshSkippedInactive", tabID: tabID)
-                    perfRecorder.event(
-                        "save.session.innerRefreshSkipped",
-                        tabID: tabID,
-                        fields: [
-                            "reason": "inactiveTab",
-                            "currentTabID": perfRecorder.shortID(currentTabID)
-                        ]
-                    )
-                #endif
-            }
-        }
-
-        // Build the persisted session only for the binding generation captured below.
-        let lastUserMessageAt = persistableSnapshot.lastUserMessageAt
-        let canonicalItemCount = persistableSnapshot.canonicalVisibleRowCount
-        let sessionName = resolvedSessionDisplayName(for: tabID)
-        var agentSession = AgentSessionPayloadBuilder.makePayload(
-            session: session, sessionID: sessionID, workspaceID: workspace.id,
-            name: sessionName, snapshot: persistableSnapshot
-        )
-        guard let saveToken = makeSaveCommitToken(for: session, workspace: workspace),
-              isSaveCommitTokenCurrent(saveToken, creationHandle: effectiveCreationSave?.handle)
-        else {
-            requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
-            return .deferred("The session or its storage location changed before persistence could commit.")
-        }
-
-        guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
-            workspaceID: workspace.id, sessionID: sessionID
-        ), writer.session === session else {
-            // Unknown placement and conflicting identities are not transient save retries.
-            // Keep dirty state and fail required flushes honestly; do not guess a workspace,
-            // bypass writer admission, or spin a debounce loop while the conflict remains.
-            return .deferred("The session does not have a unique runtime writer for this workspace.")
-        }
-        let preparedWrite: AgentSessionSaveRuntime.PreparedWrite
-        do {
-            preparedWrite = try AgentSessionSaveRuntime.prepare(
-                payload: agentSession, session: session, creation: effectiveCreationSave
-            )
-        } catch {
-            return .failed(.init(operation: .save, tabID: tabID, message: error.localizedDescription))
-        }
-        do {
-            let outcome = try await AgentSessionSaveRuntime.commit(
-                preparedWrite,
-                workspace: workspace,
-                canonicalItemCount: canonicalItemCount,
-                writer: writer,
-                token: saveToken,
-                storageIsCurrent: { [weak self, weak workspaceManager] in
-                    guard self?.isSaveCommitTokenCurrent(saveToken, creationHandle: effectiveCreationSave?.handle) == true,
-                          let current = workspaceManager?.workspace(withID: workspace.id) else { return false }
-                    return WorkspaceSessionSidecarMigration.workspaceDirectory(
-                        for: current, root: AgentSessionDataService.defaultWorkspaceRootURL()
-                    ).standardizedFileURL.path == saveToken.workspaceDirectoryPath
-                },
-                currentName: { [self] in resolvedSessionDisplayName(for: tabID) },
-                observingPhase: observingPhase,
-                saver: agentSessionSaver
-            )
-            let receipt: AgentSessionSaveRuntime.Receipt
-            switch outcome {
-            case let .deferred(message, requestFreshSave):
-                if requestFreshSave {
-                    requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
-                }
-                return .deferred(message)
-            case let .committed(committed):
-                receipt = committed
-                agentSession = committed.payload
-            }
-            if receipt.acknowledgedCreation, sessions[tabID] === session, currentTabID == tabID {
-                // A zero-link new session needs a repaint at its configured-save boundary.
-                syncStatusPillsUIStateIfMonitorStale()
-            }
-            if let lastUserMessageAt {
-                sessionIndexStore.setSortDate(lastUserMessageAt, forTabID: tabID)
-            } else {
-                sessionIndexStore.removeSortDate(forTabID: tabID)
-            }
-            upsertSessionIndex(
-                sessionID: sessionID,
-                tabID: tabID,
-                name: sessionName,
-                lastUserMessageAt: lastUserMessageAt,
-                savedAt: agentSession.savedAt,
-                lastRunStateRaw: agentSession.lastRunState,
-                itemCount: canonicalItemCount,
-                agentKindRaw: agentSession.agentKind,
-                agentModelRaw: agentSession.agentModel,
-                agentReasoningEffortRaw: agentSession.agentReasoningEffort,
-                acpModelParameterSelections: agentSession.acpModelParameterSelections,
-                autoEditEnabled: agentSession.autoEditEnabled,
-                autoWakeOnOversightUpdates: agentSession.autoWakeOnOversightUpdates,
-                agentSessionLinkAutoWakeTargetSessionIDs: agentSession.agentSessionLinkAutoWakeTargetSessionIDs,
-                routineWakeIntervalEnabled: agentSession.routineWakeIntervalEnabled,
-                routineWakeIntervalSeconds: agentSession.routineWakeIntervalSeconds,
-                periodicIdleWakeEnabled: agentSession.periodicIdleWakeEnabled,
-                periodicIdleWakeIntervalSeconds: agentSession.periodicIdleWakeIntervalSeconds,
-                parentSessionID: agentSession.parentSessionID,
-                createdByOverseerSessionID: agentSession.createdByOverseerSessionID,
-                organizationalParentID: agentSession.organizationalParentID,
-                delegationScopeID: agentSession.delegationScopeID,
-                isMCPOriginated: agentSession.isMCPOriginated,
-                worktreeBindingSummaries: agentSession.worktreeBindings.worktreeBindingSummaries,
-                activeWorktreeMergeSummaries: agentSession.worktreeMergeOperations.activeWorktreeMergeSummaries
-            )
-            #if DEBUG
-                if let diagnosticsStartMS {
-                    perfRecorder.event(
-                        "save.session.complete",
-                        tabID: tabID,
-                        fields: [
-                            "duration": perfRecorder.formatElapsedMS(since: diagnosticsStartMS),
-                            "itemCount": String(canonicalItemCount)
-                        ]
-                    )
-                }
-            #endif
-            let durableBindingToken = receipt.binding
-            guard session.currentRestorationBindingToken == durableBindingToken else {
-                requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
-                return .deferred("The session binding changed after persistence committed.")
-            }
-            observingPhase?(.durablySaved(durableBindingToken))
-            return .durablySaved(durableBindingToken)
-        } catch {
-            #if DEBUG
-                perfRecorder.event("save.session.error", tabID: tabID, fields: ["error": String(describing: error)])
-            #endif
-            let failure = AgentSessionPersistenceFailure(
-                operation: .save,
-                tabID: tabID,
-                message: String(describing: error)
-            )
-            print("[AgentModeVM] Failed to save session: \(failure.message)")
-            return .failed(failure)
-        }
+    private func saveSessionCore(for tabID: UUID, creationSave: SessionCreationSave? = nil, observingPhase: ((RequiredSavePhase) -> Void)? = nil) async -> AgentSessionSaveCoreResult {
+        await persistenceRuntime.saveSessionCore(for: tabID, creationSave: creationSave, observingPhase: observingPhase)
     }
 
     private func waitForInFlightSave(sessionID: UUID) async {
-        await runtimeSessionStore.saveQueue.waitForInFlightSave(sessionID: sessionID)
+        await persistenceRuntime.waitForInFlightSave(sessionID: sessionID)
     }
 
     func flushSave(for tabID: UUID) async {
-        guard let session = sessions[tabID] else { return }
-        session.saveDebounceTask?.cancel()
-        _ = await saveSession(for: tabID)
+        await persistenceRuntime.flushSave(for: tabID)
     }
 
-    /// Internal rather than private because the cross-session send transaction uses required
-    /// persistence as its delivery linearization point: the attributed row must be durable before a
-    /// provider turn starts, and a debounced `scheduleSave` cannot provide that guarantee.
-    func flushSaveRequired(
-        for tabID: UUID,
-        workspaceID: UUID,
-        observingSavePhase: ((RequiredSavePhase) -> Void)? = nil
-    ) async -> Result<Void, AgentSessionPersistenceFailure> {
-        observingSavePhase?(.beforeWrite)
-        guard let capturedSession = sessions[tabID] else { return .success(()) }
-        let capturedBinding = capturedSession.persistentSessionBindingIdentity
-        let capturedRestorationToken = capturedSession.currentRestorationBindingToken
-        if let message = capturedSession.restorationAdmissionFailureMessage {
-            return .failure(.init(operation: .save, tabID: tabID, message: message))
-        }
-        capturedSession.saveDebounceTask?.cancel()
+    func flushSaveRequired(for tabID: UUID, workspaceID: UUID, observingSavePhase: ((RequiredSavePhase) -> Void)? = nil) async -> Result<Void, AgentSessionPersistenceFailure> {
+        await persistenceRuntime.flushSaveRequired(for: tabID, workspaceID: workspaceID, observingSavePhase: observingSavePhase)
+    }
 
-        if let sessionID = capturedSession.activeAgentSessionID {
-            while saveInFlightSessionIDs.contains(sessionID) {
-                await waitForInFlightSave(sessionID: sessionID)
-            }
+    private func publishSessionSave(_ session: TabSession, receipt: AgentSessionSaveRuntime.Receipt, canonicalItemCount: Int) {
+        let tabID = session.tabID
+        let agentSession = receipt.payload
+        let sessionID = agentSession.id
+        let sessionName = agentSession.name
+        let lastUserMessageAt = agentSession.lastUserMessageAt
+        if receipt.acknowledgedCreation, sessions[tabID] === session, currentTabID == tabID {
+            // A zero-link new session needs a repaint at its configured-save boundary.
+            syncStatusPillsUIStateIfMonitorStale()
         }
-
-        guard workspaceManager?.activeWorkspace?.id == workspaceID else {
-            return .failure(.init(
-                operation: .save,
-                tabID: tabID,
-                message: "The owning workspace changed during required persistence."
-            ))
+        if let lastUserMessageAt {
+            sessionIndexStore.setSortDate(lastUserMessageAt, forTabID: tabID)
+        } else {
+            sessionIndexStore.removeSortDate(forTabID: tabID)
         }
-        guard sessions[tabID] === capturedSession,
-              capturedSession.persistentSessionBindingIdentity == capturedBinding,
-              capturedSession.currentRestorationBindingToken == capturedRestorationToken,
-              capturedSession.restorationAdmissionFailureMessage == nil
-        else {
-            return .failure(.init(
-                operation: .save,
-                tabID: tabID,
-                message: "The live session owner changed during required persistence."
-            ))
-        }
-
-        switch await saveSession(for: tabID, observingPhase: observingSavePhase) {
-        case .saved:
-            guard !capturedSession.isDirty else {
-                return .failure(.init(
-                    operation: .save,
-                    tabID: tabID,
-                    message: "The session changed while required persistence was committing."
-                ))
-            }
-            return .success(())
-        case .notRequired:
-            return .success(())
-        case let .deferred(message):
-            return .failure(.init(operation: .save, tabID: tabID, message: message))
-        case let .failed(failure):
-            return .failure(failure)
-        }
+        upsertSessionIndex(
+            sessionID: sessionID,
+            tabID: tabID,
+            name: sessionName,
+            lastUserMessageAt: lastUserMessageAt,
+            savedAt: agentSession.savedAt,
+            lastRunStateRaw: agentSession.lastRunState,
+            itemCount: canonicalItemCount,
+            agentKindRaw: agentSession.agentKind,
+            agentModelRaw: agentSession.agentModel,
+            agentReasoningEffortRaw: agentSession.agentReasoningEffort,
+            acpModelParameterSelections: agentSession.acpModelParameterSelections,
+            autoEditEnabled: agentSession.autoEditEnabled,
+            autoWakeOnOversightUpdates: agentSession.autoWakeOnOversightUpdates,
+            agentSessionLinkAutoWakeTargetSessionIDs: agentSession.agentSessionLinkAutoWakeTargetSessionIDs,
+            routineWakeIntervalEnabled: agentSession.routineWakeIntervalEnabled,
+            routineWakeIntervalSeconds: agentSession.routineWakeIntervalSeconds,
+            periodicIdleWakeEnabled: agentSession.periodicIdleWakeEnabled,
+            periodicIdleWakeIntervalSeconds: agentSession.periodicIdleWakeIntervalSeconds,
+            parentSessionID: agentSession.parentSessionID,
+            createdByOverseerSessionID: agentSession.createdByOverseerSessionID,
+            organizationalParentID: agentSession.organizationalParentID,
+            delegationScopeID: agentSession.delegationScopeID,
+            isMCPOriginated: agentSession.isMCPOriginated,
+            worktreeBindingSummaries: agentSession.worktreeBindings.worktreeBindingSummaries,
+            activeWorktreeMergeSummaries: agentSession.worktreeMergeOperations.activeWorktreeMergeSummaries
+        )
     }
 
     private func persistCurrentSession() {

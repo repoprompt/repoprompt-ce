@@ -262,6 +262,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     }
 
     private weak var viewModel: AgentModeViewModel?
+    private var persistenceRuntime: AgentSessionPersistenceRuntime?
     private var terminalCommitBarrier: AgentRunTerminalCommitBarrier?
     private var terminalSessionBinder: (@MainActor (AgentTabSession) -> AgentRunTerminalSessionBinding)?
     #if DEBUG
@@ -488,6 +489,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     func attach(viewModel: AgentModeViewModel) {
         self.viewModel = viewModel
+        installPersistenceRuntime(viewModel.persistenceRuntime)
+    }
+
+    func installPersistenceRuntime(_ runtime: AgentSessionPersistenceRuntime) {
+        persistenceRuntime = runtime
     }
 
     func installTerminalCommitBarrier(
@@ -777,7 +783,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.codexModel = reference.model
         session.codexReasoningEffort = reference.reasoningEffort
         session.isDirty = true
-        viewModel?.scheduleSave(for: session.tabID)
+        persistenceRuntime?.scheduleSave(for: session)
     }
 
     private func publishCodexHookGateState(for session: AgentTabSession) {
@@ -1287,7 +1293,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             notice,
             sequenceIndex: session.nextSequenceIndex
         ))
-        viewModel?.scheduleSave(for: session.tabID)
+        persistenceRuntime?.scheduleSave(for: session)
         publishCodexHookGateState(for: session)
         continuation?.resume()
     }
@@ -2652,7 +2658,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.runState = .idle
         setRunningStatus(nil, source: nil, session: session)
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-        viewModel?.scheduleSave(for: session.tabID)
+        persistenceRuntime?.scheduleSave(for: session)
     }
 
     /// How an overseer-requested Codex compaction ended at its provider boundary.
@@ -2895,7 +2901,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         setRunningStatus("Compacting context…", source: .transport, session: session, urgent: true)
         viewModel?.setAgentRunActive(session.tabID, isActive: true)
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-        viewModel?.scheduleSave(for: session.tabID)
+        persistenceRuntime?.scheduleSave(for: session)
     }
 
     private func beginTrackedCodexUserTurn(_ session: AgentTabSession) {
@@ -3200,7 +3206,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         viewModel?.refreshCodexContextUsageSnapshot(for: session)
         session.isDirty = true
         viewModel?.requestUIRefresh(tabID: session.tabID)
-        viewModel?.scheduleSave(for: session.tabID)
+        persistenceRuntime?.scheduleSave(for: session)
     }
 
     private func resetTrackedCodexTurns(_ session: AgentTabSession) {
@@ -3390,7 +3396,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         session.isDirty = true
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-        viewModel?.scheduleSave(for: session.tabID)
+        persistenceRuntime?.scheduleSave(for: session)
         if case .noActiveTurn = reason {
             scheduleCodexFallbackIdlePump(session: session, queueID: submission.queueID)
         }
@@ -3697,7 +3703,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             updateCodexStallWatchdogState(for: session)
             if let auditTurnID = head.optimisticUserItemID {
                 session.updateAutomationAudit(turnID: auditTurnID) { $0.recordCodexDispatch(.fallbackStart) }
-                viewModel?.scheduleSave(for: session.tabID)
+                persistenceRuntime?.scheduleSave(for: session)
             }
             let released = inputProof.flatMap { viewModel?.agentSessionLinkHandoffProviderInput(for: session, dispatchID: promptDispatchID, claim: monitoring?.claim, proof: $0) }
             guard released?.mustAbortDispatch != true else { throw CancellationError() }
@@ -3717,7 +3723,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         autoEffortApplied: head.autoEffortApplied
                     )
                 }
-                viewModel?.scheduleSave(for: session.tabID)
+                persistenceRuntime?.scheduleSave(for: session)
             }
             viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: released == nil ? monitoring?.claim : released?.claim)
             guard var inFlight = session.codexFallbackDispatchInFlight,
@@ -3798,7 +3804,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
         }
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-        viewModel?.scheduleSave(for: session.tabID)
+        persistenceRuntime?.scheduleSave(for: session)
     }
 
     private enum CodexFallbackAbandonmentMode: Equatable {
@@ -3877,7 +3883,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         viewModel?.publishMCPStateChange(for: session)
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-        viewModel?.scheduleSave(for: session.tabID)
+        persistenceRuntime?.scheduleSave(for: session)
     }
 
     func handleMCPControlReset(
@@ -5146,7 +5152,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 logCodex("[AgentModeVM][CodexReconnect] reconnect preserved after generation mismatch (current=\(session.codexToolPreferencesGeneration) started=\(preferenceGenerationAtStart)); next ensure will rebuild thread config")
             }
             session.isDirty = true
-            viewModel?.scheduleSave(for: session.tabID)
+            persistenceRuntime?.scheduleSave(for: session)
             scheduleCodexThreadNameSyncIfPossible(
                 for: session,
                 name: viewModel?.codexThreadDisplayName(for: session.tabID),
@@ -5370,7 +5376,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 notice,
                 sequenceIndex: session.nextSequenceIndex
             ))
-            viewModel?.scheduleSave(for: session.tabID)
+            persistenceRuntime?.scheduleSave(for: session)
         }
         await finalizeCodexRun(
             session,
@@ -6159,7 +6165,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     session.updateAutomationAudit(turnID: auditTurnID) {
                         $0.recordCodexDispatch(.managedAuthReplay)
                     }
-                    viewModel?.scheduleSave(for: session.tabID)
+                    persistenceRuntime?.scheduleSave(for: session)
                 }
                 guard await validateCodexComputerUseScope(session: session, controller: controller, activationID: computerUseActivationID) else { throw CancellationError() }
                 if computerUseActivationID != nil {
@@ -6193,7 +6199,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             autoEffortApplied: replayTurn.autoEffortApplied
                         )
                     }
-                    viewModel?.scheduleSave(for: session.tabID)
+                    persistenceRuntime?.scheduleSave(for: session)
                 }
                 return receipt
             }
@@ -6238,7 +6244,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         if !wasReconnectNeeded {
             session.isDirty = true
             if scheduleSave {
-                viewModel?.scheduleSave(for: session.tabID)
+                persistenceRuntime?.scheduleSave(for: session)
             }
         }
         logCodex("[AgentModeVM][CodexReconnect] reconnect flag set for tab \(session.tabID) source=\(source) (changed=\(!wasReconnectNeeded))")
@@ -6642,7 +6648,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             setRunningStatus(nil, source: nil, session: session)
             viewModel?.setAgentRunActive(session.tabID, isActive: false)
             viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-            viewModel?.scheduleSave(for: session.tabID)
+            persistenceRuntime?.scheduleSave(for: session)
         }
         #if DEBUG
             if reason == "workspace-resolution", let testWorkspaceResolutionFailurePublicationGate {
@@ -6715,7 +6721,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             viewModel?.setAgentRunActive(session.tabID, isActive: false)
         }
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-        viewModel?.scheduleSave(for: session.tabID)
+        persistenceRuntime?.scheduleSave(for: session)
     }
 
     private func retireCodexControllerAfterWorkspaceResolutionFailure(
@@ -7102,7 +7108,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             return
                         }
                         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-                        viewModel?.scheduleSave(for: session.tabID)
+                        persistenceRuntime?.scheduleSave(for: session)
                         return
                     }
 
@@ -7761,7 +7767,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             var state = session.selfCompactState
             if state.cancelStaleParkedNote(for: session) {
                 session.selfCompactState = state
-                viewModel?.scheduleSave(for: session.tabID)
+                persistenceRuntime?.scheduleSave(for: session)
             }
             guard let parked = session.selfCompactState.parkedNote,
                   session.selfCompactNoteDispatchIsCurrent(parked.dispatchID)
@@ -7812,7 +7818,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 )
                 session.appendItem(AgentChatItem.error(message, sequenceIndex: session.nextSequenceIndex))
                 viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-                viewModel?.scheduleSave(for: session.tabID)
+                persistenceRuntime?.scheduleSave(for: session)
                 return .preDispatchRejected(message: message)
             }
             guard session.runID == activeSendRunID,
@@ -7967,7 +7973,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 }
                 setRunningStatus(nil, source: nil, session: session)
                 viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-                viewModel?.scheduleSave(for: session.tabID)
+                persistenceRuntime?.scheduleSave(for: session)
             }
             return .failed(message: message)
         }
@@ -7998,7 +8004,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 session.appendItem(AgentChatItem.error(message, sequenceIndex: session.nextSequenceIndex))
                 setRunningStatus(nil, source: nil, session: session)
                 viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-                viewModel?.scheduleSave(for: session.tabID)
+                persistenceRuntime?.scheduleSave(for: session)
             }
             return .failed(message: message)
         }
@@ -8310,7 +8316,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             session.updateAutomationAudit(turnID: auditTurnID) {
                                 $0.recordCodexDispatch(.start)
                             }
-                            viewModel?.scheduleSave(for: session.tabID)
+                            persistenceRuntime?.scheduleSave(for: session)
                         }
                         guard await computerUsePhysicalDispatchIsCurrent() else { throw CancellationError() }
                         // Bind switch evidence before optional Read proof can suspend. Upstream's
@@ -8344,7 +8350,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                                 throw CancellationError()
                             }
                             session.selfCompactState = state
-                            viewModel?.scheduleSave(for: session.tabID)
+                            persistenceRuntime?.scheduleSave(for: session)
                         }
                         let receipt: CodexTurnStartReceipt
                         do {
@@ -8354,7 +8360,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                                     var state = session.selfCompactState
                                     _ = state.noteDefinitivelyNotAttempted(noteDispatchID)
                                     session.selfCompactState = state
-                                    viewModel?.scheduleSave(for: session.tabID)
+                                    persistenceRuntime?.scheduleSave(for: session)
                                 }
                                 throw CancellationError()
                             }
@@ -8373,7 +8379,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                                 var state = session.selfCompactState
                                 _ = state.noteTransportFailed(noteDispatchID)
                                 session.selfCompactState = state
-                                viewModel?.scheduleSave(for: session.tabID)
+                                persistenceRuntime?.scheduleSave(for: session)
                             }
                             throw error
                         }
@@ -8384,7 +8390,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                                 viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
                             }
                             session.selfCompactState = state
-                            viewModel?.scheduleSave(for: session.tabID)
+                            persistenceRuntime?.scheduleSave(for: session)
                         }
                         if let auditTurnID {
                             session.updateAutomationAudit(turnID: auditTurnID) {
@@ -8393,7 +8399,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                                     autoEffortApplied: physicalSelection.isAuto
                                 )
                             }
-                            viewModel?.scheduleSave(for: session.tabID)
+                            persistenceRuntime?.scheduleSave(for: session)
                         }
                         return receipt
                     }
@@ -8410,12 +8416,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 logCodex("[AgentModeVM] sendCodexNativeMessage: calling controller.steerUserTurn expectedTurnID=\(identity.turnID)")
                 if let auditTurnID {
                     session.updateAutomationAudit(turnID: auditTurnID) { $0.recordCodexDispatch(.steer) }
-                    viewModel?.scheduleSave(for: session.tabID)
+                    persistenceRuntime?.scheduleSave(for: session)
                 }
                 func recordAcceptedSteer() {
                     guard let auditTurnID else { return }
                     session.updateAutomationAudit(turnID: auditTurnID) { $0.recordCodexSteerAccepted() }
-                    viewModel?.scheduleSave(for: session.tabID)
+                    persistenceRuntime?.scheduleSave(for: session)
                 }
                 do {
                     let proof = await viewModel?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
@@ -8435,7 +8441,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         var state = session.selfCompactState
                         guard state.noteWillAttempt(parkedNote.dispatchID) else { return .cancelled }
                         session.selfCompactState = state
-                        viewModel?.scheduleSave(for: session.tabID)
+                        persistenceRuntime?.scheduleSave(for: session)
                     }
                     let released = proof.flatMap { viewModel?.agentSessionLinkHandoffProviderInput(for: session, dispatchID: promptDispatchID, claim: monitoring?.claim, proof: $0) }
                     guard released?.mustAbortDispatch != true else {
@@ -8443,7 +8449,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             var state = session.selfCompactState
                             _ = state.noteDefinitivelyNotAttempted(parkedNote.dispatchID)
                             session.selfCompactState = state
-                            viewModel?.scheduleSave(for: session.tabID)
+                            persistenceRuntime?.scheduleSave(for: session)
                         }
                         throw CancellationError()
                     }
@@ -8462,7 +8468,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
                         }
                         session.selfCompactState = state
-                        viewModel?.scheduleSave(for: session.tabID)
+                        persistenceRuntime?.scheduleSave(for: session)
                     }
                     recordAcceptedSteer()
                     if receipt.acceptedTurnID != identity.turnID {
@@ -8485,7 +8491,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             _ = state.noteTransportFailed(parkedNote.dispatchID)
                         }
                         session.selfCompactState = state
-                        viewModel?.scheduleSave(for: session.tabID)
+                        persistenceRuntime?.scheduleSave(for: session)
                         throw mismatch
                     }
                     guard case let .expectedTurnMismatch(expectedTurnID, actualTurnID, failure) = mismatch,
@@ -8555,7 +8561,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         var state = session.selfCompactState
                         _ = state.noteTransportFailed(parkedNote.dispatchID)
                         session.selfCompactState = state
-                        viewModel?.scheduleSave(for: session.tabID)
+                        persistenceRuntime?.scheduleSave(for: session)
                     }
                     throw error
                 }
@@ -8748,7 +8754,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 session.appendItem(AgentChatItem.error(message, sequenceIndex: session.nextSequenceIndex))
                 setRunningStatus(nil, source: nil, session: session)
                 viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-                viewModel?.scheduleSave(for: session.tabID)
+                persistenceRuntime?.scheduleSave(for: session)
             }
             return .failed(message: message)
         }
@@ -9930,7 +9936,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             viewModel?.applyCodexNativeContextUsage(usage, session: session)
             session.isDirty = true
             viewModel?.requestUIRefresh(tabID: session.tabID, scope: .runtimeMetrics)
-            viewModel?.scheduleSaveForCommandOutput(tabID: session.tabID, minInterval: 2.0)
+            persistenceRuntime?.scheduleSaveForCommandOutput(session: session, minInterval: 2.0)
         case let .approvalRequest(request):
             guard session.runState.isActive else { return }
             CodexComputerUseWorkflow.logApprovalDecision(
@@ -10121,7 +10127,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     ) {
                         guard terminalApplyResult.didChange else { return }
                         viewModel?.requestUIRefresh(tabID: session.tabID)
-                        viewModel?.scheduleSave(for: session.tabID)
+                        persistenceRuntime?.scheduleSave(for: session)
                         return
                     }
                     let didUpdateLive = upsertLiveBashExecution(
@@ -10162,7 +10168,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 ) {
                     AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] finalize bash toolResult tool=\(toolName) invocationID=\(invocationID?.uuidString ?? "nil") liveCount=\(session.bashLiveExecutionByKey.count)")
                     viewModel?.requestUIRefresh(tabID: session.tabID)
-                    viewModel?.scheduleSave(for: session.tabID)
+                    persistenceRuntime?.scheduleSave(for: session)
                 }
                 return
             }
@@ -10341,7 +10347,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     {
                         state.active?.compactTurnSucceeded = true
                         session.selfCompactState = state
-                        viewModel?.scheduleSave(for: session.tabID)
+                        persistenceRuntime?.scheduleSave(for: session)
                     }
                 }
                 await finalizeCodexRun(
@@ -10479,7 +10485,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 viewModel?.publishMCPStateChange(for: session)
                 viewModel?.setAgentRunActive(session.tabID, isActive: false)
                 viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-                viewModel?.scheduleSave(for: session.tabID)
+                persistenceRuntime?.scheduleSave(for: session)
                 scheduleCodexIdleShutdownIfNeeded(for: session, reason: "transport-closed-idle")
                 return
             }
@@ -11706,7 +11712,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 logCodex("[AgentModeVM][CodexIdle] shutting down idle app-server for tab \(tabID) reason=\(reason)")
                 await shutdownCodexSession(session, reclaimOnlyIfStillIdle: true)
                 viewModel?.requestUIRefresh(tabID: tabID, urgent: true)
-                viewModel?.scheduleSave(for: tabID)
+                persistenceRuntime?.scheduleSave(for: session)
             }
         )
     }
@@ -11986,7 +11992,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             ) {
                 guard terminalApplyResult.didChange else { return }
                 viewModel?.requestUIRefresh(tabID: session.tabID)
-                viewModel?.scheduleSave(for: session.tabID)
+                persistenceRuntime?.scheduleSave(for: session)
                 return
             }
             if upsertLiveBashExecution(
@@ -12027,7 +12033,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             observedAt: observedAt
         ) {
             viewModel?.requestUIRefresh(tabID: session.tabID)
-            viewModel?.scheduleSave(for: session.tabID)
+            persistenceRuntime?.scheduleSave(for: session)
         }
     }
 
@@ -12074,7 +12080,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         guard didReconcile else { return }
         session.isDirty = true
         viewModel?.requestUIRefresh(tabID: session.tabID)
-        viewModel?.scheduleSave(for: session.tabID)
+        persistenceRuntime?.scheduleSave(for: session)
     }
 
     private func finalizePendingToolCalls(

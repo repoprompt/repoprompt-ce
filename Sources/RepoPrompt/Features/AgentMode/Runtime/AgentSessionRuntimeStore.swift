@@ -95,7 +95,11 @@ final class AgentSessionRuntimeStore {
         fileprivate let id = UUID()
         fileprivate let store: AgentSessionRuntimeStore
         let presentation = AgentSessionPresentationRuntime()
-        let saveQueue = AgentSessionSaveQueue()
+        lazy var persistence = AgentSessionPersistenceRuntime(scope: self)
+        var saveQueue: AgentSessionSaveQueue {
+            persistence.queue
+        }
+
         private(set) var sessions: [UUID: AgentTabSession] = [:]
         private var liveClaimByTabID: [UUID: UUID] = [:]
         private var liveTabIDsBySessionID: [UUID: Set<UUID>] = [:]
@@ -115,6 +119,10 @@ final class AgentSessionRuntimeStore {
                 store.refreshBindingObservation(for: session)
                 updateLiveSessionBindingIndex(tabID: tabID)
             }
+        }
+
+        func resolveWriter(workspaceID: UUID, sessionID: UUID) -> WriterResolution {
+            store.resolveWriter(workspaceID: workspaceID, sessionID: sessionID)
         }
 
         func liveSessionTabIDs(for sessionID: UUID) -> Set<UUID> {

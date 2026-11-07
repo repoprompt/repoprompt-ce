@@ -3755,3 +3755,54 @@ Conductor lint `0d525fa2-7d2e-4d13-8388-5010030ee5c9`
 (`m9-save-runtime-lint-v1`) passed on the same Swift tree. No live app action,
 publishing or target move occurred. Final product/index/full-suite evidence remains
 open until the remaining host/routing transition is implemented.
+
+### M9 continuation — scope-owned persistence orchestration (2026-11-07)
+
+`Scope.persistence` now owns debounce admission, save coalescing, the complete
+save transaction, required flushes and in-flight drain through the existing
+`AgentSessionSaveQueue`, payload writer and configured-creation authority. The VM's
+save entrypoints are compatibility delegates. Its remaining composition supplies
+catalog/carrier admission and reads, suppression and the existing provider-switch
+gate; no parallel lease or lifecycle authority was added. Sidebar/index projection
+is a separate optional presentation callback. Durable payload and metadata writes
+still use `AgentSessionDataService`.
+
+Run-service persistence and usage hooks retain the concrete persistence runtime.
+Codex save and throttled-output call sites now use that runtime and exact session
+objects instead of calling the VM by tab ID. The current UI composition installs
+the dependency; this does not yet remove the coordinator's other VM dependencies.
+
+A debounce retains its exact scope until it settles. It cannot save a different
+object installed under the same tab ID. Review identified that simply rejecting a
+same-object binding-generation change could lose a transition follow-up; it now
+re-arms under the new incarnation and runs ordinary writer/restoration admission.
+No conflict or unavailable writer is bypassed. Required flushes without a scope or
+composition fail rather than acknowledging a write. A vanished UI adapter reports
+owner unavailability, not persistence suppression.
+
+Standalone tests exercise real-disk saves through run hooks without presentation,
+scope retention/release, same-object requalification versus recycled tab objects,
+configured first-save acknowledgment, missing composition, held writes across
+storage/incarnation changes, and an existing authority's save refusal. No test
+constructs a window, prompt VM or workspace VM for those runtime transactions.
+
+Initial conductor ticket `a4941ac3-a8ed-44d4-a70d-6a4ad47dcb22`
+(`m9-persistence-composition-v1`) passed **90 tests**: first-save 47, standalone
+persistence 5, presentation 4, save runtime 4, worktree recovery 30. This receipt
+predates Codex direct wiring and the reviewed same-object re-arm.
+Final conductor ticket `b4e71595-7ceb-42cf-850c-95ff92f236ad`
+(`m9-persistence-composition-v2`) passed **176 tests**: ACP execution 11,
+first-save 47, standalone persistence 6, presentation 4, save runtime 4,
+Codex resume/wedge commit 74, worktree recovery 30. This includes the re-arm,
+released-scope and missing-composition assertions. Conductor lint
+`96e2bf0c-a2e3-4f62-a5f5-6119791b9850`
+(`m9-persistence-composition-lint-v1`) passed on the same Swift tree.
+The review's last-user-date question was checked against the builder: the receipt
+payload copies `snapshot.lastUserMessageAt`, preserving the old index input.
+
+M9 acceptance remains open: the production catalog/carrier adapter is still
+VM-composed; provider input, live transcript/attachment effects, routing and the
+prepared execution host must become window-free. The obsolete prepared-window
+factory and close-cancels-run path are not retired yet. These remaining gates are
+part of M9, not delegated to M10. No publishing or visible app lifecycle action
+occurred.
