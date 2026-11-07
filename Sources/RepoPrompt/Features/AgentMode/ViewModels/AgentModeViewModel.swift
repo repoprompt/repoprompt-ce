@@ -512,7 +512,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         Int
     ) async -> AsyncThrowingStream<AgentSessionSidebarBuildBatch, Error>
 
-    private let runtimeSessionStore = AgentSessionRuntimeStore()
+    private let runtimeSessionStore = AgentSessionRuntimeStore.shared.makeScope()
     private(set) var sessions: [UUID: TabSession] {
         get { runtimeSessionStore.sessions }
         set {
@@ -3157,16 +3157,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessionListCacheGeneration &+= 1
     }
 
-    lazy var claudeContextUsageEstimator = ClaudeContextUsageEstimator(
-        tokenEstimator: { Self.estimateRuntimeTokens(for: $0) },
-        contextUsageBuilder: { usage, modelContextWindow in
-            Self.contextUsageFromClaudeProviderTokens(usage, modelContextWindow: modelContextWindow)
-        }
-    )
-
-    lazy var codexContextUsageEstimator = CodexContextUsageEstimator()
-
-    lazy var acpContextUsageEstimator = ACPContextUsageEstimator()
+    let usageRuntime = AgentSessionUsageRuntime()
 
     func slashSkillSuggestions(for query: String) async -> [MentionSuggestion] {
         let sourceTabID = currentTabID
@@ -3572,25 +3563,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             childAgentRunWaitDrainTimeoutSeconds: Self.childAgentRunWaitDrainTimeoutSeconds
         )
         let hooks = AgentModeRunService.Hooks(
-            usage: .init(
-                estimateRuntimeTokens: { text in
-                    Self.estimateRuntimeTokens(for: text)
-                },
-                addUserInputTokensToActiveNonCodexTurn: { [weak self] tokens, session in
-                    self?.addUserInputTokensToActiveNonCodexTurn(tokens, for: session)
-                },
-                startNonCodexTurnAccountingIfNeeded: { [weak self] session, initialMessage in
-                    self?.startNonCodexTurnAccountingIfNeeded(for: session, initialMessage: initialMessage)
-                },
-                finalizeNonCodexTurnUsage: { [weak self] session, promptTokens, completionTokens, contextUsedTokens in
-                    self?.finalizeNonCodexTurnUsageIfNeeded(
-                        for: session,
-                        promptTokens: promptTokens,
-                        completionTokens: completionTokens,
-                        contextUsedTokens: contextUsedTokens
-                    )
-                }
-            ),
+            usage: usageRuntime.makeRunHooks(scheduleSave: { [weak self] session in
+                self?.scheduleSave(for: session)
+            }),
             attachments: .init(
                 reserveAttachmentsForTurn: { [weak self] attachments, session in
                     self?.reserveAttachmentsForTurn(attachments, session: session)
@@ -6074,8 +6049,28 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         {
             return nil
         }
+        if let freshCreation, case let .compareAndSet(workspaceID) = mutationTarget,
+           freshCreation.workspaceID != workspaceID { return nil }
+        var qualifiesUnscopedBinding = false
         if session.activeAgentSessionID == sessionID {
-            return session.persistentSessionBindingIdentity
+            guard case let .compareAndSet(workspaceID) = mutationTarget,
+                  let binding = session.persistentSessionBindingIdentity
+            else {
+                return session.persistentSessionBindingIdentity
+            }
+            if let boundWorkspaceID = binding.workspaceID {
+                return boundWorkspaceID == workspaceID ? binding : nil
+            }
+            // An explicit carrier CAS may qualify an otherwise idle unscoped binding. Rotate
+            // its incarnation and rehydrate; neither UI selection nor old readiness earns the
+            // new workspace's payload authority. Never disturb admitted work or an in-flight save.
+            guard !session.bindingTransitionInProgress, !session.isDirty,
+                  !session.qualifiedRestorationReadiness.isCreating,
+                  !bindingHasSynchronousOwnership(session),
+                  !saveInFlightSessionIDs.contains(binding.sessionID),
+                  workspaceManager?.activeAgentSessionID(forTabID: session.tabID, inWorkspaceID: workspaceID) == binding.sessionID
+            else { return nil }
+            qualifiesUnscopedBinding = true
         }
 
         let previousSessionID = session.activeAgentSessionID
@@ -6131,10 +6126,23 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             removePendingUIRefresh(for: session.tabID)
         }
         _ = session.beginPersistentBindingTransition()
+        let bindingWorkspaceID: UUID?
+        switch mutationTarget {
+        case let .compareAndSet(workspaceID):
+            bindingWorkspaceID = workspaceID
+        case .runtimeOnly:
+            let carriers = workspaceManager?.workspaces.filter { workspace in
+                workspace.composeTabs.contains { $0.id == session.tabID }
+                    || workspace.stashedTabs.contains { $0.tab.id == session.tabID }
+            } ?? []
+            let workspaceIDs = Set(carriers.map(\.id))
+            bindingWorkspaceID = freshCreation?.workspaceID ?? (workspaceIDs.count == 1 ? workspaceIDs.first : nil)
+        }
         let binding = sessionID.map {
-            AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: $0)
+            AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: $0, workspaceID: bindingWorkspaceID)
         }
         session.installPersistentSessionBinding(binding)
+        if qualifiesUnscopedBinding { session.hasLoadedPersistedState = false }
         if let freshCreation {
             _ = session.acceptFreshCreation(freshCreation, workspaceID: freshCreation.workspaceID)
         }
@@ -21556,9 +21564,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private static func estimateRuntimeTokens(for text: String) -> Int {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return 0 }
-        return TokenCalculationService.estimateTokens(for: trimmed)
+        AgentSessionUsageRuntime.estimateRuntimeTokens(for: text)
     }
 
     static func extractTaggedPaths(from text: String) -> [String] {

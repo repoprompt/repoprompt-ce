@@ -1,217 +1,74 @@
 import Foundation
 import RepoPromptAIContracts
-import RepoPromptClaudeProvider
 import RepoPromptDomainRuntime
 
+/// Presentation callers forward accounting to the runtime and schedule saves only when a durable
+/// turn report was appended. The runtime can perform all accounting without constructing this VM.
 @MainActor
 extension AgentModeViewModel {
+    var claudeContextUsageEstimator: ClaudeContextUsageEstimator {
+        usageRuntime.claudeContextUsageEstimator
+    }
+
+    var acpContextUsageEstimator: ACPContextUsageEstimator {
+        usageRuntime.acpContextUsageEstimator
+    }
+
     func nonCodexContextUsageEstimator(for agent: AgentProviderKind) -> (any ContextUsageEstimating)? {
-        switch agent {
-        case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
-            claudeContextUsageEstimator
-        case .openCode, .cursor, .grokBuild, .antigravity, .devin:
-            acpContextUsageEstimator
-        case .codexExec:
-            nil
-        }
+        usageRuntime.nonCodexContextUsageEstimator(for: agent)
     }
 
     func applyCodexNativeContextUsage(_ usage: AgentContextUsage, session: TabSession) {
-        session.codexContextUsage = usage
-        _ = codexContextUsageEstimator.ingestNativeContextUsage(usage, session: session)
-        // A Codex report delivered after the tab switched provider is not the new provider's load.
-        guard session.selectedAgent == .codexExec else { return }
-        session.noteLiveContextUsageReport(
-            contextUsedTokens: usage.lastTotalTokens,
-            promptTokens: nil,
-            modelContextWindow: usage.modelContextWindow
-        )
+        usageRuntime.applyCodexNativeContextUsage(usage, session: session)
     }
 
-    /// Ingests one live usage report from a non-Codex provider stream and records which figures it
-    /// vouches for, even when the stored snapshot came out unchanged. Returns whether the session's
-    /// usage state changed.
-    func ingestNonCodexUsageReport(
-        promptTokens: Int?,
-        completionTokens: Int?,
-        contextUsedTokens: Int?,
-        modelContextWindow: Int?,
-        session: TabSession
-    ) -> Bool {
-        guard let estimator = nonCodexContextUsageEstimator(for: session.selectedAgent) else { return false }
-        // The vouch compares against the stored window, which the estimator caps the same way.
-        let vouchableWindow = ClaudeCompatiblePluginAutoCompactWindow.cappedReportedWindow(
-            modelContextWindow,
-            autoCompactWindow: session.activeClaudeAutoCompactWindowTokens
-        )
-        let changed = estimator.ingestUsageSignal(
-            promptTokens: promptTokens,
-            completionTokens: completionTokens,
-            contextUsedTokens: contextUsedTokens,
-            modelContextWindow: modelContextWindow,
-            session: session
-        ) != nil
-        session.noteLiveContextUsageReport(
-            contextUsedTokens: contextUsedTokens,
-            // A prompt count is billed input, not occupancy: it cannot vouch during a compaction turn.
-            promptTokens: session.contextCountVouchAwaitsOccupancyReport ? nil : promptTokens,
-            modelContextWindow: vouchableWindow
-        )
-        return changed
+    func ingestNonCodexUsageReport(promptTokens: Int?, completionTokens: Int?, contextUsedTokens: Int?, modelContextWindow: Int?, session: TabSession) -> Bool {
+        usageRuntime.ingestNonCodexUsageReport(promptTokens: promptTokens, completionTokens: completionTokens, contextUsedTokens: contextUsedTokens, modelContextWindow: modelContextWindow, session: session)
     }
 
     func refreshCodexContextUsageSnapshot(for session: TabSession) {
-        _ = codexContextUsageEstimator.ingestNativeContextUsage(session.codexContextUsage, session: session)
+        usageRuntime.refreshCodexContextUsageSnapshot(for: session)
     }
 
-    /// Ingests a non-Codex provider's end-of-turn usage (`message_stop`), where Claude-compatible
-    /// providers report the context window, then records which figures it vouches for. The result's
-    /// aggregate billed prompt count is never treated as a context count.
-    func ingestNonCodexTurnFinalization(
-        promptTokens: Int?,
-        completionTokens: Int?,
-        contextUsedTokens: Int?,
-        modelContextWindow: Int?,
-        session: TabSession
-    ) {
-        guard let estimator = nonCodexContextUsageEstimator(for: session.selectedAgent) else { return }
-        let vouchableWindow = ClaudeCompatiblePluginAutoCompactWindow.cappedReportedWindow(
-            modelContextWindow,
-            autoCompactWindow: session.activeClaudeAutoCompactWindowTokens
-        )
-        // Whether the provider already reported occupancy this turn must be read before the
-        // finalization consumes its per-turn marker.
-        let heldOccupancy = estimator.hasOccupancyReportThisTurn(session: session)
-        _ = estimator.ingestTurnFinalizationSignal(
-            contextUsedTokens: contextUsedTokens,
-            modelContextWindow: modelContextWindow,
-            session: session
-        )
-        finalizeNonCodexTurnUsageIfNeeded(
-            for: session,
-            promptTokens: promptTokens,
-            completionTokens: completionTokens,
-            contextUsedTokens: contextUsedTokens
-        )
-        // An ACP turn that ended without its own `usage_update` occupancy report leaves any stored
-        // count from an earlier turn outdated, and its billed count is ring-only (see
-        // `observationContextLoad`), so the count vouch is withdrawn and no billed count takes one.
-        // Vouch presence then always matches whether a count is exported, and its transitions
-        // republish (a later `usage_update` confirming the same figure establishes a vouch).
-        if session.selectedAgent.acpProviderID != nil, !heldOccupancy {
-            session.withdrawContextCountVouch(notingWindow: vouchableWindow)
-            return
+    func ingestNonCodexTurnFinalization(promptTokens: Int?, completionTokens: Int?, contextUsedTokens: Int?, modelContextWindow: Int?, session: TabSession) {
+        if usageRuntime.ingestNonCodexTurnFinalization(promptTokens: promptTokens, completionTokens: completionTokens, contextUsedTokens: contextUsedTokens, modelContextWindow: modelContextWindow, session: session) {
+            scheduleSave(for: session)
         }
-        // A billed prompt-call count is a different quantity than occupancy: when the estimator
-        // held a live `usage_update` figure this turn, the billed report cannot disturb that
-        // figure's vouch — vouch the figure the provider actually reported this turn. Without a
-        // live occupancy report the billed report stands alone, vouch or withdraw. Note the vouch
-        // call treats nil and non-positive inputs as no-ops — only a positive reported count or
-        // window can vouch a figure or withdraw an existing vouch.
-        // During an overseer compaction turn the billed count is the pre-compaction context, so it
-        // neither vouches nor withdraws; only this turn's occupancy report may vouch. (ACP turns
-        // without one already returned above; this keeps the rule for any runtime.)
-        let vouchedCount: Int? = if heldOccupancy {
-            session.contextUsageSnapshot?.used
-        } else if session.contextCountVouchAwaitsOccupancyReport {
-            nil
-        } else {
-            contextUsedTokens
-        }
-        session.noteLiveContextUsageReport(
-            contextUsedTokens: vouchedCount,
-            promptTokens: nil,
-            modelContextWindow: vouchableWindow
-        )
     }
 
     func clearContextUsageSnapshot(for session: TabSession) {
-        session.contextUsageSnapshot = nil
-        session.contextCompactedAt = nil
+        usageRuntime.clearContextUsageSnapshot(for: session)
     }
 
     func dequeuePendingNonCodexUserTokens(for session: TabSession) -> Int? {
-        guard !session.pendingNonCodexUserInputTokenQueue.isEmpty else { return nil }
-        return session.pendingNonCodexUserInputTokenQueue.removeFirst()
+        usageRuntime.dequeuePendingNonCodexUserTokens(for: session)
     }
 
     func startNonCodexTurnAccountingIfNeeded(for session: TabSession, initialMessage: String) {
-        guard let estimator = nonCodexContextUsageEstimator(for: session.selectedAgent) else { return }
-        if session.activeNonCodexTurnTokenAccumulator != nil {
-            finalizeNonCodexTurnUsageIfNeeded(for: session, promptTokens: nil, completionTokens: nil, contextUsedTokens: nil)
+        if usageRuntime.startNonCodexTurnAccountingIfNeeded(for: session, initialMessage: initialMessage) {
+            scheduleSave(for: session)
         }
-        estimator.beginTurn(session: session, initialMessage: initialMessage)
     }
 
     func addUserInputTokensToActiveNonCodexTurn(_ tokens: Int, for session: TabSession) {
-        guard let estimator = nonCodexContextUsageEstimator(for: session.selectedAgent) else { return }
-        estimator.addUserInputTokens(tokens, session: session)
+        usageRuntime.addUserInputTokensToActiveNonCodexTurn(tokens, for: session)
     }
 
     func addToolInputTokens(_ payload: String?, for session: TabSession) {
-        guard let estimator = nonCodexContextUsageEstimator(for: session.selectedAgent) else { return }
-        estimator.addToolInputPayload(payload, session: session)
+        usageRuntime.addToolInputTokens(payload, for: session)
     }
 
     func addToolOutputTokens(_ payload: String?, for session: TabSession) {
-        guard let estimator = nonCodexContextUsageEstimator(for: session.selectedAgent) else { return }
-        estimator.addToolOutputPayload(payload, session: session)
+        usageRuntime.addToolOutputTokens(payload, for: session)
     }
 
-    func finalizeNonCodexTurnUsageIfNeeded(
-        for session: TabSession,
-        promptTokens: Int?,
-        completionTokens: Int?,
-        contextUsedTokens: Int?
-    ) {
-        guard let estimator = nonCodexContextUsageEstimator(for: session.selectedAgent) else { return }
-        let didAppend = estimator.finalizeTurn(
-            promptTokens: promptTokens,
-            completionTokens: completionTokens,
-            contextUsedTokens: contextUsedTokens,
-            session: session
-        )
-        if didAppend {
-            scheduleSave(for: session.tabID)
+    func finalizeNonCodexTurnUsageIfNeeded(for session: TabSession, promptTokens: Int?, completionTokens: Int?, contextUsedTokens: Int?) {
+        if usageRuntime.finalizeNonCodexTurnUsageIfNeeded(for: session, promptTokens: promptTokens, completionTokens: completionTokens, contextUsedTokens: contextUsedTokens) {
+            scheduleSave(for: session)
         }
     }
 
-    nonisolated static func contextUsageFromClaudeProviderTokens(
-        _ usage: [AgentTokenUsagePersist],
-        modelContextWindow: Int?
-    ) -> AgentContextUsage? {
-        guard !usage.isEmpty else { return nil }
-        // Without a known window there is no ceiling: a fixed fallback would discard valid
-        // occupancy restored from larger-window sessions.
-        let maxContextTokens = modelContextWindow.map { max(1, $0) } ?? Int.max
-        // Only trust exact stream-derived context snapshots (contextUsedTokens).
-        // Do NOT fall back to promptTokens — those are billed-turn aggregates that
-        // include internal tool sub-steps and cause inflated context estimates.
-        for turn in usage.reversed() {
-            if turn.contextCompacted {
-                return AgentContextUsage(
-                    modelContextWindow: modelContextWindow,
-                    lastTotalTokens: nil,
-                    totalTotalTokens: nil,
-                    awaitingPostCompactionUsage: true
-                )
-            }
-            if let contextUsed = turn.contextUsedTokens,
-               contextUsed > 0,
-               contextUsed <= maxContextTokens
-            {
-                return AgentContextUsage(
-                    modelContextWindow: modelContextWindow,
-                    lastTotalTokens: contextUsed,
-                    totalTotalTokens: contextUsed
-                )
-            }
-        }
-        guard modelContextWindow != nil else { return nil }
-        return AgentContextUsage(
-            modelContextWindow: modelContextWindow,
-            lastTotalTokens: nil,
-            totalTotalTokens: nil
-        )
+    nonisolated static func contextUsageFromClaudeProviderTokens(_ usage: [AgentTokenUsagePersist], modelContextWindow: Int?) -> AgentContextUsage? {
+        AgentSessionUsageRuntime.contextUsageFromClaudeProviderTokens(usage, modelContextWindow: modelContextWindow)
     }
 }

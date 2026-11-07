@@ -167,6 +167,20 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
                 XCTAssertEqual(source.resolutionState(for: fixture.sessionID), .replicated)
                 XCTAssertEqual(source.provenance(for: fixture.sessionID)?.hasUniqueRuntimeOwner, false)
                 XCTAssertNil(SessionAdminWindows.runtimeOwner(for: fixture.sessionID))
+                let partialCapture = AgentSessionCarrierResolver.capture(
+                    windows: [fixture.window], sessionIDs: [fixture.sessionID], includeRuntimeOwners: true
+                )
+                XCTAssertEqual(
+                    partialCapture.runtimeWriterRejections[fixture.sessionID],
+                    .conflicting,
+                    "A narrower presentation census cannot hide a process-wide writer claim"
+                )
+                XCTAssertNotNil(partialCapture.bindingConflictDetail(for: fixture.sessionID))
+                XCTAssertNil(partialCapture.uniqueRuntimeOwners[fixture.sessionID])
+                XCTAssertNil(
+                    SessionAdminWindows.owningViewModel(for: fixture.sessionID),
+                    "Readable metadata must not provide a cold-mutation fallback around a writer conflict"
+                )
                 XCTAssertFalse(SessionAdminWindows.isCurrent(originalOwner), "A second bound object invalidates prior owner proof before it finishes loading")
                 let before = try fixture.git.runGit(["worktree", "list", "--porcelain"], at: fixture.repository)
                 let ownerSaveGeneration = fixture.session.saveRequestGeneration
@@ -194,6 +208,40 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
                 XCTAssertEqual(try fixture.git.runGit(["worktree", "list", "--porcelain"], at: fixture.repository), before)
                 fixture.assertForegroundUnchanged()
             }
+        }
+    }
+
+    func testUnscopedLiveBindingRequiresExplicitWorkspaceQualificationAndFreshHydration() async throws {
+        try await withFixture(canonicalHost: true) { fixture in
+            let vm = fixture.window.agentModeViewModel
+            let session = fixture.session
+            let workspaceID = try XCTUnwrap(session.persistentSessionBindingIdentity?.workspaceID)
+            session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: fixture.sessionID))
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            session.hasLoadedPersistedState = true
+            let unscoped = try XCTUnwrap(session.currentRestorationBindingToken)
+            let capture = AgentSessionCarrierResolver.capture(
+                windows: [fixture.window], sessionIDs: [fixture.sessionID], includeRuntimeOwners: true
+            )
+            XCTAssertEqual(capture.runtimeWriterRejections[fixture.sessionID], .unavailable(.unscopedBinding))
+            XCTAssertNil(SessionAdminWindows.owningViewModel(for: fixture.sessionID))
+            // Runtime-only refresh cannot silently borrow the selected workspace.
+            XCTAssertEqual(vm.test_installPersistentSessionBinding(sessionID: fixture.sessionID, on: session), unscoped.bindingIdentity)
+            session.isDirty = true
+            XCTAssertNil(vm.test_installPersistentSessionBinding(
+                sessionID: fixture.sessionID, on: session, compareAndSetInWorkspaceID: workspaceID
+            ), "Qualification may not discard unsaved payload changes")
+            session.isDirty = false
+            let scoped = try XCTUnwrap(vm.test_installPersistentSessionBinding(
+                sessionID: fixture.sessionID, on: session, compareAndSetInWorkspaceID: workspaceID
+            ))
+            XCTAssertEqual(scoped.workspaceID, workspaceID)
+            XCTAssertNotEqual(scoped.generation, unscoped.bindingIdentity.generation)
+            XCTAssertFalse(session.hasLoadedPersistedState)
+            XCTAssertFalse(session.permitsBoundOperationAndSave, "The old workspace's readiness is not transferable")
+            XCTAssertNil(vm.test_installPersistentSessionBinding(
+                sessionID: fixture.sessionID, on: session, compareAndSetInWorkspaceID: UUID()
+            ), "A qualified binding cannot be silently redirected to another workspace")
         }
     }
 

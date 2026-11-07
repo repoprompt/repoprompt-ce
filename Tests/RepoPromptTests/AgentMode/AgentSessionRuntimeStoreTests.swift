@@ -6,7 +6,7 @@ import XCTest
 @MainActor
 final class AgentSessionRuntimeStoreTests: XCTestCase {
     func testBindingChangesAndDuplicateClaimsStayIndexedWithoutPresentation() {
-        let store = AgentSessionRuntimeStore()
+        let store = AgentSessionRuntimeStore().makeScope()
         let first = AgentTabSession(tabID: UUID())
         let second = AgentTabSession(tabID: UUID())
         let original = UUID(), rebound = UUID()
@@ -27,7 +27,7 @@ final class AgentSessionRuntimeStoreTests: XCTestCase {
     }
 
     func testRetiredCallbackCannotChangeReplacementIndex() throws {
-        let store = AgentSessionRuntimeStore()
+        let store = AgentSessionRuntimeStore().makeScope()
         let tabID = UUID(), oldID = UUID(), newID = UUID()
         let old = AgentTabSession(tabID: tabID)
         old.installPersistentSessionBinding(.init(tabID: tabID, sessionID: oldID))
@@ -51,7 +51,7 @@ final class AgentSessionRuntimeStoreTests: XCTestCase {
     }
 
     func testBindingCallbackDoesNotRetainStoreOrSession() throws {
-        var store: AgentSessionRuntimeStore? = AgentSessionRuntimeStore()
+        var store: AgentSessionRuntimeStore.Scope? = AgentSessionRuntimeStore().makeScope()
         var session: AgentTabSession? = AgentTabSession(tabID: UUID())
         weak var weakStore = store
         weak var weakSession = session
@@ -63,6 +63,99 @@ final class AgentSessionRuntimeStoreTests: XCTestCase {
         XCTAssertNil(weakStore)
         XCTAssertNil(weakSession, "The derived-index callback must not form a retain cycle.")
         callback?()
+    }
+
+    func testWriterResolutionPinsWorkspaceObjectAndIncarnation() {
+        let store = AgentSessionRuntimeStore()
+        let scope = store.makeScope()
+        let workspaceID = UUID(), sessionID = UUID()
+        let session = AgentTabSession(tabID: UUID())
+        guard case .unavailable(.absent) = store.resolveWriter(workspaceID: workspaceID, sessionID: sessionID) else {
+            return XCTFail("No live claim must not elect a writer")
+        }
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: workspaceID))
+        scope.replaceSessions([session.tabID: session])
+        guard case let .unique(writer) = store.resolveWriter(workspaceID: workspaceID, sessionID: sessionID) else {
+            return XCTFail("The exact scoped object must resolve")
+        }
+        XCTAssertTrue(writer.isCurrent)
+        XCTAssertTrue(writer.session === session)
+        guard case .conflicting = store.resolveWriter(workspaceID: UUID(), sessionID: sessionID) else {
+            return XCTFail("A workspace mismatch must fail closed")
+        }
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: workspaceID))
+        XCTAssertFalse(writer.isCurrent, "Same UUID with a new generation cannot reuse a lease")
+        _ = session.beginPersistentBindingTransition()
+        guard case .unavailable(.bindingTransition) = store.resolveWriter(workspaceID: workspaceID, sessionID: sessionID) else {
+            return XCTFail("An in-flight rebind is not an admitted writer")
+        }
+    }
+
+    func testUnscopedBindingCannotAdmitWriterAndLeaseRetainsScope() throws {
+        let store = AgentSessionRuntimeStore()
+        var scope: AgentSessionRuntimeStore.Scope? = store.makeScope()
+        weak var retainedScope = scope
+        let session = AgentTabSession(tabID: UUID())
+        let workspaceID = UUID(), sessionID = UUID()
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID))
+        scope?.replaceSessions([session.tabID: session])
+        guard case .unavailable(.unscopedBinding) = store.resolveWriter(workspaceID: workspaceID, sessionID: sessionID) else {
+            return XCTFail("No selected-window fallback may supply missing workspace authority")
+        }
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: workspaceID))
+        var lease: AgentSessionRuntimeStore.Writer?
+        if case let .unique(writer) = store.resolveWriter(workspaceID: workspaceID, sessionID: sessionID) {
+            lease = writer
+        }
+        XCTAssertTrue(try XCTUnwrap(lease).isCurrent)
+        scope = nil
+        XCTAssertNotNil(retainedScope, "An admitted command keeps its exact owner alive across suspension")
+        lease = nil
+        XCTAssertNil(retainedScope)
+        guard case .unavailable(.absent) = store.resolveWriter(workspaceID: workspaceID, sessionID: sessionID) else {
+            return XCTFail("A completed command leaves no phantom writer after its scope retires")
+        }
+    }
+
+    func testConflictingScopesAreNotElectedAndRetiredScopesDoNotLeaveClaims() {
+        let store = AgentSessionRuntimeStore()
+        let first = store.makeScope()
+        var second: AgentSessionRuntimeStore.Scope? = store.makeScope()
+        let workspaceID = UUID(), sessionID = UUID(), tabID = UUID()
+        let a = AgentTabSession(tabID: tabID), b = AgentTabSession(tabID: tabID)
+        for session in [a, b] {
+            session.installPersistentSessionBinding(.init(tabID: tabID, sessionID: sessionID, workspaceID: workspaceID))
+        }
+        first.replaceSessions([tabID: a])
+        second?.replaceSessions([tabID: b])
+        guard case .conflicting = store.resolveWriter(workspaceID: workspaceID, sessionID: sessionID) else {
+            return XCTFail("Agreeing metadata on distinct live objects is still conflicting writers")
+        }
+        second = nil
+        guard case let .unique(writer) = store.resolveWriter(workspaceID: workspaceID, sessionID: sessionID) else {
+            return XCTFail("A dead scope cannot retain a phantom claim")
+        }
+        XCTAssertTrue(writer.session === a)
+        first.replaceSessions([:])
+        XCTAssertFalse(writer.isCurrent)
+    }
+
+    func testSameObjectInTwoScopesRemainsConflictingAcrossRebind() {
+        let store = AgentSessionRuntimeStore()
+        let first = store.makeScope(), second = store.makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        let workspaceID = UUID(), oldID = UUID(), newID = UUID()
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: oldID, workspaceID: workspaceID))
+        first.replaceSessions([session.tabID: session])
+        second.replaceSessions([session.tabID: session])
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: newID, workspaceID: workspaceID))
+        guard case .conflicting = store.resolveWriter(workspaceID: workspaceID, sessionID: newID) else {
+            return XCTFail("Rebinding cannot hide a competing scope")
+        }
+        first.replaceSessions([:])
+        XCTAssertNotNil(session.persistentSessionBindingDidChange)
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: oldID, workspaceID: workspaceID))
+        XCTAssertEqual(second.liveSessionTabIDs(for: oldID), [session.tabID])
     }
 
     func testViewModelPublishesBeforeStorageChangesAndUsesRuntimeIndex() {

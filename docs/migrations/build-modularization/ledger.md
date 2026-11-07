@@ -3496,3 +3496,59 @@ intact. Primary risks are stale carrier evidence and dispatch-value drift; focus
 real-disk and input-capture tests cover those boundaries. Lookup remains bounded by
 the supplied workspace catalog with UUID point reads, no polling or new background
 owner. The broader writer transition must not be labeled complete by these changes.
+
+### M9 completion continuation — writer authority (in progress)
+
+The subsequent completion request starts from `48b4707d0`. The next transition
+promotes the existing runtime store to process ownership with lifetime scopes;
+scopes retain objects and the store holds weak scope references. Exact writer
+capabilities capture object, binding generation, workspace and restoration token.
+Absent, unscoped, transitioning and conflicting claims remain distinguishable;
+metadata replicas never register live objects. The carrier adapter is being moved
+to consume this authority rather than independently elect a live writer.
+
+`AgentPersistentSessionBindingIdentity` gains an in-memory optional workspace UUID
+(no Codable/schema change). Production binding installation captures explicit CAS
+workspace or unique carrier workspace, never a later selected-tab inference.
+Unscoped bindings fail closed for writer admission. Cross-scope binding observation
+is maintained centrally so the same object accidentally installed in two scopes
+cannot hide a duplicate claim by rebinding.
+
+This transition is an intermediate local checkpoint, not M9 acceptance. Initial focused
+conductor ticket `116272e7-e502-4393-8e85-5fa2db6c3afa` passed **57 tests** (writer store
+7, context snapshot 2, first-save 47, historical/stashed metadata 1). A subsequent
+usage-accounting extraction moves estimator ownership and all accounting bodies to
+`AgentSessionUsageRuntime`; run hooks retain that service, while durable-report
+append results explicitly trigger the caller's exact-object save. No presentation
+object is needed by the accounting service. The VM retains forwarding accessors,
+not a second accounting implementation. Runtime carrier evidence now retains the
+writer capability across suspension rather than only an unqualified session object.
+
+Ticket `caac76ea-5b54-443f-a9f3-8be28f0ae488` failed compilation before tests because
+Swift disallows covariant `Self` in a stored-property initializer; the initializer
+now names its concrete service type. Corrected ticket
+`a20f4e3d-0aec-4138-a674-844ab5189037` then failed compilation before tests because
+`RuntimeOwner.matches` was not actor-isolated after gaining a writer-currency check;
+`RuntimeOwner` is now explicitly MainActor-owned. Retry `m9-writer-usage-v4`, ticket
+`9556badc-e12b-4ca7-b772-8ac7c81c3642`, passed **251 tests**: first-save 47, context-load
+40, handoff inheritance 100, writer store 8, standalone usage 2, Claude window-cap
+lifecycle 15, Claude window resolution 11, administration/worktree recovery 28.
+Non-mutating conductor lint `d76251e8-e73c-4f4f-b2cf-af7ceae6a42c` passed. These are
+focused transition receipts, not full M9 or final-product/index validation.
+
+The transition review found that a rejected live writer could disappear into a
+cold metadata fallback. Carrier snapshots now retain explicit writer rejection
+reasons and administration refuses that fallback. A partial-window census test
+checks the process-wide conflict. Same-ID explicit workspace qualification now
+rotates the binding and requires hydration again; dirty, owned, creating or saving
+objects cannot be silently qualified, and a fresh-creation claim must match the
+CAS workspace. The suggested immediate retirement on presentation close is not
+adopted: that would elect a successor before owned work and durable effects drain.
+Explicit runtime retirement still belongs in the remaining host/drain cutover.
+
+Remaining integration includes runtime command/services extraction,
+first-save/cancellation admission, administration/scope/link adoption, window-free
+payload hosting, presentation attachment and settlement-driven handoff/drain.
+Inspection confirms the MCP agent tool services still require `WindowState`, and
+Codex coordination reaches 46 distinct VM members; replacing these with a protocol
+that merely forwards to the VM would not satisfy the requested outcome.
