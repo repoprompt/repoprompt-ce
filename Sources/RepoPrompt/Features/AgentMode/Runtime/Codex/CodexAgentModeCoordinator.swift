@@ -262,6 +262,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
     }
 
     private weak var viewModel: AgentModeViewModel?
+    private var usageRuntime = AgentSessionUsageRuntime()
+    private var presentationRuntime = AgentSessionPresentationRuntime()
     private var persistenceRuntime: AgentSessionPersistenceRuntime?
     private var attachmentRuntime: AgentSessionAttachmentRuntime?
     private var mcpRuntime: AgentSessionMCPRuntime?
@@ -494,6 +496,16 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         installPersistenceRuntime(viewModel.persistenceRuntime)
         installAttachmentRuntime(viewModel.attachmentRuntime)
         installMCPRuntime(viewModel.mcpRuntime)
+        installUsageRuntime(viewModel.usageRuntime)
+        installPresentationRuntime(viewModel.presentationRuntime)
+    }
+
+    func installUsageRuntime(_ runtime: AgentSessionUsageRuntime) {
+        usageRuntime = runtime
+    }
+
+    func installPresentationRuntime(_ runtime: AgentSessionPresentationRuntime) {
+        presentationRuntime = runtime
     }
 
     func installMCPRuntime(_ runtime: AgentSessionMCPRuntime) {
@@ -801,7 +813,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
     private func publishCodexHookGateState(for session: AgentTabSession) {
         AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
         updateCodexStallWatchdogState(for: session)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
         mcpRuntime?.handleObservedMCPStateChange(for: session)
     }
 
@@ -2309,7 +2321,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         session: AgentTabSession
     ) {
         AgentSessionHydrationRuntime.restoreCodexMetadata(from: agentSession, to: session)
-        viewModel?.refreshCodexContextUsageSnapshot(for: session)
+        usageRuntime.refreshCodexContextUsageSnapshot(for: session)
         if session.selectedAgent == .codexExec {
             reconcilePersistedCodexCommandStatusIfNeeded(session: session)
         }
@@ -2390,7 +2402,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         }
         _ = stageCodexComputerUseActivationIfNeeded(session: session)
         cancelCodexIdleShutdown(for: session.tabID)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
     }
 
     @discardableResult
@@ -2666,10 +2678,10 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         if let ownership = session.activeRunOwnership {
             _ = session.endRunAttempt(ifCurrent: ownership, source: "codex.compaction.startFailed")
         }
-        viewModel?.setAgentRunActive(session.tabID, isActive: false)
+        presentationRuntime.setAgentRunActive(session, isActive: false)
         session.runState = .idle
         setRunningStatus(nil, source: nil, session: session)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
         persistenceRuntime?.scheduleSave(for: session)
     }
 
@@ -2911,8 +2923,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         recordCodexWatchdogProgress(for: session, at: compactionStartedAt)
         updateCodexStallWatchdogState(for: session)
         setRunningStatus("Compacting context…", source: .transport, session: session, urgent: true)
-        viewModel?.setAgentRunActive(session.tabID, isActive: true)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        presentationRuntime.setAgentRunActive(session, isActive: true)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
         persistenceRuntime?.scheduleSave(for: session)
     }
 
@@ -3215,9 +3227,9 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
 
     private func markCodexContextCompacted(_ session: AgentTabSession) {
         session.contextCompactedAt = Date()
-        viewModel?.refreshCodexContextUsageSnapshot(for: session)
+        usageRuntime.refreshCodexContextUsageSnapshot(for: session)
         session.isDirty = true
-        viewModel?.requestUIRefresh(tabID: session.tabID)
+        presentationRuntime.requestUIRefresh(for: session)
         persistenceRuntime?.scheduleSave(for: session)
     }
 
@@ -3407,7 +3419,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             }
         }
         session.isDirty = true
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
         persistenceRuntime?.scheduleSave(for: session)
         if case .noActiveTurn = reason {
             scheduleCodexFallbackIdlePump(session: session, queueID: submission.queueID)
@@ -3545,7 +3557,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         if beginsSuccessorAttempt {
             session.mcpFollowUpRunPending = false
         }
-        viewModel?.setAgentRunActive(session.tabID, isActive: true)
+        presentationRuntime.setAgentRunActive(session, isActive: true)
         mcpRuntime?.handleObservedMCPStateChange(for: session)
         beginTrackedCodexUserTurn(session)
         let dispatchStartedAt = Date()
@@ -3807,7 +3819,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             )
         } else {
             session.runState = .failed
-            viewModel?.setAgentRunActive(session.tabID, isActive: false)
+            presentationRuntime.setAgentRunActive(session, isActive: false)
         }
         if !session.codexFallbackQueue.isEmpty {
             abandonCodexFallbackQueue(
@@ -3815,7 +3827,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 reason: "Codex queued follow-ups were cancelled after an earlier queued dispatch failed."
             )
         }
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
         persistenceRuntime?.scheduleSave(for: session)
     }
 
@@ -3894,7 +3906,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             )
         }
         mcpRuntime?.handleObservedMCPStateChange(for: session)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
         persistenceRuntime?.scheduleSave(for: session)
     }
 
@@ -4472,7 +4484,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             session.codexRolloutPath = nil
             session.providerCleanupHandle = nil
             session.codexContextUsage = nil
-            viewModel?.clearContextUsageSnapshot(for: session)
+            usageRuntime.clearContextUsageSnapshot(for: session)
             session.codexModel = nil
             session.codexReasoningEffort = nil
             session.codexNeedsReconnect = false
@@ -4823,7 +4835,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             itemKind: .error
         )
         session.appendItem(item)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
     }
 
     private static func missedCodexCompletionRecoveryMessage() -> String {
@@ -5140,7 +5152,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 )
             )
             session.appendItem(recoveryNoticeItem)
-            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+            presentationRuntime.requestUIRefresh(for: session, urgent: true)
         }
         if let ref = startResult.sessionRef {
             cancelCodexTransportClosedFallback(for: session.tabID)
@@ -5737,8 +5749,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         setRunningStatus("Reconnecting…", source: .reconnect, session: session, urgent: true)
         session.codexLastEventAt = recoveryStartedAt
         recordCodexWatchdogProgress(for: session, at: recoveryStartedAt)
-        viewModel?.setAgentRunActive(session.tabID, isActive: true)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        presentationRuntime.setAgentRunActive(session, isActive: true)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
 
         let cancelEventTask = switch trigger {
         case .unexpectedStreamEnd:
@@ -5878,7 +5890,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         }
 
         updateCodexStallWatchdogState(for: session)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
         return .recovered
     }
 
@@ -5934,7 +5946,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         pendingTurn.retryAttempted = true
         session.codexPendingAuthRetryTurn = pendingTurn
         setRunningStatus("Refreshing Codex authentication…", source: .reconnect, session: session, urgent: true)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
 
         switch await authRecovery.refreshManagedAccount() {
         case let .requiresUserLogin(guidance):
@@ -6223,7 +6235,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 attachments: replayTurn.attachments,
                 attachmentReservationID: replayTurn.attachmentReservationID
             )
-            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+            presentationRuntime.requestUIRefresh(for: session, urgent: true)
             return true
         } catch {
             if acquiredAgentSessionLinkPhysicalDispatch {
@@ -6658,8 +6670,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             }
             session.runState = .failed
             setRunningStatus(nil, source: nil, session: session)
-            viewModel?.setAgentRunActive(session.tabID, isActive: false)
-            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+            presentationRuntime.setAgentRunActive(session, isActive: false)
+            presentationRuntime.requestUIRefresh(for: session, urgent: true)
             persistenceRuntime?.scheduleSave(for: session)
         }
         #if DEBUG
@@ -6730,9 +6742,9 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             }
             session.runState = .failed
             setRunningStatus(nil, source: nil, session: session)
-            viewModel?.setAgentRunActive(session.tabID, isActive: false)
+            presentationRuntime.setAgentRunActive(session, isActive: false)
         }
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
         persistenceRuntime?.scheduleSave(for: session)
     }
 
@@ -7119,7 +7131,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                         ) else {
                             return
                         }
-                        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                        presentationRuntime.requestUIRefresh(for: session, urgent: true)
                         persistenceRuntime?.scheduleSave(for: session)
                         return
                     }
@@ -7129,7 +7141,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                         session.codexEventTask = nil
                         session.codexEventTaskRunID = nil
                         AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
-                        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                        presentationRuntime.requestUIRefresh(for: session, urgent: true)
                         mcpRuntime?.handleObservedMCPStateChange(for: session)
                         await ensureCodexNativeSession(
                             session: session,
@@ -7574,7 +7586,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                codexAuthRecoveryAttemptedRunIDs.insert(runID).inserted
             {
                 setRunningStatus("Refreshing Codex authentication…", source: .reconnect, session: session, urgent: true)
-                viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                presentationRuntime.requestUIRefresh(for: session, urgent: true)
                 switch await authRecovery.refreshManagedAccount() {
                 case let .requiresUserLogin(guidance):
                     _ = markCodexReconnectNeeded(for: session, source: "managed-auth-recovery-required-during-start")
@@ -7703,7 +7715,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 }
                 session.appendItem(errorItem)
             }
-            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+            presentationRuntime.requestUIRefresh(for: session, urgent: true)
         }
     }
 
@@ -7829,7 +7841,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                     disposition: .restoreToPending
                 )
                 session.appendItem(AgentChatItem.error(message, sequenceIndex: session.nextSequenceIndex))
-                viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                presentationRuntime.requestUIRefresh(for: session, urgent: true)
                 persistenceRuntime?.scheduleSave(for: session)
                 return .preDispatchRejected(message: message)
             }
@@ -7863,8 +7875,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         let sendStartedAt = Date()
         session.codexLastEventAt = sendStartedAt
         recordCodexWatchdogProgress(for: session, at: sendStartedAt)
-        viewModel?.setAgentRunActive(session.tabID, isActive: true)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        presentationRuntime.setAgentRunActive(session, isActive: true)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
         cancelCodexIdleShutdown(for: session.tabID)
 
         func turnSelection() -> (model: String?, reasoningEffort: String?, serviceTier: String?, isAuto: Bool) {
@@ -7984,7 +7996,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                     session.appendItem(AgentChatItem.error(message, sequenceIndex: session.nextSequenceIndex))
                 }
                 setRunningStatus(nil, source: nil, session: session)
-                viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                presentationRuntime.requestUIRefresh(for: session, urgent: true)
                 persistenceRuntime?.scheduleSave(for: session)
             }
             return .failed(message: message)
@@ -8015,7 +8027,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 )
                 session.appendItem(AgentChatItem.error(message, sequenceIndex: session.nextSequenceIndex))
                 setRunningStatus(nil, source: nil, session: session)
-                viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                presentationRuntime.requestUIRefresh(for: session, urgent: true)
                 persistenceRuntime?.scheduleSave(for: session)
             }
             return .failed(message: message)
@@ -8399,7 +8411,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                             var state = session.selfCompactState
                             if state.noteAccepted(noteDispatchID) {
                                 session.appendItem(AgentChatItem.selfCompactionNoteRestored(sequenceIndex: session.nextSequenceIndex))
-                                viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                                presentationRuntime.requestUIRefresh(for: session, urgent: true)
                             }
                             session.selfCompactState = state
                             persistenceRuntime?.scheduleSave(for: session)
@@ -8477,7 +8489,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                         var state = session.selfCompactState
                         if state.noteAccepted(parkedNote.dispatchID) {
                             session.appendItem(AgentChatItem.selfCompactionNoteRestored(sequenceIndex: session.nextSequenceIndex))
-                            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                            presentationRuntime.requestUIRefresh(for: session, urgent: true)
                         }
                         session.selfCompactState = state
                         persistenceRuntime?.scheduleSave(for: session)
@@ -8721,7 +8733,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                         disposition: .restoreToPending
                     )
                     setRunningStatus(nil, source: nil, session: session)
-                    viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                    presentationRuntime.requestUIRefresh(for: session, urgent: true)
                 }
                 return .cancelled
             }
@@ -8765,7 +8777,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 )
                 session.appendItem(AgentChatItem.error(message, sequenceIndex: session.nextSequenceIndex))
                 setRunningStatus(nil, source: nil, session: session)
-                viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                presentationRuntime.requestUIRefresh(for: session, urgent: true)
                 persistenceRuntime?.scheduleSave(for: session)
             }
             return .failed(message: message)
@@ -8862,7 +8874,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             sequenceIndex: session.nextSequenceIndex
         )
         session.appendItem(toolItem)
-        viewModel?.requestUIRefresh(tabID: session.tabID)
+        presentationRuntime.requestUIRefresh(for: session)
     }
 
     private func handleCodexToolResult(
@@ -8985,7 +8997,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             isError: isError,
             session: session
         )
-        viewModel?.requestUIRefresh(tabID: session.tabID)
+        presentationRuntime.requestUIRefresh(for: session)
     }
 
     /// Returns `true` when an incoming apply_patch running payload should be ignored
@@ -9067,8 +9079,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                   Self.flushPendingAssistantDeltaState(session)
             else { return }
             session.assistantDeltaFlushGeneration &+= 1
-            self?.viewModel?.requestAssistantPresentationRefresh(
-                session: session,
+            self?.presentationRuntime.assistantDeltaApplied(
+                session,
                 sourceItemsRevision: session.sourceItemsRevision,
                 flushGeneration: session.assistantDeltaFlushGeneration
             )
@@ -9114,8 +9126,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             return
         }
         session.assistantDeltaFlushGeneration &+= 1
-        viewModel?.requestAssistantPresentationRefresh(
-            session: session,
+        presentationRuntime.assistantDeltaApplied(
+            session,
             sourceItemsRevision: session.sourceItemsRevision,
             flushGeneration: session.assistantDeltaFlushGeneration
         )
@@ -9136,8 +9148,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         session.pendingCodexAssistantScope = nil
         guard didFlush || didSeal else { return }
         session.assistantDeltaFlushGeneration &+= 1
-        viewModel?.requestAssistantPresentationRefresh(
-            session: session,
+        presentationRuntime.assistantDeltaApplied(
+            session,
             sourceItemsRevision: session.sourceItemsRevision,
             flushGeneration: session.assistantDeltaFlushGeneration
         )
@@ -9239,8 +9251,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
 
         guard didChange else { return }
         session.assistantDeltaFlushGeneration &+= 1
-        viewModel?.requestAssistantPresentationRefresh(
-            session: session,
+        presentationRuntime.assistantDeltaApplied(
+            session,
             sourceItemsRevision: session.sourceItemsRevision,
             flushGeneration: session.assistantDeltaFlushGeneration
         )
@@ -9258,7 +9270,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         guard session.runningStatusText != value || session.runningStatusSource != normalizedSource else { return }
         session.runningStatusText = value
         session.runningStatusSource = normalizedSource
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: urgent)
+        presentationRuntime.requestUIRefresh(for: session, urgent: urgent)
     }
 
     private static func reasoningAggregationKey(
@@ -9433,7 +9445,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             setRunningStatus(nil, source: nil, session: session, urgent: true)
         }
         if didUpdateTranscript {
-            viewModel?.requestUIRefresh(tabID: session.tabID)
+            presentationRuntime.requestUIRefresh(for: session)
         }
     }
 
@@ -9560,7 +9572,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             setRunningStatus(nil, source: nil, session: session, urgent: true)
         }
         if didChange {
-            viewModel?.requestUIRefresh(tabID: session.tabID)
+            presentationRuntime.requestUIRefresh(for: session)
         }
     }
 
@@ -9708,7 +9720,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             },
             postCommit: { [weak self] _, _ in
                 guard let self else { return }
-                viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                presentationRuntime.requestUIRefresh(for: session, urgent: true)
                 // Session-scoped Computer Use remains armed across local-user turns. Catalog
                 // repair and idle reclamation must not retire its otherwise reusable controller.
                 //
@@ -9945,9 +9957,9 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             return
         case let .tokenUsage(usage):
             guard session.runState.isActive else { return }
-            viewModel?.applyCodexNativeContextUsage(usage, session: session)
+            usageRuntime.applyCodexNativeContextUsage(usage, session: session)
             session.isDirty = true
-            viewModel?.requestUIRefresh(tabID: session.tabID, scope: .runtimeMetrics)
+            presentationRuntime.requestUIRefresh(for: session, scope: .runtimeMetrics)
             persistenceRuntime?.scheduleSaveForCommandOutput(session: session, minInterval: 2.0)
         case let .approvalRequest(request):
             guard session.runState.isActive else { return }
@@ -9959,7 +9971,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             sealAssistantBoundary(session)
             session.pendingApproval = request
             AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
-            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+            presentationRuntime.requestUIRefresh(for: session, urgent: true)
             mcpRuntime?.handleObservedMCPStateChange(for: session)
         case let .permissionsRequest(request):
             guard session.runState.isActive else { return }
@@ -9967,7 +9979,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             sealAssistantBoundary(session)
             session.pendingPermissionsRequest = request
             AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
-            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+            presentationRuntime.requestUIRefresh(for: session, urgent: true)
             mcpRuntime?.handleObservedMCPStateChange(for: session)
         case let .mcpElicitationRequest(request):
             guard session.runState.isActive else { return }
@@ -9982,7 +9994,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 session.queuedMCPElicitationRequests.append(request)
             }
             AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
-            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+            presentationRuntime.requestUIRefresh(for: session, urgent: true)
             mcpRuntime?.handleObservedMCPStateChange(for: session)
         case let .requestUserInput(request):
             guard session.runState.isActive else { return }
@@ -10032,7 +10044,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 session.queuedUserInputRequests.append(request)
             }
             AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
-            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+            presentationRuntime.requestUIRefresh(for: session, urgent: true)
         case let .serverRequestIssue(issue):
             if await attemptManagedCodexAuthRecovery(
                 for: session,
@@ -10079,7 +10091,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 ) != nil
                 if didUpdate {
                     AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] ensure bash anchor/live-state tool=\(toolName) invocationID=\(invocationID?.uuidString ?? "nil") liveCount=\(session.bashLiveExecutionByKey.count) totalItems=\(session.items.count)")
-                    viewModel?.requestUIRefresh(tabID: session.tabID)
+                    presentationRuntime.requestUIRefresh(for: session)
                 }
                 return
             }
@@ -10091,7 +10103,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             )
             session.appendItem(toolItem)
             AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] append toolCall tool=\(toolName) invocationID=\(invocationID?.uuidString ?? "nil") argsChars=\(argsJSON?.count ?? 0) totalItems=\(session.items.count)")
-            viewModel?.requestUIRefresh(tabID: session.tabID)
+            presentationRuntime.requestUIRefresh(for: session)
         case let .toolResult(toolName, invocationID, argsJSON, resultJSON, isError, _):
             guard session.runState.isActive else { return }
             let toolName = AgentToolNamePolicy.accepted(toolName) ?? AgentToolNamePolicy.fallbackName
@@ -10138,7 +10150,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                         session: session
                     ) {
                         guard terminalApplyResult.didChange else { return }
-                        viewModel?.requestUIRefresh(tabID: session.tabID)
+                        presentationRuntime.requestUIRefresh(for: session)
                         persistenceRuntime?.scheduleSave(for: session)
                         return
                     }
@@ -10161,8 +10173,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                         ).map { materializeRunningBashExecution($0.state, session: session) } ?? false)
                         : false
                     if didUpdateLive || didMaterialize {
-                        viewModel?.requestUIRefresh(
-                            tabID: session.tabID,
+                        presentationRuntime.requestUIRefresh(
+                            for: session,
                             scope: shouldMaterializeRunningOutput ? .full : .transcriptRuntime
                         )
                     }
@@ -10179,7 +10191,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                     observedAt: eventTimestamp
                 ) {
                     AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] finalize bash toolResult tool=\(toolName) invocationID=\(invocationID?.uuidString ?? "nil") liveCount=\(session.bashLiveExecutionByKey.count)")
-                    viewModel?.requestUIRefresh(tabID: session.tabID)
+                    presentationRuntime.requestUIRefresh(for: session)
                     persistenceRuntime?.scheduleSave(for: session)
                 }
                 return
@@ -10251,7 +10263,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 session: session
             )
             AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] apply toolResult tool=\(toolName) invocationID=\(invocationID?.uuidString ?? "nil") isError=\(isError.map(String.init(describing:)) ?? "nil") resultChars=\(resultJSON.count) totalItems=\(session.items.count)")
-            viewModel?.requestUIRefresh(tabID: session.tabID)
+            presentationRuntime.requestUIRefresh(for: session)
         case let .commandExecutionRunning(runningUpdate):
             guard session.runState.isActive
                 || shouldApplyCommandExecutionRunningUpdateToInactiveSession(runningUpdate, session: session)
@@ -10290,8 +10302,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 setRunningStatus(statusText, source: .transport, session: session, urgent: true)
                 session.runState = .running
             }
-            viewModel?.setAgentRunActive(session.tabID, isActive: true)
-            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+            presentationRuntime.setAgentRunActive(session, isActive: true)
+            presentationRuntime.requestUIRefresh(for: session, urgent: true)
         case let .turnCompleted(turnID, status, failure):
             let completionOwnership = session.activeRunOwnership
             if bufferCodexTurnCompletionDuringReattachIfNeeded(
@@ -10401,8 +10413,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             {
                 setRunningStatus("Codex is active…", source: .transport, session: session, urgent: true)
             }
-            viewModel?.setAgentRunActive(session.tabID, isActive: true)
-            viewModel?.requestUIRefresh(tabID: session.tabID, scope: .runtimeMetrics)
+            presentationRuntime.setAgentRunActive(session, isActive: true)
+            presentationRuntime.requestUIRefresh(for: session, scope: .runtimeMetrics)
         case let .errorNotification(notification):
             let willRetry: Bool
             if let structuredWillRetry = notification.willRetry {
@@ -10421,8 +10433,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                     )
                 }
                 setRunningStatus(notification.message, source: .reconnect, session: session, urgent: true)
-                viewModel?.setAgentRunActive(session.tabID, isActive: true)
-                viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true, scope: .runtimeMetrics)
+                presentationRuntime.setAgentRunActive(session, isActive: true)
+                presentationRuntime.requestUIRefresh(for: session, urgent: true, scope: .runtimeMetrics)
                 return
             }
             if await attemptManagedCodexAuthRecovery(
@@ -10452,8 +10464,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                     )
                 }
                 setRunningStatus(message, source: .reconnect, session: session, urgent: true)
-                viewModel?.setAgentRunActive(session.tabID, isActive: true)
-                viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true, scope: .runtimeMetrics)
+                presentationRuntime.setAgentRunActive(session, isActive: true)
+                presentationRuntime.requestUIRefresh(for: session, urgent: true, scope: .runtimeMetrics)
                 return
             }
             if await attemptManagedCodexAuthRecovery(
@@ -10473,7 +10485,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         case let .system(message):
             let systemItem = AgentChatItem.system(message, sequenceIndex: session.nextSequenceIndex)
             session.appendItem(systemItem)
-            viewModel?.requestUIRefresh(tabID: session.tabID)
+            presentationRuntime.requestUIRefresh(for: session)
         }
     }
 
@@ -10495,16 +10507,16 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 clearCodexPendingInteractions(in: session)
                 AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
                 mcpRuntime?.handleObservedMCPStateChange(for: session)
-                viewModel?.setAgentRunActive(session.tabID, isActive: false)
-                viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                presentationRuntime.setAgentRunActive(session, isActive: false)
+                presentationRuntime.requestUIRefresh(for: session, urgent: true)
                 persistenceRuntime?.scheduleSave(for: session)
                 scheduleCodexIdleShutdownIfNeeded(for: session, reason: "transport-closed-idle")
                 return
             }
             if !hasPendingCodexInteraction(for: session) {
                 setRunningStatus("Reconnecting…", source: .reconnect, session: session, urgent: true)
-                viewModel?.setAgentRunActive(session.tabID, isActive: true)
-                viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true, scope: .runtimeMetrics)
+                presentationRuntime.setAgentRunActive(session, isActive: true)
+                presentationRuntime.requestUIRefresh(for: session, urgent: true, scope: .runtimeMetrics)
                 if let sourceController {
                     scheduleCodexTransportClosedFallback(for: session, sourceController: sourceController)
                 }
@@ -11677,9 +11689,9 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         case .noChange:
             break
         case .liveStateOnly:
-            viewModel?.requestUIRefresh(tabID: session.tabID, scope: .transcriptRuntime)
+            presentationRuntime.requestUIRefresh(for: session, scope: .transcriptRuntime)
         case .materializedTranscript:
-            viewModel?.requestUIRefresh(tabID: session.tabID)
+            presentationRuntime.requestUIRefresh(for: session)
         }
     }
 
@@ -11723,7 +11735,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 }
                 logCodex("[AgentModeVM][CodexIdle] shutting down idle app-server for tab \(tabID) reason=\(reason)")
                 await shutdownCodexSession(session, reclaimOnlyIfStillIdle: true)
-                viewModel?.requestUIRefresh(tabID: tabID, urgent: true)
+                presentationRuntime.requestUIRefresh(for: session, urgent: true)
                 persistenceRuntime?.scheduleSave(for: session)
             }
         )
@@ -11983,9 +11995,9 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             case .noChange:
                 break
             case .liveStateOnly:
-                viewModel?.requestUIRefresh(tabID: session.tabID, scope: .transcriptRuntime)
+                presentationRuntime.requestUIRefresh(for: session, scope: .transcriptRuntime)
             case .materializedTranscript:
-                viewModel?.requestUIRefresh(tabID: session.tabID)
+                presentationRuntime.requestUIRefresh(for: session)
             }
             return
         }
@@ -12002,7 +12014,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 session: session
             ) {
                 guard terminalApplyResult.didChange else { return }
-                viewModel?.requestUIRefresh(tabID: session.tabID)
+                presentationRuntime.requestUIRefresh(for: session)
                 persistenceRuntime?.scheduleSave(for: session)
                 return
             }
@@ -12026,8 +12038,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 {
                     _ = materializeRunningBashExecution(state, session: session)
                 }
-                viewModel?.requestUIRefresh(
-                    tabID: session.tabID,
+                presentationRuntime.requestUIRefresh(
+                    for: session,
                     scope: shouldMaterializeRunningOutput ? .full : .transcriptRuntime
                 )
             }
@@ -12043,7 +12055,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             session: session,
             observedAt: observedAt
         ) {
-            viewModel?.requestUIRefresh(tabID: session.tabID)
+            presentationRuntime.requestUIRefresh(for: session)
             persistenceRuntime?.scheduleSave(for: session)
         }
     }
@@ -12090,7 +12102,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         rebuildLiveBashExecutionState(from: session)
         guard didReconcile else { return }
         session.isDirty = true
-        viewModel?.requestUIRefresh(tabID: session.tabID)
+        presentationRuntime.requestUIRefresh(for: session)
         persistenceRuntime?.scheduleSave(for: session)
     }
 
@@ -12300,7 +12312,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         session.pendingApproval = nil
         AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
         handleRunInteractionStateChange(for: session, reason: .approvalResponseSubmitted)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
         Task { [controller] in
             await controller.respondToServerRequest(id: requestID, result: result)
         }
@@ -12321,7 +12333,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         session.pendingPermissionsRequest = nil
         AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
         handleRunInteractionStateChange(for: session, reason: .permissionsResponseSubmitted)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
         let authoritativeTurnID = session.codexAuthoritativeActiveTurn?.turnID
         Task { [controller] in
             await controller.respondToServerRequest(id: request.requestID, result: result)
@@ -12349,7 +12361,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         }
         AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
         handleRunInteractionStateChange(for: session, reason: .mcpElicitationResponseSubmitted)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
         mcpRuntime?.handleObservedMCPStateChange(for: session)
         let authoritativeTurnID = session.codexAuthoritativeActiveTurn?.turnID
         Task { [controller] in
@@ -12461,7 +12473,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         session.codexRolloutPath = nil
         session.providerCleanupHandle = nil
         session.codexContextUsage = nil
-        viewModel?.clearContextUsageSnapshot(for: session)
+        usageRuntime.clearContextUsageSnapshot(for: session)
         session.activeReasoningItemID = nil
         session.reasoningItemIDsByGroupID.removeAll()
         session.codexReasoningSegmentsByKey.removeAll()

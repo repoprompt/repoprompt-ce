@@ -1666,6 +1666,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             flushPendingUIRefresh(cancelScheduled: true)
         }
 
+        func test_pendingUIRefreshScopes(for tabID: UUID) -> Set<UIRefreshScope> {
+            pendingUIRefreshScopesByTabID[tabID] ?? []
+        }
+
         func test_drainScheduledDerivedTranscriptRefresh(tabID: UUID) async {
             while let session = sessions[tabID], let task = session.derivedTranscriptRefreshTask {
                 let generation = session.derivedTranscriptRefreshGeneration
@@ -2028,9 +2032,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     guard let self, sessions[session.tabID] === session else { return }
                     publishAgentRunActivity(tabID: session.tabID, session: session, isActive: isActive)
                 },
-                refresh: { [weak self] session, urgent in
+                refresh: { [weak self] session, urgent, scope in
                     guard let self, sessions[session.tabID] === session else { return }
-                    requestUIRefresh(tabID: session.tabID, urgent: urgent)
+                    requestUIRefresh(tabID: session.tabID, urgent: urgent, scope: scope)
                 },
                 turnComplete: { [weak self] session in
                     guard let self, sessions[session.tabID] === session else { return }
@@ -3191,6 +3195,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     var usageRuntime: AgentSessionUsageRuntime {
         runtimeSessionStore.usage
+    }
+
+    var presentationRuntime: AgentSessionPresentationRuntime {
+        runtimeSessionStore.presentation
     }
 
     var streamRuntime: AgentSessionStreamRuntime {

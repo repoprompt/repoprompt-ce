@@ -65,6 +65,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         shouldManageCodexTooling: Bool = false,
         codexResumeGate: TestReleaseFence? = nil,
         saverBehavior: LiveSendEventLog.SaverBehavior = .succeed,
+        storagePath: URL? = nil,
         firstSaveGate: FirstSaveGate? = nil,
         secondSaveGate: FirstSaveGate? = nil,
         codexStallWatchdogProbeThreshold: TimeInterval? = nil,
@@ -98,6 +99,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         let workspace = WorkspaceModel(
             name: "Overseer compaction",
             repoPaths: [],
+            customStoragePath: storagePath,
             ephemeralFlag: true,
             composeTabs: [ComposeTabState(id: tabID)],
             activeComposeTabID: tabID
@@ -547,8 +549,22 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
     }
 
     func testSelfMCPAdmissionRejectsCompetingWriterArrivingDuringRequiredSave() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("M9CompactWrite-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
         let gate = FirstSaveGate()
-        let fixture = try makeFixture(firstSaveGate: gate)
+        let fixture = try makeFixture(storagePath: root)
+        let service = AgentSessionDataService()
+        var savedURL: URL?
+        var writes = 0
+        fixture.viewModel.test_setAgentSessionSaver { payload, workspace, count in
+            writes += 1
+            let url = try await service.saveAgentSession(
+                payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count
+            )
+            savedURL = url
+            if writes == 1 { await gate.pause() }
+            return url
+        }
         let runID = UUID()
         fixture.session.installRunID(runID)
         fixture.session.runState = .running
@@ -565,6 +581,13 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
             )
         }
         await gate.waitUntilEntered()
+        let persistedJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: XCTUnwrap(savedURL))) as? [String: Any])
+        let persistedState = try JSONDecoder().decode(
+            AgentSelfCompactState.self,
+            from: JSONSerialization.data(withJSONObject: XCTUnwrap(persistedJSON["selfCompactState"]))
+        )
+        XCTAssertEqual(persistedState.active?.note, "retain for recovery")
+        XCTAssertEqual(persistedState.active?.idempotencyKey, "writer-during-save")
         let otherTabID = UUID()
         let competing = fixture.viewModel.session(for: otherTabID)
         competing.installPersistentSessionBinding(AgentPersistentSessionBindingIdentity(
@@ -576,10 +599,21 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         guard case let .blocked(reason) = result else {
             return XCTFail("A new competing writer must prevent a scheduled receipt")
         }
-        XCTAssertEqual(reason, "session_not_exclusive")
+        // The payload already reached disk, but the new writer invalidates its acknowledgment.
+        // This failed flush must retain recovery evidence rather than report an acknowledged reservation.
+        XCTAssertEqual(reason, "persistence_indeterminate")
         XCTAssertNil(fixture.session.selfCompactState.active)
-        XCTAssertEqual(fixture.session.selfCompactState.latest?.outcome, .cancelled)
+        XCTAssertEqual(fixture.session.selfCompactState.latest?.outcome, .recoveryRequired)
+        XCTAssertEqual(fixture.session.selfCompactState.latest?.recoveryNote, "retain for recovery")
+        XCTAssertEqual(fixture.session.selfCompactState.latest?.noteDelivery, .notSent)
+        XCTAssertTrue(fixture.session.isDirty)
+        await fixture.session.saveDebounceTask?.value
+        XCTAssertEqual(writes, 1, "Writer conflict must not start a compensating write or repeat native dispatch")
         XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
+        let restored = try await service.loadAgentSession(from: XCTUnwrap(savedURL))
+        XCTAssertNil(restored.selfCompactState?.active, "A durable reservation cannot execute after reload")
+        XCTAssertEqual(restored.selfCompactState?.latest?.outcome, .recoveryRequired)
+        XCTAssertEqual(restored.selfCompactState?.latest?.recoveryNote, "retain for recovery")
     }
 
     func testSelfMCPAdmissionPersistenceFailureNeverLeavesExecutableRequest() async throws {

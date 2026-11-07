@@ -1,5 +1,12 @@
 import Foundation
 
+/// In-memory projection scope; no persisted or reflected type identity is changed.
+enum AgentSessionPresentationRefreshScope: String, Equatable, Hashable {
+    case full
+    case transcriptRuntime
+    case runtimeMetrics
+}
+
 /// Optional exact-object presentation attachment. This is not a writer registration or a run
 /// lifecycle owner: detach only stops projections. Runtime activity is updated even when no
 /// presenter exists, and a late detach token cannot disconnect a newer presenter.
@@ -7,7 +14,7 @@ import Foundation
 final class AgentSessionPresentationRuntime {
     struct Sink {
         let activityChanged: (AgentTabSession, Bool) -> Void
-        let refresh: (AgentTabSession, Bool) -> Void
+        let refresh: (AgentTabSession, Bool, AgentSessionPresentationRefreshScope) -> Void
         let turnComplete: (AgentTabSession) -> Void
         let turnFailed: (AgentTabSession, String?) -> Void
         var assistantDelta: ((AgentTabSession, Int, UInt64) -> Void)?
@@ -76,13 +83,21 @@ final class AgentSessionPresentationRuntime {
         }
     }
 
+    func setAgentRunActive(_ session: AgentTabSession, isActive: Bool) {
+        Self.applyRunActivity(to: session, isActive: isActive)
+        sink(for: session)?.activityChanged(session, isActive)
+    }
+
+    func requestUIRefresh(for session: AgentTabSession, urgent: Bool = false, scope: AgentSessionPresentationRefreshScope = .full) {
+        sink(for: session)?.refresh(session, urgent, scope)
+    }
+
     func makeRunHooks() -> AgentModeRunService.RunPresentationHooks {
         .init(
             setAgentRunActive: { [self] session, isActive in
-                Self.applyRunActivity(to: session, isActive: isActive)
-                sink(for: session)?.activityChanged(session, isActive)
+                setAgentRunActive(session, isActive: isActive)
             },
-            requestUIRefresh: { [self] session, urgent in sink(for: session)?.refresh(session, urgent) },
+            requestUIRefresh: { [self] session, urgent in requestUIRefresh(for: session, urgent: urgent) },
             notifyAgentTurnComplete: { [self] session in sink(for: session)?.turnComplete(session) },
             notifyAgentTurnFailed: { [self] session, error in sink(for: session)?.turnFailed(session, error) }
         )

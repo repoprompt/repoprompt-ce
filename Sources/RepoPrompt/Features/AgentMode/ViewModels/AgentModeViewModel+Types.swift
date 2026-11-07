@@ -156,11 +156,7 @@ extension AgentModeViewModel {
 
     typealias AgentInteractionTransport = AgentRunInteractionTransport
 
-    enum UIRefreshScope: String, Equatable, Hashable {
-        case full
-        case transcriptRuntime
-        case runtimeMetrics
-    }
+    typealias UIRefreshScope = AgentSessionPresentationRefreshScope
 
     struct AssistantPresentationRequest: Equatable {
         let tabID: UUID

@@ -4059,3 +4059,52 @@ with agreeing UI replicas, actual window-free run-host/input/continuation compos
 MCP/admin/scope/link runtime routing, and replacing the prepared `WindowState` factory
 remain open. Full-suite qualification and live smoke are not claimed. No app lifecycle
 action, publication, push or PR-state change was performed.
+
+### M9 continuation — Codex runtime effects and partial-write receipts (2026-11-08)
+
+The Codex coordinator now sends usage, activity, assistant-delta and refresh effects
+to the existing concrete usage/presentation runtimes instead of 87 weak-VM call sites.
+Usage and originating run timestamps remain live without a presenter; optional
+presentation dispatch is exact-object, not a lookup of a potentially recycled tab ID.
+Production attachment installs the scope services. A standalone coordinator also owns
+concrete services without constructing a window or view model. The one refresh sink
+carries the existing full/transcript-runtime/runtime-metrics scope, preserving narrow
+publications. The in-memory refresh enum moved with a VM alias; persisted/reflected
+identities are unchanged. This does not remove the remaining provider-input, route,
+factory or continuation dependencies and is not a window-free run-host claim.
+
+Full-suite ticket `b1569e4c-37d2-46c9-8ff1-c1a4cc9fcc62` at `a04d7902a` was cancelled
+at 15m59s after 3,114 completed case passes and one failing case (two assertions).
+It is **not** a full-suite pass. The compaction test expected a successful required-save
+acknowledgment followed by `session_not_exclusive` / local cancellation. An exact writer
+that loses exclusivity while its saver is suspended now correctly refuses that
+acknowledgment: the existing compaction transaction returns `persistence_indeterminate`
+and preserves a recovery note. Its test now commits a real payload before admitting the
+competitor, proves the reservation exists on disk, drains the refused debounced save,
+and verifies recovery rather than executable work on reload. No production persistence,
+writer or native-dispatch guard was relaxed.
+
+New coordinator regressions exercise actual native turn/usage events without a VM,
+presenter detach during a turn, and production VM attachment followed by a reused-tab
+replacement. Review also removed a redundant optional scoped-refresh callback in favor
+of one explicit scoped sink. The old usage VM methods were verified to be forwarding
+only. The unchanged compaction branch after a successful required-save acknowledgment
+is distinct from the tested failed-acknowledgment branch; `selfCompactState` already
+marks changes dirty, and this work does not redefine local cancellation as a disk receipt.
+
+Initial focused ticket `c46ea92f-f58f-4273-88a3-704c86657173` executed 146 tests with
+one failure in a new assertion: Codex's reported window belongs to
+`contextUsageSnapshot.window`, not the separate non-Codex capacity field. The new
+disk-backed compaction case and the other 144 cases passed. That assertion was corrected
+without changing the accounting implementation.
+
+Corrected ticket `f43ba7bf-6d37-4d9a-8a80-636c2f0698f7` (`m9-codex-effects-v2`)
+passed **150 tests**: standalone/production Codex runtime effects 2, interaction runtime
+4, compaction transactions 26, context load 40, presentation runtime 4, and Codex
+resume/wedge commit 74. Lint ticket `7d82eeac-5909-4c65-b059-8512d1edec34` passed
+the same Swift tree. Scoped formatting and independent review were performed; no
+ratchet baseline changed. The earlier product/index receipt belongs to `a04d7902a`,
+not this new integration. Full-suite qualification and live smoke remain unclaimed.
+General independent writer admission, real run-host/input/factory/continuation
+composition, window-free saved execution and presentation-preserving close remain
+open. No push, PR-state mutation, merge, or app lifecycle action was performed.

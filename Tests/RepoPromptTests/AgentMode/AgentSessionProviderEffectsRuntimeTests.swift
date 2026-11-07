@@ -2,7 +2,9 @@ import AppKit
 import Foundation
 import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
 import XCTest
 
 @MainActor
@@ -222,7 +224,7 @@ final class AgentSessionStreamRuntimeTests: XCTestCase {
         let f = Fixture()
         let runtime = f.scope.stream
         var refreshes = 0
-        let attachment = f.scope.presentation.attach(f.session, sink: .init(activityChanged: { _, _ in }, refresh: { _, _ in refreshes += 1 }, turnComplete: { _ in }, turnFailed: { _, _ in }))
+        let attachment = f.scope.presentation.attach(f.session, sink: .init(activityChanged: { _, _ in }, refresh: { _, _, _ in refreshes += 1 }, turnComplete: { _ in }, turnFailed: { _, _ in }))
         f.scope.presentation.detach(attachment)
         let owner = try XCTUnwrap(f.session.activeRunOwnership)
         let runID = try XCTUnwrap(f.session.runID)
@@ -285,7 +287,7 @@ final class AgentSessionStreamRuntimeTests: XCTestCase {
         successor.isDirty = true
         f.scope.replaceSessions([successor.tabID: successor])
         var successorRefreshes = 0
-        _ = f.scope.presentation.attach(successor, sink: .init(activityChanged: { _, _ in }, refresh: { _, _ in successorRefreshes += 1 }, turnComplete: { _ in }, turnFailed: { _, _ in }))
+        _ = f.scope.presentation.attach(successor, sink: .init(activityChanged: { _, _ in }, refresh: { _, _, _ in successorRefreshes += 1 }, turnComplete: { _ in }, turnFailed: { _, _ in }))
         hooks.requestUIRefresh(f.session, true)
         hooks.scheduleSave(f.session)
         XCTAssertEqual(successorRefreshes, 0)
@@ -304,7 +306,7 @@ final class AgentSessionStreamRuntimeTests: XCTestCase {
         var assistantPublications: [(Int, UInt64)] = []
         var derivedPublications = 0
         _ = f.scope.presentation.attach(f.session, sink: .init(
-            activityChanged: { _, _ in }, refresh: { _, _ in }, turnComplete: { _ in }, turnFailed: { _, _ in },
+            activityChanged: { _, _ in }, refresh: { _, _, _ in }, turnComplete: { _ in }, turnFailed: { _, _ in },
             assistantDelta: { [weak expected = f.session] session, revision, generation in
                 XCTAssertTrue(session === expected)
                 assistantPublications.append((revision, generation))
@@ -687,7 +689,7 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         var refreshes = 0
         let attachment = scope.presentation.attach(session, sink: .init(
             activityChanged: { _, _ in },
-            refresh: { _, _ in refreshes += 1
+            refresh: { _, _, _ in refreshes += 1
                 if refreshes == 1 { subscribed.fulfill() }
             },
             turnComplete: { _ in }, turnFailed: { _, _ in }
@@ -717,5 +719,94 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         func runInteractionStateChanged(for session: AgentTabSession, reason: AgentRunInteractionStateChangeReason) {
             reasons.append(reason)
         }
+    }
+}
+
+@MainActor
+final class AgentSessionCodexRuntimeEffectsTests: XCTestCase {
+    func testNativeUsageAndActivityContinueWithoutViewModelOrPresentation() async throws {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let coordinator = makeCoordinator(scope: scope)
+        let session = AgentTabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        session.selectedModelRaw = "gpt-5"
+        session.codexConversationID = "runtime-thread"
+        session.codexController = LifecycleNoopCodexController(recorder: LifecycleRecorder())
+        session.installRunID(UUID())
+        _ = session.beginRunAttempt(source: "test.runtime.codex")
+        scope.replaceSessions([session.tabID: session])
+        await coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "turn-one"), session: session)
+        XCTAssertEqual(session.runState, .running)
+        let startedAt = try XCTUnwrap(session.activeAgentRunStartedAt)
+        await coordinator.test_handleCodexNativeEvent(.tokenUsage(.init(modelContextWindow: 200_000, lastTotalTokens: 1200, totalTotalTokens: 1800)), session: session)
+        XCTAssertEqual(session.contextUsageSnapshot?.used, 1200)
+        XCTAssertEqual(session.contextUsageSnapshot?.window, 200_000)
+        XCTAssertTrue(session.isDirty)
+
+        var scopes: [AgentSessionPresentationRefreshScope] = []
+        let attachment = scope.presentation.attach(session, sink: .init(
+            activityChanged: { _, _ in XCTFail("Attaching a presenter must not restart the turn") },
+            refresh: { actual, _, refreshScope in
+                XCTAssertTrue(actual === session)
+                scopes.append(refreshScope)
+            },
+            turnComplete: { _ in }, turnFailed: { _, _ in }
+        ))
+        await coordinator.test_handleCodexNativeEvent(.tokenUsage(.init(modelContextWindow: 200_000, lastTotalTokens: 2400, totalTotalTokens: 3600)), session: session)
+        XCTAssertEqual(scopes, [.runtimeMetrics])
+        scope.presentation.detach(attachment)
+        await coordinator.test_handleCodexNativeEvent(.tokenUsage(.init(modelContextWindow: 200_000, lastTotalTokens: 3600, totalTotalTokens: 5400)), session: session)
+        XCTAssertEqual(session.contextUsageSnapshot?.used, 3600)
+        XCTAssertEqual(session.activeAgentRunStartedAt, startedAt)
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertEqual(scopes, [.runtimeMetrics], "Detached presentation receives no later metrics")
+        await session.codexController?.shutdown()
+    }
+
+    func testProductionAttachmentPublishesNativeEffectsButRejectsRecycledTab() async {
+        let viewModel = AgentModeViewModel(
+            testWindowID: -902, testWorkspacePath: nil, shouldManageCodexTooling: false,
+            codexControllerFactory: { _, _, _, _, _, _ in fatalError("Event handling must not launch a controller") }
+        )
+        let coordinator = viewModel.test_codexCoordinator
+        let predecessor = viewModel.session(for: UUID())
+        predecessor.selectedAgent = .codexExec
+        predecessor.codexConversationID = "presentation-thread"
+        predecessor.codexController = LifecycleNoopCodexController(recorder: LifecycleRecorder())
+        predecessor.installRunID(UUID())
+        _ = predecessor.beginRunAttempt(source: "test.runtime.presentation")
+        await coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "turn-one"), session: predecessor)
+        XCTAssertTrue(viewModel.tabsWithActiveAgentRun.contains(predecessor.tabID))
+        viewModel.test_flushPendingUIRefresh()
+        await coordinator.test_handleCodexNativeEvent(.tokenUsage(.init(modelContextWindow: 200_000, lastTotalTokens: 1200, totalTotalTokens: 1200)), session: predecessor)
+        XCTAssertEqual(viewModel.test_pendingUIRefreshScopes(for: predecessor.tabID), [.runtimeMetrics])
+        XCTAssertEqual(predecessor.contextUsageSnapshot?.used, 1200)
+
+        viewModel.setAgentRunActive(predecessor, isActive: false)
+        viewModel.removePendingUIRefresh(for: predecessor.tabID)
+        let replacement = AgentTabSession(tabID: predecessor.tabID)
+        viewModel.test_installLiveSession(replacement)
+        await coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "turn-one"), session: predecessor)
+        await coordinator.test_handleCodexNativeEvent(.tokenUsage(.init(modelContextWindow: 200_000, lastTotalTokens: 7200, totalTotalTokens: 7200)), session: predecessor)
+        XCTAssertEqual(predecessor.contextUsageSnapshot?.used, 7200)
+        XCTAssertNotNil(predecessor.activeAgentRunStartedAt, "Originating runtime state remains independent of the replacement UI")
+        XCTAssertFalse(viewModel.tabsWithActiveAgentRun.contains(replacement.tabID))
+        XCTAssertEqual(viewModel.test_pendingUIRefreshScopes(for: replacement.tabID), [])
+        XCTAssertNil(replacement.contextUsageSnapshot)
+        XCTAssertNil(replacement.activeAgentRunStartedAt)
+        await predecessor.codexController?.shutdown()
+        await viewModel.prepareForWindowClose()
+    }
+
+    private func makeCoordinator(scope: AgentSessionRuntimeStore.Scope) -> CodexAgentModeCoordinator {
+        let coordinator = CodexAgentModeCoordinator(
+            windowID: -901, runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
+            codexControllerFactory: { _, _, _, _, _, _, _, _ in fatalError("Event handling must not launch a controller") },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            shouldManageCodexTooling: false, codexHookApprovalSettings: GlobalSettingsStore.shared
+        )
+        coordinator.installUsageRuntime(scope.usage)
+        coordinator.installPresentationRuntime(scope.presentation)
+        return coordinator
     }
 }

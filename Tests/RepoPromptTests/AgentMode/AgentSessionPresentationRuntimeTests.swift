@@ -107,7 +107,7 @@ final class AgentSessionPresentationRuntimeTests: XCTestCase {
         var sink: AgentSessionPresentationRuntime.Sink {
             .init(
                 activityChanged: { [weak self] _, active in self?.activity.append(active) },
-                refresh: { [weak self] _, _ in self?.refreshes += 1 },
+                refresh: { [weak self] _, _, _ in self?.refreshes += 1 },
                 turnComplete: { [weak self] _ in self?.completions += 1 },
                 turnFailed: { [weak self] _, _ in self?.failures += 1 }
             )
