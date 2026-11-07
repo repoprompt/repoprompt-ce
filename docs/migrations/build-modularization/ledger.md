@@ -104,12 +104,10 @@ not duplicate it in individual registries. No other new global owner is authoriz
 
 ## Ratchet exception — background Oracle invocations (2026-11-06)
 
-`app_static_shared_declarations`: **89 → 90**, solely for
-`OracleBackgroundInvocationRegistry.shared`. Generated with
-`python3 Scripts/modularization_metrics.py update --allow-regression --baseline .build/validation-artifacts/oracle-index/ratchets.generated.json`
-after copying the current baseline to that temporary path. Only this metric is adopted
-in `ratchets.json`; all other baseline keys remain unchanged.
-This is an explicit one-owner exception, not a relaxation of the gate or a rename to evade its shared count.
+This is an explicit one-owner exception for `OracleBackgroundInvocationRegistry.shared`.
+After the M6 module extraction, `python3 Scripts/modularization_metrics.py check` measures
+**88** `app_static_shared_declarations`, within main's existing ceiling of **89**.
+The existing `ratchets.json` baseline is retained.
 
 The owner is the process-memory index of background Oracle invocations used by
 `ask_oracle`/`oracle_chat_log`, provider awareness, and session deletion, independent of

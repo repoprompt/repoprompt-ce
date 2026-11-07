@@ -9718,7 +9718,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         worktreeBindingState(
             forAgentSessionID: sessionID,
             tabID: tabID,
-            resolutionSnapshot: makePersistentBindingResolutionSnapshot()
+            resolutionSnapshot: makePersistentBindingResolutionSnapshot(for: [sessionID])
         )
     }
 
