@@ -4913,7 +4913,19 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             let (fixture, clock, endpoint) = try periodicFixture()
             if periodic { _ = try reservePeriodic(fixture, clock: clock, endpoint: endpoint) }
             else { fixture.session.oversight.retirePeriodicScheduling() }
-            let session = AgentTabSession(tabID: fixture.tabID)
+            let controller = MonitorFakeNativeController()
+            await controller.setRejectResume(true)
+            let freshController = MonitorFakeNativeController()
+            var creations = 0
+            let host = AgentModeViewModel(
+                testWindowID: -904,
+                codexControllerFactory: { _, _, _, _, _, _ in fatalError("Claude recovery must not construct Codex") },
+                claudeControllerFactory: { _, _, _, _ in
+                    creations += 1
+                    return creations == 1 ? controller : freshController
+                }
+            )
+            let session = host.session(for: fixture.tabID)
             session.hasLoadedPersistedState = true
             session.testInstallPersistentSessionBinding(sessionID: UUID())
             session.recordRestorationAuthoritative(.persistedPayloadApplied)
@@ -4921,23 +4933,17 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             session.oversight.pendingAutoWake = fixture.session.oversight.pendingAutoWake
             session.selectedAgent = .claudeCode
             session.providerSessionID = "missing-original-session"
-            let controller = MonitorFakeNativeController()
-            await controller.setRejectResume(true)
-            var creations = 0
-            let coordinator = ClaudeAgentModeCoordinator(
-                windowID: 1, workspacePathProvider: { _ in nil },
-                claudeControllerFactory: { _, _, _, _ in
-                    creations += 1
-                    return controller
-                }
-            )
+            session.items.append(.init(kind: .user, text: "Preserve this recovery history"))
+            let coordinator = host.claudeCoordinator
             let runID = UUID()
             session.installRunID(runID)
             let ownership = session.beginRunAttempt(source: "test.periodic.resume")
             let result = await coordinator.ensureClaudeNativeSession(
                 session: session, intent: .runAttempt(ownership: ownership, runID: runID)
             )
-            let attempts = await controller.startOrResumeExistingSessionIDs
+            let originalAttempts = await controller.startOrResumeExistingSessionIDs
+            let freshAttempts = await freshController.startOrResumeExistingSessionIDs
+            let attempts = originalAttempts + freshAttempts
             if periodic {
                 guard case .failed = result else { return XCTFail("periodic resume must fail closed: \(result)") }
                 XCTAssertEqual(attempts, ["missing-original-session"])
@@ -4947,8 +4953,20 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 XCTAssertEqual(result, .ready)
                 XCTAssertEqual(attempts, ["missing-original-session", nil])
                 XCTAssertEqual(creations, 2)
+                let sent = await coordinator.sendClaudeNativeMessage(
+                    session: session, text: "Continue", attachments: [],
+                    intent: .runAttempt(ownership: ownership, runID: runID),
+                    allowsCatalogRouteControllerRecovery: false
+                )
+                XCTAssertEqual(sent, .sent)
+                let messages = await freshController.sentMessages
+                XCTAssertEqual(messages.count, 1)
+                XCTAssertTrue(try XCTUnwrap(messages.first).contains("<forked_session"))
+                XCTAssertTrue(try XCTUnwrap(messages.first).contains("Preserve this recovery history"))
             }
             await controller.shutdown()
+            await freshController.shutdown()
+            await host.prepareForWindowClose()
         }
     }
 

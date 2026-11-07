@@ -117,8 +117,8 @@ extension AgentModeRunService {
             _ session: AgentTabSession?,
             _ skipsSlashExpansion: Bool
         ) async -> String
-        /// Stages a transcript handoff for fresh-session resume recovery.
-        let stageResumeRecoveryHandoffIfNeeded: (_ session: AgentTabSession) async -> Void
+        /// False refuses a fresh-session fallback whose recovery context was superseded or unavailable.
+        let stageResumeRecoveryHandoffIfNeeded: (_ session: AgentTabSession) async -> Bool
         /// Prepends a staged handoff payload to provider-facing text.
         let prependPendingHandoffIfNeeded: (_ text: String, _ session: AgentTabSession) -> String
         /// Records whether a staged handoff payload was accepted by the provider send attempt.

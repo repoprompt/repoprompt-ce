@@ -4152,3 +4152,73 @@ claim that those entire suites ran. Final lint
 push, PR change or visible-app lifecycle action occurred. General writer admission and
 the actual window-free run-host/routing replacement remain open; the incomplete full
 suite recorded above has not been converted into a passing receipt.
+
+### M9 continuation — runtime-owned resume handoff preparation (2026-11-08)
+
+Retired VM-owned ordinary handoff prepend/send-consumption and the unqualified
+post-await resume-recovery assignment. `AgentSessionHandoffRuntime` now belongs to
+one runtime scope. Its preparation retains that scope and captures the exact session,
+persistent binding and transition generation, Stop fence, originating run/attempt,
+agent and an in-memory handoff revision before workspace-context IO. Commit rejects
+replacement, rebind, retirement, cancellation, a new run, or an intervening handoff,
+including change-and-restore. Transcript and model changes alone do not discard a
+valid frozen cutoff snapshot. Existing handoffs bypass transcript reconstruction.
+
+The ordinary pending-handoff value and three provider-switch composition/dispatch
+values are now runtime-owned with VM compatibility aliases; fields, physical-dispatch
+rules and persisted session schema are unchanged. Prepend and send-outcome hooks use
+the concrete runtime, not a weak VM callback. The originating runner still owns
+physical dispatch and send-outcome qualification; this is not a new delivery authority.
+Provider-switch confirmation remains separate from ordinary handoff consumption.
+
+Review caught the required caller consequence: refusing stale preparation must not
+silently start a contextless fresh provider. Claude and ACP now require a successful
+recovery result before fallback; ACP also rechecks its exact attempt after that await.
+The worktree transition caller propagates refusal as stale before provider-context
+invalidation, rather than interpreting it as an absent optional handoff. An existing
+handoff and a newly staged one remain distinct so worktree rollback only owns the
+payload it actually staged. Production Claude recovery coverage uses the real VM
+hook and checks the recovered transcript in the fake controller's provider input;
+the isolated runtime cases construct no WindowState, PromptViewModel or workspace VM.
+
+Validation iterations: `9e788ef2-967b-4f15-817f-6e31b9c9a73e` failed before tests on
+invalid throwing capture-list syntax in the new cancellation fixture.
+`febce8fa-a2e6-4fcd-a88f-f028c3beeef1` failed before tests on a test factory's wrong
+arity. `3a4a0ad2-628d-4a85-8b40-fadc6e456a2a` failed before tests on a missing
+required route-recovery argument in the strengthened integration test. These were
+fixture/compiler errors, not passing execution receipts. Lint
+`e5674596-f1ec-4339-97ad-62053b3dfbed` passed before the final fixture and worktree
+caller corrections. Corrected execution receipts follow below.
+
+Ticket `f1ac0726-b20a-4c5a-8116-4120e48dd1d5` executed 240 selected tests with
+seven failing cases (14 assertions, including six unexpected assertion/throw reports).
+All six new runtime cases passed. The strengthened Claude integration fixture reused
+one controller after shutting down its event stream; it now supplies a distinct fresh
+controller, like production. The durable worktree fixture also installed its session
+binding before attaching a workspace and never qualified that binding afterward. It
+now creates the exact carrier and exercises the production qualification CAS before
+granting restored readiness; the production unscoped-writer refusal is unchanged.
+Four worktree cases reported `ambiguousGitTopology` in unchanged repository-exclude
+reconciliation; their cause is not attributed to the handoff change without further
+evidence. These failures are being isolated rather than hidden by longer timeouts or
+weaker assertions. Lint `688b2577-e8b1-43dc-a73a-8db41af6331f` passed before these
+last fixture corrections.
+
+The next focused ticket `5e2db468-c19b-4c24-8907-398340e2d0d1` ran 50 tests:
+49 cases passed and the Manage-link case failed two assertions because it still
+expected a nil carrier after the fixture began installing an explicit carrier.
+Its CAS now asserts the already-installed exact session ID. All four prior topology
+cases passed on this run; their earlier failure mechanism remains unproven.
+Final ticket `ee1ee17e-aaac-4911-916c-2440ddd31b32` passed **251 tests**: ACP execution
+11, ACP identity 13, provider switching 39, standalone handoff 6, periodic resume
+failure 2, handoff inheritance 100, worktree admission 42, and Claude approval/resume
+38. The ACP execution suite is selected by its actual class name, not the earlier
+nonmatching filename-like filter. Final lint `6d5c6f8f-1e7c-4482-bf47-d46ffa447053`
+passed the same Swift tree. No production identity guard or timeout was weakened.
+
+Remaining: workspace-context capture is still supplied by the VM composition;
+independent first-mutation writer admission, provider input/link/continuation
+composition, actual window-free saved execution, and presentation-preserving close
+are not completed by this extraction. No target move, push, PR change, merge or
+visible-app lifecycle action occurred. The earlier incomplete full-suite run remains
+unqualified until a new full run completes.

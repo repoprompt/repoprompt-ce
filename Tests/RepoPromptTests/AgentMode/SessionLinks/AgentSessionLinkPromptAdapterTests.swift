@@ -3163,7 +3163,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 isSessionCurrent: { candidate in candidate === session },
                 requestUIRefresh: { _, _ in },
                 scheduleSave: { _ in },
-                stageClaudeResumeRecoveryHandoff: { _ in },
+                stageClaudeResumeRecoveryHandoff: { _ in true },
                 prependPendingHandoff: { text, _ in text },
                 qualifyAgentSessionLinkProviderInputRoute: { _, routeWait in
                     if routeWait != nil {
@@ -3469,7 +3469,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 isSessionCurrent: { candidate in candidate === session },
                 requestUIRefresh: { _, _ in },
                 scheduleSave: { _ in },
-                stageClaudeResumeRecoveryHandoff: { _ in },
+                stageClaudeResumeRecoveryHandoff: { _ in true },
                 prependPendingHandoff: { text, _ in text },
                 qualifyAgentSessionLinkProviderInputRoute: { _, routeWait in
                     // An immediate `.unavailable` here stands in for a route wait that ran out.

@@ -2589,10 +2589,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 self?.scheduleSave(for: session)
             },
             stageClaudeResumeRecoveryHandoff: { [weak self] session in
-                await self?.stageClaudeResumeRecoveryHandoffIfNeeded(for: session)
+                await self?.stageClaudeResumeRecoveryHandoffIfNeeded(for: session) ?? false
             },
-            prependPendingHandoff: { [weak self] text, session in
-                self?.prependPendingHandoffIfNeeded(text, session: session) ?? text
+            prependPendingHandoff: { [handoff = handoffRuntime] text, session in
+                handoff.prependPendingHandoffIfNeeded(text, session: session)
             },
             qualifyAgentSessionLinkProviderInputRoute: { [weak self] session, routeWait in
                 guard let self else { return .unavailable }
@@ -3672,13 +3672,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     )
                 },
                 stageResumeRecoveryHandoffIfNeeded: { [weak self] session in
-                    _ = await self?.stageResumeRecoveryHandoffIfNeeded(for: session)
+                    await self?.prepareResumeRecoveryHandoff(for: session).permitsFreshSession ?? false
                 },
-                prependPendingHandoffIfNeeded: { [weak self] text, session in
-                    self?.prependPendingHandoffIfNeeded(text, session: session) ?? text
+                prependPendingHandoffIfNeeded: { [handoff = handoffRuntime] text, session in
+                    handoff.prependPendingHandoffIfNeeded(text, session: session)
                 },
-                recordPendingHandoffSendOutcome: { [weak self] session, didSend in
-                    self?.recordPendingHandoffSendOutcome(for: session, didSend: didSend)
+                recordPendingHandoffSendOutcome: { [handoff = handoffRuntime] session, didSend in
+                    handoff.recordSendOutcome(for: session, didSend: didSend)
                 },
                 claimAgentSessionLinkPrompt: { [weak self] session, dispatchID in
                     guard let self else {
@@ -9168,8 +9168,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 if !changedDuringActiveRun {
                     try commitAuthority? {}
                     let previousHandoff = session.pendingHandoff
-                    if let stagedHandoff = await stageResumeRecoveryHandoffIfNeeded(for: session) {
-                        handoffRollback = (previousHandoff, stagedHandoff)
+                    switch await prepareResumeRecoveryHandoff(for: session) {
+                    case let .staged(stagedHandoff): handoffRollback = (previousHandoff, stagedHandoff)
+                    case .unchanged: break
+                    case .refused: throw ExecutionLocationTransitionError.stale
                     }
                     try await revalidateAuthority?()
                 }
@@ -19472,90 +19474,35 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return providerText
     }
 
-    @MainActor
-    func prependPendingHandoffIfNeeded(
-        _ text: String,
-        session: TabSession
-    ) -> String {
-        guard session.pendingHandoff.providerSwitchDelivery == nil,
-              session.oversight.pendingAutoWake?.isPeriodic != true,
-              let handoffPayload = session.pendingHandoff.payload,
-              session.pendingHandoff.isStagedForSend == false
-        else {
-            return text
-        }
-        let trimmedPayload = handoffPayload.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedPayload.isEmpty else {
-            return text
-        }
-        session.pendingHandoff.isStagedForSend = true
-        return trimmedPayload + "\n\n" + text
+    var handoffRuntime: AgentSessionHandoffRuntime {
+        _ = persistenceRuntime
+        return runtimeSessionStore.handoff
     }
 
-    // SEARCH-HELPER: Handoff, Resume, Recovery, Transcript, Session Transfer
-    // Shared helper that stages a resume-recovery handoff so the model has
-    // conversational context after a forced fresh session start.
     @MainActor
-    func stageResumeRecoveryHandoffIfNeeded(for session: TabSession) async -> PendingHandoffState? {
-        guard session.pendingHandoff.providerSwitchDelivery == nil,
-              session.oversight.pendingAutoWake?.isPeriodic != true else { return nil }
-        // Don't overwrite an existing staged payload, or claim ownership of it for rollback.
-        if let existingPayload = session.pendingHandoff.payload,
-           !existingPayload.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        {
-            return nil
-        }
+    func prependPendingHandoffIfNeeded(_ text: String, session: TabSession) -> String {
+        handoffRuntime.prependPendingHandoffIfNeeded(text, session: session)
+    }
+
+    /// The host supplies workspace context; exact-incarnation staging and consumption belong
+    /// to the runtime. Capture before the context read, not after its suspension.
+    private func prepareResumeRecoveryHandoff(for session: TabSession) async -> AgentSessionHandoffRuntime.RecoveryResult {
+        let handoff = handoffRuntime
+        if handoff.canReuseRecovery(for: session) { return .unchanged }
         let cutoffItemID = session.items.last(where: { $0.kind != .thinking })?.id
-        let sourceTabName = normalizedSessionTitle(workspaceManager?.composeTabName(with: session.tabID))
-        let escapedSourceTabName = sourceTabName
-            .replacingOccurrences(of: "&", with: "&amp;")
-            .replacingOccurrences(of: "\"", with: "&quot;")
-            .replacingOccurrences(of: "<", with: "&lt;")
-            .replacingOccurrences(of: ">", with: "&gt;")
-        let sourceAgentName = session.selectedAgent.displayName
-        let transcriptXML = buildForkTranscriptXML(from: session, upToItemID: cutoffItemID)
-        // delivery_id makes crash/restart retries best-effort idempotent at the prompt level.
-        let deliveryID = UUID().uuidString
-        let payload = await Self.composeClaudeResumeRecoveryHandoffPayload(
-            sourceTabName: escapedSourceTabName,
-            sourceAgentName: sourceAgentName,
-            transcriptXML: transcriptXML,
-            initialThreadContextBlock: buildInitialThreadContextBlock(tabID: session.tabID),
-            deliveryID: deliveryID
-        )
-        guard !payload.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return nil
-        }
-        let stagedHandoff = PendingHandoffState(
-            payload: payload,
-            createdAt: Date(),
-            sourceItemID: cutoffItemID,
-            defersProviderLockUntilSend: false,
-            isStagedForSend: false,
-            executionLocationFailure: session.pendingHandoff.executionLocationFailure
-        )
-        session.pendingHandoff = stagedHandoff
-        session.isDirty = true
-        return stagedHandoff
+        guard let preparation = handoff.prepareRecovery(
+            for: session,
+            sourceTabName: normalizedSessionTitle(workspaceManager?.composeTabName(with: session.tabID)),
+            transcriptXML: buildForkTranscriptXML(from: session, upToItemID: cutoffItemID)
+        ) else { return .refused }
+        let context = await buildInitialThreadContextBlock(tabID: session.tabID)
+        guard let staged = handoff.stageRecovery(preparation, initialThreadContextBlock: context) else { return .refused }
+        return .staged(staged)
     }
 
     @MainActor
-    func stageClaudeResumeRecoveryHandoffIfNeeded(for session: TabSession) async {
-        _ = await stageResumeRecoveryHandoffIfNeeded(for: session)
-    }
-
-    @MainActor
-    private func recordPendingHandoffSendOutcome(for session: TabSession, didSend: Bool) {
-        // Switch confirmation uses the exact physical-dispatch context, never this legacy Boolean.
-        guard session.pendingHandoff.providerSwitchDelivery == nil,
-              session.oversight.pendingAutoWake?.isPeriodic != true, session.pendingHandoff.isStagedForSend else { return }
-        if didSend {
-            session.pendingHandoff.clearAfterSend()
-            session.isDirty = true
-            scheduleSave(for: session.tabID)
-            return
-        }
-        session.pendingHandoff.isStagedForSend = false
+    func stageClaudeResumeRecoveryHandoffIfNeeded(for session: TabSession) async -> Bool {
+        await prepareResumeRecoveryHandoff(for: session).permitsFreshSession
     }
 
     @MainActor
@@ -21436,40 +21383,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     nonisolated static func composeClaudeResumeRecoveryHandoffPayload(
-        sourceTabName: String,
-        sourceAgentName: String,
-        transcriptXML: String,
-        initialThreadContextBlock: String?,
-        deliveryID: String
+        sourceTabName: String, sourceAgentName: String, transcriptXML: String,
+        initialThreadContextBlock: String?, deliveryID: String
     ) -> String {
-        let trimmedTranscriptXML = transcriptXML.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedInitialThreadContextBlock = initialThreadContextBlock?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        var payloadSections: [String] = []
-        if let trimmedInitialThreadContextBlock,
-           !trimmedInitialThreadContextBlock.isEmpty
-        {
-            payloadSections.append(
-                """
-                <original_thread_context>
-                \(trimmedInitialThreadContextBlock)
-                </original_thread_context>
-                """
-            )
-        }
-        if !trimmedTranscriptXML.isEmpty {
-            payloadSections.append(trimmedTranscriptXML)
-        }
-
-        let payloadBody = payloadSections.joined(separator: "\n\n")
-        return """
-        <forked_session source="\(sourceTabName)" delivery_id="\(deliveryID)">
-        You are continuing a session that was restarted after a native resume failed for \(sourceAgentName). Use the recovered transcript below, plus any preserved thread context, to continue seamlessly.
-
-        \(payloadBody)
-        </forked_session>
-        """
+        AgentSessionHandoffRuntime.composeResumeRecoveryPayload(
+            sourceTabName: sourceTabName, sourceAgentName: sourceAgentName,
+            transcriptXML: transcriptXML, initialThreadContextBlock: initialThreadContextBlock,
+            deliveryID: deliveryID
+        )
     }
 
     nonisolated static func composeSessionHandoffPayload(

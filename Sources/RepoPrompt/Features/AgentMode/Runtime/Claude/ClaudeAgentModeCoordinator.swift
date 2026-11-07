@@ -87,7 +87,7 @@ final class ClaudeAgentModeCoordinator {
         let scheduleSave: @MainActor (_ session: AgentTabSession) -> Void
         var cleanupProviderRun: @MainActor (AgentTabSession, UUID) async -> Void = { _, _ in }
         var adoptProviderTurn: @MainActor (AgentTabSession, ClaudeControllerEventListener, UUID, AgentRunStartStopFence) async -> Bool = { _, _, _, _ in false }
-        let stageClaudeResumeRecoveryHandoff: @MainActor (_ session: AgentTabSession) async -> Void
+        let stageClaudeResumeRecoveryHandoff: @MainActor (_ session: AgentTabSession) async -> Bool
         let prependPendingHandoff: @MainActor (_ text: String, _ session: AgentTabSession) -> String
         /// `routeWait` is non-nil only for a controller this send launched; see
         /// `AgentModeViewModel.qualifyProviderInputRoute(for:routeWait:)`.
@@ -124,7 +124,7 @@ final class ClaudeAgentModeCoordinator {
             isSessionCurrent: @escaping @MainActor (_ session: AgentTabSession) -> Bool,
             requestUIRefresh: @escaping @MainActor (_ session: AgentTabSession, _ urgent: Bool) -> Void,
             scheduleSave: @escaping @MainActor (_ session: AgentTabSession) -> Void,
-            stageClaudeResumeRecoveryHandoff: @escaping @MainActor (_ session: AgentTabSession) async -> Void,
+            stageClaudeResumeRecoveryHandoff: @escaping @MainActor (_ session: AgentTabSession) async -> Bool,
             prependPendingHandoff: @escaping @MainActor (_ text: String, _ session: AgentTabSession) -> String,
             qualifyAgentSessionLinkProviderInputRoute: @escaping @MainActor (
                 _ session: AgentTabSession,
@@ -176,7 +176,7 @@ final class ClaudeAgentModeCoordinator {
                 isSessionCurrent: { _ in true },
                 requestUIRefresh: { _, _ in },
                 scheduleSave: { _ in },
-                stageClaudeResumeRecoveryHandoff: { _ in },
+                stageClaudeResumeRecoveryHandoff: { _ in false },
                 prependPendingHandoff: { text, _ in text },
                 qualifyAgentSessionLinkProviderInputRoute: { _, _ in .notRequired },
                 hasCurrentAgentSessionLinkProviderInputRoute: { _, _ in true },
@@ -1093,7 +1093,9 @@ final class ClaudeAgentModeCoordinator {
             {
                 session.recordRunProgress(ownership: owner, kind: .stageTransition, stage: .retrying, retryIntent: .applicationManaged)
             }
-            await hostCapabilities.stageClaudeResumeRecoveryHandoff(session)
+            guard await hostCapabilities.stageClaudeResumeRecoveryHandoff(session) else {
+                throw ControllerLifecycleError.superseded
+            }
             guard intentIsCurrent(intent, for: session),
                   let detached = detachClaudeController(
                       controller,

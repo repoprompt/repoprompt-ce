@@ -810,3 +810,171 @@ final class AgentSessionCodexRuntimeEffectsTests: XCTestCase {
         return coordinator
     }
 }
+
+@MainActor
+final class AgentSessionHandoffRuntimeTests: XCTestCase {
+    func testWindowFreeRecoveryRetainsExactScopeAndDoesNotOverwriteAnotherPreparation() throws {
+        var scope: AgentSessionRuntimeStore.Scope? = AgentSessionRuntimeStore().makeScope()
+        weak var weakScope = scope
+        let session = AgentTabSession(tabID: UUID())
+        scope?.replaceSessions([session.tabID: session])
+        let runtime = try XCTUnwrap(scope?.handoff)
+        var first = runtime.prepareRecovery(for: session, sourceTabName: "A & B", transcriptXML: "<transcript>first</transcript>")
+        let second = try XCTUnwrap(runtime.prepareRecovery(for: session, sourceTabName: "other", transcriptXML: "stale"))
+        scope = nil
+        XCTAssertNotNil(weakScope)
+        let staged = try XCTUnwrap(try runtime.stageRecovery(XCTUnwrap(first), initialThreadContextBlock: "<file_map>root</file_map>"))
+        XCTAssertTrue(try XCTUnwrap(staged.payload).contains("source=\"A &amp; B\""))
+        XCTAssertTrue(try XCTUnwrap(staged.payload).contains("<original_thread_context>"))
+        XCTAssertTrue(try XCTUnwrap(staged.payload).contains("<transcript>first</transcript>"))
+        XCTAssertNil(runtime.stageRecovery(second, initialThreadContextBlock: "wrong context"))
+        XCTAssertEqual(session.pendingHandoff, staged)
+        XCTAssertTrue(session.isDirty)
+        first = nil
+        // The second outstanding preparation still owns its exact scope until its caller finishes.
+        withExtendedLifetime(second) { XCTAssertNotNil(weakScope) }
+    }
+
+    func testRecoveryRefusesChangedIncarnationsInputsAndHandoffABA() throws {
+        enum Mutation: CaseIterable { case rebind, replace, stop, retirement, handoff, handoffABA }
+        for mutation in Mutation.allCases {
+            let scope = AgentSessionRuntimeStore().makeScope()
+            let session = AgentTabSession(tabID: UUID())
+            let binding = AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: UUID(), workspaceID: UUID())
+            session.installPersistentSessionBinding(binding)
+            scope.replaceSessions([session.tabID: session])
+            let runtime = scope.handoff
+            let preparation = try XCTUnwrap(runtime.prepareRecovery(for: session, sourceTabName: "source", transcriptXML: "old transcript"))
+            switch mutation {
+            case .rebind:
+                session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: binding.sessionID, workspaceID: binding.workspaceID))
+            case .replace:
+                let replacement = AgentTabSession(tabID: session.tabID)
+                replacement.installPersistentSessionBinding(binding)
+                scope.replaceSessions([replacement.tabID: replacement])
+            case .stop: session.stopState.invalidateScheduledStarts()
+            case .retirement: scope.beginRetirement()
+            case .handoff: session.pendingHandoff.payload = "newer handoff"
+            case .handoffABA:
+                let original = session.pendingHandoff
+                session.pendingHandoff.payload = "intervening handoff"
+                session.pendingHandoff = original
+            }
+            let expected = session.pendingHandoff
+            let dirty = session.isDirty
+            XCTAssertNil(runtime.stageRecovery(preparation, initialThreadContextBlock: "stale context"), "\(mutation)")
+            XCTAssertEqual(session.pendingHandoff, expected, "\(mutation)")
+            XCTAssertEqual(session.isDirty, dirty, "Refused preparation is not a new mutation: \(mutation)")
+            if mutation == .replace {
+                XCTAssertNil(scope.sessions[session.tabID]?.pendingHandoff.payload)
+            }
+        }
+    }
+
+    func testCancelledContextWaitCannotStageAndReleasesScopeAfterCompletion() async throws {
+        var scope: AgentSessionRuntimeStore.Scope? = AgentSessionRuntimeStore().makeScope()
+        weak var weakScope = scope
+        let session = AgentTabSession(tabID: UUID())
+        scope?.replaceSessions([session.tabID: session])
+        let runtime = try XCTUnwrap(scope?.handoff)
+        var preparation = runtime.prepareRecovery(for: session, sourceTabName: "source", transcriptXML: "transcript")
+        let gate = TestReleaseFence(name: "handoff context IO")
+        XCTAssertNotNil(preparation)
+        let task = Task { [preparation] in
+            await gate.enterAndWait()
+            guard let preparation else { return nil as AgentPendingHandoffState? }
+            return runtime.stageRecovery(preparation, initialThreadContextBlock: "late context")
+        }
+        addTeardownBlock { gate.release() }
+        preparation = nil
+        scope = nil
+        guard await gate.waitUntilEntered() else { return XCTFail("Recovery context IO was never entered") }
+        XCTAssertNotNil(weakScope, "Pending context work retains its exact owner, not a presentation")
+        task.cancel()
+        gate.release()
+        let result = await task.value
+        XCTAssertNil(result)
+        XCTAssertNil(session.pendingHandoff.payload)
+        XCTAssertNil(weakScope, "The finished request must release its scope")
+    }
+
+    func testCutoffSnapshotSurvivesLaterRowsAndModelOnlyChangeAndAdmissionIsLazy() throws {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        scope.replaceSessions([session.tabID: session])
+        let runtime = scope.handoff
+        var builds = 0
+        func transcript() -> String {
+            builds += 1
+            return "captured transcript"
+        }
+        let preparation = try XCTUnwrap(runtime.prepareRecovery(for: session, sourceTabName: "source", transcriptXML: transcript()))
+        session.items.append(.init(kind: .user, text: "later input"))
+        session.selectedModelRaw = "new-model"
+        let staged = try XCTUnwrap(runtime.stageRecovery(preparation, initialThreadContextBlock: nil))
+        XCTAssertTrue(try XCTUnwrap(staged.payload).contains("captured transcript"))
+        XCTAssertFalse(try XCTUnwrap(staged.payload).contains("later input"))
+        XCTAssertTrue(runtime.canReuseRecovery(for: session))
+        XCTAssertNil(runtime.prepareRecovery(for: session, sourceTabName: "source", transcriptXML: transcript()))
+        XCTAssertEqual(builds, 1, "An existing handoff must not rebuild the transcript")
+        session.pendingHandoff = .init()
+        _ = session.beginPersistentBindingTransition()
+        XCTAssertFalse(runtime.canReuseRecovery(for: session))
+        XCTAssertNil(runtime.prepareRecovery(for: session, sourceTabName: "source", transcriptXML: transcript()))
+        XCTAssertEqual(builds, 1, "An unadmitted binding must not build recovery context")
+    }
+
+    func testMissingRecoveryHostCannotStartContextlessClaudeReplacement() async {
+        let session = AgentTabSession(tabID: UUID())
+        session.hasLoadedPersistedState = true
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        session.selectedAgent = .claudeCode
+        session.providerSessionID = "missing-original-session"
+        let controller = MonitorFakeNativeController()
+        await controller.setRejectResume(true)
+        var creations = 0
+        let coordinator = ClaudeAgentModeCoordinator(
+            windowID: -903, workspacePathProvider: { _ in nil },
+            claudeControllerFactory: { _, _, _, _ in creations += 1
+                return controller
+            }
+        )
+        let runID = UUID()
+        session.installRunID(runID)
+        let owner = session.beginRunAttempt(source: "test.handoff.missingHost")
+        let result = await coordinator.ensureClaudeNativeSession(session: session, intent: .runAttempt(ownership: owner, runID: runID))
+        XCTAssertNotEqual(result, .ready)
+        XCTAssertEqual(creations, 1, "No fresh controller without acknowledged recovery preparation")
+        let attempts = await controller.startOrResumeExistingSessionIDs
+        XCTAssertEqual(attempts, ["missing-original-session"])
+        XCTAssertEqual(session.providerSessionID, "missing-original-session")
+        await controller.shutdown()
+    }
+
+    func testConsumptionKeepsFailureMarkerAndCannotTouchRecycledTab() {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        scope.replaceSessions([session.tabID: session])
+        let runtime = scope.handoff
+        session.pendingHandoff = .init(payload: " recovery ", executionLocationFailure: "worktree unavailable")
+        XCTAssertEqual(runtime.prependPendingHandoffIfNeeded("input", session: session), "recovery\n\ninput")
+        XCTAssertEqual(runtime.prependPendingHandoffIfNeeded("input", session: session), "input")
+        runtime.recordSendOutcome(for: session, didSend: false)
+        XCTAssertFalse(session.pendingHandoff.isStagedForSend)
+        XCTAssertNotNil(session.pendingHandoff.payload)
+        _ = runtime.prependPendingHandoffIfNeeded("retry", session: session)
+        runtime.recordSendOutcome(for: session, didSend: true)
+        XCTAssertNil(session.pendingHandoff.payload)
+        XCTAssertEqual(session.pendingHandoff.executionLocationFailure, "worktree unavailable")
+        XCTAssertTrue(session.isDirty)
+        session.pendingHandoff = .init(payload: "old", isStagedForSend: true)
+        let replacement = AgentTabSession(tabID: session.tabID)
+        replacement.pendingHandoff = .init(payload: "new", isStagedForSend: true)
+        scope.replaceSessions([replacement.tabID: replacement])
+        runtime.recordSendOutcome(for: session, didSend: true)
+        XCTAssertEqual(session.pendingHandoff.payload, "old")
+        XCTAssertEqual(replacement.pendingHandoff.payload, "new")
+        XCTAssertEqual(runtime.prependPendingHandoffIfNeeded("input", session: session), "input")
+    }
+}

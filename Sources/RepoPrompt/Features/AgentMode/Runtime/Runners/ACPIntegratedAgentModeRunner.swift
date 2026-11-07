@@ -936,7 +936,10 @@ final class ACPIntegratedAgentModeRunner {
                     // Existing cancellation cleanup retires this unprompted controller.
                     guard !isPeriodic else { throw CancellationError() }
 
-                    await hooks.providerInput.stageResumeRecoveryHandoffIfNeeded(session)
+                    guard await hooks.providerInput.stageResumeRecoveryHandoffIfNeeded(session),
+                          !Task.isCancelled,
+                          session.isCurrentRunAttemptForCurrentBinding(ingressOwner, expectedRunID: runID)
+                    else { throw CancellationError() }
                     initialMessageForPromptTurn = hooks.providerInput.prependPendingHandoffIfNeeded(initialMessageForRun, session)
                 }
                 applyProviderSessionIdentity(

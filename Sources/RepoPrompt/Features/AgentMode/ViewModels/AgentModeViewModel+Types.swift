@@ -638,36 +638,7 @@ extension AgentModeViewModel {
 
     typealias RequiredSavePhase = AgentSessionRequiredSavePhase
 
-    struct PendingHandoffState: Equatable {
-        var payload: String?
-        var createdAt: Date?
-        var sourceItemID: UUID?
-        /// True only for a freshly-created handoff tab. Keeps agent selection editable
-        /// until the destination tab successfully sends its first real user turn.
-        var defersProviderLockUntilSend: Bool = false
-        var isStagedForSend: Bool = false
-        /// Durable failure/preparation marker; ordinary send cleanup must never clear it.
-        var executionLocationFailure: String?
-        /// Nil retains the existing fork/resume-recovery delivery policy.
-        var providerSwitchDelivery: AgentProviderSwitchDelivery?
-        /// Captured by the existing physical fence; never persisted or reused by another dispatch.
-        var providerSwitchDispatch: ProviderSwitchPhysicalDispatch?
-
-        var hasPayload: Bool {
-            guard let payload else { return false }
-            return !payload.isEmpty
-        }
-
-        mutating func clearAfterSend() {
-            payload = nil
-            createdAt = nil
-            sourceItemID = nil
-            defersProviderLockUntilSend = false
-            isStagedForSend = false
-            providerSwitchDelivery = nil
-            providerSwitchDispatch = nil
-        }
-    }
+    typealias PendingHandoffState = AgentPendingHandoffState
 
     struct CodexWatchdogState: Equatable {
         var lastProgressAt: Date?

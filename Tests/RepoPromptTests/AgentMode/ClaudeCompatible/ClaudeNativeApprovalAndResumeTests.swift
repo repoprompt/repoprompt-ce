@@ -847,7 +847,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             var accepted = 0
             coordinator.installHostCapabilities(.init(
                 isSessionCurrent: { $0 === session }, requestUIRefresh: { _, _ in }, scheduleSave: { _ in },
-                stageClaudeResumeRecoveryHandoff: { _ in }, prependPendingHandoff: { text, _ in text },
+                stageClaudeResumeRecoveryHandoff: { _ in true }, prependPendingHandoff: { text, _ in text },
                 decorateAgentSessionLinkPrompt: { text, _, _ in .init(text: text, claim: nil, mustAbortDispatch: false) },
                 acquireAgentSessionLinkPhysicalDispatch: { _, _ in true },
                 recordAgentSessionLinkPhysicalDispatchNotAttempted: { _, _ in notAttempted += 1 },
@@ -1822,7 +1822,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         let gate = Gate()
         h.host.claudeCoordinator.installHostCapabilities(.init(
             isSessionCurrent: { $0 === session }, requestUIRefresh: { _, _ in }, scheduleSave: { _ in },
-            stageClaudeResumeRecoveryHandoff: { _ in }, prependPendingHandoff: { text, _ in text },
+            stageClaudeResumeRecoveryHandoff: { _ in true }, prependPendingHandoff: { text, _ in text },
             qualifyAgentSessionLinkProviderInputRoute: { _, _ in await gate.wait()
                 return .unavailable
             },
@@ -1877,7 +1877,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         defer { h.host.test_beforeACPToolIdleWait = nil }
         h.host.claudeCoordinator.installHostCapabilities(.init(
             isSessionCurrent: { $0 === session }, requestUIRefresh: { _, _ in }, scheduleSave: { _ in },
-            stageClaudeResumeRecoveryHandoff: { _ in }, prependPendingHandoff: { text, _ in text },
+            stageClaudeResumeRecoveryHandoff: { _ in true }, prependPendingHandoff: { text, _ in text },
             qualifyAgentSessionLinkProviderInputRoute: { _, _ in .unavailable },
             hasCurrentAgentSessionLinkProviderInputRoute: { _, _ in false },
             decorateAgentSessionLinkPrompt: { text, _, _ in .init(text: text, claim: nil, mustAbortDispatch: false) },
@@ -2348,7 +2348,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         // Refuse the real coordinator's route gate, before its physical input boundary.
         h.host.claudeCoordinator.installHostCapabilities(.init(
             isSessionCurrent: { $0 === session }, requestUIRefresh: { _, _ in }, scheduleSave: { _ in },
-            stageClaudeResumeRecoveryHandoff: { _ in }, prependPendingHandoff: { text, _ in text },
+            stageClaudeResumeRecoveryHandoff: { _ in true }, prependPendingHandoff: { text, _ in text },
             qualifyAgentSessionLinkProviderInputRoute: { _, _ in await gate.wait()
                 return .unavailable
             },
@@ -2391,7 +2391,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
             let gate = Gate()
             h.host.claudeCoordinator.installHostCapabilities(.init(
                 isSessionCurrent: { $0 === session }, requestUIRefresh: { _, _ in }, scheduleSave: { _ in },
-                stageClaudeResumeRecoveryHandoff: { _ in }, prependPendingHandoff: { text, _ in text },
+                stageClaudeResumeRecoveryHandoff: { _ in true }, prependPendingHandoff: { text, _ in text },
                 qualifyAgentSessionLinkProviderInputRoute: { _, _ in await gate.wait()
                     return .unavailable
                 },

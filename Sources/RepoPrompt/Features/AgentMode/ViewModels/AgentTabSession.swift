@@ -1520,8 +1520,10 @@ final class AgentTabSession: ObservableObject {
 
     /// Handoff payload (injected into provider-facing text on first user send).
     /// Cleared only after the provider accepts the turn.
-    var pendingHandoff: AgentModeViewModel.PendingHandoffState = .init() {
+    private(set) var pendingHandoffRevision: UInt64 = 0
+    var pendingHandoff: AgentPendingHandoffState = .init() {
         didSet {
+            if oldValue != pendingHandoff { pendingHandoffRevision &+= 1 }
             if oldValue.executionLocationFailure != pendingHandoff.executionLocationFailure
                 || oldValue.providerSwitchDelivery != pendingHandoff.providerSwitchDelivery
                 || oldValue.providerSwitchDispatch != pendingHandoff.providerSwitchDispatch
