@@ -349,6 +349,8 @@ extension AgentSessionLinkExecutionRuntime {
             return .blocked(failure == .endpointInvalidated ? .endpointReadiness : failure)
         }
 
+        guard let command = admit(candidate) else { return .blocked(.endpointSession) }
+        defer { withExtendedLifetime(command) {} }
         let envelope = AgentSessionLinkMessageEnvelope.render(
             sourceSessionID: request.observerSessionID, sourceName: request.observerDisplayName,
             linkID: request.linkID, linkGeneration: request.linkGeneration,
@@ -362,7 +364,7 @@ extension AgentSessionLinkExecutionRuntime {
         let dispatchedMessage = computerUseArmedAtAdmission
             ? CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: providerMessage) : providerMessage
         if case let .failure(failure) = await providerSwitchSendAdmission(session: session, input: dispatchedMessage, isCurrent: {
-            stopFence.permitsStart(of: session) && liveness().permitsDelivery
+            command.isCurrent && stopFence.permitsStart(of: session) && liveness().permitsDelivery
         }) { return .blocked(failure) }
 
         // 3. Local composer claim. Losing it means a local user Send won the race, which is exactly
@@ -405,7 +407,7 @@ extension AgentSessionLinkExecutionRuntime {
         }
         let switchPreparation: ProviderSwitchSendPreparation?
         switch await providerSwitchSendAdmission(session: session, input: dispatchedMessage, isCurrent: {
-            stopFence.permitsStart(of: session) && liveness().permitsDelivery && self.composerSubmitClaimIsCurrent(claim)
+            command.isCurrent && stopFence.permitsStart(of: session) && liveness().permitsDelivery && self.composerSubmitClaimIsCurrent(claim)
         }) {
         case let .failure(failure):
             releaseComposerSubmitClaim(claim)
@@ -417,7 +419,7 @@ extension AgentSessionLinkExecutionRuntime {
         //    the observer incarnation and the target window's closing state, which an observer
         //    rebind/close or a window teardown during that await would otherwise slip past.
         let postCommitLiveness = liveness()
-        guard let liveSession = agentSessionLinkLiveSession(matching: candidate) else {
+        guard command.isCurrent, let liveSession = agentSessionLinkLiveSession(matching: candidate) else {
             releaseComposerSubmitClaim(claim)
             return .blocked(.endpointPostSession)
         }
@@ -444,14 +446,7 @@ extension AgentSessionLinkExecutionRuntime {
             releaseComposerSubmitClaim(claim)
             return .blocked(failure == .endpointInvalidated ? .endpointPostReadiness : failure)
         }
-        guard let workspaceID = commands.workspaceID(session) else {
-            releaseComposerSubmitClaim(claim)
-            return .blocked(.endpointMissingWorkspace)
-        }
-        guard workspaceID == candidate.workspaceID else {
-            releaseComposerSubmitClaim(claim)
-            return .blocked(.endpointWorkspace)
-        }
+        let workspaceID = command.identity.workspaceID
 
         return await persistAndStartNoncomposerTurn(
             session: liveSession,
@@ -515,6 +510,15 @@ extension AgentSessionLinkExecutionRuntime {
             let reason = AgentSessionLinkDeliveryReadiness.restorationBlockReason(liveSession.qualifiedRestorationReadiness)
             return .blocked(AgentSessionLinkSendFailure(reason ?? .targetLoading))
         }
+        guard let sessionID = liveSession.activeAgentSessionID,
+              case let .unique(writer) = owner.resolveWriter(sessionID: sessionID, expectedWorkspaceID: workspaceID),
+              writer.scope === owner, writer.session === liveSession,
+              case let .success(command) = writer.admitCommand()
+        else {
+            releaseComposerSubmitClaim(claim)
+            return .blocked(.endpointSession)
+        }
+        defer { withExtendedLifetime(command) {} }
         var switchPreparation = providerSwitchPreparation
         if liveSession.pendingHandoff.providerSwitchDelivery != nil, switchPreparation == nil {
             let input = liveSession.isCodexComputerUseArmed
@@ -531,6 +535,10 @@ extension AgentSessionLinkExecutionRuntime {
         if let switchPreparation, !providerSwitchPreparationIsCurrent(switchPreparation, session: liveSession) {
             releaseComposerSubmitClaim(claim)
             return .blocked(.providerHandoverNeedsReview)
+        }
+        guard command.isCurrent else {
+            releaseComposerSubmitClaim(claim)
+            return .blocked(.endpointPostSession)
         }
         liveSession.noteAcceptedTaskInput()
         // 6. Durable acceptance. The bubble keeps raw words; the exact provider payload is metadata.
@@ -551,6 +559,12 @@ extension AgentSessionLinkExecutionRuntime {
         requestUIRefresh(tabID: tabID, urgent: true)
 
         if case .failure = await flushSaveRequired(for: tabID, workspaceID: workspaceID) {
+            // The saver may have returned for the originating payload after this object was rebound.
+            // A stale writer may neither acknowledge that write nor compensate against its successor.
+            guard writer.isCurrent else {
+                releaseComposerSubmitClaim(claim)
+                return .blocked(.persistenceIndeterminate)
+            }
             rollbackNoncomposerStagedRow(
                 itemID: userItem.id,
                 tabID: tabID,
@@ -684,8 +698,10 @@ extension AgentSessionLinkExecutionRuntime {
     func agentSessionLinkLiveSession(
         matching candidate: AgentSessionLinkEndpointCandidate
     ) -> TabSession? {
-        guard let session = sessions[candidate.tabID],
-              session.activeAgentSessionID == candidate.sessionID,
+        guard let scope,
+              case let .unique(writer) = scope.resolveWriter(sessionID: candidate.sessionID, expectedWorkspaceID: candidate.workspaceID),
+              writer.scope === scope, writer.session.tabID == candidate.tabID,
+              let session = sessions[candidate.tabID], writer.session === session,
               let identity = agentSessionLinkObserverEndpoint(tabID: candidate.tabID),
               identity == candidate.domainEndpoint
         else {

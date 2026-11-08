@@ -929,8 +929,8 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
 
     /// Cross-window liveness for one send, answered in a single synchronous MainActor pass.
     ///
-    /// The transaction itself runs on the target window's `AgentModeViewModel`, which cannot see the
-    /// observer's window or its own window's teardown flag. Both facts are read here, from the same
+    /// The transaction itself runs on the target's runtime scope, which does not own the
+    /// observer's presentation or the target presentation's teardown flag. Both facts are read here, from the same
     /// candidate snapshot, so the two fences the transaction crosses compare like with like. Nothing
     /// here focuses, activates, or switches a window.
     func agentSessionLinkSendLiveness(
@@ -950,18 +950,22 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         )
     }
 
-    /// Routes the send transaction to the exact owning window.
-    ///
-    /// Window liveness is re-checked here rather than trusted from the candidate: the whole
-    /// transaction runs on that window's `AgentModeViewModel`, and a terminating manager or closing
-    /// window must refuse before any target state is touched. Nothing here focuses or activates the
-    /// window.
-    func agentSessionLinkStartStopFence(for candidate: AgentSessionLinkEndpointCandidate) -> AgentRunStartStopFence? {
+    /// Resolves the command runtime through the process writer authority. The endpoint's route ID
+    /// is an incarnation fence, not a window-selection instruction. Existing liveness probes retain
+    /// presentation-close refusal until the separate presentation-lifetime cutover.
+    private func agentSessionLinkCommandRuntime(for candidate: AgentSessionLinkEndpointCandidate) -> AgentSessionLinkExecutionRuntime? {
         guard !isTerminating,
-              let window = window(withID: candidate.windowID), !window.isClosing,
-              let session = window.agentModeViewModel.agentSessionLinkLiveSession(matching: candidate)
-        else { return nil }
-        return AgentRunStartStopFence(session: session)
+              case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+                  sessionID: candidate.sessionID, expectedWorkspaceID: candidate.workspaceID
+              ), let runtime = writer.scope.linkExecution,
+              runtime.admit(candidate) != nil else { return nil }
+        return runtime
+    }
+
+    func agentSessionLinkStartStopFence(for candidate: AgentSessionLinkEndpointCandidate) -> AgentRunStartStopFence? {
+        guard let runtime = agentSessionLinkCommandRuntime(for: candidate),
+              let command = runtime.admit(candidate) else { return nil }
+        return AgentRunStartStopFence(session: command.writer.session)
     }
 
     func agentSessionLinkPerformSend(
@@ -971,10 +975,10 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
     ) async -> AgentSessionLinkSendTransactionOutcome {
         guard !isTerminating else { return .blocked(.shuttingDown) }
-        guard let window = window(withID: candidate.windowID), !window.isClosing else {
+        guard let runtime = agentSessionLinkCommandRuntime(for: candidate) else {
             return .blocked(.endpointHost)
         }
-        return await window.agentModeViewModel.agentSessionLinkPerformSend(
+        return await runtime.agentSessionLinkPerformSend(
             to: candidate,
             request: request,
             liveness: liveness,
@@ -1072,10 +1076,10 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
     ) async -> AgentSessionLinkStopTransactionOutcome {
         guard !isTerminating else { return .blocked(.shuttingDown) }
-        guard let window = window(withID: candidate.windowID), !window.isClosing else {
+        guard let runtime = agentSessionLinkCommandRuntime(for: candidate) else {
             return .blocked(.endpointHost)
         }
-        return await window.agentModeViewModel.agentSessionLinkPerformStop(
+        return await runtime.agentSessionLinkPerformStop(
             to: candidate,
             request: request,
             liveness: liveness,

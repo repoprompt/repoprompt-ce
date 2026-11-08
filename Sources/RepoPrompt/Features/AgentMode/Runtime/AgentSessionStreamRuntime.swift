@@ -10,7 +10,10 @@ final class AgentSessionStreamRuntime {
     private let usage: AgentSessionUsageRuntime
     private let persistence: AgentSessionPersistenceRuntime
     private let presentation: AgentSessionPresentationRuntime
-    weak var runService: AgentModeRunService?
+    private var runService: AgentModeRunService? {
+        scope?.execution
+    }
+
     weak var codexCoordinator: CodexAgentModeCoordinator?
     var assistantFlushDelay: () async throws -> Void = { try await Task.sleep(nanoseconds: 250_000_000) }
 

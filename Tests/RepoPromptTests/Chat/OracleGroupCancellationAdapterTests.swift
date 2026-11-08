@@ -442,7 +442,7 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
                 }
                 let attempt = session.activeRunAttemptID
                 if schedule == "managedStop" {
-                    window.agentModeViewModel.withdrawQueuedWorkForManagedStop(session: session)
+                    window.agentModeViewModel.linkExecutionRuntime.withdrawQueuedWorkForManagedStop(session: session)
                     let joined = await window.agentModeViewModel.awaitOracleBackgroundDrain(for: session)
                     XCTAssertTrue(joined, "Claim-time Stop survives subsequent run admission refusal")
                 } else { await window.agentModeViewModel.cancelAgentRun(tabID: session.tabID) }

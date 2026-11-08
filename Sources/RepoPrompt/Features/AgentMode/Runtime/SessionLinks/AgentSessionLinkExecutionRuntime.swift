@@ -25,7 +25,6 @@ final class AgentSessionLinkExecutionRuntime {
         /// adapter phase this preserves the old all-or-nothing late-hook behavior after VM loss.
         /// A nonvisual host supplies its own lifetime independently of presentation.
         let isAvailable: @MainActor () -> Bool
-        let endpoint: @MainActor (UUID) -> DomainAgentSessionLinkEndpointIdentity?
         let workspaceID: @MainActor (AgentTabSession) -> UUID?
         let augment: @MainActor (AgentTabSession, String, [AgentFileAttachment], [AgentTaggedFileAttachment], Bool) async -> String
         let initialMessage: @MainActor (AgentTabSession, String) async -> String
@@ -46,6 +45,8 @@ final class AgentSessionLinkExecutionRuntime {
     }
 
     var pendingSendEffects: [UUID: PendingSendEffect] = [:]
+    var pendingStopEffects: [UUID: PendingSendEffect] = [:]
+    let routeID: Int
     let commands: Commands
     let catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink
     var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
@@ -53,8 +54,9 @@ final class AgentSessionLinkExecutionRuntime {
     /// Display labels are optional and never participate in authority or receipt qualification.
     var displayProps: (@MainActor (DomainAgentSessionLinkEndpointIdentity) -> AgentMonitorPillProps?)?
 
-    init(scope: AgentSessionRuntimeStore.Scope, commands: Commands, diagnostics: any AgentSessionLinkCatalogEventSink) {
+    init(scope: AgentSessionRuntimeStore.Scope, routeID: Int, commands: Commands, diagnostics: any AgentSessionLinkCatalogEventSink) {
         self.scope = scope
+        self.routeID = routeID
         self.commands = commands
         catalogDiagnosticsSink = diagnostics
     }
@@ -74,6 +76,7 @@ final class AgentSessionLinkExecutionRuntime {
     }
 
     #if DEBUG
+        var test_endpointRead: (() -> Void)?
         var test_beforeRoutineIdleFollowUpStart: ((AgentTabSession, UUID) -> Bool)?
         var test_agentSessionLinkAfterProviderInputRouteReadiness: (() async -> Void)?
         var test_agentSessionLinkHasActiveOutboundLink: ((DomainAgentSessionLinkEndpointIdentity) async -> Bool)?
@@ -86,8 +89,29 @@ final class AgentSessionLinkExecutionRuntime {
     #endif
 
     func agentSessionLinkObserverEndpoint(tabID: UUID) -> DomainAgentSessionLinkEndpointIdentity? {
-        guard let scope, !scope.hasReleasedWriterClaims, scope.sessions[tabID] != nil else { return nil }
-        return commands.endpoint(tabID)
+        #if DEBUG
+            test_endpointRead?()
+        #endif
+        guard let scope, !scope.hasReleasedWriterClaims,
+              let session = scope.sessions[tabID], let sessionID = session.activeAgentSessionID,
+              case let .unique(writer) = scope.resolveWriter(sessionID: sessionID),
+              writer.scope === scope, writer.session === session else { return nil }
+        return DomainAgentSessionLinkEndpointIdentity(
+            windowID: routeID, workspaceID: writer.identity.workspaceID,
+            tabID: tabID, sessionID: sessionID,
+            persistentBindingGeneration: writer.binding.generation,
+            bindingTransitionGeneration: session.bindingTransitionGeneration
+        )
+    }
+
+    func admit(_ candidate: AgentSessionLinkEndpointCandidate) -> AgentSessionRuntimeStore.Command? {
+        guard let scope,
+              case let .unique(writer) = scope.resolveWriter(
+                  sessionID: candidate.sessionID, expectedWorkspaceID: candidate.workspaceID
+              ), writer.scope === scope, writer.session.tabID == candidate.tabID,
+              agentSessionLinkObserverEndpoint(tabID: candidate.tabID) == candidate.domainEndpoint
+        else { return nil }
+        return try? writer.admitCommand().get()
     }
 
     func hasCurrentRunCatalogRouteTokenInCurrentMCPServer(_ token: AgentSessionLinkRunCatalogRouteToken, tabID: UUID) -> Bool {

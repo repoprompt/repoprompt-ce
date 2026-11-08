@@ -1536,7 +1536,7 @@ struct AgentRunMCPToolService {
         var stopped = false
         var outcomeSnapshot: AgentRunMCPSnapshot?
         if target.pendingStart {
-            admitted = viewModel.withdrawPendingStartForSessionLink(session: target.session, admission: admission)
+            admitted = viewModel.linkExecutionRuntime.withdrawPendingStartForSessionLink(session: target.session, admission: admission)
             if admitted { outcomeSnapshot = viewModel.mcpSnapshot(for: target.session) }
         } else {
             guard let ownership = target.ownership else {
@@ -1557,7 +1557,7 @@ struct AgentRunMCPToolService {
                     }
                 }
             )
-            admitted = await viewModel.cancelAgentRunForSessionLink(
+            admitted = await viewModel.linkExecutionRuntime.cancelAgentRunForSessionLink(
                 session: target.session, admission: admission, outcomeRecorder: recorder,
                 completion: .terminalPublished
             )

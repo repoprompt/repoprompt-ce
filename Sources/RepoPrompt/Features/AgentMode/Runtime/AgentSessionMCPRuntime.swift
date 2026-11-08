@@ -240,6 +240,22 @@ final class AgentSessionMCPRuntime {
 
     private weak var scope: AgentSessionRuntimeStore.Scope?
     var metadata: Metadata?
+    /// Recovery claims are runtime state. The workspace check remains a read-only resource
+    /// input until the window-free catalog host is installed; it never selects a writer.
+    var outstandingProvisionalTargets: [UUID: AgentModeViewModel.MCPSessionTarget] = [:]
+    var workspaceHasProvisionalClaim: ((UUID, UUID) -> Bool)?
+
+    func settledSession(for writer: AgentSessionRuntimeStore.Writer) -> AgentTabSession? {
+        guard writer.scope === scope, writer.isCurrent,
+              workspaceHasProvisionalClaim?(writer.identity.workspaceID, writer.identity.sessionID) != true,
+              !outstandingProvisionalTargets.values.contains(where: { target in
+                  target.sessionID == writer.identity.sessionID
+                      && target.recoveryClaim?.state != .accepted
+                      && target.recoveryClaim?.state != .complete
+              }) else { return nil }
+        return writer.session
+    }
+
     /// Retains the actual mapping projection, never its presentation model. Cleanup
     /// shares this storage; transport and owner-availability fences reject stale maps.
     private var runRoute: (id: Int, bindings: MCPRunRouteBindings)?

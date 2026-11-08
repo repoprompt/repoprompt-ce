@@ -892,7 +892,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private let usesProductionAgentDefaultsAndModelPolling: Bool
     let clearConsumedAttachmentsAfterProviderConsumption: Bool
     let applyEditsApprovalStore: ApplyEditsApprovalStore
-    private lazy var runService: AgentModeRunService = makeRunService()
+    private var runService: AgentModeRunService {
+        if let execution = runtimeSessionStore.execution { return execution }
+        let execution = makeRunService()
+        runtimeSessionStore.installExecution(execution)
+        return execution
+    }
+
     private lazy var runProviderComposition = AgentRunProviderComposition(
         headless: headlessProviderFactory, acp: acpProviderFactory, controller: acpControllerFactory
     )
@@ -1072,9 +1078,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// One outcome-driven retry handles transient settlement without polling; later explicit
     /// discard attempts can resume a responsibility that remains nonterminal.
     private var pendingMCPSessionTargetDiscards: [UUID: PendingMCPSessionTargetDiscard] = [:]
-    /// A claim-bearing target owns its recovery boundary from resolution until acceptance or
-    /// terminal discard, including the interval before cleanup is registered.
-    private var outstandingProvisionalMCPSessionTargets: [UUID: MCPSessionTarget] = [:]
     /// A newer same-session target cannot become provider-visible until cleanup holding an older
     /// authority has crossed every suspension point where it could still mutate session state.
     private var mcpSessionTargetDiscardAuthorityBySessionID: [UUID: MCPSessionTargetDiscardAuthority] = [:]
@@ -1327,7 +1330,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         var test_outstandingProvisionalMCPSessionTargetCount: Int {
-            outstandingProvisionalMCPSessionTargets.count
+            mcpRuntime.outstandingProvisionalTargets.count
         }
 
         var test_provisionalRuntimeTargetIdentityCount: Int {
@@ -1337,7 +1340,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         func test_outstandingProvisionalMCPSessionTarget(
             sessionID: UUID
         ) -> MCPSessionTarget? {
-            outstandingProvisionalMCPSessionTargets.values.first {
+            mcpRuntime.outstandingProvisionalTargets.values.first {
                 $0.sessionID == sessionID
             }
         }
@@ -1368,7 +1371,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 _ = runService
             } else {
                 precondition(sessions.values.allSatisfy { $0.activeRunOwnership == nil })
-                runService = makeRunService(mcpServerEnabler: mcpServerEnabler, connectionPolicyInstaller: connectionPolicyInstaller, expectedPIDPolicyArmer: expectedPIDPolicyArmer)
+                runtimeSessionStore.test_replaceExecution(makeRunService(mcpServerEnabler: mcpServerEnabler, connectionPolicyInstaller: connectionPolicyInstaller, expectedPIDPolicyArmer: expectedPIDPolicyArmer))
             }
             return runService
         }
@@ -3056,6 +3059,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         scheduleInitialSkillCatalogRefresh()
         sessionIndexStore.delegate = self
         workspaceSwitchProvider.delegate = self
+        _ = runService
     }
 
     #if DEBUG
@@ -3276,6 +3280,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             scheduleInitialSkillCatalogRefresh()
             sessionIndexStore.delegate = self
             workspaceSwitchProvider.delegate = self
+            _ = runService
         }
     #endif
 
@@ -3307,9 +3312,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// canonical admission/start/switch commands depend on this adapter; inventories, claims,
     /// route proof, wake tasks, snoozes and physical settlement live in the runtime.
     lazy var linkExecutionRuntime: AgentSessionLinkExecutionRuntime = {
-        let runtime = runtimeSessionStore.makeLinkExecution(commands: .init(
+        let runtime = runtimeSessionStore.makeLinkExecution(routeID: windowID, commands: .init(
             isAvailable: { [weak self] in self != nil },
-            endpoint: { [weak self] tabID in self?.agentSessionLinkObserverEndpoint(tabID: tabID) },
             workspaceID: { [weak self] session in
                 guard let self, sessions[session.tabID] === session else { return nil }
                 return workspaceManager?.activeWorkspaceID
@@ -3376,6 +3380,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     var mcpRuntime: AgentSessionMCPRuntime {
         let runtime = runtimeSessionStore.mcp
         if let mcpServer { runtime.installRunRoute(id: windowID, bindings: mcpServer.runRouteBindings) }
+        if runtime.workspaceHasProvisionalClaim == nil {
+            runtime.workspaceHasProvisionalClaim = { [weak self] workspaceID, sessionID in
+                self?.workspaceManager?.hasActiveProvisionalAgentSession(workspaceID: workspaceID, sessionID: sessionID) == true
+            }
+        }
         if runtime.metadata == nil {
             runtime.metadata = .init(
                 sessionName: { [weak self] session, sessionID in
@@ -3919,7 +3928,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             toolTrackingHooks: toolTrackingHooks,
             perfRecorder: perfRecorder
         )
-        streamRuntime.runService = service
         streamRuntime.codexCoordinator = codexCoordinator
         return service
     }
@@ -5067,6 +5075,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         await runtimeSessionStore.continuation.drainPendingStarts()
         await interactionRuntime.drainPendingEffects()
         await runtimeSessionStore.linkExecution?.drainPendingSendEffects()
+        await runtimeSessionStore.linkExecution?.drainPendingStopEffects()
         await applyEditsApprovalStore.cleanupWindowScopes(
             windowID: windowID,
             reason: "Cancelled because window is closing"
@@ -9508,7 +9517,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 propagatedError = error
             }
             if let reservedSessionID {
-                let recoveryRetainsAuthority = outstandingProvisionalMCPSessionTargets.values.contains { target in
+                let recoveryRetainsAuthority = mcpRuntime.outstandingProvisionalTargets.values.contains { target in
                     target.sessionID == reservedSessionID
                         && target.discardAuthorityID == discardAuthorityID
                         && target.recoveryClaim?.state != .accepted
@@ -11288,7 +11297,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 "The previous Agent session target is still retiring. Retry after cleanup settles."
             )
         }
-        let outstandingRecoveryIDs: [UUID] = outstandingProvisionalMCPSessionTargets.compactMap { recoveryID, target in
+        let outstandingRecoveryIDs: [UUID] = mcpRuntime.outstandingProvisionalTargets.compactMap { recoveryID, target in
             guard target.sessionID == sessionID,
                   target.discardAuthorityID != discardAuthorityID,
                   target.recoveryClaim?.state != .accepted,
@@ -11329,7 +11338,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private func registerOutstandingProvisionalMCPSessionTarget(_ target: MCPSessionTarget) {
         guard let recoveryID = target.recoveryClaim?.identity.recoveryID else { return }
-        outstandingProvisionalMCPSessionTargets[recoveryID] = target
+        mcpRuntime.outstandingProvisionalTargets[recoveryID] = target
         if let lifecycleIdentity = target.lifecycleIdentity,
            let sessionID = target.sessionID,
            let session = sessions[target.tabID],
@@ -11349,7 +11358,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard let claim = target.recoveryClaim,
               claim.identity.tabID == target.tabID,
               claim.identity.sessionID == target.sessionID,
-              let registered = outstandingProvisionalMCPSessionTargets[claim.identity.recoveryID]
+              let registered = mcpRuntime.outstandingProvisionalTargets[claim.identity.recoveryID]
         else { return false }
         return registered.tabID == target.tabID
             && registered.sessionID == target.sessionID
@@ -11373,7 +11382,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 throw MCPError.invalidParams("The Agent session target is still provisional.")
             }
         }
-        guard !outstandingProvisionalMCPSessionTargets.values.contains(where: {
+        guard !mcpRuntime.outstandingProvisionalTargets.values.contains(where: {
             $0.sessionID == sessionID
                 && $0.recoveryClaim?.state != .accepted
                 && $0.recoveryClaim?.state != .complete
@@ -11387,27 +11396,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     /// Stop is a control read, so it must not mutate a session whose recovery owner has not settled.
     func mcpSettledLiveSessionForStop(sessionID: UUID) throws -> TabSession? {
-        if let workspaceManager,
-           let workspaceID = workspaceManager.activeWorkspaceID,
-           workspaceManager.hasActiveProvisionalAgentSession(
-               workspaceID: workspaceID,
-               sessionID: sessionID
-           )
-        {
-            return nil
-        }
-        guard !outstandingProvisionalMCPSessionTargets.values.contains(where: { target in
-            target.sessionID == sessionID
-                && target.recoveryClaim?.state != .accepted
-                && target.recoveryClaim?.state != .complete
-        }) else { return nil }
-        return try authoritativeLiveSession(for: sessionID)
+        guard let command = try runtimeCommand(sessionID: sessionID) else { return nil }
+        return mcpRuntime.settledSession(for: command.writer)
     }
 
     private func releaseOutstandingProvisionalMCPSessionTarget(_ target: MCPSessionTarget) {
         guard let recoveryID = target.recoveryClaim?.identity.recoveryID else { return }
         if outstandingProvisionalMCPSessionTargetMatches(target) {
-            outstandingProvisionalMCPSessionTargets.removeValue(forKey: recoveryID)
+            mcpRuntime.outstandingProvisionalTargets.removeValue(forKey: recoveryID)
             provisionalRuntimeTargetIdentityByRecoveryID.removeValue(forKey: recoveryID)
         }
         bindingOnlyMCPSessionTargetRecoveryIDs.remove(recoveryID)
@@ -18727,47 +18723,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return true
     }
 
-    /// Routes a managed Stop through the same user-Stop spine for the exact admitted object.
-    @discardableResult
-    func cancelAgentRunForSessionLink(
-        session: TabSession,
-        admission: AgentRunCancellationAdmission,
-        outcomeRecorder: AgentRunCancellationOutcomeRecorder,
-        completion: AgentModeRunService.CancellationCompletion = .terminalTeardownCompleted
-    ) async -> Bool {
-        guard sessions[session.tabID] === session else { return false }
-        await runService.cancelRun(
-            tabID: session.tabID,
-            session: session,
-            intent: .userStop,
-            completion: completion,
-            origin: .explicitStop,
-            admission: admission,
-            outcomeRecorder: outcomeRecorder
-        )
-        return outcomeRecorder.initiatedCancellation
-    }
-
-    /// Withdraw the exact startup-pending producer; no terminal run is synthesized.
-    @discardableResult
-    func withdrawPendingStartForSessionLink(
-        session: TabSession,
-        admission: AgentRunCancellationAdmission
-    ) -> Bool {
-        guard sessions[session.tabID] === session else { return false }
-        let withdrawn = runService.withdrawPendingStartForSessionLink(
-            tabID: session.tabID,
-            session: session,
-            admission: admission
-        )
-        if withdrawn {
-            updateBindingsFromSession(session)
-            scheduleSave(for: session.tabID)
-            requestUIRefresh(tabID: session.tabID, urgent: true)
-        }
-        return withdrawn
-    }
-
     /// Cancel a render-time run target, refusing if the live tab no longer matches that target.
     /// - Returns: `true` when cancellation was routed to the guarded target; `false` when refused.
     @discardableResult
@@ -19635,13 +19590,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
     #endif
-
-    func withdrawQueuedWorkForManagedStop(session: TabSession) {
-        closeOracleBackground(for: session)
-        runService.withdrawQueuedWorkForManagedStop(tabID: session.tabID, session: session)
-        updateBindingsFromSession(session)
-        scheduleSave(for: session.tabID)
-    }
 
     @discardableResult
     func prepareAgentRunCancellation(

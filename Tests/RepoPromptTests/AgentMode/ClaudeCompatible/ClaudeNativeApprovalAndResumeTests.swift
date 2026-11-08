@@ -2969,7 +2969,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
                 let adoption = listener.adoptionTask
                 let candidate = try XCTUnwrap(vm.agentSessionLinkCandidate(tabID: tabID, sessionID: sessionID, tabName: "Claude route", isWindowClosing: false))
                 let observer = DomainAgentSessionLinkEndpointIdentity(windowID: 2, workspaceID: UUID(), tabID: UUID(), sessionID: UUID(), persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1)
-                let stop = await vm.agentSessionLinkPerformStop(
+                let stop = await vm.linkExecutionRuntime.agentSessionLinkPerformStop(
                     to: candidate,
                     request: .init(requestID: UUID(), linkID: UUID(), linkGeneration: 1, observerEndpoint: observer, observerDisplayName: "Overseer"),
                     liveness: { .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false) },

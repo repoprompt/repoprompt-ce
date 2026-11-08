@@ -760,7 +760,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             stopLivenessReadings.append(admissionLiveness)
             guard admissionLiveness.permitsDelivery else { return .blocked(.endpointInvalidated) }
             if routeStopToInteractionViewModel, let interactionViewModel {
-                return await interactionViewModel.agentSessionLinkPerformStop(
+                return await interactionViewModel.linkExecutionRuntime.agentSessionLinkPerformStop(
                     to: candidate, request: request, liveness: liveness,
                     queueHasCommittedDrain: queueHasCommittedDrain,
                     withdrawInbound: withdrawInbound, commitAuthorization: commitAuthorization
@@ -2837,11 +2837,13 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(viewModel.agentSidebarLaneCreator(tabID: tabID, expectedSessionID: sessionID)?.sessionID, freshCreator)
         let secondTabID = UUID()
         let second = viewModel.session(for: secondTabID)
-        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: second, updateWorkspaceMetadata: false)
+        XCTAssertEqual(viewModel.test_bindingRejection(sessionID: sessionID, on: second), .conflictingWriter)
+        XCTAssertNil(viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: second, updateWorkspaceMetadata: false))
         second.createdByOverseerSessionID = indexedCreator
-        // Both same-UUID live rows must read their own tab, not whichever dictionary value is first.
+        // A refused second writer cannot impersonate the first row's provenance.
+        XCTAssertNil(second.persistentSessionBindingIdentity)
         XCTAssertEqual(viewModel.agentSidebarLaneCreator(tabID: tabID, expectedSessionID: sessionID)?.sessionID, freshCreator)
-        XCTAssertEqual(viewModel.agentSidebarLaneCreator(tabID: secondTabID, expectedSessionID: sessionID)?.sessionID, indexedCreator)
+        XCTAssertNil(viewModel.agentSidebarLaneCreator(tabID: secondTabID, expectedSessionID: sessionID))
         first.hasLoadedPersistedState = true
         first.createdByOverseerSessionID = nil
         XCTAssertNil(viewModel.agentSidebarLaneCreator(tabID: tabID, expectedSessionID: sessionID))

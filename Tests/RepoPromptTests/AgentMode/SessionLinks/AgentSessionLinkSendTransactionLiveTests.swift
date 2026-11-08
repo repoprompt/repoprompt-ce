@@ -893,14 +893,11 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
     func testEndpointDriftAfterTheCommitFenceAbortsBeforeMutating() async throws {
         let fixture = try makeFixture()
 
-        let outcome = await send(fixture) { [manager = fixture.manager, fixture] in
-            // Rebind the tab to a different session while the authority commit is in flight.
-            _ = manager.compareAndSetActiveAgentSessionID(
-                expected: fixture.sessionID,
-                replacement: UUID(),
-                forTabID: fixture.tabID,
-                inWorkspaceID: fixture.workspaceID
-            )
+        let outcome = await send(fixture) { [fixture] in
+            // Rebind the runtime writer, not merely its sidebar projection, while the fence waits.
+            XCTAssertNotNil(fixture.viewModel.test_installPersistentSessionBinding(
+                sessionID: UUID(), on: fixture.session, updateWorkspaceMetadata: true
+            ))
             return .committed
         }
 
@@ -915,37 +912,30 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
     ///
     /// `startAgentRun(tabID:)` acts on whatever occupies the tab *now*. An in-place rebind during the
     /// flush left the previously admitted facts unchecked, so the observer's turn could be dispatched
-    /// against a replacement binding the grant never covered. The row is already durably the
-    /// target's, so drift withholds only the provider start.
-    func testDriftDuringTheDeliveryFlushRetainsTheRowButStartsNoProvider() async throws {
+    /// against a replacement binding the grant never covered. Writer loss also prevents a qualified
+    /// save acknowledgement or compensating mutation of the successor: report uncertainty, retain
+    /// the staged row and withhold provider start.
+    func testWriterDriftDuringTheDeliveryFlushRetainsTheRowWithoutAcknowledgingOrStarting() async throws {
         let fixture = try makeFixture()
-        fixture.driftHook.duringDeliveryFlush = { [manager = fixture.manager, fixture] in
-            _ = manager.compareAndSetActiveAgentSessionID(
-                expected: fixture.sessionID,
-                replacement: UUID(),
-                forTabID: fixture.tabID,
-                inWorkspaceID: fixture.workspaceID
-            )
+        fixture.driftHook.duringDeliveryFlush = { [fixture] in
+            XCTAssertNotNil(fixture.viewModel.test_installPersistentSessionBinding(
+                sessionID: UUID(), on: fixture.session, updateWorkspaceMetadata: true
+            ))
         }
 
         let outcome = await send(fixture)
 
-        guard case let .delivered(delivery) = outcome else {
-            return XCTFail("Expected the durable delivery to be retained, got \(outcome)")
-        }
-        XCTAssertEqual(
-            delivery.deliveryState,
-            .persisted,
-            "A drifted endpoint must never be dispatched to, but the committed row is not rolled back"
-        )
+        XCTAssertEqual(outcome, .blocked(.persistenceIndeterminate))
+        let row = try XCTUnwrap(fixture.session.items.first(where: { $0.kind == .user }))
+        XCTAssertNotNil(row.crossSessionAttribution, "Writer loss must not compensate against the replacement binding")
         XCTAssertFalse(
             fixture.events.contains(.providerControllerCreated),
             "No provider turn may start against a binding that replaced the admitted one"
         )
         XCTAssertNil(fixture.session.activeComposerSubmitAttempt, "The composer claim must be released")
         XCTAssertNil(
-            fixture.session.items.first(where: { $0.id == delivery.targetItemID })?.dispatchedProviderText,
-            "A persisted-only row was never handed to the provider"
+            row.dispatchedProviderText,
+            "An unacknowledged row must never be handed to the provider"
         )
     }
 

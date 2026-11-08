@@ -5339,3 +5339,44 @@ stash remain excluded and preserved. PR #1655 stays draft; no live-app lifecycle
   the new watchdog/fixture code emitted no new diagnostics in focused compilation. This is not a
   claim that the repository has no existing warnings; the clean hosted aggregate ratchet remains
   separate. Final Swift-tree lint: `e58f94fa-e23f-4c2b-beb6-fff6dfa2113e`, passed.
+
+### M9.2 in progress: writer admission, placement, and Send/Stop routing
+
+This is a partial routing milestone, not completion of M9.2 or #1406.
+
+- `AgentSessionRuntimeStore.Writer` now carries an exact scope/incarnation/workspace/restoration
+  identity; command admission is distinct from originating-writer currency. Retirement refuses new
+  commands without invalidating already-claimed teardown or durable acknowledgement. Binding
+  admission refuses a second live writer before it can install a partial claim.
+- Delegation placement prepares a missing writer before the final synchronous scope-lease and
+  membership fence. The writer owns payload mutation and the existing serialized required save;
+  agreeing UI replicas receive projections, never writer claims. The cold file-rewrite fallback is
+  removed. Real-persistence tests cover the first mutation across cold replicas and late authority
+  loss during preparation.
+- The runtime scope now retains its single `AgentModeRunService`, shared by start and cancellation.
+  The stream runtime no longer depends on a weak view-model-owned execution back-pointer.
+  `WindowStatesManager` routes Send/Stop and their start-stop fence through the process writer;
+  route IDs remain exact endpoint fences, not window-election inputs.
+- The actual managed Stop transaction and cancellation helpers moved from the view model into
+  `AgentSessionLinkExecutionRuntime`. Claimed cleanup and audit effects retain their writer and
+  are tracked through drain. Stop effects are deliberately not joined by terminal publication,
+  which Stop itself awaits. Unsettled provisional target claims live in the existing MCP runtime.
+- Send rechecks its writer around authorization and persistence. Loss of the writer during a save
+  cannot acknowledge that write or compensate against the successor: the row remains, persistence
+  is reported indeterminate, and provider dispatch is withheld.
+- Retired here: the link `Commands.endpoint` callback, the VM managed Stop implementation and
+  cancellation helper bodies, and the VM's stored execution service. Remaining Steer/Compact/model,
+  MCP/admin/worktree, provider-input, self-compaction, terminal preparation and forwarding adapters
+  in the inventory above are still M9.2 work. Window-free resource composition remains M9.3;
+  close-preserves-run and presentation lifetime remain M9.4.
+
+Milestone validation: `1af66724-155a-4599-b74b-61510597f814` passed **580 focused tests**;
+`d1b9e6c1-9216-4f04-a909-703e918cdbf7` built both products. Fresh index check passed
+**1241/1360** wrong-way file edges and **53/66** largest-cycle components. Scoped pinned
+SwiftFormat lint and strict SwiftLint passed all 21 changed Swift files (the final wake fixture was
+rechecked separately). Normalized diagnostics in touched files matched the nine pre-existing
+warning signatures from the admission/placement builds; no new warning signature was introduced.
+The scope-lifetime witness joins its exact pending persistence task before asserting deallocation;
+it does not use a sleep or retry. Competing-writer wake coverage distinguishes cached authority
+projections from command admission: newer inventory can be cached, but no conflicted session
+mutation or provider wake is admitted. Hosted CI and live-app validation remain overseer-owned.

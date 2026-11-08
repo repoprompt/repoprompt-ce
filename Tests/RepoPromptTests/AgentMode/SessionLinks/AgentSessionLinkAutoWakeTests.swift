@@ -391,15 +391,8 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             windowID: 401, workspaceID: workspaceID, tabID: session.tabID, sessionID: sessionID,
             persistentBindingGeneration: binding.generation, bindingTransitionGeneration: session.bindingTransitionGeneration
         )
-        let runtime = scope.makeLinkExecution(commands: .init(
+        let runtime = scope.makeLinkExecution(routeID: endpoint.windowID, commands: .init(
             isAvailable: isAvailable,
-            endpoint: { [weak scope, weak session] tabID in
-                onEndpointRead()
-                guard let session, scope?.sessions[tabID] === session,
-                      session.persistentSessionBindingIdentity == binding,
-                      session.bindingTransitionGeneration == endpoint.bindingTransitionGeneration else { return nil }
-                return endpoint
-            },
             workspaceID: { _ in workspaceID },
             augment: { _, input, _, _, _ in input },
             initialMessage: { _, input in input },
@@ -439,6 +432,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 return true
             }
         ), diagnostics: NoopAgentSessionLinkCatalogEventSink())
+        runtime.test_endpointRead = onEndpointRead
         if let workspace {
             scope.persistence.composition = .init(
                 workspace: { workspace }, workspaceWithID: { $0 == workspace.id ? workspace : nil },
@@ -1367,11 +1361,27 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             attempt.compactTurnSucceeded = true
             attempt.noteDispatchStarted = loss == "attemptedForeign"
             fixture.session.selfCompactState = AgentSelfCompactState(active: attempt)
+            let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
             let competingWriter = loss == "competingWriter" ? fixture.viewModel.session(for: UUID()) : nil
+            // Deliberately bypass normal binding admission to exercise corrupted competing claims.
             competingWriter?.testInstallPersistentSessionBinding(sessionID: fixture.sessionID)
             defer { competingWriter?.testInstallPersistentSessionBinding(sessionID: nil) }
             XCTAssertEqual(owner.matchesLocalBinding(fixture.session), loss != "localGeneration", loss)
             XCTAssertEqual(fixture.viewModel.agentSelfCompactBlocksNotificationWake(fixture.session), loss != "currentOwner", loss)
+            if loss == "competingWriter" {
+                XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+                fixture.viewModel.agentSessionLinkPublishPromptInventory(
+                    Self.inventory(observerSessionID: fixture.sessionID, revision: .max, targetCount: 1), to: endpoint
+                )
+                fixture.viewModel.agentSessionLinkReconcilePeriodicWake(for: endpoint)
+                XCTAssertEqual(fixture.session.selfCompactState.active, attempt, "No writer may mutate a conflicted session")
+                XCTAssertNil(fixture.session.selfCompactState.latest)
+                XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+                // Inventory is a retained authority projection, not writer admission. Even a newer
+                // cached publication cannot mutate the conflicted session or schedule provider input.
+                XCTAssertEqual(fixture.viewModel.agentSessionLinkPromptInventoryBySessionID[fixture.sessionID]?.inventory.linkSetRevision, .max)
+                continue
+            }
             try publishInventory(fixture, revision: 1)
             try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
             if loss == "currentOwner" || loss == "attemptedForeign" {

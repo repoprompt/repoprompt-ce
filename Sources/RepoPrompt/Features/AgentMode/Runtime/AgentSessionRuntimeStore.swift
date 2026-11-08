@@ -217,6 +217,11 @@ final class AgentSessionRuntimeStore {
     final class Scope {
         fileprivate let id = UUID()
         fileprivate let store: AgentSessionRuntimeStore
+
+        func resolveWriter(sessionID: UUID, expectedWorkspaceID: UUID? = nil) -> WriterResolution {
+            store.resolveWriter(sessionID: sessionID, expectedWorkspaceID: expectedWorkspaceID)
+        }
+
         let presentation = AgentSessionPresentationRuntime()
         let usage = AgentSessionUsageRuntime()
         lazy var turnTiming = AgentSessionTurnTimingRuntime(presentation: presentation)
@@ -232,16 +237,35 @@ final class AgentSessionRuntimeStore {
             return runtime
         }
 
+        private(set) var execution: AgentModeRunService?
+
+        func installExecution(_ execution: AgentModeRunService) {
+            precondition(self.execution == nil, "Execution is installed once by its runtime host.")
+            self.execution = execution
+        }
+
+        #if DEBUG
+            func test_replaceExecution(_ execution: AgentModeRunService) {
+                precondition(sessions.values.allSatisfy { $0.activeRunOwnership == nil })
+                self.execution = execution
+            }
+        #endif
+
+        var installedInteractions: AgentSessionInteractionRuntime? {
+            interactionRuntime
+        }
+
         private(set) var linkExecution: AgentSessionLinkExecutionRuntime?
 
         func makeLinkExecution(
+            routeID: Int,
             commands: AgentSessionLinkExecutionRuntime.Commands,
             diagnostics: any AgentSessionLinkCatalogEventSink
         ) -> AgentSessionLinkExecutionRuntime {
             // Host composition installs once. Presentation attachment must use `linkExecution`,
             // never replace its command authority or reset pending claims/tasks.
             precondition(linkExecution == nil, "Link execution is installed once by its runtime host.")
-            let runtime = AgentSessionLinkExecutionRuntime(scope: self, commands: commands, diagnostics: diagnostics)
+            let runtime = AgentSessionLinkExecutionRuntime(scope: self, routeID: routeID, commands: commands, diagnostics: diagnostics)
             linkExecution = runtime
             return runtime
         }
@@ -297,6 +321,7 @@ final class AgentSessionRuntimeStore {
             guard isRetiring, saveQueue.inFlightSessionIDs.isEmpty, !attachments.hasPendingRetention,
                   !continuation.hasPendingStarts,
                   linkExecution?.pendingSendEffects.isEmpty != false,
+                  linkExecution?.pendingStopEffects.isEmpty != false,
                   sessions.values.allSatisfy({ session in
                       !session.runState.isActive && session.activeComposerSubmitAttempt == nil
                           && !session.terminalCommitInProgress && (!session.isDirty || session.activeAgentSessionID.map {

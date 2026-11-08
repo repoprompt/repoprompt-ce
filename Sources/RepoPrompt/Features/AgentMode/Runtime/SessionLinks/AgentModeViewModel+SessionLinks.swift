@@ -282,13 +282,7 @@ extension AgentModeViewModel {
     /// publication at one incarnation. It is deliberately read-only and creates nothing: an unbound
     /// or unresolvable tab yields `nil` so the caller fails closed instead of inventing an endpoint.
     func agentSessionLinkObserverEndpoint(tabID: UUID) -> DomainAgentSessionLinkEndpointIdentity? {
-        guard let session = sessions[tabID],
-              let sessionID = session.activeAgentSessionID,
-              let identity = agentSessionLifecycleIdentity(tabID: tabID, expectedSessionID: sessionID)
-        else {
-            return nil
-        }
-        return identity.monitorEndpoint(windowID: windowID)
+        linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID)
     }
 
     func agentSessionLinkCandidate(

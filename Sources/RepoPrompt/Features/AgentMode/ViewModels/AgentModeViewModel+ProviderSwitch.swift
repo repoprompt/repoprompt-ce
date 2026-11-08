@@ -168,7 +168,7 @@ extension AgentModeViewModel {
             // Queued work with no live run gets the same claim-time withdrawal an explicit Stop
             // runs — without manufacturing a cancelled attempt the way cancelRun would on idle.
             prepareAgentRunCancellation(session: session, intent: .userStop, origin: .explicitStop)
-            withdrawQueuedWorkForManagedStop(session: session)
+            linkExecutionRuntime.withdrawQueuedWorkForManagedStop(session: session)
             retireTimedOutManagedStopIfEligible(session)
             return providerSwitchSourceIsSettled(session)
         }
