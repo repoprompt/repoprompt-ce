@@ -1480,6 +1480,8 @@ final class AgentTabSession: ObservableObject {
 
     var claudeController: (any NativeAgentRuntimeControlling)?
     var acpController: ACPAgentSessionController?
+    /// Retained input, not liveness: use only with its exact ownership and restoration binding.
+    var acpWorkspaceAdmission: AgentACPWorkspaceAdmission?
 
     var codexEventTask: Task<Void, Never>?
     var codexEventTaskRunID: UUID?

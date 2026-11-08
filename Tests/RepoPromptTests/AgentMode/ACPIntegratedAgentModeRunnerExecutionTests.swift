@@ -356,7 +356,7 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
                     return try ACPAgentSessionController(provider: provider, runRequest: request)
                 }
             )
-            let composition = AgentModeRunComposition(execution: harness.service, resources: resources)
+            let composition = AgentModeRunComposition(execution: harness.service, resources: resources, workspace: harness.workspace)
             let outcome = AgentRunStartOutcomeRecorder()
             let fence = AgentRunStartStopFence(session: session)
             let start = Task { await composition.startRun(
@@ -392,6 +392,44 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
                 XCTAssertNil(session.activeRunOwnership)
             }
         }
+    }
+
+    func testWorkspaceAdmissionRetainsLogicalRootAndRevalidatesWorktreeAndBinding() throws {
+        let session = AgentTabSession(tabID: UUID())
+        let sessionID = UUID()
+        session.testInstallPersistentSessionBinding(sessionID: sessionID)
+        let ownership = session.beginRunAttempt(source: "workspace admission")
+        let input = AgentRunWorkspaceInput(fallbackWorkspacePath: "/captured/logical-root")
+        let admission = AgentACPWorkspaceAdmission(
+            input: input, ownership: ownership, session: session
+        )
+        XCTAssertTrue(admission.isCurrent(for: session))
+        XCTAssertEqual(try admission.input.resolve(bindings: []), "/captured/logical-root")
+        let missing = AgentSessionWorktreeBinding(
+            id: "binding", repositoryID: "repository", repoKey: "repository",
+            logicalRootPath: "/captured/logical-root", worktreeID: "worktree",
+            worktreeRootPath: "/nonexistent-m9-worktree-\(UUID().uuidString)", source: "test"
+        )
+        XCTAssertThrowsError(try admission.input.resolve(bindings: [missing]), "A captured root is not cached filesystem authority")
+        session.testInstallPersistentSessionBinding(sessionID: sessionID)
+        XCTAssertFalse(admission.isCurrent(for: session), "Same session UUID with a new binding cannot reuse the admitted workspace")
+        XCTAssertEqual(session.activeRunOwnership, ownership)
+        _ = session.beginPersistentBindingTransition()
+        let duringTransition = AgentACPWorkspaceAdmission(
+            input: input, ownership: ownership, session: session
+        )
+        XCTAssertFalse(duringTransition.isCurrent(for: session), "Matching values do not admit a binding transition in progress")
+
+        // Runtime-only attempts have no restoration token. Their existing transition generation
+        // still fences an old admission after a nil-to-nil binding transition settles.
+        let runtimeOnly = AgentTabSession(tabID: UUID())
+        let runtimeOwner = runtimeOnly.beginRunAttempt(source: "runtime-only workspace")
+        let runtimeAdmission = AgentACPWorkspaceAdmission(input: input, ownership: runtimeOwner, session: runtimeOnly)
+        XCTAssertTrue(runtimeAdmission.isCurrent(for: runtimeOnly))
+        let transition = runtimeOnly.beginPersistentBindingTransition()
+        runtimeOnly.finishPersistentBindingTransition(generation: transition)
+        XCTAssertNil(runtimeOnly.currentRestorationBindingToken)
+        XCTAssertFalse(runtimeAdmission.isCurrent(for: runtimeOnly))
     }
 
     func testPreparedHeadlessConstructionIsOneShotAndStopFencesFactoryInvocation() async throws {
@@ -443,7 +481,7 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
             }
         )
         let prepared = await runner.prepareRun(
-            tabID: session.tabID, session: session, initialUserMessage: "turn", initialMessageForRun: "turn", attachments: [],
+            tabID: session.tabID, session: session, workspace: .init(fallbackWorkspacePath: nil), initialUserMessage: "turn", initialMessageForRun: "turn", attachments: [],
             runRequest: ACPRunRequest(agentKind: .devin, modelString: nil, workspacePath: nil, resumeSessionID: nil, attachments: [], taskLabelKind: nil),
             makeLease: { harness.makeLease(runID: $0, tabID: session.tabID) }
         )

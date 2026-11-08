@@ -12,7 +12,6 @@ final class AgentModeRunService {
         let connectionPolicyInstaller: AgentRunExecutionContracts.ConnectionPolicyInstaller
         let expectedPIDPolicyArmer: (MCPBootstrapLeaseSpec) async -> Bool
         let mcpServerEnabler: AgentRunExecutionContracts.MCPServerEnabler
-        let workspacePathProvider: (AgentTabSession) throws -> String?
         let codexCoordinator: CodexAgentModeCoordinator
         let claudeCoordinator: ClaudeAgentModeCoordinator
         let shouldManageCodexTooling: Bool
@@ -231,6 +230,7 @@ final class AgentModeRunService {
     func prepareRun(
         tabID: UUID,
         session: AgentTabSession,
+        workspace: AgentRunWorkspaceInput,
         initialUserMessage: String,
         initialMessageForRun: String,
         attachments: [AgentFileAttachment],
@@ -291,7 +291,7 @@ final class AgentModeRunService {
         let runtimePermission = dependencies.providerRuntimePermissionResolver(selectedAgent, session.permissionProfile)
         let workspacePath: String?
         do {
-            workspacePath = try dependencies.workspacePathProvider(session)
+            workspacePath = try workspace.resolve(bindings: session.worktreeBindings)
         } catch {
             let message = Self.providerStartupFailureMessage(for: error)
             await failBeforeProviderStartup(session: session, message: message)
@@ -379,6 +379,7 @@ final class AgentModeRunService {
             let resources = await acpRunner.prepareRun(
                 tabID: tabID,
                 session: session,
+                workspace: workspace,
                 initialUserMessage: initialUserMessage,
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,
@@ -457,9 +458,13 @@ final class AgentModeRunService {
             steeringDebugLog("[AgentRunSteeringWake] ACP active submit guard rejected agent=\(selectedAgent.rawValue) state=\(session.runState.rawValue) attachments=\(attachments.count) runID=\(String(describing: session.runID)) targetRunID=\(String(describing: targetRunID)) attempt=\(String(describing: session.activeRunAttemptID)) targetAttempt=\(String(describing: targetRunAttemptID)) hasController=\(session.acpController != nil) controllerMatches=\(session.acpController === targetController)")
             return false
         }
+        guard let admission = session.acpWorkspaceAdmission, admission.isCurrent(for: session) else {
+            steeringDebugLog("[AgentRunSteeringWake] ACP workspace admission refused tab=\(session.tabID) missing=\(session.acpWorkspaceAdmission == nil) transitioning=\(session.bindingTransitionInProgress) bindingMatches=\(session.acpWorkspaceAdmission?.binding == session.currentRestorationBindingToken) ownerMatches=\(session.acpWorkspaceAdmission?.ownership == session.activeRunOwnership)")
+            return false
+        }
         let workspacePath: String?
         do {
-            workspacePath = try dependencies.workspacePathProvider(session)
+            workspacePath = try admission.input.resolve(bindings: session.worktreeBindings)
         } catch {
             let message = Self.providerStartupFailureMessage(for: error)
             await failBeforeProviderStartup(session: session, message: message)

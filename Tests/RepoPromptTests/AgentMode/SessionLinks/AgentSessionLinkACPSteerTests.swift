@@ -109,7 +109,11 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         session.acpController = controller
         session.runState = .running
         session.installRunID(UUID())
-        _ = session.beginRunAttempt(source: "managed-acp-steer-test")
+        let ownership = session.beginRunAttempt(source: "managed-acp-steer-test")
+        session.acpWorkspaceAdmission = .init(
+            input: .init(fallbackWorkspacePath: directory.path), ownership: ownership,
+            session: session
+        )
         let fixture = Fixture(
             viewModel: viewModel, manager: manager, session: session, candidate: candidate,
             controller: controller, provider: provider, directory: directory, promptGate: promptGate
@@ -205,6 +209,58 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         guard case let .settled(receipt) = stop else { return XCTFail("Expected Stop receipt") }
         XCTAssertEqual(receipt.result, .stopped)
         XCTAssertNil(fixture.session.scheduledACPFollowUp)
+    }
+
+    func testActiveACPRefusesMissingOrPreviousAttemptWorkspaceWithoutProviderWrite() async throws {
+        let fixture = try await makeFixture()
+        let session = fixture.session
+        let service = fixture.viewModel.test_initializeRunService()
+        let admitted = try XCTUnwrap(session.acpWorkspaceAdmission)
+        let before = fixture.provider.promptedMessages.count
+        session.acpWorkspaceAdmission = nil
+        let missing = await service.submitActiveACPPromptIfSupported(
+            session: session, messageForRun: "must not reach provider", attachments: [],
+            targetRunID: session.runID, targetRunAttemptID: session.activeRunAttemptID,
+            targetController: fixture.controller
+        )
+        XCTAssertFalse(missing)
+        XCTAssertEqual(fixture.provider.promptedMessages.count, before)
+        session.acpWorkspaceAdmission = admitted
+        session.beginRunAttempt(source: "successor must admit its own workspace")
+        let successor = session.activeRunOwnership
+        let stale = await service.submitActiveACPPromptIfSupported(
+            session: session, messageForRun: "must not reuse old workspace", attachments: [],
+            targetRunID: session.runID, targetRunAttemptID: session.activeRunAttemptID,
+            targetController: fixture.controller
+        )
+        XCTAssertFalse(stale)
+        XCTAssertEqual(session.activeRunOwnership, successor)
+        XCTAssertEqual(session.runState, .running, "Refusal must not terminalize the successor")
+        XCTAssertEqual(fixture.provider.promptedMessages.count, before)
+    }
+
+    func testMissingWorkspaceAdmissionRequeuesMixedBatchWithoutLosingReceiptOrLocalDraft() async throws {
+        let fixture = try await makeFixture()
+        let session = fixture.session
+        let owner = session.activeRunOwnership
+        let before = fixture.provider.promptedMessages.count
+        session.acpWorkspaceAdmission = nil
+        session.pendingACPSteeringInstructions.append(.init(
+            id: UUID(), targetRunID: session.runID, targetRunAttemptID: session.activeRunAttemptID,
+            providerText: "local provider direction", interruptedPromptProviderText: nil,
+            attachments: [], taggedFileAttachments: [], draftText: "local draft",
+            optimisticUserItemID: nil, createdAt: Date()
+        ))
+        let outcome = await steer(fixture, request: request("managed direction"))
+        guard case let .delivered(delivery) = outcome else { return XCTFail("Expected queued receipt: \(outcome)") }
+        await session.acpSteeringFlushTask?.value
+        XCTAssertEqual(delivery.deliveryState, .queuedFollowUp)
+        XCTAssertEqual(fixture.provider.promptedMessages.count, before)
+        XCTAssertEqual(session.activeRunOwnership, owner)
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertTrue(session.pendingACPSteeringInstructions.isEmpty)
+        XCTAssertTrue(session.pendingInstructions.contains { $0.providerText.contains("managed direction") })
+        XCTAssertTrue(session.pendingInstructions.contains { $0.providerText.contains("local provider direction") && $0.localDraftText == "local draft" })
     }
 
     func testRunningACPManagedSteerDeliversFramedPrompt() async throws {

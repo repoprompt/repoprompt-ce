@@ -372,7 +372,7 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
             resumeSessionID: nil, attachments: [], taskLabelKind: nil
         )
         await harness.resources.fulfill(runner.prepareRun(
-            tabID: session.tabID, session: session,
+            tabID: session.tabID, session: session, workspace: harness.workspace,
             initialUserMessage: "prime", initialMessageForRun: "prime", attachments: [],
             runRequest: initialRequest,
             makeLease: { harness.makeLease(runID: $0, tabID: session.tabID) }
@@ -393,7 +393,7 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
             sessionModeID: "auto_edit"
         )
         await harness.resources.fulfill(runner.prepareRun(
-            tabID: session.tabID, session: session,
+            tabID: session.tabID, session: session, workspace: harness.workspace,
             initialUserMessage: frame, initialMessageForRun: frame, attachments: [],
             runRequest: noteRequest,
             makeLease: { harness.makeLease(runID: $0, tabID: session.tabID) }

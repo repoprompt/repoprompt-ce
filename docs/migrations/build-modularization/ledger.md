@@ -4914,3 +4914,47 @@ Validation:
 Canonical writer admission, window-free saved-host composition, remaining context/startup/terminal
 commands, runtime-addressed routing and presentation-preserving execution/handoff/drain remain open.
 This is not full-suite, aggregate-warning, hosted-CI or live-smoke qualification, and not M9 completion.
+
+### M9 continuation — explicit execution workspace inputs (2026-11-08)
+
+Removed the mutable-session workspace callback from `AgentModeRunService.Dependencies`. Run
+composition supplies an immutable logical fallback root; the existing worktree resolver still checks
+current bindings and filesystem/Git identity at the original execution guard point. Queued ACP input
+uses the root admitted by its originating attempt, not a later selected window or a weak VM returning
+nil after detachment. The native coordinators' separate workspace dependencies and canonical host
+composition remain open; this value is not a canonical catalog or writer grant.
+
+The ACP runner records the input immediately after the existing `beginRunAttempt`, before its
+control/reuse/fresh-provider branches. Steering requires the existing run ID, attempt and controller
+checks plus the exact session object, restoration binding and binding-transition generation. The
+separate generation covers runtime-only nil-to-nil binding transitions. Missing/stale input refuses
+without terminating a successor, and the existing dequeued-batch path preserves managed receipts and
+local draft recovery. The record is retained input, not another lifecycle manager or liveness flag.
+
+Coverage includes live filesystem refusal for a missing bound worktree, same-ID rebinding,
+in-progress and nil-to-nil transitions, missing/previous-attempt steering with no provider write,
+and the real mixed local/managed flush producing a queued-follow-up receipt while retaining the
+local draft and current running owner. The existing manual live-controller fixture explicitly
+installs its originating workspace input; assertions and timeouts were not weakened.
+
+Validation:
+- `4b56a9c6-e889-44cf-af34-10ed15d568a1` passed **125 tests** before review additions.
+- `e2d8efde-0f54-4a97-abda-f68e597e178a` passed **126 tests**; its extra worktree filter used a
+  non-matching class prefix. The correct isolated suite passed **42 tests** in
+  `4514dde0-ff47-456a-9ed2-c4b6e00e2916`.
+- Final `fac17795-8e6c-4326-b8c7-b6a0b9b6c2b4` passed **168 tests** on the final Swift tree:
+  ACP execution 15, waiting ownership 2, ACP settle 24, background settle 4, compact runner 8,
+  compact transaction 6, managed ACP steering 29, worktree admission 42, Claude approval/resume 38.
+- Both products passed `38373203-8f5d-4b37-b983-b1426bee7783`; lint passed
+  `875135a6-154c-4a67-a835-702b5c005115` on the same Swift tree. Earlier product/lint receipts
+  `7170ef47-016b-4893-868c-ca975913b768` / `a3d7cf41-61a2-4c8d-bf4c-55c0273eb938` predate the
+  final exact-object/transition fence and are not the final qualification.
+- Fresh compiler index passed **1241/1360** wrong-way file edges and **53/66** largest-cycle
+  components (1131 files, 156358 symbols), with no baseline increase.
+- Scoped formatting and one independent review completed. Source tracing confirmed production ACP
+  attempts enter through the runner; other attempt constructors are native/headless or terminal
+  failure/cancellation paths. Mandatory staged contribution preflight applies before commit.
+
+Independent canonical writer admission, window-free saved-host composition, remaining runtime
+commands/routing, presentation-preserving execution and full final qualification remain open.
+This is not full-suite, aggregate-warning, hosted-CI or live-smoke qualification, and not M9 completion.

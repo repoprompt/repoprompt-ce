@@ -22,8 +22,9 @@ import XCTest
 final class AgentSessionLinkRunnerHarness {
     let service: AgentModeRunService
     let resources: AgentRunProviderComposition
+    let workspace: AgentRunWorkspaceInput
     var composition: AgentModeRunComposition {
-        AgentModeRunComposition(execution: service, resources: resources)
+        AgentModeRunComposition(execution: service, resources: resources, workspace: workspace)
     }
 
     let host: AgentModeViewModel
@@ -102,6 +103,7 @@ final class AgentSessionLinkRunnerHarness {
         testMCPServer: MCPServerViewModel? = nil
     ) {
         self.stubSystemPrompt = stubSystemPrompt
+        workspace = AgentRunWorkspaceInput(fallbackWorkspacePath: workspacePath)
         self.headlessProviderFactory = headlessProviderFactory
         let recorder = LifecycleRecorder()
         self.recorder = recorder
@@ -144,7 +146,6 @@ final class AgentSessionLinkRunnerHarness {
             connectionPolicyInstaller: policyInstaller,
             expectedPIDPolicyArmer: { _ in true },
             mcpServerEnabler: serverEnabler,
-            workspacePathProvider: { _ in workspacePath },
             codexCoordinator: host.test_codexCoordinator,
             claudeCoordinator: host.claudeCoordinator,
             shouldManageCodexTooling: false,

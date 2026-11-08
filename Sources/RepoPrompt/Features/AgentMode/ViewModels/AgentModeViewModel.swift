@@ -889,7 +889,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         headless: headlessProviderFactory, acp: acpProviderFactory, controller: acpControllerFactory
     )
     private var runComposition: AgentModeRunComposition {
-        AgentModeRunComposition(execution: runService, resources: runProviderComposition)
+        AgentModeRunComposition(execution: runService, resources: runProviderComposition, workspace: .init(fallbackWorkspacePath: workspacePathProvider()))
     }
 
     func providerSwitchTerminalIsSettled(_ session: TabSession) -> Bool {
@@ -1363,7 +1363,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         func test_composeRunService(_ execution: AgentModeRunService) -> AgentModeRunComposition {
-            AgentModeRunComposition(execution: execution, resources: runProviderComposition)
+            AgentModeRunComposition(execution: execution, resources: runProviderComposition, workspace: .init(fallbackWorkspacePath: workspacePathProvider()))
         }
 
         func test_consumeClaudeTerminalEvents(
@@ -3748,10 +3748,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 )
             },
             mcpServerEnabler: mcpServerEnabler ?? self.mcpServerEnabler,
-            workspacePathProvider: { [weak self] session in
-                guard let self else { return nil }
-                return try effectiveWorkspacePath(for: session)
-            },
             codexCoordinator: codexCoordinator,
             claudeCoordinator: claudeCoordinator,
             shouldManageCodexTooling: shouldManageCodexTooling,

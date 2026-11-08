@@ -9,10 +9,12 @@ import RepoPromptAIContracts
 final class AgentModeRunComposition {
     let execution: AgentModeRunService
     private let resources: AgentRunProviderComposition
+    private let workspace: AgentRunWorkspaceInput
 
-    init(execution: AgentModeRunService, resources: AgentRunProviderComposition) {
+    init(execution: AgentModeRunService, resources: AgentRunProviderComposition, workspace: AgentRunWorkspaceInput) {
         self.execution = execution
         self.resources = resources
+        self.workspace = workspace
     }
 
     @discardableResult
@@ -35,6 +37,7 @@ final class AgentModeRunComposition {
         switch await execution.prepareRun(
             tabID: tabID,
             session: session,
+            workspace: workspace,
             initialUserMessage: initialUserMessage,
             initialMessageForRun: initialMessageForRun,
             attachments: attachments,
