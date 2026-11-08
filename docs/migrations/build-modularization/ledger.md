@@ -5824,3 +5824,43 @@ all 137 existing tests but exposed an unrelated approval actor in the new fixtur
 fixture uses the installed actor and observes subscription/state acknowledgement, preserving
 all rollback assertions. Neither earlier run qualifies this milestone. No live-app or full-suite
 validation was run.
+
+### M9.2 partial milestone: conditional approval receipts and runtime control detach
+
+The existing approval-store scope entry now carries a revision and at most one override owner.
+Activation prepares and conditionally applies an exact resource receipt; ordinary writes,
+including same-value manual writes and existing hydration synchronization, supersede it.
+Release-before-apply invalidates the request, cleanup/reuse cannot recreate its revision, and
+an old release cannot restore over a newer owner. There is no second claim ledger, tombstone
+set, successor reconciliation loop, or changed plain-write policy. A nil entry value still
+follows the global default. Registration replacement preserves the value-only resource receipt.
+
+The first causal successor test caught an important handover case: enabled state can still be
+the predecessor's override, not a user preference. Every activation now takes a resource receipt;
+the one existing entry carries its underlying restore value into a successor owner. A release
+between successor preparation and application fails closed rather than retrying. Review also
+caught stale local projection after a refused restore; release republishes the actor's actual
+value even when it does not mutate it. Tests cover manual writes before apply and during control.
+
+Generic and owned MCP deactivation share an actual runtime body. Local context, permissions and
+optional presentation detach before suspension; remaining effects name only the old approval
+receipt and exact domain registration. VM teardown likewise clears its old observer state before
+awaiting, rather than erasing a successor on return. The existing scope-local duplicate-control
+veto remains: passing an exact copied object must not expose another holder's resources. Tests
+exercise a copied context and a complete successor activation during paused old cleanup, including
+actor preference, domain registration, pending state and UI membership. Existing permission
+guidance uses the same optional presentation sink as before.
+
+This retires two VM deactivation mutation bodies, not all MCP routing. Context writer-identity
+qualification, cross-scope copied-registration protection, the remaining control selectors and
+reactivation/discard host adapters remain M9.2. The original M9.2 inventory and done criteria still
+apply. No window-free saved-host work, prepared-window retirement, close-preserves-run or new
+handoff/drain policy is included.
+
+Validation: `9020fb70-183d-4667-858f-86e16bd6f2ac` passed **153 focused tests**. Both products
+passed `be6c2ec8-2a31-4b8c-8fc7-20c638d6761a`; full lint passed
+`2a260152-c3b1-49fa-a627-d23ed76bba5b`. Fresh index passed **1242/1360** wrong-way file edges
+and **53/66** largest-cycle components. Two emitted touched-file warning signatures matched
+the baseline; none were new. The first run passed 151 tests but failed the new successor's
+approval-value assertion, exposing the skipped-ownership case described above; it is not a
+qualification pass. No live-app or full-suite validation was run.

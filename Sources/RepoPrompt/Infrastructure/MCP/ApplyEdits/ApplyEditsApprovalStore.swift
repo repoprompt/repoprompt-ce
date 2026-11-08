@@ -81,12 +81,29 @@ actor ApplyEditsApprovalStore: Sendable {
 
     private typealias SnapshotContinuation = AsyncStream<ApplyEditsApprovalSnapshot>.Continuation
 
-    private var autoEditOverridesByScope: [ApplyEditsApprovalScope: Bool] = [:]
+    /// One resource revision per existing scope entry. A nil value still follows the global
+    /// default; preparing a conditional override does not freeze that fallback.
+    private struct AutoEditEntry {
+        var value: Bool?
+        var revision = UUID()
+        var owner: UUID?
+        var restoreValue: Bool?
+    }
+
+    struct AutoEditOverride: Equatable {
+        fileprivate let scope: ApplyEditsApprovalScope
+        fileprivate let revision: UUID
+        fileprivate let expectedValue: Bool
+        let restoreValue: Bool
+        fileprivate let id = UUID()
+    }
+
+    private var autoEditOverridesByScope: [ApplyEditsApprovalScope: AutoEditEntry] = [:]
     private var pendingByScope: [ApplyEditsApprovalScope: PendingRecord] = [:]
     private var subscriptions: [ApplyEditsApprovalScope: [UUID: SnapshotContinuation]] = [:]
 
     func autoEditEnabled(for scope: ApplyEditsApprovalScope) -> Bool {
-        autoEditOverridesByScope[scope] ?? Self.globalDefaultAutoEditEnabled()
+        autoEditOverridesByScope[scope]?.value ?? Self.globalDefaultAutoEditEnabled()
     }
 
     func setAutoEditEnabled(
@@ -94,11 +111,57 @@ actor ApplyEditsApprovalStore: Sendable {
         for scope: ApplyEditsApprovalScope,
         updateGlobalDefault: Bool
     ) {
-        autoEditOverridesByScope[scope] = enabled
+        // Every ordinary write supersedes an outstanding override, including a same-value
+        // manual write. Old cleanup cannot restore over that choice.
+        autoEditOverridesByScope[scope] = AutoEditEntry(value: enabled)
         if updateGlobalDefault {
             Self.setGlobalDefaultAutoEditEnabled(enabled)
         }
         publishSnapshot(for: scope)
+    }
+
+    func prepareAutoEditOverride(for scope: ApplyEditsApprovalScope) -> AutoEditOverride {
+        let entry = autoEditOverridesByScope[scope] ?? AutoEditEntry()
+        autoEditOverridesByScope[scope] = entry
+        return AutoEditOverride(
+            scope: scope, revision: entry.revision,
+            expectedValue: autoEditEnabled(for: scope),
+            restoreValue: entry.restoreValue ?? autoEditEnabled(for: scope)
+        )
+    }
+
+    /// No suspension between comparison and mutation. A cancelled, cleaned-up, or superseded
+    /// request cannot arrive late and overwrite the next occupant of this resource address.
+    func applyAutoEditOverride(_ receipt: AutoEditOverride) -> Bool {
+        guard var entry = autoEditOverridesByScope[receipt.scope],
+              entry.revision == receipt.revision,
+              autoEditEnabled(for: receipt.scope) == receipt.expectedValue else { return false }
+        entry.value = true
+        entry.owner = receipt.id
+        entry.restoreValue = receipt.restoreValue
+        entry.revision = UUID()
+        autoEditOverridesByScope[receipt.scope] = entry
+        publishSnapshot(for: receipt.scope)
+        return true
+    }
+
+    func releaseAutoEditOverride(_ receipt: AutoEditOverride) {
+        guard var entry = autoEditOverridesByScope[receipt.scope] else { return }
+        // Even a superseded restore must project the resource's actual value, rather than
+        // leave the detached session's speculative restore visible in an attached presenter.
+        defer { publishSnapshot(for: receipt.scope) }
+        if entry.owner == receipt.id {
+            entry.value = receipt.restoreValue
+            entry.owner = nil
+            entry.restoreValue = nil
+            entry.revision = UUID()
+            autoEditOverridesByScope[receipt.scope] = entry
+        } else if entry.revision == receipt.revision {
+            // Release may beat apply to the actor. Invalidate that pending request without
+            // changing the effective value, retaining tombstones, or retrying on a successor.
+            entry.revision = UUID()
+            autoEditOverridesByScope[receipt.scope] = entry
+        }
     }
 
     func requestReview(

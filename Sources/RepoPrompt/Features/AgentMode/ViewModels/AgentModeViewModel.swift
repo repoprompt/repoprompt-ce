@@ -7754,16 +7754,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             reason: "Codex queued follow-up was cancelled because MCP control was torn down."
         )
         session.mcpControlActivationGeneration &+= 1
-        if let context = session.mcpControlContext {
-            if deactivateLiveControlContext {
-                await mcpDeactivateControlContext(
-                    sessionID: context.sessionID,
-                    cleanupSessionStore: cleanupSessionStore
-                )
-            } else if cleanupSessionStore {
-                await AgentRunSessionStore.cleanup(registration: context.registration)
-            }
-        }
+        let context = session.mcpControlContext
+        // Detach observers and local cleanup before suspension; an activation installed while
+        // exact external resources drain must not be cleared by the old teardown's continuation.
         // Defensive: ensure permission profile is reset even if deactivation
         // was skipped (e.g. context was already nil during tab close).
         session.permissionProfile = .userConfigured
@@ -7777,6 +7770,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.mcpControlCleanupTask?.cancel()
         session.mcpControlCleanupTask = nil
         session.mcpFollowUpRunPending = false
+        if let context {
+            if deactivateLiveControlContext {
+                await mcpRuntime.deactivateControlContext(
+                    session: session, expectedContext: context,
+                    approvalStore: applyEditsApprovalStore, cleanupRegistration: cleanupSessionStore
+                )
+            } else if cleanupSessionStore {
+                await AgentRunSessionStore.cleanup(registration: context.registration)
+            }
+        }
     }
 
     func publishMCPStateChange(for session: TabSession) {
@@ -11406,36 +11409,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return
         }
 
-        codexCoordinator.handleMCPControlReset(
-            for: session,
-            reason: "Codex queued follow-up was cancelled because MCP control was deactivated."
+        await mcpRuntime.deactivateControlContext(
+            session: session, expectedContext: context,
+            approvalStore: applyEditsApprovalStore, cleanupRegistration: cleanupSessionStore
         )
-        session.mcpControlActivationGeneration &+= 1
-        session.mcpControlCleanupTask?.cancel()
-        session.mcpControlCleanupTask = nil
-        session.mcpFollowUpRunPending = false
-        if context.forceAutoEditEnabled {
-            session.autoEditEnabled = context.autoEditEnabledBeforeOverride
-            await applyEditsApprovalStore.setAutoEditEnabled(
-                context.autoEditEnabledBeforeOverride,
-                for: applyEditsScope(for: session.tabID),
-                updateGlobalDefault: false
-            )
-        }
-        await AgentRunSessionStore.removeCancellationHandler(
-            registration: context.registration
-        )
-        session.mcpControlContext = nil
-        mcpControlledTabIDs.remove(session.tabID)
-        if cleanupSessionStore {
-            await AgentRunSessionStore.cleanup(registration: context.registration)
-        }
-        // Restore provider permissions to user-configured values.
-        session.permissionProfile = .userConfigured
-        if session.tabID == currentTabID {
-            updateBindingsFromSession(session)
-            refreshAutoEditPermissionGuidanceForActiveSession()
-        }
     }
 
     /// Failed resume attempts may release only the activation they created.
@@ -11451,39 +11428,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
               context.registration == expectedContext.registration,
               !session.runState.isActive
         else { return false }
-        mcpRemoveAgentRunOracleReviewContexts(sessionID: sessionID)
-        codexCoordinator.handleMCPControlReset(
-            for: session,
-            reason: "Codex queued follow-up was cancelled because its MCP resume failed."
+        return await mcpRuntime.deactivateControlContext(
+            session: session, expectedContext: context,
+            approvalStore: applyEditsApprovalStore, cleanupRegistration: true, requireInactive: true
         )
-        session.mcpControlActivationGeneration &+= 1
-        let deactivationGeneration = session.mcpControlActivationGeneration
-        session.mcpControlCleanupTask?.cancel()
-        session.mcpControlCleanupTask = nil
-        session.mcpFollowUpRunPending = false
-        if context.forceAutoEditEnabled {
-            session.autoEditEnabled = context.autoEditEnabledBeforeOverride
-        }
-        session.mcpControlContext = nil
-        mcpControlledTabIDs.remove(session.tabID)
-        session.permissionProfile = .userConfigured
-        if session.tabID == currentTabID {
-            updateBindingsFromSession(session)
-            refreshAutoEditPermissionGuidanceForActiveSession()
-        }
-        if context.forceAutoEditEnabled {
-            await applyEditsApprovalStore.setAutoEditEnabled(
-                context.autoEditEnabledBeforeOverride,
-                for: applyEditsScope(for: session.tabID),
-                updateGlobalDefault: false
-            )
-        }
-        await AgentRunSessionStore.removeCancellationHandler(registration: context.registration)
-        await AgentRunSessionStore.cleanup(registration: context.registration)
-        return sessions[session.tabID] === session
-            && session.mcpControlActivationGeneration == deactivationGeneration
-            && session.mcpControlContext == nil
-            && !session.runState.isActive
     }
 
     @discardableResult

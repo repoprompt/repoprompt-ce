@@ -79,9 +79,23 @@ extension AgentSessionMCPRuntime {
                 "The requested agent session became active before MCP control activation."
             )
         }
-        let priorAutoEditEnabled = existingContext?.sessionID == sessionID
-            ? existingContext?.autoEditEnabledBeforeOverride ?? session.autoEditEnabled
-            : session.autoEditEnabled
+        // Even an already-enabled resource needs an exact owner. Its value may be the
+        // predecessor's override awaiting release, not the user's underlying preference.
+        let autoEditOverride = await resources.approvalStore.prepareAutoEditOverride(for: resources.approvalScope)
+        let priorAutoEditEnabled = autoEditOverride.restoreValue
+        do {
+            try requireActivationOwner()
+            guard cancellation.permitsPublication,
+                  session.mcpControlActivationGeneration == activationGeneration,
+                  session.mcpControlContext == existingContext
+            else {
+                throw MCPError.invalidParams("The MCP control activation was superseded before permission setup.")
+            }
+        } catch {
+            await resources.approvalStore.releaseAutoEditOverride(autoEditOverride)
+            await AgentRunSessionStore.cleanup(registration: registration)
+            throw error
+        }
         let activatedContext = AgentMCPControlContext(
             sessionID: sessionID,
             activationID: activationID,
@@ -97,7 +111,8 @@ extension AgentSessionMCPRuntime {
             suppressUserNotifications: true,
             forceAutoEditEnabled: true,
             autoEditEnabledBeforeOverride: priorAutoEditEnabled,
-            taskLabelKind: taskLabelKind
+            taskLabelKind: taskLabelKind,
+            autoEditOverride: autoEditOverride
         )
         let priorMCPOriginated = session.isMCPOriginated
         let priorPermissionProfile = session.permissionProfile
@@ -127,6 +142,7 @@ extension AgentSessionMCPRuntime {
                     return
                 }
                 // A removed or rebound original without a successor must not leak its registration.
+                await resources.approvalStore.releaseAutoEditOverride(autoEditOverride)
                 await AgentRunSessionStore.cleanup(registration: registration)
                 return
             }
@@ -140,11 +156,7 @@ extension AgentSessionMCPRuntime {
             let restoreAutoEdit = didOverrideAutoEdit && session.autoEditEnabled
             if restoreAutoEdit { session.autoEditEnabled = priorAutoEditEnabled }
             writer.scope.presentation.mcpControlChanged(session, controlled: false)
-            if restoreAutoEdit {
-                await resources.approvalStore.setAutoEditEnabled(
-                    priorAutoEditEnabled, for: resources.approvalScope, updateGlobalDefault: false
-                )
-            }
+            await resources.approvalStore.releaseAutoEditOverride(autoEditOverride)
             await AgentRunSessionStore.cleanup(registration: registration)
         }
         #if DEBUG
@@ -187,18 +199,15 @@ extension AgentSessionMCPRuntime {
                 "selectedModel": session.selectedModelRaw
             ])
         #endif
-        if priorAutoEditEnabled != true {
-            didOverrideAutoEdit = true
-            session.autoEditEnabled = true
-            await resources.approvalStore.setAutoEditEnabled(
-                true,
-                for: resources.approvalScope,
-                updateGlobalDefault: false
-            )
-            #if DEBUG
-                await test_afterMCPControlSetupAwait?(session)
-            #endif
+        didOverrideAutoEdit = true
+        session.autoEditEnabled = true
+        guard await resources.approvalStore.applyAutoEditOverride(autoEditOverride) else {
+            await releaseFailedInstalledActivation()
+            throw MCPError.invalidParams("The approval configuration changed during MCP control activation.")
         }
+        #if DEBUG
+            await test_afterMCPControlSetupAwait?(session)
+        #endif
         guard cancellation.permitsPublication,
               writer.scope.sessions[tabID] === session,
               session.currentRestorationBindingToken == activationBindingToken,

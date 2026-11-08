@@ -27,6 +27,7 @@ struct AgentMCPControlContext: Equatable {
     /// The task label kind for this MCP-controlled run (e.g. explore, engineer).
     /// Used to customize tool advertisement and system prompts for role-specific behavior.
     let taskLabelKind: AgentModelCatalog.TaskLabelKind?
+    var autoEditOverride: ApplyEditsApprovalStore.AutoEditOverride?
 
     func replacingRegistration(_ registration: AgentRunSessionStore.Registration) -> Self {
         Self(
@@ -41,7 +42,8 @@ struct AgentMCPControlContext: Equatable {
             suppressUserNotifications: suppressUserNotifications,
             forceAutoEditEnabled: forceAutoEditEnabled,
             autoEditEnabledBeforeOverride: autoEditEnabledBeforeOverride,
-            taskLabelKind: taskLabelKind
+            taskLabelKind: taskLabelKind,
+            autoEditOverride: autoEditOverride
         )
     }
 }
@@ -59,6 +61,7 @@ final class AgentSessionMCPRuntime {
         var test_afterMCPControlActivation: (@MainActor (AgentTabSession) async -> Void)?
         var test_afterMCPControlRegistration: (@MainActor (UUID) async -> Void)?
         var test_afterMCPControlSetupAwait: (@MainActor (AgentTabSession) async -> Void)?
+        var test_afterMCPControlDetached: (@MainActor (AgentTabSession) async -> Void)?
     #endif
 
     enum ControlActivationOwnership {
@@ -1393,6 +1396,50 @@ final class AgentSessionMCPRuntime {
         }
         delegatedAgentRunOracleReviewContextsByKey[key] = delegated
         return delegated
+    }
+
+    /// Detach this exact receipt synchronously. All suspension below names only resources
+    /// owned by that receipt, never the session-ID occupant found after an actor hop.
+    @discardableResult
+    func deactivateControlContext(
+        session: AgentTabSession, expectedContext: AgentMCPControlContext,
+        approvalStore: ApplyEditsApprovalStore, cleanupRegistration: Bool,
+        requireInactive: Bool = false
+    ) async -> Bool {
+        guard let scope, scope.sessions[session.tabID] === session,
+              session.mcpControlContext == expectedContext,
+              // Preserve the old scope-local control ambiguity veto until context identity
+              // routing replaces it. A copied context must not release the original's resources.
+              scope.sessions.values.count(where: { $0.mcpControlContext?.sessionID == expectedContext.sessionID }) == 1,
+              !requireInactive || !session.runState.isActive else { return false }
+        mcpRemoveAgentRunOracleReviewContexts(sessionID: expectedContext.sessionID)
+        codexCoordinator?.handleMCPControlReset(
+            for: session, reason: "Codex queued follow-up was cancelled because MCP control was deactivated."
+        )
+        session.mcpControlActivationGeneration &+= 1
+        let generation = session.mcpControlActivationGeneration
+        session.mcpControlCleanupTask?.cancel()
+        session.mcpControlCleanupTask = nil
+        session.mcpFollowUpRunPending = false
+        if expectedContext.forceAutoEditEnabled {
+            session.autoEditEnabled = expectedContext.autoEditEnabledBeforeOverride
+        }
+        session.mcpControlContext = nil
+        session.permissionProfile = .userConfigured
+        scope.presentation.mcpControlChanged(session, controlled: false)
+        scope.presentation.permissionsChanged(session)
+        #if DEBUG
+            await test_afterMCPControlDetached?(session)
+        #endif
+        if let receipt = expectedContext.autoEditOverride {
+            await approvalStore.releaseAutoEditOverride(receipt)
+        }
+        await AgentRunSessionStore.removeCancellationHandler(registration: expectedContext.registration)
+        if cleanupRegistration { await AgentRunSessionStore.cleanup(registration: expectedContext.registration) }
+        return scope.sessions[session.tabID] === session
+            && session.mcpControlActivationGeneration == generation
+            && session.mcpControlContext == nil
+            && !session.runState.isActive
     }
 
     func mcpRemoveAgentRunOracleReviewContexts(sessionID: UUID) {
