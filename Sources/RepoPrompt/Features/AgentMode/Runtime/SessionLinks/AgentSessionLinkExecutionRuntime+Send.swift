@@ -247,12 +247,28 @@ extension AgentSessionLinkExecutionRuntime {
         }
     }
 
+    /// The physical proof carries an incarnation, not just a binding token. Resolving it may
+    /// recover the originating writer during retirement, but may never adopt a replacement claim.
+    private func providerSwitchWriter(
+        for session: TabSession, proof: AgentProviderSwitchPhysicalDispatch
+    ) -> AgentSessionRuntimeStore.Writer? {
+        guard let scope, let sessionID = session.activeAgentSessionID,
+              case let .unique(writer) = scope.resolveWriter(
+                  sessionID: sessionID, expectedWorkspaceID: proof.admission.writerIdentity.workspaceID
+              ),
+              writer.scope === scope, writer.session === session,
+              writer.identity == proof.admission.writerIdentity, writer.isCurrent else { return nil }
+        return writer
+    }
+
     func providerSwitchAcquirePhysicalDispatch(session: TabSession, dispatchID: AgentSessionLinkPromptDispatchID) -> Bool {
         guard session.pendingHandoff.providerSwitchDelivery != nil else { return true }
         guard session.pendingHandoff.providerSwitchDelivery == .sending,
               session.pendingHandoff.isStagedForSend else { return false }
         let effectiveID = agentSessionLinkEffectiveDispatchID(for: session, dispatchID: dispatchID)
         guard let staged = session.pendingHandoff.providerSwitchDispatch,
+              let writer = providerSwitchWriter(for: session, proof: staged),
+              case .success = writer.admitCommand(),
               sessions[session.tabID] === session, staged.binding == session.currentRestorationBindingToken,
               staged.stopFence.permitsStart(of: session),
               let ownership = staged.runOwnership, let runID = session.runID,
@@ -286,7 +302,10 @@ extension AgentSessionLinkExecutionRuntime {
               session.pendingHandoff.isStagedForSend,
               let staged = session.pendingHandoff.providerSwitchDispatch,
               staged.dispatchID == context.dispatchID, staged.binding == session.currentRestorationBindingToken,
-              let workspaceID = commands.workspaceID(session) else { return }
+              let writer = providerSwitchWriter(for: session, proof: staged) else { return }
+        // Physical acceptance acknowledges an already-dispatched effect. Retirement blocks a new
+        // dispatch, not this originating acknowledgement or its final durable clear.
+        let workspaceID = writer.identity.workspaceID
         let sending = session.pendingHandoff
         let binding = session.currentRestorationBindingToken
         session.pendingHandoff.clearAfterSend()
@@ -298,17 +317,18 @@ extension AgentSessionLinkExecutionRuntime {
         )))
         session.isDirty = true
         let effectID = UUID()
-        let task = Task { @MainActor [self, session, owner] in
-            defer { pendingSendEffects.removeValue(forKey: effectID)
-                withExtendedLifetime(owner) {}
-            }
+        let task = Task { @MainActor [self, session, writer] in
+            defer { pendingSendEffects.removeValue(forKey: effectID) }
+            // Admission and the scheduled write are separate actor turns. Do not let a replaced
+            // claim persist this acknowledgement through the successor's tab slot.
+            guard writer.isCurrent else { return }
             // A returned frozen clear must survive later save-token drift. The ordinary fresh-save
             // owner carries it forward; only an unacknowledged write restores uncertainty.
             var saverReturned = false
             let result = await flushSaveRequired(for: session.tabID, workspaceID: workspaceID, observingSavePhase: {
                 if case .writeReturned = $0 { saverReturned = true }
             })
-            if case .failure = result, !saverReturned,
+            if case .failure = result, !saverReturned, writer.isCurrent,
                sessions[session.tabID] === session, session.currentRestorationBindingToken == binding,
                session.pendingHandoff == cleared
             {

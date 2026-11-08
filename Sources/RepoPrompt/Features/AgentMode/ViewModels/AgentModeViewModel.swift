@@ -3901,14 +3901,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     await links.drainPendingSendEffects(for: session)
                     return await publication.publishTerminalCommit(revision, successorKind: successorKind, for: session)
                 },
-                onSelfCompactTerminalSettled: { [weak self] session, revision, result, teardownSettled in
+                onSelfCompactTerminalSettled: { [weak self, links = linkExecutionRuntime] session, revision, result, teardownSettled in
                     self?.agentSelfCompactTerminalSettled(
                         session: session,
                         revision: revision,
                         publication: result,
                         teardownSettled: teardownSettled
                     )
-                    self?.providerSwitchRunSettled(session, revision: revision, publication: result)
+                    links.providerSwitchRunSettled(session, revision: revision, publication: result)
                     self?.providerSwitchGenerationSettled(session)
                     // Same post-publication seam: a session's own worktree switch applies only
                     // at its origin turn's settled terminal boundary.

@@ -5628,3 +5628,33 @@ file edges and **53/66** largest-cycle components. Four emitted touched-file war
 matched the baseline; none were new. The missing test-helper isolation, obsolete race hook and
 escaped test-fault runs are failed receipts, not qualification. A focused Oracle review was performed
 and its transient-proof cleanup finding addressed. No live-app or full-suite validation was run.
+
+### M9.2 partial milestone: originating-writer physical handover events
+
+Physical provider-switch acquisition now resolves the exact writer incarnation stored in its
+value proof and requires command admission at every release check. Binding a logical dispatch ID
+is not physical acceptance: Codex repeats the check after asynchronous Read proof, so retirement
+must still refuse that final release. A provider acceptance that already occurred instead uses
+the originating writer's drain currency and workspace. Its queued clear-save retains that writer,
+rechecks before selecting a save target, and cannot compensate a failed old write onto a reacquired
+claim. A retained in-memory acknowledgement remains dirty for the successor's own explicit save.
+
+Three obsolete VM physical-event forwarding methods are removed. Terminal handover-proof cleanup
+now captures the scope's link runtime directly rather than depending on a weak presentation callback.
+The terminal barrier and the link/notice/claim/wake owners are unchanged; inner runner admission,
+Steer, creation/hydration and the remaining MCP/admin routing are still M9.2 work.
+
+New causal cases retain identical binding tokens while reacquiring a claim before dispatch,
+acceptance, the scheduled save or a failing save. They verify exact save counts, unchanged state on
+refusal, retirement's late acceptance drain, and real persisted convergence through a successor's
+separate save. Review suggested relaxing repeated acquisition during retirement; inspection of
+Codex's pre/post-Read checks showed that would release new provider IO, so the guard is preserved
+and the scenario explicitly tested. The review found no blocking issue.
+
+Validation: `8ba00cb9-631e-466c-8e4d-72ed38c7ef3f` passed **400 focused tests**, including actual
+headless/ACP runner suites, handoff, Send, Stop, wake and native-Claude lifecycle coverage. Both
+products passed `84a63aba-8a26-4727-9147-15d72a346a94`; full lint passed
+`d5299cb4-9664-4e13-ae2d-84c8b9cd4f65`, followed by scoped pinned formatter/strict SwiftLint
+on the final test-only refinements. Fresh index passed **1241/1360** wrong-way file edges and
+**53/66** largest-cycle components. One emitted touched-file warning signature matched the baseline;
+none were new. No live-app or full-suite validation was run.
