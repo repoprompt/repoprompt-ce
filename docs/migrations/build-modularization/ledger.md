@@ -5658,3 +5658,38 @@ products passed `84a63aba-8a26-4727-9147-15d72a346a94`; full lint passed
 on the final test-only refinements. Fresh index passed **1241/1360** wrong-way file edges and
 **53/66** largest-cycle components. One emitted touched-file warning signature matched the baseline;
 none were new. No live-app or full-suite validation was run.
+
+### M9.2 partial milestone: replicated-creator accounting and production placement
+
+Creation accounting and spawn-stamping authorization no longer reject agreeing presentations
+when provenance proves one exact restored runtime writer. Preparation eligibility alone is still
+insufficient for a creator. Ancestry conflicts, scope capabilities, quota counting, reservations
+and the existing full-access policy remain unchanged. These are accounting/authorization proofs,
+not substitutes for the writer command required by the mutation host. The refusal guidance no
+longer tells users to close an otherwise valid duplicate presentation.
+
+The real-carrier regression distinguishes cold metadata, one writer, a refused second installation,
+and deliberately injected legacy competing claims. It verifies both presentation orders, one
+logical capacity count, scope stamping, in-flight quota exhaustion and reservation release. Existing
+census corruption fixtures now assert ordinary conflicting-writer refusal before raw injection,
+without dropping their conservative accounting or mutation-refusal assertions.
+
+The cold-replica placement journey now starts with the production MCP service, front door, structural
+handler registration, scope authorization and durable reparent transaction, rather than only calling
+the host. Preview creates no writer. A separate test inspection hold keeps the idle prepared adapter
+available for later witness checks; observed save-time hold counts prove the production transaction
+acquires its own hold through persistence and releases it afterward. Both UI indexes and prepared
+witnesses are checked before any subsequent lower-level mutation can overwrite the first result.
+The read-only replicas never acquire payload sessions. This is not completion of M9.2: execution,
+Steer, creation/hydration and the remaining MCP/admin adapters are still open.
+
+Validation: `e029a298-b667-46c1-ab03-9b4ab61f1229` passed **151 focused tests**. Both products
+passed `bd24097f-e05f-4344-abc3-8005fb74beed`; full lint passed
+`55ad14d2-98a0-4cf0-a634-fb010d8246cb`, followed by pinned formatter lint and strict SwiftLint
+on all five changed Swift files after the final test-only lifetime correction. Fresh index passed
+**1241/1360** wrong-way file edges and **53/66** largest-cycle components. Three emitted
+touched-file warning signatures matched the baseline; none were new. The earlier missing handler,
+spawn-stamp authorization and obsolete duplicate-install fixtures were failed receipts, not passes.
+Review prompted first-transaction projection assertions and a precise raw-writer refusal witness;
+the inspection hold avoids assuming that an idle prepared adapter survives an unrelated disk await.
+No live-app or full-suite validation was run.

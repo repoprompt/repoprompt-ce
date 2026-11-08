@@ -70,7 +70,9 @@ extension OverseerAuthorizationEngine {
             return projector.knownProvenance(for: sessionID).map {
                 $0.hasUniqueRuntimeOwner || $0.canPrepareRuntimeWriter
             } == true
-        case .adminWorktreeUnbind, .adminWorktreeRelease:
+        case .adminSpawn, .adminWorktreeUnbind, .adminWorktreeRelease:
+            // Spawn accounting/stamping uses the existing creator, not a cold target that
+            // can be prepared. Other scope and quota checks remain authoritative.
             return projector.knownProvenance(for: sessionID)?.hasUniqueRuntimeOwner == true
         default:
             return false

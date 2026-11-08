@@ -313,6 +313,9 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
 
     func testFirstPlacementAcrossColdReplicasUsesOnePreparedWriterAndProjectsEveryWitness() async throws {
         try await MCPSharedServerTestLease.shared.withLease { _ in
+            let originalFullAccess = OverseerGlobalAutoApprove.isEnabled
+            OverseerGlobalAutoApprove.isEnabled = { false }
+            defer { OverseerGlobalAutoApprove.isEnabled = originalFullAccess }
             let fixture = try await Fixture.make(isolated: true)
             let mirror = try await fixture.addReplica()
             let manager = WindowStatesManager.shared
@@ -320,13 +323,22 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
             let workspace = try fixture.workspace()
             let originalRegistry = AgentSessionCarrierResolver.preparedSessionRuntimes
             let originalFactory = manager.test_preparedOversightOwnerFactory
+            // Keep the prepared adapter available for post-transaction witness inspection.
+            // This hold creates no writer; the production transaction must acquire/release its own.
+            manager.beginPreparedOversightPreparation(target)
+            defer { manager.endPreparedOversightPreparation(target) }
             var preparations = 0
+            var observingProductionPlacement = false
+            var productionSaveHoldCounts: [Int] = []
             AgentSessionCarrierResolver.preparedSessionRuntimes = manager
             manager.test_preparedOversightOwnerFactory = { workspace, source in
                 preparations += 1
                 let owner = WindowState.makePreparedSessionOwner(workspace: workspace, borrowing: source)
                 owner.agentModeViewModel.test_setAgentSessionSaver { payload, workspace, count in
-                    try await AgentSessionDataService.shared.saveAgentSession(
+                    if observingProductionPlacement {
+                        productionSaveHoldCounts.append(manager.preparedOversightPreparationInFlight[target, default: 0])
+                    }
+                    return try await AgentSessionDataService.shared.saveAgentSession(
                         payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count
                     )
                 }
@@ -355,6 +367,48 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
                 guard case .unavailable(.absent) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: target) else {
                     throw SessionAdminHostError.invalid("The target must start cold")
                 }
+                fixture.frontDoor.registerStructureHandlers(scopes: fixture.scopes, worktreeOwnership: fixture.ownership)
+                let caller = try XCTUnwrap(fixture.callerTab.activeAgentSessionID)
+                let requested = try fixture.scopes.requestScope(
+                    requesterSessionID: caller, requesterTabID: fixture.callerTab.id,
+                    kind: .workspace(workspaceID: workspace.id), capabilities: [.observe, .restructure],
+                    guardrails: .init(), reason: nil, idempotencyKey: nil
+                ).get()
+                let granted = try fixture.scopes.approve(requestID: requested.id).get()
+                let fields: [String: Value] = [
+                    "scope_id": .string(granted.id.uuidString), "parent_session_id": .string(caller.uuidString)
+                ]
+                var previewFields = fields
+                previewFields["preview"] = .bool(true)
+                let preview = try await fixture.call("reparent", previewFields)
+                XCTAssertEqual(preview["result"], .string("preview"))
+                XCTAssertEqual(preparations, 0, "Preview must not elect or hydrate a writer")
+                // Exercise the real MCP caller resolution, authorization and scope transaction,
+                // not just the host's lower-level preparation/commit methods.
+                observingProductionPlacement = true
+                let reply = try await fixture.call("reparent", fields)
+                observingProductionPlacement = false
+                XCTAssertFalse(productionSaveHoldCounts.isEmpty)
+                XCTAssertTrue(productionSaveHoldCounts.allSatisfy { $0 == 2 }, "The production hold must cover the actual save")
+                XCTAssertEqual(reply["changed_count"], .int(1), "\(reply)")
+                let item = try XCTUnwrap(reply["items"]?.arrayValue?.first?.objectValue)
+                XCTAssertEqual(item["result"], .string("moved"))
+                XCTAssertNil(item["persist_failed"])
+                XCTAssertEqual(preparations, 1)
+                let firstReopen = try await AgentSessionDataService().loadAgentSession(id: target, for: workspace)
+                XCTAssertEqual(firstReopen?.organizationalParentID, caller)
+                for window in [fixture.window, mirror] {
+                    XCTAssertEqual(window.agentModeViewModel.ownerValidatedSessionIndex[target]?.organizationalParentID, caller)
+                    XCTAssertNil(window.agentModeViewModel.sessions[fixture.targetTab.id])
+                }
+                XCTAssertEqual(manager.preparedOversightLocations[target]?.isCurrent, true)
+                XCTAssertEqual(manager.preparedOversightOwnerLocations[target]?.entry.organizationalParentID, caller)
+                let preparedOwner = try XCTUnwrap(manager.preparedOversightWindows[target])
+                guard case let .unique(firstWriter) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: target) else {
+                    throw SessionAdminHostError.invalid("The production transaction must leave one exact writer")
+                }
+                XCTAssertTrue(firstWriter.session === preparedOwner.agentModeViewModel.sessions[fixture.targetTab.id])
+                XCTAssertEqual(manager.preparedOversightPreparationInFlight[target], 1, "Only the test's inspection hold may remain after the transaction")
                 let host = SessionAdminWindowsStructureHost()
                 let hold = try await host.prepareOrganizationalPlacement(sessionID: target, isStillAuthorized: { true })
                 defer { hold.release() }
