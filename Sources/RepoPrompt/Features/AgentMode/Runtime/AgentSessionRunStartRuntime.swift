@@ -15,7 +15,6 @@ final class AgentSessionRunStartRuntime {
         let availabilityFailure: (AgentProviderKind) -> String?
         let bindSession: (AgentTabSession) -> BindingAdmission?
         let commitCreation: (AgentSessionCreationHandle) async -> Bool
-        let prepareEpoch: (AgentTabSession, AgentRunStartStopFence) async -> Void
         let providerSwitchRefusal: (AgentTabSession) -> String
         let prepareProviderSwitch: (AgentProviderSwitchSendPreparation?, AgentTabSession, AgentRunStartStopFence) async -> (user: String, initial: String)?
         let augment: (String, AgentTabSession, [AgentFileAttachment], [AgentTaggedFileAttachment], Bool, Bool) async -> String
@@ -223,7 +222,7 @@ final class AgentSessionRunStartRuntime {
         guard periodicStartIsCurrent(), stopFence.permitsStart(of: session),
               isCurrent(), session.currentRestorationBindingToken == startBindingToken,
               session.operationAdmissionFailureMessage == nil else { return nil }
-        await environment.prepareEpoch(session, stopFence)
+        guard await owner.mcp.prepareWaitTrackingForRunStart(session: session, stopFence: stopFence) else { return nil }
         guard periodicStartIsCurrent(), stopFence.permitsStart(of: session),
               isCurrent(), session.currentRestorationBindingToken == startBindingToken,
               session.operationAdmissionFailureMessage == nil else { return nil }

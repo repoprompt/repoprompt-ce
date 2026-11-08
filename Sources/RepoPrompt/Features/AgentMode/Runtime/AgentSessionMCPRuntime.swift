@@ -3,6 +3,7 @@ import Foundation
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptMCPServer
+import RepoPromptShared
 
 struct AgentRunEpochTransitionIntent: Equatable {
     let token: UUID
@@ -49,6 +50,46 @@ struct AgentMCPControlContext: Equatable {
 /// attachment is not required to build snapshots, wake waiters or publish a committed turn.
 @MainActor
 final class AgentSessionMCPRuntime {
+    /// Boxed storage preserves the runtime-sized task-local contract (#1039).
+    nonisolated static let epochTransitionToken = BoxedTaskLocal<UUID?>(nil)
+
+    #if DEBUG
+        var test_afterEpochBegan: (@MainActor () async -> Void)?
+    #endif
+
+    /// The runtime supplies execution/cancellation; a presenter is never required to prepare
+    /// a controlled turn. Ordinary non-MCP starts do not construct provider resources.
+    @discardableResult
+    func prepareWaitTrackingForRunStart(session: AgentTabSession, stopFence: AgentRunStartStopFence) async -> Bool {
+        guard let context = session.mcpControlContext else { return true }
+        guard let scope, let sessionID = session.activeAgentSessionID,
+              case let .unique(writer) = scope.resolveWriter(sessionID: sessionID),
+              writer.scope === scope, writer.session === session,
+              case let .success(command) = writer.admitCommand(),
+              context.sessionID == sessionID, context.registration.sessionID == sessionID,
+              stopFence.permitsStart(of: session), !session.runState.isActive,
+              let execution = scope.execution else { return false }
+        if context.preparedEpoch != nil { return true }
+        #if DEBUG
+            let afterEpoch = test_afterEpochBegan
+        #else
+            let afterEpoch: (@MainActor () async -> Void)? = nil
+        #endif
+        await prepareRunEpoch(
+            session: session, stopFence: stopFence,
+            transitionToken: Self.epochTransitionToken.get(), store: AgentRunSessionStore.shared,
+            cancelInstalledRun: { exact in
+                await execution.cancelRun(tabID: exact.tabID, session: exact, intent: .runtimeShutdown, completion: .terminalTeardownCompleted)
+            },
+            afterEpochBegan: afterEpoch
+        )
+        // An accepted epoch may have been acknowledged for the originating object after
+        // Stop or retirement. That acknowledgement is not permission to dispatch a turn.
+        return command.isCurrent && stopFence.permitsStart(of: session)
+            && session.mcpControlContext?.activationID == context.activationID
+            && session.mcpControlContext?.preparedEpoch != nil
+    }
+
     /// The domain registration owns this capability before control is published. It retains
     /// the exact runtime scope, not its optional presenter, until domain cleanup/drain releases it.
     /// A cancellation delivered during setup prevents publication; one delivered afterwards
@@ -118,10 +159,14 @@ final class AgentSessionMCPRuntime {
         cancelInstalledRun: @escaping @MainActor (AgentTabSession) async -> Void,
         afterEpochBegan: (@MainActor () async -> Void)? = nil
     ) async {
-        guard let scope, !scope.isRetiring, !scope.hasReleasedWriterClaims, scope.sessions[session.tabID] === session else { return }
-        defer { withExtendedLifetime(scope) {} }
+        guard let scope, let sessionID = session.activeAgentSessionID,
+              case let .unique(writer) = scope.resolveWriter(sessionID: sessionID),
+              writer.scope === scope, writer.session === session,
+              case let .success(command) = writer.admitCommand() else { return }
+        defer { withExtendedLifetime(command) {} }
         guard stopFence.permitsStart(of: session), !session.runState.isActive,
-              let originalContext = session.mcpControlContext
+              let originalContext = session.mcpControlContext,
+              originalContext.sessionID == sessionID, originalContext.registration.sessionID == sessionID
         else { return }
         if originalContext.preparedEpoch != nil {
             return
@@ -162,7 +207,7 @@ final class AgentSessionMCPRuntime {
             recoveryCancellation = cancellation
             // Control activation already requires a persistent incarnation. An unbound or
             // retiring projection cannot recover a missing registration as a new writer.
-            guard stopFence.permitsStart(of: session),
+            guard command.isCurrent, stopFence.permitsStart(of: session),
                   session.mcpControlActivationGeneration == activationGeneration,
                   let context = session.mcpControlContext,
                   context.activationID == originalContext.activationID,
@@ -176,7 +221,7 @@ final class AgentSessionMCPRuntime {
             else {
                 return
             }
-            guard cancellation.permitsPublication, stopFence.permitsStart(of: session),
+            guard command.isCurrent, cancellation.permitsPublication, stopFence.permitsStart(of: session),
                   session.mcpControlActivationGeneration == activationGeneration,
                   let context = session.mcpControlContext,
                   context.activationID == originalContext.activationID,
@@ -195,9 +240,11 @@ final class AgentSessionMCPRuntime {
             )
         }
         await afterEpochBegan?()
-        // Preserve an already-admitted original epoch even if presentation/scope membership
-        // changed during the actor hop. Only new recovery control requires publication admission.
+        // Preserve an already-admitted epoch on a detached original object. A still-installed
+        // object must retain its writer incarnation: release/reacquisition is a successor even
+        // when the binding token was copied. Recovery additionally requires control admission.
         guard recoveryCancellation?.permitsPublication != false,
+              writer.isCurrent || scope.sessions[session.tabID] !== session,
               case let .accepted(epoch) = result,
               stopFence.binding == session.persistentSessionBindingIdentity,
               !session.bindingTransitionInProgress,
@@ -224,8 +271,7 @@ final class AgentSessionMCPRuntime {
         session.mcpControlContext = context
         // An accepted epoch belongs to this binding even if Stop won during the actor hop.
         // Retain it unconsumed for the next start; never leave the store ahead of its owner.
-        guard scope.sessions[session.tabID] === session, !scope.hasReleasedWriterClaims,
-              !scope.isRetiring, stopFence.permitsStart(of: session), !Task.isCancelled else { return }
+        guard command.isCurrent, stopFence.permitsStart(of: session), !Task.isCancelled else { return }
         session.mcpFollowUpRunPendingUpdatedAt = Date()
         if !session.mcpFollowUpRunPending {
             session.mcpFollowUpRunPending = true

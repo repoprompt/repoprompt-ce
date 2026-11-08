@@ -1509,6 +1509,13 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
     private func fixture(mcp: Bool = false, write: @escaping @Sendable (Data) throws -> Void = { _ in }) async throws -> Fixture {
         let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
         let session = harness.host.session(for: UUID())
+        let controlledSessionID = mcp ? UUID() : nil
+        if let controlledSessionID {
+            XCTAssertNil(harness.host.test_bindingRejection(sessionID: controlledSessionID, on: session))
+            session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: controlledSessionID, workspaceID: UUID()))
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            XCTAssertNotNil(try harness.host.runtimeCommand(sessionID: controlledSessionID))
+        }
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
         session.runState = .completed
@@ -1521,8 +1528,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         )
         await controller.test_installConfigurationTransport(write: write)
         session.claudeController = controller
-        if mcp {
-            let id = UUID()
+        if let id = controlledSessionID {
             let registration = await AgentRunSessionStore.register(sessionID: id)
             session.mcpControlContext = .init(
                 sessionID: id,
@@ -2086,6 +2092,13 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
             return creations > 1 ? replacement ?? controller : controller
         })
         let session = harness.host.session(for: UUID())
+        let controlledSessionID = mcp ? UUID() : nil
+        if let controlledSessionID {
+            XCTAssertNil(harness.host.test_bindingRejection(sessionID: controlledSessionID, on: session))
+            session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: controlledSessionID, workspaceID: UUID()))
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            XCTAssertNotNil(try harness.host.runtimeCommand(sessionID: controlledSessionID))
+        }
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
         session.runState = .completed
@@ -2095,8 +2108,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         let outcome = await harness.host.claudeCoordinator.ensureClaudeNativeSession(session: session, intent: .reconnect(runID: runID, providerSessionID: "monitor-native-session", currency: session.persistentBindingTransitionToken()))
         XCTAssertEqual(outcome, .ready)
         let installed = await harness.host.claudeCoordinator.test_installEventListener(for: session)
-        if mcp {
-            let id = UUID()
+        if let id = controlledSessionID {
             let registration = await AgentRunSessionStore.register(sessionID: id)
             session.mcpControlContext = .init(
                 sessionID: id, activationID: UUID(), registration: registration,
@@ -3105,7 +3117,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
 
     func testPreparedSuccessorIsConsumedWithoutAnotherEpochTransition() async throws {
         let f = try await fixture(mcp: true)
-        await f.harness.host.prepareMCPWaitTrackingForRunStart(session: f.session, stopFence: .init(session: f.session))
+        await f.harness.host.mcpRuntime.prepareWaitTrackingForRunStart(session: f.session, stopFence: .init(session: f.session))
         let prepared = try XCTUnwrap(f.session.mcpControlContext?.preparedEpoch)
         var preparations = 0
         f.harness.host.test_setAfterMCPStoreEpochBegan { preparations += 1 }

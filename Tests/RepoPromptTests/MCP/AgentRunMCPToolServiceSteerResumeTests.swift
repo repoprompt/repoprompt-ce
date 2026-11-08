@@ -1285,7 +1285,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         if startPending {
             _ = try XCTUnwrap(window.agentModeViewModel.stageMCPRunEpochTransition(sessionID: sessionID, kind: .steering))
         } else {
-            await window.agentModeViewModel.prepareMCPWaitTrackingForRunStart(
+            await window.agentModeViewModel.mcpRuntime.prepareWaitTrackingForRunStart(
                 session: session, stopFence: .init(session: session)
             )
             let preparedEpoch = try XCTUnwrap(session.mcpControlContext?.preparedEpoch)
@@ -1304,7 +1304,9 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         var tab = try XCTUnwrap(window.workspaceManager.composeTab(with: session.tabID))
         tab.activeAgentSessionID = sessionID
         window.workspaceManager.updateComposeTab(tab, markDirty: false)
-        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID))
+        try session.installPersistentSessionBinding(.init(
+            tabID: session.tabID, sessionID: sessionID, workspaceID: XCTUnwrap(window.workspaceManager.activeWorkspaceID)
+        ))
     }
 
     private func installCancelIndex(sessionID: UUID, tabID: UUID, parentSessionID: UUID, in viewModel: AgentModeViewModel) {
@@ -1674,6 +1676,37 @@ final class AgentRunStartBudgetTests: XCTestCase {
         }
     }
 
+    func testRuntimeEpochAcknowledgementDoesNotAuthorizeAStaleStart() async throws {
+        for change in ["stop", "retire", "reacquire"] {
+            let fixture = try await makeFixture()
+            let vm = fixture.window.agentModeViewModel
+            let session = fixture.session
+            let command = try XCTUnwrap(vm.runtimeCommand(sessionID: fixture.sessionID))
+            let registration = try XCTUnwrap(session.mcpControlContext?.registration)
+            let binding = session.currentRestorationBindingToken
+            vm.test_setAfterMCPStoreEpochBegan {
+                if change == "stop" {
+                    session.stopState.invalidateScheduledStarts()
+                } else if change == "retire" {
+                    command.writer.scope.beginRetirement()
+                } else {
+                    let sessions = command.writer.scope.sessions
+                    command.writer.scope.replaceSessions([:])
+                    command.writer.scope.replaceSessions(sessions)
+                }
+            }
+            let permitted = await vm.mcpRuntime.prepareWaitTrackingForRunStart(session: session, stopFence: .init(session: session))
+            XCTAssertFalse(permitted, change)
+            XCTAssertEqual(session.currentRestorationBindingToken, binding)
+            let durableEpoch = await AgentRunSessionStore.currentEpoch(for: registration)
+            XCTAssertNotNil(durableEpoch, "The durable actor accepted the originating epoch")
+            XCTAssertEqual(session.mcpControlContext?.preparedEpoch, change == "reacquire" ? nil : durableEpoch)
+            XCTAssertNil(session.activeRunOwnership)
+            vm.test_setAfterMCPStoreEpochBegan(nil)
+            await fixture.cleanup()
+        }
+    }
+
     func testPostActivationExpiryKeepsAgedPreEpochSessionPollableWaitableAndCancellable() async throws {
         let fixture = try await makeFixture()
         addTeardownBlock { @MainActor in await fixture.cleanup() }
@@ -1723,7 +1756,7 @@ final class AgentRunStartBudgetTests: XCTestCase {
         let oldContext = fixture.session.mcpControlContext
         let oldStamp = Date().addingTimeInterval(-60)
         fixture.session.mcpFollowUpRunPendingUpdatedAt = oldStamp
-        await vm.prepareMCPWaitTrackingForRunStart(session: fixture.session, stopFence: AgentRunStartStopFence(session: fixture.session))
+        await vm.mcpRuntime.prepareWaitTrackingForRunStart(session: fixture.session, stopFence: AgentRunStartStopFence(session: fixture.session))
         XCTAssertNotNil(fixture.session.mcpControlContext?.currentEpoch)
         XCTAssertNotEqual(fixture.session.mcpControlContext, oldContext)
         XCTAssertGreaterThan(try XCTUnwrap(fixture.session.mcpFollowUpRunPendingUpdatedAt), oldStamp)
@@ -1764,7 +1797,7 @@ final class AgentRunStartBudgetTests: XCTestCase {
                     target: target, message: "dispatch then suspend", metadata: .init(connectionID: nil, clientName: nil, windowID: nil),
                     agentModeVM: vm, agentRaw: nil, modelRaw: nil, reasoningEffortRaw: nil,
                     dispatchInstruction: { _, _, _, _, _ in
-                        await vm.prepareMCPWaitTrackingForRunStart(session: session, stopFence: AgentRunStartStopFence(session: session))
+                        await vm.mcpRuntime.prepareWaitTrackingForRunStart(session: session, stopFence: AgentRunStartStopFence(session: session))
                         XCTAssertNotNil(session.mcpControlContext?.preparedEpoch)
                         XCTAssertNotNil(session.mcpControlContext?.currentEpoch)
                         let prepared = AgentRunMCPToolService.startExpirySnapshot(sessionID: fixture.sessionID, agentModeVM: vm)

@@ -99,6 +99,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             let session = try XCTUnwrap(f).session
             let startup = try XCTUnwrap(f).scope.startup
             let links = try XCTUnwrap(f).runtime
+            try XCTUnwrap(f).scope.mcp.test_afterEpochBegan = { XCTFail("Changed preparation must not publish a new epoch") }
             weak let owner = try XCTUnwrap(f).scope
             var workspaceID = try XCTUnwrap(f).endpoint.workspaceID
             let gate = AutoWakeCatalogAuthorityGate()
@@ -119,7 +120,6 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 commitCreation: { _ in XCTFail("Changed preparation must not acknowledge creation")
                     return false
                 },
-                prepareEpoch: { _, _ in XCTFail("Changed preparation must not publish a new epoch") },
                 providerSwitchRefusal: { _ in "Provider switch pending" },
                 prepareProviderSwitch: { _, _, _ in XCTFail("Unexpected switch preparation")
                     return nil
@@ -178,7 +178,8 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         let gate = AutoWakeCatalogAuthorityGate()
         let outcome = AgentRunStartOutcomeRecorder()
         var preparations = 0
-        var epochs = 0
+        XCTAssertNil(session.mcpControlContext, "This ordinary start has no MCP epoch to prepare")
+        f.scope.mcp.test_afterEpochBegan = { XCTFail("An ordinary start must not create an MCP epoch") }
         let environment = AgentSessionRunStartRuntime.Environment(
             currentWorkspaceID: { f.endpoint.workspaceID },
             prepareSession: { _ in preparations += 1 },
@@ -187,7 +188,6 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             commitCreation: { _ in XCTFail("Already persisted identity must not claim new creation")
                 return false
             },
-            prepareEpoch: { _, _ in epochs += 1 },
             providerSwitchRefusal: { _ in "Provider switch pending" },
             prepareProviderSwitch: { _, _, _ in XCTFail("Unexpected switch preparation")
                 return nil
@@ -207,7 +207,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         }
         await gate.waitUntilEntered()
         XCTAssertEqual(preparations, 2)
-        XCTAssertEqual(epochs, 1)
+        XCTAssertNil(session.mcpControlContext, "Passing epoch preparation must not create control for an ordinary start")
         try session.installPersistentSessionBinding(.init(
             tabID: session.tabID, sessionID: XCTUnwrap(session.activeAgentSessionID), workspaceID: f.endpoint.workspaceID
         ))

@@ -388,6 +388,7 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
             let session = AgentTabSession(tabID: UUID())
             let id = UUID(), activationID = UUID()
             session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: id, workspaceID: UUID()))
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
             scope.replaceSessions([session.tabID: session])
             let original = await store.register(sessionID: id)
             await store.cleanup(registration: original)
@@ -465,6 +466,7 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
         let session = AgentTabSession(tabID: UUID())
         let id = UUID()
         session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: id, workspaceID: UUID()))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
         scope.replaceSessions([session.tabID: session])
         let original = await store.register(sessionID: id)
         await store.cleanup(registration: original)
@@ -496,6 +498,7 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
         let session = AgentTabSession(tabID: UUID())
         let id = UUID()
         session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: id, workspaceID: UUID()))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
         scope.replaceSessions([session.tabID: session])
         let original = await store.register(sessionID: id)
         session.mcpControlContext = .init(
@@ -516,6 +519,56 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
         XCTAssertFalse(session.mcpFollowUpRunPending, "Only the original epoch is reconciled, not a successor start")
         await store.cleanup(registration: original)
         _ = await store.shutdown()
+    }
+
+    func testEpochAdmissionAndAcknowledgementCannotCrossWriterIncarnations() async {
+        for refusal in ["unrestored", "retiring", "conflict", "reacquired"] {
+            let domain = makeCancellationStore()
+            let writers = AgentSessionRuntimeStore()
+            let scope = writers.makeScope()
+            let session = scope.makeSession(tabID: UUID())
+            let id = UUID(), workspaceID = UUID()
+            session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: id, workspaceID: workspaceID))
+            if refusal != "unrestored" { session.recordRestorationAuthoritative(.persistedPayloadApplied) }
+            scope.replaceSessions([session.tabID: session])
+            let registration = await domain.register(sessionID: id)
+            session.mcpControlContext = .init(
+                sessionID: id, activationID: UUID(), registration: registration,
+                currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
+                originatingConnectionID: nil, interactionTransport: .mcp(sessionID: id, originatingConnectionID: nil),
+                suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: nil
+            )
+            let competitor = writers.makeScope()
+            if refusal == "retiring" { scope.beginRetirement() }
+            if refusal == "conflict" {
+                let replica = competitor.makeSession(tabID: UUID())
+                // Deliberately model a legacy competing claim; normal binding admission refuses it.
+                replica.installPersistentSessionBinding(.init(tabID: replica.tabID, sessionID: id, workspaceID: workspaceID))
+                competitor.replaceSessions([replica.tabID: replica])
+            }
+            var admitted = 0
+            await scope.mcp.prepareRunEpoch(
+                session: session, stopFence: .init(session: session), transitionToken: nil, store: domain,
+                cancelInstalledRun: { _ in XCTFail("An existing registration must not be recovered") },
+                afterEpochBegan: {
+                    admitted += 1
+                    XCTAssertEqual(refusal, "reacquired")
+                    let binding = session.currentRestorationBindingToken
+                    scope.replaceSessions([:])
+                    scope.replaceSessions([session.tabID: session])
+                    XCTAssertEqual(session.currentRestorationBindingToken, binding, "Only the runtime claim changed")
+                }
+            )
+            XCTAssertEqual(admitted, refusal == "reacquired" ? 1 : 0, refusal)
+            let durableEpoch = await domain.currentEpoch(for: registration)
+            XCTAssertEqual(durableEpoch != nil, refusal == "reacquired", refusal)
+            XCTAssertNil(session.mcpControlContext?.preparedEpoch, "Never publish into a successor claim: \(refusal)")
+            XCTAssertNil(session.mcpControlContext?.currentEpoch)
+            XCTAssertFalse(session.mcpFollowUpRunPending)
+            withExtendedLifetime(competitor) {}
+            await domain.cleanup(registration: registration)
+            _ = await domain.shutdown()
+        }
     }
 
     func testRegistrationRetainsExactRuntimeCancellationUntilCleanupWithoutPresentation() async throws {

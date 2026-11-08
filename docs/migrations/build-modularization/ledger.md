@@ -5520,3 +5520,36 @@ Fresh index passed **1241/1360** wrong-way file edges and **53/66** largest-cycl
 Six emitted touched-file warning signatures matched the previous baseline; none were new.
 Earlier runs exposed the legacy unscoped fixtures and the local publication-order regression;
 those failures are not qualification receipts. No live-app or full-suite validation was run.
+
+### M9.2 partial milestone: runtime-owned MCP epoch preparation
+
+Run-start calls the scope's MCP runtime directly; `Environment.prepareEpoch` and the view-model
+preparation body are removed. The runtime owns the boxed transition-token carrier and composes
+cancellation from its already-installed execution service. Ordinary non-MCP starts do not create
+control or provider resources. Existing epoch-transition staging is still an open routing adapter.
+
+Epoch preparation admits the exact unique restored writer before calling the durable domain store.
+Missing-record recovery rechecks that same command around registration; conflicts, retirement and
+claim release/reacquisition cannot publish new control. A durable epoch accepted before Stop or
+retirement is still acknowledged on its originating object, but the runtime returns a separate start
+permission which run-start and Claude follow-up preparation must honor. Detached originating objects
+can reconcile their accepted epoch; a reinstalled object with an identical binding but a new writer
+incarnation cannot receive the old acknowledgement. The domain store remains the epoch authority.
+
+Coverage exercises rejected admission, same-binding claim reacquisition, recovered registration,
+Stop/retirement acknowledgements and the separate dispatch result. The native-Claude controlled-turn
+fixture now installs a workspace-qualified restored writer before creating MCP control; the public
+cancellation rebind fixture likewise preserves workspace identity while changing its session binding.
+Their original cancellation, adoption and lifecycle assertions remain intact. Other run-start, input,
+control-activation and command-routing adapters remain M9.2 work.
+
+Validation: `c9b1dbf7-67ee-48a1-bc62-392164e6f73b` passed **215 focused tests**, and
+`5ea27f48-3053-45b4-9a61-b7d2e7dcee96` passed **21 execution-runtime tests**, including the
+changed custom run-start environments. Both products passed
+`2902a377-fcf3-4b33-ad01-a2fbea63ed5a`; full lint passed
+`554a0ca3-3e26-47fe-97fa-66328fbc966f`, followed by scoped pinned formatter and strict SwiftLint
+checks on all seven final Swift files. Fresh index passed **1241/1360** wrong-way file edges and
+**53/66** largest-cycle components. Six emitted touched-file warning signatures matched the existing
+baseline; none were new. Earlier iterations exposed unbound test control fixtures; a periodic ACP
+response-gate timeout did not recur in either subsequent run, with its assertions and timeout unchanged.
+Those failed/cancelled runs are not qualification receipts. No live-app or full-suite validation was run.

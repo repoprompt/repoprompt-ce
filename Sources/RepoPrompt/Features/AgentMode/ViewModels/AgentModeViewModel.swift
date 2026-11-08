@@ -22,12 +22,6 @@ import SwiftUI
 /// View model for Agent mode - manages per-tab agent chat sessions with long-running agent interactions
 @MainActor
 final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownParticipant {
-    // Boxed: runtime-sized payloads must not use `@TaskLocal` directly (#1039).
-    private nonisolated static let mcpRunEpochTransitionTokenTaskLocal = BoxedTaskLocal<UUID?>(nil)
-    private nonisolated static var mcpRunEpochTransitionToken: UUID? {
-        mcpRunEpochTransitionTokenTaskLocal.get()
-    }
-
     nonisolated static func steeringDebugLog(_ message: @autoclosure () -> String) {
         #if DEBUG
             guard UserDefaults.standard.bool(forKey: "enableSteeringDebugLogging") else { return }
@@ -1151,7 +1145,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         /// Counts rows whose normalized search fields were actually materialized.
         /// Stays at zero while the sidebar search box is empty.
         var test_sidebarSearchFieldsMaterializationCount = 0
-        private var test_afterMCPStoreEpochBegan: (@MainActor () async -> Void)?
         private var test_afterDurableChildTabCreation: (@MainActor () async -> Void)?
         /// Runs on the `@MainActor` inside `agentSessionLinkTranscriptPage(...)`, after the page has
         /// been materialized off the actor and before the release gate re-proves the endpoint.
@@ -1453,7 +1446,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         func test_setAfterMCPStoreEpochBegan(_ hook: (@MainActor () async -> Void)?) {
-            test_afterMCPStoreEpochBegan = hook
+            mcpRuntime.test_afterEpochBegan = hook
         }
 
         func test_setAfterDurableChildTabCreation(_ hook: (@MainActor () async -> Void)?) {
@@ -2831,8 +2824,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if original.preparedEpoch == nil {
             do {
                 try await withMCPRunEpochTransition(sessionID: original.sessionID, kind: .relatedFollowUp) {
-                    await self.prepareMCPWaitTrackingForRunStart(session: session, stopFence: fence)
-                    guard session.mcpControlContext?.preparedEpoch != nil else { throw CancellationError() }
+                    guard await self.mcpRuntime.prepareWaitTrackingForRunStart(session: session, stopFence: fence) else { throw CancellationError() }
                 }
             } catch { return false }
         }
@@ -8035,38 +8027,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             throw MCPError.invalidParams("The requested agent run is no longer active.")
         }
         do {
-            return try await Self.mcpRunEpochTransitionTokenTaskLocal.withValue(token) {
+            return try await AgentSessionMCPRuntime.epochTransitionToken.withValue(token) {
                 try await operation()
             }
         } catch {
             clearStagedMCPRunEpochTransition(sessionID: sessionID, token: token)
             throw error
         }
-    }
-
-    func prepareMCPWaitTrackingForRunStart(
-        session: TabSession,
-        stopFence: AgentRunStartStopFence
-    ) async {
-        // Ordinary non-MCP starts must not eagerly compose providers. A live control
-        // activation has already installed its run service and cancellation capability.
-        guard stopFence.permitsStart(of: session), !session.runState.isActive,
-              let context = session.mcpControlContext, context.preparedEpoch == nil else { return }
-        let service = runService
-        #if DEBUG
-            let afterEpoch = test_afterMCPStoreEpochBegan
-        #else
-            let afterEpoch: (@MainActor () async -> Void)? = nil
-        #endif
-        await mcpRuntime.prepareRunEpoch(
-            session: session, stopFence: stopFence,
-            transitionToken: Self.mcpRunEpochTransitionToken,
-            store: AgentRunSessionStore.shared,
-            cancelInstalledRun: { exact in
-                await service.cancelRun(tabID: exact.tabID, session: exact, intent: .runtimeShutdown, completion: .terminalTeardownCompleted)
-            },
-            afterEpochBegan: afterEpoch
-        )
     }
 
     func mcpSnapshot(sessionID: UUID) -> AgentRunMCPSnapshot? {
@@ -18529,7 +18496,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 return .init(sessionID: id, creation: creation)
             },
             commitCreation: { await self.commitConfiguredSessionCreation(handle: $0) },
-            prepareEpoch: { await self.prepareMCPWaitTrackingForRunStart(session: $0, stopFence: $1) },
             providerSwitchRefusal: { Self.providerSwitchStartRefusal($0).message },
             prepareProviderSwitch: { await self.prepareProviderSwitchHandoverForSend($0, session: $1, stopFence: $2) },
             augment: { text, session, attachments, tagged, ignoresHandoff, skipsSlash in
