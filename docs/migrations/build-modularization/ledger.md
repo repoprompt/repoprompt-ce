@@ -5938,3 +5938,120 @@ CI logs. Neither a relaxed assertion nor a larger timing budget is included.
   **53/66** largest-cycle components. No new compiler warnings in the four touched Swift files.
   One bounded independent review completed; its save/quiet-gate ordering recommendation was applied.
   Hosted full-suite status and live smoke remain overseer-owned; no visible app lifecycle action ran.
+
+### M9.2a cap and M9.2b handoff (PR #1659)
+
+The overseer explicitly split M9.2 at this checkpoint. **PR #1659 is M9.2a**, the canonical
+writer contract and first routing cutover; it does **not** complete the original M9.2 brief.
+A fresh session will take **M9.2b**, stacked on this branch. No new routing item was started
+after the cap decision. The control-context incarnation item was already committed as
+`f0ee70bc37e463359213685a48c3ccc9a0f6c3ee`; the remainder below is deliberately outstanding,
+not silently reassigned to M9.3 or M9.4.
+
+**Delivered in M9.2a.** The existing runtime store and live-claim index distinguish absent,
+unscoped/transitioning, unique and conflicting writers; capabilities carry exact session,
+workspace, scope and incarnation. Agreeing UI replicas neither elect a writer nor prevent
+preparing the first valid writer. Normal conflicting installation is refused, while explicit
+legacy-corruption fixtures prove fail-closed routing. Command admission is distinct from an
+originating writer's final persistence, cancellation, acknowledgement and terminal settlement.
+The existing authorization engine and four disjoint link owners remain authoritative.
+
+Actual runtime-owned cutovers include placement and its durable receipt, link Send/Stop,
+model/effort and Compact, composer claims, terminal transcript materialization, input construction,
+provider-switch preparation/physical receipts, MCP epoch/registration/control installation and
+conditional permission rollback/detach, control-context identity and metadata mutation, and
+Claude provider-turn adoption. Corresponding VM transaction bodies and command callbacks were
+removed where those replacements activated. The remaining compatibility entrypoints and inner
+provider/host boundaries below are **not** claimed as retired. Earlier milestone sections record
+individual causal tests, review corrections and failed iterations.
+
+**Main reconciliation.** M9.1 tip `2a4d8237bd0216483c594c9af4e7c929e9e16af5` was merged normally
+as `b6f66cbcf38e7a62b25d79933d5110137506e9bc`; only appended ledger sections conflicted, and
+both were retained. Before the explicitly authorized ancestry-only merge, `git diff 2a4d8237b
+origin/main` was verified empty against squash `48b0d82ad5ba56076ceff70e25abc087b00f4bd7`.
+Commit `85ec0bf7675f4bade29218a5fcec20074740909f` then used `-s ours` solely to record that
+already-integrated main ancestry. Its first-parent tree diff is empty. `git merge-tree
+--write-tree HEAD origin/main` is clean, and the triple-dot diff contains M9.2 changes rather
+than replaying M9.1. No rebase, force-push or history rewrite was used.
+
+#### Remaining for M9.2b — files, adapters and ownership boundaries
+
+Paths under **AM** below mean `Sources/RepoPrompt/Features/AgentMode/`. **M** = roughly 3–5
+files; **L** = 6+ files or a broad caller/fixture migration. These are surface estimates, not
+elapsed-time estimates. The original adapter inventory above remains the completion checklist;
+this table supersedes earlier entries that still listed now-delivered control identity/install
+or creator-replica/first-placement work as open.
+
+| Remaining group | Size | Starting files and actual adapters to retire |
+| --- | --- | --- |
+| Binding, creation and hydration | L | `AM/ViewModels/AgentModeViewModel.swift`: `prepareSessionForRunStart`, `performPersistedSessionLoad`, binding/creation and first-save callbacks; `AM/Runtime/AgentSessionRunStartRuntime.swift` environment preparation/bind/commit inputs; restoration/persistence runtimes. Preserve first-bind synchronous writer capture before save, and distinguish normal hydration from an intentional binding retry. |
+| Startup, continuation and inner provider execution | L | VM `makeRunStartEnvironment`/`makeFollowUpLaunch`; `AM/Services/AgentModeRunComposition.swift`; `AM/Runtime/AgentModeRunService.swift`, `AgentRunResourcePreparation.swift`, and Codex/Claude/ACP/headless runners/coordinators. Outer startup fences are implemented; inner factory, lease, installation and physical-release awaits still need the same capability. Separate new-command admission from originating terminal cleanup. |
+| Link Steer, local/provider input and self-compaction | L | `AM/Runtime/SessionLinks/AgentModeViewModel+SessionLinkSteer.swift`; VM `submitNoncomposerSteer`/`submitPreparedUserTurn`; `AgentSessionLinkExecutionRuntime.Commands` start/self-compact inputs and remaining link storage forwarders; provider input release/self-compaction callers. Send/Stop/Model/Compact and shared composer claims are already runtime-owned. Move actual bodies, not callback-shaped wrappers. |
+| MCP metadata/tool routing and copied-resource protection | L | `AM/Runtime/AgentSessionMCPRuntime.swift`, `AgentSessionMCPRuntime+ControlActivation.swift`, `AgentSessionRuntimeStore.swift`; VM control compatibility callers, host activation preparation and reactivation/discard wrappers; `Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentRunMCPToolService.swift` and `Infrastructure/MCP/AppShared/MCPRunRouteBindings.swift`. Context identity and actual registration/install/detach/epoch bodies are done. Remaining work includes cross-scope copied-registration/approval receipt protection and replacing VM/window target selection. |
+| Administration and worktree commands | L | `Sources/RepoPrompt/App/SessionAdminWindowsHosts.swift`; `AM/Runtime/Delegation/AgentModeViewModel+DelegationLifecycle.swift`; `AM/ViewModels/AgentModeViewModel+WorktreeMerge.swift`, `AgentModeViewModel+SelfWorktreeRelocation.swift`; `AM/Services/SessionAdminWorktreeHandler.swift`. Retire `owningViewModel` mutation selection, fork and worktree transition/merge bodies while retaining scope leases/authorization. Placement, model/effort, creator accounting and production cold-replica first reparent are already covered. |
+| Interaction and provider approval commands | M | `AM/Runtime/AgentSessionInteractionRuntime*.swift`, VM interaction forwarding, provider/approval composition. Runtime interaction storage exists; remaining mutation callbacks and command routing must consume the writer while consent UI remains optional presentation. |
+| Provider event/tool-hook and terminal follow-up routing | L | VM service/coordinator composition and terminal self-compaction/provider-switch-generation/worktree-relocation hooks; provider coordinators/runners and Claude tool-hook installation. Claude provider-turn adoption, physical handover receipts and terminal transcript materialization are already cut over; do not confuse them with the remaining event paths. Never join Stop-effect drain from terminal publication. |
+| Persistence and payload-forwarding retirement | M–L | VM save/token/`flushSaveRequired`, session proxy and mutable `_modify` aliases; runtime persistence, provider-input/resume-handoff, draft, usage, timing and transcript forwarding; remaining session-link VM extensions. Search actual call sites before deleting aliases, and preserve originating receipt semantics after retirement/loss rather than compensating against a successor. |
+
+**Suggested first investigation, not an implemented fix:** cross-scope copies can still name the
+same approval/domain registration receipt. Scope-local ambiguity veto and stale-context teardown
+are implemented; cross-scope protection is not. Identify the structural installation holder from
+the existing scope/tab/incarnation index, independently of global writer uniqueness: a raw
+conflict makes every `ownsPersistentClaim` false, so that predicate cannot elect a cleanup owner.
+A copied context must not release another holder's resources, while an abandoned exact provisional
+receipt must still unwind after claim loss. Add no parallel registration/lifecycle manager or
+strong writer stored in the context. Preserve the existing detached-target disposal ordering.
+
+**Fixture cautions for the next session:** `Scope.makeSession` only constructs; `replaceSessions`
+admits it. `Tests/RepoPromptTests/Helpers/AgentSessionLinkRunnerTestSupport.swift` contains real
+identity lookup, not a fabricated capability. Some lower-level runner fixtures use standalone
+unbound objects or a custom execution service not installed in the scope; migrate high-level
+command fixtures explicitly instead of adding an optional/default-true production bypass.
+Normal readiness/hydration/dirty changes do not mint new live-claim incarnations. Do not weaken
+index minting to make an old context reusable. Keep the mutable host-workspace resource fence:
+a current writer does not pin a window's mutable context or launch path.
+
+**M9.2b done criteria:** exact session/workspace/incarnation and appropriate command/event/durable
+acknowledgement at each remaining boundary; distinct zero/one/conflicting outcomes and valid
+agreeing-replica first mutation; all MCP/admin/scope/link mutation entries writer-routed with
+unchanged authorization; caller/body searches proving every M9.2-assigned adapter actually retired;
+causal race/real-persistence coverage, both products, full lint, fresh index and zero new warnings.
+Only explicitly documented resource/presentation adapters may remain. M9.3 owns window-free saved
+target composition and prepared-window retirement. M9.4 owns close-preserves-run, handoff/drain and
+presentation lifetime. Today's close-cancels-run stays unchanged; M10 target relocation is separate.
+
+**Cap validation fixture audit.** The merged-tree integration run passed 597 cases with two
+existing opt-in diagnostic skips. A broader run selecting every class in the PR's changed test
+files passed 1,568 cases, skipped those two diagnostics, and exposed one stale fixture in
+`SessionAdminOrganizingOperationTests.testOverThresholdRaisesOneCardAndApprovalAppliesOnlyTickedItems`
+(in `SessionAdminScopeLifecycleTests.swift`): it expected normal admission to install a second live writer. The overseer explicitly authorized
+this test-only repair pattern and a repository-wide scan for siblings. All 153 occurrences of
+the normal test binding entrypoint were inspected; the same pattern was also found in
+`AgentContextExportRenderSnapshotTests.testSameTurnBindingConflictIsVisibleToNextAuthoritativeResolution`
+and `SessionAdminWorktreeRecoveryTests.testCompetingBoundWritersCannotMutateConfigurationOrCreateWorktree`.
+Each now asserts typed `.conflictingWriter`, refused installation and unchanged nil binding before
+using the existing raw-corruption hook. All approval, card-count, no-effect, conflict-cache,
+configuration and worktree assertions remain. No production or formatter-policy change was made;
+pinned scoped formatting changed zero files. The failed broad run is not a qualification receipt.
+
+**Final M9.2a qualification on the integrated tree:**
+
+- `f5c0dd45-0c48-4e95-b13b-0f3a13feaf9c` passed **1,610 tests**, with **2 existing opt-in
+  diagnostic skips** and **0 failures**. It selects every test class in the changed test files,
+  the incoming Oracle/transcript regressions, and both additionally repaired fixture suites.
+- Both products passed `e3d159fd-f4e3-4a30-a37d-94df0f5654e4`.
+- Full `make dev-lint` through Conductor passed `fb9de748-b725-4652-9cbd-89a6b8dd94a5`.
+- Fresh index check passed **1242/1360** wrong-way file edges and **53/66** largest-cycle
+  components; no ratchet baseline was raised.
+- The final and earlier actual compile logs were audited for the PR's touched Swift files plus
+  incoming integration files. **22 emitted warning signatures matched the baseline; zero were
+  new.** Cached product success was not treated as evidence that earlier warnings did not exist.
+- The earlier merged-tree integration check passed **597 tests + 2 skips** under
+  `0b90d918-78fe-4df2-8cbd-e1e115289911`; products
+  `946a89c9-de11-4da2-8e99-d90713ab8aee` and full lint
+  `ed9707d6-cb97-474c-9fc4-611cdceac384` also passed. The broader final receipt above supersedes
+  the failed 1,568-pass fixture-discovery run, not merely a retry with unchanged source.
+
+No local full-suite, live-app, release or hosted-CI success is claimed. No CI logs were read.
+After the validated M9.2a push and PR update, this lane stops feature work; only CI failures
+reported by the overseer are assigned to it. M9.2b belongs to the fresh follow-on session.

@@ -6060,7 +6060,11 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         // A genuinely loaded duplicate is still ambiguous, even when its session ID matches.
         let duplicate = AgentModeViewModel.TabSession(tabID: fixture.tab)
         second.agentModeViewModel.test_installLiveSession(duplicate)
-        _ = try XCTUnwrap(second.agentModeViewModel.test_installPersistentSessionBinding(sessionID: fixture.overseer, on: duplicate))
+        XCTAssertEqual(second.agentModeViewModel.test_bindingRejection(sessionID: fixture.overseer, on: duplicate), .conflictingWriter)
+        XCTAssertNil(second.agentModeViewModel.test_installPersistentSessionBinding(sessionID: fixture.overseer, on: duplicate))
+        XCTAssertNil(duplicate.persistentSessionBindingIdentity)
+        // Exercise legacy corruption only after proving ordinary writer admission refuses it.
+        duplicate.testInstallPersistentSessionBinding(sessionID: fixture.overseer)
         XCTAssertNil(AgentSessionAdministrationFrontDoor.liveExplicitBinding(forTab: fixture.tab))
         await fixture.approveAndApply(cardID)
         XCTAssertEqual(cardState(), .pending)

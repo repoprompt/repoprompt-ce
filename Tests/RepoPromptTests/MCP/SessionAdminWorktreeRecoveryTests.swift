@@ -211,9 +211,13 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
                 peer.parentSessionID = fixture.session.parentSessionID
                 peer.createdByOverseerSessionID = fixture.session.createdByOverseerSessionID
                 peer.hasLoadedPersistedState = peerReady
-                _ = try XCTUnwrap(fixture.replica.agentModeViewModel.test_installPersistentSessionBinding(
+                XCTAssertEqual(fixture.replica.agentModeViewModel.test_bindingRejection(sessionID: fixture.sessionID, on: peer), .conflictingWriter)
+                XCTAssertNil(fixture.replica.agentModeViewModel.test_installPersistentSessionBinding(
                     sessionID: fixture.sessionID, on: peer
                 ))
+                XCTAssertNil(peer.persistentSessionBindingIdentity)
+                // This refusal scenario requires legacy corruption, not an admitted second writer.
+                peer.testInstallPersistentSessionBinding(sessionID: fixture.sessionID)
                 if peerReady { peer.recordRestorationAuthoritative(.persistedPayloadApplied) }
                 XCTAssertEqual(peer.permitsBoundOperationAndSave, peerReady)
                 XCTAssertTrue(try fixture.replica.agentModeViewModel.authoritativeLiveSession(for: fixture.sessionID) === peer)
