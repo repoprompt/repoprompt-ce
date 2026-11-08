@@ -140,6 +140,61 @@ final class AgentSessionRuntimeStoreTests: XCTestCase {
         XCTAssertFalse(writer.isCurrent)
     }
 
+    func testCommandCapabilityRejectsConflictsAndSameIdentityRebind() throws {
+        let store = AgentSessionRuntimeStore()
+        let scope = store.makeScope(), competing = store.makeScope()
+        let workspaceID = UUID()
+        let claim = AgentSessionCreationClaim(workspaceID: workspaceID)
+        let session = scope.makeSession(tabID: UUID())
+        let binding = AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: claim.sessionID, workspaceID: workspaceID)
+        session.installPersistentSessionBinding(binding)
+        let creation = try XCTUnwrap(session.acceptFreshCreation(claim, workspaceID: workspaceID))
+        scope.replaceSessions([session.tabID: session])
+        guard case let .unique(writer) = store.resolveWriter(workspaceID: workspaceID, sessionID: claim.sessionID) else {
+            return XCTFail("Exact runtime must admit first configuration without presentation")
+        }
+        let command = try writer.admitCommand(.creation(creation)).get()
+        XCTAssertTrue(command.isCurrent)
+        XCTAssertEqual(command.identity.restoration, session.currentRestorationBindingToken)
+        let deletion = try AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: claim.sessionID)
+        XCTAssertFalse(command.isCurrent)
+        XCTAssertEqual(writer.query()?.commandRejection, .deleted)
+        AgentSessionDeletionRegistry.shared.didFailDurableDeletion(deletion)
+        XCTAssertTrue(command.isCurrent)
+        let replica = AgentTabSession(tabID: session.tabID)
+        replica.installPersistentSessionBinding(binding)
+        XCTAssertTrue(command.isCurrent, "An unregistered UI replica is not another writer")
+        competing.replaceSessions([replica.tabID: replica])
+        XCTAssertFalse(command.isCurrent, "An actual competing runtime claim fails closed")
+        XCTAssertNil(writer.query())
+        competing.replaceSessions([:])
+        XCTAssertTrue(command.isCurrent)
+        _ = session.beginPersistentBindingTransition()
+        session.installPersistentSessionBinding(binding)
+        XCTAssertFalse(command.isCurrent, "Even an identical binding has a new restoration incarnation")
+        XCTAssertNil(writer.query())
+        guard case let .unique(rebound) = store.resolveWriter(workspaceID: workspaceID, sessionID: claim.sessionID) else {
+            return XCTFail("Expected rebound writer")
+        }
+        scope.replaceSessions([replica.tabID: replica])
+        guard case let .unique(replaced) = store.resolveWriter(workspaceID: workspaceID, sessionID: claim.sessionID) else {
+            return XCTFail("Expected replacement writer")
+        }
+        XCTAssertNotEqual(replaced.identity, rebound.identity, "A replacement cannot inherit its predecessor's acknowledgement")
+        XCTAssertEqual(replaced.restoration, writer.restoration)
+        XCTAssertNotEqual(replaced.identity, writer.identity, "Copied binding tokens do not make two objects the same incarnation")
+        XCTAssertFalse(rebound.isCurrent)
+        scope.replaceSessions([replica.tabID: replica])
+        XCTAssertTrue(replaced.isCurrent, "Republishing the same object preserves its claim")
+        scope.replaceSessions([:])
+        scope.replaceSessions([replica.tabID: replica])
+        XCTAssertFalse(replaced.isCurrent, "Reacquiring a released claim cannot revive an old acknowledgement")
+        guard case let .unique(reacquired) = store.resolveWriter(workspaceID: workspaceID, sessionID: claim.sessionID) else {
+            return XCTFail("Expected a newly admitted claim")
+        }
+        XCTAssertNotEqual(reacquired.identity.incarnationID, replaced.identity.incarnationID)
+    }
+
     func testSameObjectInTwoScopesRemainsConflictingAcrossRebind() {
         let store = AgentSessionRuntimeStore()
         let first = store.makeScope(), second = store.makeScope()
@@ -169,6 +224,13 @@ final class AgentSessionRuntimeStoreTests: XCTestCase {
             return XCTFail("Expected exact originating writer")
         }
         let replacement = AgentTabSession(tabID: session.tabID)
+        XCTAssertFalse(successor.permitsBinding(sessionID, on: replacement), "A cold replica cannot create a second writer")
+        XCTAssertFalse(scope.permitsBinding(sessionID, on: replacement), "Another object in the same scope is not the writer")
+        XCTAssertTrue(scope.permitsBinding(sessionID, on: session))
+        guard case let .unique(sessionOnlyWriter) = store.resolveWriter(sessionID: sessionID) else {
+            return XCTFail("Session-only lookup must use the runtime's workspace, not UI metadata")
+        }
+        XCTAssertEqual(sessionOnlyWriter.identity, writer.identity)
         scope.beginRetirement()
         XCTAssertTrue(store.hasRetiringWriter(sessionID: sessionID))
         XCTAssertFalse(successor.permitsBinding(sessionID, on: replacement))

@@ -20,6 +20,49 @@ final class AgentSessionRuntimeStore {
         case conflicting
     }
 
+    /// Value identity carried by commands, queries and acknowledgements. The scope identifies
+    /// the owner; the claim incarnation also fences object replacement and claim reacquisition.
+    struct WriterIdentity: Equatable {
+        let scopeID: UUID
+        let incarnationID: UUID
+        let workspaceID: UUID
+        let restoration: AgentSessionRestorationBindingToken
+
+        var sessionID: UUID {
+            restoration.bindingIdentity.sessionID
+        }
+    }
+
+    struct Query {
+        let identity: WriterIdentity
+        let runState: AgentSessionRunState
+        let commandRejection: CommandRejection?
+    }
+
+    enum CommandRequirement {
+        case restored
+        case creation(AgentSessionCreationHandle)
+    }
+
+    enum CommandRejection: Error, Equatable {
+        case staleWriter, retiring, deleted, restorationUnavailable
+    }
+
+    /// Admission is not authorization. Callers retain their existing consent, operation and
+    /// cancellation fences and must revalidate this capability after every suspension.
+    @MainActor
+    struct Command {
+        let writer: Writer
+        let requirement: CommandRequirement
+        var identity: WriterIdentity {
+            writer.identity
+        }
+
+        var isCurrent: Bool {
+            writer.commandRejection(requirement) == nil
+        }
+    }
+
     /// Exact-object capability. Holding one keeps its scope alive across suspension; it does
     /// not grant consent, bypass restoration, or survive replacement/rebinding in the store.
     @MainActor
@@ -28,13 +71,39 @@ final class AgentSessionRuntimeStore {
         let session: AgentTabSession
         let binding: AgentPersistentSessionBindingIdentity
         let restoration: AgentSessionRestorationBindingToken
+        let identity: WriterIdentity
+
+        func query() -> Query? {
+            guard isCurrent else { return nil }
+            return Query(identity: identity, runState: session.runState, commandRejection: commandRejection(.restored))
+        }
+
+        func admitCommand(_ requirement: CommandRequirement = .restored) -> Result<Command, CommandRejection> {
+            if let rejection = commandRejection(requirement) { return .failure(rejection) }
+            return .success(Command(writer: self, requirement: requirement))
+        }
+
+        fileprivate func commandRejection(_ requirement: CommandRequirement) -> CommandRejection? {
+            guard isCurrent else { return .staleWriter }
+            guard !scope.isRetiring else { return .retiring }
+            guard !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: binding.sessionID),
+                  !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: binding.sessionID)
+            else { return .deleted }
+            switch requirement {
+            case .restored:
+                guard session.permitsBoundOperationAndSave else { return .restorationUnavailable }
+            case let .creation(handle):
+                guard session.creationHandleIsCurrent(handle) else { return .restorationUnavailable }
+            }
+            return nil
+        }
 
         var isCurrent: Bool {
             guard let workspaceID = binding.workspaceID,
                   case let .unique(current) = scope.store.resolveWriter(workspaceID: workspaceID, sessionID: binding.sessionID)
             else { return false }
             return current.scope === scope && current.session === session
-                && current.binding == binding && current.restoration == restoration
+                && current.identity == identity
         }
     }
 
@@ -54,6 +123,10 @@ final class AgentSessionRuntimeStore {
     /// UI replicas never enter this store. Multiple live claims remain conflicts even when
     /// their metadata agrees; a selected tab/window is not a tie breaker.
     func resolveWriter(workspaceID: UUID, sessionID: UUID) -> WriterResolution {
+        resolveWriter(sessionID: sessionID, expectedWorkspaceID: workspaceID)
+    }
+
+    func resolveWriter(sessionID: UUID, expectedWorkspaceID: UUID? = nil) -> WriterResolution {
         var match: (Scope, AgentTabSession)?
         for reference in scopes.values {
             guard let scope = reference.value else { continue }
@@ -67,11 +140,24 @@ final class AgentSessionRuntimeStore {
             return .unavailable(.absent)
         }
         guard let boundWorkspaceID = binding.workspaceID else { return .unavailable(.unscopedBinding) }
-        guard boundWorkspaceID == workspaceID else { return .conflicting }
+        if let expectedWorkspaceID, boundWorkspaceID != expectedWorkspaceID { return .conflicting }
         guard !session.bindingTransitionInProgress, let restoration = session.currentRestorationBindingToken else {
             return .unavailable(.bindingTransition)
         }
-        return .unique(Writer(scope: scope, session: session, binding: binding, restoration: restoration))
+        guard let incarnationID = scope.liveClaimByTabID[session.tabID]?.incarnationID else { return .unavailable(.absent) }
+        return .unique(Writer(
+            scope: scope, session: session, binding: binding, restoration: restoration,
+            identity: WriterIdentity(scopeID: scope.id, incarnationID: incarnationID, workspaceID: boundWorkspaceID, restoration: restoration)
+        ))
+    }
+
+    private func hasOtherClaim(sessionID: UUID, scope: Scope, session: AgentTabSession) -> Bool {
+        scopes.values.contains { reference in
+            guard let owner = reference.value else { return false }
+            return owner.liveSessionTabIDs(for: sessionID).contains { tabID in
+                owner !== scope || owner.sessions[tabID] !== session
+            }
+        }
     }
 
     /// Admission is distinct from the originating writer capability: final IO must keep its
@@ -219,7 +305,12 @@ final class AgentSessionRuntimeStore {
         }
 
         private(set) var sessions: [UUID: AgentTabSession] = [:]
-        private var liveClaimByTabID: [UUID: UUID] = [:]
+        fileprivate struct LiveClaim {
+            let sessionID: UUID
+            let incarnationID = UUID()
+        }
+
+        fileprivate var liveClaimByTabID: [UUID: LiveClaim] = [:]
         private var liveTabIDsBySessionID: [UUID: Set<UUID>] = [:]
 
         fileprivate init(store: AgentSessionRuntimeStore) {
@@ -241,6 +332,7 @@ final class AgentSessionRuntimeStore {
         }
 
         func permitsBinding(_ sessionID: UUID, on session: AgentTabSession) -> Bool {
+            guard !store.hasOtherClaim(sessionID: sessionID, scope: self, session: session) else { return false }
             if sessions[session.tabID] === session, session.activeAgentSessionID == sessionID {
                 return !hasReleasedWriterClaims
             }
@@ -257,13 +349,13 @@ final class AgentSessionRuntimeStore {
 
         fileprivate func updateLiveSessionBindingIndex(tabID: UUID) {
             if let previous = liveClaimByTabID.removeValue(forKey: tabID) {
-                liveTabIDsBySessionID[previous]?.remove(tabID)
-                if liveTabIDsBySessionID[previous]?.isEmpty == true {
-                    liveTabIDsBySessionID.removeValue(forKey: previous)
+                liveTabIDsBySessionID[previous.sessionID]?.remove(tabID)
+                if liveTabIDsBySessionID[previous.sessionID]?.isEmpty == true {
+                    liveTabIDsBySessionID.removeValue(forKey: previous.sessionID)
                 }
             }
             if let current = sessions[tabID]?.activeAgentSessionID {
-                liveClaimByTabID[tabID] = current
+                liveClaimByTabID[tabID] = LiveClaim(sessionID: current)
                 liveTabIDsBySessionID[current, default: []].insert(tabID)
             }
         }
