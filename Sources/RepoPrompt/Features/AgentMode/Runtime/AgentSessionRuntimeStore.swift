@@ -172,6 +172,7 @@ final class AgentSessionRuntimeStore {
 
         lazy var observation = AgentSessionObservationRuntime(scope: self)
         lazy var startup = AgentSessionRunStartRuntime(scope: self)
+        lazy var continuation = AgentSessionRunContinuationRuntime(scope: self)
 
         /// Construct the actual observed runtime object; UI defaults and saved hydration are
         /// applied by composition before admitting it into this scope's binding index.
@@ -204,6 +205,7 @@ final class AgentSessionRuntimeStore {
         @discardableResult
         func releaseWriterClaimsAfterDrain() -> Bool {
             guard isRetiring, saveQueue.inFlightSessionIDs.isEmpty, !attachments.hasPendingRetention,
+                  !continuation.hasPendingStarts,
                   linkExecution?.pendingSendEffects.isEmpty != false,
                   sessions.values.allSatisfy({ session in
                       !session.runState.isActive && session.activeComposerSubmitAttempt == nil

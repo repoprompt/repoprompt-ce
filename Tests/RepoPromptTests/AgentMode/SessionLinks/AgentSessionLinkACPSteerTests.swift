@@ -467,6 +467,51 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         XCTAssertFalse(draft.contains(envelope))
     }
 
+    func testWindowCloseJoinsGatedFollowUpWithoutLaunchingAfterRetirement() async throws {
+        let fixture = try await makeFixture()
+        await fixture.viewModel.test_publishNaturalCompletion(fixture.session)
+        let entered = AgentSessionLinkStopSignal<Void>()
+        let release = AgentSessionLinkStopSignal<Void>()
+        let finished = AgentSessionLinkStopSignal<Void>()
+        addTeardownBlock { release.finish(()) }
+        fixture.viewModel.test_beforeScheduledACPFollowUpStart = {
+            entered.finish(())
+            await release.value()
+        }
+        fixture.viewModel.test_didFinishScheduledACPFollowUpStart = { finished.finish(()) }
+        defer {
+            fixture.viewModel.test_beforeScheduledACPFollowUpStart = nil
+            fixture.viewModel.test_didFinishScheduledACPFollowUpStart = nil
+        }
+        let (batch, sink) = mixedSteeringBatch(fixture)
+        fixture.viewModel.test_requeueDequeuedACPSteeringAfterStop(
+            batch, session: fixture.session, stopFence: .init(session: fixture.session)
+        )
+        await entered.value()
+        XCTAssertEqual(sink.outcome, .delivered(.queuedFollowUp))
+        let closing = AgentSessionLinkStopSignal<Void>()
+        var closed = false
+        let close = Task {
+            closing.finish(())
+            await fixture.viewModel.prepareForWindowClose()
+            closed = true
+        }
+        // prepareForWindowClose fences its private scope before its first suspension.
+        // This same-actor signal precedes the call without an intervening await.
+        await closing.value()
+        XCTAssertFalse(closed)
+        release.finish(())
+        await finished.value()
+        await close.value
+        XCTAssertTrue(closed)
+        XCTAssertTrue(fixture.provider.promptedMessages.isEmpty)
+        XCTAssertNil(fixture.session.scheduledACPFollowUp)
+        XCTAssertFalse(fixture.session.mcpFollowUpRunPending)
+        let draft = fixture.viewModel.retrieveDraftText(for: fixture.session.tabID)
+        XCTAssertTrue(draft.contains("typed local draft"))
+        XCTAssertFalse(draft.contains("managed scheduled direction"))
+    }
+
     func testTerminalBarrierFollowUpStopRestoresTypedLocalDraft() async throws {
         let fixture = try await makeFixture()
         let (batch, sink) = mixedSteeringBatch(fixture)

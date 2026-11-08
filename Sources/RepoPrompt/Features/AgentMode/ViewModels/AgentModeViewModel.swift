@@ -707,8 +707,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var test_claudeAttachmentRestartFinished: (@MainActor () -> Void)?
         var test_afterProviderInputAugmentation: (@MainActor () async -> Void)?
         var test_beforeACPToolIdleWait: (@MainActor () async throws -> Void)?
-        var test_beforeScheduledACPFollowUpStart: (@MainActor () async -> Void)?
-        var test_didFinishScheduledACPFollowUpStart: (@MainActor () -> Void)?
+        var test_beforeScheduledACPFollowUpStart: (@MainActor () async -> Void)? {
+            get { runtimeSessionStore.continuation.test_beforeScheduledACPFollowUpStart }
+            set { runtimeSessionStore.continuation.test_beforeScheduledACPFollowUpStart = newValue }
+        }
+
+        var test_didFinishScheduledACPFollowUpStart: (@MainActor () -> Void)? {
+            get { runtimeSessionStore.continuation.test_didFinishScheduledACPFollowUpStart }
+            set { runtimeSessionStore.continuation.test_didFinishScheduledACPFollowUpStart = newValue }
+        }
+
         /// Replaces only the provider start of a self worktree relocation's continuation turn.
         var test_selfWorktreeRelocationContinuationStarter: (@MainActor (TabSession, String) async -> Void)?
 
@@ -3890,31 +3898,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     )
                 }
             ),
-            continuation: .init(
-                startFollowUpRun: { [weak self] session, instruction in
-                    if session.selectedAgent.acpProviderID != nil {
-                        self?.scheduleTypedACPFollowUpRun(
-                            session: session, instruction: instruction,
-                            capturedStopFence: instruction.stopFence
-                        )
-                        return
-                    }
-                    let instruction = instruction.retainingStopFence(instruction.stopFence ?? AgentRunStartStopFence(session: session))
-                    Task { @MainActor [weak self, weak session] in
-                        guard let self, let session else { return }
-                        await startFollowUpRun(for: session, instruction: instruction)
-                    }
-                },
-                startTypedACPFollowUpRun: { [weak self] session, instruction in
-                    self?.scheduleTypedACPFollowUpRun(
-                        session: session, instruction: instruction,
-                        capturedStopFence: instruction.stopFence
-                    )
-                },
-                signalMCPInstructionDelivered: { session in
-                    await publication.signalMCPInstructionDelivered(for: session)
-                }
-            ),
+            continuation: runtimeSessionStore.continuation.makeRunHooks(prepareLaunch: { [weak self] in
+                self?.makeFollowUpLaunch()
+            }),
             prepareForCancellation: { [interactions = interactionRuntime, links = linkExecutionRuntime] session, intent, origin in
                 interactions.prepareRunCancellation(session: session, intent: intent, origin: origin, links: links)
             },
@@ -3939,135 +3925,32 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         instruction: TabSession.PendingInstruction,
         capturedStopFence: AgentRunStartStopFence? = nil
     ) {
-        let stopFence = capturedStopFence ?? AgentRunStartStopFence(session: session)
-        guard stopFence.permitsStart(of: session) else {
-            if sessions[session.tabID] === session,
-               stopFence.binding == session.persistentSessionBindingIdentity,
-               let draft = instruction.localDraftText
-            {
-                restoreComposerDraft(
-                    tabID: session.tabID, text: draft,
-                    message: "Restored local ACP follow-up after cancelled start",
-                    strategy: .prependAlways
-                )
-            }
-            return
-        }
-        session.mcpFollowUpRunPending = true
-        if var scheduled = session.scheduledACPFollowUp {
-            // Keep later fallbacks under the same Stop-owned producer until its start settles.
-            // A failed first start must not leave them in the general queue without an owner.
-            scheduled.queuedInstructions.append(.init(instruction: instruction, stopFence: stopFence))
-            session.scheduledACPFollowUp = scheduled
-            session.isDirty = true
-            updateBindingsFromSession(session)
-            scheduleSave(for: session.tabID)
-            return
-        }
-        let scheduled = TabSession.ScheduledACPFollowUp(
-            id: UUID(), instruction: instruction, stopFence: stopFence
+        runtimeSessionStore.continuation.scheduleTypedACPFollowUp(
+            session: session, instruction: instruction, capturedStopFence: capturedStopFence,
+            launch: makeFollowUpLaunch()
         )
-        session.scheduledACPFollowUp = scheduled
-        Task { @MainActor [weak self, weak session] in
-            guard let self, let session else { return }
-            #if DEBUG
-                defer { test_didFinishScheduledACPFollowUpStart?() }
-                await test_beforeScheduledACPFollowUpStart?()
-            #endif
-            guard session.scheduledACPFollowUp?.id == scheduled.id else { return }
-            let startOutcome = AgentRunStartOutcomeRecorder()
-            _ = await startAgentRun(
-                tabID: session.tabID, initialMessage: instruction.providerText,
-                directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: instruction.skipsSlashExpansion, stopFence: stopFence),
-                startOutcome: startOutcome
-            )
-            guard let settled = session.scheduledACPFollowUp, settled.id == scheduled.id else { return }
-            session.scheduledACPFollowUp = nil
-            if startOutcome.outcome.didStart {
-                // Only an accepted run can transfer still-fenced successors. Keep each fence
-                // on the queued instruction through every later terminal handoff; otherwise a
-                // failed successor start could leave its siblings with a fresh post-Stop fence.
-                let eligible = settled.queuedInstructions.filter { $0.stopFence.permitsStart(of: session) }
-                let cancelledDrafts = settled.queuedInstructions
-                    .filter { !$0.stopFence.permitsStart(of: session) }
-                    .filter { $0.stopFence.binding == session.persistentSessionBindingIdentity }
-                    .compactMap(\.instruction.localDraftText)
-                if sessions[session.tabID] === session, !cancelledDrafts.isEmpty {
-                    restoreComposerDraft(
-                        tabID: session.tabID, text: cancelledDrafts.joined(separator: "\n"),
-                        message: "Restored local ACP follow-up after cancelled start",
-                        strategy: .prependAlways
-                    )
-                }
-                if session.runState.isActive {
-                    session.pendingInstructions.append(contentsOf: eligible.map {
-                        $0.instruction.retainingStopFence($0.stopFence)
-                    })
-                } else {
-                    for next in eligible {
-                        scheduleTypedACPFollowUpRun(
-                            session: session, instruction: next.instruction,
-                            capturedStopFence: next.stopFence
-                        )
-                    }
-                }
-            } else if sessions[session.tabID] === session {
-                let drafts = ([TabSession.ScheduledACPFollowUp.QueuedInstruction(
-                    instruction: settled.instruction, stopFence: settled.stopFence
-                )] + settled.queuedInstructions)
-                    .filter { $0.stopFence.binding == session.persistentSessionBindingIdentity }
-                    .compactMap(\.instruction.localDraftText)
-                if !drafts.isEmpty {
-                    restoreComposerDraft(
-                        tabID: session.tabID, text: drafts.joined(separator: "\n"),
-                        message: "Restored local ACP follow-up after failed start",
-                        strategy: .prependAlways
-                    )
-                }
-            }
-            if session.scheduledACPFollowUp == nil {
-                session.mcpFollowUpRunPending = false
-                handleObservedMCPStateChange(for: session)
-            }
-        }
     }
 
-    private func startFollowUpRun(
-        for session: TabSession,
-        instruction: TabSession.PendingInstruction
-    ) async {
-        guard sessions[session.tabID] === session else {
-            session.mcpFollowUpRunPending = false
-            #if DEBUG
-                perfRecorder.increment("run.followUp.dropped.staleSession", tabID: session.tabID)
-                perfRecorder.event(
-                    "run.followUp.dropped",
-                    tabID: session.tabID,
-                    fields: ["reason": "staleSession"]
-                )
-            #endif
-            handleObservedMCPStateChange(for: session)
-            return
-        }
-        let fence = instruction.stopFence ?? AgentRunStartStopFence(session: session)
-        let outcome = AgentRunStartOutcomeRecorder()
-        await startAgentRun(
-            tabID: session.tabID,
-            initialMessage: instruction.providerText,
-            directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: instruction.skipsSlashExpansion, stopFence: fence),
-            startOutcome: outcome
+    private func startFollowUpRun(for session: TabSession, instruction: TabSession.PendingInstruction) async {
+        await runtimeSessionStore.continuation.startFollowUp(
+            session: session, instruction: instruction, launch: makeFollowUpLaunch()
         )
-        if !outcome.outcome.didStart,
-           sessions[session.tabID] === session, fence.permitsStart(of: session),
-           session.selectedAgent.usesClaudeNativeRuntime,
-           session.activeRunOwnership.map({ session.claudeTerminalAnchor?.0 == $0 }) == true
-        {
-            // Terminal dispatch dequeued this instruction before adoption won admission.
-            // Its original typed payload stays owed to the next ordinary terminal boundary.
-            session.pendingInstructions.insert(instruction.retainingStopFence(fence), at: 0)
-            session.isDirty = true
-            updateBindingsFromSession(session)
-            scheduleSave(for: session.tabID)
+    }
+
+    /// Capture this request's existing authorities before scheduling its producer. The closure
+    /// calls the concrete startup runtime, never back into a VM implementation of startup.
+    /// Canonical host composition must replace these legacy workspace inputs at host cutover.
+    private func makeFollowUpLaunch() -> AgentSessionRunContinuationRuntime.Launch {
+        let environment = makeRunStartEnvironment()
+        let startup = runtimeSessionStore.startup
+        let coordinator = claudeCoordinator
+        let links = linkExecutionRuntime
+        return .init { session, instruction, outcome in
+            _ = await startup.start(
+                session: session, initialMessage: instruction.providerText,
+                directStartOptions: .init(skipsSlashExpansion: instruction.skipsSlashExpansion, stopFence: instruction.stopFence),
+                startOutcome: outcome, claudeCoordinator: coordinator, links: links, environment: environment
+            )
         }
     }
 
@@ -5131,6 +5014,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         guard !hasPreparedForWindowClose else { return }
         hasPreparedForWindowClose = true
+        // This legacy path retires its private runtime, not merely its presentation. Fence
+        // pending producers before the first await; final originating IO remains permitted.
+        // The independent-host cutover must detach presentation without invoking retirement.
+        runtimeSessionStore.beginRetirement()
         closeOracleBackgroundWindowAdmission()
         let task = Task<Void, Never> { @MainActor [weak self] in
             guard let self else { return }
@@ -5173,6 +5060,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         activeTranscriptPresentationScope = nil
         codexCoordinator.stop()
         claudeCoordinator.stop()
+        await runtimeSessionStore.continuation.drainPendingStarts()
         await interactionRuntime.drainPendingEffects()
         await runtimeSessionStore.linkExecution?.drainPendingSendEffects()
         await applyEditsApprovalStore.cleanupWindowScopes(
@@ -18657,6 +18545,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         } else {
             session = self.session(for: tabID)
         }
+        return await runtimeSessionStore.startup.start(
+            session: session, initialMessage: initialMessage, attachments: attachments,
+            taggedFileAttachments: taggedFileAttachments, codexFallbackContext: codexFallbackContext,
+            autoEffortSelection: autoEffortSelection, directStartOptions: directStartOptions,
+            startOutcome: startOutcome, providerSwitchPreparation: providerSwitchPreparation,
+            claudeCoordinator: claudeCoordinator, links: linkExecutionRuntime, environment: makeRunStartEnvironment()
+        )
+    }
+
+    private func makeRunStartEnvironment() -> AgentSessionRunStartRuntime.Environment {
         var environment = AgentSessionRunStartRuntime.Environment(
             currentWorkspaceID: { self.workspaceManager?.activeWorkspaceID },
             prepareSession: { await self.prepareSessionForRunStart(tabID: $0.tabID, session: $0) },
@@ -18689,13 +18587,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 return true
             }
         #endif
-        return await runtimeSessionStore.startup.start(
-            session: session, initialMessage: initialMessage, attachments: attachments,
-            taggedFileAttachments: taggedFileAttachments, codexFallbackContext: codexFallbackContext,
-            autoEffortSelection: autoEffortSelection, directStartOptions: directStartOptions,
-            startOutcome: startOutcome, providerSwitchPreparation: providerSwitchPreparation,
-            claudeCoordinator: claudeCoordinator, links: linkExecutionRuntime, environment: environment
-        )
+        return environment
     }
 
     private static func claudeReasoningStatusPreview(from raw: String) -> String? {

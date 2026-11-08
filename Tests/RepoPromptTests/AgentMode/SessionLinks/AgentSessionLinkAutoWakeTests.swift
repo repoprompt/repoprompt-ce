@@ -218,6 +218,148 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         XCTAssertTrue(session.items.isEmpty)
     }
 
+    func testFollowUpProducerRetainsScopeAndJoinsBeforeWriterReleaseWithoutPresentation() async throws {
+        var f: Fixture? = try fixture()
+        let session = try XCTUnwrap(f).session
+        let continuation = try XCTUnwrap(f).scope.continuation
+        weak let owner = try XCTUnwrap(f).scope
+        let gate = AutoWakeCatalogAuthorityGate()
+        continuation.test_beforeScheduledACPFollowUpStart = { _ = await gate.requirement() }
+        var launches = 0
+        let launch = AgentSessionRunContinuationRuntime.Launch { _, _, _ in launches += 1 }
+        continuation.scheduleTypedACPFollowUp(
+            session: session, instruction: .init(providerText: "provider text", localDraftText: "first local draft"), launch: launch
+        )
+        await gate.waitUntilEntered()
+        continuation.scheduleTypedACPFollowUp(session: session, instruction: .providerOnly("managed text"), launch: launch)
+        continuation.scheduleTypedACPFollowUp(
+            session: session, instruction: .init(providerText: "more provider text", localDraftText: "second local draft"), launch: launch
+        )
+        XCTAssertEqual(session.scheduledACPFollowUp?.queuedInstructions.count, 2)
+        owner?.beginRetirement()
+        session.isDirty = false
+        XCTAssertEqual(owner?.releaseWriterClaimsAfterDrain(), false, "Pending producers are not a released writer")
+        let entered = expectation(description: "drain entered")
+        var drained = false
+        let drain = Task {
+            entered.fulfill()
+            await continuation.drainPendingStarts()
+            drained = true
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        drain.cancel()
+        f = nil
+        XCTAssertNotNil(owner)
+        XCTAssertFalse(drained, "Cancelling the waiter cannot acknowledge an unjoined producer")
+        await gate.open()
+        await drain.value
+        XCTAssertEqual(launches, 0)
+        XCTAssertFalse(continuation.hasPendingStarts)
+        XCTAssertNil(session.scheduledACPFollowUp)
+        XCTAssertFalse(session.mcpFollowUpRunPending)
+        XCTAssertEqual(session.draftText, "first local draft\nsecond local draft")
+        XCTAssertFalse(session.draftText.contains("managed"))
+        XCTAssertNil(owner)
+    }
+
+    func testFollowUpRefusesRecycledOrReboundOwnerBeforeLaunch() async throws {
+        for change in ["replacement", "binding", "stop"] {
+            let f = try fixture()
+            let session = f.session
+            let runtime = f.scope.continuation
+            let gate = AutoWakeCatalogAuthorityGate()
+            runtime.test_beforeScheduledACPFollowUpStart = { _ = await gate.requirement() }
+            var launches = 0
+            runtime.scheduleTypedACPFollowUp(
+                session: session, instruction: .init(providerText: "provider-only rendering", localDraftText: "original draft"),
+                launch: .init { _, _, _ in launches += 1 }
+            )
+            await gate.waitUntilEntered()
+            let replacement = AgentTabSession(tabID: session.tabID)
+            replacement.draftText = "successor draft"
+            switch change {
+            case "replacement": f.scope.replaceSessions([session.tabID: replacement])
+            case "binding": session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: f.endpoint.sessionID, workspaceID: f.endpoint.workspaceID))
+            default: session.stopState.invalidateScheduledStarts()
+            }
+            await gate.open()
+            await runtime.drainPendingStarts()
+            XCTAssertEqual(launches, 0, change)
+            XCTAssertEqual(replacement.draftText, "successor draft")
+            XCTAssertNil(session.scheduledACPFollowUp)
+            XCTAssertEqual(session.draftText, change == "stop" ? "original draft" : "", change)
+        }
+    }
+
+    func testAcceptedFollowUpTransfersOriginalTypedStopFencesWithoutPresentation() async throws {
+        for firstRemainsActive in [true, false] {
+            let f = try fixture()
+            let runtime = f.scope.continuation
+            let gate = AutoWakeCatalogAuthorityGate()
+            runtime.test_beforeScheduledACPFollowUpStart = { _ = await gate.requirement() }
+            var launched: [AgentRunPendingInstruction] = []
+            runtime.scheduleTypedACPFollowUp(session: f.session, instruction: .providerOnly("first"), launch: .init { session, instruction, recorder in
+                launched.append(instruction)
+                session.runState = firstRemainsActive || launched.count > 1 ? .running : .completed
+                recorder.recordAccepted()
+            })
+            await gate.waitUntilEntered()
+            let fence = AgentRunStartStopFence(session: f.session)
+            runtime.scheduleTypedACPFollowUp(
+                session: f.session,
+                instruction: .init(providerText: "next provider text", localDraftText: "next draft", stopFence: fence, skipsSlashExpansion: true),
+                launch: nil
+            )
+            await gate.open()
+            await runtime.drainPendingStarts()
+            XCTAssertEqual(launched.count, firstRemainsActive ? 1 : 2)
+            let queued = try XCTUnwrap(firstRemainsActive ? f.session.pendingInstructions.first : launched.last)
+            XCTAssertEqual(queued.providerText, "next provider text")
+            XCTAssertEqual(queued.localDraftText, "next draft")
+            XCTAssertTrue(queued.skipsSlashExpansion)
+            XCTAssertTrue(try XCTUnwrap(queued.stopFence).permitsStart(of: f.session))
+            f.session.stopState.invalidateScheduledStarts()
+            XCTAssertFalse(try XCTUnwrap(queued.stopFence).permitsStart(of: f.session))
+            XCTAssertEqual(f.session.draftText, "")
+        }
+    }
+
+    func testFollowUpHooksRecoverAbsentCompositionAndRetainClaudeAdoptionWork() async throws {
+        let f = try fixture()
+        let runtime = f.scope.continuation
+        let unavailable = runtime.makeRunHooks(prepareLaunch: { nil })
+        unavailable.startTypedACPFollowUpRun(f.session, .init(providerText: "private rendering", localDraftText: "local recovery"))
+        await runtime.drainPendingStarts()
+        XCTAssertEqual(f.session.draftText, "local recovery")
+        XCTAssertFalse(f.session.mcpFollowUpRunPending)
+        XCTAssertNil(f.session.scheduledACPFollowUp)
+
+        f.session.selectedAgent = .claudeCode
+        let ownership = f.session.beginRunAttempt(source: "test.followup.adoption")
+        f.session.claudeTerminalAnchor = (ownership, .exact(UUID()))
+        f.session.pendingInstructions = [.providerOnly("later")]
+        var launches = 0
+        let hooks = runtime.makeRunHooks(prepareLaunch: {
+            .init { _, _, recorder in
+                launches += 1
+                recorder.recordStartFailure(message: nil)
+            }
+        })
+        hooks.startFollowUpRun(f.session, .providerOnly("still owed"))
+        await runtime.drainPendingStarts()
+        XCTAssertEqual(launches, 1)
+        XCTAssertEqual(f.session.pendingInstructions.map(\.providerText), ["still owed", "later"])
+        XCTAssertNotNil(f.session.pendingInstructions.first?.stopFence)
+
+        f.session.mcpFollowUpRunPending = true
+        hooks.startFollowUpRun(f.session, .providerOnly("cancelled before task admission"))
+        f.session.stopState.invalidateScheduledStarts()
+        await runtime.drainPendingStarts()
+        XCTAssertEqual(launches, 1, "The fence must be captured before enqueueing the Task")
+        XCTAssertFalse(f.session.mcpFollowUpRunPending)
+        XCTAssertEqual(f.session.pendingInstructions.map(\.providerText), ["still owed", "later"])
+    }
+
     private struct Fixture {
         let scope: AgentSessionRuntimeStore.Scope
         let session: AgentTabSession

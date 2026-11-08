@@ -5139,3 +5139,53 @@ Validation:
 Canonical workspace/admission inputs, saved-host construction, remaining terminal/follow-up
 ownership, exact runtime routing and presentation-detach/drain integration remain open. Full-suite,
 final hosted CI and live smoke are not established by this checkpoint.
+
+### M9 continuation — runtime-owned follow-up producers and joined recovery (2026-11-08)
+
+`AgentSessionRunContinuationRuntime` owns the actual ACP scheduled-start queue, ordinary
+follow-up producer, typed draft recovery and Claude adoption-race reinsertion previously implemented
+in the VM. Its Tasks retain the exact scope until settlement and remove themselves from the pending
+set on every completion. Cancelling a drain waiter is not proof that its producers finished. Writer
+claim release now refuses while these starts remain pending.
+
+The first ACP producer owns the batch's startup composition; queued instructions preserve their
+individual Stop fences and draft provenance. Production composition captures a per-request launch
+that calls the concrete startup runtime, rather than a VM implementation of startup. The existing
+workspace and creation inputs still depend on the legacy host and are not claimed as canonical
+window-free composition. No new run, queue, acknowledgement or lifecycle authority was introduced.
+
+Review identified a real legacy-close admission gap for idle scheduled producers. The close path
+now marks its private scope retiring before the first await, stops coordinators in the original
+order, then joins producers. Final originating persistence remains permitted. This is retirement
+of the legacy private runtime, not the eventual presentation-only detach path. Non-ACP refusal
+preserves an existing ACP pending flag, and the original Stop fence is captured before every Task
+hop. Missing launch composition restores typed ACP drafts without turning managed provider text
+into local user text.
+
+Standalone tests exercise scope lifetime and a cancelled drain waiter, refusal after replacement or
+same-ID rebinding, active and already-completed successor transfer, missing composition recovery,
+Claude adoption reinsertion and Stop before the task starts. A real VM/ACP integration holds the
+producer, starts close, releases it and proves close completes without a provider prompt. Original
+Stop, managed receipt and draft assertions remain intact; no timeout or retry inflation was used.
+
+Validation:
+- Initial `6e031103-3797-4583-b583-4d2b3c3900cc` passed **114 tests** before review fixes.
+  Its `AgentStopTransactionTests` filter matched none; that typo also remained in the next run
+  and was corrected with the explicit supplemental suites below.
+- Final `19731b9d-0525-4008-a4c0-89ed12f62f08` passed **193 tests**: MCP steer/resume 27,
+  first-save 47, ACP steering 30, scoped link execution 21, Claude approval/resume 38 and worktree
+  recovery 30. The new gated window-close case and all four standalone continuation cases passed.
+- Supplemental `0f4dec08-1ec3-42c2-89f9-2f6fd802c2cc` passed **50 tests**: Stop transactions 34,
+  route cleanup 1, Stop transcript 4, runtime store 9 and waiting ownership 2. Together the final
+  unchanged Swift tree passed **243 named tests**.
+- Both products passed `3acc44df-7f42-4863-8344-215154e9e706`; lint passed
+  `156dddfb-84c4-4c48-96e4-57f61fe9be02`. Fresh compiler index passed **1242/1360** wrong-way
+  file edges and **53/66** largest-cycle components (1135 files, 156615 symbols), without a
+  baseline increase. The final compilation reported no compiler warning in the five touched Swift
+  files; aggregate hosted warning qualification is separate.
+- Scoped formatting and one independent review completed. Mandatory staged contribution preflight
+  applies before commit.
+
+Canonical writer admission, saved-host construction, remaining terminal self-compaction/worktree
+commands, exact runtime routing and presentation-only close/handoff integration remain open. This
+checkpoint does not establish final full-suite, hosted CI or live-smoke qualification.
