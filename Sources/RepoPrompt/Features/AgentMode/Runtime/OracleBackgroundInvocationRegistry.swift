@@ -300,6 +300,8 @@ final class OracleBackgroundInvocationRegistry {
         var drain: Task<Void, Never>?
         var generation: UInt64 = 0
         var historyTruncated = false
+        /// Lookup index only; entries remain the authority through the full cleanup drain.
+        var liveInvocationIDs: Set<UUID> = []
     }
 
     private(set) var isShuttingDown = false
@@ -361,6 +363,7 @@ final class OracleBackgroundInvocationRegistry {
         let job = Job(registry: self, owner: owner, epoch: state.epoch, runID: runID, invocationID: invocationID)
         let entry = Entry(job: job, createdAt: now())
         entries[invocationID] = entry
+        state.liveInvocationIDs.insert(invocationID)
         // No inherited MCP task-local authority or request cancellation lifetime.
         let worker = Task.detached { @MainActor in
             do {
@@ -503,23 +506,35 @@ final class OracleBackgroundInvocationRegistry {
         await entry.task?.value
     }
 
+    /// Provider-input awareness needs only this exact owner's bounded live set, not process-wide
+    /// retained history or its truncation metadata. Preparing/uncommitted entries stay invisible.
+    func liveInvocations(for owner: Owner) -> [Snapshot] {
+        let live = (owners[owner]?.liveInvocationIDs ?? []).compactMap { entries[$0] }
+            .filter { $0.phase.isLive && $0.job.owner == owner && $0.job.handoff.isCommitted }
+        return invocationSnapshots(live)
+    }
+
+    private func invocationSnapshots(_ entries: [Entry]) -> [Snapshot] {
+        entries.sorted { lhs, rhs in
+            lhs.createdAt == rhs.createdAt ? older(lhs, rhs) : lhs.createdAt > rhs.createdAt
+        }.compactMap { entry in
+            entry.reference.map {
+                Snapshot(reference: $0, phase: entry.phase, createdAt: entry.createdAt, laneOutcomes: entry.outcomes, queries: entry.queries.mapValues(\.identity), groupStatus: entry.groupStatus)
+            }
+        }
+    }
+
     /// Settled discovery follows persisted session identity, like canonical provenance. Live
     /// resources remain fenced to the exact binding incarnation until its drain completes.
     func snapshot(for owner: Owner, includeFinished: Bool = true) -> OwnerSnapshot {
         let selected = entries.values.filter {
             $0.job.owner.sessionKey == owner.sessionKey && (!$0.phase.isLive || $0.job.owner == owner)
                 && $0.job.handoff.isCommitted && (includeFinished || $0.phase.isLive)
-        }.sorted { lhs, rhs in
-            lhs.createdAt == rhs.createdAt ? older(lhs, rhs) : lhs.createdAt > rhs.createdAt
         }
         return OwnerSnapshot(
             epoch: owners[owner]?.epoch, generation: owners[owner]?.generation ?? 0,
             historyTruncated: owners.contains { $0.key.sessionKey == owner.sessionKey && $0.value.historyTruncated },
-            invocations: selected.compactMap { entry in
-                entry.reference.map {
-                    Snapshot(reference: $0, phase: entry.phase, createdAt: entry.createdAt, laneOutcomes: entry.outcomes, queries: entry.queries.mapValues(\.identity), groupStatus: entry.groupStatus)
-                }
-            }
+            invocations: invocationSnapshots(selected)
         )
     }
 
@@ -610,6 +625,7 @@ final class OracleBackgroundInvocationRegistry {
         job.handoff.releaseWorker()
         entry.ready?.resume(throwing: error ?? RegistryError.invalidExecution)
         entry.ready = nil
+        owners[job.owner]?.liveInvocationIDs.remove(job.provenance.invocationID)
         if job.handoff.isCommitted {
             entry.phase = entry.published ? .settled : .orphaned
             changed(job.owner)
