@@ -515,7 +515,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         XCTAssertNil(wrongWorkspace)
     }
 
-    func testAggregateOraclePillCountAndLabelsUseConfiguredOrLatestProjectedGroup() {
+    func testAggregateOraclePillCountAndLabelsUseConfiguredOrLatestRequest() {
         let historical = ChatSession(
             oracleGroupID: UUID(),
             oracleLaneIndex: 0,
@@ -552,14 +552,14 @@ final class AgentOraclePillRoutingTests: XCTestCase {
 
         XCTAssertEqual(
             AgentOraclePillLogic.aggregateOracleCount(
-                configuredAdditionalCount: 0,
+                configuredAdditionalCount: 2,
                 sessions: [historical, latestSingle]
             ),
             1
         )
         XCTAssertEqual(
             AgentOraclePillLogic.aggregateOracleCount(
-                configuredAdditionalCount: 0,
+                configuredAdditionalCount: 4,
                 sessions: [historical, staleSiblingProjection, latestProjected]
             ),
             4
@@ -577,6 +577,20 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         XCTAssertEqual(
             (0 ... 4).map(OracleViewModel.oracleLabel(laneIndex:)),
             ["Oracle", "Oracle 2", "Oracle 3", "Oracle 4", "Oracle 5"]
+        )
+    }
+
+    func testAggregateOraclePillCountUsesPrimaryOnlyRequestInsteadOfConfiguredOracles() {
+        let primaryOnly = ChatSession(
+            oracleGroupID: UUID(),
+            oracleLaneIndex: 0,
+            oracleGroupSize: 1,
+            name: "Primary Only"
+        )
+
+        XCTAssertEqual(
+            AgentOraclePillLogic.aggregateOracleCount(configuredAdditionalCount: 2, sessions: [primaryOnly]),
+            1
         )
     }
 

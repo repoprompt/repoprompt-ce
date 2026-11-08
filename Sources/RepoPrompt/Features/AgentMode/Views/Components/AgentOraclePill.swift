@@ -122,12 +122,11 @@ enum AgentOraclePillLogic {
     }
 
     static func aggregateOracleCount(configuredAdditionalCount: Int, sessions: [ChatSession]) -> Int {
-        let configured = 1 + configuredAdditionalCount
-        guard let latest = sessions.max(by: { $0.savedAt < $1.savedAt }),
-              latest.oracleGroupID != nil
-        else { return configured }
-        let projected = min(max(latest.oracleGroupSize ?? 1, 1), 5)
-        return max(configured, projected)
+        guard let latest = sessions.max(by: { $0.savedAt < $1.savedAt }) else {
+            return 1 + configuredAdditionalCount
+        }
+        guard latest.oracleGroupID != nil else { return 1 }
+        return min(max(latest.oracleGroupSize ?? 1, 1), 5)
     }
 
     static func latestStreamingSession(
