@@ -37,10 +37,6 @@ enum AgentRunSessionStore {
         await shared.register(sessionID: sessionID, cancellationHandler: cancellationHandler)
     }
 
-    static func registerIfMissing(sessionID: UUID) async -> Registration? {
-        await shared.registerIfMissing(sessionID: sessionID)
-    }
-
     static func claimResumableSession(
         sessionID: UUID,
         cancellationHandler: DomainAgentRunSessionStore.RegistrationCancellationHandler? = nil

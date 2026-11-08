@@ -5438,16 +5438,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func agentWorkspaceLookupContext(tabID: UUID, session: TabSession? = nil) async -> WorkspaceLookupContext {
-        guard let store = promptManager?.workspaceFileContextStore else { return .visibleWorkspace }
+        guard let source = providerWorkspaceSource(tabID: tabID, session: session) else { return .visibleWorkspace }
+        return await source.lookupContext()
+    }
+
+    private func providerWorkspaceSource(tabID: UUID?, session: TabSession?) -> AgentSessionProviderInputRuntime.WorkspaceSource? {
+        guard let store = promptManager?.workspaceFileContextStore else { return nil }
+        guard let tabID else { return .init(store: store, lookupSource: nil) }
         let resolvedSession = session ?? sessions[tabID]
-        guard resolvedSession?.worktreeBindingTransitionInProgress != true else {
-            return .visibleWorkspace
-        }
-        let source = AgentWorkspaceLookupContextSource(
+        let source: AgentWorkspaceLookupContextSource? = resolvedSession?.worktreeBindingTransitionInProgress == true ? nil : .init(
             activeAgentSessionID: composerSourceAgentSessionID(tabID: tabID, session: resolvedSession),
             worktreeBindings: resolvedSession?.worktreeBindings ?? []
         )
-        return await AgentWorkspaceLookupContextResolver.lookupContext(source: source, store: store)
+        return .init(store: store, lookupSource: source)
     }
 
     private func makeSession(for tabID: UUID) -> TabSession {
@@ -8128,105 +8131,25 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session: TabSession,
         stopFence: AgentRunStartStopFence
     ) async {
+        // Ordinary non-MCP starts must not eagerly compose providers. A live control
+        // activation has already installed its run service and cancellation capability.
         guard stopFence.permitsStart(of: session), !session.runState.isActive,
-              let originalContext = session.mcpControlContext
-        else { return }
-        if originalContext.preparedEpoch != nil {
-            return
-        }
-        let scopedTransitionIntent = originalContext.pendingEpochTransition.flatMap { intent -> AgentRunEpochTransitionIntent? in
-            guard intent.token == Self.mcpRunEpochTransitionToken,
-                  intent.expectedCurrentEpoch == originalContext.currentEpoch
-            else { return nil }
-            return intent
-        }
-        let transitionKind: AgentRunEpochTransitionKind = if let scopedTransitionIntent {
-            scopedTransitionIntent.kind
-        } else if originalContext.currentEpoch == nil {
-            .initial
-        } else if originalContext.pendingEpochTransition != nil {
-            .unrelated
-        } else if session.mcpFollowUpRunPending {
-            .relatedFollowUp
-        } else {
-            .unrelated
-        }
-        let activationGeneration = session.mcpControlActivationGeneration
-        var registration = originalContext.registration
-        var result = await AgentRunSessionStore.beginEpoch(
-            registration: registration,
-            activationID: originalContext.activationID,
-            expectedCurrentEpoch: originalContext.currentEpoch,
-            transitionKind: transitionKind
-        )
-        // A stale result means the existing record advanced to another epoch; only rejected
-        // results are eligible for missing-record recovery through registerIfMissing.
-        if case .rejected = result {
-            guard stopFence.permitsStart(of: session),
-                  session.mcpControlActivationGeneration == activationGeneration,
-                  let context = session.mcpControlContext,
-                  context.activationID == originalContext.activationID,
-                  context.registration == originalContext.registration,
-                  context.currentEpoch == originalContext.currentEpoch,
-                  let recoveredRegistration = await AgentRunSessionStore.registerIfMissing(
-                      sessionID: originalContext.sessionID
-                  )
-            else {
-                return
-            }
-            guard stopFence.permitsStart(of: session),
-                  session.mcpControlActivationGeneration == activationGeneration,
-                  let context = session.mcpControlContext,
-                  context.activationID == originalContext.activationID,
-                  context.registration == originalContext.registration,
-                  context.currentEpoch == originalContext.currentEpoch
-            else {
-                await AgentRunSessionStore.cleanup(registration: recoveredRegistration)
-                return
-            }
-            registration = recoveredRegistration
-            result = await AgentRunSessionStore.beginEpoch(
-                registration: registration,
-                activationID: originalContext.activationID,
-                expectedCurrentEpoch: nil,
-                transitionKind: transitionKind
-            )
-        }
+              let context = session.mcpControlContext, context.preparedEpoch == nil else { return }
+        let service = runService
         #if DEBUG
-            await test_afterMCPStoreEpochBegan?()
+            let afterEpoch = test_afterMCPStoreEpochBegan
+        #else
+            let afterEpoch: (@MainActor () async -> Void)? = nil
         #endif
-        guard case let .accepted(epoch) = result,
-              stopFence.binding == session.persistentSessionBindingIdentity,
-              !session.bindingTransitionInProgress,
-              session.mcpControlActivationGeneration == activationGeneration,
-              var context = session.mcpControlContext,
-              context.activationID == originalContext.activationID,
-              context.registration == originalContext.registration,
-              context.currentEpoch == originalContext.currentEpoch || context.currentEpoch == epoch
-        else {
-            if registration != originalContext.registration {
-                await AgentRunSessionStore.cleanup(registration: registration)
-            }
-            return
-        }
-        context = context.replacingRegistration(registration)
-        context.currentEpoch = epoch
-        context.preparedEpoch = epoch
-        let pendingTransitionToken = context.pendingEpochTransition?.token
-        let shouldClearPendingTransition = pendingTransitionToken == scopedTransitionIntent?.token
-            || pendingTransitionToken == Self.mcpRunEpochTransitionToken
-        if shouldClearPendingTransition {
-            context.pendingEpochTransition = nil
-        }
-        session.mcpControlContext = context
-        // An accepted epoch belongs to this binding even if Stop won during the actor hop.
-        // Retain it unconsumed for the next start; never leave the store ahead of its owner.
-        guard stopFence.permitsStart(of: session), !Task.isCancelled else { return }
-        session.mcpFollowUpRunPendingUpdatedAt = Date()
-        if !session.mcpFollowUpRunPending {
-            session.mcpFollowUpRunPending = true
-            handleObservedMCPStateChange(for: session)
-        }
+        await mcpRuntime.prepareRunEpoch(
+            session: session, stopFence: stopFence,
+            transitionToken: Self.mcpRunEpochTransitionToken,
+            store: AgentRunSessionStore.shared,
+            cancelInstalledRun: { exact in
+                await service.cancelRun(tabID: exact.tabID, session: exact, intent: .runtimeShutdown, completion: .terminalTeardownCompleted)
+            },
+            afterEpochBegan: afterEpoch
+        )
     }
 
     func mcpSnapshot(sessionID: UUID) -> AgentRunMCPSnapshot? {
@@ -18671,28 +18594,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         shouldPublishCatalog: @MainActor () -> Bool = { true }
     ) async -> String {
         let effectiveAgent = agent ?? session?.selectedAgent ?? activeSession?.selectedAgent ?? selectedAgent
-        let withSkillExpansion = skipsSlashExpansion ? text : await expandSlashSkillInvocationIfNeeded(text, agentKind: effectiveAgent, shouldPublishCatalog: shouldPublishCatalog)
-        guard shouldPublishCatalog() else { return withSkillExpansion }
-        let lookupContext: WorkspaceLookupContext = if let session {
-            await agentWorkspaceLookupContext(tabID: session.tabID, session: session)
-        } else if let tabID = currentTabID {
-            await agentWorkspaceLookupContext(tabID: tabID, session: sessions[tabID])
-        } else {
-            .visibleWorkspace
-        }
-        guard shouldPublishCatalog() else { return withSkillExpansion }
-        let context = promptManager.map {
-            AgentSessionProviderInputRuntime.Context(store: $0.workspaceFileContextStore, lookup: lookupContext)
-        }
-        let providerText = await providerInputRuntime.finishUserMessage(
-            withSkillExpansion,
+        let providerText = await providerInputRuntime.augmentUserMessage(
+            text,
             attachments: attachments,
             taggedFileAttachments: taggedFileAttachments,
             agent: effectiveAgent,
-            context: context,
+            workspacePaths: currentWorkspacePaths(),
+            workspace: { self.providerWorkspaceSource(tabID: session?.tabID ?? self.currentTabID, session: session) },
             session: session,
             handoff: handoffRuntime,
             ignoresPendingHandoff: ignoresPendingHandoff,
+            skipsSlashExpansion: skipsSlashExpansion,
             isCurrent: shouldPublishCatalog
         )
         guard shouldPublishCatalog() else { return providerText }
@@ -18737,11 +18649,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     @MainActor
     func stageClaudeResumeRecoveryHandoffIfNeeded(for session: TabSession) async -> Bool {
         await prepareResumeRecoveryHandoff(for: session).permitsFreshSession
-    }
-
-    @MainActor
-    private func expandSlashSkillInvocationIfNeeded(_ text: String, agentKind: AgentProviderKind? = nil, shouldPublishCatalog: @MainActor () -> Bool = { true }) async -> String {
-        await providerInputRuntime.expandSlashSkillInvocationIfNeeded(text, agentKind: agentKind ?? activeSession?.selectedAgent ?? selectedAgent, workspacePaths: currentWorkspacePaths(), shouldPublishCatalog: shouldPublishCatalog)
     }
 
     // MARK: - Agent Run Lifecycle
@@ -20119,44 +20026,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func shouldIncludeInitialThreadContext(for session: TabSession) -> Bool {
-        guard session.providerSessionID == nil else { return false }
-        guard !session.items.contains(where: Self.itemBlocksInitialThreadContext) else { return false }
-        let userMessageCount = session.items.enumerated().reduce(into: 0) { partialResult, entry in
-            let (index, item) = entry
-            if item.kind == .user,
-               !item.isLocalControlPlaneEcho,
-               !Self.isGoalObjectiveControlEcho(item, at: index, in: session.items)
-            {
-                partialResult += 1
-            }
-        }
-        return userMessageCount <= 1
-    }
-
-    private static func isGoalObjectiveControlEcho(_ item: AgentChatItem, at index: Int, in items: [AgentChatItem]) -> Bool {
-        guard item.kind == .user else { return false }
-        let objective = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !objective.isEmpty else { return false }
-        let expectedResultPrefix = "Set Codex goal: \(objective)"
-        return items.dropFirst(index + 1).contains { candidate in
-            candidate.kind == .system && candidate.text.contains(expectedResultPrefix)
-        }
-    }
-
-    private static func itemBlocksInitialThreadContext(_ item: AgentChatItem) -> Bool {
-        switch item.kind {
-        case .assistant, .assistantInline, .toolCall, .toolResult, .thinking:
-            true
-        case .user, .system, .error:
-            false
-        }
+        AgentSessionProviderInputRuntime.shouldIncludeInitialThreadContext(for: session)
     }
 
     private func initialThreadContext(tabID: UUID, session: TabSession?) async -> (fileTree: String, promptText: String?) {
         guard let promptManager else {
             return ("", nil)
         }
-        let store = promptManager.workspaceFileContextStore
         let isActiveTab = tabID == currentTabID
         if isActiveTab {
             workspaceManager?.publishActiveComposeTabSnapshot(commitToMemory: true)
@@ -20164,43 +20040,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let tabState = workspaceManager?.composeTab(with: tabID)
         let promptText = isActiveTab ? promptManager.promptText : tabState?.promptText
         let selection = tabState?.selection ?? StoredSelection()
-        let lookupContext = await agentWorkspaceLookupContext(tabID: tabID, session: session)
-        let fileTree = await AgentProviderContextBuilder.initialFileTree(
-            selection: selection,
-            store: store,
-            lookupContext: lookupContext
-        )
-        return (fileTree, promptText)
+        guard let workspace = providerWorkspaceSource(tabID: tabID, session: session) else { return ("", nil) }
+        return await providerInputRuntime.initialThreadContext(.init(
+            workspace: workspace, selection: selection, promptText: promptText
+        ))
     }
 
-    nonisolated static func composeInitialThreadMessage(
-        initialMessage: String,
-        fileTree: String,
-        promptText: String?
-    ) -> String {
-        let trimmedTree = fileTree.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedPrompt = promptText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let trimmedInstruction = initialMessage.trimmingCharacters(in: .whitespacesAndNewlines)
-        var contextSections: [String] = []
-        if !trimmedTree.isEmpty {
-            contextSections.append("""
-            <file_map>
-            \(trimmedTree)
-            </file_map>
-            """)
-        }
-        if !trimmedPrompt.isEmpty {
-            contextSections.append("""
-            <current_prompt_content>
-            \(trimmedPrompt)
-            </current_prompt_content>
-            """)
-        }
-        guard !contextSections.isEmpty else { return initialMessage }
-        guard !trimmedInstruction.isEmpty else {
-            return contextSections.joined(separator: "\n\n")
-        }
-        return [initialMessage, contextSections.joined(separator: "\n\n")].joined(separator: "\n\n")
+    nonisolated static func composeInitialThreadMessage(initialMessage: String, fileTree: String, promptText: String?) -> String {
+        AgentSessionProviderInputRuntime.composeInitialThreadMessage(initialMessage: initialMessage, fileTree: fileTree, promptText: promptText)
     }
 
     nonisolated static func composeClaudeResumeRecoveryHandoffPayload(

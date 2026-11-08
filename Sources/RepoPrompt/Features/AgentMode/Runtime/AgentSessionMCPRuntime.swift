@@ -4,6 +4,46 @@ import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptMCPServer
 
+struct AgentRunEpochTransitionIntent: Equatable {
+    let token: UUID
+    let kind: AgentRunEpochTransitionKind
+    let expectedCurrentEpoch: AgentRunTurnEpoch?
+}
+
+struct AgentMCPControlContext: Equatable {
+    let sessionID: UUID
+    let activationID: UUID
+    let registration: AgentRunSessionStore.Registration
+    var currentEpoch: AgentRunTurnEpoch?
+    var preparedEpoch: AgentRunTurnEpoch?
+    var pendingEpochTransition: AgentRunEpochTransitionIntent?
+    let originatingConnectionID: UUID?
+    let interactionTransport: AgentRunInteractionTransport
+    let suppressUserNotifications: Bool
+    let forceAutoEditEnabled: Bool
+    let autoEditEnabledBeforeOverride: Bool
+    /// The task label kind for this MCP-controlled run (e.g. explore, engineer).
+    /// Used to customize tool advertisement and system prompts for role-specific behavior.
+    let taskLabelKind: AgentModelCatalog.TaskLabelKind?
+
+    func replacingRegistration(_ registration: AgentRunSessionStore.Registration) -> Self {
+        Self(
+            sessionID: sessionID,
+            activationID: activationID,
+            registration: registration,
+            currentEpoch: currentEpoch,
+            preparedEpoch: preparedEpoch,
+            pendingEpochTransition: pendingEpochTransition,
+            originatingConnectionID: originatingConnectionID,
+            interactionTransport: interactionTransport,
+            suppressUserNotifications: suppressUserNotifications,
+            forceAutoEditEnabled: forceAutoEditEnabled,
+            autoEditEnabledBeforeOverride: autoEditEnabledBeforeOverride,
+            taskLabelKind: taskLabelKind
+        )
+    }
+}
+
 /// Runtime-owned remote projections and publication. DomainAgentRunSessionStore and the
 /// terminal commit barrier remain the only lifecycle/terminal authorities. Presentation
 /// attachment is not required to build snapshots, wake waiters or publish a committed turn.
@@ -65,6 +105,131 @@ final class AgentSessionMCPRuntime {
             else { return }
             AgentSessionInteractionRuntime.cancelPendingInstruction(for: session)
             await cancelInstalledRun(session)
+        }
+    }
+
+    /// Prepare the existing domain epoch without a presentation owner. Recovery installs its
+    /// exact cancellation capability atomically with registration, before publishing control.
+    func prepareRunEpoch(
+        session: AgentTabSession,
+        stopFence: AgentRunStartStopFence,
+        transitionToken: UUID?,
+        store: DomainAgentRunSessionStore,
+        cancelInstalledRun: @escaping @MainActor (AgentTabSession) async -> Void,
+        afterEpochBegan: (@MainActor () async -> Void)? = nil
+    ) async {
+        guard let scope, !scope.isRetiring, !scope.hasReleasedWriterClaims, scope.sessions[session.tabID] === session else { return }
+        defer { withExtendedLifetime(scope) {} }
+        guard stopFence.permitsStart(of: session), !session.runState.isActive,
+              let originalContext = session.mcpControlContext
+        else { return }
+        if originalContext.preparedEpoch != nil {
+            return
+        }
+        let scopedTransitionIntent = originalContext.pendingEpochTransition.flatMap { intent -> AgentRunEpochTransitionIntent? in
+            guard intent.token == transitionToken,
+                  intent.expectedCurrentEpoch == originalContext.currentEpoch
+            else { return nil }
+            return intent
+        }
+        let transitionKind: AgentRunEpochTransitionKind = if let scopedTransitionIntent {
+            scopedTransitionIntent.kind
+        } else if originalContext.currentEpoch == nil {
+            .initial
+        } else if originalContext.pendingEpochTransition != nil {
+            .unrelated
+        } else if session.mcpFollowUpRunPending {
+            .relatedFollowUp
+        } else {
+            .unrelated
+        }
+        let activationGeneration = session.mcpControlActivationGeneration
+        var recoveryCancellation: ControlActivationCancellation?
+        var registration = originalContext.registration
+        var result = await store.beginEpoch(
+            registration: registration,
+            activationID: originalContext.activationID,
+            expectedCurrentEpoch: originalContext.currentEpoch,
+            transitionKind: transitionKind
+        )
+        // A stale result means the existing record advanced to another epoch; only rejected
+        // results are eligible for missing-record recovery through registerIfMissing.
+        if case .rejected = result {
+            let cancellation = ControlActivationCancellation(
+                scope: scope, session: session, activationID: originalContext.activationID,
+                cancelInstalledRun: cancelInstalledRun
+            )
+            recoveryCancellation = cancellation
+            // Control activation already requires a persistent incarnation. An unbound or
+            // retiring projection cannot recover a missing registration as a new writer.
+            guard stopFence.permitsStart(of: session),
+                  session.mcpControlActivationGeneration == activationGeneration,
+                  let context = session.mcpControlContext,
+                  context.activationID == originalContext.activationID,
+                  context.registration == originalContext.registration,
+                  context.currentEpoch == originalContext.currentEpoch,
+                  cancellation.permitsPublication,
+                  let recoveredRegistration = await store.registerIfMissing(
+                      recovering: originalContext.registration,
+                      cancellationHandler: { await cancellation.cancel(registration: $0) }
+                  )
+            else {
+                return
+            }
+            guard cancellation.permitsPublication, stopFence.permitsStart(of: session),
+                  session.mcpControlActivationGeneration == activationGeneration,
+                  let context = session.mcpControlContext,
+                  context.activationID == originalContext.activationID,
+                  context.registration == originalContext.registration,
+                  context.currentEpoch == originalContext.currentEpoch
+            else {
+                await store.cleanup(registration: recoveredRegistration)
+                return
+            }
+            registration = recoveredRegistration
+            result = await store.beginEpoch(
+                registration: registration,
+                activationID: originalContext.activationID,
+                expectedCurrentEpoch: nil,
+                transitionKind: transitionKind
+            )
+        }
+        await afterEpochBegan?()
+        // Preserve an already-admitted original epoch even if presentation/scope membership
+        // changed during the actor hop. Only new recovery control requires publication admission.
+        guard recoveryCancellation?.permitsPublication != false,
+              case let .accepted(epoch) = result,
+              stopFence.binding == session.persistentSessionBindingIdentity,
+              !session.bindingTransitionInProgress,
+              session.mcpControlActivationGeneration == activationGeneration,
+              var context = session.mcpControlContext,
+              context.activationID == originalContext.activationID,
+              context.registration == originalContext.registration,
+              context.currentEpoch == originalContext.currentEpoch || context.currentEpoch == epoch
+        else {
+            if registration != originalContext.registration {
+                await store.cleanup(registration: registration)
+            }
+            return
+        }
+        context = context.replacingRegistration(registration)
+        context.currentEpoch = epoch
+        context.preparedEpoch = epoch
+        let pendingTransitionToken = context.pendingEpochTransition?.token
+        let shouldClearPendingTransition = pendingTransitionToken == scopedTransitionIntent?.token
+            || pendingTransitionToken == transitionToken
+        if shouldClearPendingTransition {
+            context.pendingEpochTransition = nil
+        }
+        session.mcpControlContext = context
+        // An accepted epoch belongs to this binding even if Stop won during the actor hop.
+        // Retain it unconsumed for the next start; never leave the store ahead of its owner.
+        guard scope.sessions[session.tabID] === session, !scope.hasReleasedWriterClaims,
+              !scope.isRetiring, stopFence.permitsStart(of: session), !Task.isCancelled else { return }
+        session.mcpFollowUpRunPendingUpdatedAt = Date()
+        if !session.mcpFollowUpRunPending {
+            session.mcpFollowUpRunPending = true
+            handleObservedMCPStateChange(for: session, store: store)
         }
     }
 
@@ -729,7 +894,10 @@ final class AgentSessionMCPRuntime {
             && session.activeAgentSessionID == sessionID
     }
 
-    func handleObservedMCPStateChange(for session: AgentTabSession) {
+    func handleObservedMCPStateChange(
+        for session: AgentTabSession,
+        store: DomainAgentRunSessionStore = AgentRunSessionStore.shared
+    ) {
         guard !session.terminalCommitInProgress else { return }
         // Terminal waiter publication is owned exclusively by AgentRunTerminalCommitBarrier.
         // Legacy/special-purpose state changes without a canonical revision must not race it.
@@ -761,7 +929,7 @@ final class AgentSessionMCPRuntime {
             else {
                 return
             }
-            await AgentRunSessionStore.signalSnapshot(snapshot, cursor: cursor)
+            await store.noteSnapshot(snapshot, cursor: cursor)
         }
 
         if snapshot.status.isTerminal {

@@ -368,6 +368,18 @@ package actor DomainAgentRunSessionStore {
         return registration
     }
 
+    /// Missing-record recovery is only valid inside the original runtime incarnation.
+    /// A rejected epoch from a foreign/restarted runtime must not mint a new local owner.
+    package func registerIfMissing(
+        recovering previous: Registration,
+        cancellationHandler: @escaping RegistrationCancellationHandler
+    ) -> Registration? {
+        guard previous.runtimeID == identity.runtimeID,
+              previous.runtimeGeneration == identity.lifecycleGeneration,
+              previous.generation > 0 else { return nil }
+        return registerIfMissing(sessionID: previous.sessionID, cancellationHandler: cancellationHandler)
+    }
+
     private func bindCancellationHandler(_ handler: RegistrationCancellationHandler?, to registration: Registration) {
         cancellationHandlers[registration.sessionID] = handler.map { handler in
             { @Sendable in await handler(registration) }

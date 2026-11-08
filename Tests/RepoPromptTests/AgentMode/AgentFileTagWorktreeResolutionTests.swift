@@ -9,26 +9,79 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
     @MainActor
     func testRuntimeProviderInputUsesCapturedWorktreeContentWithoutPresentation() async throws {
         let fixture = try await makeBoundFixture(includeBranchOnly: false)
-        let lookup = await makeLookupContext(fixture: fixture)
+        let source = AgentSessionProviderInputRuntime.WorkspaceSource(
+            store: fixture.store,
+            lookupSource: .init(activeAgentSessionID: fixture.sessionID, worktreeBindings: [fixture.binding])
+        )
         let scope = AgentSessionRuntimeStore().makeScope()
         let catalog = AgentSkillCatalog(homeDirectoryURL: fixture.logicalRoot.appendingPathComponent("home"))
         let input = scope.providerInput(skillCatalog: catalog, perfRecorder: NoopAgentModePerfRecorder())
         XCTAssertTrue(input === scope.providerInput(skillCatalog: catalog, perfRecorder: NoopAgentModePerfRecorder()))
-        let text = await input.finishUserMessage(
+        let text = await input.augmentUserMessage(
             "Inspect @Sources/App.swift", attachments: [], taggedFileAttachments: [], agent: .claudeCode,
-            context: .init(store: fixture.store, lookup: lookup), session: nil,
-            handoff: scope.handoff, ignoresPendingHandoff: true, isCurrent: { true }
+            workspacePaths: [fixture.logicalRoot.path], workspace: { source }, session: nil,
+            handoff: scope.handoff, ignoresPendingHandoff: true, skipsSlashExpansion: false, isCurrent: { true }
         )
         XCTAssertTrue(text.contains("let origin = \"worktree\""), text)
         XCTAssertFalse(text.contains("let origin = \"base\""), text)
         XCTAssertFalse(text.contains(fixture.worktreeRoot.path), text)
         XCTAssertEqual(text.components(separatedBy: "<file_contents>").count - 1, 1)
-        let repeated = await input.finishUserMessage(
+        let repeated = await input.augmentUserMessage(
             text, attachments: [], taggedFileAttachments: [], agent: .claudeCode,
-            context: .init(store: fixture.store, lookup: lookup), session: nil,
-            handoff: scope.handoff, ignoresPendingHandoff: true, isCurrent: { true }
+            workspacePaths: [fixture.logicalRoot.path], workspace: { source }, session: nil,
+            handoff: scope.handoff, ignoresPendingHandoff: true, skipsSlashExpansion: true, isCurrent: { true }
         )
         XCTAssertEqual(repeated, text)
+        let context = await input.initialThreadContext(.init(
+            workspace: source,
+            selection: .init(selectedPaths: [fixture.logicalRoot.appendingPathComponent("Sources/App.swift").path]),
+            promptText: "Captured prompt"
+        ))
+        XCTAssertTrue(context.fileTree.contains("App.swift"), context.fileTree)
+        XCTAssertFalse(context.fileTree.contains(fixture.worktreeRoot.path), context.fileTree)
+        let initial = AgentSessionProviderInputRuntime.composeInitialThreadMessage(
+            initialMessage: "Inspect", fileTree: context.fileTree, promptText: context.promptText
+        )
+        XCTAssertTrue(initial.contains("<file_map>"), initial)
+        XCTAssertTrue(initial.contains("<current_prompt_content>\nCaptured prompt\n</current_prompt_content>"), initial)
+        XCTAssertTrue(initial.hasPrefix("Inspect\n\n"), initial)
+    }
+
+    @MainActor
+    func testRuntimeInputResolvesPresentationSourceAfterSkillsAndHonorsRefusal() async throws {
+        let fixture = try await makeBoundFixture(includeBranchOnly: true)
+        _ = await makeLookupContext(fixture: fixture)
+        let commands = fixture.logicalRoot.appendingPathComponent(".claude/commands")
+        try FileManager.default.createDirectory(at: commands, withIntermediateDirectories: true)
+        try "Inspect $ARGUMENTS".write(to: commands.appendingPathComponent("inspect.md"), atomically: true, encoding: .utf8)
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let catalog = AgentSkillCatalog(homeDirectoryURL: fixture.logicalRoot.appendingPathComponent("home"))
+        let input = scope.providerInput(skillCatalog: catalog, perfRecorder: NoopAgentModePerfRecorder())
+        var sourceReads = 0
+        let result = await input.augmentUserMessage(
+            "/skill:inspect @Sources/App.swift", attachments: [], taggedFileAttachments: [], agent: .claudeCode,
+            workspacePaths: [fixture.logicalRoot.path], workspace: {
+                sourceReads += 1
+                XCTAssertNotNil(catalog.resolve(name: "inspect"), "Binding inputs must be captured after skill discovery")
+                // The same branch used while a binding transition is in progress. Hidden
+                // worktree roots remain loaded, but must not become the visible fallback.
+                return .init(store: fixture.store, lookupSource: nil)
+            }, session: nil, handoff: scope.handoff, ignoresPendingHandoff: true,
+            skipsSlashExpansion: false, isCurrent: { true }
+        )
+        XCTAssertEqual(sourceReads, 1)
+        XCTAssertTrue(result.contains("<selected_skill_context name=\"inspect\""), result)
+        XCTAssertTrue(result.contains("let origin = \"base\""), result)
+        XCTAssertFalse(result.contains("let origin = \"worktree\""), result)
+        let refused = await input.augmentUserMessage(
+            "@Sources/App.swift", attachments: [], taggedFileAttachments: [], agent: .claudeCode,
+            workspacePaths: [fixture.logicalRoot.path], workspace: {
+                XCTFail("Refused input must not read workspace source")
+                return .init(store: fixture.store, lookupSource: nil)
+            }, session: nil, handoff: scope.handoff, ignoresPendingHandoff: true,
+            skipsSlashExpansion: true, isCurrent: { false }
+        )
+        XCTAssertEqual(refused, "@Sources/App.swift")
     }
 
     @MainActor

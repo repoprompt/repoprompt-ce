@@ -544,7 +544,7 @@ final class AgentTabSession: ObservableObject {
     var worktreeMergeReviewTimeoutTask: Task<Void, Never>?
     /// External MCP control attachment. Its presence and effective task label determine whether this
     /// exact session may act as an oversight observer.
-    var mcpControlContext: AgentModeViewModel.AgentMCPControlContext? {
+    var mcpControlContext: AgentMCPControlContext? {
         didSet {
             if mcpControlContext != nil { oversight.overseerActivation = nil }
             guard oldValue?.taskLabelKind != mcpControlContext?.taskLabelKind

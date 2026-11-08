@@ -349,6 +349,144 @@ final class AgentSessionStreamRuntimeTests: XCTestCase {
 
 @MainActor
 final class AgentSessionMCPRuntimeTests: XCTestCase {
+    func testRecoveredEpochCancellationIsInstalledBeforeControlPublication() async throws {
+        for refusal in ["cancel", "retire", "replacement", "installed"] {
+            let cancelBeforePublication = refusal != "installed"
+            let store = makeCancellationStore()
+            let scope = AgentSessionRuntimeStore().makeScope()
+            let session = AgentTabSession(tabID: UUID())
+            let id = UUID(), activationID = UUID()
+            session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: id, workspaceID: UUID()))
+            scope.replaceSessions([session.tabID: session])
+            let original = await store.register(sessionID: id)
+            await store.cleanup(registration: original)
+            for invalid in [
+                DomainAgentSessionRegistration(runtimeID: original.runtimeID, runtimeGeneration: original.runtimeGeneration + 1, sessionID: id, generation: original.generation),
+                DomainAgentSessionRegistration(runtimeID: original.runtimeID, runtimeGeneration: original.runtimeGeneration, sessionID: id, generation: 0)
+            ] {
+                let admitted = await store.registerIfMissing(recovering: invalid) { _ in
+                    XCTFail("Invalid recovery must not install a cancellation capability")
+                }
+                XCTAssertNil(admitted)
+            }
+            session.mcpControlContext = .init(
+                sessionID: id, activationID: activationID, registration: original,
+                currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
+                originatingConnectionID: nil, interactionTransport: .mcp(sessionID: id, originatingConnectionID: nil),
+                suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: nil
+            )
+            let foreignStore = makeCancellationStore()
+            await scope.mcp.prepareRunEpoch(
+                session: session, stopFence: .init(session: session), transitionToken: nil, store: foreignStore,
+                cancelInstalledRun: { _ in XCTFail("A foreign authority cannot own recovery cancellation") }
+            )
+            let foreignRegistration = await foreignStore.currentRegistration(for: id)
+            XCTAssertNil(foreignRegistration, "A foreign runtime must not turn a rejected epoch into local admission")
+            XCTAssertEqual(session.mcpControlContext?.registration, original)
+            _ = await foreignStore.shutdown()
+            var cancellations = 0
+            var recovered: AgentRunSessionStore.Registration?
+            await scope.mcp.prepareRunEpoch(
+                session: session, stopFence: .init(session: session), transitionToken: nil, store: store,
+                cancelInstalledRun: { exact in
+                    XCTAssertIdentical(exact, session)
+                    cancellations += 1
+                }, afterEpochBegan: {
+                    recovered = await store.currentRegistration(for: id)
+                    XCTAssertNotEqual(recovered, original)
+                    XCTAssertEqual(session.mcpControlContext?.registration, original)
+                    if refusal == "cancel", let recovered {
+                        let handled = await store.test_invokeCancellationHandler(registration: recovered)
+                        XCTAssertTrue(handled, "Recovery must install cancellation in the registration actor turn")
+                    } else if refusal == "retire" {
+                        scope.beginRetirement()
+                    } else if refusal == "replacement" {
+                        let replacement = AgentTabSession(tabID: session.tabID)
+                        scope.replaceSessions([replacement.tabID: replacement])
+                    }
+                }
+            )
+            let registration = try XCTUnwrap(recovered)
+            if cancelBeforePublication {
+                XCTAssertEqual(cancellations, 0, "A pending replacement must not cancel the previous context")
+                XCTAssertEqual(session.mcpControlContext?.registration, original)
+                XCTAssertNil(session.mcpControlContext?.preparedEpoch)
+                let current = await store.currentRegistration(for: id)
+                XCTAssertNil(current, "Cancelled recovery must release its own registration")
+            } else {
+                XCTAssertEqual(session.mcpControlContext?.registration, registration)
+                XCTAssertNotNil(session.mcpControlContext?.preparedEpoch)
+                let handled = await store.test_invokeCancellationHandler(registration: registration)
+                XCTAssertTrue(handled)
+                XCTAssertEqual(cancellations, 1)
+                session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: id, workspaceID: UUID()))
+                _ = await store.test_invokeCancellationHandler(registration: registration)
+                XCTAssertEqual(cancellations, 1, "Recovery cancellation must not reach a rebound incarnation")
+                await store.cleanup(registration: registration)
+            }
+            _ = await store.shutdown()
+        }
+    }
+
+    func testRecoveredEpochAcceptedBeforeStopIsRetainedWithoutStartingFollowUp() async throws {
+        let store = makeCancellationStore()
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        let id = UUID()
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: id, workspaceID: UUID()))
+        scope.replaceSessions([session.tabID: session])
+        let original = await store.register(sessionID: id)
+        await store.cleanup(registration: original)
+        session.mcpControlContext = .init(
+            sessionID: id, activationID: UUID(), registration: original,
+            currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
+            originatingConnectionID: nil, interactionTransport: .mcp(sessionID: id, originatingConnectionID: nil),
+            suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: nil
+        )
+        await scope.mcp.prepareRunEpoch(
+            session: session, stopFence: .init(session: session), transitionToken: nil, store: store,
+            cancelInstalledRun: { _ in XCTFail("Local Stop fencing must not invoke shutdown cancellation") },
+            afterEpochBegan: { session.stopState.invalidateScheduledStarts() }
+        )
+        let registration = try XCTUnwrap(session.mcpControlContext?.registration)
+        XCTAssertNotEqual(registration, original)
+        let actualEpoch = await store.currentEpoch(for: registration)
+        XCTAssertNotNil(actualEpoch)
+        XCTAssertEqual(session.mcpControlContext?.currentEpoch, actualEpoch)
+        XCTAssertEqual(session.mcpControlContext?.preparedEpoch, actualEpoch)
+        XCTAssertFalse(session.mcpFollowUpRunPending)
+        await store.cleanup(registration: registration)
+        _ = await store.shutdown()
+    }
+
+    func testAcceptedOriginalEpochIsReconciledAfterScopeMembershipChanges() async {
+        let store = makeCancellationStore()
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        let id = UUID()
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: id, workspaceID: UUID()))
+        scope.replaceSessions([session.tabID: session])
+        let original = await store.register(sessionID: id)
+        session.mcpControlContext = .init(
+            sessionID: id, activationID: UUID(), registration: original,
+            currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
+            originatingConnectionID: nil, interactionTransport: .mcp(sessionID: id, originatingConnectionID: nil),
+            suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: nil
+        )
+        await scope.mcp.prepareRunEpoch(
+            session: session, stopFence: .init(session: session), transitionToken: nil, store: store,
+            cancelInstalledRun: { _ in XCTFail("An existing registration must not be replaced") },
+            afterEpochBegan: { scope.replaceSessions([:]) }
+        )
+        let actualEpoch = await store.currentEpoch(for: original)
+        XCTAssertNotNil(actualEpoch)
+        XCTAssertEqual(session.mcpControlContext?.currentEpoch, actualEpoch)
+        XCTAssertEqual(session.mcpControlContext?.preparedEpoch, actualEpoch)
+        XCTAssertFalse(session.mcpFollowUpRunPending, "Only the original epoch is reconciled, not a successor start")
+        await store.cleanup(registration: original)
+        _ = await store.shutdown()
+    }
+
     func testRegistrationRetainsExactRuntimeCancellationUntilCleanupWithoutPresentation() async throws {
         let store = makeCancellationStore()
         var scope: AgentSessionRuntimeStore.Scope? = AgentSessionRuntimeStore().makeScope()

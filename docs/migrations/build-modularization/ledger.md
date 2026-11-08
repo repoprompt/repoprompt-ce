@@ -5001,3 +5001,49 @@ admission and remaining startup/terminal commands still require the main M9 cuto
 legacy child-wake publication/origin callbacks and tool bootstrap still depend on window composition.
 This checkpoint is not full-suite, aggregate-warning, hosted-CI or live-smoke qualification and does
 not establish presentation-preserving managed execution or M9 completion.
+
+### M9 continuation — input context assembly and recovered control epochs (2026-11-08)
+
+Moved initial-thread eligibility, context wrapping, actual file-tree assembly and asynchronous
+skill/context/attachment/handoff orchestration into `AgentSessionProviderInputRuntime`. Composition
+still supplies the existing presentation lookup source, captured after skill discovery at the same
+boundary as before. This preserves mutable worktree-binding timing; it is explicitly the existing
+permissive presentation policy, not canonical saved-host admission. The VM retains UI snapshot and
+source selection, not a second copy of the input-building algorithms.
+
+Moved actual MCP epoch preparation into the scope-owned MCP runtime. Missing-record recovery now
+installs the existing exact cancellation capability atomically with registration before recovered
+control is published. The domain overload rejects foreign runtimes, other lifecycle generations and
+invalid registrations; it uses the existing registration authority. Accepted original epochs are
+reconciled even when scope membership changes during the actor hop, while successor effects still
+require the current scope and Stop fence. New recovery control additionally requires exact current
+incarnation and admission; cancellation, retirement or replacement cleans up its partial registration.
+Snapshot publication uses the same injected domain store. Neutral in-memory control/transition values
+replace VM-nested definitions without changing persisted schema.
+
+Coverage exercises real worktree content and initial-context wrapping, post-skill source capture and
+refusal, pending versus installed recovery cancellation, retirement, replacement, foreign/invalid
+registrations, accepted epochs across Stop and accepted original epochs after scope removal. New
+runtime fixtures do not construct WindowState, PromptViewModel or WorkspaceManagerViewModel. No
+assertions or timeouts were weakened and no additional lifecycle owner was introduced.
+
+Validation:
+- `0af74f3f-74b1-482b-9dc4-bcb176b3683b` failed compilation before tests: missing provider-kind
+  import. The corrected input-context run `4e9c74d8-096c-4b43-bc5d-685da8c5f963` passed **195 tests**.
+- Epoch attempts `7d445a2b-ccac-4f10-a042-6d36d9665035` and
+  `073c25bd-fb09-47a9-9871-5cb8da6d9b9f` failed compilation before tests: the handler needed
+  `@escaping`, then the extracted transition value needed its neutral owner. Both were corrected.
+- Final `892e9cf6-c688-4e89-9fde-82414c91becf` passed **281 tests**: composer submission 39,
+  worktree file tags 18, MCP steer/resume 27, first-save admission 47, handoff inheritance 100,
+  runtime MCP 12 and Claude approval/resume 38. Actual named XCTest counts were checked.
+- Both products passed `76923a6c-735a-4167-b36e-e7c00fa45bf2`; lint passed
+  `3f494305-0437-40c6-b05a-d11dc0b5fc27` on the final Swift tree.
+- Fresh compiler index passed **1239/1360** wrong-way file edges and **53/66** largest-cycle
+  components (1133 files, 156477 symbols), without a baseline increase.
+- Scoped formatting and one independent review per transition completed; review findings about
+  binding-capture timing and already-accepted epoch reconciliation were applied and tested.
+  Mandatory staged contribution preflight applies before commit.
+
+Canonical writer admission, window-free saved host and catalog/context composition, remaining
+startup/terminal commands and exact runtime routing remain open. This is not full-suite,
+aggregate-warning, hosted-CI or live-smoke qualification and does not establish M9 completion.

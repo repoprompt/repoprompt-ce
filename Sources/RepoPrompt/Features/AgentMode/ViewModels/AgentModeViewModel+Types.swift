@@ -407,45 +407,8 @@ extension AgentModeViewModel {
     /// provider binding layer's top-level permission profile model.
     typealias AgentPermissionProfile = AgentProviderPermissionProfile
 
-    struct AgentRunEpochTransitionIntent: Equatable {
-        let token: UUID
-        let kind: AgentRunEpochTransitionKind
-        let expectedCurrentEpoch: AgentRunTurnEpoch?
-    }
-
-    struct AgentMCPControlContext: Equatable {
-        let sessionID: UUID
-        let activationID: UUID
-        let registration: AgentRunSessionStore.Registration
-        var currentEpoch: AgentRunTurnEpoch?
-        var preparedEpoch: AgentRunTurnEpoch?
-        var pendingEpochTransition: AgentRunEpochTransitionIntent?
-        let originatingConnectionID: UUID?
-        let interactionTransport: AgentInteractionTransport
-        let suppressUserNotifications: Bool
-        let forceAutoEditEnabled: Bool
-        let autoEditEnabledBeforeOverride: Bool
-        /// The task label kind for this MCP-controlled run (e.g. explore, engineer).
-        /// Used to customize tool advertisement and system prompts for role-specific behavior.
-        let taskLabelKind: AgentModelCatalog.TaskLabelKind?
-
-        func replacingRegistration(_ registration: AgentRunSessionStore.Registration) -> Self {
-            Self(
-                sessionID: sessionID,
-                activationID: activationID,
-                registration: registration,
-                currentEpoch: currentEpoch,
-                preparedEpoch: preparedEpoch,
-                pendingEpochTransition: pendingEpochTransition,
-                originatingConnectionID: originatingConnectionID,
-                interactionTransport: interactionTransport,
-                suppressUserNotifications: suppressUserNotifications,
-                forceAutoEditEnabled: forceAutoEditEnabled,
-                autoEditEnabledBeforeOverride: autoEditEnabledBeforeOverride,
-                taskLabelKind: taskLabelKind
-            )
-        }
-    }
+    typealias AgentRunEpochTransitionIntent = RepoPromptApp.AgentRunEpochTransitionIntent
+    typealias AgentMCPControlContext = RepoPromptApp.AgentMCPControlContext
 
     /// Internal for cross-file AgentModeViewModel extension access after the mechanical file split.
     enum MCPActiveInstructionDeliverySignalTiming: Equatable {
