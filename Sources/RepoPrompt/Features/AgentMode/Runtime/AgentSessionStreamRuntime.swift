@@ -166,6 +166,17 @@ final class AgentSessionStreamRuntime {
     @discardableResult
     func applyClaudeReasoningStatusDelta(_ delta: String, session: AgentTabSession) -> Bool {
         guard ClaudeReasoningExtractionFeature.isEnabled else { return false }
+        return applyEnabledClaudeReasoningStatusDelta(delta, session: session)
+    }
+
+    #if DEBUG
+        /// Exercise the enabled path without changing the production feature flag.
+        func test_applyClaudeReasoningStatusDelta(_ delta: String, session: AgentTabSession) -> Bool {
+            applyEnabledClaudeReasoningStatusDelta(delta, session: session)
+        }
+    #endif
+
+    private func applyEnabledClaudeReasoningStatusDelta(_ delta: String, session: AgentTabSession) -> Bool {
         guard session.selectedAgent.usesClaudeNativeRuntime else {
             Self.claudeReasoningDebug("drop delta for non-Claude-native agent tab=\(session.tabID.uuidString) selectedAgent=\(session.selectedAgent.rawValue)")
             return false
@@ -176,7 +187,7 @@ final class AgentSessionStreamRuntime {
             return false
         }
         Self.claudeReasoningDebug("apply delta tab=\(session.tabID.uuidString) deltaLen=\(delta.count) trimmedLen=\(trimmedDelta.count) snippet=\(Self.claudeReasoningDebugSnippet(delta)) statusBefore=\(session.runningStatusText ?? "nil") sourceBefore=\(String(describing: session.runningStatusSource))")
-        session.claudeReasoningStatusBuffer = delta
+        session.claudeReasoningStatusBuffer += delta
         if session.claudeReasoningStatusBuffer.count > Self.claudeReasoningStatusBufferCharacterLimit {
             session.claudeReasoningStatusBuffer = String(session.claudeReasoningStatusBuffer.suffix(Self.claudeReasoningStatusBufferCharacterLimit))
             Self.claudeReasoningDebug("trimmed reasoning buffer tab=\(session.tabID.uuidString) bufferLen=\(session.claudeReasoningStatusBuffer.count)")

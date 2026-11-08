@@ -18601,7 +18601,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     #if DEBUG
         func test_applyClaudeReasoningStatusDelta(_ delta: String, session: TabSession) -> Bool {
-            applyClaudeReasoningStatusDelta(delta, session: session)
+            streamRuntime.test_applyClaudeReasoningStatusDelta(delta, session: session)
         }
 
         func test_handleStreamResult(

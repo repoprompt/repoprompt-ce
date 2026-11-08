@@ -220,6 +220,37 @@ final class AgentSessionAttachmentRuntimeTests: XCTestCase {
 
 @MainActor
 final class AgentSessionStreamRuntimeTests: XCTestCase {
+    func testClaudeReasoningPreviewAccumulatesChunksAndBoundsBufferAfterFullBlock() {
+        let viewModel = AgentModeViewModel(
+            testWorkspacePath: NSTemporaryDirectory(),
+            codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) }
+        )
+        let session = AgentTabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        // Exercise immediate updates to an already visible reasoning status, without a timer.
+        _ = session.setRunningStatus("Thinking", source: .reasoning)
+        let deltas = ["First line\nInvest", "igating the ", "parser."]
+        for delta in deltas {
+            XCTAssertTrue(viewModel.test_applyClaudeReasoningStatusDelta(delta, session: session))
+        }
+        let fullBlock = deltas.joined()
+        XCTAssertEqual(session.claudeReasoningStatusBuffer, fullBlock)
+        XCTAssertEqual(session.runningStatusText, "Investigating the parser.")
+
+        // The translator can emit the complete multiline thinking block after its chunks.
+        XCTAssertFalse(viewModel.test_applyClaudeReasoningStatusDelta(fullBlock, session: session))
+        XCTAssertEqual(session.runningStatusText, "Investigating the parser.")
+
+        let oversizedDelta = String(repeating: "🧠", count: 4000) + "\nLatest "
+        XCTAssertTrue(viewModel.test_applyClaudeReasoningStatusDelta(oversizedDelta, session: session))
+        XCTAssertEqual(session.claudeReasoningStatusBuffer.count, 4000)
+        XCTAssertTrue(viewModel.test_applyClaudeReasoningStatusDelta("bounded line", session: session))
+        XCTAssertEqual(session.claudeReasoningStatusBuffer, String((oversizedDelta + "bounded line").suffix(4000)))
+        XCTAssertEqual(session.claudeReasoningStatusBuffer.count, 4000)
+        XCTAssertEqual(session.runningStatusText, "Latest bounded line")
+        XCTAssertNil(session.claudeReasoningStatusFlushTask)
+    }
+
     func testDetachedPresentationDoesNotDropAcceptedStreamOrToolBoundaries() async throws {
         let f = Fixture()
         let runtime = f.scope.stream
