@@ -748,7 +748,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         /// Test-only suspension point after async route qualification and before Codex's final route fence.
-        var test_agentSessionLinkAfterProviderInputRouteReadiness: (() async -> Void)?
+        var test_agentSessionLinkAfterProviderInputRouteReadiness: (() async -> Void)? {
+            get { linkExecutionRuntime.test_agentSessionLinkAfterProviderInputRouteReadiness }
+            set { linkExecutionRuntime.test_agentSessionLinkAfterProviderInputRouteReadiness = newValue }
+        }
+
         /// Supplies an optional frozen claim component for real native-adapter release tests.
         var test_agentSessionLinkLocalInputDecoration: ((AgentSessionLinkPromptRenderResult) -> AgentSessionLinkLocalInputDecoration?)? {
             get { linkExecutionRuntime.test_agentSessionLinkLocalInputDecoration }
@@ -3303,17 +3307,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     directStartOptions: options,
                     startOutcome: outcome,
                     providerSwitchPreparation: preparation
-                )
-            },
-            resume: { [weak self] session, text, claim, origin, proof, undecorated in
-                guard let self, sessions[session.tabID] === session else { return false }
-                return resumeWaitingInstructionContinuation(
-                    session: session,
-                    providerText: text,
-                    claim: claim,
-                    origin: origin,
-                    inputProof: proof,
-                    undecoratedProviderText: undecorated
                 )
             },
             settleSelfCompact: { [weak self] session in self?.agentSelfCompactSettleStaleParkedNote(session) },
@@ -20541,45 +20534,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         inputProof: AgentSessionLinkProviderInputRelease.Proof? = nil,
         undecoratedProviderText: String? = nil
     ) -> Bool {
-        guard let continuation = session.instructionContinuation else { return false }
-        session.noteAcceptedTaskInput() // User and lane-update continuations reuse, never reset, the attempt.
-        let released = inputProof.flatMap { proof in
-            claim.map { agentSessionLinkHandoffProviderInput(for: session, dispatchID: $0.dispatchID, claim: $0, proof: proof) }
-        }
-        guard released?.mustAbortDispatch != true else { return false }
-        let providerText = released.flatMap { release in undecoratedProviderText.map(release.text) } ?? providerText
-        let claim = released == nil ? claim : released?.claim
-        switch origin {
-        case .user:
-            // Estimated from the decorated text, not the augmented text: this is what the provider is
-            // actually handed, and the supplement it may carry can run to the renderer's full byte
-            // budget. Measuring the undecorated string would leave that entirely outside accounting.
-            addUserInputTokensToActiveNonCodexTurn(
-                Self.estimateRuntimeTokens(for: providerText),
-                for: session
-            )
-        case .laneUpdateAutoWake:
-            // This is provider-consumed system-origin input, not user-authored input. Account it in
-            // the non-user input bucket so context/cost estimates stay truthful without impersonating
-            // the local user.
-            addToolInputTokens(providerText, for: session)
-        }
-        session.instructionTimeoutTask?.cancel()
-        session.instructionTimeoutTask = nil
-        session.instructionContinuation = nil
-        session.instructionWaitID = nil
-        session.waitingPrompt = nil
-        session.runState = .running
-        updateBindingsFromSession(session)
-        continuation.resume(returning: UserInstructionResponse(
-            text: providerText,
-            timedOut: false,
-            elapsedSeconds: 0,
-            origin: origin
-        ))
-        // Successful `resume(returning:)` is the acceptance boundary.
-        acceptAgentSessionLinkPromptClaim(claim)
-        return true
+        linkExecutionRuntime.resumeWaitingInstructionContinuation(
+            session: session, providerText: providerText, claim: claim, origin: origin,
+            inputProof: inputProof, undecoratedProviderText: undecoratedProviderText
+        )
     }
 
     // MARK: - Ask User Question (MCP Tool Support)

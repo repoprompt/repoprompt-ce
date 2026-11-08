@@ -52,8 +52,8 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         let endpoint: DomainAgentSessionLinkEndpointIdentity
     }
 
-    /// Exact value-only placement for these runtime tests. Required execution commands explicitly
-    /// refuse provider starts; none delegates through a window, workspace VM or agent VM.
+    /// Exact value-only placement for these runtime tests. A start witness is supplied only by
+    /// tests exercising dispatch; none delegates through a window, workspace VM or agent VM.
     private func fixture(
         isAvailable: @escaping @MainActor () -> Bool = { true },
         workspace: WorkspaceModel? = nil,
@@ -91,9 +91,6 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 if let start { await start(session, text, outcome) }
                 else { XCTFail("This fixture must never launch a provider") }
                 return nil
-            },
-            resume: { _, _, _, _, _, _ in XCTFail("No waiting continuation is installed")
-                return false
             },
             settleSelfCompact: { session in XCTAssertNil(session.selfCompactState.active) },
             selfCompactBlocksWake: { $0.selfCompactState.blocksAutomaticWake },
@@ -306,6 +303,165 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             XCTAssertTrue(f.session.pendingTurnRuntimeAnchors.isEmpty)
             XCTAssertNil(f.session.activeComposerSubmitAttempt)
         }
+    }
+
+    func testWindowFreeInstructionResumeAccountsOriginAndAcknowledgesAfterSingleDelivery() async throws {
+        for origin in [UserInstructionResponse.Origin.user, .laneUpdateAutoWake(wakeID: UUID())] {
+            var available = true
+            let f = try fixture(isAvailable: { available })
+            f.session.selectedAgent = .claudeCode
+            _ = f.scope.usage.startNonCodexTurnAccountingIfNeeded(for: f.session, initialMessage: "")
+            f.runtime.agentSessionLinkPublishPromptInventory(
+                AgentSessionLinkAutoWakeTests.inventory(observerSessionID: f.endpoint.sessionID, revision: 1),
+                to: f.endpoint
+            )
+            let dispatch = AgentSessionLinkPromptDispatchID.headlessRun(runID: UUID())
+            let claim = try XCTUnwrap(f.runtime.agentSessionLinkPromptClaim(for: f.session, dispatchID: dispatch))
+            let installed = expectation(description: "Instruction continuation installed before response")
+            let response = Task { @MainActor in
+                try await withCheckedThrowingContinuation { continuation in
+                    f.session.instructionWaitID = UUID()
+                    f.session.instructionContinuation = continuation
+                    f.session.waitingPrompt = "Continue?"
+                    f.session.runState = .waitingForUser
+                    installed.fulfill()
+                }
+            }
+            await fulfillment(of: [installed], timeout: 3)
+            let baseText = "Exact provider input including the rendered supplement"
+            let proof = origin == .user ? nil : await AgentSessionLinkProviderInputRelease.prove(claim, readProof: { _ in false })
+            let text = proof == nil ? baseText : AgentSessionLinkPromptComposer.decorated(baseText, with: claim)
+            let attachment = f.scope.presentation.attach(f.session, sink: .init(
+                activityChanged: { _, _ in }, refresh: { _, _, _ in }, turnComplete: { _ in }, turnFailed: { _, _ in },
+                binding: { _ in
+                    XCTAssertFalse(f.runtime.agentSessionLinkPromptClaimStore.isPending(claim), "Receipt precedes optional presentation")
+                    available = false
+                }
+            ))
+            XCTAssertTrue(f.runtime.resumeWaitingInstructionContinuation(
+                session: f.session, providerText: baseText, claim: claim, origin: origin,
+                inputProof: proof, undecoratedProviderText: proof == nil ? nil : baseText
+            ))
+            XCTAssertFalse(available, "Presentation ran only after the delivery and receipt")
+            f.scope.presentation.detach(attachment)
+            available = true
+            XCTAssertFalse(f.runtime.resumeWaitingInstructionContinuation(session: f.session, providerText: "Duplicate", claim: claim, origin: origin))
+            if f.session.instructionContinuation != nil { AgentSessionInteractionRuntime.cancelPendingInstruction(for: f.session) }
+            let delivered = try await response.value
+            XCTAssertEqual(delivered.text, text)
+            XCTAssertEqual(delivered.origin, origin)
+            XCTAssertNil(f.session.instructionWaitID)
+            XCTAssertNil(f.session.waitingPrompt)
+            XCTAssertEqual(f.session.runState, .running)
+            let tokens = AgentSessionUsageRuntime.estimateRuntimeTokens(for: text)
+            XCTAssertEqual(f.session.activeNonCodexTurnTokenAccumulator?.estimatedUserInputTokens, origin == .user ? tokens : 0)
+            XCTAssertEqual(f.session.activeNonCodexTurnTokenAccumulator?.estimatedToolInputTokens, origin == .user ? 0 : tokens)
+            XCTAssertNil(f.session.lastUserMessageAt)
+            XCTAssertFalse(f.session.items.contains { $0.kind == .user })
+            XCTAssertNil(f.runtime.agentSessionLinkPromptClaim(for: f.session, dispatchID: .headlessRun(runID: UUID())))
+        }
+    }
+
+    func testInstructionResumeRefusesReplacementAndUnavailableOwnerWithoutConsumingContinuation() async throws {
+        var available = true
+        let f = try fixture(isAvailable: { available })
+        let installed = expectation(description: "Original wait is installed")
+        let response = Task { @MainActor in
+            try await withCheckedThrowingContinuation { continuation in
+                f.session.instructionWaitID = UUID()
+                f.session.instructionContinuation = continuation
+                f.session.runState = .waitingForUser
+                installed.fulfill()
+            }
+        }
+        await fulfillment(of: [installed], timeout: 3)
+        available = false
+        XCTAssertFalse(f.runtime.resumeWaitingInstructionContinuation(session: f.session, providerText: "Unavailable", claim: nil, origin: .user))
+        XCTAssertNotNil(f.session.instructionContinuation)
+        available = true
+        let replacement = AgentTabSession(tabID: f.session.tabID)
+        replacement.installPersistentSessionBinding(.init(tabID: replacement.tabID, sessionID: f.endpoint.sessionID, workspaceID: f.endpoint.workspaceID))
+        f.scope.replaceSessions([replacement.tabID: replacement])
+        XCTAssertFalse(f.runtime.ownsSession(f.session))
+        XCTAssertTrue(f.runtime.ownsSession(replacement))
+        XCTAssertFalse(f.runtime.resumeWaitingInstructionContinuation(session: f.session, providerText: "Stale", claim: nil, origin: .user))
+        XCTAssertNotNil(f.session.instructionContinuation)
+        XCTAssertNil(replacement.instructionContinuation)
+        AgentSessionInteractionRuntime.cancelPendingInstruction(for: f.session)
+        guard case let .failure(error) = await response.result, error is CancellationError else {
+            return XCTFail("Only the original cancellation owner may settle the refused continuation")
+        }
+        XCTAssertNil(f.session.instructionContinuation)
+    }
+
+    func testWindowFreeInstructionProofRefusalLeavesWakeClaimAndWaiterUnconsumed() async throws {
+        let f = try fixture()
+        f.session.selectedAgent = .claudeCode
+        let inventory = AgentSessionLinkAutoWakeTests.inventory(observerSessionID: f.endpoint.sessionID, revision: 1)
+        f.runtime.agentSessionLinkPublishPromptInventory(.init(
+            observerSessionID: inventory.observerSessionID, linkSetRevision: inventory.linkSetRevision,
+            items: inventory.items.map {
+                .init(
+                    targetSessionID: $0.targetSessionID,
+                    displayName: $0.displayName,
+                    capabilityNames: $0.capabilityNames + ["manage"],
+                    reference: $0.reference
+                )
+            }
+        ), to: f.endpoint)
+        f.session.runState = .running
+        // This exercises the continuation handoff, not wake scheduling. Reserve a real wake-family
+        // claim without admitting an asynchronous producer that could consume it first.
+        let wakeID = UUID()
+        let baseline = AgentSessionLinkAutoWakeTests.laneSnapshot(observerEndpoint: f.endpoint)
+        let entry = try XCTUnwrap(baseline.entries.first)
+        let metadata = AgentSessionLinkPassiveStatusNotices.ManagedMetadata(.init(
+            sessionID: entry.targetSessionID, displayName: entry.displayName, providerDisplayName: nil,
+            status: .idle, board: .empty, idleForSend: true, pendingInteractionKind: nil,
+            latestVisibleAssistantPreview: nil, visibleRowCount: 0, lastActivityAt: Date(timeIntervalSince1970: 0)
+        ))
+        let managedEntry = AgentSessionLinkPassiveStatusNotices.PendingEntry(
+            reference: entry.reference, targetEndpoint: entry.targetEndpoint, targetSessionID: entry.targetSessionID,
+            displayName: entry.displayName, fromStatus: entry.fromStatus, toStatus: entry.toStatus,
+            observedAt: entry.observedAt, idleForSend: entry.idleForSend,
+            changeSequence: entry.changeSequence, edgeSequence: entry.edgeSequence, managedMetadata: metadata
+        )
+        f.runtime.agentSessionLinkPublishPassiveStatusNotices(.init(
+            observerEndpoint: f.endpoint, queueEpoch: baseline.queueEpoch, queueRevision: baseline.queueRevision,
+            linkSetRevision: baseline.linkSetRevision, isEnabled: true, isDeliverable: true, entries: [managedEntry],
+            unacknowledgedOverflowCount: 0, overflowProduced: 0, autoWakeLanes: baseline.autoWakeLanes
+        ), to: f.endpoint)
+        let claim = try XCTUnwrap(f.runtime.agentSessionLinkPromptClaim(for: f.session, dispatchID: .autoWake(wakeID: wakeID)))
+        XCTAssertNotNil(claim.passive)
+        XCTAssertTrue(claim.dispatchID.isAutoWakeFamily)
+        XCTAssertFalse(claim.managedMetadataRequirements.isEmpty)
+        let proof = await AgentSessionLinkProviderInputRelease.prove(claim, readProof: { _ in false })
+        let installed = expectation(description: "Original wait before late proof refusal")
+        let response = Task { @MainActor in
+            try await withCheckedThrowingContinuation { continuation in
+                f.session.instructionWaitID = UUID()
+                f.session.instructionContinuation = continuation
+                f.session.runState = .waitingForUser
+                installed.fulfill()
+            }
+        }
+        await fulfillment(of: [installed], timeout: 3)
+        let waitID = f.session.instructionWaitID
+        let notices = f.runtime.agentSessionLinkPassiveNoticesBySessionID[f.endpoint.sessionID]
+        XCTAssertFalse(f.runtime.resumeWaitingInstructionContinuation(
+            session: f.session, providerText: "Must not send", claim: claim,
+            origin: .laneUpdateAutoWake(wakeID: wakeID), inputProof: proof, undecoratedProviderText: "Undecorated"
+        ))
+        XCTAssertEqual(f.session.instructionWaitID, waitID)
+        XCTAssertNotNil(f.session.instructionContinuation)
+        XCTAssertTrue(f.runtime.agentSessionLinkPromptClaimStore.isPending(claim))
+        XCTAssertEqual(f.runtime.agentSessionLinkPassiveNoticesBySessionID[f.endpoint.sessionID], notices)
+        XCTAssertTrue(f.session.items.isEmpty)
+        AgentSessionInteractionRuntime.cancelPendingInstruction(for: f.session)
+        guard case let .failure(error) = await response.result, error is CancellationError else {
+            return XCTFail("Refused handoff must leave settlement to cancellation")
+        }
+        f.session.oversight.pendingAutoWake = nil
     }
 
     func testWindowFreeInventoryHoldsAndClaimsRetainOneOwnerWithoutPresentation() throws {

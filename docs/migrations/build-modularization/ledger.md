@@ -4703,3 +4703,48 @@ Independent writer admission, canonical saved-run host construction, remaining c
 composition, runtime-addressed routing and presentation-preserving handoff/drain remain open.
 This transaction cutover is not M9 completion. Final full-suite, aggregate-warning and live-smoke
 qualification remain open; no visible app lifecycle action or M10 target move occurred.
+
+### M9 continuation — scope-owned instruction delivery and native link commands (2026-11-08)
+
+Retired the link executor's VM-forwarding instruction-resume callback. The runtime now owns
+continuation delivery, timeout cleanup, user-versus-lane token accounting and claim acceptance.
+It retains the exact scope through the synchronous delivery/receipt boundary, refuses a replaced
+object or retired/unavailable owner, and publishes optional presentation only after acceptance.
+A reentrant presentation callback therefore cannot remove the legacy command owner between
+physical delivery and its receipt. Refused delivery leaves the waiter to its existing cancellation
+owner; no replacement run is started. Existing task-input bookkeeping ordering is unchanged.
+
+Codex replay, bootstrap qualification, exact-object checks, provider-switch physical acquisition
+and lane-batch classification now use the installed concrete link runtime rather than the VM.
+Managed replay without that runtime fails closed. The readiness test seam forwards to the same
+runtime storage. This does not remove the remaining settings/bootstrap/start/catalog adapters
+or establish a complete window-free host.
+
+Three additional standalone runtime tests cover single delivery and origin-separated accounting,
+receipt ordering under reentrant presentation loss, recycled-tab/unavailable-owner refusal, and
+managed-proof refusal without consuming the original claim or instruction waiter. The negative
+proof fixture uses a real managed-metadata claim with a matching Manage inventory capability,
+then withholds the required current authorization proof. It does not start an unrelated wake task.
+
+Validation history is retained rather than treating retries as an initial pass:
+- `8ccd59d5-49e3-49c2-8ae6-72055a1b1344` failed test compilation (origin associated value and
+  throwing-continuation fixture types); production compiled. Both fixture errors were corrected.
+- `702e21c3-14d0-4e18-b147-40b06db782f7` ran 238 tests with two failing cases/seven assertions.
+  The new negative-proof fixture tested the wrong boundary; a transport tombstone alone is not
+  proof refusal. The existing periodic-deletion case also observed an already-cancelled attempt.
+- `a2701610-34fd-4544-9d3e-32a84c5dcbae` reran the 12 runtime tests plus the exact deletion case:
+  deletion passed; the negative fixture could not obtain a managed claim.
+- `86dca887-acfb-4935-ad79-3b2cddae6087` ran 166 tests with that same one fixture failure.
+  Two misspelled adapter filters matched nothing. Source inspection identified the fixture's
+  missing Manage inventory capability; the fail-closed production filter was not weakened.
+- Final `21dadc46-1065-4fb8-b1fb-e7b0a1ef824b` passed **238 tests**: runtime 12, auto-wake 127,
+  MCP steer/resume 27, Codex prompt adapter 41, native/headless prompt adapter 31. The periodic
+  deletion assertion passed in this broader run as well as the isolated run; its earlier ordering
+  failure remains unexplained, not classified as a baseline flake. No assertion or timeout changed.
+- Both products passed `d642820c-1071-4e00-907b-2e48b2e92f5a`; lint passed
+  `22219b3f-8e5d-45ce-b780-ba57353ed29b` on the same Swift tree. Scoped formatting, one independent
+  review and mandatory staged contribution preflight apply. No baseline or warning budget increased.
+
+Independent canonical writer admission, saved execution without window/view-model construction,
+remaining runtime command composition, runtime-addressed control routing and presentation-preserving
+handoff/drain remain required. This is not M9 completion or full-suite/CI/live-smoke qualification.

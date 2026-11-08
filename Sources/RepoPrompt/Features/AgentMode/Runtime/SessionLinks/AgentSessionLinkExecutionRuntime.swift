@@ -31,7 +31,6 @@ final class AgentSessionLinkExecutionRuntime {
         let initialMessage: @MainActor (AgentTabSession, String) async -> String
         let modelDisplayName: @MainActor (AgentTabSession) -> String
         let start: @MainActor (AgentTabSession, String, AgentDirectRunStartOptions, AgentRunStartOutcomeRecorder?, AgentProviderSwitchSendPreparation?) async -> CodexAgentModeCoordinator.NativeSendOutcome?
-        let resume: @MainActor (AgentTabSession, String, AgentSessionLinkOutboundPromptClaim?, UserInstructionResponse.Origin, AgentSessionLinkProviderInputRelease.Proof?, String?) -> Bool
         let settleSelfCompact: @MainActor (AgentTabSession) -> Void
         let selfCompactBlocksWake: @MainActor (AgentTabSession) -> Bool
         let composerTarget: @MainActor (UUID?, AgentTabSession?) -> AgentComposerSubmitTarget?
@@ -76,6 +75,7 @@ final class AgentSessionLinkExecutionRuntime {
 
     #if DEBUG
         var test_beforeRoutineIdleFollowUpStart: ((AgentTabSession, UUID) -> Bool)?
+        var test_agentSessionLinkAfterProviderInputRouteReadiness: (() async -> Void)?
         var test_agentSessionLinkHasActiveOutboundLink: ((DomainAgentSessionLinkEndpointIdentity) async -> Bool)?
         var test_agentSessionLinkAuthoritativeRunCatalogRouteToken: ((UUID, Int, UUID) async -> AgentSessionLinkRunCatalogRouteToken?)?
         var test_agentSessionLinkAwaitAuthoritativeRunCatalogRouteToken: ((UUID, Int, UUID, TimeInterval) async -> AgentSessionLinkRunCatalogRouteToken?)?
@@ -123,10 +123,6 @@ final class AgentSessionLinkExecutionRuntime {
     func startAgentRun(tabID: UUID, initialMessage: String, directStartOptions: AgentDirectRunStartOptions, startOutcome: AgentRunStartOutcomeRecorder? = nil, providerSwitchPreparation: AgentProviderSwitchSendPreparation?) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         guard let session = sessions[tabID] else { return nil }
         return await commands.start(session, initialMessage, directStartOptions, startOutcome, providerSwitchPreparation)
-    }
-
-    func resumeWaitingInstructionContinuation(session: AgentTabSession, providerText: String, claim: AgentSessionLinkOutboundPromptClaim?, origin: UserInstructionResponse.Origin, inputProof: AgentSessionLinkProviderInputRelease.Proof?, undecoratedProviderText: String?) -> Bool {
-        commands.resume(session, providerText, claim, origin, inputProof, undecoratedProviderText)
     }
 
     func makeComposerSubmitTarget(tabID: UUID?, session: AgentTabSession?) -> AgentComposerSubmitTarget? {
