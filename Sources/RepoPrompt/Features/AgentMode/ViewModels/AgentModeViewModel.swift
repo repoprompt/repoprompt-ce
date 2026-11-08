@@ -903,7 +903,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private let sessionLifecycleAuthority = AgentSessionLifecycleAuthority()
-    var modelRouterSettingsStore: GlobalSettingsStore = .shared
+    var modelRouterSettingsStore: GlobalSettingsStore = .shared {
+        didSet { codexCoordinator.installModelRouterSettingsStore(modelRouterSettingsStore) }
+    }
+
     var modelRouterRuntime: AgentTaskRouterRuntime?
     struct StagedTaskRoutingResult {
         let candidates: [AgentTaskRoutingCandidateBuilder.Candidate]
@@ -3000,7 +3003,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
             )
         }
-        codexCoordinator.attach(viewModel: self)
+        configureCodexRuntime(codexCoordinator)
         observeCodexComputerUseSetting()
         claudeCoordinator.installHostCapabilities(
             makeClaudeCoordinatorHostCapabilities(),
@@ -3238,7 +3241,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 claudeCoordinator: claudeCoordinator
             )
             providerBindingService = AgentModeProviderBindingService()
-            codexCoordinator.attach(viewModel: self)
+            configureCodexRuntime(codexCoordinator)
             observeCodexComputerUseSetting()
             claudeCoordinator.installHostCapabilities(
                 makeClaudeCoordinatorHostCapabilities(),
@@ -3727,6 +3730,21 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return false
     }
 
+    /// Composition installs concrete execution services independently of the optional UI attachment.
+    func configureCodexRuntime(_ coordinator: CodexAgentModeCoordinator) {
+        coordinator.installPersistenceRuntime(persistenceRuntime)
+        coordinator.installAttachmentRuntime(attachmentRuntime)
+        coordinator.installMCPRuntime(mcpRuntime)
+        coordinator.installUsageRuntime(usageRuntime)
+        coordinator.installPresentationRuntime(presentationRuntime)
+        coordinator.installLinkExecutionRuntime(linkExecutionRuntime)
+        coordinator.installExecutionServices(
+            drafts: draftRuntime, mcpServerEnabler: mcpServerEnabler,
+            modelRouterSettingsStore: modelRouterSettingsStore
+        )
+        coordinator.attachPresentation(self)
+    }
+
     private func makeRunService(
         mcpServerEnabler: MCPServerEnabler? = nil,
         connectionPolicyInstaller: ConnectionPolicyInstaller? = nil,
@@ -3757,7 +3775,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 publication.mcpBindPendingAgentRunOracleReviewContext(tabID: tabID, runID: runID)
             },
             cancelMCPToolsForRun: { [mcpRunToolCanceller] runID, reason in
-                mcpRunToolCanceller(runID, reason)
+                _ = mcpRunToolCanceller(runID, reason)
             },
             awaitNoActiveMCPTools: { [weak self, tools = mcpServer?.toolExecutionRuntime] runID in
                 #if DEBUG
@@ -7887,15 +7905,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     func signalCodexInstructionDelivered(for session: TabSession) async {
         await signalMCPInstructionDelivered(for: session)
-    }
-
-    func restoreCodexFallbackDraft(tabID: UUID, text: String, message: String) {
-        restoreComposerDraft(
-            tabID: tabID,
-            text: text,
-            message: message,
-            strategy: .prependAlways
-        )
     }
 
     func publishRunInteractionStateChange(
@@ -12450,7 +12459,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 guard !payload.containsArgument("answers") else {
                     throw MCPError.invalidParams("continue_without_hooks requires the answers argument to be absent.")
                 }
-                guard !codexCoordinator.isCodexHookApprovalStrictModeEnabled() else {
+                guard !codexCoordinator.isCodexHookApprovalStrictModeEnabled(for: session) else {
                     throw MCPError.invalidParams(
                         AgentCodexHookReviewResolutionError.strictModeRequiresApproval.localizedDescription
                     )
@@ -15516,21 +15525,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     // MARK: - User Interaction
 
-    func ensureMCPServerEnabledForThreadStart() async -> Bool {
-        await mcpServerEnabler()
-    }
-
-    func hasAuthoritativeRunRouteInCurrentMCPServer(
-        runID: UUID,
-        tabID: UUID
-    ) async -> Bool {
-        await ServerNetworkManager.shared.authoritativeRunCatalogRouteToken(
-            runID: runID,
-            windowID: windowID,
-            tabID: tabID
-        ) != nil
-    }
-
     func hasCurrentRunCatalogRouteTokenInCurrentMCPServer(
         _ token: AgentSessionLinkRunCatalogRouteToken,
         tabID: UUID
@@ -18195,6 +18189,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             finishNativeSlashControlProgress(progressRestoreState, session: hydratedSession)
             return .failed(message)
         }
+        if invocation.command == .compact { ensureRunServiceMaterializedForRunStart() }
         let result = await codexCoordinator.executeNativeSlashCommand(
             invocation.command,
             argumentsText: invocation.argumentsText,

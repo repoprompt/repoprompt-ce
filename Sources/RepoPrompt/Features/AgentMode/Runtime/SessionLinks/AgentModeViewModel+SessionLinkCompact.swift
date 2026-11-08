@@ -345,6 +345,7 @@ extension AgentModeViewModel {
         switch support {
         case .codex:
             guard let expectedThreadID = session.codexConversationID else { return .notStarted }
+            ensureRunServiceMaterializedForRunStart()
             let start = await codexCoordinator.startOversightCompaction(
                 session: session,
                 expectedThreadID: expectedThreadID,

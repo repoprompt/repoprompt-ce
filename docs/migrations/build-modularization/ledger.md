@@ -5047,3 +5047,45 @@ Validation:
 Canonical writer admission, window-free saved host and catalog/context composition, remaining
 startup/terminal commands and exact runtime routing remain open. This is not full-suite,
 aggregate-warning, hosted-CI or live-smoke qualification and does not establish M9 completion.
+
+### M9 continuation — native execution capabilities and warning repair (2026-11-08)
+
+Codex execution now receives the existing draft, MCP bootstrap and settings capabilities directly
+from composition instead of resolving them through its weak presentation owner. The optional owner
+continues to serve UI model updates, thread display naming and explicit Computer Use presentation
+admission; detaching it does not grant Computer Use permission. Existing route queries retain the
+same transport authority and exact route arguments. Runtime workspace and MCP catalog composition
+remain legacy dependencies, so this does not establish a window-free saved host.
+
+Draft restoration uses the existing exact-object recovery policy and cannot overwrite a replacement
+session. Hook approval policy uses the session's bound workspace for both enforcement and UI;
+unknown placement fails closed. Native compaction command entrypoints install the existing run
+service and terminal barrier before execution, with a debug assertion for missing composition.
+No new lifecycle, settings or routing authority was added.
+
+The reported hosted warning in the MCP cancellation hook is fixed by explicitly discarding the
+existing cancellation count. No warning or modularization budget was raised. A bounded comparison
+of compiler warnings in touched files against the preceding validated compilation found no new
+diagnostic and removed the reported unused-result warning; this is not an aggregate warning-budget
+qualification.
+
+Validation:
+- Initial `9068179d-b547-4e4c-af87-c4a3143eff95` passed **149 tests**, with one existing opt-in
+  vendor-signing test skipped, before review hardening.
+- Final `de22f27a-edf0-41a8-990b-e43a96b015e0` passed **289 tests**, with that same opt-in test
+  skipped: composer submission 39, MCP steer/resume 27, native self-compaction completion 25,
+  terminal scheduling 8, Codex prompt adapter 41, compact transactions 30, runtime MCP 12,
+  Computer Use workflow 24, hook review cards 4, execution adapters 4 and resume/wedge commits 75.
+- Both products passed `55fadc2c-90e5-46f6-be02-22219149f787`; lint passed
+  `452105ba-9bee-4495-95f8-d831b9713ff0` on the final Swift tree.
+- Fresh compiler index passed **1239/1360** wrong-way file edges and **53/66** largest-cycle
+  components (1133 files, 156490 symbols), without a baseline increase.
+- Scoped formatting and one independent review completed. Strict-policy fail-closed behavior,
+  matching presentation policy and explicit compaction ownership were applied and tested.
+  Mandatory staged contribution preflight applies before commit.
+
+Standalone coverage exercises bound settings and original-object draft recovery without a
+presentation. Existing cold-compaction coverage detaches presentation before bootstrap and retains
+its physical dispatch assertions. Canonical writer admission, saved-host construction, remaining
+startup/terminal commands, runtime routing and close/handoff/drain integration remain open. Full
+suite, final hosted CI and live smoke are not established by this checkpoint.

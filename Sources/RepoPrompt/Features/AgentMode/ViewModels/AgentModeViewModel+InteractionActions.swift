@@ -39,7 +39,8 @@ extension AgentModeViewModel {
     }
 
     func isCodexHookApprovalStrictModeEnabled() -> Bool {
-        codexCoordinator.isCodexHookApprovalStrictModeEnabled()
+        guard let session = activeSession else { return true }
+        return codexCoordinator.isCodexHookApprovalStrictModeEnabled(for: session)
     }
 
     func codexRememberedApprovalAllowed(for tabID: UUID?) -> Bool {

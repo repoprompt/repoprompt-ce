@@ -615,7 +615,7 @@ final class AgentSessionMCPRuntime {
         if let request = session.pendingCodexHookReview {
             return mcpCodexHookInteraction(
                 for: request,
-                strictModeEnabled: codexCoordinator?.isCodexHookApprovalStrictModeEnabled() ?? true
+                strictModeEnabled: codexCoordinator?.isCodexHookApprovalStrictModeEnabled(for: session) ?? true
             )
         }
         if let review = session.pendingWorktreeMergeReview {

@@ -261,7 +261,11 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         }
     }
 
-    private weak var viewModel: AgentModeViewModel?
+    // Optional UI attachment only. Execution services are retained independently below.
+    private weak var presentationOwner: AgentModeViewModel?
+    private var draftRecovery: AgentModeRunService.QueuedWorkRecoveryHooks?
+    private var mcpServerEnabler: AgentRunExecutionContracts.MCPServerEnabler = { false }
+    private var modelRouterSettingsStore: GlobalSettingsStore = .shared
     private var usageRuntime = AgentSessionUsageRuntime()
     private var presentationRuntime = AgentSessionPresentationRuntime()
     private var persistenceRuntime: AgentSessionPersistenceRuntime?
@@ -491,14 +495,23 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         }
     }
 
-    func attach(viewModel: AgentModeViewModel) {
-        self.viewModel = viewModel
-        installPersistenceRuntime(viewModel.persistenceRuntime)
-        installAttachmentRuntime(viewModel.attachmentRuntime)
-        installMCPRuntime(viewModel.mcpRuntime)
-        installUsageRuntime(viewModel.usageRuntime)
-        installPresentationRuntime(viewModel.presentationRuntime)
-        installLinkExecutionRuntime(viewModel.linkExecutionRuntime)
+    func attachPresentation(_ viewModel: AgentModeViewModel?) {
+        presentationOwner = viewModel
+        if viewModel == nil { stopCodexModelsSubscription() }
+    }
+
+    func installExecutionServices(
+        drafts: AgentSessionDraftRuntime,
+        mcpServerEnabler: @escaping AgentRunExecutionContracts.MCPServerEnabler,
+        modelRouterSettingsStore: GlobalSettingsStore
+    ) {
+        draftRecovery = drafts.makeRunHooks()
+        self.mcpServerEnabler = mcpServerEnabler
+        self.modelRouterSettingsStore = modelRouterSettingsStore
+    }
+
+    func installModelRouterSettingsStore(_ store: GlobalSettingsStore) {
+        modelRouterSettingsStore = store
     }
 
     func installUsageRuntime(_ runtime: AgentSessionUsageRuntime) {
@@ -721,10 +734,14 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         logCodex("[AgentModeVM][CodexUI] cleared stale pending Codex interactions for tab \(session.tabID) before new turn \(turnID)")
     }
 
-    func isCodexHookApprovalStrictModeEnabled() -> Bool {
-        codexHookApprovalSettings.codexHookApprovalStrictModeEnabled(
-            workspaceID: viewModel?.activeWorkspaceIDForSessionIndexOwnership
-        )
+    func isCodexHookApprovalStrictModeEnabled(workspaceID: UUID?) -> Bool {
+        codexHookApprovalSettings.codexHookApprovalStrictModeEnabled(workspaceID: workspaceID)
+    }
+
+    func isCodexHookApprovalStrictModeEnabled(for session: AgentTabSession) -> Bool {
+        // Unknown placement must never inherit a permissive global/default policy.
+        guard let workspaceID = session.persistentSessionBindingIdentity?.workspaceID else { return true }
+        return isCodexHookApprovalStrictModeEnabled(workspaceID: workspaceID)
     }
 
     private struct CodexHookGateOperationAuthority {
@@ -1059,7 +1076,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             guard request.phase.allowsContinueWithoutHooks else {
                 throw AgentCodexHookReviewResolutionError.invalidDecision
             }
-            guard !isCodexHookApprovalStrictModeEnabled() else {
+            guard !isCodexHookApprovalStrictModeEnabled(for: session) else {
                 throw AgentCodexHookReviewResolutionError.strictModeRequiresApproval
             }
             let skippedCount = request.phase == .discoveryFailed ? nil : request.hooks.count
@@ -1126,7 +1143,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 throw AgentCodexHookReviewResolutionError.invalidSelection
             }
             let allUnresolvedKeys = Set(request.hooks.map { CodexHookUTF8Identity($0.key) })
-            guard !isCodexHookApprovalStrictModeEnabled() || requestedKeys == allUnresolvedKeys else {
+            guard !isCodexHookApprovalStrictModeEnabled(for: session) || requestedKeys == allUnresolvedKeys else {
                 throw AgentCodexHookReviewResolutionError.strictModeRequiresApproval
             }
             try await submitCodexHookApproval(
@@ -1200,7 +1217,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             let expectedSkippedIdentities = Set(request.trustCandidates.map(\.selectionIdentity))
                 .subtracting(approvedIdentities)
             let verifiedUnresolvedIdentities = Set(verified.unresolvedProjectHooks.map(\.selectionIdentity))
-            let strictModeRequiresRefresh = isCodexHookApprovalStrictModeEnabled()
+            let strictModeRequiresRefresh = isCodexHookApprovalStrictModeEnabled(for: session)
                 && !verifiedUnresolvedIdentities.isEmpty
             guard !strictModeRequiresRefresh,
                   verifiedUnresolvedIdentities.isSubset(of: expectedSkippedIdentities)
@@ -1937,8 +1954,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
     }
 
     func updateCodexModelPolling() {
-        guard let viewModel else { return }
-        if viewModel.selectedAgent == .codexExec {
+        guard let presentationOwner else { return }
+        if presentationOwner.selectedAgent == .codexExec {
             startCodexModelsSubscriptionIfNeeded()
         } else {
             stopCodexModelsSubscription()
@@ -1955,12 +1972,12 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 await MainActor.run { [weak self] in
                     guard snapshot.isAuthorizedForPublication,
                           let self,
-                          let viewModel
+                          let presentationOwner
                     else { return }
                     // Update UI state — registry updates are owned by the polling service
-                    viewModel.updateCodexDynamicModels(snapshot.models)
+                    presentationOwner.updateCodexDynamicModels(snapshot.models)
                     // Preserve existing "normalize selection after refresh" behavior
-                    if let session = viewModel.activeSession, session.selectedAgent == .codexExec {
+                    if let session = presentationOwner.activeSession, session.selectedAgent == .codexExec {
                         normalizeCodexSelectionForSession(session, preservingExplicitEffort: true)
                     }
                 }
@@ -2277,8 +2294,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
     ) {
         guard session.selectedAgent == .codexExec else {
             session.selectedReasoningEffortRaw = nil
-            if session.tabID == viewModel?.currentTabID {
-                viewModel?.applyCodexSelectionToBindings(
+            if session.tabID == presentationOwner?.currentTabID {
+                presentationOwner?.applyCodexSelectionToBindings(
                     modelRaw: session.selectedModelRaw,
                     reasoningEffortRaw: nil
                 )
@@ -2297,8 +2314,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         session.selectedModelRaw = normalizedModel
         session.selectedReasoningEffortRaw = chosenEffort?.rawValue
 
-        if session.tabID == viewModel?.currentTabID {
-            viewModel?.applyCodexSelectionToBindings(
+        if session.tabID == presentationOwner?.currentTabID {
+            presentationOwner?.applyCodexSelectionToBindings(
                 modelRaw: normalizedModel,
                 reasoningEffortRaw: chosenEffort?.rawValue
             )
@@ -2381,7 +2398,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
     private func computerUseAdmissionMessage(session: AgentTabSession, checkRuntime: Bool = true) -> String? {
         guard CodexComputerUseWorkflow.isEnabled else { return CodexComputerUseWorkflow.disabledMessage }
         guard session.selectedAgent == .codexExec, session.parentSessionID == nil,
-              viewModel?.sessions[session.tabID] === session,
+              presentationOwner?.sessions[session.tabID] === session,
               session.codexComputerUseOwnershipTransitionHolds.isEmpty,
               codexControllerRetirementTaskByTabID[session.tabID]?.includesComputerUse != true else { return CodexComputerUseWorkflow.ineligibleMessage }
         if checkRuntime, let message = computerUseRuntimeUnavailableMessage() { return message }
@@ -2396,8 +2413,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         let generation = session.bindingTransitionGeneration
         let runtimeMessage = await computerUseRuntimePreflight()
         guard !Task.isCancelled,
-              viewModel?.currentTabID == session.tabID,
-              viewModel?.sessions[session.tabID] === session,
+              presentationOwner?.currentTabID == session.tabID,
+              presentationOwner?.sessions[session.tabID] === session,
               session.codexComputerUseArmingRequestID == requestID,
               session.persistentSessionBindingIdentity == binding,
               session.bindingTransitionGeneration == generation,
@@ -2919,7 +2936,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
     }
 
     private func beginCodexCompaction(_ session: AgentTabSession) {
-        viewModel?.ensureRunServiceMaterializedForRunStart()
+        assert(terminalCommitBarrier != nil, "Host composition must install terminal ownership before native compaction")
         if session.activeRunOwnership == nil {
             _ = session.beginRunAttempt(source: "codex.compaction")
         }
@@ -3888,11 +3905,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 if case .manual = entry.origin,
                    !entry.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 {
-                    viewModel?.restoreCodexFallbackDraft(
-                        tabID: session.tabID,
-                        text: entry.draftText,
-                        message: reason
-                    )
+                    draftRecovery?.restoreDraftText(session, entry.draftText, reason, .prependAlways)
                 }
             }
         }
@@ -4766,7 +4779,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         routingStateOwner: (@MainActor @Sendable () -> Bool)? = nil
     ) -> MCPBootstrapLease? {
         guard shouldManageCodexTooling else { return nil }
-        viewModel?.mcpBindPendingAgentRunOracleReviewContext(tabID: tabID, runID: runID)
+        mcpRuntime?.mcpBindPendingAgentRunOracleReviewContext(tabID: tabID, runID: runID)
         let leaseSpec = MCPBootstrapLeaseSpec.agentMode(
             tabID: tabID,
             runID: runID,
@@ -4779,9 +4792,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         return MCPBootstrapLease(
             spec: leaseSpec,
             perfRecorder: perfRecorder,
-            mcpServerEnabler: { [weak viewModel] in
-                await viewModel?.ensureMCPServerEnabledForThreadStart() ?? false
-            },
+            mcpServerEnabler: mcpServerEnabler,
             policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller),
             routingStateOwner: routingStateOwner
         )
@@ -5190,7 +5201,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             persistenceRuntime?.scheduleSave(for: session)
             scheduleCodexThreadNameSyncIfPossible(
                 for: session,
-                name: viewModel?.codexThreadDisplayName(for: session.tabID),
+                name: presentationOwner?.codexThreadDisplayName(for: session.tabID),
                 explicitThreadID: ref.conversationID,
                 source: "start-or-resume"
             )
@@ -7204,10 +7215,11 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         let requiresTransportStart = !hasActiveThread || session.codexNeedsReconnect
         let shouldBootstrapSessionInitialization = effectiveRunState.isActive || requiresTransportStart
         let hasLiveRunRoute = await shouldManageCodexTooling
-            ? (viewModel?.hasAuthoritativeRunRouteInCurrentMCPServer(
+            ? (ServerNetworkManager.shared.authoritativeRunCatalogRouteToken(
                 runID: runID,
+                windowID: windowID,
                 tabID: session.tabID
-            ) ?? false)
+            ) != nil)
             : true
         guard await computerUseStartupIsCurrent(preparedController) else { return }
         let shouldForceReconnectForMissingLiveRoute = shouldManageCodexTooling
@@ -7902,8 +7914,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                       provider: session.selectedAgent,
                       selectedModelRaw: session.selectedModelRaw,
                       manualEffortRaw: manual.reasoningEffort,
-                      configuration: viewModel?.modelRouterSettingsStore.autoEffortConfiguration()
-                          ?? GlobalSettingsStore.shared.autoEffortConfiguration()
+                      configuration: modelRouterSettingsStore.autoEffortConfiguration()
                   ),
                   let baseModel = CodexModelSpecifier(raw: session.selectedModelRaw).baseModel,
                   let advertisedModel = modelOptions(for: .codexExec).first(where: {
@@ -10856,7 +10867,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
     }
 
     private func canMaterializeRunningBashOutput(for session: AgentTabSession) -> Bool {
-        viewModel?.canBuildOrPublishActiveTranscriptBindings(for: session) ?? true
+        presentationOwner?.canBuildOrPublishActiveTranscriptBindings(for: session) ?? true
     }
 
     private static func isTerminalBashTranscriptItem(
