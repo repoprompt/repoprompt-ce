@@ -64,7 +64,13 @@ extension OverseerAuthorizationEngine {
         guard let operation else { return false }
         switch operation {
         case .adminSetModel, .adminSetEffort, .adminWorktreeCreate, .adminWorktreeBind,
-             .adminWorktreeUnbind, .adminWorktreeRelease:
+             .adminAdopt, .adminReparent, .adminFork, .adminLink:
+            // These hosts prepare before their final decision region, then require an exact
+            // admitted writer. Agreeing UI replicas alone neither grant nor deny that writer.
+            return projector.knownProvenance(for: sessionID).map {
+                $0.hasUniqueRuntimeOwner || $0.canPrepareRuntimeWriter
+            } == true
+        case .adminWorktreeUnbind, .adminWorktreeRelease:
             return projector.knownProvenance(for: sessionID)?.hasUniqueRuntimeOwner == true
         default:
             return false

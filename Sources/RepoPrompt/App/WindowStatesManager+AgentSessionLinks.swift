@@ -56,7 +56,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
             if snapshot.metadata[id]?.isEmpty != false {
                 snapshot.metadata[id] = [.init(window: source, workspaceID: location.workspace.id, entry: location.entry)]
             }
-            guard !snapshot.ambiguousSessionIDs.contains(id), !snapshot.replicatedSessionIDs.contains(id),
+            guard !snapshot.ambiguousSessionIDs.contains(id),
                   let owner = preparedOversightWindows[id], !owner.isClosing,
                   let witness = preparedOversightOwnerLocations[id], witness.isCurrent,
                   witness.agreesOnCarrierAndProvenance(with: location), !preparedOversightHandoffs.contains(id),
@@ -64,7 +64,9 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
                   runtime.permitsBoundOperationAndSave,
                   let tabs = owner.workspaceManager.activeWorkspace?.composeTabs, tabs.count == 1,
                   let tab = tabs.first else { continue }
-            if let existing = snapshot.uniqueLocations[id], existing.window !== source {
+            if let existing = snapshot.uniqueLocations[id],
+               existing.workspaceID != location.workspace.id || existing.tab.id != location.tab.id
+            {
                 snapshot.ambiguousSessionIDs.insert(id)
                 continue
             }
@@ -124,6 +126,38 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         }
     }
 
+    /// Metadata replicas and saved preparation witnesses project the admitted writer's placement.
+    /// Updating the witnesses in the same synchronous region prevents our own projection from
+    /// looking like an unrelated provenance change during the subsequent durable flush.
+    func projectDelegationPlacement(_ writer: AgentSessionRuntimeStore.Writer) {
+        guard writer.isCurrent else { return }
+        let id = writer.identity.sessionID
+        func projected(_ entry: AgentSessionIndexEntry) -> AgentSessionIndexEntry {
+            var copy = entry
+            copy.organizationalParentID = writer.session.organizationalParentID
+            copy.delegationScopeID = writer.session.delegationScopeID
+            return copy
+        }
+        for window in sessionRuntimeWindows where window.workspaceManager.activeWorkspaceID == writer.identity.workspaceID {
+            let vm = window.agentModeViewModel
+            if let entry = vm.ownerValidatedSessionIndex[id], entry.tabID == writer.session.tabID {
+                vm.sessionIndexStore.applyLocalUpsert(projected(entry))
+            }
+        }
+        func projectedLocation(_ location: SavedOversightSessionLocation) -> SavedOversightSessionLocation {
+            SavedOversightSessionLocation(
+                window: location.window, workspace: location.workspace, tab: location.tab,
+                stashedTabID: location.stashedTabID, entry: projected(location.entry)
+            )
+        }
+        if let location = preparedOversightLocations[id], location.workspace.id == writer.identity.workspaceID {
+            preparedOversightLocations[id] = projectedLocation(location)
+        }
+        if let location = preparedOversightOwnerLocations[id], location.workspace.id == writer.identity.workspaceID {
+            preparedOversightOwnerLocations[id] = projectedLocation(location)
+        }
+    }
+
     func beginPreparedOversightPreparation(_ id: UUID) {
         preparedOversightPreparationInFlight[id, default: 0] += 1
     }
@@ -145,7 +179,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         guard !deletion.isPermanentlyDeleted(sessionID: target), !deletion.isDeletionInProgress(sessionID: target) else { return .failure(.missing) }
         let windows = allWindows.filter { !$0.isClosing }
         let census = AgentSessionCarrierResolver.capture(windows: windows, sessionIDs: [target])
-        guard !census.ambiguousSessionIDs.contains(target), !census.replicatedSessionIDs.contains(target) else { return .failure(.ambiguous) }
+        guard !census.ambiguousSessionIDs.contains(target) else { return .failure(.ambiguous) }
         if let location = preparedOversightOwnerLocations[target], location.isCurrent,
            let owner = preparedOversightWindows[target], !owner.isClosing,
            census.uniqueLocations[target]?.window === owner
@@ -192,8 +226,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
             },
             isCurrent: { saved in
                 let current = AgentSessionCarrierResolver.capture(windows: self.allWindows, sessionIDs: [target])
-                return !current.ambiguousSessionIDs.contains(target) && !current.replicatedSessionIDs.contains(target)
-                    && location(for: saved)?.isCurrent == true
+                return !current.ambiguousSessionIDs.contains(target) && location(for: saved)?.isCurrent == true
             }
         )
         let found: SavedOversightSessionLocation
@@ -231,10 +264,29 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         {
             guard await releasePreparedOversightOwnerForVisit(sessionID: target, preparingReplacement: true) else { return .failure(.changed) }
         }
+        guard isStillAuthorized(), !Task.isCancelled, location.isCurrent else { return .failure(.changed) }
+        // Resolve after every preparation suspension. The window below is an adapter for the
+        // exact writer, not an election among agreeing presentation replicas.
+        let writerOwner: WindowState?
+        switch AgentSessionRuntimeStore.shared.resolveWriter(sessionID: target, expectedWorkspaceID: location.workspace.id) {
+        case let .unique(writer):
+            guard let exact = sessionRuntimeWindows.first(where: {
+                !$0.isClosing && $0.agentModeViewModel.sessions[writer.session.tabID] === writer.session
+            }) else { return .failure(.changed) }
+            writerOwner = exact
+        case .unavailable(.absent): writerOwner = nil
+        case .unavailable: return .failure(.changed)
+        case .conflicting: return .failure(.ambiguous)
+        }
+        let carriers = AgentSessionCarrierResolver.capture(windows: allWindows, sessionIDs: [target])
+        guard !carriers.ambiguousSessionIDs.contains(target) else { return .failure(.ambiguous) }
         let owner: WindowState
-        if let existing = preparedOversightWindows[target], !existing.isClosing {
+        if let writerOwner {
+            owner = writerOwner
+        } else if let existing = preparedOversightWindows[target], !existing.isClosing {
             owner = existing
-        } else if location.stashedTabID == nil, source.workspaceManager.activeWorkspaceID == location.workspace.id,
+        } else if !carriers.replicatedSessionIDs.contains(target),
+                  location.stashedTabID == nil, source.workspaceManager.activeWorkspaceID == location.workspace.id,
                   location.tab.activeAgentSessionID == nil || location.tab.activeAgentSessionID == target
         {
             owner = source
@@ -258,6 +310,10 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         )
         guard isStillAuthorized(), location.isCurrent else { return .failure(.changed) }
         guard ready else { return .failure(.unreadable) }
+        guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+            sessionID: target, expectedWorkspaceID: location.workspace.id
+        ), writer.session === owner.agentModeViewModel.sessions[location.tab.id],
+        (try? writer.admitCommand().get()) != nil else { return .failure(.changed) }
         if preparedOversightWindows[target] != nil, preparedOversightRunObservations[target] == nil,
            let candidate = owner.agentModeViewModel.agentSessionLinkCandidates(isWindowClosing: false, includeLocation: false).first(where: { $0.sessionID == target })
         {

@@ -8,7 +8,7 @@ enum DelegationSessionResolutionState: Equatable {
     /// A physical/live claim exists, but its owner has no placement metadata to prove authority.
     case unproven
     case unique
-    /// One logical carrier has agreeing window replicas but no proven canonical mutation owner.
+    /// One logical carrier has agreeing window replicas. Runtime ownership is a separate fact.
     case replicated
     case ambiguous
 }
@@ -116,6 +116,13 @@ struct OpenWindowsDelegationProvenanceSource: DelegationProvenanceSource {
             }
             let isLive = ambiguous || observed.contains(.idle) || observed.contains(.running)
             let runState: DomainDelegationScopeTargetState = observed.contains(.running) ? .running : ambiguous ? .unknown : .idle
+            let canPrepareRuntimeWriter = if includeRuntime, !ambiguous, !placementConflict, !missingPlacement,
+                                             case .unavailable(.absent) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: id)
+            {
+                true
+            } else {
+                false
+            }
             result.records[id] = DelegationSessionProvenance(
                 sessionID: id, workspaceID: placementConflict ? nil : agreed?.workspaceID,
                 parentSessionID: placementConflict ? nil : agreed?.entry.parentSessionID,
@@ -123,7 +130,8 @@ struct OpenWindowsDelegationProvenanceSource: DelegationProvenanceSource {
                 organizationalParentID: placementConflict ? nil : agreed?.entry.organizationalParentID,
                 delegationScopeID: placementConflict ? nil : agreed?.entry.delegationScopeID,
                 isLive: isLive, worktreeCount: boundWorktrees.count, boundWorktreeIDs: boundWorktrees,
-                runState: runState, hasUniqueRuntimeOwner: carriers.uniqueRuntimeOwners[id] != nil
+                runState: runState, hasUniqueRuntimeOwner: carriers.uniqueRuntimeOwners[id] != nil,
+                canPrepareRuntimeWriter: canPrepareRuntimeWriter
             )
         }
         return result

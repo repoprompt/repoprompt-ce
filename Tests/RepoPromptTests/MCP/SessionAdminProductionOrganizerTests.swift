@@ -157,27 +157,37 @@ final class DelegationPlacementPersistenceTests: XCTestCase {
         XCTAssertEqual(restored?.delegationScopeID, scope)
     }
 
-    func testUnloadedPlacementReportsMissingFileAndPersistsExistingProvenance() async throws {
+    func testUnloadedPlacementCannotRewriteSavedPayloadWithoutAWriter() async throws {
         let fixture = try await makeFixture()
-        let parent = UUID(), scope = UUID(), creator = UUID()
-        do {
-            try await fixture.dataService.updateDelegationPlacement(
-                id: fixture.sessionID, organizationalParentID: parent, delegationScopeID: scope,
-                for: fixture.workspace
-            )
-            XCTFail("A missing file is a failed commit, not a successful no-op")
-        } catch DelegationPlacementPersistenceError.sessionFileMissing {}
-        var original = AgentSession(id: fixture.sessionID, name: "Unloaded")
-        original.createdByOverseerSessionID = creator
-        _ = try await fixture.dataService.saveAgentSession(original, for: fixture.workspace)
-        try await fixture.dataService.updateDelegationPlacement(
-            id: fixture.sessionID, organizationalParentID: parent, delegationScopeID: scope,
-            for: fixture.workspace
-        )
+        let originalParent = UUID(), scope = UUID(), creator = UUID()
+        fixture.session.createdByOverseerSessionID = creator
+        let initial = try XCTUnwrap(fixture.viewModel.commitDelegationPlacement(
+            sessionID: fixture.sessionID, organizationalParentID: originalParent, delegationScopeID: scope
+        ))
+        try await initial.persisted()
+        fixture.viewModel.test_removeSession(tabID: fixture.session.tabID)
+        XCTAssertNil(try fixture.viewModel.commitDelegationPlacement(
+            sessionID: fixture.sessionID, organizationalParentID: UUID(), delegationScopeID: UUID()
+        ), "Saved metadata cannot bypass preparation and writer admission")
         let restored = try await reopen(fixture)
-        XCTAssertEqual(restored?.organizationalParentID, parent)
+        XCTAssertEqual(restored?.organizationalParentID, originalParent)
         XCTAssertEqual(restored?.delegationScopeID, scope)
         XCTAssertEqual(restored?.createdByOverseerSessionID, creator)
+    }
+
+    func testRetirementAfterPlacementCommitStillAcknowledgesOriginatingWriter() async throws {
+        let fixture = try await makeFixture()
+        let command = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
+        let parent = UUID()
+        let commit = try XCTUnwrap(fixture.viewModel.commitDelegationPlacement(
+            sessionID: fixture.sessionID, organizationalParentID: parent, delegationScopeID: UUID()
+        ))
+        command.writer.scope.beginRetirement()
+        XCTAssertFalse(command.isCurrent)
+        try await commit.persisted()
+        let restored = try await reopen(fixture)
+        XCTAssertEqual(restored?.organizationalParentID, parent)
+        XCTAssertTrue(command.writer.isCurrent)
     }
 }
 
@@ -248,6 +258,118 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
         _ = session.beginRunAttempt(source: "session-admin-stop-integration")
         window.agentModeViewModel.test_installLiveSession(session)
         return session
+    }
+
+    func testPlacementRechecksRevokedLeaseAfterPreparationAndReleasesHold() async throws {
+        let fixture = SessionAdminStructureTests.Fixture()
+        let root = UUID(), target = UUID(), destination = UUID()
+        fixture.provenance.add(root, parent: nil)
+        fixture.provenance.add(target, parent: root)
+        fixture.provenance.add(destination, parent: root)
+        let grant = try fixture.grant(root)
+        var preparations = 0
+        let host = SessionAdminWindowsStructureHost(preparation: { id, isStillAuthorized in
+            XCTAssertEqual(id, target)
+            XCTAssertTrue(isStillAuthorized())
+            preparations += 1
+            fixture.runtime.revoke(scopeID: grant.id)
+            XCTAssertFalse(isStillAuthorized())
+            return .ready
+        })
+        let context = SessionAdminHandlerContext(scopes: fixture.runtime, projector: fixture.projector)
+        fixture.core.register(SessionAdminRestructureHandler(context: context, host: host))
+        let reply = try await fixture.value(
+            .adminReparent, caller: root, targets: [target],
+            args: ["parent_session_id": .string(destination.uuidString)]
+        )
+        XCTAssertEqual(preparations, 1)
+        XCTAssertEqual(reply["changed_count"], .int(0))
+        let item = try XCTUnwrap(reply["items"]?.arrayValue?.first?.objectValue)
+        XCTAssertEqual(item["code"], .string("scope_revoked"))
+        XCTAssertNil(fixture.provenance.sessions[target]?.organizationalParentID)
+        XCTAssertNil(WindowStatesManager.shared.preparedOversightPreparationInFlight[target])
+        guard case .unavailable(.absent) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: target) else {
+            return XCTFail("Preparation refusal must not install a writer")
+        }
+    }
+
+    func testFirstPlacementAcrossColdReplicasUsesOnePreparedWriterAndProjectsEveryWitness() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let fixture = try await Fixture.make(isolated: true)
+            let mirror = try await fixture.addReplica()
+            let manager = WindowStatesManager.shared
+            let target = try XCTUnwrap(fixture.targetTab.activeAgentSessionID)
+            let workspace = try fixture.workspace()
+            let originalRegistry = AgentSessionCarrierResolver.preparedSessionRuntimes
+            let originalFactory = manager.test_preparedOversightOwnerFactory
+            var preparations = 0
+            AgentSessionCarrierResolver.preparedSessionRuntimes = manager
+            manager.test_preparedOversightOwnerFactory = { workspace, source in
+                preparations += 1
+                let owner = WindowState.makePreparedSessionOwner(workspace: workspace, borrowing: source)
+                owner.agentModeViewModel.test_setAgentSessionSaver { payload, workspace, count in
+                    try await AgentSessionDataService.shared.saveAgentSession(
+                        payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count
+                    )
+                }
+                return owner
+            }
+            @MainActor func cleanup() async {
+                if let owner = manager.preparedOversightWindows.removeValue(forKey: target) {
+                    owner.beginClose()
+                    let retired = await owner.tearDownPreparedSessionOwner()
+                    XCTAssertTrue(retired)
+                }
+                manager.preparedOversightRunObservations.removeValue(forKey: target)?.invalidate()
+                manager.preparedOversightCarrierSubscriptions.removeValue(forKey: target)
+                manager.preparedOversightOwnerLocations.removeValue(forKey: target)
+                manager.preparedOversightLocations.removeValue(forKey: target)
+                manager.test_preparedOversightOwnerFactory = originalFactory
+                AgentSessionCarrierResolver.preparedSessionRuntimes = originalRegistry
+                await fixture.removeReplica(mirror)
+                await fixture.cleanup()
+            }
+            do {
+                _ = try await AgentSessionDataService.shared.saveAgentSession(
+                    AgentSession(id: target, workspaceID: workspace.id, composeTabID: fixture.targetTab.id, name: "Saved target", items: []),
+                    for: workspace
+                )
+                guard case .unavailable(.absent) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: target) else {
+                    throw SessionAdminHostError.invalid("The target must start cold")
+                }
+                let host = SessionAdminWindowsStructureHost()
+                let hold = try await host.prepareOrganizationalPlacement(sessionID: target, isStillAuthorized: { true })
+                defer { hold.release() }
+                let parent = UUID(), scope = UUID()
+                let commit = try XCTUnwrap(host.commitOrganizationalPlacement(sessionID: target, parentID: parent, delegationScopeID: scope))
+                let owner = try XCTUnwrap(manager.preparedOversightWindows[target])
+                XCTAssertFalse(owner === fixture.window || owner === mirror)
+                // A private runtime has no published sidebar snapshot; project the existing UI
+                // indexes, while its exact session owns the payload mutation.
+                for window in [fixture.window, mirror] {
+                    XCTAssertEqual(window.agentModeViewModel.ownerValidatedSessionIndex[target]?.organizationalParentID, parent)
+                    XCTAssertEqual(window.agentModeViewModel.ownerValidatedSessionIndex[target]?.delegationScopeID, scope)
+                }
+                let liveSession = try XCTUnwrap(owner.agentModeViewModel.sessions[fixture.targetTab.id])
+                XCTAssertEqual(liveSession.organizationalParentID, parent)
+                XCTAssertEqual(liveSession.delegationScopeID, scope)
+                XCTAssertEqual(manager.preparedOversightLocations[target]?.entry.organizationalParentID, parent)
+                XCTAssertEqual(manager.preparedOversightOwnerLocations[target]?.entry.organizationalParentID, parent)
+                XCTAssertEqual(manager.preparedOversightLocations[target]?.isCurrent, true)
+                try await commit.persisted()
+                let reopened = try await AgentSessionDataService().loadAgentSession(id: target, for: workspace)
+                XCTAssertEqual(reopened?.organizationalParentID, parent)
+                let again = try await host.prepareOrganizationalPlacement(sessionID: target, isStillAuthorized: { true })
+                again.release()
+                XCTAssertEqual(preparations, 1)
+                XCTAssertNil(fixture.window.agentModeViewModel.sessions[fixture.targetTab.id])
+                XCTAssertNil(mirror.agentModeViewModel.sessions[fixture.targetTab.id])
+                await cleanup()
+            } catch {
+                await cleanup()
+                throw error
+            }
+        }
     }
 
     func testStopSelectsTheExactRunningObjectAcrossColdCanonicalReplicasInEitherOrder() async throws {

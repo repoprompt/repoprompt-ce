@@ -1504,6 +1504,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             sessions[session.tabID] = session
         }
 
+        func test_bindingRejection(sessionID: UUID, on session: TabSession) -> AgentSessionRuntimeStore.BindingRejection? {
+            runtimeSessionStore.bindingRejection(sessionID, on: session)
+        }
+
         func test_installPersistentSessionBinding(
             sessionID: UUID?,
             on session: TabSession
@@ -20392,6 +20396,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
+    /// Runtime ownership is independent of the tab/window that presented this command.
+    /// Local composition may address only its own exact writer; metadata never supplies a fallback.
+    func runtimeCommand(
+        sessionID: UUID, requirement: AgentSessionRuntimeStore.CommandRequirement = .restored
+    ) throws -> AgentSessionRuntimeStore.Command? {
+        switch AgentSessionRuntimeStore.shared.resolveWriter(sessionID: sessionID) {
+        case .unavailable(.absent):
+            return nil
+        case .unavailable, .conflicting:
+            throw PersistentBindingMutationError.staleTransition
+        case let .unique(writer):
+            guard writer.scope === runtimeSessionStore else { throw PersistentBindingMutationError.staleTransition }
+            return try writer.admitCommand(requirement).get()
+        }
+    }
+
     func requireSessionConfigurationAdmission(
         _ session: TabSession, creationHandle: AgentSessionCreationHandle?
     ) throws {
@@ -20405,6 +20425,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         } else if let message = session.operationAdmissionFailureMessage {
             throw MCPError.invalidParams(message)
         }
+        guard let sessionID = session.activeAgentSessionID,
+              let command = try runtimeCommand(
+                  sessionID: sessionID, requirement: creationHandle.map { .creation($0) } ?? .restored
+              ), command.writer.session === session else { throw PersistentBindingMutationError.staleTransition }
     }
 
     func failSessionCreation(_ handle: AgentSessionCreationHandle?, message: String) {

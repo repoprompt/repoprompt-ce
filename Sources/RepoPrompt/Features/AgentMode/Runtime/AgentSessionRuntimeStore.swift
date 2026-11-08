@@ -14,6 +14,10 @@ final class AgentSessionRuntimeStore {
         case absent, unscopedBinding, bindingTransition
     }
 
+    enum BindingRejection: Equatable {
+        case conflictingWriter, retiring
+    }
+
     enum WriterResolution {
         case unavailable(Unavailable)
         case unique(Writer)
@@ -331,12 +335,16 @@ final class AgentSessionRuntimeStore {
             }
         }
 
-        func permitsBinding(_ sessionID: UUID, on session: AgentTabSession) -> Bool {
-            guard !store.hasOtherClaim(sessionID: sessionID, scope: self, session: session) else { return false }
+        func bindingRejection(_ sessionID: UUID, on session: AgentTabSession) -> BindingRejection? {
+            guard !store.hasOtherClaim(sessionID: sessionID, scope: self, session: session) else { return .conflictingWriter }
             if sessions[session.tabID] === session, session.activeAgentSessionID == sessionID {
-                return !hasReleasedWriterClaims
+                return hasReleasedWriterClaims ? .retiring : nil
             }
-            return !isRetiring && !store.hasRetiringWriter(sessionID: sessionID)
+            return isRetiring || store.hasRetiringWriter(sessionID: sessionID) ? .retiring : nil
+        }
+
+        func permitsBinding(_ sessionID: UUID, on session: AgentTabSession) -> Bool {
+            bindingRejection(sessionID, on: session) == nil
         }
 
         func resolveWriter(workspaceID: UUID, sessionID: UUID) -> WriterResolution {
