@@ -6,7 +6,7 @@ import Foundation
 /// `agent_session_link` operations use these identities to select a capability, but their actual
 /// generation-qualified authorization and lease come from `DomainAgentSessionLinkAuthority`.
 /// `monitorList` is the one targetless identity and uses `authorizeObserverScoped` below.
-package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, Sendable {
+package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable {
     case runPoll = "agent_run.poll"
     case runWait = "agent_run.wait"
     case runCancel = "agent_run.cancel"
@@ -63,6 +63,8 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
     case adminTree = "session_admin.tree"
     case adminLinks = "session_admin.links"
     case adminRename = "session_admin.rename"
+    case adminAssociatePR = "session_admin.associate_pr"
+    case adminCorrectPRs = "session_admin.correct_pr_associations"
     case adminSetPin = "session_admin.set_pin"
     case adminReorderPins = "session_admin.reorder_pins"
     case adminSetGroup = "session_admin.set_group"
@@ -87,7 +89,7 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
     case adminMergePreview = "session_admin.merge_preview"
     case adminMergeApply = "session_admin.merge_apply"
 
-    package enum Family: String, Hashable, Sendable {
+    package enum Family: String, Hashable {
         /// Existing spawn-provenance control and read operations.
         case sessionControl = "session_control"
         /// New user-granted oversight operations.
@@ -108,7 +110,7 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
             .monitor
         case .adminRequestScope, .adminScopeStatus, .adminReleaseScope, .adminAttenuate,
              .adminInventory, .adminGet, .adminTree, .adminLinks,
-             .adminRename, .adminSetPin, .adminReorderPins, .adminSetGroup, .adminReorderGroups,
+             .adminRename, .adminAssociatePR, .adminCorrectPRs, .adminSetPin, .adminReorderPins, .adminSetGroup, .adminReorderGroups,
              .adminArchive, .adminUnarchive,
              .adminLink, .adminUnlink, .adminReparent, .adminAdopt, .adminRelease, .adminRetire,
              .adminSpawn, .adminFork, .adminSetModel, .adminSetEffort,
@@ -185,7 +187,7 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
 ///
 /// It is derived from server-owned run routing (`RequestMetadata` → connection purpose → exact
 /// run-installed/handover/pending-run tab context), never from tool arguments.
-package enum DomainAgentSessionCallerIdentity: Hashable, Sendable {
+package enum DomainAgentSessionCallerIdentity: Hashable {
     /// A non-Agent principal operating through explicitly routed window control.
     case administrativePrincipal
     /// An Agent Mode run whose exact run-scoped session identity resolved.
@@ -212,7 +214,7 @@ package enum DomainAgentSessionCallerIdentity: Hashable, Sendable {
 ///
 /// `unknown` is used when provenance could not be established authoritatively; it never authorizes an
 /// Agent-origin caller.
-package enum DomainAgentSessionTargetProvenance: Hashable, Sendable {
+package enum DomainAgentSessionTargetProvenance: Hashable {
     case known(targetSessionID: UUID, parentSessionID: UUID?)
     case unknown(targetSessionID: UUID)
 
@@ -230,7 +232,7 @@ package enum DomainAgentSessionTargetProvenance: Hashable, Sendable {
 }
 
 /// An oversight grant presented by the link authority. Never accepted from tool arguments.
-package struct DomainAgentSessionMonitorGrantProof: Hashable, Sendable {
+package struct DomainAgentSessionMonitorGrantProof: Hashable {
     package let linkID: UUID
     package let generation: UInt64
     package let capability: DomainAgentSessionLinkCapability
@@ -262,7 +264,7 @@ package struct DomainAgentSessionMonitorGrantProof: Hashable, Sendable {
     }
 }
 
-package enum DomainAgentSessionAuthorityBasis: Hashable, Sendable {
+package enum DomainAgentSessionAuthorityBasis: Hashable {
     case administrativePrincipal
     case directSpawnProvenance(parentSessionID: UUID)
     case monitorGrant(linkID: UUID, generation: UInt64, capability: DomainAgentSessionLinkCapability)
@@ -275,7 +277,7 @@ package enum DomainAgentSessionAuthorityBasis: Hashable, Sendable {
 
 /// Denial reasons are diagnostic only. Callers must surface one indistinguishable user-facing message
 /// so an Agent-origin caller cannot probe whether an unauthorized UUID exists.
-package enum DomainAgentSessionAuthorizationDenial: String, Error, Equatable, Sendable {
+package enum DomainAgentSessionAuthorizationDenial: String, Error, Equatable {
     case callerRoutingUnresolved = "caller_routing_unresolved"
     case targetProvenanceUnknown = "target_provenance_unknown"
     case notDirectChild = "not_direct_child"
@@ -302,7 +304,7 @@ package enum DomainAgentSessionAuthorizationDenial: String, Error, Equatable, Se
     case humanOnlyOperation = "human_only_operation"
 }
 
-package enum DomainAgentSessionAuthorizationDecision: Equatable, Sendable {
+package enum DomainAgentSessionAuthorizationDecision: Equatable {
     case authorized(DomainAgentSessionAuthorityBasis)
     case denied(DomainAgentSessionAuthorizationDenial)
 
@@ -323,7 +325,7 @@ package enum DomainAgentSessionAuthorizationDecision: Equatable, Sendable {
 }
 
 /// Discovery scope for targetless enumeration operations such as `agent_manage.list_sessions`.
-package enum DomainAgentSessionDiscoveryScope: Hashable, Sendable {
+package enum DomainAgentSessionDiscoveryScope: Hashable {
     case unrestricted
     case directChildren(of: UUID)
     case none

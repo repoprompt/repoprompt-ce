@@ -15,6 +15,7 @@ struct AgentSessionOrganizeState: Equatable {
     let workspaceID: UUID
     let tabID: UUID
     var name: String
+    var titleMetadata: AgentSessionTitleMetadata?
     var isArchived: Bool
     var isPinned: Bool
     var pinnedOrder: Int?
@@ -95,6 +96,14 @@ protocol AgentSessionOrganizingBackend: AnyObject {
     /// Group mirrors for every active tab in one loaded workspace.
     func groupEntries(workspaceID: UUID) -> [(sessionID: UUID, group: String, order: Int?)]?
 
+    func trustedPullRequestHosts(_ sessionIDs: [UUID]) -> Set<String>
+    func titleSnapshot(_ sessionID: UUID) async throws -> AgentSessionTitleSnapshot
+    func commitTitle(
+        _ sessionID: UUID,
+        command: AgentSessionTitleCommand,
+        expectedRevision: UInt64,
+        isAuthorized: @escaping @MainActor () -> Bool
+    ) async throws -> AgentSessionTitleSnapshot
     func rename(_ sessionID: UUID, to name: String) -> Bool
     func rename(_ sessionIDs: [UUID], to name: String) -> Set<UUID>
     func rename(_ names: [UUID: String]) -> Set<UUID>
@@ -138,6 +147,24 @@ protocol AgentSessionOrganizingBackend: AnyObject {
 }
 
 extension AgentSessionOrganizingBackend {
+    func trustedPullRequestHosts(_: [UUID]) -> Set<String> {
+        ["github.com"]
+    }
+
+    func titleSnapshot(_ sessionID: UUID) async throws -> AgentSessionTitleSnapshot {
+        guard let state = state(of: sessionID) else { throw AgentSessionTitleError.denied("workspace_not_loaded") }
+        return .init(metadata: state.titleMetadata, name: state.name, persistenceState: "not_needed")
+    }
+
+    func commitTitle(
+        _ sessionID: UUID,
+        command: AgentSessionTitleCommand,
+        expectedRevision: UInt64,
+        isAuthorized: @escaping @MainActor () -> Bool
+    ) async throws -> AgentSessionTitleSnapshot {
+        throw AgentSessionTitleError.denied("title_mutation_unsupported")
+    }
+
     func commitGroupOrderValues(
         _ values: [UUID: Int?], workspaceID: UUID,
         expected: Set<AgentSessionGroupOrderEntry>, affectedSessionIDs: Set<UUID>,
@@ -276,6 +303,36 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
     func groupEntries(workspaceID: UUID) -> [(sessionID: UUID, group: String, order: Int?)]? {
         guard let (window, workspace) = loadedWorkspace(workspaceID) else { return nil }
         return groupEntries(window: window, workspace: workspace)
+    }
+
+    func trustedPullRequestHosts(_ sessionIDs: [UUID]) -> Set<String> {
+        locations(for: Set(sessionIDs), windows: liveWindows()).values.reduce(into: Set(["github.com"])) { hosts, carrier in
+            if let workspace = carrier.location.window.workspaceManager.workspace(withID: carrier.location.workspaceID) {
+                hosts.formUnion(AgentSessionPullRequestHosts.configured(repositoryPaths: workspace.repoPaths))
+            }
+        }
+    }
+
+    func titleSnapshot(_ sessionID: UUID) async throws -> AgentSessionTitleSnapshot {
+        guard let location = locations(for: [sessionID], windows: liveWindows())[sessionID]?.location,
+              location.stashedTabID == nil else { throw AgentSessionTitleError.denied("workspace_not_loaded") }
+        return try await location.window.agentModeViewModel.currentSessionTitle(tabID: location.tabID)
+    }
+
+    func commitTitle(
+        _ sessionID: UUID,
+        command: AgentSessionTitleCommand,
+        expectedRevision: UInt64,
+        isAuthorized: @escaping @MainActor () -> Bool
+    ) async throws -> AgentSessionTitleSnapshot {
+        guard let location = locations(for: [sessionID], windows: liveWindows())[sessionID]?.location,
+              location.stashedTabID == nil else { throw AgentSessionTitleError.denied("workspace_not_loaded") }
+        return try await location.window.agentModeViewModel.sessionTitleCoordinator.apply(
+            command,
+            tabID: location.tabID,
+            expectedRevision: expectedRevision,
+            isAuthorized: isAuthorized
+        )
     }
 
     func rename(_ sessionID: UUID, to name: String) -> Bool {
@@ -844,6 +901,7 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
             workspaceID: location.workspaceID,
             tabID: location.tabID,
             name: location.tab.name,
+            titleMetadata: location.window.agentModeViewModel.sessions[location.tabID]?.titleMetadata ?? location.tab.agentTitleProjection?.titleMetadata,
             isArchived: location.stashedTabID != nil,
             isPinned: location.tab.isPinned,
             pinnedOrder: location.tab.pinnedOrder,

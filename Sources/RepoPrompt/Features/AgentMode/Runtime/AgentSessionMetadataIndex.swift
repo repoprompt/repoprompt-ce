@@ -9,6 +9,7 @@ struct AgentSessionMeta {
     let id: UUID
     let composeTabID: UUID?
     let name: String
+    var titleMetadata: AgentSessionTitleMetadata?
     let lastModified: Date
     let itemCount: Int
     let agentKind: String?
@@ -76,6 +77,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var workspaceID: UUID?
     var composeTabID: UUID?
     var name: String
+    var titleMetadata: AgentSessionTitleMetadata?
     var savedAt: Date
     var lastUserMessageAt: Date?
     var itemCount: Int
@@ -159,6 +161,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         workspaceID: UUID?,
         composeTabID: UUID?,
         name: String,
+        titleMetadata: AgentSessionTitleMetadata? = nil,
         savedAt: Date,
         lastUserMessageAt: Date?,
         itemCount: Int,
@@ -200,6 +203,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         self.workspaceID = workspaceID
         self.composeTabID = composeTabID
         self.name = name
+        self.titleMetadata = titleMetadata
         self.savedAt = savedAt
         self.lastUserMessageAt = lastUserMessageAt
         self.itemCount = itemCount
@@ -243,6 +247,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         case workspaceID
         case composeTabID
         case name
+        case titleMetadata
         case savedAt
         case lastUserMessageAt
         case itemCount
@@ -287,6 +292,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         workspaceID = try container.decodeIfPresent(UUID.self, forKey: .workspaceID)
         composeTabID = try container.decodeIfPresent(UUID.self, forKey: .composeTabID)
         name = try container.decode(String.self, forKey: .name)
+        titleMetadata = try container.decodeIfPresent(AgentSessionTitleMetadata.self, forKey: .titleMetadata)
         savedAt = try container.decode(Date.self, forKey: .savedAt)
         lastUserMessageAt = try container.decodeIfPresent(Date.self, forKey: .lastUserMessageAt)
         itemCount = try container.decode(Int.self, forKey: .itemCount)
@@ -347,6 +353,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             id: id,
             tabID: tabID,
             name: AgentSessionRestoreSupport.normalizedSessionTitle(displayName ?? name),
+            titleMetadata: titleMetadata,
             lastUserMessageAt: lastUserMessageAt,
             savedAt: savedAt,
             lastRunStateRaw: lastRunStateRaw,
@@ -378,6 +385,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             id: id,
             composeTabID: composeTabID,
             name: AgentSessionRestoreSupport.normalizedSessionTitle(name),
+            titleMetadata: titleMetadata,
             lastModified: lastModifiedOverride ?? observedFileModificationDate ?? savedAt,
             itemCount: itemCount,
             agentKind: agentKindRaw,
@@ -398,6 +406,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && workspaceID == other.workspaceID
             && composeTabID == other.composeTabID
             && name == other.name
+            && titleMetadata == other.titleMetadata
             && savedAt == other.savedAt
             && lastUserMessageAt == other.lastUserMessageAt
             && itemCount == other.itemCount
@@ -453,6 +462,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             workspaceID: session.workspaceID,
             composeTabID: session.composeTabID,
             name: AgentSessionRestoreSupport.normalizedSessionTitle(session.name),
+            titleMetadata: session.titleMetadata,
             savedAt: session.savedAt,
             lastUserMessageAt: session.lastUserMessageAt,
             itemCount: session.effectiveItemCount,

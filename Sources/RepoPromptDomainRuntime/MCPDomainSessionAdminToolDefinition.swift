@@ -13,7 +13,7 @@ package enum MCPDomainSessionAdminToolDefinition {
     package static let operations: [String] = [
         "request_scope", "scope_status", "release_scope", "attenuate",
         "inventory", "get", "tree", "links",
-        "rename", "set_pin", "reorder_pins", "set_group", "reorder_groups", "archive", "unarchive",
+        "rename", "associate_pr", "correct_pr_associations", "set_pin", "reorder_pins", "set_group", "reorder_groups", "archive", "unarchive",
         "link", "unlink", "reparent", "adopt", "release", "retire",
         "fork", "set_model", "set_effort",
         "worktree_create", "worktree_bind", "worktree_unbind", "worktree_release", "worktree_inventory",
@@ -27,7 +27,7 @@ package enum MCPDomainSessionAdminToolDefinition {
     package static let implementedOperations: Set<String> = [
         "request_scope", "scope_status", "release_scope", "attenuate",
         "inventory", "get", "tree", "links",
-        "rename", "set_pin", "reorder_pins", "set_group", "reorder_groups", "archive", "unarchive",
+        "rename", "associate_pr", "correct_pr_associations", "set_pin", "reorder_pins", "set_group", "reorder_groups", "archive", "unarchive",
         "link", "unlink", "reparent", "adopt", "release", "retire",
         "fork", "set_model", "set_effort",
         "worktree_create", "worktree_bind", "worktree_unbind", "worktree_release", "worktree_inventory",
@@ -61,7 +61,7 @@ package enum MCPDomainSessionAdminToolDefinition {
         - `confirmation_status`: read one of your batch cards by `confirmation_id`.
 
         **Inventory** (observe; scope members only): `inventory` (filter, limit; history-backed and may be incomplete), `get` (session_id), `tree` (session_id? root), `links` (session_id?). `total_complete` describes the selected records/filter; `history_complete` describes the selected history coverage. Global endpoint/link/orphan coverage is separate. An incomplete zero never proves an empty workspace. Organization fields are omitted when `organization_complete` is false and unknown fields never match pin/group/archive filters.
-        **Organize** (organize): `rename` (name), `set_pin` (pinned), `reorder_pins` (order + expected_order CAS), `set_group` (group; empty string ungroups), `reorder_groups` (workspace, order + expected_order CAS), `archive`, `unarchive`. Reversible calls return an `undo_token` for `undo`. Only sessions in a workspace an open window shows can be changed; others report `workspace_not_loaded`.
+        **Organize** (organize): `rename` (name; human/legacy bases are protected), `associate_pr` (url), `correct_pr_associations` (add_pr_urls, remove_pr_urls, expected_title_revision; human PR associations/suppressions are protected), `set_pin` (pinned), `reorder_pins` (order + expected_order CAS), `set_group` (group; empty string ungroups), `reorder_groups` (workspace, order + expected_order CAS), `archive`, `unarchive`. Reversible calls return an `undo_token` for `undo`. Only sessions in a workspace an open window shows can be changed; others report `workspace_not_loaded`.
         **Release** (restructure): `release` unlinks links among scope members and clears their Auto-wake; `retire` also stops (control) and archives.
         Target ops take `session_id`, `targets`, or `filter`; `preview: true` lists exact items and effects.
 
@@ -138,7 +138,11 @@ package enum MCPDomainSessionAdminToolDefinition {
                     "maximum": .int(500),
                     "description": .string("[inventory, tree, links] Max rows; default 100.")
                 ]),
-                "name": .stringSchema("[rename] New session name."),
+                "name": .stringSchema("[rename] New base title. Delegated agents cannot overwrite human or protected legacy titles."),
+                "url": .stringSchema("[associate_pr] Canonical HTTPS pull request URL; explicit local association, not remote verification."),
+                "add_pr_urls": .object(["type": .string("array"), "items": .stringSchema("Canonical PR URL to add."), "description": .string("[correct_pr_associations] PR URLs to add; max 64.")]),
+                "remove_pr_urls": .object(["type": .string("array"), "items": .stringSchema("Canonical PR URL to remove."), "description": .string("[correct_pr_associations] PR URLs to remove. Human associations/suppressions are protected.")]),
+                "expected_title_revision": .stringSchema("[associate_pr optional, correct_pr_associations required] Decimal UInt64 revision from the title receipt; stale values fail without mutation."),
                 "pinned": .object([
                     "type": .string("boolean"),
                     "description": .string("[set_pin] true pins, false unpins.")
