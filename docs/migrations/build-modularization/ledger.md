@@ -5590,3 +5590,41 @@ and **53/66** largest-cycle components. Six emitted touched-file warning signatu
 existing baseline; none were new. Earlier missing-import failures, the settings-bootstrap trap and
 the canceled unbound-provider-fixture run are not passing receipts. No live-app or full-suite
 validation was run.
+
+### M9.2 partial milestone: runtime input construction and provider-switch receipts
+
+Run-start and link provider-switch admission now call the scope's provider-input runtime directly.
+Their augmentation and initial-message command callbacks are removed; host composition supplies
+workspace paths, lookup resources and prompt/selection snapshots instead. Run-start also calls the
+existing link runtime's provider-switch preparation directly, removing that VM callback. Skill
+publication, workspace capture, initial-context construction and handoff staging honor the exact
+command and Stop/resource fences across suspension. An already-foreign host workspace is refused,
+not merely a workspace that changes during preparation. A host without an active workspace supplies
+no workspace paths, context store or initial-thread snapshot; global skill resources remain independent.
+The mutable resource fence stays until window-free resource composition is available.
+
+Provider-switch preparations retain their admitted command. Acceptance cannot install dispatch
+proof for a reacquired writer. Sending-save and ready-compensation use the originating writer and
+its workspace; a lost incarnation cannot authorize rollback or a compensating save. Review caught
+that simply returning after writer loss left the old transient dispatch armed. Cleanup now releases
+only the exact originating proof, whose value evidence includes writer incarnation, while retaining
+durable `.sending` uncertainty and the accepted row. The unused VM ready-compensation adapter is
+removed. Broader provider dispatch, creation/hydration, Steer and MCP/admin command routing remain
+M9.2 work; this milestone does not complete that segment.
+
+Coverage uses real skill discovery gates for writer rebind/reacquisition, retirement, Stop and
+workspace drift, with no stale handoff staging or catalog publication. It also covers successful
+unpresented construction, initial-thread resource capture/refusal, and exact save counts across
+provider-switch writer loss. The old composition race gate was moved from the deleted VM callback
+to actual runtime discovery without dropping its behavior assertions. A test-only saver fault is
+bounded to its transaction and removed before fixture teardown, preventing later checkpoint saves
+from executing stale test assertions.
+
+Validation: `b8a85da1-10f0-4362-974c-687dd74ece6a` passed **476 focused tests**. Both products
+passed `f2f8f5d5-d2d7-4e34-80b1-201edfb9d00f`; full lint passed
+`14792b3a-9690-4dc5-b34c-317e31b79564`, with scoped pinned formatter and strict SwiftLint
+passing again after the final test-only fixture cleanup. Fresh index passed **1241/1360** wrong-way
+file edges and **53/66** largest-cycle components. Four emitted touched-file warning signatures
+matched the baseline; none were new. The missing test-helper isolation, obsolete race hook and
+escaped test-fault runs are failed receipts, not qualification. A focused Oracle review was performed
+and its transient-proof cleanup finding addressed. No live-app or full-suite validation was run.

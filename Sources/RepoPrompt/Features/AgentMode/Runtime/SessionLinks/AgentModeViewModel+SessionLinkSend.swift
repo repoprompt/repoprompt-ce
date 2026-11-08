@@ -80,12 +80,6 @@ extension AgentModeViewModel {
         linkExecutionRuntime.providerSwitchPreparationIsCurrent(preparation, session: session)
     }
 
-    func providerSwitchRestoreReadyBeforeDispatch(
-        session: TabSession, sending: PendingHandoffState, workspaceID: UUID
-    ) async {
-        await linkExecutionRuntime.providerSwitchRestoreReadyBeforeDispatch(session: session, sending: sending, workspaceID: workspaceID)
-    }
-
     /// Called at the existing physical acquisition hook, not pipeline admission. Binding one exact
     /// logical dispatch is transient evidence; losing it on restart leaves durable sending inert.
     func providerSwitchAcquirePhysicalDispatch(session: TabSession, dispatchID: AgentSessionLinkPromptDispatchID) -> Bool {

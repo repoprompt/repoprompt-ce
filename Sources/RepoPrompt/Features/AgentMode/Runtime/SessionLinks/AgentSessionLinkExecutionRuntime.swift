@@ -22,8 +22,10 @@ final class AgentSessionLinkExecutionRuntime {
         let isAvailable: @MainActor () -> Bool
         let modelAvailability: @MainActor () -> AgentModelCatalog.AvailabilityContext?
         let workspaceID: @MainActor (AgentTabSession) -> UUID?
-        let augment: @MainActor (AgentTabSession, String, [AgentFileAttachment], [AgentTaggedFileAttachment], Bool) async -> String
-        let initialMessage: @MainActor (AgentTabSession, String) async -> String
+        let input: AgentSessionProviderInputRuntime
+        let workspacePaths: @MainActor () -> [String]
+        let inputWorkspace: @MainActor (AgentTabSession) -> AgentSessionProviderInputRuntime.WorkspaceSource?
+        let initialThreadInput: @MainActor (AgentTabSession) -> AgentSessionProviderInputRuntime.InitialThreadInput?
         let modelDisplayName: @MainActor (AgentTabSession) -> String
         let start: @MainActor (AgentTabSession, String, AgentDirectRunStartOptions, AgentRunStartOutcomeRecorder?, AgentProviderSwitchSendPreparation?) async -> CodexAgentModeCoordinator.NativeSendOutcome?
         let settleSelfCompact: @MainActor (AgentTabSession) -> Void

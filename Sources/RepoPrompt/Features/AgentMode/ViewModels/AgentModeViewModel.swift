@@ -3334,13 +3334,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 guard let self, sessions[session.tabID] === session else { return nil }
                 return workspaceManager?.activeWorkspaceID
             },
-            augment: { [weak self] session, input, attachments, taggedFiles, skipsSlashExpansion in
-                guard let self, sessions[session.tabID] === session else { return input }
-                return await augmentUserMessageForProviderSend(input, attachments: attachments, taggedFileAttachments: taggedFiles, agent: session.selectedAgent, session: session, ignoresPendingHandoff: true, skipsSlashExpansion: skipsSlashExpansion)
-            },
-            initialMessage: { [weak self] session, input in
-                guard let self, sessions[session.tabID] === session else { return input }
-                return await buildInitialThreadMessageIfNeeded(tabID: session.tabID, session: session, initialMessage: input)
+            input: providerInputRuntime,
+            workspacePaths: { [weak self] in self?.runtimeInputWorkspacePaths() ?? [] },
+            inputWorkspace: { [weak self] in self?.runtimeInputWorkspaceSource(session: $0) },
+            initialThreadInput: { [weak self] session in
+                guard let self else { return nil }
+                return captureInitialThreadInput(tabID: session.tabID, workspace: runtimeInputWorkspaceSource(session: session))
             },
             modelDisplayName: { [weak self] session in
                 self?.inputBarModelDisplayName(rawModel: session.selectedModelRaw, agentKind: session.selectedAgent) ?? session.selectedModelRaw
@@ -18447,6 +18446,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
+    /// A runtime start supplies the exact bound session. Sidebar selection is not lookup authority.
+    /// The environment's workspace fence still protects this mutable host content store.
+    private func runtimeInputWorkspacePaths() -> [String] {
+        guard workspaceManager?.activeWorkspaceID != nil else { return [] }
+        return currentWorkspacePaths()
+    }
+
+    private func runtimeInputWorkspaceSource(session: TabSession) -> AgentSessionProviderInputRuntime.WorkspaceSource? {
+        guard workspaceManager?.activeWorkspaceID != nil,
+              let store = promptManager?.workspaceFileContextStore else { return nil }
+        let lookupSource: AgentWorkspaceLookupContextSource? = session.worktreeBindingTransitionInProgress ? nil : .init(
+            activeAgentSessionID: session.activeAgentSessionID, worktreeBindings: session.worktreeBindings
+        )
+        return .init(store: store, lookupSource: lookupSource)
+    }
+
     private func makeRunStartEnvironment() -> AgentSessionRunStartRuntime.Environment {
         var environment = AgentSessionRunStartRuntime.Environment(
             currentWorkspaceID: { self.workspaceManager?.activeWorkspaceID },
@@ -18462,14 +18477,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             },
             commitCreation: { await self.commitConfiguredSessionCreation(handle: $0) },
             providerSwitchRefusal: { Self.providerSwitchStartRefusal($0).message },
-            prepareProviderSwitch: { await self.prepareProviderSwitchHandoverForSend($0, session: $1, stopFence: $2) },
-            augment: { text, session, attachments, tagged, ignoresHandoff, skipsSlash in
-                await self.augmentUserMessageForProviderSend(
-                    text, attachments: attachments, taggedFileAttachments: tagged, agent: session.selectedAgent,
-                    session: session, ignoresPendingHandoff: ignoresHandoff, skipsSlashExpansion: skipsSlash
-                )
+            input: providerInputRuntime,
+            workspacePaths: { self.runtimeInputWorkspacePaths() },
+            inputWorkspace: { self.runtimeInputWorkspaceSource(session: $0) },
+            initialThreadInput: { session in
+                self.captureInitialThreadInput(tabID: session.tabID, workspace: self.runtimeInputWorkspaceSource(session: session))
             },
-            initialMessage: { await self.buildInitialThreadMessageIfNeeded(tabID: $0.tabID, session: $0, initialMessage: $1) },
             composition: { self.runComposition }
         )
         #if DEBUG
@@ -19434,14 +19447,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session: TabSession,
         initialMessage: String
     ) async -> String {
-        guard shouldIncludeInitialThreadContext(for: session) else {
-            return initialMessage
-        }
-        let context = await initialThreadContext(tabID: tabID, session: session)
-        return Self.composeInitialThreadMessage(
-            initialMessage: initialMessage,
-            fileTree: context.fileTree,
-            promptText: context.promptText
+        await providerInputRuntime.buildInitialThreadMessageIfNeeded(
+            session: session, initialMessage: initialMessage,
+            input: { self.captureInitialThreadInput(tabID: tabID, workspace: self.providerWorkspaceSource(tabID: tabID, session: session)) },
+            isCurrent: { true }
         )
     }
 
@@ -19461,9 +19470,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func initialThreadContext(tabID: UUID, session: TabSession?) async -> (fileTree: String, promptText: String?) {
-        guard let promptManager else {
+        guard let input = captureInitialThreadInput(tabID: tabID, workspace: providerWorkspaceSource(tabID: tabID, session: session)) else {
             return ("", nil)
         }
+        return await providerInputRuntime.initialThreadContext(input)
+    }
+
+    /// Capture presentation-owned prompt/selection values only; no provider input work or session mutation.
+    private func captureInitialThreadInput(
+        tabID: UUID, workspace: AgentSessionProviderInputRuntime.WorkspaceSource?
+    ) -> AgentSessionProviderInputRuntime.InitialThreadInput? {
+        guard let promptManager, let workspace else { return nil }
         let isActiveTab = tabID == currentTabID
         if isActiveTab {
             workspaceManager?.publishActiveComposeTabSnapshot(commitToMemory: true)
@@ -19471,10 +19488,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let tabState = workspaceManager?.composeTab(with: tabID)
         let promptText = isActiveTab ? promptManager.promptText : tabState?.promptText
         let selection = tabState?.selection ?? StoredSelection()
-        guard let workspace = providerWorkspaceSource(tabID: tabID, session: session) else { return ("", nil) }
-        return await providerInputRuntime.initialThreadContext(.init(
-            workspace: workspace, selection: selection, promptText: promptText
-        ))
+        return .init(workspace: workspace, selection: selection, promptText: promptText)
     }
 
     nonisolated static func composeInitialThreadMessage(initialMessage: String, fileTree: String, promptText: String?) -> String {

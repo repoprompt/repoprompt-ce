@@ -35,6 +35,7 @@ extension AgentSessionProviderInputRuntime {
         skipsSlashExpansion: Bool,
         isCurrent: @MainActor () -> Bool
     ) async -> String {
+        guard isCurrent() else { return text }
         let expanded = skipsSlashExpansion ? text : await expandSlashSkillInvocationIfNeeded(
             text, agentKind: agent, workspacePaths: workspacePaths, shouldPublishCatalog: isCurrent
         )
@@ -51,6 +52,23 @@ extension AgentSessionProviderInputRuntime {
             expanded, attachments: attachments, taggedFileAttachments: taggedFileAttachments,
             agent: agent, context: context, session: session, handoff: handoff,
             ignoresPendingHandoff: ignoresPendingHandoff, isCurrent: isCurrent
+        )
+    }
+
+    /// Resource capture remains host-composed; context construction and admission are runtime work.
+    /// Refused work must not capture successor resources or publish its result into a new start.
+    func buildInitialThreadMessageIfNeeded(
+        session: AgentTabSession,
+        initialMessage: String,
+        input: @MainActor () -> InitialThreadInput?,
+        isCurrent: @MainActor () -> Bool
+    ) async -> String {
+        guard isCurrent(), Self.shouldIncludeInitialThreadContext(for: session),
+              let input = input(), isCurrent() else { return initialMessage }
+        let context = await initialThreadContext(input)
+        guard isCurrent() else { return initialMessage }
+        return Self.composeInitialThreadMessage(
+            initialMessage: initialMessage, fileTree: context.fileTree, promptText: context.promptText
         )
     }
 

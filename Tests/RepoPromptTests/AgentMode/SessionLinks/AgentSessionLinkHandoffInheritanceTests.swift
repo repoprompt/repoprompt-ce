@@ -863,6 +863,56 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testProviderSwitchInputCannotCrossWriterIncarnationsDuringSkillDiscovery() async throws {
+            for retire in [false, true] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let session = fixture.sourceSession
+                    session.selectedAgent = .openCode
+                    session.selectedModelRaw = "unknown-window"
+                    try installSwitch(fixture)
+                    let command = try XCTUnwrap(vm.runtimeCommand(sessionID: XCTUnwrap(session.activeAgentSessionID)))
+                    let scope = command.writer.scope
+                    let before = session.pendingHandoff
+                    let items = session.items
+                    let gate = SwitchGate()
+                    let catalog = vm.linkExecutionRuntime.commands.input.skillCatalog
+                    catalog.markDirty()
+                    catalog.test_beforePublish = { await gate.wait() }
+                    defer { gate.open()
+                        catalog.test_beforePublish = nil
+                    }
+                    let task = Task { await vm.providerSwitchSendAdmission(session: session, input: "ordinary switched input") }
+                    do {
+                        try await AsyncTestWait.waitUntil("runtime input reaches real skill discovery") { gate.entered }
+                    } catch {
+                        gate.open()
+                        _ = await task.value
+                        throw error
+                    }
+                    if retire {
+                        scope.beginRetirement()
+                    } else {
+                        let binding = session.currentRestorationBindingToken
+                        let sessions = scope.sessions
+                        var withoutOrigin = sessions
+                        withoutOrigin.removeValue(forKey: session.tabID)
+                        scope.replaceSessions(withoutOrigin)
+                        scope.replaceSessions(sessions)
+                        XCTAssertEqual(session.currentRestorationBindingToken, binding)
+                    }
+                    XCTAssertFalse(command.isCurrent)
+                    gate.open()
+                    guard case .failure(.targetStopped) = await task.value else {
+                        return XCTFail("Stale provider-switch input must not mint a preparation")
+                    }
+                    XCTAssertEqual(session.pendingHandoff, before)
+                    XCTAssertEqual(session.items, items)
+                    XCTAssertNil(session.activeRunOwnership)
+                }
+            }
+        }
+
         func testSwitchExpandedSkillAndTaggedFileRefusalsRetainClaimedComposer() async throws {
             for skill in [true, false] {
                 try await withFixture { fixture in
@@ -921,10 +971,12 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     var didEnterAugmentation = false
                     let release = AgentSessionLinkStopSignal<Void>()
                     defer { release.finish(()) }
-                    fixture.viewModel.test_afterProviderInputAugmentation = { didEnterAugmentation = true
+                    let catalog = fixture.viewModel.linkExecutionRuntime.commands.input.skillCatalog
+                    catalog.markDirty()
+                    catalog.test_beforePublish = { didEnterAugmentation = true
                         await release.value()
                     }
-                    defer { fixture.viewModel.test_afterProviderInputAugmentation = nil }
+                    defer { catalog.test_beforePublish = nil }
                     let rows = session.items.map(\.id)
                     let claim = try composerClaim(fixture, text: "keep draft")
                     var completed: AgentModeViewModel.UserTurnSubmissionResult?
@@ -953,6 +1005,59 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     XCTAssertNil(session.agentTask)
                     XCTAssertNil(session.acpController)
                     XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .ready)
+                }
+            }
+        }
+
+        func testSwitchPreparationCannotResaveAReacquiredWriterOrLeaveItsDispatchArmed() async throws {
+            for duringSave in [false, true] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let session = fixture.sourceSession
+                    try installSwitch(fixture)
+                    let preparation = try await switchPreparation(fixture)
+                    let scope = preparation.command.writer.scope
+                    let binding = session.currentRestorationBindingToken
+                    @MainActor func reacquire() {
+                        let sessions = scope.sessions
+                        var withoutOrigin = sessions
+                        withoutOrigin.removeValue(forKey: session.tabID)
+                        scope.replaceSessions(withoutOrigin)
+                        scope.replaceSessions(sessions)
+                        XCTAssertEqual(session.currentRestorationBindingToken, binding)
+                        XCTAssertFalse(preparation.command.isCurrent)
+                    }
+                    let before = session.pendingHandoff
+                    let accepted = AgentChatItem.user("Retained accepted input", sequenceIndex: session.nextSequenceIndex)
+                    session.appendItem(accepted)
+                    var saves = 0
+                    var transactionActive = true
+                    let savedURL = fixture.rootURL.appendingPathComponent("reacquired-switch.json")
+                    defer {
+                        transactionActive = false
+                        vm.test_setAgentSessionSaver { _, _, _ in savedURL }
+                    }
+                    vm.test_setAgentSessionSaver { _, _, _ in
+                        guard transactionActive else { return savedURL }
+                        saves += 1
+                        XCTAssertEqual(session.pendingHandoff.providerSwitchDispatch?.admission.writerIdentity, preparation.command.writer.identity)
+                        reacquire()
+                        return savedURL
+                    }
+                    if !duringSave { reacquire() }
+                    let receipt = preparation.accepting(accepted.id, session: session)
+                    let result = await vm.prepareProviderSwitchHandoverForSend(receipt, session: session, stopFence: .init(session: session))
+                    XCTAssertNil(result)
+                    XCTAssertEqual(saves, duringSave ? 1 : 0, "No compensating save may target the successor")
+                    if duringSave {
+                        XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
+                        XCTAssertFalse(session.pendingHandoff.isStagedForSend, "The originating request must release its transient dispatch proof")
+                        XCTAssertNil(session.pendingHandoff.providerSwitchDispatch)
+                    } else {
+                        XCTAssertEqual(session.pendingHandoff, before, "Stale acceptance cannot install physical dispatch evidence")
+                    }
+                    XCTAssertTrue(session.items.contains { $0.id == accepted.id })
+                    XCTAssertNil(session.activeRunOwnership)
                 }
             }
         }

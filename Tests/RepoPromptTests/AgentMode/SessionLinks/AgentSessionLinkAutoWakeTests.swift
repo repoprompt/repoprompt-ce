@@ -94,7 +94,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
     }
 
     func testStartupRetainsExactScopeAndRefusesChangesAcrossPreparationWithoutPresentation() async throws {
-        for change in ["entryRefusal", "stop", "replacement", "binding", "retirement", "reacquired", "workspace"] {
+        for change in ["entryRefusal", "entryWorkspace", "stop", "replacement", "binding", "retirement", "reacquired", "workspace"] {
             var f: Fixture? = try fixture()
             let session = try XCTUnwrap(f).session
             let startup = try XCTUnwrap(f).scope.startup
@@ -102,6 +102,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             try XCTUnwrap(f).scope.mcp.test_afterEpochBegan = { XCTFail("Changed preparation must not publish a new epoch") }
             weak let owner = try XCTUnwrap(f).scope
             var workspaceID = try XCTUnwrap(f).endpoint.workspaceID
+            if change == "entryWorkspace" { workspaceID = UUID() }
             let gate = AutoWakeCatalogAuthorityGate()
             let outcome = AgentRunStartOutcomeRecorder()
             let item = AgentChatItem.user("Retained original input", sequenceIndex: session.nextSequenceIndex)
@@ -121,14 +122,15 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                     return false
                 },
                 providerSwitchRefusal: { _ in "Provider switch pending" },
-                prepareProviderSwitch: { _, _, _ in XCTFail("Unexpected switch preparation")
+                input: AgentSessionProviderInputRuntime(skillCatalog: AgentSkillCatalog()),
+                workspacePaths: { XCTFail("Changed preparation must not augment input")
+                    return []
+                },
+                inputWorkspace: { _ in XCTFail("Changed preparation must not capture input resources")
                     return nil
                 },
-                augment: { text, _, _, _, _, _ in XCTFail("Changed preparation must not augment input")
-                    return text
-                },
-                initialMessage: { _, text in XCTFail("Changed preparation must not build initial context")
-                    return text
+                initialThreadInput: { _ in XCTFail("Changed preparation must not build initial context")
+                    return nil
                 },
                 composition: { preconditionFailure("Changed preparation must not construct execution") }
             )
@@ -140,8 +142,8 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                     claudeCoordinator: coordinator, links: links, environment: environment
                 )
             }
-            if change == "entryRefusal" {
-                owner?.beginRetirement()
+            if change == "entryRefusal" || change == "entryWorkspace" {
+                if change == "entryRefusal" { owner?.beginRetirement() }
                 _ = await task.value
                 f = nil
                 XCTAssertFalse(session.hasLocalComposerCandidate(itemID: item.id, fence: candidateFence))
@@ -187,6 +189,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         }
         var preparations = 0
         var starts = 0
+        session.pendingHandoff = .init(payload: "<forked_session>Admitted continuity</forked_session>", createdAt: Date())
         let outcome = AgentRunStartOutcomeRecorder()
         var environment = AgentSessionRunStartRuntime.Environment(
             currentWorkspaceID: { f.endpoint.workspaceID },
@@ -201,13 +204,14 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 return false
             },
             providerSwitchRefusal: { _ in "Unexpected switch" },
-            prepareProviderSwitch: { _, _, _ in XCTFail("Unexpected switch")
-                return nil
-            },
-            augment: { text, _, _, _, _, _ in text }, initialMessage: { _, text in text },
+            input: AgentSessionProviderInputRuntime(skillCatalog: AgentSkillCatalog()),
+            workspacePaths: { [] }, inputWorkspace: { _ in nil }, initialThreadInput: { _ in nil },
             composition: { preconditionFailure("The test intercepts provider dispatch") }
         )
-        environment.test_startOverride = { _, _, _ in starts += 1
+        environment.test_startOverride = { _, user, initial in
+            starts += 1
+            XCTAssertTrue(user.contains("<forked_session>Admitted continuity</forked_session>"))
+            XCTAssertEqual(initial, user)
             return true
         }
         _ = await f.scope.startup.start(
@@ -219,19 +223,29 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         XCTAssertEqual(starts, 1)
         XCTAssertTrue(outcome.outcome.didStart)
         XCTAssertTrue(writer.isCurrent)
+        XCTAssertTrue(session.pendingHandoff.isStagedForSend)
     }
 
     func testStartupDoesNotAcknowledgeAReboundAttemptAfterInputSuspension() async throws {
-        for reacquire in [false, true] {
+        for change in ["binding", "reacquired", "workspace", "retirement", "stop"] {
             let f = try fixture()
             let session = f.session
             let gate = AutoWakeCatalogAuthorityGate()
             let outcome = AgentRunStartOutcomeRecorder()
             var preparations = 0
+            var workspaceID = f.endpoint.workspaceID
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("RuntimeStartInput-\(UUID().uuidString)")
+            let skill = root.appendingPathComponent(".agents/skills/writer-proof")
+            try FileManager.default.createDirectory(at: skill, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            try "Use the admitted writer".write(to: skill.appendingPathComponent("SKILL.md"), atomically: true, encoding: .utf8)
+            let catalog = AgentSkillCatalog(homeDirectoryURL: root.appendingPathComponent("home"))
+            catalog.test_beforePublish = { _ = await gate.requirement() }
+            session.pendingHandoff = .init(payload: "<forked_session>Retained continuity</forked_session>", createdAt: Date())
             XCTAssertNil(session.mcpControlContext, "This ordinary start has no MCP epoch to prepare")
             f.scope.mcp.test_afterEpochBegan = { XCTFail("An ordinary start must not create an MCP epoch") }
             let environment = AgentSessionRunStartRuntime.Environment(
-                currentWorkspaceID: { f.endpoint.workspaceID },
+                currentWorkspaceID: { workspaceID },
                 prepareSession: { _ in preparations += 1 },
                 availabilityFailure: { _ in nil },
                 bindSession: { .init(sessionID: $0.activeAgentSessionID!, creation: nil) },
@@ -239,14 +253,13 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                     return false
                 },
                 providerSwitchRefusal: { _ in "Provider switch pending" },
-                prepareProviderSwitch: { _, _, _ in XCTFail("Unexpected switch preparation")
+                input: AgentSessionProviderInputRuntime(skillCatalog: catalog),
+                workspacePaths: { [root.path] },
+                inputWorkspace: { _ in XCTFail("Stale discovery cannot capture successor workspace resources")
                     return nil
                 },
-                augment: { text, _, _, _, _, _ in _ = await gate.requirement()
-                    return text
-                },
-                initialMessage: { _, text in XCTFail("Stale augmentation cannot proceed to initial-message preparation")
-                    return text
+                initialThreadInput: { _ in XCTFail("Stale augmentation cannot proceed to initial-message preparation")
+                    return nil
                 },
                 composition: { preconditionFailure("A rebound attempt must not construct execution") }
             )
@@ -260,12 +273,16 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             await gate.waitUntilEntered()
             XCTAssertEqual(preparations, 2)
             XCTAssertNil(session.mcpControlContext, "Passing epoch preparation must not create control for an ordinary start")
-            if reacquire {
+            switch change {
+            case "reacquired":
                 let binding = session.currentRestorationBindingToken
                 f.scope.replaceSessions([:])
                 f.scope.replaceSessions([session.tabID: session])
                 XCTAssertEqual(session.currentRestorationBindingToken, binding)
-            } else {
+            case "workspace": workspaceID = UUID()
+            case "retirement": f.scope.beginRetirement()
+            case "stop": session.stopState.invalidateScheduledStarts()
+            default:
                 try session.installPersistentSessionBinding(.init(
                     tabID: session.tabID, sessionID: XCTUnwrap(session.activeAgentSessionID), workspaceID: f.endpoint.workspaceID
                 ))
@@ -276,7 +293,13 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             XCTAssertFalse(outcome.outcome.didStart)
             XCTAssertNil(session.activeRunOwnership)
             XCTAssertTrue(session.items.isEmpty)
-            XCTAssertTrue(session.mcpFollowUpRunPending, "Old cleanup cannot clear the successor's pending marker")
+            XCTAssertEqual(session.mcpFollowUpRunPending, change == "binding" || change == "reacquired", "Only the originating writer may clear its pending marker")
+            XCTAssertFalse(session.pendingHandoff.isStagedForSend, "Suspended input cannot mutate handoff after \(change)")
+            XCTAssertTrue(session.pendingHandoff.hasPayload)
+            XCTAssertNil(catalog.resolve(name: "writer-proof"), "Stale discovery must not publish the catalog")
+            catalog.test_beforePublish = nil
+            await catalog.refresh(workspacePaths: [root.path], agentKind: session.selectedAgent)
+            XCTAssertNotNil(catalog.resolve(name: "writer-proof"), "The refused scan had a real discoverable skill")
         }
     }
 
@@ -457,8 +480,8 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             isAvailable: isAvailable,
             modelAvailability: { .init() },
             workspaceID: { _ in workspaceID },
-            augment: { _, input, _, _, _ in input },
-            initialMessage: { _, input in input },
+            input: scope.providerInput(skillCatalog: AgentSkillCatalog(), perfRecorder: NoopAgentModePerfRecorder()),
+            workspacePaths: { [] }, inputWorkspace: { _ in nil }, initialThreadInput: { _ in nil },
             modelDisplayName: { $0.selectedModelRaw },
             start: { session, text, _, outcome, _ in
                 if let start { await start(session, text, outcome) }

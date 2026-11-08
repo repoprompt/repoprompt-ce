@@ -16,9 +16,10 @@ final class AgentSessionRunStartRuntime {
         let bindSession: (AgentTabSession) -> BindingAdmission?
         let commitCreation: (AgentSessionCreationHandle) async -> Bool
         let providerSwitchRefusal: (AgentTabSession) -> String
-        let prepareProviderSwitch: (AgentProviderSwitchSendPreparation?, AgentTabSession, AgentRunStartStopFence) async -> (user: String, initial: String)?
-        let augment: (String, AgentTabSession, [AgentFileAttachment], [AgentTaggedFileAttachment], Bool, Bool) async -> String
-        let initialMessage: (AgentTabSession, String) async -> String
+        let input: AgentSessionProviderInputRuntime
+        let workspacePaths: () -> [String]
+        let inputWorkspace: (AgentTabSession) -> AgentSessionProviderInputRuntime.WorkspaceSource?
+        let initialThreadInput: (AgentTabSession) -> AgentSessionProviderInputRuntime.InitialThreadInput?
         let composition: () -> AgentModeRunComposition
         #if DEBUG
             var test_startOverride: ((AgentTabSession, String, String) async -> Bool)?
@@ -75,7 +76,11 @@ final class AgentSessionRunStartRuntime {
         let originalBindingToken = session.currentRestorationBindingToken
         let originalWorkspaceID = environment.currentWorkspaceID()
         func resourcesAreCurrent() -> Bool {
-            environment.currentWorkspaceID() == originalWorkspaceID
+            guard environment.currentWorkspaceID() == originalWorkspaceID else { return false }
+            // An already-mismatched host is not a valid resource snapshot merely because it
+            // stayed unchanged. Nil remains the explicit no-workspace resource composition.
+            guard let originalWorkspaceID, let writer else { return true }
+            return originalWorkspaceID == writer.identity.workspaceID
         }
         func isCurrent() -> Bool {
             guard owner.sessions[tabID] === session, !owner.isRetiring, !owner.hasReleasedWriterClaims,
@@ -83,6 +88,11 @@ final class AgentSessionRunStartRuntime {
             if let writer { return writer.isCurrent }
             return session.currentRestorationBindingToken == originalBindingToken
         }
+        if let writer, let originalWorkspaceID, originalWorkspaceID != writer.identity.workspaceID {
+            startOutcome?.recordStartFailure(message: "Workspace resources do not belong to the session's runtime writer.")
+            return nil
+        }
+        guard isCurrent() else { return nil }
         if session.pendingHandoff.providerSwitchDelivery != nil, providerSwitchPreparation == nil {
             let message = environment.providerSwitchRefusal(session)
             startOutcome?.recordStartFailure(message: message)
@@ -258,7 +268,7 @@ final class AgentSessionRunStartRuntime {
         // the rendered lane claim the supplement path attaches.
         let switchMessages: (user: String, initial: String)?
         if session.pendingHandoff.providerSwitchDelivery != nil {
-            switchMessages = await environment.prepareProviderSwitch(providerSwitchPreparation, session, stopFence)
+            switchMessages = await links.prepareProviderSwitchHandoverForSend(providerSwitchPreparation, session: session, stopFence: stopFence)
             guard command.isCurrent, resourcesAreCurrent(), stopFence.permitsStart(of: session), periodicStartIsCurrent() else { return nil }
             guard switchMessages != nil else {
                 let message = environment.providerSwitchRefusal(session)
@@ -268,12 +278,18 @@ final class AgentSessionRunStartRuntime {
         } else {
             switchMessages = nil
         }
+        func inputIsCurrent() -> Bool {
+            command.isCurrent && resourcesAreCurrent() && stopFence.permitsStart(of: session) && periodicStartIsCurrent()
+        }
         let augmentedInitialMessage = if let switchMessages { switchMessages.user } else if directStartOptions.skipsUserAugmentation {
             initialMessage
         } else {
-            await environment.augment(
-                initialMessage, session, attachments, taggedFileAttachments,
-                directStartOptions.ignoresPendingHandoff, directStartOptions.skipsSlashExpansion
+            await environment.input.augmentUserMessage(
+                initialMessage, attachments: attachments, taggedFileAttachments: taggedFileAttachments,
+                agent: session.selectedAgent, workspacePaths: environment.workspacePaths(),
+                workspace: { environment.inputWorkspace(session) }, session: session, handoff: owner.handoff,
+                ignoresPendingHandoff: directStartOptions.ignoresPendingHandoff,
+                skipsSlashExpansion: directStartOptions.skipsSlashExpansion, isCurrent: inputIsCurrent
             )
         }
         guard command.isCurrent, resourcesAreCurrent(), stopFence.permitsStart(of: session), periodicStartIsCurrent() else { return nil }
@@ -282,7 +298,10 @@ final class AgentSessionRunStartRuntime {
         let initialMessageForRun = if let switchMessages { switchMessages.initial } else { directStartOptions.providerControlCommand != nil
             || directStartOptions.selfCompactDispatchID?.stage == .note
             ? augmentedInitialMessage
-            : await environment.initialMessage(session, augmentedInitialMessage)
+            : await environment.input.buildInitialThreadMessageIfNeeded(
+                session: session, initialMessage: augmentedInitialMessage,
+                input: { environment.initialThreadInput(session) }, isCurrent: inputIsCurrent
+            )
         }
         guard periodicStartIsCurrent(), stopFence.permitsStart(of: session), command.isCurrent, resourcesAreCurrent(),
               session.operationAdmissionFailureMessage == nil else { return nil }

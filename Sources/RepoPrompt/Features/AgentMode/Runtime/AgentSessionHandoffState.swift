@@ -85,6 +85,7 @@ struct AgentProviderSwitchPhysicalDispatch: Equatable {
 
 /// Request-local composition evidence, not a persisted preview or a second admission owner.
 struct AgentProviderSwitchSendPreparation {
+    let command: AgentSessionRuntimeStore.Command
     let binding: AgentSessionRestorationBindingToken?
     private(set) var handoff: AgentPendingHandoffState
     let agent: AgentProviderKind
@@ -106,13 +107,16 @@ struct AgentProviderSwitchSendPreparation {
     func accepting(_ itemID: UUID, session: AgentTabSession) -> Self {
         var copy = self
         copy.acceptedInputID = itemID
-        if session.currentRestorationBindingToken == binding, session.pendingHandoff == handoff {
+        if command.isCurrent, command.writer.session === session,
+           session.currentRestorationBindingToken == binding, session.pendingHandoff == handoff
+        {
             copy.handoff.providerSwitchDispatch = copy.physicalDispatch
             session.pendingHandoff.providerSwitchDispatch = copy.handoff.providerSwitchDispatch
         }
         return copy
     }
 
+    @MainActor
     var physicalDispatch: AgentProviderSwitchPhysicalDispatch {
         .init(
             dispatchID: nil,
@@ -129,6 +133,7 @@ struct AgentProviderSwitchSendPreparation {
 }
 
 struct AgentProviderSwitchAdmissionEvidence: Equatable {
+    let writerIdentity: AgentSessionRuntimeStore.WriterIdentity
     let agent: AgentProviderKind
     let model: String
     let catalogWindow: Int?
@@ -137,7 +142,9 @@ struct AgentProviderSwitchAdmissionEvidence: Equatable {
     let inputAlreadyIncludesSupplement: Bool
     let instructionsDigest: SHA256.Digest
 
+    @MainActor
     init(_ preparation: AgentProviderSwitchSendPreparation) {
+        writerIdentity = preparation.command.writer.identity
         agent = preparation.agent
         model = preparation.model
         catalogWindow = preparation.catalogWindow
