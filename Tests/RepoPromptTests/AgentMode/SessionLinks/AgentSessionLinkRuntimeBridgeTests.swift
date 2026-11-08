@@ -1223,7 +1223,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             fields: [],
             details: [.init(label: "api_key=private-label", value: "secret=private-value", isCode: false)]
         )
-        let projected = AgentModeViewModel.overseerProjection(of: interaction)
+        let projected = AgentSessionInteractionRuntime.overseerProjection(of: interaction)
         XCTAssertEqual(projected.options.map(\.label), ["continue"])
         XCTAssertFalse(projected.title?.contains("private-title") ?? false)
         XCTAssertFalse(projected.options.first?.description?.contains("private-description") ?? false)
@@ -1259,7 +1259,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             options: [], fields: [], details: []
         )
         let start = ProcessInfo.processInfo.systemUptime
-        let projected = AgentModeViewModel.overseerProjection(of: interaction)
+        let projected = AgentSessionInteractionRuntime.overseerProjection(of: interaction)
         XCTAssertEqual(projected.prompt, whitespace)
         XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 3)
         XCTAssertFalse(AgentSessionLinkPendingInteractionInspection.rawPromptExceedsWorkLimit(interaction))
@@ -1613,7 +1613,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             fields: [.init(id: "token", prompt: "Token?", isSecret: true, allowsOther: false, options: [])],
             details: []
         )
-        XCTAssertEqual(viewModel.overseerManualOnlyReason(for: secret, session: session), .secretInput)
+        XCTAssertEqual(viewModel.interactionRuntime.overseerManualOnlyReason(for: secret, session: session), .secretInput)
         let hook = AgentRunMCPSnapshot.Interaction(
             id: UUID(),
             kind: .hookApproval,
@@ -1626,7 +1626,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             fields: [],
             details: []
         )
-        XCTAssertEqual(viewModel.overseerManualOnlyReason(for: hook, session: session), .hookApproval)
+        XCTAssertEqual(viewModel.interactionRuntime.overseerManualOnlyReason(for: hook, session: session), .hookApproval)
     }
 
     private func pollState(

@@ -33,7 +33,7 @@ final class AgentSessionLinkHeadlessRunnerPromptAdapterTests: XCTestCase {
 
     /// Drives the real `HeadlessAgentModeRunner` directly.
     ///
-    /// No shipping agent kind routes to this runner through `AgentModeRunService.startRun` (Codex,
+    /// No shipping agent kind routes to this runner through `AgentModeRunComposition.startRun` (Codex,
     /// Claude-compatible, and ACP kinds each go elsewhere), so constructing the runner is the only way
     /// to exercise its adapter and acceptance boundary.
     private func startRun(
@@ -43,7 +43,7 @@ final class AgentSessionLinkHeadlessRunnerPromptAdapterTests: XCTestCase {
         localComposerCandidate: UUID? = nil
     ) async {
         let runner = harness.makeHeadlessRunner()
-        await runner.startRun(
+        await harness.resources.fulfill(runner.prepareRun(
             tabID: session.tabID,
             session: session,
             initialUserMessage: message,
@@ -51,7 +51,7 @@ final class AgentSessionLinkHeadlessRunnerPromptAdapterTests: XCTestCase {
             attachments: [],
             makeLease: { runID in harness.makeLease(runID: runID, tabID: session.tabID) },
             localComposerCandidate: localComposerCandidate
-        )
+        ))
         await session.agentTask?.value
     }
 
@@ -400,7 +400,7 @@ final class AgentSessionLinkACPRunnerPromptAdapterTests: XCTestCase {
     }
 
     private func startRun(_ fixture: Fixture, message: String, localComposerCandidate: UUID? = nil) async {
-        _ = await fixture.harness.service.startRun(
+        _ = await fixture.harness.composition.startRun(
             tabID: fixture.session.tabID,
             session: fixture.session,
             initialUserMessage: message,

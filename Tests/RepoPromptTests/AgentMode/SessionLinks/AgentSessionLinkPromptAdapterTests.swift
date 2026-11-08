@@ -2907,11 +2907,18 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 windowID: endpoint.windowID, runID: runID
             )
             fixture.viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { _, _, _ in token }
-            // Exercise the production final fence, not a simulated route-current boolean.
+            // The synthetic async authority query needs an explicit final-fence hook;
+            // otherwise the test seam deliberately bypasses live transport qualification.
+            // Exercise the composed runtime, not a simulated boolean or the server VM.
+            let routeRuntime = fixture.viewModel.mcpRuntime
             fixture.viewModel.test_agentSessionLinkCurrentRunCatalogRouteToken = { candidate, tabID in
-                server.hasCurrentRunCatalogRouteToken(candidate, expectedTabID: tabID)
+                routeRuntime.hasCurrentRunCatalogRouteToken(candidate, tabID: tabID)
             }
-            XCTAssertTrue(server.hasCurrentRunCatalogRouteToken(token, expectedTabID: fixture.tabID))
+            XCTAssertTrue(fixture.viewModel.hasCurrentRunCatalogRouteTokenInCurrentMCPServer(token, tabID: fixture.tabID))
+            let otherScope = AgentSessionRuntimeStore().makeScope()
+            XCTAssertFalse(otherScope.mcp.hasCurrentRunCatalogRouteToken(token, tabID: fixture.tabID))
+            otherScope.mcp.installRunRoute(id: endpoint.windowID + 1, bindings: server.runRouteBindings)
+            XCTAssertFalse(otherScope.mcp.hasCurrentRunCatalogRouteToken(token, tabID: fixture.tabID), "A live mapping must not authorize another runtime route")
             let configurationGate = CatalogAuthorityGate()
             await controller.setConfigurationGate(configurationGate)
             addTeardownBlock { @MainActor in
@@ -2947,7 +2954,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             XCTAssertTrue(server.hasCurrentRunRouteMapping(
                 runID: runID, connectionID: connectionID, expectedTabID: fixture.tabID
             ), "retained mappings must reproduce the unsafe cleanup interval")
-            XCTAssertFalse(server.hasCurrentRunCatalogRouteToken(token, expectedTabID: fixture.tabID))
+            XCTAssertFalse(fixture.viewModel.hasCurrentRunCatalogRouteTokenInCurrentMCPServer(token, tabID: fixture.tabID))
             await configurationGate.open()
             try await AsyncTestWait.waitUntil("removing-route refusal or physical send") {
                 let refused = await MainActor.run {
@@ -3163,7 +3170,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 isSessionCurrent: { candidate in candidate === session },
                 requestUIRefresh: { _, _ in },
                 scheduleSave: { _ in },
-                stageClaudeResumeRecoveryHandoff: { _ in },
+                stageClaudeResumeRecoveryHandoff: { _ in true },
                 prependPendingHandoff: { text, _ in text },
                 qualifyAgentSessionLinkProviderInputRoute: { _, routeWait in
                     if routeWait != nil {
@@ -3469,7 +3476,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 isSessionCurrent: { candidate in candidate === session },
                 requestUIRefresh: { _, _ in },
                 scheduleSave: { _ in },
-                stageClaudeResumeRecoveryHandoff: { _ in },
+                stageClaudeResumeRecoveryHandoff: { _ in true },
                 prependPendingHandoff: { text, _ in text },
                 qualifyAgentSessionLinkProviderInputRoute: { _, routeWait in
                     // An immediate `.unavailable` here stands in for a route wait that ran out.

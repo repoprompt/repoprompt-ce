@@ -11,9 +11,9 @@ import RepoPromptDomainRuntime
 // - Canonical lifecycle/durable settlement stays owned by the domain layer
 //   (`DomainAgentRunSessionStore`); `TerminalSettlementHooks` only adapts into
 //   that authority and must remain exactly-once per run attempt ownership.
-// - Presentation, binding-observation, queued-work recovery, and persistence
-//   hooks are host projections. They must never become backend authority: a
-//   headless host may implement them as no-ops without changing run semantics.
+// - Presentation is optional. Binding observation, queued-work recovery, and
+//   persistence are not optional UI effects: a window-free host must provide
+//   their runtime implementations rather than silently dropping durable/user work.
 // - `AgentTabSession` remains at broader app-host orchestration
 //   hooks because the app is the only adopter today. Terminal settlement does
 //   not receive that type: `bindTerminalSession(_:)` partially applies the
@@ -46,7 +46,7 @@ extension AgentModeRunService {
     /// Authority: presentation projection.
     struct RunPresentationHooks {
         let setAgentRunActive: (AgentTabSession, Bool) -> Void
-        let requestUIRefresh: (UUID, Bool) -> Void
+        let requestUIRefresh: (AgentTabSession, Bool) -> Void
         let notifyAgentTurnComplete: (AgentTabSession) -> Void
         /// Defaulted so hosts and test doubles that predate failure notifications stay source-compatible.
         var notifyAgentTurnFailed: (AgentTabSession, String?) -> Void = { _, _ in }
@@ -69,14 +69,14 @@ extension AgentModeRunService {
     ///
     /// Authority: queued-work recovery projection.
     struct QueuedWorkRecoveryHooks {
-        let restoreDraftText: (_ tabID: UUID, _ text: String, _ message: String, _ strategy: DraftRestorationStrategy) -> Void
+        let restoreDraftText: (_ session: AgentTabSession, _ text: String, _ message: String, _ strategy: DraftRestorationStrategy) -> Void
         var isCurrentSessionBinding: @MainActor (AgentTabSession, AgentRunStartStopFence) -> Bool = { session, fence in
             fence.binding == session.persistentSessionBindingIdentity
         }
 
         /// Withdraws a run's initial user row whose send was refused by route verification before
         /// any provider dispatch, restoring its text to an empty composer (see
-        /// `AgentModeViewModel.restoreRouteRefusedUnsentTurn`). Hosts without a composer keep the row.
+        /// `AgentSessionDraftRuntime.restoreRouteRefusedUnsentTurn`). Recovery does not require a composer.
         var restoreRouteRefusedUnsentTurn: @MainActor (
             _ session: AgentTabSession,
             _ userItemID: UUID,
@@ -117,8 +117,8 @@ extension AgentModeRunService {
             _ session: AgentTabSession?,
             _ skipsSlashExpansion: Bool
         ) async -> String
-        /// Stages a transcript handoff for fresh-session resume recovery.
-        let stageResumeRecoveryHandoffIfNeeded: (_ session: AgentTabSession) async -> Void
+        /// False refuses a fresh-session fallback whose recovery context was superseded or unavailable.
+        let stageResumeRecoveryHandoffIfNeeded: (_ session: AgentTabSession) async -> Bool
         /// Prepends a staged handoff payload to provider-facing text.
         let prependPendingHandoffIfNeeded: (_ text: String, _ session: AgentTabSession) -> String
         /// Records whether a staged handoff payload was accepted by the provider send attempt.
@@ -206,6 +206,7 @@ extension AgentModeRunService {
         let cancelPendingApproval: (AgentTabSession) -> Void
         let cancelPendingApplyEditsReview: (AgentTabSession, String) -> Void
         let cancelPendingWorktreeMergeReview: (AgentTabSession, String) -> Void
+        var drainPendingEffects: (AgentTabSession) async -> Void = { _ in }
     }
 
     /// Adapter into the canonical durable terminal settlement authority
@@ -279,6 +280,7 @@ extension AgentModeRunService.Hooks {
         _ session: AgentTabSession
     ) -> AgentRunTerminalSessionBinding {
         let tabID = session.tabID
+        let successorFence = AgentRunStartStopFence(session: session)
         #if DEBUG
             let observationFlush = session.test_flushQuietToolObservations
             let observationCheck = session.test_quietToolObservationsAreComplete
@@ -345,11 +347,16 @@ extension AgentModeRunService.Hooks {
                     persistence.scheduleSave(session)
                 },
                 publishTerminalCommit: { revision, successorKind in
-                    await terminalSettlement.publishTerminalCommit(
+                    await interactions.drainPendingEffects(session)
+                    return await terminalSettlement.publishTerminalCommit(
                         session,
                         revision,
                         successorKind
                     )
+                },
+                permitsTerminalSuccessor: { revision, result in
+                    queuedWorkRecovery.isCurrentSessionBinding(session, successorFence)
+                        && successorFence.permitsTerminalSuccessor(of: session, revision: revision, publication: result)
                 },
                 startFollowUpRun: { instruction in
                     continuation.startFollowUpRun(session, instruction)

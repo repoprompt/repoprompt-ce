@@ -12,7 +12,7 @@ import RepoPromptSettingsCore
 #endif
 
 @MainActor
-final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
+final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
     typealias CodexControllerFactory = (
         _ runID: UUID,
         _ tabID: UUID,
@@ -261,7 +261,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
     }
 
-    private weak var viewModel: AgentModeViewModel?
+    // Optional UI attachment only. Execution services are retained independently below.
+    private weak var presentationOwner: AgentModeViewModel?
+    private var draftRecovery: AgentModeRunService.QueuedWorkRecoveryHooks?
+    private var mcpServerEnabler: AgentRunExecutionContracts.MCPServerEnabler = { false }
+    private var modelRouterSettingsStore: GlobalSettingsStore = .shared
+    private var usageRuntime = AgentSessionUsageRuntime()
+    private var presentationRuntime = AgentSessionPresentationRuntime()
+    private var persistenceRuntime: AgentSessionPersistenceRuntime?
+    private var attachmentRuntime: AgentSessionAttachmentRuntime?
+    private var mcpRuntime: AgentSessionMCPRuntime?
     private var terminalCommitBarrier: AgentRunTerminalCommitBarrier?
     private var terminalSessionBinder: (@MainActor (AgentTabSession) -> AgentRunTerminalSessionBinding)?
     #if DEBUG
@@ -486,8 +495,49 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
     }
 
-    func attach(viewModel: AgentModeViewModel) {
-        self.viewModel = viewModel
+    func attachPresentation(_ viewModel: AgentModeViewModel?) {
+        presentationOwner = viewModel
+        if viewModel == nil { stopCodexModelsSubscription() }
+    }
+
+    func installExecutionServices(
+        drafts: AgentSessionDraftRuntime,
+        mcpServerEnabler: @escaping AgentRunExecutionContracts.MCPServerEnabler,
+        modelRouterSettingsStore: GlobalSettingsStore
+    ) {
+        draftRecovery = drafts.makeRunHooks()
+        self.mcpServerEnabler = mcpServerEnabler
+        self.modelRouterSettingsStore = modelRouterSettingsStore
+    }
+
+    func installModelRouterSettingsStore(_ store: GlobalSettingsStore) {
+        modelRouterSettingsStore = store
+    }
+
+    func installUsageRuntime(_ runtime: AgentSessionUsageRuntime) {
+        usageRuntime = runtime
+    }
+
+    func installPresentationRuntime(_ runtime: AgentSessionPresentationRuntime) {
+        presentationRuntime = runtime
+    }
+
+    func installMCPRuntime(_ runtime: AgentSessionMCPRuntime) {
+        mcpRuntime = runtime
+    }
+
+    func installAttachmentRuntime(_ runtime: AgentSessionAttachmentRuntime) {
+        attachmentRuntime = runtime
+    }
+
+    private var linkExecutionRuntime: AgentSessionLinkExecutionRuntime?
+
+    func installLinkExecutionRuntime(_ runtime: AgentSessionLinkExecutionRuntime) {
+        linkExecutionRuntime = runtime
+    }
+
+    func installPersistenceRuntime(_ runtime: AgentSessionPersistenceRuntime) {
+        persistenceRuntime = runtime
     }
 
     func installTerminalCommitBarrier(
@@ -678,16 +728,20 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return
         }
         guard clearCodexPendingInteractions(in: session) else { return }
-        viewModel?.reconcileInteractiveRunState(session)
-        viewModel?.publishMCPStateChange(for: session)
+        AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
+        mcpRuntime?.handleObservedMCPStateChange(for: session)
         handleRunInteractionStateChange(for: session, reason: .pendingQuestionCancelled)
         logCodex("[AgentModeVM][CodexUI] cleared stale pending Codex interactions for tab \(session.tabID) before new turn \(turnID)")
     }
 
-    func isCodexHookApprovalStrictModeEnabled() -> Bool {
-        codexHookApprovalSettings.codexHookApprovalStrictModeEnabled(
-            workspaceID: viewModel?.activeWorkspaceIDForSessionIndexOwnership
-        )
+    func isCodexHookApprovalStrictModeEnabled(workspaceID: UUID?) -> Bool {
+        codexHookApprovalSettings.codexHookApprovalStrictModeEnabled(workspaceID: workspaceID)
+    }
+
+    func isCodexHookApprovalStrictModeEnabled(for session: AgentTabSession) -> Bool {
+        // Unknown placement must never inherit a permissive global/default policy.
+        guard let workspaceID = session.persistentSessionBindingIdentity?.workspaceID else { return true }
+        return isCodexHookApprovalStrictModeEnabled(workspaceID: workspaceID)
     }
 
     private struct CodexHookGateOperationAuthority {
@@ -777,14 +831,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.codexModel = reference.model
         session.codexReasoningEffort = reference.reasoningEffort
         session.isDirty = true
-        viewModel?.scheduleSave(for: session.tabID)
+        persistenceRuntime?.scheduleSave(for: session)
     }
 
     private func publishCodexHookGateState(for session: AgentTabSession) {
-        viewModel?.reconcileInteractiveRunState(session)
+        AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
         updateCodexStallWatchdogState(for: session)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-        viewModel?.publishMCPStateChange(for: session)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
+        mcpRuntime?.handleObservedMCPStateChange(for: session)
     }
 
     private func finishCodexHookReviewAttempt(
@@ -1022,7 +1076,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             guard request.phase.allowsContinueWithoutHooks else {
                 throw AgentCodexHookReviewResolutionError.invalidDecision
             }
-            guard !isCodexHookApprovalStrictModeEnabled() else {
+            guard !isCodexHookApprovalStrictModeEnabled(for: session) else {
                 throw AgentCodexHookReviewResolutionError.strictModeRequiresApproval
             }
             let skippedCount = request.phase == .discoveryFailed ? nil : request.hooks.count
@@ -1089,7 +1143,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 throw AgentCodexHookReviewResolutionError.invalidSelection
             }
             let allUnresolvedKeys = Set(request.hooks.map { CodexHookUTF8Identity($0.key) })
-            guard !isCodexHookApprovalStrictModeEnabled() || requestedKeys == allUnresolvedKeys else {
+            guard !isCodexHookApprovalStrictModeEnabled(for: session) || requestedKeys == allUnresolvedKeys else {
                 throw AgentCodexHookReviewResolutionError.strictModeRequiresApproval
             }
             try await submitCodexHookApproval(
@@ -1163,7 +1217,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             let expectedSkippedIdentities = Set(request.trustCandidates.map(\.selectionIdentity))
                 .subtracting(approvedIdentities)
             let verifiedUnresolvedIdentities = Set(verified.unresolvedProjectHooks.map(\.selectionIdentity))
-            let strictModeRequiresRefresh = isCodexHookApprovalStrictModeEnabled()
+            let strictModeRequiresRefresh = isCodexHookApprovalStrictModeEnabled(for: session)
                 && !verifiedUnresolvedIdentities.isEmpty
             guard !strictModeRequiresRefresh,
                   verifiedUnresolvedIdentities.isSubset(of: expectedSkippedIdentities)
@@ -1287,7 +1341,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             notice,
             sequenceIndex: session.nextSequenceIndex
         ))
-        viewModel?.scheduleSave(for: session.tabID)
+        persistenceRuntime?.scheduleSave(for: session)
         publishCodexHookGateState(for: session)
         continuation?.resume()
     }
@@ -1900,8 +1954,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     }
 
     func updateCodexModelPolling() {
-        guard let viewModel else { return }
-        if viewModel.selectedAgent == .codexExec {
+        guard let presentationOwner else { return }
+        if presentationOwner.selectedAgent == .codexExec {
             startCodexModelsSubscriptionIfNeeded()
         } else {
             stopCodexModelsSubscription()
@@ -1918,12 +1972,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 await MainActor.run { [weak self] in
                     guard snapshot.isAuthorizedForPublication,
                           let self,
-                          let viewModel
+                          let presentationOwner
                     else { return }
                     // Update UI state — registry updates are owned by the polling service
-                    viewModel.updateCodexDynamicModels(snapshot.models)
+                    presentationOwner.updateCodexDynamicModels(snapshot.models)
                     // Preserve existing "normalize selection after refresh" behavior
-                    if let session = viewModel.activeSession, session.selectedAgent == .codexExec {
+                    if let session = presentationOwner.activeSession, session.selectedAgent == .codexExec {
                         normalizeCodexSelectionForSession(session, preservingExplicitEffort: true)
                     }
                 }
@@ -2223,14 +2277,25 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         return output
     }
 
+    func selectionPolicy(forModelRaw modelRaw: String, includeGlobalFallback: Bool) -> AgentCodexSelectionPolicy {
+        let options = reasoningEffortOptions(forModelRaw: modelRaw, agentKind: .codexExec)
+        return .init(
+            options: options,
+            defaultEffort: defaultReasoningEffort(forModelRaw: modelRaw, agentKind: .codexExec),
+            lastUsed: lastUsedReasoningEffort(
+                forModelRaw: modelRaw, validOptions: options, includeGlobalFallback: includeGlobalFallback
+            )
+        )
+    }
+
     func normalizeCodexSelectionForSession(
         _ session: AgentTabSession,
         preservingExplicitEffort: Bool
     ) {
         guard session.selectedAgent == .codexExec else {
             session.selectedReasoningEffortRaw = nil
-            if session.tabID == viewModel?.currentTabID {
-                viewModel?.applyCodexSelectionToBindings(
+            if session.tabID == presentationOwner?.currentTabID {
+                presentationOwner?.applyCodexSelectionToBindings(
                     modelRaw: session.selectedModelRaw,
                     reasoningEffortRaw: nil
                 )
@@ -2238,44 +2303,19 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return
         }
 
-        let parsed = CodexModelSpecifier(raw: session.selectedModelRaw)
         let normalizedModel = Self.normalizedCodexSelectionModelRaw(from: session.selectedModelRaw)
-        let explicitEffort = preservingExplicitEffort
-            ? CodexReasoningEffort.parse(session.selectedReasoningEffortRaw)
-            : nil
-        let parsedEffort = parsed.reasoningEffort
-        let options = reasoningEffortOptions(forModelRaw: normalizedModel, agentKind: .codexExec)
-        let defaultEffort = defaultReasoningEffort(forModelRaw: normalizedModel, agentKind: .codexExec)
-        let lastUsed = lastUsedReasoningEffort(
-            forModelRaw: normalizedModel,
-            validOptions: options,
-            includeGlobalFallback: preservingExplicitEffort
+        let chosenEffort = selectionPolicy(
+            forModelRaw: normalizedModel, includeGlobalFallback: preservingExplicitEffort
+        ).reasoningEffort(
+            modelRaw: session.selectedModelRaw,
+            explicitRaw: preservingExplicitEffort ? session.selectedReasoningEffortRaw : nil
         )
-        let chosenEffort: CodexReasoningEffort? = {
-            guard !options.isEmpty else { return nil }
-            if let explicitEffort, options.contains(explicitEffort) {
-                return explicitEffort
-            }
-            if let parsedEffort, options.contains(parsedEffort) {
-                return parsedEffort
-            }
-            if let lastUsed, options.contains(lastUsed) {
-                return lastUsed
-            }
-            if let defaultEffort, options.contains(defaultEffort) {
-                return defaultEffort
-            }
-            if options.contains(.medium) {
-                return .medium
-            }
-            return options.first
-        }()
 
         session.selectedModelRaw = normalizedModel
         session.selectedReasoningEffortRaw = chosenEffort?.rawValue
 
-        if session.tabID == viewModel?.currentTabID {
-            viewModel?.applyCodexSelectionToBindings(
+        if session.tabID == presentationOwner?.currentTabID {
+            presentationOwner?.applyCodexSelectionToBindings(
                 modelRaw: normalizedModel,
                 reasoningEffortRaw: chosenEffort?.rawValue
             )
@@ -2304,19 +2344,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         from agentSession: AgentSession,
         session: AgentTabSession
     ) {
-        session.codexConversationID = agentSession.codexConversationID
-        session.codexRolloutPath = agentSession.codexRolloutPath
-        session.providerCleanupHandle = agentSession.resolvedProviderCleanupHandle
-        session.codexModel = agentSession.codexModel
-        session.codexReasoningEffort = agentSession.codexReasoningEffort
-        session.codexContextUsage = AgentContextUsage(
-            modelContextWindow: agentSession.codexContextWindow,
-            lastTotalTokens: agentSession.codexLastTotalTokens,
-            totalTotalTokens: agentSession.codexTotalTotalTokens
-        )
-        viewModel?.refreshCodexContextUsageSnapshot(for: session)
+        AgentSessionHydrationRuntime.restoreCodexMetadata(from: agentSession, to: session)
+        usageRuntime.refreshCodexContextUsageSnapshot(for: session)
         if session.selectedAgent == .codexExec {
-            session.codexNeedsReconnect = agentSession.codexConversationID != nil || agentSession.codexRolloutPath != nil
             reconcilePersistedCodexCommandStatusIfNeeded(session: session)
         }
     }
@@ -2325,21 +2355,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         from session: AgentTabSession,
         to agentSession: inout AgentSession
     ) {
-        agentSession.codexConversationID = session.codexConversationID
-        agentSession.codexRolloutPath = session.codexRolloutPath
-        agentSession.providerCleanupHandle = ProviderConversationCleanupHandle.resolved(
-            provider: session.selectedAgent.rawValue,
-            explicit: session.providerCleanupHandle,
-            providerSessionID: session.providerSessionID,
-            codexConversationID: session.codexConversationID,
-            codexRolloutPath: session.codexRolloutPath
-        )
-        agentSession.codexModel = session.codexModel
-        agentSession.codexReasoningEffort = session.codexReasoningEffort
-        agentSession.codexContextWindow = session.codexContextUsage?.modelContextWindow
-        agentSession.contextWindowCapacity = session.contextWindowCapacity
-        agentSession.codexLastTotalTokens = session.codexContextUsage?.lastTotalTokens
-        agentSession.codexTotalTotalTokens = session.codexContextUsage?.totalTotalTokens
+        AgentSessionPayloadBuilder.applyCodexPersistence(from: session, to: &agentSession)
     }
 
     func nativeSlashCommand(named name: String, session: AgentTabSession) -> NativeSlashCommand? {
@@ -2382,7 +2398,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private func computerUseAdmissionMessage(session: AgentTabSession, checkRuntime: Bool = true) -> String? {
         guard CodexComputerUseWorkflow.isEnabled else { return CodexComputerUseWorkflow.disabledMessage }
         guard session.selectedAgent == .codexExec, session.parentSessionID == nil,
-              viewModel?.sessions[session.tabID] === session,
+              presentationOwner?.sessions[session.tabID] === session,
               session.codexComputerUseOwnershipTransitionHolds.isEmpty,
               codexControllerRetirementTaskByTabID[session.tabID]?.includesComputerUse != true else { return CodexComputerUseWorkflow.ineligibleMessage }
         if checkRuntime, let message = computerUseRuntimeUnavailableMessage() { return message }
@@ -2397,8 +2413,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let generation = session.bindingTransitionGeneration
         let runtimeMessage = await computerUseRuntimePreflight()
         guard !Task.isCancelled,
-              viewModel?.currentTabID == session.tabID,
-              viewModel?.sessions[session.tabID] === session,
+              presentationOwner?.currentTabID == session.tabID,
+              presentationOwner?.sessions[session.tabID] === session,
               session.codexComputerUseArmingRequestID == requestID,
               session.persistentSessionBindingIdentity == binding,
               session.bindingTransitionGeneration == generation,
@@ -2410,7 +2426,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         _ = stageCodexComputerUseActivationIfNeeded(session: session)
         cancelCodexIdleShutdown(for: session.tabID)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
     }
 
     @discardableResult
@@ -2686,11 +2702,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         if let ownership = session.activeRunOwnership {
             _ = session.endRunAttempt(ifCurrent: ownership, source: "codex.compaction.startFailed")
         }
-        viewModel?.setAgentRunActive(session.tabID, isActive: false)
+        presentationRuntime.setAgentRunActive(session, isActive: false)
         session.runState = .idle
         setRunningStatus(nil, source: nil, session: session)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-        viewModel?.scheduleSave(for: session.tabID)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
+        persistenceRuntime?.scheduleSave(for: session)
     }
 
     /// How an overseer-requested Codex compaction ended at its provider boundary.
@@ -2920,7 +2936,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     }
 
     private func beginCodexCompaction(_ session: AgentTabSession) {
-        viewModel?.ensureRunServiceMaterializedForRunStart()
+        assert(terminalCommitBarrier != nil, "Host composition must install terminal ownership before native compaction")
         if session.activeRunOwnership == nil {
             _ = session.beginRunAttempt(source: "codex.compaction")
         }
@@ -2931,9 +2947,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         recordCodexWatchdogProgress(for: session, at: compactionStartedAt)
         updateCodexStallWatchdogState(for: session)
         setRunningStatus("Compacting context…", source: .transport, session: session, urgent: true)
-        viewModel?.setAgentRunActive(session.tabID, isActive: true)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-        viewModel?.scheduleSave(for: session.tabID)
+        presentationRuntime.setAgentRunActive(session, isActive: true)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
+        persistenceRuntime?.scheduleSave(for: session)
     }
 
     private func beginTrackedCodexUserTurn(_ session: AgentTabSession) {
@@ -3235,10 +3251,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     private func markCodexContextCompacted(_ session: AgentTabSession) {
         session.contextCompactedAt = Date()
-        viewModel?.refreshCodexContextUsageSnapshot(for: session)
+        usageRuntime.refreshCodexContextUsageSnapshot(for: session)
         session.isDirty = true
-        viewModel?.requestUIRefresh(tabID: session.tabID)
-        viewModel?.scheduleSave(for: session.tabID)
+        presentationRuntime.requestUIRefresh(for: session)
+        persistenceRuntime?.scheduleSave(for: session)
     }
 
     private func resetTrackedCodexTurns(_ session: AgentTabSession) {
@@ -3421,14 +3437,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 state: .durablyQueued(queueID: submission.queueID)
             )
         } else if session.mcpControlContext != nil {
-            Task { @MainActor [weak viewModel, weak session] in
-                guard let viewModel, let session else { return }
-                await viewModel.signalCodexInstructionDelivered(for: session)
+            Task { @MainActor [mcpRuntime, weak session] in
+                guard let session else { return }
+                await mcpRuntime?.signalMCPInstructionDelivered(for: session)
             }
         }
         session.isDirty = true
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-        viewModel?.scheduleSave(for: session.tabID)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
+        persistenceRuntime?.scheduleSave(for: session)
         if case .noActiveTurn = reason {
             scheduleCodexFallbackIdlePump(session: session, queueID: submission.queueID)
         }
@@ -3565,8 +3581,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         if beginsSuccessorAttempt {
             session.mcpFollowUpRunPending = false
         }
-        viewModel?.setAgentRunActive(session.tabID, isActive: true)
-        viewModel?.publishMCPStateChange(for: session)
+        presentationRuntime.setAgentRunActive(session, isActive: true)
+        mcpRuntime?.handleObservedMCPStateChange(for: session)
         beginTrackedCodexUserTurn(session)
         let dispatchStartedAt = Date()
         session.codexLastEventAt = dispatchStartedAt
@@ -3627,7 +3643,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         guard let controller = session.codexController,
               ObjectIdentifier(controller) == head.originControllerInstanceID
         else {
-            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+            linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                 for: session,
                 dispatchID: .codexFallback(queueID: head.id)
             )
@@ -3645,7 +3661,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let dispatchAttemptID = session.activeRunAttemptID
         // A fallback successor bypasses normal session readiness, including its attempt-scoped observer registration.
         await ensureCodexToolTrackingForReadySessionIfNeeded(for: session, runID: head.originRunID)
-        let qualification = await viewModel?.qualifyProviderInputRoute(for: session) ?? .unavailable
+        let qualification = await linkExecutionRuntime?.qualifyProviderInputRoute(for: session) ?? .unavailable
         // Qualification suspends. A replaced run/head/controller may not spend this old entry or
         // terminalize its successor; the queue's exact owner handles its own cancellation.
         guard session.codexFallbackDispatchInFlight?.id == head.id,
@@ -3655,15 +3671,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
               session.codexControllerGeneration == head.originControllerGeneration,
               session.codexConversationID == head.originThreadID
         else {
-            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
+            linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
             return false
         }
         guard !Task.isCancelled,
               head.stopFence?.permitsStart(of: session) ?? true,
               qualification.allowsDispatch,
-              viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: qualification) == true
+              linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: qualification) == true
         else {
-            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
+            linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
             await failCodexFallbackDispatch(
                 session: session, entry: head,
                 message: Task.isCancelled ? nil : "Codex queued follow-up lost its exact RepoPrompt MCP route before dispatch."
@@ -3676,16 +3692,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             await failCodexFallbackDispatch(session: session, entry: head, message: nil)
             return false
         }
-        let monitoring = viewModel?.agentSessionLinkDecoratedProviderText(
+        let monitoring = linkExecutionRuntime?.agentSessionLinkDecoratedProviderText(
             head.providerText,
             session: session,
             dispatchID: promptDispatchID
         )
         defer { withExtendedLifetime(monitoring?.quietMarkerProducerLifetime) {} }
         let requiredLaneUnavailable = monitoring?.mustAbortDispatch == true
-            || (monitoring == nil && AgentModeViewModel.dispatchRequiresLaneBatch(session, promptDispatchID))
+            || (monitoring == nil && AgentSessionLinkExecutionRuntime.dispatchRequiresLaneBatch(session, promptDispatchID))
         guard !requiredLaneUnavailable else {
-            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+            linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                 for: session,
                 dispatchID: promptDispatchID
             )
@@ -3693,7 +3709,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return false
         }
         session.noteAcceptedTaskInput() // Fallback replay on reused/new ownership remains ordinary.
-        let inputProof = await viewModel?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
+        let inputProof = await linkExecutionRuntime?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
         // Managed metadata and quiet qualification can suspend too, even without local input.
         guard session.codexFallbackDispatchInFlight?.id == head.id,
               session.activeRunAttemptID == dispatchAttemptID, session.runID == head.originRunID,
@@ -3701,13 +3717,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
               session.codexControllerGeneration == head.originControllerGeneration,
               session.codexConversationID == head.originThreadID
         else {
-            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
+            linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
             return false
         }
         guard !Task.isCancelled, head.stopFence?.permitsStart(of: session) ?? true,
-              viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: qualification) == true
+              linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: qualification) == true
         else {
-            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
+            linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
             await failCodexFallbackDispatch(
                 session: session, entry: head,
                 message: Task.isCancelled || !(head.stopFence?.permitsStart(of: session) ?? true)
@@ -3715,12 +3731,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
             return false
         }
-        let acquiredPhysicalDispatch = viewModel?.agentSessionLinkAcquirePhysicalDispatch(
+        let acquiredPhysicalDispatch = linkExecutionRuntime?.agentSessionLinkAcquirePhysicalDispatch(
             for: session,
             dispatchID: promptDispatchID
-        ) ?? !AgentModeViewModel.dispatchRequiresLaneBatch(session, promptDispatchID)
+        ) ?? !AgentSessionLinkExecutionRuntime.dispatchRequiresLaneBatch(session, promptDispatchID)
         guard acquiredPhysicalDispatch else {
-            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+            linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                 for: session,
                 dispatchID: promptDispatchID
             )
@@ -3735,9 +3751,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             updateCodexStallWatchdogState(for: session)
             if let auditTurnID = head.optimisticUserItemID {
                 session.updateAutomationAudit(turnID: auditTurnID) { $0.recordCodexDispatch(.fallbackStart) }
-                viewModel?.scheduleSave(for: session.tabID)
+                persistenceRuntime?.scheduleSave(for: session)
             }
-            let released = inputProof.flatMap { viewModel?.agentSessionLinkHandoffProviderInput(for: session, dispatchID: promptDispatchID, claim: monitoring?.claim, proof: $0) }
+            let released = inputProof.flatMap { linkExecutionRuntime?.agentSessionLinkHandoffProviderInput(for: session, dispatchID: promptDispatchID, claim: monitoring?.claim, proof: $0) }
             guard released?.mustAbortDispatch != true else { throw CancellationError() }
             let oracle = session.oracleBackgroundAwareness.reserve(session: session, providerID: ObjectIdentifier(controller))
             defer { session.oracleBackgroundAwareness.release(oracle) }
@@ -3759,9 +3775,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         autoEffortApplied: head.autoEffortApplied
                     )
                 }
-                viewModel?.scheduleSave(for: session.tabID)
+                persistenceRuntime?.scheduleSave(for: session)
             }
-            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: released == nil ? monitoring?.claim : released?.claim)
+            linkExecutionRuntime?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: released == nil ? monitoring?.claim : released?.claim)
             guard var inFlight = session.codexFallbackDispatchInFlight,
                   inFlight.id == head.id,
                   session.codexController.map(ObjectIdentifier.init) == head.originControllerInstanceID
@@ -3787,7 +3803,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
             return true
         } catch {
-            viewModel?.agentSessionLinkRecordPhysicalDispatchFailure(
+            linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchFailure(
                 for: session,
                 dispatchID: promptDispatchID
             )
@@ -3813,7 +3829,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         session.mcpFollowUpRunPending = false
         session.codexPendingTurnKind = nil
-        viewModel?.finalizeAttachmentsForTurn(
+        attachmentRuntime?.finalizeAttachmentsForTurn(
             for: session,
             reservationID: entry.attachmentReservationID,
             disposition: .restoreToPending
@@ -3831,7 +3847,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
         } else {
             session.runState = .failed
-            viewModel?.setAgentRunActive(session.tabID, isActive: false)
+            presentationRuntime.setAgentRunActive(session, isActive: false)
         }
         if !session.codexFallbackQueue.isEmpty {
             abandonCodexFallbackQueue(
@@ -3839,8 +3855,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 reason: "Codex queued follow-ups were cancelled after an earlier queued dispatch failed."
             )
         }
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-        viewModel?.scheduleSave(for: session.tabID)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
+        persistenceRuntime?.scheduleSave(for: session)
     }
 
     private enum CodexFallbackAbandonmentMode: Equatable {
@@ -3889,11 +3905,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 if case .manual = entry.origin,
                    !entry.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 {
-                    viewModel?.restoreCodexFallbackDraft(
-                        tabID: session.tabID,
-                        text: entry.draftText,
-                        message: reason
-                    )
+                    draftRecovery?.restoreDraftText(session, entry.draftText, reason, .prependAlways)
                 }
             }
         }
@@ -3901,7 +3913,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             if case let .mcp(attemptID) = inFlight.origin {
                 session.codexSteerAckTracker.markStale(attemptID: attemptID, reason: reason)
             }
-            viewModel?.finalizeAttachmentsForTurn(
+            attachmentRuntime?.finalizeAttachmentsForTurn(
                 for: session,
                 reservationID: inFlight.attachmentReservationID,
                 disposition: .keepFiles
@@ -3912,14 +3924,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
         }
         if let (wakeID, dispatchID) = abandonedWake, session.oversight.pendingAutoWake?.wakeID == wakeID {
-            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+            linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                 for: session,
                 dispatchID: dispatchID
             )
         }
-        viewModel?.publishMCPStateChange(for: session)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-        viewModel?.scheduleSave(for: session.tabID)
+        mcpRuntime?.handleObservedMCPStateChange(for: session)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
+        persistenceRuntime?.scheduleSave(for: session)
     }
 
     func handleMCPControlReset(
@@ -4250,7 +4262,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         )
                         return false
                     }
-                    viewModel?.publishMCPStateChange(for: session)
+                    mcpRuntime?.handleObservedMCPStateChange(for: session)
                     return false
                 case .stale:
                     session.mcpFollowUpRunPending = false
@@ -4258,14 +4270,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         session: session,
                         reason: "Codex queued follow-up was cancelled because terminal publication became stale."
                     )
-                    viewModel?.publishMCPStateChange(for: session)
+                    mcpRuntime?.handleObservedMCPStateChange(for: session)
                     return false
                 }
                 guard session.codexFallbackQueue.first?.id == head.id,
                       session.codexFallbackQueue.first?.state == .eligibleForSuccessor(completedTurnID: turnID)
                 else {
                     session.mcpFollowUpRunPending = false
-                    viewModel?.publishMCPStateChange(for: session)
+                    mcpRuntime?.handleObservedMCPStateChange(for: session)
                     return false
                 }
                 guard let claimedHead = claimCodexFallbackHead(
@@ -4273,7 +4285,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     expectedQueueID: head.id,
                     beginsSuccessorAttempt: true
                 ) else {
-                    viewModel?.publishMCPStateChange(for: session)
+                    mcpRuntime?.handleObservedMCPStateChange(for: session)
                     return false
                 }
                 Task { @MainActor [weak self, weak session, claimedHead] in
@@ -4352,15 +4364,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     }
 
     private static func normalizedCodexSelectionModelRaw(from raw: String?) -> String {
-        let specifier = CodexModelSpecifier(raw: raw)
-        guard let baseModel = specifier.baseModel else { return AgentModel.defaultModel.rawValue }
-        if let serviceTier = CodexServiceTierVariantCatalog.supportedServiceTier(
-            baseModelID: baseModel,
-            serviceTier: specifier.serviceTier
-        ) {
-            return "\(baseModel)-\(serviceTier)"
-        }
-        return baseModel
+        AgentCodexSelectionPolicy.normalizedModelRaw(from: raw)
     }
 
     private func shouldShowNativeSlashCommand(
@@ -4504,7 +4508,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session.codexRolloutPath = nil
             session.providerCleanupHandle = nil
             session.codexContextUsage = nil
-            viewModel?.clearContextUsageSnapshot(for: session)
+            usageRuntime.clearContextUsageSnapshot(for: session)
             session.codexModel = nil
             session.codexReasoningEffort = nil
             session.codexNeedsReconnect = false
@@ -4775,7 +4779,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         routingStateOwner: (@MainActor @Sendable () -> Bool)? = nil
     ) -> MCPBootstrapLease? {
         guard shouldManageCodexTooling else { return nil }
-        viewModel?.mcpBindPendingAgentRunOracleReviewContext(tabID: tabID, runID: runID)
+        mcpRuntime?.mcpBindPendingAgentRunOracleReviewContext(tabID: tabID, runID: runID)
         let leaseSpec = MCPBootstrapLeaseSpec.agentMode(
             tabID: tabID,
             runID: runID,
@@ -4788,9 +4792,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         return MCPBootstrapLease(
             spec: leaseSpec,
             perfRecorder: perfRecorder,
-            mcpServerEnabler: { [weak viewModel] in
-                await viewModel?.ensureMCPServerEnabledForThreadStart() ?? false
-            },
+            mcpServerEnabler: mcpServerEnabler,
             policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller),
             routingStateOwner: routingStateOwner
         )
@@ -4855,7 +4857,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             itemKind: .error
         )
         session.appendItem(item)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
     }
 
     private static func missedCodexCompletionRecoveryMessage() -> String {
@@ -5172,7 +5174,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 )
             )
             session.appendItem(recoveryNoticeItem)
-            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+            presentationRuntime.requestUIRefresh(for: session, urgent: true)
         }
         if let ref = startResult.sessionRef {
             cancelCodexTransportClosedFallback(for: session.tabID)
@@ -5196,10 +5198,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 logCodex("[AgentModeVM][CodexReconnect] reconnect preserved after generation mismatch (current=\(session.codexToolPreferencesGeneration) started=\(preferenceGenerationAtStart)); next ensure will rebuild thread config")
             }
             session.isDirty = true
-            viewModel?.scheduleSave(for: session.tabID)
+            persistenceRuntime?.scheduleSave(for: session)
             scheduleCodexThreadNameSyncIfPossible(
                 for: session,
-                name: viewModel?.codexThreadDisplayName(for: session.tabID),
+                name: presentationOwner?.codexThreadDisplayName(for: session.tabID),
                 explicitThreadID: ref.conversationID,
                 source: "start-or-resume"
             )
@@ -5420,7 +5422,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 notice,
                 sequenceIndex: session.nextSequenceIndex
             ))
-            viewModel?.scheduleSave(for: session.tabID)
+            persistenceRuntime?.scheduleSave(for: session)
         }
         await finalizeCodexRun(
             session,
@@ -5769,8 +5771,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         setRunningStatus("Reconnecting…", source: .reconnect, session: session, urgent: true)
         session.codexLastEventAt = recoveryStartedAt
         recordCodexWatchdogProgress(for: session, at: recoveryStartedAt)
-        viewModel?.setAgentRunActive(session.tabID, isActive: true)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        presentationRuntime.setAgentRunActive(session, isActive: true)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
 
         let cancelEventTask = switch trigger {
         case .unexpectedStreamEnd:
@@ -5910,7 +5912,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
 
         updateCodexStallWatchdogState(for: session)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
         return .recovered
     }
 
@@ -5930,8 +5932,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         attachmentReservationID: UUID?
     ) async {
         setRunningStatus("Waiting for response…", source: .transport, session: session, urgent: true)
-        viewModel?.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session: session)
-        viewModel?.markAttachmentsConsumed(for: session, reservationID: attachmentReservationID)
+        attachmentRuntime?.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session: session)
+        attachmentRuntime?.markAttachmentsConsumed(for: session, reservationID: attachmentReservationID)
         updateCodexStallWatchdogState(for: session)
     }
 
@@ -5966,7 +5968,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         pendingTurn.retryAttempted = true
         session.codexPendingAuthRetryTurn = pendingTurn
         setRunningStatus("Refreshing Codex authentication…", source: .reconnect, session: session, urgent: true)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
 
         switch await authRecovery.refreshManagedAccount() {
         case let .requiresUserLogin(guidance):
@@ -6036,21 +6038,21 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             guard replayTurn.expectedTurnID == nil else {
                 return false
             }
-            let routeReadiness = await viewModel?.qualifyProviderInputRoute(for: session) ?? .unavailable
+            let routeReadiness = await linkExecutionRuntime?.qualifyProviderInputRoute(for: session) ?? .unavailable
             guard routeReadiness.allowsDispatch else {
-                viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+                linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                     for: session,
                     dispatchID: replayDispatchID
                 )
                 return false
             }
-            let inputRouteWasCurrent = viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
+            let inputRouteWasCurrent = linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
             guard session.runID == runID,
                   let activeController = session.codexController,
                   Self.sameCodexControllerInstance(activeController, controller),
                   inputRouteWasCurrent
             else {
-                viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+                linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                     for: session,
                     dispatchID: replayDispatchID
                 )
@@ -6070,20 +6072,20 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 }
             }
             let finalReadiness = if routeReadiness == .notRequired,
-                                    viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) != true
+                                    linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) != true
             {
-                await viewModel?.qualifyProviderInputRoute(for: session) ?? .unavailable
+                await linkExecutionRuntime?.qualifyProviderInputRoute(for: session) ?? .unavailable
             } else {
                 routeReadiness
             }
-            let inputRouteIsCurrent = viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) == true
+            let inputRouteIsCurrent = linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) == true
             guard session.runState.isActive,
                   session.runID == runID,
                   let activeController = session.codexController,
                   Self.sameCodexControllerInstance(activeController, controller),
                   inputRouteIsCurrent
             else {
-                viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+                linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                     for: session,
                     dispatchID: replayDispatchID
                 )
@@ -6105,8 +6107,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             let replayText: String
             var acceptedReplayClaim: AgentSessionLinkOutboundPromptClaim?
             if replayTurn.monitoringDispatchContext?.isPeriodic == true {
-                guard let endpoint = viewModel?.agentSessionLinkObserverEndpoint(tabID: session.tabID),
-                      viewModel?.agentSessionLinkPeriodicWakeIsEligible(session, endpoint: endpoint) == true else { return false }
+                guard let endpoint = linkExecutionRuntime?.agentSessionLinkObserverEndpoint(tabID: session.tabID),
+                      linkExecutionRuntime?.agentSessionLinkPeriodicWakeIsEligible(session, endpoint: endpoint) == true else { return false }
                 if var attempt = session.oversight.pendingAutoWake {
                     guard attempt.isPeriodic,
                           attempt.wakeID == replayTurn.monitoringDispatchContext?.dispatchID.autoWakeID,
@@ -6119,7 +6121,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     text: replayTurn.text, claim: nil, mustAbortDispatch: false
                 )
                 if let claim = replayTurn.monitoringClaim {
-                    guard viewModel?.agentSessionLinkCanReuseAcceptedPromptClaim(
+                    guard linkExecutionRuntime?.agentSessionLinkCanReuseAcceptedPromptClaim(
                         claim, for: session, dispatchID: claim.dispatchID
                     ) == true else { return false }
                     acceptedReplayClaim = claim
@@ -6131,13 +6133,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                       originalMonitoringDispatchID.isAutoWakeFamily
             {
                 guard let acknowledged = replayTurn.monitoringClaim,
-                      viewModel?.agentSessionLinkCanReuseAcceptedPromptClaim(
+                      linkExecutionRuntime?.agentSessionLinkCanReuseAcceptedPromptClaim(
                           acknowledged,
                           for: session,
                           dispatchID: originalMonitoringDispatchID
                       ) == true
                 else {
-                    viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+                    linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                         for: session,
                         dispatchID: originalMonitoringDispatchID
                     )
@@ -6148,16 +6150,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 replayText = AgentSessionLinkPromptComposer.decorated(replayTurn.text, with: acknowledged)
             } else {
                 monitoring = nil
-                let requiredLaneUnavailable = AgentModeViewModel.dispatchRequiresLaneBatch(session, replayDispatchID)
+                let requiredLaneUnavailable = AgentSessionLinkExecutionRuntime.dispatchRequiresLaneBatch(session, replayDispatchID)
                 guard !requiredLaneUnavailable else {
-                    viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+                    linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                         for: session,
                         dispatchID: replayDispatchID
                     )
                     return false
                 }
                 if let acknowledged = replayTurn.monitoringClaim,
-                   viewModel?.agentSessionLinkCanReuseAcceptedPromptClaim(
+                   linkExecutionRuntime?.agentSessionLinkCanReuseAcceptedPromptClaim(
                        acknowledged,
                        for: session,
                        dispatchID: replayDispatchID
@@ -6175,25 +6177,26 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 ?? AgentSessionLinkDispatchContext(session: session, dispatchID: replayDispatchID)
             let replayClaim = acceptedReplayClaim
             let replayProof: AgentSessionLinkProviderInputRelease.Proof?
-            if let replayClaim, !replayClaim.managedMetadataRequirements.isEmpty, let viewModel {
-                replayProof = await viewModel.agentSessionLinkProveProviderInput(for: session, claim: replayClaim)
+            if let replayClaim, !replayClaim.managedMetadataRequirements.isEmpty {
+                guard let linkExecutionRuntime else { return false }
+                replayProof = await linkExecutionRuntime.agentSessionLinkProveProviderInput(for: session, claim: replayClaim)
                 guard !Task.isCancelled, session.runState.isActive,
                       computerUseRecoveryStopFence.permitsStart(of: session), session.runID == runID,
                       session.activeRunAttemptID == computerUseRecoveryAttemptID,
                       session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(controller),
-                      viewModel.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) else { return false }
+                      linkExecutionRuntime.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) else { return false }
             } else {
                 replayProof = nil
             }
             // Ordinary auth replay may compose against an existing dispatching wake. Its local
             // wrapper must retain that cohort through acceptance just like the native send path.
             defer { withExtendedLifetime(monitoring?.quietMarkerProducerLifetime) {} }
-            let acquiredPhysicalDispatch = viewModel?.agentSessionLinkAcquirePhysicalDispatch(
+            let acquiredPhysicalDispatch = linkExecutionRuntime?.agentSessionLinkAcquirePhysicalDispatch(
                 for: session,
                 dispatchID: replayDispatchID
-            ) ?? !AgentModeViewModel.dispatchRequiresLaneBatch(session, replayDispatchID)
+            ) ?? !AgentSessionLinkExecutionRuntime.dispatchRequiresLaneBatch(session, replayDispatchID)
             guard acquiredPhysicalDispatch else {
-                viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+                linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                     for: session,
                     dispatchID: replayDispatchID
                 )
@@ -6209,7 +6212,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     session.updateAutomationAudit(turnID: auditTurnID) {
                         $0.recordCodexDispatch(.managedAuthReplay)
                     }
-                    viewModel?.scheduleSave(for: session.tabID)
+                    persistenceRuntime?.scheduleSave(for: session)
                 }
                 guard await validateCodexComputerUseScope(session: session, controller: controller, activationID: computerUseActivationID) else { throw CancellationError() }
                 if computerUseActivationID != nil {
@@ -6218,13 +6221,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                           session.runID == runID,
                           session.activeRunAttemptID == computerUseRecoveryAttemptID,
                           session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(controller),
-                          viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) == true else { throw CancellationError() }
+                          linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) == true else { throw CancellationError() }
                 }
                 var finalReplayText = replayText
                 if let replayClaim {
                     let requiresLaneBatch = replayTurn.monitoringDispatchContext?.isPeriodic != true
                         && originalMonitoringDispatchID?.isAutoWakeFamily == true
-                    guard let released = viewModel?.agentSessionLinkHandoffAcceptedReplay(
+                    guard let released = linkExecutionRuntime?.agentSessionLinkHandoffAcceptedReplay(
                         for: session, claim: replayClaim, proof: replayProof, requiresLaneBatch: requiresLaneBatch
                     ), !released.mustAbortDispatch else { throw CancellationError() }
                     finalReplayText = released.text(replayTurn.text)
@@ -6246,23 +6249,23 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             autoEffortApplied: replayTurn.autoEffortApplied
                         )
                     }
-                    viewModel?.scheduleSave(for: session.tabID)
+                    persistenceRuntime?.scheduleSave(for: session)
                 }
                 return receipt
             }
             dispatched = true
-            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext ?? replayDispatchContext, claim: nil)
+            linkExecutionRuntime?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext ?? replayDispatchContext, claim: nil)
             await applySuccessfulCodexNativeSend(
                 for: session,
                 runID: runID,
                 attachments: replayTurn.attachments,
                 attachmentReservationID: replayTurn.attachmentReservationID
             )
-            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+            presentationRuntime.requestUIRefresh(for: session, urgent: true)
             return true
         } catch {
             if acquiredAgentSessionLinkPhysicalDispatch {
-                viewModel?.agentSessionLinkRecordPhysicalDispatchFailure(
+                linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchFailure(
                     for: session,
                     dispatchID: replayDispatchID
                 )
@@ -6291,7 +6294,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         if !wasReconnectNeeded {
             session.isDirty = true
             if scheduleSave {
-                viewModel?.scheduleSave(for: session.tabID)
+                persistenceRuntime?.scheduleSave(for: session)
             }
         }
         logCodex("[AgentModeVM][CodexReconnect] reconnect flag set for tab \(session.tabID) source=\(source) (changed=\(!wasReconnectNeeded))")
@@ -6522,7 +6525,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         // can be spent much later, at a terminal commit that never passes through the projection
         // reconciler's own gate. Disabled oversight alone does not withdraw independently granted
         // session administration; both paths use the same current-surface decision.
-        guard viewModel?.agentSessionLinkCatalogRepairIsEnabled(for: session) == true else {
+        guard linkExecutionRuntime?.agentSessionLinkCatalogRepairIsEnabled(for: session) == true else {
             session.codexSessionLinkCatalogRepairCycle = nil
             logCodex("[AgentModeVM][CodexSessionLinkRepair] closed tab=\(session.tabID) reason=tool-disabled")
             catalogDiagnosticsSink.record(.repairTransition(
@@ -6564,7 +6567,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             } else {
                 logCodex("[AgentModeVM][CodexSessionLinkRepair] consumed tab=\(session.tabID)")
             }
-            viewModel?.agentSessionLinkRedriveCurrentPassiveSnapshot(for: session)
+            linkExecutionRuntime?.agentSessionLinkRedriveCurrentPassiveSnapshot(for: session)
         case .pending:
             guard let expectedController = session.codexController else { return }
             // The expected controller is read and compared inside this one synchronous MainActor
@@ -6583,7 +6586,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 tabID: session.tabID,
                 outcome: .spentReplaced
             ))
-            viewModel?.agentSessionLinkRedriveCurrentPassiveSnapshot(for: session)
+            linkExecutionRuntime?.agentSessionLinkRedriveCurrentPassiveSnapshot(for: session)
         }
     }
 
@@ -6693,9 +6696,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
             session.runState = .failed
             setRunningStatus(nil, source: nil, session: session)
-            viewModel?.setAgentRunActive(session.tabID, isActive: false)
-            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-            viewModel?.scheduleSave(for: session.tabID)
+            presentationRuntime.setAgentRunActive(session, isActive: false)
+            presentationRuntime.requestUIRefresh(for: session, urgent: true)
+            persistenceRuntime?.scheduleSave(for: session)
         }
         #if DEBUG
             if reason == "workspace-resolution", let testWorkspaceResolutionFailurePublicationGate {
@@ -6765,10 +6768,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
             session.runState = .failed
             setRunningStatus(nil, source: nil, session: session)
-            viewModel?.setAgentRunActive(session.tabID, isActive: false)
+            presentationRuntime.setAgentRunActive(session, isActive: false)
         }
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-        viewModel?.scheduleSave(for: session.tabID)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
+        persistenceRuntime?.scheduleSave(for: session)
     }
 
     private func retireCodexControllerAfterWorkspaceResolutionFailure(
@@ -7154,8 +7157,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         ) else {
                             return
                         }
-                        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-                        viewModel?.scheduleSave(for: session.tabID)
+                        presentationRuntime.requestUIRefresh(for: session, urgent: true)
+                        persistenceRuntime?.scheduleSave(for: session)
                         return
                     }
 
@@ -7163,9 +7166,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         logCodex("[AgentModeVM][CodexRecovery] events stream ended while Codex interaction is pending for tab \(session.tabID); preserving pending UI and restarting listener")
                         session.codexEventTask = nil
                         session.codexEventTaskRunID = nil
-                        viewModel?.reconcileInteractiveRunState(session)
-                        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-                        viewModel?.publishMCPStateChange(for: session)
+                        AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
+                        presentationRuntime.requestUIRefresh(for: session, urgent: true)
+                        mcpRuntime?.handleObservedMCPStateChange(for: session)
                         await ensureCodexNativeSession(
                             session: session,
                             policyAlreadyInstalled: true,
@@ -7212,10 +7215,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let requiresTransportStart = !hasActiveThread || session.codexNeedsReconnect
         let shouldBootstrapSessionInitialization = effectiveRunState.isActive || requiresTransportStart
         let hasLiveRunRoute = await shouldManageCodexTooling
-            ? (viewModel?.hasAuthoritativeRunRouteInCurrentMCPServer(
+            ? (ServerNetworkManager.shared.authoritativeRunCatalogRouteToken(
                 runID: runID,
+                windowID: windowID,
                 tabID: session.tabID
-            ) ?? false)
+            ) != nil)
             : true
         guard await computerUseStartupIsCurrent(preparedController) else { return }
         let shouldForceReconnectForMissingLiveRoute = shouldManageCodexTooling
@@ -7395,8 +7399,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                                   session.codexControllerGeneration == pendingStart.controllerGeneration,
                                   managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken)
                             else { return false }
-                            guard let viewModel else { return false }
-                            let readiness = await viewModel.qualifyProviderInputRoute(for: session)
+                            guard let linkExecutionRuntime else { return false }
+                            let readiness = await linkExecutionRuntime.qualifyProviderInputRoute(for: session)
                             guard readiness.allowsDispatch else { return false }
                             // Validate inside the lease boundary: a stale .routed outcome
                             // cannot retain an unconsumed policy for another process.
@@ -7408,7 +7412,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             )
                             return !Task.isCancelled
                                 && routeBelongsToController
-                                && viewModel.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: readiness)
+                                && linkExecutionRuntime.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: readiness)
                                 && session.runID == runID
                                 && session.activeRunAttemptID == runAttemptIDAtEntry
                                 && session.codexController.map(ObjectIdentifier.init) == expectedControllerID
@@ -7424,7 +7428,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     // Scope validation suspends after the lease's final route check. Revalidate
                     // that exact process/run route before publishing a companion-enabled thread.
                     if computerUseActivationID != nil {
-                        let readiness = await viewModel?.qualifyProviderInputRoute(for: session) ?? .unavailable
+                        let readiness = await linkExecutionRuntime?.qualifyProviderInputRoute(for: session) ?? .unavailable
                         let routeIsOwned = await routeOwnerValidator(expectedController, runID, windowID, session.tabID)
                         guard !Task.isCancelled, computerUseStartupStopFence.permitsStart(of: session), routeIsOwned,
                               session.runID == runID, session.activeRunAttemptID == runAttemptIDAtEntry,
@@ -7432,7 +7436,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                               session.codexControllerGeneration == pendingStart.controllerGeneration,
                               session.pendingCodexComputerUseActivation?.id == computerUseActivationID,
                               computerUseAdmissionMessage(session: session) == nil,
-                              viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: readiness) == true
+                              linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: readiness) == true
                         else {
                             discardPendingCodexStart(for: session, controllerID: expectedControllerID)
                             await lease.failAndCleanup()
@@ -7609,7 +7613,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                codexAuthRecoveryAttemptedRunIDs.insert(runID).inserted
             {
                 setRunningStatus("Refreshing Codex authentication…", source: .reconnect, session: session, urgent: true)
-                viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                presentationRuntime.requestUIRefresh(for: session, urgent: true)
                 switch await authRecovery.refreshManagedAccount() {
                 case let .requiresUserLogin(guidance):
                     _ = markCodexReconnectNeeded(for: session, source: "managed-auth-recovery-required-during-start")
@@ -7738,7 +7742,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 }
                 session.appendItem(errorItem)
             }
-            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+            presentationRuntime.requestUIRefresh(for: session, urgent: true)
         }
     }
 
@@ -7814,7 +7818,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             var state = session.selfCompactState
             if state.cancelStaleParkedNote(for: session) {
                 session.selfCompactState = state
-                viewModel?.scheduleSave(for: session.tabID)
+                persistenceRuntime?.scheduleSave(for: session)
             }
             guard let parked = session.selfCompactState.parkedNote,
                   session.selfCompactNoteDispatchIsCurrent(parked.dispatchID)
@@ -7834,7 +7838,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     runID: activeSendRunID, runAttemptID: activeSendRunAttemptID
                 )
             } catch {
-                viewModel?.finalizeAttachmentsForTurn(
+                attachmentRuntime?.finalizeAttachmentsForTurn(
                     for: session, reservationID: attachmentReservationID, disposition: .restoreToPending
                 )
                 return .cancelled
@@ -7848,7 +7852,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 steeringMessage
             )
             if Task.isCancelled {
-                viewModel?.finalizeAttachmentsForTurn(
+                attachmentRuntime?.finalizeAttachmentsForTurn(
                     for: session,
                     reservationID: attachmentReservationID,
                     disposition: .restoreToPending
@@ -7858,14 +7862,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             guard drained else {
                 let message = "Codex did not send because child agent_run.wait scopes did not drain after steering wake."
                 logCodex("[AgentModeVM] sendCodexNativeMessage: \(message)")
-                viewModel?.finalizeAttachmentsForTurn(
+                attachmentRuntime?.finalizeAttachmentsForTurn(
                     for: session,
                     reservationID: attachmentReservationID,
                     disposition: .restoreToPending
                 )
                 session.appendItem(AgentChatItem.error(message, sequenceIndex: session.nextSequenceIndex))
-                viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-                viewModel?.scheduleSave(for: session.tabID)
+                presentationRuntime.requestUIRefresh(for: session, urgent: true)
+                persistenceRuntime?.scheduleSave(for: session)
                 return .preDispatchRejected(message: message)
             }
             guard session.runID == activeSendRunID,
@@ -7873,7 +7877,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                   session.selectedAgent == .codexExec
             else {
                 let message = "Codex did not send because the active run changed while waiting for child agent_run.wait scopes to drain."
-                viewModel?.finalizeAttachmentsForTurn(
+                attachmentRuntime?.finalizeAttachmentsForTurn(
                     for: session,
                     reservationID: attachmentReservationID,
                     disposition: .restoreToPending
@@ -7883,7 +7887,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         if hasCodexStartupClaim(for: session) {
             let message = "Codex did not send because thread routing is still being confirmed."
-            viewModel?.finalizeAttachmentsForTurn(
+            attachmentRuntime?.finalizeAttachmentsForTurn(
                 for: session,
                 reservationID: attachmentReservationID,
                 disposition: .restoreToPending
@@ -7898,8 +7902,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let sendStartedAt = Date()
         session.codexLastEventAt = sendStartedAt
         recordCodexWatchdogProgress(for: session, at: sendStartedAt)
-        viewModel?.setAgentRunActive(session.tabID, isActive: true)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        presentationRuntime.setAgentRunActive(session, isActive: true)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
         cancelCodexIdleShutdown(for: session.tabID)
 
         func turnSelection() -> (model: String?, reasoningEffort: String?, serviceTier: String?, isAuto: Bool) {
@@ -7910,8 +7914,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                       provider: session.selectedAgent,
                       selectedModelRaw: session.selectedModelRaw,
                       manualEffortRaw: manual.reasoningEffort,
-                      configuration: viewModel?.modelRouterSettingsStore.autoEffortConfiguration()
-                          ?? GlobalSettingsStore.shared.autoEffortConfiguration()
+                      configuration: modelRouterSettingsStore.autoEffortConfiguration()
                   ),
                   let baseModel = CodexModelSpecifier(raw: session.selectedModelRaw).baseModel,
                   let advertisedModel = modelOptions(for: .codexExec).first(where: {
@@ -7959,7 +7962,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             // and unwind without dispatching a first turn. Cancellation owns the terminal state, so this
             // publishes no failure.
             clearCodexPendingAuthRetryTurn(session)
-            viewModel?.finalizeAttachmentsForTurn(
+            attachmentRuntime?.finalizeAttachmentsForTurn(
                 for: session,
                 reservationID: attachmentReservationID,
                 disposition: .restoreToPending
@@ -7968,7 +7971,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         if session.activeRunAttemptID != sendRunAttemptIDAtEntry {
             clearCodexPendingAuthRetryTurn(session)
-            viewModel?.finalizeAttachmentsForTurn(
+            attachmentRuntime?.finalizeAttachmentsForTurn(
                 for: session,
                 reservationID: attachmentReservationID,
                 disposition: .restoreToPending
@@ -7977,7 +7980,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         if hasCodexStartupClaim(for: session) {
             clearCodexPendingAuthRetryTurn(session)
-            viewModel?.finalizeAttachmentsForTurn(
+            attachmentRuntime?.finalizeAttachmentsForTurn(
                 for: session,
                 reservationID: attachmentReservationID,
                 disposition: .restoreToPending
@@ -8010,7 +8013,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     deleteDeferredFilesWhenFailureHasNoInFlight: false
                 )
             } else {
-                viewModel?.finalizeAttachmentsForTurn(
+                attachmentRuntime?.finalizeAttachmentsForTurn(
                     for: session,
                     reservationID: attachmentReservationID,
                     disposition: .restoreToPending
@@ -8019,15 +8022,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     session.appendItem(AgentChatItem.error(message, sequenceIndex: session.nextSequenceIndex))
                 }
                 setRunningStatus(nil, source: nil, session: session)
-                viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-                viewModel?.scheduleSave(for: session.tabID)
+                presentationRuntime.requestUIRefresh(for: session, urgent: true)
+                persistenceRuntime?.scheduleSave(for: session)
             }
             return .failed(message: message)
         }
 
         guard await validateCodexComputerUseScope(session: session, controller: controller, activationID: computerUseActivationID) else {
             clearCodexPendingAuthRetryTurn(session)
-            viewModel?.finalizeAttachmentsForTurn(for: session, reservationID: attachmentReservationID, disposition: .restoreToPending)
+            attachmentRuntime?.finalizeAttachmentsForTurn(for: session, reservationID: attachmentReservationID, disposition: .restoreToPending)
             return .preDispatchRejected(message: CodexComputerUseWorkflow.ineligibleMessage)
         }
 
@@ -8043,15 +8046,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     notifyOnCompleted: false
                 )
             } else {
-                viewModel?.finalizeAttachmentsForTurn(
+                attachmentRuntime?.finalizeAttachmentsForTurn(
                     for: session,
                     reservationID: attachmentReservationID,
                     disposition: .restoreToPending
                 )
                 session.appendItem(AgentChatItem.error(message, sequenceIndex: session.nextSequenceIndex))
                 setRunningStatus(nil, source: nil, session: session)
-                viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-                viewModel?.scheduleSave(for: session.tabID)
+                presentationRuntime.requestUIRefresh(for: session, urgent: true)
+                persistenceRuntime?.scheduleSave(for: session)
             }
             return .failed(message: message)
         }
@@ -8088,18 +8091,18 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
         let promptDispatchID = AgentSessionLinkPromptDispatchID.codexNativeSend(sendRunID)
         let expectedControllerID = ObjectIdentifier(controller)
-        var routeReadiness: AgentModeViewModel.ProviderInputRouteReadiness = if isSelfNote {
+        var routeReadiness: AgentSessionLinkExecutionRuntime.ProviderInputRouteReadiness = if isSelfNote {
             .notRequired
         } else {
-            await viewModel?.qualifyProviderInputRoute(for: session) ?? .unavailable
+            await linkExecutionRuntime?.qualifyProviderInputRoute(for: session) ?? .unavailable
         }
         guard routeReadiness.allowsDispatch else {
-            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+            linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                 for: session,
                 dispatchID: promptDispatchID
             )
             clearCodexPendingAuthRetryTurn(session)
-            viewModel?.finalizeAttachmentsForTurn(
+            attachmentRuntime?.finalizeAttachmentsForTurn(
                 for: session,
                 reservationID: attachmentReservationID,
                 disposition: .restoreToPending
@@ -8115,7 +8118,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             case .cancelled, .notRequired, .ready:
                 preconditionFailure("non-rejection route outcome entered rejection message path")
             }
-            guard viewModel?.sessions[session.tabID] === session else {
+            guard linkExecutionRuntime?.ownsSession(session) == true else {
                 return .stale(reason: message)
             }
             if terminalizeRejectedSend {
@@ -8131,26 +8134,26 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return .preDispatchRejected(message: message)
         }
         #if DEBUG
-            if let afterReadiness = viewModel?.test_agentSessionLinkAfterProviderInputRouteReadiness {
+            if let afterReadiness = linkExecutionRuntime?.test_agentSessionLinkAfterProviderInputRouteReadiness {
                 await afterReadiness()
             }
         #endif
         if !isSelfNote, routeReadiness == .notRequired,
-           viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) != true
+           linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) != true
         {
-            routeReadiness = await viewModel?.qualifyProviderInputRoute(for: session) ?? .unavailable
+            routeReadiness = await linkExecutionRuntime?.qualifyProviderInputRoute(for: session) ?? .unavailable
         }
-        let inputRouteIsCurrent = isSelfNote || viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
+        let inputRouteIsCurrent = isSelfNote || linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
         guard session.runID == sendRunID,
               session.codexController.map(ObjectIdentifier.init) == expectedControllerID,
               inputRouteIsCurrent
         else {
-            viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+            linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                 for: session,
                 dispatchID: promptDispatchID
             )
             clearCodexPendingAuthRetryTurn(session)
-            viewModel?.finalizeAttachmentsForTurn(
+            attachmentRuntime?.finalizeAttachmentsForTurn(
                 for: session,
                 reservationID: attachmentReservationID,
                 disposition: .restoreToPending
@@ -8163,7 +8166,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             } else {
                 "Codex did not send because the RepoPrompt MCP route changed before dispatch. Your message was restored."
             }
-            guard viewModel?.sessions[session.tabID] === session else {
+            guard linkExecutionRuntime?.ownsSession(session) == true else {
                 return .stale(reason: message)
             }
             if terminalizeRejectedSend {
@@ -8208,22 +8211,22 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             // Hook review can suspend after a link-less qualification. Upgrade only when
             // current exact membership now needs a route; never wait for tool discovery.
             let finalReadiness = if routeReadiness == .notRequired,
-                                    self.viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) != true
+                                    self.linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) != true
             {
-                await self.viewModel?.qualifyProviderInputRoute(for: session) ?? .unavailable
+                await self.linkExecutionRuntime?.qualifyProviderInputRoute(for: session) ?? .unavailable
             } else {
                 routeReadiness
             }
-            let inputRouteIsCurrent = self.viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) == true
+            let inputRouteIsCurrent = self.linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) == true
             let providerRouteIsCurrent = session.runID == sendRunID
                 && session.codexController.map(ObjectIdentifier.init) == expectedControllerID
             guard providerRouteIsCurrent, inputRouteIsCurrent else {
-                self.viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+                self.linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                     for: session,
                     dispatchID: promptDispatchID
                 )
                 self.clearCodexPendingAuthRetryTurn(session)
-                self.viewModel?.finalizeAttachmentsForTurn(
+                self.attachmentRuntime?.finalizeAttachmentsForTurn(
                     for: session,
                     reservationID: attachmentReservationID,
                     disposition: .restoreToPending
@@ -8236,7 +8239,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 } else {
                     "Codex did not send because the RepoPrompt MCP route changed before dispatch. Your message was restored."
                 }
-                guard self.viewModel?.sessions[session.tabID] === session else {
+                guard self.linkExecutionRuntime?.ownsSession(session) == true else {
                     return .stale(reason: message)
                 }
                 if terminalizeRejectedSend {
@@ -8253,20 +8256,20 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
 
             routeReadiness = finalReadiness
-            let candidate = self.viewModel?.agentSessionLinkDecoratedProviderText(
+            let candidate = self.linkExecutionRuntime?.agentSessionLinkDecoratedProviderText(
                 text,
                 session: session,
                 dispatchID: promptDispatchID
             )
             let requiredLaneUnavailable = candidate?.mustAbortDispatch == true
-                || (candidate == nil && AgentModeViewModel.dispatchRequiresLaneBatch(session, promptDispatchID))
+                || (candidate == nil && AgentSessionLinkExecutionRuntime.dispatchRequiresLaneBatch(session, promptDispatchID))
             guard !requiredLaneUnavailable else {
-                self.viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
+                self.linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                     for: session,
                     dispatchID: promptDispatchID
                 )
                 self.clearCodexPendingAuthRetryTurn(session)
-                self.viewModel?.finalizeAttachmentsForTurn(
+                self.attachmentRuntime?.finalizeAttachmentsForTurn(
                     for: session,
                     reservationID: attachmentReservationID,
                     disposition: .restoreToPending
@@ -8294,13 +8297,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
         func acquireFinalizedAgentSessionLinkDispatch() -> Bool {
             guard !isSelfNote else { return true }
-            let acquired = viewModel?.agentSessionLinkAcquirePhysicalDispatch(
+            let acquired = linkExecutionRuntime?.agentSessionLinkAcquirePhysicalDispatch(
                 for: session, dispatchID: promptDispatchID
-            ) ?? !AgentModeViewModel.dispatchRequiresLaneBatch(session, promptDispatchID)
+            ) ?? !AgentSessionLinkExecutionRuntime.dispatchRequiresLaneBatch(session, promptDispatchID)
             if acquired {
                 acquiredAgentSessionLinkPhysicalDispatch = true
             } else {
-                viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
+                linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
             }
             return acquired
         }
@@ -8314,7 +8317,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 && session.runID == sendRunID
                 && session.activeRunAttemptID == sendRunAttemptIDAtEntry
                 && session.codexController.map(ObjectIdentifier.init) == expectedControllerID
-                && viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
+                && linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
         }
 
         do {
@@ -8365,26 +8368,26 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             session.updateAutomationAudit(turnID: auditTurnID) {
                                 $0.recordCodexDispatch(.start)
                             }
-                            viewModel?.scheduleSave(for: session.tabID)
+                            persistenceRuntime?.scheduleSave(for: session)
                         }
                         guard await computerUsePhysicalDispatchIsCurrent() else { throw CancellationError() }
                         // Bind switch evidence before optional Read proof can suspend. Upstream's
                         // finalized dispatch acquisition remains after Read, with a switch recheck.
-                        guard viewModel?.providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: promptDispatchID)
+                        guard linkExecutionRuntime?.providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: promptDispatchID)
                             ?? (session.pendingHandoff.providerSwitchDelivery == nil)
                         else { throw CancellationError() }
-                        let proof = await viewModel?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
+                        let proof = await linkExecutionRuntime?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
                         guard !Task.isCancelled, effectiveStopFence.permitsStart(of: session),
                               session.runID == sendRunID, session.activeRunAttemptID == sendRunAttemptIDAtEntry,
                               session.codexController.map(ObjectIdentifier.init) == expectedControllerID,
                               session.pendingCodexComputerUseActivation?.id == computerUseActivationID,
                               computerUseActivationID != nil || session.codexControllerFeatureState?.computerUseEnabled != true,
                               computerUseActivationID == nil || (session.codexControllerFeatureState?.computerUseEnabled == true && computerUseAdmissionMessage(session: session) == nil),
-                              isSelfNote || viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
+                              isSelfNote || linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
                         else { throw CancellationError() }
                         // Read proof can suspend after acquisition. Assert the same frozen switch
                         // evidence again at this final synchronous release fence, never re-fit it.
-                        guard viewModel?.providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: promptDispatchID)
+                        guard linkExecutionRuntime?.providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: promptDispatchID)
                             ?? (session.pendingHandoff.providerSwitchDelivery == nil)
                         else { throw CancellationError() }
                         guard acquireFinalizedAgentSessionLinkDispatch() else { throw CancellationError() }
@@ -8399,17 +8402,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                                 throw CancellationError()
                             }
                             session.selfCompactState = state
-                            viewModel?.scheduleSave(for: session.tabID)
+                            persistenceRuntime?.scheduleSave(for: session)
                         }
                         let receipt: CodexTurnStartReceipt
                         do {
-                            let released = proof.flatMap { viewModel?.agentSessionLinkHandoffProviderInput(for: session, dispatchID: promptDispatchID, claim: monitoring?.claim, proof: $0) }
+                            let released = proof.flatMap { linkExecutionRuntime?.agentSessionLinkHandoffProviderInput(for: session, dispatchID: promptDispatchID, claim: monitoring?.claim, proof: $0) }
                             guard released?.mustAbortDispatch != true else {
                                 if let noteDispatchID {
                                     var state = session.selfCompactState
                                     _ = state.noteDefinitivelyNotAttempted(noteDispatchID)
                                     session.selfCompactState = state
-                                    viewModel?.scheduleSave(for: session.tabID)
+                                    persistenceRuntime?.scheduleSave(for: session)
                                 }
                                 throw CancellationError()
                             }
@@ -8430,7 +8433,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                                 var state = session.selfCompactState
                                 _ = state.noteTransportFailed(noteDispatchID)
                                 session.selfCompactState = state
-                                viewModel?.scheduleSave(for: session.tabID)
+                                persistenceRuntime?.scheduleSave(for: session)
                             }
                             throw error
                         }
@@ -8438,10 +8441,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             var state = session.selfCompactState
                             if state.noteAccepted(noteDispatchID) {
                                 session.appendItem(AgentChatItem.selfCompactionNoteRestored(sequenceIndex: session.nextSequenceIndex))
-                                viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                                presentationRuntime.requestUIRefresh(for: session, urgent: true)
                             }
                             session.selfCompactState = state
-                            viewModel?.scheduleSave(for: session.tabID)
+                            persistenceRuntime?.scheduleSave(for: session)
                         }
                         if let auditTurnID {
                             session.updateAutomationAudit(turnID: auditTurnID) {
@@ -8450,7 +8453,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                                     autoEffortApplied: physicalSelection.isAuto
                                 )
                             }
-                            viewModel?.scheduleSave(for: session.tabID)
+                            persistenceRuntime?.scheduleSave(for: session)
                         }
                         return receipt
                     }
@@ -8467,22 +8470,22 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 logCodex("[AgentModeVM] sendCodexNativeMessage: calling controller.steerUserTurn expectedTurnID=\(identity.turnID)")
                 if let auditTurnID {
                     session.updateAutomationAudit(turnID: auditTurnID) { $0.recordCodexDispatch(.steer) }
-                    viewModel?.scheduleSave(for: session.tabID)
+                    persistenceRuntime?.scheduleSave(for: session)
                 }
                 func recordAcceptedSteer() {
                     guard let auditTurnID else { return }
                     session.updateAutomationAudit(turnID: auditTurnID) { $0.recordCodexSteerAccepted() }
-                    viewModel?.scheduleSave(for: session.tabID)
+                    persistenceRuntime?.scheduleSave(for: session)
                 }
                 do {
-                    let proof = await viewModel?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
+                    let proof = await linkExecutionRuntime?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
                     guard !Task.isCancelled, effectiveStopFence.permitsStart(of: session),
                           session.runID == sendRunID, session.activeRunAttemptID == sendRunAttemptIDAtEntry,
                           session.codexController.map(ObjectIdentifier.init) == expectedControllerID,
                           session.pendingCodexComputerUseActivation?.id == computerUseActivationID,
                           computerUseActivationID != nil || session.codexControllerFeatureState?.computerUseEnabled != true,
                           computerUseActivationID == nil || (session.codexControllerFeatureState?.computerUseEnabled == true && computerUseAdmissionMessage(session: session) == nil),
-                          viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
+                          linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
                     else { throw CancellationError() }
                     guard acquireFinalizedAgentSessionLinkDispatch() else { throw CancellationError() }
                     if let parkedNote {
@@ -8492,15 +8495,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         var state = session.selfCompactState
                         guard state.noteWillAttempt(parkedNote.dispatchID) else { return .cancelled }
                         session.selfCompactState = state
-                        viewModel?.scheduleSave(for: session.tabID)
+                        persistenceRuntime?.scheduleSave(for: session)
                     }
-                    let released = proof.flatMap { viewModel?.agentSessionLinkHandoffProviderInput(for: session, dispatchID: promptDispatchID, claim: monitoring?.claim, proof: $0) }
+                    let released = proof.flatMap { linkExecutionRuntime?.agentSessionLinkHandoffProviderInput(for: session, dispatchID: promptDispatchID, claim: monitoring?.claim, proof: $0) }
                     guard released?.mustAbortDispatch != true else {
                         if let parkedNote {
                             var state = session.selfCompactState
                             _ = state.noteDefinitivelyNotAttempted(parkedNote.dispatchID)
                             session.selfCompactState = state
-                            viewModel?.scheduleSave(for: session.tabID)
+                            persistenceRuntime?.scheduleSave(for: session)
                         }
                         throw CancellationError()
                     }
@@ -8518,10 +8521,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         var state = session.selfCompactState
                         if state.noteAccepted(parkedNote.dispatchID) {
                             session.appendItem(AgentChatItem.selfCompactionNoteRestored(sequenceIndex: session.nextSequenceIndex))
-                            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                            presentationRuntime.requestUIRefresh(for: session, urgent: true)
                         }
                         session.selfCompactState = state
-                        viewModel?.scheduleSave(for: session.tabID)
+                        persistenceRuntime?.scheduleSave(for: session)
                     }
                     recordAcceptedSteer()
                     if receipt.acceptedTurnID != identity.turnID {
@@ -8546,7 +8549,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             _ = state.noteTransportFailed(parkedNote.dispatchID)
                         }
                         session.selfCompactState = state
-                        viewModel?.scheduleSave(for: session.tabID)
+                        persistenceRuntime?.scheduleSave(for: session)
                         throw mismatch
                     }
                     guard case let .expectedTurnMismatch(expectedTurnID, actualTurnID, failure) = mismatch,
@@ -8618,7 +8621,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         var state = session.selfCompactState
                         _ = state.noteTransportFailed(parkedNote.dispatchID)
                         session.selfCompactState = state
-                        viewModel?.scheduleSave(for: session.tabID)
+                        persistenceRuntime?.scheduleSave(for: session)
                     }
                     throw error
                 }
@@ -8629,7 +8632,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             // `startUserTurn`, or a `steerUserTurn` receipt carrying an accepted turn ID. Acknowledge
             // before the staleness guard below, because a dispatch the provider accepted after the
             // local run changed still delivered the supplement exactly once.
-            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: releasedMonitoringClaim)
+            linkExecutionRuntime?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: releasedMonitoringClaim)
             // Managed-auth recovery can still replay this exact turn after acceptance. Hand it the
             // acknowledged claim so the replay can re-attach the identical fragment instead of
             // shipping the bare stored text and silently dropping the revision forever.
@@ -8659,7 +8662,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 } else if fallbackContext?.origin == .manual,
                           session.mcpControlContext != nil
                 {
-                    await viewModel?.signalCodexInstructionDelivered(for: session)
+                    await mcpRuntime?.signalMCPInstructionDelivered(for: session)
                 }
                 logCodex("[AgentModeVM] sendCodexNativeMessage: provider accepted typed dispatch after the local run/controller changed")
                 return .sent
@@ -8684,12 +8687,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             } else if fallbackContext?.origin == .manual,
                       session.mcpControlContext != nil
             {
-                await viewModel?.signalCodexInstructionDelivered(for: session)
+                await mcpRuntime?.signalMCPInstructionDelivered(for: session)
             }
             return .sent
         } catch let steerError as CodexTurnSteerError {
             if acquiredAgentSessionLinkPhysicalDispatch {
-                viewModel?.agentSessionLinkRecordPhysicalDispatchFailure(
+                linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchFailure(
                     for: session,
                     dispatchID: promptDispatchID
                 )
@@ -8732,7 +8735,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
         } catch {
             if acquiredAgentSessionLinkPhysicalDispatch {
-                viewModel?.agentSessionLinkRecordPhysicalDispatchFailure(
+                linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchFailure(
                     for: session,
                     dispatchID: promptDispatchID
                 )
@@ -8743,7 +8746,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     sendRunID: sendRunID,
                     controller: controller
                 ) else {
-                    viewModel?.finalizeAttachmentsForTurn(
+                    attachmentRuntime?.finalizeAttachmentsForTurn(
                         for: session,
                         reservationID: attachmentReservationID,
                         disposition: .restoreToPending
@@ -8760,13 +8763,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         notifyOnCompleted: false
                     )
                 } else {
-                    viewModel?.finalizeAttachmentsForTurn(
+                    attachmentRuntime?.finalizeAttachmentsForTurn(
                         for: session,
                         reservationID: attachmentReservationID,
                         disposition: .restoreToPending
                     )
                     setRunningStatus(nil, source: nil, session: session)
-                    viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                    presentationRuntime.requestUIRefresh(for: session, urgent: true)
                 }
                 return .cancelled
             }
@@ -8803,15 +8806,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     notifyOnCompleted: false
                 )
             } else {
-                viewModel?.finalizeAttachmentsForTurn(
+                attachmentRuntime?.finalizeAttachmentsForTurn(
                     for: session,
                     reservationID: attachmentReservationID,
                     disposition: .restoreToPending
                 )
                 session.appendItem(AgentChatItem.error(message, sequenceIndex: session.nextSequenceIndex))
                 setRunningStatus(nil, source: nil, session: session)
-                viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-                viewModel?.scheduleSave(for: session.tabID)
+                presentationRuntime.requestUIRefresh(for: session, urgent: true)
+                persistenceRuntime?.scheduleSave(for: session)
             }
             return .failed(message: message)
         }
@@ -8907,7 +8910,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             sequenceIndex: session.nextSequenceIndex
         )
         session.appendItem(toolItem)
-        viewModel?.requestUIRefresh(tabID: session.tabID)
+        presentationRuntime.requestUIRefresh(for: session)
     }
 
     private func handleCodexToolResult(
@@ -9030,7 +9033,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             isError: isError,
             session: session
         )
-        viewModel?.requestUIRefresh(tabID: session.tabID)
+        presentationRuntime.requestUIRefresh(for: session)
     }
 
     /// Returns `true` when an incoming apply_patch running payload should be ignored
@@ -9112,8 +9115,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                   Self.flushPendingAssistantDeltaState(session)
             else { return }
             session.assistantDeltaFlushGeneration &+= 1
-            self?.viewModel?.requestAssistantPresentationRefresh(
-                session: session,
+            self?.presentationRuntime.assistantDeltaApplied(
+                session,
                 sourceItemsRevision: session.sourceItemsRevision,
                 flushGeneration: session.assistantDeltaFlushGeneration
             )
@@ -9159,8 +9162,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return
         }
         session.assistantDeltaFlushGeneration &+= 1
-        viewModel?.requestAssistantPresentationRefresh(
-            session: session,
+        presentationRuntime.assistantDeltaApplied(
+            session,
             sourceItemsRevision: session.sourceItemsRevision,
             flushGeneration: session.assistantDeltaFlushGeneration
         )
@@ -9181,8 +9184,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.pendingCodexAssistantScope = nil
         guard didFlush || didSeal else { return }
         session.assistantDeltaFlushGeneration &+= 1
-        viewModel?.requestAssistantPresentationRefresh(
-            session: session,
+        presentationRuntime.assistantDeltaApplied(
+            session,
             sourceItemsRevision: session.sourceItemsRevision,
             flushGeneration: session.assistantDeltaFlushGeneration
         )
@@ -9284,8 +9287,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
         guard didChange else { return }
         session.assistantDeltaFlushGeneration &+= 1
-        viewModel?.requestAssistantPresentationRefresh(
-            session: session,
+        presentationRuntime.assistantDeltaApplied(
+            session,
             sourceItemsRevision: session.sourceItemsRevision,
             flushGeneration: session.assistantDeltaFlushGeneration
         )
@@ -9303,7 +9306,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         guard session.runningStatusText != value || session.runningStatusSource != normalizedSource else { return }
         session.runningStatusText = value
         session.runningStatusSource = normalizedSource
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: urgent)
+        presentationRuntime.requestUIRefresh(for: session, urgent: urgent)
     }
 
     private static func reasoningAggregationKey(
@@ -9478,7 +9481,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             setRunningStatus(nil, source: nil, session: session, urgent: true)
         }
         if didUpdateTranscript {
-            viewModel?.requestUIRefresh(tabID: session.tabID)
+            presentationRuntime.requestUIRefresh(for: session)
         }
     }
 
@@ -9605,7 +9608,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             setRunningStatus(nil, source: nil, session: session, urgent: true)
         }
         if didChange {
-            viewModel?.requestUIRefresh(tabID: session.tabID)
+            presentationRuntime.requestUIRefresh(for: session)
         }
     }
 
@@ -9690,7 +9693,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         case .failed:
             .failed
         }
-        let attachmentDisposition: AgentModeViewModel.AttachmentTurnDisposition = if turnStatus == .failed {
+        let attachmentDisposition: DomainAgentRunAttachmentTurnDisposition = if turnStatus == .failed {
             if deleteDeferredFilesWhenFailureHasNoInFlight,
                case .idle = session.attachmentTurnState
             {
@@ -9753,7 +9756,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             },
             postCommit: { [weak self] _, _ in
                 guard let self else { return }
-                viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                presentationRuntime.requestUIRefresh(for: session, urgent: true)
                 // Session-scoped Computer Use remains armed across local-user turns. Catalog
                 // repair and idle reclamation must not retire its otherwise reusable controller.
                 //
@@ -9990,10 +9993,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return
         case let .tokenUsage(usage):
             guard session.runState.isActive else { return }
-            viewModel?.applyCodexNativeContextUsage(usage, session: session)
+            usageRuntime.applyCodexNativeContextUsage(usage, session: session)
             session.isDirty = true
-            viewModel?.requestUIRefresh(tabID: session.tabID, scope: .runtimeMetrics)
-            viewModel?.scheduleSaveForCommandOutput(tabID: session.tabID, minInterval: 2.0)
+            presentationRuntime.requestUIRefresh(for: session, scope: .runtimeMetrics)
+            persistenceRuntime?.scheduleSaveForCommandOutput(session: session, minInterval: 2.0)
         case let .approvalRequest(request):
             guard session.runState.isActive else { return }
             CodexComputerUseWorkflow.logApprovalDecision(
@@ -10003,17 +10006,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             clearCodexPendingAuthRetryTurn(session)
             sealAssistantBoundary(session)
             session.pendingApproval = request
-            viewModel?.reconcileInteractiveRunState(session)
-            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-            viewModel?.publishMCPStateChange(for: session)
+            AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
+            presentationRuntime.requestUIRefresh(for: session, urgent: true)
+            mcpRuntime?.handleObservedMCPStateChange(for: session)
         case let .permissionsRequest(request):
             guard session.runState.isActive else { return }
             clearCodexPendingAuthRetryTurn(session)
             sealAssistantBoundary(session)
             session.pendingPermissionsRequest = request
-            viewModel?.reconcileInteractiveRunState(session)
-            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-            viewModel?.publishMCPStateChange(for: session)
+            AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
+            presentationRuntime.requestUIRefresh(for: session, urgent: true)
+            mcpRuntime?.handleObservedMCPStateChange(for: session)
         case let .mcpElicitationRequest(request):
             guard session.runState.isActive else { return }
             clearCodexPendingAuthRetryTurn(session)
@@ -10026,9 +10029,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             } else {
                 session.queuedMCPElicitationRequests.append(request)
             }
-            viewModel?.reconcileInteractiveRunState(session)
-            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-            viewModel?.publishMCPStateChange(for: session)
+            AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
+            presentationRuntime.requestUIRefresh(for: session, urgent: true)
+            mcpRuntime?.handleObservedMCPStateChange(for: session)
         case let .requestUserInput(request):
             guard session.runState.isActive else { return }
             clearCodexPendingAuthRetryTurn(session)
@@ -10076,8 +10079,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             } else {
                 session.queuedUserInputRequests.append(request)
             }
-            viewModel?.reconcileInteractiveRunState(session)
-            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+            AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
+            presentationRuntime.requestUIRefresh(for: session, urgent: true)
         case let .serverRequestIssue(issue):
             if await attemptManagedCodexAuthRecovery(
                 for: session,
@@ -10124,7 +10127,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 ) != nil
                 if didUpdate {
                     AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] ensure bash anchor/live-state tool=\(toolName) invocationID=\(invocationID?.uuidString ?? "nil") liveCount=\(session.bashLiveExecutionByKey.count) totalItems=\(session.items.count)")
-                    viewModel?.requestUIRefresh(tabID: session.tabID)
+                    presentationRuntime.requestUIRefresh(for: session)
                 }
                 return
             }
@@ -10136,7 +10139,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
             session.appendItem(toolItem)
             AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] append toolCall tool=\(toolName) invocationID=\(invocationID?.uuidString ?? "nil") argsChars=\(argsJSON?.count ?? 0) totalItems=\(session.items.count)")
-            viewModel?.requestUIRefresh(tabID: session.tabID)
+            presentationRuntime.requestUIRefresh(for: session)
         case let .toolResult(toolName, invocationID, argsJSON, resultJSON, isError, _):
             guard session.runState.isActive else { return }
             let toolName = AgentToolNamePolicy.accepted(toolName) ?? AgentToolNamePolicy.fallbackName
@@ -10183,8 +10186,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         session: session
                     ) {
                         guard terminalApplyResult.didChange else { return }
-                        viewModel?.requestUIRefresh(tabID: session.tabID)
-                        viewModel?.scheduleSave(for: session.tabID)
+                        presentationRuntime.requestUIRefresh(for: session)
+                        persistenceRuntime?.scheduleSave(for: session)
                         return
                     }
                     let didUpdateLive = upsertLiveBashExecution(
@@ -10206,8 +10209,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         ).map { materializeRunningBashExecution($0.state, session: session) } ?? false)
                         : false
                     if didUpdateLive || didMaterialize {
-                        viewModel?.requestUIRefresh(
-                            tabID: session.tabID,
+                        presentationRuntime.requestUIRefresh(
+                            for: session,
                             scope: shouldMaterializeRunningOutput ? .full : .transcriptRuntime
                         )
                     }
@@ -10224,8 +10227,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     observedAt: eventTimestamp
                 ) {
                     AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] finalize bash toolResult tool=\(toolName) invocationID=\(invocationID?.uuidString ?? "nil") liveCount=\(session.bashLiveExecutionByKey.count)")
-                    viewModel?.requestUIRefresh(tabID: session.tabID)
-                    viewModel?.scheduleSave(for: session.tabID)
+                    presentationRuntime.requestUIRefresh(for: session)
+                    persistenceRuntime?.scheduleSave(for: session)
                 }
                 return
             }
@@ -10296,7 +10299,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 session: session
             )
             AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] apply toolResult tool=\(toolName) invocationID=\(invocationID?.uuidString ?? "nil") isError=\(isError.map(String.init(describing:)) ?? "nil") resultChars=\(resultJSON.count) totalItems=\(session.items.count)")
-            viewModel?.requestUIRefresh(tabID: session.tabID)
+            presentationRuntime.requestUIRefresh(for: session)
         case let .commandExecutionRunning(runningUpdate):
             guard session.runState.isActive
                 || shouldApplyCommandExecutionRunningUpdateToInactiveSession(runningUpdate, session: session)
@@ -10335,8 +10338,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 setRunningStatus(statusText, source: .transport, session: session, urgent: true)
                 session.runState = .running
             }
-            viewModel?.setAgentRunActive(session.tabID, isActive: true)
-            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+            presentationRuntime.setAgentRunActive(session, isActive: true)
+            presentationRuntime.requestUIRefresh(for: session, urgent: true)
         case let .turnCompleted(turnID, status, failure):
             let completionOwnership = session.activeRunOwnership
             if bufferCodexTurnCompletionDuringReattachIfNeeded(
@@ -10404,7 +10407,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     {
                         state.active?.compactTurnSucceeded = true
                         session.selfCompactState = state
-                        viewModel?.scheduleSave(for: session.tabID)
+                        persistenceRuntime?.scheduleSave(for: session)
                     }
                 }
                 await finalizeCodexRun(
@@ -10446,8 +10449,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             {
                 setRunningStatus("Codex is active…", source: .transport, session: session, urgent: true)
             }
-            viewModel?.setAgentRunActive(session.tabID, isActive: true)
-            viewModel?.requestUIRefresh(tabID: session.tabID, scope: .runtimeMetrics)
+            presentationRuntime.setAgentRunActive(session, isActive: true)
+            presentationRuntime.requestUIRefresh(for: session, scope: .runtimeMetrics)
         case let .errorNotification(notification):
             let willRetry: Bool
             if let structuredWillRetry = notification.willRetry {
@@ -10466,8 +10469,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     )
                 }
                 setRunningStatus(notification.message, source: .reconnect, session: session, urgent: true)
-                viewModel?.setAgentRunActive(session.tabID, isActive: true)
-                viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true, scope: .runtimeMetrics)
+                presentationRuntime.setAgentRunActive(session, isActive: true)
+                presentationRuntime.requestUIRefresh(for: session, urgent: true, scope: .runtimeMetrics)
                 return
             }
             if await attemptManagedCodexAuthRecovery(
@@ -10497,8 +10500,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     )
                 }
                 setRunningStatus(message, source: .reconnect, session: session, urgent: true)
-                viewModel?.setAgentRunActive(session.tabID, isActive: true)
-                viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true, scope: .runtimeMetrics)
+                presentationRuntime.setAgentRunActive(session, isActive: true)
+                presentationRuntime.requestUIRefresh(for: session, urgent: true, scope: .runtimeMetrics)
                 return
             }
             if await attemptManagedCodexAuthRecovery(
@@ -10518,7 +10521,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         case let .system(message):
             let systemItem = AgentChatItem.system(message, sequenceIndex: session.nextSequenceIndex)
             session.appendItem(systemItem)
-            viewModel?.requestUIRefresh(tabID: session.tabID)
+            presentationRuntime.requestUIRefresh(for: session)
         }
     }
 
@@ -10538,18 +10541,18 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 )
                 setRunningStatus(nil, source: nil, session: session)
                 clearCodexPendingInteractions(in: session)
-                viewModel?.reconcileInteractiveRunState(session)
-                viewModel?.publishMCPStateChange(for: session)
-                viewModel?.setAgentRunActive(session.tabID, isActive: false)
-                viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-                viewModel?.scheduleSave(for: session.tabID)
+                AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
+                mcpRuntime?.handleObservedMCPStateChange(for: session)
+                presentationRuntime.setAgentRunActive(session, isActive: false)
+                presentationRuntime.requestUIRefresh(for: session, urgent: true)
+                persistenceRuntime?.scheduleSave(for: session)
                 scheduleCodexIdleShutdownIfNeeded(for: session, reason: "transport-closed-idle")
                 return
             }
             if !hasPendingCodexInteraction(for: session) {
                 setRunningStatus("Reconnecting…", source: .reconnect, session: session, urgent: true)
-                viewModel?.setAgentRunActive(session.tabID, isActive: true)
-                viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true, scope: .runtimeMetrics)
+                presentationRuntime.setAgentRunActive(session, isActive: true)
+                presentationRuntime.requestUIRefresh(for: session, urgent: true, scope: .runtimeMetrics)
                 if let sourceController {
                     scheduleCodexTransportClosedFallback(for: session, sourceController: sourceController)
                 }
@@ -10864,7 +10867,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     }
 
     private func canMaterializeRunningBashOutput(for session: AgentTabSession) -> Bool {
-        viewModel?.canBuildOrPublishActiveTranscriptBindings(for: session) ?? true
+        presentationOwner?.canBuildOrPublishActiveTranscriptBindings(for: session) ?? true
     }
 
     private static func isTerminalBashTranscriptItem(
@@ -11722,9 +11725,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         case .noChange:
             break
         case .liveStateOnly:
-            viewModel?.requestUIRefresh(tabID: session.tabID, scope: .transcriptRuntime)
+            presentationRuntime.requestUIRefresh(for: session, scope: .transcriptRuntime)
         case .materializedTranscript:
-            viewModel?.requestUIRefresh(tabID: session.tabID)
+            presentationRuntime.requestUIRefresh(for: session)
         }
     }
 
@@ -11768,8 +11771,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 }
                 logCodex("[AgentModeVM][CodexIdle] shutting down idle app-server for tab \(tabID) reason=\(reason)")
                 await shutdownCodexSession(session, reclaimOnlyIfStillIdle: true)
-                viewModel?.requestUIRefresh(tabID: tabID, urgent: true)
-                viewModel?.scheduleSave(for: tabID)
+                presentationRuntime.requestUIRefresh(for: session, urgent: true)
+                persistenceRuntime?.scheduleSave(for: session)
             }
         )
     }
@@ -11798,17 +11801,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         ensureCodexStallWatchdog(for: session)
     }
 
-    func agentModeViewModel(
-        _ viewModel: AgentModeViewModel,
-        didChangeRunInteractionStateFor session: AgentTabSession,
-        reason: AgentModeViewModel.RunInteractionStateChangeReason
+    func runInteractionStateChanged(
+        for session: AgentTabSession,
+        reason: AgentRunInteractionStateChangeReason
     ) {
         handleRunInteractionStateChange(for: session, reason: reason)
     }
 
     private func handleRunInteractionStateChange(
         for session: AgentTabSession,
-        reason: AgentModeViewModel.RunInteractionStateChangeReason
+        reason: AgentRunInteractionStateChangeReason
     ) {
         _ = reason
         updateCodexStallWatchdogState(for: session)
@@ -12029,9 +12031,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             case .noChange:
                 break
             case .liveStateOnly:
-                viewModel?.requestUIRefresh(tabID: session.tabID, scope: .transcriptRuntime)
+                presentationRuntime.requestUIRefresh(for: session, scope: .transcriptRuntime)
             case .materializedTranscript:
-                viewModel?.requestUIRefresh(tabID: session.tabID)
+                presentationRuntime.requestUIRefresh(for: session)
             }
             return
         }
@@ -12048,8 +12050,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 session: session
             ) {
                 guard terminalApplyResult.didChange else { return }
-                viewModel?.requestUIRefresh(tabID: session.tabID)
-                viewModel?.scheduleSave(for: session.tabID)
+                presentationRuntime.requestUIRefresh(for: session)
+                persistenceRuntime?.scheduleSave(for: session)
                 return
             }
             if upsertLiveBashExecution(
@@ -12072,8 +12074,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 {
                     _ = materializeRunningBashExecution(state, session: session)
                 }
-                viewModel?.requestUIRefresh(
-                    tabID: session.tabID,
+                presentationRuntime.requestUIRefresh(
+                    for: session,
                     scope: shouldMaterializeRunningOutput ? .full : .transcriptRuntime
                 )
             }
@@ -12089,8 +12091,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session: session,
             observedAt: observedAt
         ) {
-            viewModel?.requestUIRefresh(tabID: session.tabID)
-            viewModel?.scheduleSave(for: session.tabID)
+            presentationRuntime.requestUIRefresh(for: session)
+            persistenceRuntime?.scheduleSave(for: session)
         }
     }
 
@@ -12136,8 +12138,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         rebuildLiveBashExecutionState(from: session)
         guard didReconcile else { return }
         session.isDirty = true
-        viewModel?.requestUIRefresh(tabID: session.tabID)
-        viewModel?.scheduleSave(for: session.tabID)
+        presentationRuntime.requestUIRefresh(for: session)
+        persistenceRuntime?.scheduleSave(for: session)
     }
 
     private func finalizePendingToolCalls(
@@ -12344,9 +12346,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return
         }
         session.pendingApproval = nil
-        viewModel?.reconcileInteractiveRunState(session)
+        AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
         handleRunInteractionStateChange(for: session, reason: .approvalResponseSubmitted)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
         Task { [controller] in
             await controller.respondToServerRequest(id: requestID, result: result)
         }
@@ -12365,9 +12367,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         guard Self.computerUseAllowsDecision(decision, session: session) else { return }
         let result = Self.buildPermissionsResult(decision: decision, request: request)
         session.pendingPermissionsRequest = nil
-        viewModel?.reconcileInteractiveRunState(session)
+        AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
         handleRunInteractionStateChange(for: session, reason: .permissionsResponseSubmitted)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
         let authoritativeTurnID = session.codexAuthoritativeActiveTurn?.turnID
         Task { [controller] in
             await controller.respondToServerRequest(id: request.requestID, result: result)
@@ -12393,10 +12395,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         if !session.queuedMCPElicitationRequests.isEmpty {
             session.pendingMCPElicitationRequest = session.queuedMCPElicitationRequests.removeFirst()
         }
-        viewModel?.reconcileInteractiveRunState(session)
+        AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
         handleRunInteractionStateChange(for: session, reason: .mcpElicitationResponseSubmitted)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-        viewModel?.publishMCPStateChange(for: session)
+        presentationRuntime.requestUIRefresh(for: session, urgent: true)
+        mcpRuntime?.handleObservedMCPStateChange(for: session)
         let authoritativeTurnID = session.codexAuthoritativeActiveTurn?.turnID
         Task { [controller] in
             await controller.respondToServerRequest(id: request.requestID, result: response.jsonObject)
@@ -12507,7 +12509,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.codexRolloutPath = nil
         session.providerCleanupHandle = nil
         session.codexContextUsage = nil
-        viewModel?.clearContextUsageSnapshot(for: session)
+        usageRuntime.clearContextUsageSnapshot(for: session)
         session.activeReasoningItemID = nil
         session.reasoningItemIDsByGroupID.removeAll()
         session.codexReasoningSegmentsByKey.removeAll()
