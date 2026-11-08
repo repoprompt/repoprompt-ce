@@ -5301,3 +5301,41 @@ Fresh-runtime fixture repair validation: `025bb09a-367e-417e-ba6d-cd5d33a50ec7`,
 zero failures (restoration admission 19, runtime store 9). No new compiler diagnostic in the
 changed fixture. Scoped SwiftFormat and lint `e58f94fa-e23f-4c2b-beb6-fff6dfa2113e` passed.
 A new full-suite run and both product/index gates follow this final Swift tree.
+
+#### M9.1 published-head gate reconciliation
+
+Published code/test head: `d92a8371f9a2d799be76a38b80ef4e145125c85a`, normal fast-forward push
+on 2026-11-08 after the mandatory push safety preflight. The local brief and terminal-materialisation
+stash remain excluded and preserved. PR #1655 stays draft; no live-app lifecycle action was run.
+
+- Full local ticket `150c3fb1-4f2a-4944-8cb6-e822b2e36f75` **did not pass**: it reached its
+  unchanged 3600-second job limit after 6279 completed cases, including 14 failed cases. Thirteen
+  were Oracle admission failures following a shutdown suite; one was a Codex interpreter-version
+  probe failure. This is not a full-suite qualification receipt.
+- Separate focused `80fc7d45-b399-435f-88fe-3830b4bd0436` passed **38 tests** (Codex runtime
+  authority 18, Oracle cancellation adapter 20). That focused pass does not erase the full-run
+  failure or establish the transient Codex probe's historical cause.
+- The shutdown/Oracle ordering witness `7910823a-752d-4407-90ac-bc4b4ae4d677` ran **31 cases**:
+  shutdown 11 passed, Oracle 13/20 failed (27 assertion/error events). An isolated temporary clone
+  of **main `bb68ff0d29ef8582a4636fa615ec6acd374a011a`** ran the identical filter under ticket
+  `b45628d3-6b7e-42a8-99b4-49e5da9a1e17`: the same 31 cases and identical 13 failed-case names.
+  The shutdown fixture permanently closes the shared Oracle registry used by the later class.
+  This is a **pre-existing local cross-suite ordering issue**, not an M9.1 regression. The proposed
+  isolation experiment was removed from the branch and preserved only as a local patch. No
+  production shutdown-policy change, assertion relaxation or timeout increase is included.
+- Per overseer direction, the **hosted per-suite-process shards are the authoritative full-suite
+  gate**. Their result and the debug/live smoke are owned by the overseer; this worker did not read
+  CI logs and does not claim either gate passed.
+- Final `make dev-swift-build PRODUCT=all`: `7bb4c881-442c-408b-8315-56ca055b8b9b`, **passed**.
+  The preceding attempt `b690da03-4069-4497-9a35-f1e3f2971d77` failed because the incremental
+  compiler referenced a missing generated `Sparkle.framework`; the intact vendored framework was
+  recopied to that generated location before the successful coordinated rebuild. No tracked file
+  or binary dependency changed.
+- Fresh compiler-index check after that build: **1242/1360** wrong-way file edges and **53/66**
+  largest-cycle components, passed; no ratchet baseline change.
+- Warning audit: all **11 diagnostic locations / 9 warning kinds** emitted by the final product
+  build in branch-changed files have unchanged source lines and matching compiler diagnostics in
+  the main comparison build. The new observation unused-result warning was repaired earlier;
+  the new watchdog/fixture code emitted no new diagnostics in focused compilation. This is not a
+  claim that the repository has no existing warnings; the clean hosted aggregate ratchet remains
+  separate. Final Swift-tree lint: `e58f94fa-e23f-4c2b-beb6-fff6dfa2113e`, passed.
