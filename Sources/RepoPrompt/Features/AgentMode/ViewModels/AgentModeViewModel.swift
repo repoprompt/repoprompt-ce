@@ -16031,19 +16031,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 previousTranscript: previousSanitizedTranscript,
                 previousProjection: previousBaseProjection,
                 previousProtection: previousProjectionProtection,
+                previousExcludingQuiet: true,
+                previousReplyPresentation: true,
                 protection: projectionProtection,
                 reusableFrozenPrefixTurnCount: projectionReusableTurnCount,
+                turnCaches: previousTurnProjectionCaches,
                 context: processingContext,
-                excludingQuiet: true
+                excludingQuiet: true,
+                replyPresentation: true
             ) {
-                baseProjection = reusedProjection
-                updatedTurnProjectionCaches = AgentTranscriptProjectionBuilder.updatedTurnCaches(
-                    for: localDisplayTranscript,
-                    projection: reusedProjection,
-                    protection: projectionProtection,
-                    existingTurnCaches: previousTurnProjectionCaches,
-                    excludingQuiet: true
-                )
+                baseProjection = reusedProjection.projection
+                updatedTurnProjectionCaches = reusedProjection.updatedTurnCaches
                 #if DEBUG || EDIT_FLOW_PERF
                     performanceSnapshot.projectionReuseSuccessCount += 1
                     performanceSnapshot.lastProjectionReusedTurnCount = projectionReusableTurnCount
@@ -16054,7 +16052,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     protection: projectionProtection,
                     turnCaches: previousTurnProjectionCaches,
                     context: processingContext,
-                    excludingQuiet: true
+                    excludingQuiet: true,
+                    replyPresentation: true
                 )
                 baseProjection = buildResult.projection
                 updatedTurnProjectionCaches = buildResult.updatedTurnCaches
@@ -16069,7 +16068,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 protection: projectionProtection,
                 turnCaches: previousTurnProjectionCaches,
                 context: processingContext,
-                excludingQuiet: true
+                excludingQuiet: true,
+                replyPresentation: true
             )
             baseProjection = buildResult.projection
             updatedTurnProjectionCaches = buildResult.updatedTurnCaches
