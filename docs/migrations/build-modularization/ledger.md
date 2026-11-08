@@ -4748,3 +4748,42 @@ Validation history is retained rather than treating retries as an initial pass:
 Independent canonical writer admission, saved execution without window/view-model construction,
 remaining runtime command composition, runtime-addressed control routing and presentation-preserving
 handoff/drain remain required. This is not M9 completion or full-suite/CI/live-smoke qualification.
+
+### M9 continuation — runtime-owned session construction and observation (2026-11-08)
+
+The scope now constructs observed session objects. Actual source mutation, run-state durability,
+coalesced transcript scheduling and MCP publisher subscriptions no longer live in VM callbacks.
+The existing source, persistence, restoration and terminal authorities are unchanged. Presentation
+receives optional exact-object events only. Overseer activation retirement still synchronously
+notifies the existing discovery sink; only the pill repaint waits until the enclosing mutation settles.
+Source-mutation summary types moved unchanged, with VM aliases and no persisted schema change.
+
+Pending derived work retains its exact scope until settlement. Replaced/released objects cannot
+schedule new durability or transcript work. A refused task clears only its own generation's handle,
+so subsequent readmission is not wedged and a successor task is not cleared. Coalescing policy is
+read live from the composition adapter, preserving test injection and prompt-owner lifetime behavior.
+Run-state observation retains restoration suppression and allows the originating final save during
+retirement; presentation loss does not suppress that save.
+
+Three persistence tests exercise real disk writes without a VM, pending-scope lifetime, coalescing,
+replacement/readmission, restoration suppression and writer release. A domain-store integration
+case verifies real published interaction changes from the runtime's subscription, without manually
+publishing or constructing a window/view model. Existing Combine will-set timing is preserved.
+
+Validation:
+- `b5b6517a-6e36-4faf-923f-e876d76a2320` failed compilation before tests: two activation callbacks
+  had not moved to the link runtime. Their actual VM bodies were located and moved to observation;
+  discovery authority was not replaced with a no-op or duplicated in the link owner.
+- `90ab95a3-c33d-4019-92d3-89ac4f6e5487` ran **126 tests**, one new fixture assertion failed.
+  Persistence intentionally retains its completed debounce handle. The fixture now discards that
+  joined handle before checking that released objects cannot schedule again; the save-generation
+  assertion is unchanged. No production scheduling guard or timeout was weakened.
+- Final `5270e250-8596-4def-bda6-6ebe50790188` passed **126 tests**: quiet display 14, first save 47,
+  MCP runtime 9, persistence runtime 9, runtime store 9, Claude approval/resume 38.
+- Lint `724bb996-65e3-48d9-bc74-a44a51af057d` passed on the same Swift tree. Scoped formatting,
+  one independent review and mandatory staged contribution preflight apply. No baseline increased.
+
+This removes VM-owned session-observation execution, not the remaining composition adapters.
+Independent canonical writer admission, the prepared-window replacement, provider/start composition,
+runtime routing and presentation-preserving handoff/drain remain open. Products, fresh compiler
+index, full suite, aggregate warning qualification and live smoke are not newly qualified here.

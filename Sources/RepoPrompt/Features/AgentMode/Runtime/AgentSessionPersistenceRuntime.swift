@@ -47,6 +47,7 @@ final class AgentSessionPersistenceRuntime {
         let saveAdmission: (AgentTabSession) -> String?
         let creationIsCurrent: (AgentSessionCreationHandle) -> Bool
         let admitBinding: (AgentTabSession) -> Admission?
+        var isRestoringConfiguration: () -> Bool = { false }
     }
 
     struct Presentation {

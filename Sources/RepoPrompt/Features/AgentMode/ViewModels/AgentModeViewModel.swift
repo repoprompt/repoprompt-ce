@@ -2139,6 +2139,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     guard let self, sessions[session.tabID] === session else { return }
                     publishActiveAgentRunStartedAt(for: session.tabID, session: session)
                 },
+                runState: { [weak self] session in
+                    guard let self, sessions[session.tabID] === session else { return }
+                    republishTranscriptPresentationForRunStateChangeIfNeeded(session)
+                },
+                oversightBinding: { [weak self] session in
+                    self?.agentSessionLinkRepaintCurrentPillIfOwned(session)
+                },
                 permissions: { [weak self] session in
                     guard let self, sessions[session.tabID] === session, currentTabID == session.tabID else { return }
                     refreshAutoEditPermissionGuidanceForActiveSession()
@@ -5450,34 +5457,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func makeSession(for tabID: UUID) -> TabSession {
-        let newSession = TabSession(tabID: tabID, perfRecorder: perfRecorder)
-        newSession.onSourceItemsChanged = { [weak self] session, mutation in
-            guard let self else { return }
-            // `.structural`/`.replaceAll` can be non-user replacements, so source mutations never
-            // release the restoration baseline (§5.4); covered rows keep their captured position.
-            // Source items are the canonical mutable session data. Schedule
-            // persistence from the source mutation itself so inactive presentation
-            // deferral cannot make durability depend on derived UI refresh work.
-            scheduleSave(for: session.tabID)
-            scheduleDerivedTranscriptRefresh(for: session, reason: .liveMutation, mutation: mutation)
+        _ = persistenceRuntime
+        _ = mcpRuntime
+        runtimeSessionStore.observation.coalescesDerivedRefresh = { [weak self] in
+            guard let self else { return false }
+            #if DEBUG
+                return promptManager != nil || test_allowsScheduledDerivedTranscriptRefreshWithoutPromptManager
+            #else
+                return promptManager != nil
+            #endif
         }
-        newSession.onQuietDisplayMaskChanged = { [weak self] session in
-            self?.requestUIRefresh(tabID: session.tabID, scope: .transcriptRuntime)
-        }
-        newSession.onOverseerActivationRetired = { [weak self] session, retired in
-            self?.agentSessionLinkOverseerActivationRetired(session: session, retired: retired)
-        }
-        newSession.onBindingTransitionSettled = { [weak self] session in
-            self?.agentSessionLinkBindingTransitionSettled(session: session)
-        }
-        newSession.onRunStateChanged = { [weak self] session in
-            guard let self else { return }
-            if !session.runState.isActive {
-                completeNextAgentTurnRuntimeFooterIfNeeded(for: session, endedAt: Date())
-            }
-            persistRunStateTransitionIfNeeded(for: session)
-            republishTranscriptPresentationForRunStateChangeIfNeeded(session)
-        }
+        let newSession = runtimeSessionStore.makeSession(tabID: tabID, perfRecorder: perfRecorder)
         // Initialize new session with current UI selection
         newSession.selectedAgent = selectedAgent
         newSession.selectedModelRaw = selectedModelRaw
@@ -5496,21 +5486,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if let draft = tabDraftText.removeValue(forKey: tabID) {
             newSession.draftText = draft
         }
-        configureMCPStateObservation(for: newSession)
         return newSession
-    }
-
-    private func persistRunStateTransitionIfNeeded(for session: TabSession) {
-        guard !suppressesAgentSessionPersistence else { return }
-        guard session.hasLoadedPersistedState else { return }
-        guard !isRestoringState else { return }
-        switch session.runState {
-        case .idle:
-            return
-        case .running, .waitingForUser, .waitingForQuestion, .waitingForApproval, .completed, .cancelled, .failed:
-            session.isDirty = true
-            scheduleSave(for: session.tabID)
-        }
     }
 
     func agentMessageRuntimeFooters(for tabID: UUID?) -> [UUID: AgentMessageRuntimeFooter] {
@@ -7871,30 +7847,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     // - Session store: Services/MCP/Agent/AgentRunSessionStore.swift
     // - Snapshot:      Services/MCP/Agent/AgentRunMCPSnapshot.swift
     // - Shared helpers: Services/MCP/Agent/AgentMCPToolHelpers.swift
-
-    private func configureMCPStateObservation(for session: TabSession) {
-        session.mcpStateObservationCancellable?.cancel()
-        let publishers: [AnyPublisher<Void, Never>] = [
-            session.$runState.map { _ in () }.eraseToAnyPublisher(),
-            session.$runningStatusText.map { _ in () }.eraseToAnyPublisher(),
-            session.$waitingPrompt.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingAskUser.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingUserInputRequest.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingApproval.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingCodexHookReview.map { _ in () }.eraseToAnyPublisher(),
-            session.$codexHookGateAudit.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingPermissionsRequest.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingMCPElicitationRequest.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingApplyEditsReview.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingWorktreeMergeReview.map { _ in () }.eraseToAnyPublisher(),
-            session.$items.map { _ in () }.eraseToAnyPublisher()
-        ]
-        session.mcpStateObservationCancellable = Publishers.MergeMany(publishers)
-            .sink { [weak self, weak session] _ in
-                guard let self, let session else { return }
-                handleObservedMCPStateChange(for: session)
-            }
-    }
 
     private func teardownMCPControl(
         for session: TabSession,
@@ -13899,97 +13851,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
-    private func scheduleDerivedTranscriptRefresh(
-        for session: TabSession,
-        reason: DerivedTranscriptRefreshReason,
-        mutation: SourceItemsMutation? = nil
-    ) {
-        #if DEBUG
-            let canScheduleAsyncRefresh = promptManager != nil || test_allowsScheduledDerivedTranscriptRefreshWithoutPromptManager
-        #else
-            let canScheduleAsyncRefresh = promptManager != nil
-        #endif
-        let scheduleSignpost = EditFlowPerf.begin(
-            EditFlowPerf.Stage.Transcript.scheduleRefresh,
-            EditFlowPerf.Dimensions(
-                status: reason.rawValue,
-                sourceItemCount: session.items.count
-            )
-        )
-        if reason == .liveMutation, let mutation {
-            if var pendingSummary = session.pendingSourceItemsMutationSummary {
-                pendingSummary.merge(mutation)
-                session.pendingSourceItemsMutationSummary = pendingSummary
-            } else {
-                session.pendingSourceItemsMutationSummary = PendingSourceItemsMutationSummary(mutation)
-            }
-        } else if reason != .liveMutation {
-            session.pendingSourceItemsMutationSummary = nil
-        }
-        #if DEBUG || EDIT_FLOW_PERF
-            session.transcriptPerformanceSnapshot.refreshRequestCount += 1
-        #endif
-
-        if session.terminalCommitInProgress, case .metadataRange? = mutation {
-            EditFlowPerf.end(
-                EditFlowPerf.Stage.Transcript.scheduleRefresh,
-                scheduleSignpost,
-                EditFlowPerf.Dimensions(status: reason.rawValue, outcome: "terminal-metadata-fold")
-            )
-            session.pendingDerivedTranscriptRefreshReason = .liveMutation
-            return
-        }
-
-        guard reason == .liveMutation, canScheduleAsyncRefresh else {
-            EditFlowPerf.end(
-                EditFlowPerf.Stage.Transcript.scheduleRefresh,
-                scheduleSignpost,
-                EditFlowPerf.Dimensions(status: reason.rawValue, outcome: "immediate")
-            )
-            session.pendingDerivedTranscriptRefreshReason = nil
-            session.derivedTranscriptRefreshGeneration &+= 1
-            session.derivedTranscriptRefreshTask?.cancel()
-            session.derivedTranscriptRefreshTask = nil
-            #if DEBUG || EDIT_FLOW_PERF
-                session.transcriptPerformanceSnapshot.refreshImmediateCount += 1
-            #endif
-            refreshDerivedTranscriptState(for: session, reason: reason)
-            return
-        }
-
-        if session.derivedTranscriptRefreshTask != nil {
-            EditFlowPerf.end(
-                EditFlowPerf.Stage.Transcript.scheduleRefresh,
-                scheduleSignpost,
-                EditFlowPerf.Dimensions(status: reason.rawValue, outcome: "coalesced")
-            )
-            #if DEBUG || EDIT_FLOW_PERF
-                session.transcriptPerformanceSnapshot.refreshCoalescedCount += 1
-            #endif
-            session.pendingDerivedTranscriptRefreshReason = .liveMutation
-            return
-        }
-
-        EditFlowPerf.end(
-            EditFlowPerf.Stage.Transcript.scheduleRefresh,
-            scheduleSignpost,
-            EditFlowPerf.Dimensions(status: reason.rawValue, outcome: "scheduled")
-        )
-        session.pendingDerivedTranscriptRefreshReason = .liveMutation
-        session.derivedTranscriptRefreshGeneration &+= 1
-        let scheduledGeneration = session.derivedTranscriptRefreshGeneration
-        session.derivedTranscriptRefreshTask = Task { @MainActor [weak self, weak session] in
-            guard let self, let session else { return }
-            guard !Task.isCancelled else { return }
-            guard sessions[session.tabID] === session else { return }
-            guard session.derivedTranscriptRefreshGeneration == scheduledGeneration else { return }
-            let scheduledReason = session.pendingDerivedTranscriptRefreshReason ?? .liveMutation
-            session.pendingDerivedTranscriptRefreshReason = nil
-            session.derivedTranscriptRefreshTask = nil
-            refreshDerivedTranscriptState(for: session, reason: scheduledReason)
-        }
-    }
-
     func refreshDerivedTranscriptState(
         for session: TabSession,
         reason: DerivedTranscriptRefreshReason = .manualRefresh,
@@ -15626,7 +15487,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 var creation: AgentSessionCreationHandle?
                 guard let id = ensureSessionBoundToTab(session, onCreated: { creation = $0 }) else { return nil }
                 return .init(sessionID: id, creation: creation)
-            }
+            },
+            isRestoringConfiguration: { [weak self] in self?.isRestoringState ?? false }
         )
         runtime.presentation = .init(
             currentTabID: { [weak self] in self?.currentTabID },

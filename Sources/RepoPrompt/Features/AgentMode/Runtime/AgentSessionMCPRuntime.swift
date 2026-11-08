@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
@@ -109,6 +110,30 @@ final class AgentSessionMCPRuntime {
             guard UserDefaults.standard.bool(forKey: "enableSteeringDebugLogging") else { return }
             print(message())
         #endif
+    }
+
+    func installStateObservation(for session: AgentTabSession) {
+        session.mcpStateObservationCancellable?.cancel()
+        let publishers: [AnyPublisher<Void, Never>] = [
+            session.$runState.map { _ in () }.eraseToAnyPublisher(),
+            session.$runningStatusText.map { _ in () }.eraseToAnyPublisher(),
+            session.$waitingPrompt.map { _ in () }.eraseToAnyPublisher(),
+            session.$pendingAskUser.map { _ in () }.eraseToAnyPublisher(),
+            session.$pendingUserInputRequest.map { _ in () }.eraseToAnyPublisher(),
+            session.$pendingApproval.map { _ in () }.eraseToAnyPublisher(),
+            session.$pendingCodexHookReview.map { _ in () }.eraseToAnyPublisher(),
+            session.$codexHookGateAudit.map { _ in () }.eraseToAnyPublisher(),
+            session.$pendingPermissionsRequest.map { _ in () }.eraseToAnyPublisher(),
+            session.$pendingMCPElicitationRequest.map { _ in () }.eraseToAnyPublisher(),
+            session.$pendingApplyEditsReview.map { _ in () }.eraseToAnyPublisher(),
+            session.$pendingWorktreeMergeReview.map { _ in () }.eraseToAnyPublisher(),
+            session.$items.map { _ in () }.eraseToAnyPublisher()
+        ]
+        session.mcpStateObservationCancellable = Publishers.MergeMany(publishers)
+            .sink { [weak self, weak session] _ in
+                guard let self, let session else { return }
+                handleObservedMCPStateChange(for: session)
+            }
     }
 
     func makeBindingObservationHooks() -> AgentModeRunService.RunBindingObservationHooks {

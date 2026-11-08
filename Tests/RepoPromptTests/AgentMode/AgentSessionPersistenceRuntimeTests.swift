@@ -84,6 +84,94 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
         }
     }
 
+    func testObservedSourceMutationPersistsAndRefreshesWithoutPresentation() async throws {
+        var fixture: Fixture? = try Fixture()
+        let root = try XCTUnwrap(fixture?.root)
+        defer { try? FileManager.default.removeItem(at: root) }
+        weak let owner = fixture?.scope
+        let session = try XCTUnwrap(fixture?.session)
+        let workspace = try XCTUnwrap(fixture?.placement.workspace)
+        try XCTUnwrap(owner).observation.install(on: session)
+        try XCTUnwrap(owner).persistence.debounce = {}
+        session.hasLoadedPersistedState = true
+        session.appendItem(AgentChatItem(kind: .assistant, text: "Observed without a VM", sequenceIndex: 2))
+        let refresh = try XCTUnwrap(session.derivedTranscriptRefreshTask)
+        let save = try XCTUnwrap(session.saveDebounceTask)
+        XCTAssertNil(owner?.persistence.presentation)
+        fixture = nil
+        XCTAssertNotNil(owner, "Pending source-derived work retains the exact runtime scope")
+        await refresh.value
+        await save.value
+        XCTAssertNil(owner, "Completed source work does not retain a hidden owner")
+        XCTAssertFalse(session.isDirty)
+        XCTAssertEqual(session.derivedTranscriptSyncState, AgentSessionTranscriptRuntime.syncState(for: session, projectionProtection: AgentSessionTranscriptRefreshRuntime.transcriptProjectionProtection(for: session)))
+        let saved = try await AgentSessionDataService.shared.loadAgentSession(id: XCTUnwrap(session.activeAgentSessionID), for: workspace)
+        XCTAssertEqual(saved?.effectiveItemCount, 3)
+    }
+
+    func testRuntimeConstructionCoalescesSourceChangesAndFencesRecycledObjects() async throws {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = scope.makeSession(tabID: UUID())
+        scope.replaceSessions([session.tabID: session])
+        session.appendItem(.init(kind: .user, text: "First", sequenceIndex: 0))
+        let generation = session.derivedTranscriptRefreshGeneration
+        let refresh = try XCTUnwrap(session.derivedTranscriptRefreshTask)
+        session.appendItem(.init(kind: .assistant, text: "Second", sequenceIndex: 1))
+        XCTAssertEqual(session.derivedTranscriptRefreshGeneration, generation)
+        await refresh.value
+        XCTAssertEqual(session.derivedTranscriptSyncState, AgentSessionTranscriptRuntime.syncState(for: session, projectionProtection: AgentSessionTranscriptRefreshRuntime.transcriptProjectionProtection(for: session)))
+        session.appendItem(.init(kind: .assistant, text: "Old object", sequenceIndex: 2))
+        let staleRefresh = try XCTUnwrap(session.derivedTranscriptRefreshTask)
+        let replacement = scope.makeSession(tabID: session.tabID)
+        scope.replaceSessions([replacement.tabID: replacement])
+        await staleRefresh.value
+        XCTAssertNil(session.derivedTranscriptRefreshTask, "A refused scheduled refresh cannot wedge later readmission")
+        XCTAssertTrue(replacement.items.isEmpty)
+        XCTAssertNil(replacement.derivedTranscriptRefreshTask)
+        let priorSummary = session.pendingSourceItemsMutationSummary
+        session.appendItem(.init(kind: .assistant, text: "Retired source", sequenceIndex: 3))
+        XCTAssertEqual(session.pendingSourceItemsMutationSummary, priorSummary)
+        XCTAssertNil(session.derivedTranscriptRefreshTask)
+        XCTAssertNil(session.saveDebounceTask)
+        XCTAssertNil(replacement.saveDebounceTask)
+        XCTAssertTrue(replacement.items.isEmpty)
+        scope.replaceSessions([session.tabID: session])
+        session.appendItem(.init(kind: .assistant, text: "Readmitted", sequenceIndex: 4))
+        let readmittedRefresh = try XCTUnwrap(session.derivedTranscriptRefreshTask)
+        await readmittedRefresh.value
+        XCTAssertEqual(session.derivedTranscriptSyncState, AgentSessionTranscriptRuntime.syncState(for: session, projectionProtection: AgentSessionTranscriptRefreshRuntime.transcriptProjectionProtection(for: session)))
+    }
+
+    func testObservedRunStateHonorsRestorationAndCanPersistDuringOriginatingDrain() async throws {
+        let f = try Fixture()
+        defer { f.cleanUp() }
+        f.scope.observation.install(on: f.session)
+        f.session.hasLoadedPersistedState = true
+        f.session.isDirty = false
+        f.scope.persistence.composition?.isRestoringConfiguration = { true }
+        f.session.runState = .running
+        XCTAssertFalse(f.session.isDirty)
+        XCTAssertNil(f.session.saveDebounceTask)
+        f.scope.persistence.composition?.isRestoringConfiguration = { false }
+        f.scope.persistence.debounce = {}
+        f.scope.beginRetirement()
+        f.session.runState = .completed
+        let save = try XCTUnwrap(f.session.saveDebounceTask)
+        XCTAssertTrue(f.session.isDirty)
+        await save.value
+        XCTAssertFalse(f.session.isDirty, "Retirement must retain the originating final writer")
+        // Persistence keeps its completed debounce handle. Discard that settled handle so
+        // the following assertion witnesses new scheduling, not historical task storage.
+        f.session.saveDebounceTask = nil
+        XCTAssertTrue(f.scope.releaseWriterClaimsAfterDrain())
+        let generation = f.session.saveRequestGeneration
+        f.session.appendItem(.init(kind: .assistant, text: "Released source", sequenceIndex: 2))
+        f.session.runState = .running
+        XCTAssertEqual(f.session.saveRequestGeneration, generation, "Configured persistence cannot be rearmed by a released object")
+        XCTAssertNil(f.session.saveDebounceTask)
+        XCTAssertNil(f.session.derivedTranscriptRefreshTask)
+    }
+
     func testMissingCompositionCannotAcknowledgeRequiredPersistence() async {
         let scope = AgentSessionRuntimeStore().makeScope()
         let session = AgentTabSession(tabID: UUID())

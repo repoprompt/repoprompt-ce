@@ -21,6 +21,8 @@ final class AgentSessionPresentationRuntime {
         var derivedTranscript: ((AgentTabSession) -> Void)?
         var binding: ((AgentTabSession) -> Void)?
         var elapsedTime: ((AgentTabSession) -> Void)?
+        var runState: ((AgentTabSession) -> Void)?
+        var oversightBinding: ((AgentTabSession) -> Void)?
         var permissions: ((AgentTabSession) -> Void)?
         var worktreeOperations: ((AgentTabSession) -> Void)?
         var draftChanged: ((AgentTabSession, String) -> Void)?
@@ -75,6 +77,14 @@ final class AgentSessionPresentationRuntime {
 
     func draftRestored(_ session: AgentTabSession, event: AgentComposerDraftRestorationEvent) {
         sink(for: session)?.draftRestored?(session, event)
+    }
+
+    func oversightBindingChanged(_ session: AgentTabSession) {
+        sink(for: session)?.oversightBinding?(session)
+    }
+
+    func runStateChanged(_ session: AgentTabSession) {
+        sink(for: session)?.runState?(session)
     }
 
     func elapsedTimeChanged(_ session: AgentTabSession) {

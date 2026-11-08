@@ -476,6 +476,26 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
         )
     }
 
+    func testObservedQuestionStatePublishesWithoutWindowOrViewModel() async throws {
+        let f = try await makeFixture()
+        f.scope.observation.install(on: f.session)
+        f.session.waitingPrompt = "Published by runtime observation"
+        f.session.runState = .waitingForUser
+        // Published properties notify before assignment, as in the original pipeline. This
+        // subsequent observed field witnesses the fully installed wait state without a VM call.
+        f.session.runningStatusText = "Waiting"
+        let result = await AgentRunSessionStore.waitUntilInteresting(
+            cursor: .init(registration: f.registration, epoch: f.epoch), timeoutSeconds: 3
+        )
+        guard case let .snapshotReady(snapshot) = result else { return XCTFail("Expected the observed interaction, got \(result)") }
+        XCTAssertEqual(snapshot.status, .waitingForInput)
+        XCTAssertEqual(snapshot.interaction?.prompt, "Published by runtime observation")
+        XCTAssertEqual(snapshot.sessionID, f.sessionID)
+        f.session.mcpStateObservationCancellable?.cancel()
+        f.session.mcpStateObservationCancellable = nil
+        await AgentRunSessionStore.cleanup(registration: f.registration)
+    }
+
     func testWindowFreeSnapshotAndInstructionPublicationUseExistingDomainRegistration() async throws {
         let f = try await makeFixture()
         let runtime = f.scope.mcp

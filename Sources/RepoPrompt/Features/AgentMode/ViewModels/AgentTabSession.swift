@@ -243,7 +243,7 @@ final class AgentTabSession: ObservableObject {
     private var toolCorrelationIndexes = ToolCorrelationIndexes()
     private var nextEphemeralToolResultPayloadRevision: Int = 1
     var rawToolResultPayloadRenderRevisionByItemID: [UUID: Int] = [:]
-    var onSourceItemsChanged: ((AgentTabSession, AgentModeViewModel.SourceItemsMutation) -> Void)?
+    var onSourceItemsChanged: ((AgentTabSession, AgentSourceItemsMutation) -> Void)?
     var onRunStateChanged: ((AgentTabSession) -> Void)?
     /// Activation went set → cleared/replaced. Fired synchronously from `oversight.didSet`; never
     /// for nil → nil or nil → set.
@@ -1668,7 +1668,7 @@ final class AgentTabSession: ObservableObject {
     }
 
     var sourceItemsRevision: Int = 0
-    var pendingSourceItemsMutationSummary: AgentModeViewModel.PendingSourceItemsMutationSummary?
+    var pendingSourceItemsMutationSummary: AgentPendingSourceItemsMutationSummary?
     var pendingDerivedTranscriptRefreshReason: AgentDerivedTranscriptRefreshReason?
     var derivedTranscriptRefreshTask: Task<Void, Never>?
     var derivedTranscriptRefreshGeneration: UInt64 = 0
@@ -2626,7 +2626,7 @@ final class AgentTabSession: ObservableObject {
 
     private enum SourceItemsDispatch {
         case silent
-        case notify(AgentModeViewModel.SourceItemsMutation)
+        case notify(AgentSourceItemsMutation)
     }
 
     private enum SourceItemPayloadUpdate {
@@ -3018,7 +3018,7 @@ final class AgentTabSession: ObservableObject {
     }
 
     private func finishIncrementalSourceItemsMutation(
-        _ mutation: AgentModeViewModel.SourceItemsMutation
+        _ mutation: AgentSourceItemsMutation
     ) {
         switch mutation {
         case let .replace(index, _, _), let .mutate(index, _):
@@ -3142,7 +3142,7 @@ final class AgentTabSession: ObservableObject {
 
     @discardableResult
     func mutateItemsBatch(
-        mutation: AgentModeViewModel.SourceItemsMutation = .structural,
+        mutation: AgentSourceItemsMutation = .structural,
         touchActivity: Bool = true,
         preservesQuietRange: Bool = false,
         _ body: (inout [AgentChatItem]) -> Void

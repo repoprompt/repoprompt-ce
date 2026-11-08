@@ -156,6 +156,16 @@ final class AgentSessionRuntimeStore {
             return runtime
         }
 
+        lazy var observation = AgentSessionObservationRuntime(scope: self)
+
+        /// Construct the actual observed runtime object; UI defaults and saved hydration are
+        /// applied by composition before admitting it into this scope's binding index.
+        func makeSession(tabID: UUID, perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()) -> AgentTabSession {
+            let session = AgentTabSession(tabID: tabID, perfRecorder: perfRecorder)
+            observation.install(on: session)
+            return session
+        }
+
         lazy var stream = AgentSessionStreamRuntime(scope: self)
         lazy var mcp = AgentSessionMCPRuntime(scope: self)
         lazy var persistence = AgentSessionPersistenceRuntime(scope: self)

@@ -670,108 +670,14 @@ extension AgentModeViewModel {
         }
     }
 
-    enum SourceItemsMutation {
-        case append(index: Int, itemKind: AgentChatItemKind)
-        case replace(index: Int, previousKind: AgentChatItemKind, currentKind: AgentChatItemKind)
-        case mutate(index: Int, itemKind: AgentChatItemKind)
-        case remove(index: Int, itemKind: AgentChatItemKind)
-        case replaceAll
-        case structural
-        case metadataRange(ClosedRange<Int>)
-
-        var changedIndexRange: ClosedRange<Int>? {
-            switch self {
-            case let .append(index, _),
-                 let .replace(index, _, _),
-                 let .mutate(index, _),
-                 let .remove(index, _):
-                index ... index
-            case let .metadataRange(range):
-                range
-            case .replaceAll, .structural:
-                nil
-            }
-        }
-
-        var touchesUserItem: Bool {
-            switch self {
-            case let .append(_, itemKind),
-                 let .mutate(_, itemKind),
-                 let .remove(_, itemKind):
-                itemKind == .user
-            case let .replace(_, previousKind, currentKind):
-                previousKind == .user || currentKind == .user
-            case .metadataRange:
-                false
-            case .replaceAll, .structural:
-                true
-            }
-        }
-
-        var isStructural: Bool {
-            switch self {
-            case .remove, .replaceAll, .structural:
-                true
-            case .append, .replace, .mutate, .metadataRange:
-                false
-            }
-        }
-    }
+    typealias SourceItemsMutation = AgentSourceItemsMutation
 
     enum AgentTranscriptAutoFollowArmingState: String, Codable, Equatable {
         case armed
         case disarmedAfterManualDetach
     }
 
-    struct PendingSourceItemsMutationSummary: Equatable {
-        var earliestChangedIndex: Int
-        var latestChangedIndex: Int
-        var containsRemoval: Bool
-        var containsReplaceAll: Bool
-        var containsUserMutation: Bool
-        var containsStructuralMutation: Bool
-
-        init(_ mutation: SourceItemsMutation) {
-            let changedRange = mutation.changedIndexRange
-            earliestChangedIndex = changedRange?.lowerBound ?? 0
-            latestChangedIndex = changedRange?.upperBound ?? Int.max
-            containsRemoval = {
-                if case .remove = mutation { return true }
-                return false
-            }()
-            containsReplaceAll = {
-                if case .replaceAll = mutation { return true }
-                return false
-            }()
-            containsUserMutation = mutation.touchesUserItem
-            containsStructuralMutation = mutation.isStructural
-        }
-
-        mutating func merge(_ mutation: SourceItemsMutation) {
-            if let changedRange = mutation.changedIndexRange {
-                earliestChangedIndex = min(earliestChangedIndex, changedRange.lowerBound)
-                latestChangedIndex = max(latestChangedIndex, changedRange.upperBound)
-            } else {
-                earliestChangedIndex = 0
-                latestChangedIndex = Int.max
-            }
-            if case .remove = mutation {
-                containsRemoval = true
-            }
-            if case .replaceAll = mutation {
-                containsReplaceAll = true
-            }
-            containsUserMutation = containsUserMutation || mutation.touchesUserItem
-            containsStructuralMutation = containsStructuralMutation || mutation.isStructural
-        }
-
-        var allowsIncrementalFinalTurnRebuild: Bool {
-            !containsRemoval
-                && !containsReplaceAll
-                && !containsUserMutation
-                && !containsStructuralMutation
-        }
-    }
+    typealias PendingSourceItemsMutationSummary = AgentPendingSourceItemsMutationSummary
 
     typealias DerivedTranscriptSyncState = AgentDerivedTranscriptSyncState
 
