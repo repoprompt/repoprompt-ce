@@ -5283,3 +5283,21 @@ Focused wrap-up validation:
   selected no cases; it is not included in that count. Its actual suites are covered by the full gate.
 - Scoped SwiftFormat 0.61.1: 0/3 files needed changes. Final Swift lint
   `e9d03c82-fe20-4fef-a0ca-1c52163cd718` passed (0/2142 files require formatting).
+
+The first full local run (`f50d333a-7447-4c94-8c23-acb830ed969f`) found three
+`AgentSessionRestorationAdmissionTests` failures, then was cancelled for repair; it is not a pass.
+The fresh-runtime fixture retained its old VM (also captured by XCTest teardown), leaving that
+runtime's retiring writer claim alive while creating the allegedly fresh runtime. The three
+created-session cases therefore refused binding before reading disk. The fixture now explicitly
+joins attachment/persistence work and discards the old in-memory sessions before reopening,
+asserting that no writer remains. This models process disposal, not ordinary close or a second
+live host. It neither writes the payload nor grants readiness, and all original payload, failed
+write, restoration and provider-dispatch assertions remain intact. No production close/release
+policy was changed to accommodate this restart fixture. The pre-fixture-repair product gate
+`47acabf5-b5e2-4fe5-87dc-da472663eb80` passed for both products; its fresh index check passed at
+**1242/1360** wrong-way file edges and **53/66** largest-cycle components.
+
+Fresh-runtime fixture repair validation: `025bb09a-367e-417e-ba6d-cd5d33a50ec7`, **28 tests**,
+zero failures (restoration admission 19, runtime store 9). No new compiler diagnostic in the
+changed fixture. Scoped SwiftFormat and lint `e58f94fa-e23f-4c2b-beb6-fff6dfa2113e` passed.
+A new full-suite run and both product/index gates follow this final Swift tree.
