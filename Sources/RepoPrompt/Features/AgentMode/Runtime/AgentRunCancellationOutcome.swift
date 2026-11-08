@@ -115,6 +115,29 @@ struct AgentRunStartStopFence: Equatable {
             && !session.stopState.isStopping(binding: binding)
     }
 
+    /// A committed domain publication is not permission to launch its successor on a
+    /// rebound incarnation or after Stop. Scope/object admission is checked by the caller.
+    @MainActor
+    func permitsTerminalSuccessor(
+        of session: AgentTabSession,
+        revision: AgentRunTerminalCommitRevision,
+        publication: AgentRunTerminalPublicationResult
+    ) -> Bool {
+        let binding = revision.ownership.binding
+        guard permitsStart(of: session),
+              binding.tabID == session.tabID,
+              binding.persistentSessionID == session.activeAgentSessionID,
+              binding.persistentBindingGeneration == session.persistentSessionBindingIdentity?.generation,
+              binding.bindingTransitionGeneration == session.bindingTransitionGeneration,
+              !session.bindingTransitionInProgress,
+              session.activeRunOwnership == nil || session.activeRunOwnership == revision.ownership
+        else { return false }
+        if let epoch = publication.successorEpoch {
+            return session.mcpControlContext?.currentEpoch == epoch
+        }
+        return true
+    }
+
     /// A queued inbound send survives internal lifecycle cancellations; only an explicit
     /// Stop (or a rebind or in-flight managed Stop) withdraws it.
     @MainActor

@@ -11,6 +11,60 @@ import XCTest
 
 @MainActor
 final class SessionAdminWorktreeRecoveryTests: XCTestCase {
+    func testUnscopedWriterDefersBeforeConfiguredPayloadPreparation() async throws {
+        try await withFixture(canonicalHost: true) { fixture in
+            let viewModel = fixture.window.agentModeViewModel
+            var writes = 0
+            viewModel.test_setAgentSessionSaver { _, _, _ in
+                writes += 1
+                throw CancellationError()
+            }
+            let original = try XCTUnwrap(fixture.session.persistentSessionBindingIdentity)
+            fixture.session.installPersistentSessionBinding(.init(
+                tabID: original.tabID, sessionID: original.sessionID, generation: original.generation
+            ))
+            fixture.session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            fixture.session.isDirty = true
+            let result = await viewModel.flushSaveRequired(for: fixture.session.tabID, workspaceID: fixture.workspaceID)
+            guard case let .failure(failure) = result else { return XCTFail("An unscoped binding cannot write") }
+            XCTAssertEqual(failure.message, "The session does not have a unique runtime writer for this workspace.")
+            XCTAssertEqual(writes, 0)
+            XCTAssertTrue(fixture.session.isDirty)
+            XCTAssertTrue(fixture.session.saveDebounceTask?.isCancelled ?? true, "Unscoped identities must not spin a save retry loop")
+        }
+    }
+
+    func testRequiredSaveRejectsConflictingWriterWithoutLosingDirtyStateThenRetriesExactly() async throws {
+        try await withFixture(canonicalHost: true) { fixture in
+            let viewModel = fixture.window.agentModeViewModel
+            var writes = 0
+            viewModel.test_setAgentSessionSaver { payload, workspace, count in
+                writes += 1
+                return try await AgentSessionDataService.shared.saveAgentSession(
+                    payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count
+                )
+            }
+            var competitorScope: AgentSessionRuntimeStore.Scope? = AgentSessionRuntimeStore.shared.makeScope()
+            let competitor = AgentTabSession(tabID: fixture.session.tabID)
+            competitor.installPersistentSessionBinding(.init(
+                tabID: competitor.tabID, sessionID: fixture.sessionID, workspaceID: fixture.workspaceID
+            ))
+            competitorScope?.replaceSessions([competitor.tabID: competitor])
+            fixture.session.isDirty = true
+            let refused = await viewModel.flushSaveRequired(for: fixture.session.tabID, workspaceID: fixture.workspaceID)
+            if case .success = refused { XCTFail("Conflicting identities must never authorize a durable write") }
+            XCTAssertEqual(writes, 0)
+            XCTAssertTrue(fixture.session.isDirty)
+            competitorScope = nil
+            try await viewModel.flushSaveRequired(for: fixture.session.tabID, workspaceID: fixture.workspaceID).get()
+            XCTAssertEqual(writes, 1)
+            XCTAssertFalse(fixture.session.isDirty)
+            let saved = try await fixture.savedSession()
+            XCTAssertEqual(saved?.id, fixture.sessionID)
+            XCTAssertEqual(saved?.workspaceID, fixture.workspaceID)
+        }
+    }
+
     func testUnopenedLaneModelAndEffortUseItsWriterDespiteEarlierWorkspaceReplica() async throws {
         for fullAccess in [true, false] {
             try await withFixture(fullAccess: fullAccess, canonicalHost: true) { fixture in
@@ -167,6 +221,20 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
                 XCTAssertEqual(source.resolutionState(for: fixture.sessionID), .replicated)
                 XCTAssertEqual(source.provenance(for: fixture.sessionID)?.hasUniqueRuntimeOwner, false)
                 XCTAssertNil(SessionAdminWindows.runtimeOwner(for: fixture.sessionID))
+                let partialCapture = AgentSessionCarrierResolver.capture(
+                    windows: [fixture.window], sessionIDs: [fixture.sessionID], includeRuntimeOwners: true
+                )
+                XCTAssertEqual(
+                    partialCapture.runtimeWriterRejections[fixture.sessionID],
+                    .conflicting,
+                    "A narrower presentation census cannot hide a process-wide writer claim"
+                )
+                XCTAssertNotNil(partialCapture.bindingConflictDetail(for: fixture.sessionID))
+                XCTAssertNil(partialCapture.uniqueRuntimeOwners[fixture.sessionID])
+                XCTAssertNil(
+                    SessionAdminWindows.owningViewModel(for: fixture.sessionID),
+                    "Readable metadata must not provide a cold-mutation fallback around a writer conflict"
+                )
                 XCTAssertFalse(SessionAdminWindows.isCurrent(originalOwner), "A second bound object invalidates prior owner proof before it finishes loading")
                 let before = try fixture.git.runGit(["worktree", "list", "--porcelain"], at: fixture.repository)
                 let ownerSaveGeneration = fixture.session.saveRequestGeneration
@@ -194,6 +262,40 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
                 XCTAssertEqual(try fixture.git.runGit(["worktree", "list", "--porcelain"], at: fixture.repository), before)
                 fixture.assertForegroundUnchanged()
             }
+        }
+    }
+
+    func testUnscopedLiveBindingRequiresExplicitWorkspaceQualificationAndFreshHydration() async throws {
+        try await withFixture(canonicalHost: true) { fixture in
+            let vm = fixture.window.agentModeViewModel
+            let session = fixture.session
+            let workspaceID = try XCTUnwrap(session.persistentSessionBindingIdentity?.workspaceID)
+            session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: fixture.sessionID))
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            session.hasLoadedPersistedState = true
+            let unscoped = try XCTUnwrap(session.currentRestorationBindingToken)
+            let capture = AgentSessionCarrierResolver.capture(
+                windows: [fixture.window], sessionIDs: [fixture.sessionID], includeRuntimeOwners: true
+            )
+            XCTAssertEqual(capture.runtimeWriterRejections[fixture.sessionID], .unavailable(.unscopedBinding))
+            XCTAssertNil(SessionAdminWindows.owningViewModel(for: fixture.sessionID))
+            // Runtime-only refresh cannot silently borrow the selected workspace.
+            XCTAssertEqual(vm.test_installPersistentSessionBinding(sessionID: fixture.sessionID, on: session), unscoped.bindingIdentity)
+            session.isDirty = true
+            XCTAssertNil(vm.test_installPersistentSessionBinding(
+                sessionID: fixture.sessionID, on: session, compareAndSetInWorkspaceID: workspaceID
+            ), "Qualification may not discard unsaved payload changes")
+            session.isDirty = false
+            let scoped = try XCTUnwrap(vm.test_installPersistentSessionBinding(
+                sessionID: fixture.sessionID, on: session, compareAndSetInWorkspaceID: workspaceID
+            ))
+            XCTAssertEqual(scoped.workspaceID, workspaceID)
+            XCTAssertNotEqual(scoped.generation, unscoped.bindingIdentity.generation)
+            XCTAssertFalse(session.hasLoadedPersistedState)
+            XCTAssertFalse(session.permitsBoundOperationAndSave, "The old workspace's readiness is not transferable")
+            XCTAssertNil(vm.test_installPersistentSessionBinding(
+                sessionID: fixture.sessionID, on: session, compareAndSetInWorkspaceID: UUID()
+            ), "A qualified binding cannot be silently redirected to another workspace")
         }
     }
 

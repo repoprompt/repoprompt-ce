@@ -2144,7 +2144,11 @@ final class DelegationMembershipCensusTests: XCTestCase {
 
     private func installIdleCarrier(_ sessionID: UUID, tabID: UUID, on window: WindowState) {
         let live = AgentModeViewModel.TabSession(tabID: tabID)
-        live.testInstallPersistentSessionBinding(sessionID: sessionID)
+        // Use production carrier qualification: archive performs a required payload save,
+        // so an unscoped test-only binding is not a valid writer for this workspace.
+        let binding = window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: live)
+        XCTAssertEqual(binding?.sessionID, sessionID)
+        XCTAssertEqual(binding?.workspaceID, window.workspaceManager.activeWorkspace?.id)
         live.hasLoadedPersistedState = true
         live.recordRestorationAuthoritative(.persistedPayloadApplied)
         XCTAssertNil(live.operationAdmissionFailureMessage)

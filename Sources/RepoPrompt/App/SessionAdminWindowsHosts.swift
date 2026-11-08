@@ -24,7 +24,8 @@ enum SessionAdminWindows {
         let capture = AgentSessionCarrierResolver.capture(
             windows: WindowStatesManager.shared.sessionRuntimeWindows, sessionIDs: [sessionID], includeRuntimeOwners: true
         )
-        guard !capture.ambiguousSessionIDs.contains(sessionID) else { return nil }
+        guard !capture.ambiguousSessionIDs.contains(sessionID),
+              capture.runtimeWriterRejections[sessionID] == nil else { return nil }
         if let owner = capture.uniqueRuntimeOwners[sessionID] { return owner.location.window.agentModeViewModel }
         guard !capture.replicatedSessionIDs.contains(sessionID) else { return nil }
         return capture.uniqueLocations[sessionID]?.window.agentModeViewModel

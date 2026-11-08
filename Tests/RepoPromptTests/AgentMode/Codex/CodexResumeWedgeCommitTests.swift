@@ -77,12 +77,71 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             session.runState = .running
             session.beginRunAttempt(source: "codex-resume-wedge-test")
         }
+        // These fixtures dispatch directly to the native coordinator, so compose the same
+        // terminal owner that the production command entrypoints install before dispatch.
+        viewModel.ensureRunServiceMaterializedForRunStart()
         return Fixture(
             viewModel: viewModel,
             workspaceManager: workspaceManager,
             session: session,
             factory: factory
         )
+    }
+
+    private final class RuntimeHookSettings: CodexHookApprovalSettingsProviding {
+        let strictWorkspaceID = UUID()
+        var lastWorkspaceID: UUID?
+        func codexHookApprovalStrictModeEnabled(workspaceID: UUID?) -> Bool {
+            lastWorkspaceID = workspaceID
+            return workspaceID == strictWorkspaceID
+        }
+    }
+
+    func testNativeExecutionUsesBoundSettingsAndRestoresOnlyOriginalDraftWithoutPresentation() {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        let settings = RuntimeHookSettings()
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: settings.strictWorkspaceID))
+        scope.replaceSessions([session.tabID: session])
+        let factory = WedgeControllerFactory(plans: [[]])
+        let coordinator = CodexAgentModeCoordinator(
+            windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
+            codexControllerFactory: { runID, _, _, _, _, _, _, _ in factory.make(runID: runID) },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            shouldManageCodexTooling: false, codexHookApprovalSettings: settings
+        )
+        coordinator.installExecutionServices(
+            drafts: scope.drafts, mcpServerEnabler: { false }, modelRouterSettingsStore: .shared
+        )
+        XCTAssertTrue(coordinator.isCodexHookApprovalStrictModeEnabled(for: session))
+        XCTAssertEqual(settings.lastWorkspaceID, settings.strictWorkspaceID)
+        let unbound = AgentTabSession(tabID: UUID())
+        XCTAssertTrue(coordinator.isCodexHookApprovalStrictModeEnabled(for: unbound))
+        XCTAssertEqual(settings.lastWorkspaceID, settings.strictWorkspaceID, "Unknown placement must not query a permissive global fallback")
+        let unrelatedWorkspaceID = UUID()
+        XCTAssertFalse(coordinator.isCodexHookApprovalStrictModeEnabled(workspaceID: unrelatedWorkspaceID))
+        XCTAssertTrue(coordinator.isCodexHookApprovalStrictModeEnabled(for: session), "A presentation query must not retarget runtime approval policy")
+        let controller = factory.make(runID: UUID())
+        let entry = AgentTabSession.CodexFallbackQueueEntry(
+            id: UUID(), providerText: "Unsent work", attachments: [], taggedFileAttachments: [],
+            model: nil, reasoningEffort: nil, serviceTier: nil, attachmentReservationID: nil,
+            optimisticUserItemID: nil, draftText: "Unsent work", origin: .manual,
+            fallbackReason: .staleAuthoritativeIdentity, originThreadID: Self.oldThreadID,
+            originControllerInstanceID: ObjectIdentifier(controller), originControllerGeneration: session.codexControllerGeneration,
+            originRunID: UUID(), originRunAttemptID: UUID(), blockingTurn: nil, state: .queued
+        )
+        session.codexFallbackQueue = [entry]
+        coordinator.handleMCPControlReset(for: session, reason: "Restore original local input")
+        XCTAssertEqual(scope.drafts.text(for: session.tabID), "Unsent work")
+        XCTAssertTrue(session.codexFallbackQueue.isEmpty)
+        let replacement = AgentTabSession(tabID: session.tabID)
+        replacement.draftText = "Replacement input"
+        scope.replaceSessions([replacement.tabID: replacement])
+        session.codexFallbackQueue = [entry]
+        coordinator.handleMCPControlReset(for: session, reason: "Old controller teardown")
+        XCTAssertEqual(replacement.draftText, "Replacement input")
+        XCTAssertTrue(session.codexFallbackQueue.isEmpty)
     }
 
     func testStreamEndCancelsOnlyCurrentControllersTransportFallback() async throws {
@@ -271,6 +330,10 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
                 )
             }
         }
+        // Host composition installs terminal ownership before dispatch; native execution
+        // must not depend on an attached presentation to bootstrap, compact or send.
+        fixture.viewModel.ensureRunServiceMaterializedForRunStart()
+        fixture.coordinator.attachPresentation(nil)
         let failedStart = Task { await fixture.coordinator.ensureCodexNativeSession(session: fixture.session) }
         addTeardownBlock {
             failedStart.cancel()
@@ -1490,7 +1553,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             computerUseReservedEntryExists: { false },
             codexHookApprovalSettings: GlobalSettingsStore.shared
         )
-        coordinator.attach(viewModel: fixture.viewModel)
+        fixture.viewModel.configureCodexRuntime(coordinator)
         return coordinator
     }
 
@@ -1523,7 +1586,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             shouldManageCodexTooling: true, computerUseRuntimeUnavailableMessage: { nil }, computerUseCompanionReady: { true },
             computerUseReservedEntryExists: { false }, codexHookApprovalSettings: GlobalSettingsStore.shared
         )
-        coordinator.attach(viewModel: fixture.viewModel)
+        fixture.viewModel.configureCodexRuntime(coordinator)
         let session = fixture.session
         session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
         let startup = Task { await coordinator.ensureCodexNativeSession(session: session) }

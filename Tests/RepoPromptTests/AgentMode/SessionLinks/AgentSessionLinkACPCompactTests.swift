@@ -384,7 +384,7 @@ final class AgentSessionLinkACPCompactRunnerTests: XCTestCase {
     }
 
     private func run(_ fixture: Fixture, message: String) async {
-        _ = await fixture.harness.service.startRun(
+        _ = await fixture.harness.composition.startRun(
             tabID: fixture.session.tabID,
             session: fixture.session,
             initialUserMessage: message,
@@ -404,7 +404,7 @@ final class AgentSessionLinkACPCompactRunnerTests: XCTestCase {
         _ command: AgentProviderControlCommand
     ) async -> AgentRunStartOutcomeRecorder {
         let recorder = AgentRunStartOutcomeRecorder()
-        _ = await fixture.harness.service.startRun(
+        _ = await fixture.harness.composition.startRun(
             tabID: fixture.session.tabID,
             session: fixture.session,
             initialUserMessage: command.providerText,
@@ -551,7 +551,7 @@ final class AgentSessionLinkACPCompactRunnerTests: XCTestCase {
             selfCompactDispatchID: .init(requestID: attempt.id, stage: .compact)
         )
         let recorder = AgentRunStartOutcomeRecorder()
-        _ = await fixture.harness.service.startRun(
+        _ = await fixture.harness.composition.startRun(
             tabID: fixture.session.tabID, session: fixture.session,
             initialUserMessage: command.providerText, initialMessageForRun: command.providerText,
             attachments: [], providerControlCommand: command, startOutcome: recorder
@@ -795,8 +795,7 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
         _ fixture: Fixture,
         waitForAdvertisement: Bool = true
     ) async throws -> ACPAgentSessionController {
-        let request = try XCTUnwrap(AgentModeRunService.makeACPRunRequest(
-            session: fixture.session,
+        let request = try XCTUnwrap(fixture.session.acpRunInput.makeRequest(
             workspacePath: fixture.workspacePath,
             attachments: [],
             runtimePermission: fixture.viewModel.providerBindingService.runtimePermission(

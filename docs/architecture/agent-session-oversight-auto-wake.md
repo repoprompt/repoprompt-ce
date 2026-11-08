@@ -138,7 +138,15 @@ defect in this subsystem.
 | Link authority | Grants, capabilities (including default management), generations, cursors, revocation. Process-memory. | `DomainAgentSessionLinkAuthority` |
 | Passive reducer | The canonical observer-local queue: first-to-final coalescing of target status edges plus separate, non-lossy attention occurrences. Owns no authority and performs no delivery. | `AgentSessionLinkPassiveStatusNotices` |
 | Claim / receipt | The immutable rendered batch a provider was actually sent, including exact attention occurrence identities, and what that provider's acceptance therefore acknowledges. | `AgentSessionLinkPromptContext` |
-| Wake coordinator | Temporary admission policy: may this lane start an automatic turn *right now*? | `AgentModeViewModel+SessionLinkAutoWake` |
+| Wake coordinator | Temporary admission policy: may this lane start an automatic turn *right now*? | `AgentSessionLinkExecutionRuntime+Wake` |
+
+`AgentSessionRuntimeStore.Scope` retains the link executor and its actual inventory/hold/claim storage.
+The VM forwarding methods and `_modify` accessors refer to that same owner; they do not copy its maps.
+Auto-wake and periodic scheduling execute there too, preserving the four authorities above.
+Presentation labels and refreshes are optional. Canonical endpoint admission, run start, provider-switch
+commands, self-compaction settlement and composer claims remain required composition inputs. The
+legacy app adapter still supplies those inputs; this relocation alone does not make the saved-session
+execution host independent of windows.
 
 The lane board is derived data in the existing passive observation pipeline, not a fifth owner. The target view model combines its own run outcome, stamped failure reason, send-readiness blockers, and a current child-session census into the observation snapshot; the runtime bridge publishes that snapshot through link authority, and `poll`/`wait` render it. A board change can advance the existing `wait(until: "change")` cursor, but it creates no new status or attention edge for the passive reducer, changes no Auto-wake admission rule, and persists no board state.
 
@@ -1304,8 +1312,8 @@ clear the attempt. It converts it to `.cancelledBeforeDispatch` and leaves it in
 
 That tombstone looks like dead state and is not. Providers do not mint the wake's dispatch ID — they
 use their own (`codexNativeSend`, `claudeNativeSend`, `codexFallback`, and so on), and
-`agentSessionLinkEffectiveDispatchID` plus `AgentModeViewModel.dispatchRequiresLaneBatch` (both in
-`AgentModeViewModel+SessionLinkPrompt.swift`) rewrite that ID to the wake's **only while an attempt
+`agentSessionLinkEffectiveDispatchID` plus `AgentSessionLinkExecutionRuntime.dispatchRequiresLaneBatch` (both in
+`AgentSessionLinkExecutionRuntime+Prompt.swift`) rewrite that ID to the wake's **only while an attempt
 exists in `.preparingDispatch`, `.cancelledBeforeDispatch`, or `.dispatching`**.
 
 Clear the tombstone while a provider path is still preparing and the rewrite stops happening: the
@@ -1420,10 +1428,10 @@ parts that already existed:
 | --- | --- |
 | Mismatch and close predicates, cycle value | `AgentSessionLinkCodexCatalogRepair` (`isStuckProjection`, `projectionResolvesCycle`, `Cycle`) |
 | Cycle record | `AgentTabSession.codexSessionLinkCatalogRepairCycle` |
-| Opens/closes the cycle | `agentSessionLinkReconcileCodexCatalogRepair` in `AgentModeViewModel+SessionLinkPrompt` |
+| Opens/closes the cycle | `agentSessionLinkReconcileCodexCatalogRepair` in `AgentSessionLinkExecutionRuntime+Prompt` |
 | Spends the cycle | `codexRepairSessionLinkCatalogIfQuiescent` in `CodexAgentModeCoordinator` |
 | Quiescence gate | `isQuiescentForControllerReplacement` in `CodexAgentModeCoordinator`, reading `oversight.pendingAutoWakeOwnsTransportBoundary` |
-| Re-admits the queue | `agentSessionLinkRedriveCurrentPassiveSnapshot` in `AgentModeViewModel+SessionLinkAutoWake` |
+| Re-admits the queue | `agentSessionLinkRedriveCurrentPassiveSnapshot` in `AgentSessionLinkExecutionRuntime+Wake` |
 
 **The cycle records a controller generation, not a Boolean.** `nil` on the session is no cycle;
 `Cycle.state(currentControllerGeneration:)` answers `.pending` while the recorded generation still

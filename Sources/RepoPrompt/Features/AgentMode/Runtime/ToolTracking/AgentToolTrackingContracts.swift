@@ -88,11 +88,8 @@ enum AgentToolStreamEvent {
 
 // MARK: - Tool Tracking Hooks
 
-/// Closures back into `AgentModeViewModel` for generic orchestration behavior
-/// that provider tool handlers need but should not own directly.
-///
-/// This decouples handlers from `AgentModeViewModel` — handlers receive these
-/// at construction time instead of holding a weak viewmodel reference for tool plumbing.
+/// Runtime-owned transcript, usage and persistence operations used by provider tool handlers.
+/// Production composition binds concrete scope services; only presentation is optional.
 struct AgentToolTrackingHooks {
     /// No-op hooks for test / stub contexts where the viewmodel isn't available.
     static let noOp = AgentToolTrackingHooks(
@@ -120,11 +117,11 @@ struct AgentToolTrackingHooks {
     /// Seal the assistant boundary so subsequent content starts a new bubble.
     let sealAssistantBoundary: @MainActor @Sendable (_ session: AgentTabSession) -> Void
 
-    /// Request a UI refresh for the given tab.
-    let requestUIRefresh: @MainActor @Sendable (_ tabID: UUID, _ urgent: Bool) -> Void
+    /// Request a UI refresh for this exact session, never a recycled tab.
+    let requestUIRefresh: @MainActor @Sendable (_ session: AgentTabSession, _ urgent: Bool) -> Void
 
-    /// Schedule a persistence save for the given tab.
-    let scheduleSave: @MainActor @Sendable (_ tabID: UUID) -> Void
+    /// Schedule persistence for this exact session.
+    let scheduleSave: @MainActor @Sendable (_ session: AgentTabSession) -> Void
 
     /// Account for tool input tokens from args payload.
     let addToolInputTokens: @MainActor @Sendable (_ payload: String?, _ session: AgentTabSession) -> Void

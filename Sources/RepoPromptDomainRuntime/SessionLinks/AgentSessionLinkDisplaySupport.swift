@@ -25,10 +25,14 @@ package struct AgentPersistentSessionBindingIdentity: Equatable, Hashable {
     package let tabID: UUID
     package let sessionID: UUID
     package let generation: UUID
+    /// Runtime scope, not selected presentation. Nil legacy/test bindings cannot admit a writer.
+    /// This identity is not Codable; persisted session UUIDs and payload schemas are unchanged.
+    package let workspaceID: UUID?
 
-    package init(tabID: UUID, sessionID: UUID, generation: UUID = UUID()) {
+    package init(tabID: UUID, sessionID: UUID, generation: UUID = UUID(), workspaceID: UUID? = nil) {
         self.tabID = tabID
         self.sessionID = sessionID
         self.generation = generation
+        self.workspaceID = workspaceID
     }
 }

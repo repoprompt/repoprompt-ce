@@ -9,13 +9,9 @@ import RepoPromptInstrumentation
 final class AgentModeRunService {
     struct Dependencies {
         let windowID: Int
-        let headlessProviderFactory: AgentModeViewModel.HeadlessProviderFactory
-        let acpProviderFactory: AgentModeViewModel.ACPProviderFactory
-        let acpControllerFactory: AgentModeViewModel.ACPControllerFactory
-        let connectionPolicyInstaller: AgentModeViewModel.ConnectionPolicyInstaller
+        let connectionPolicyInstaller: AgentRunExecutionContracts.ConnectionPolicyInstaller
         let expectedPIDPolicyArmer: (MCPBootstrapLeaseSpec) async -> Bool
-        let mcpServerEnabler: AgentModeViewModel.MCPServerEnabler
-        let workspacePathProvider: (AgentTabSession) throws -> String?
+        let mcpServerEnabler: AgentRunExecutionContracts.MCPServerEnabler
         let codexCoordinator: CodexAgentModeCoordinator
         let claudeCoordinator: ClaudeAgentModeCoordinator
         let shouldManageCodexTooling: Bool
@@ -136,7 +132,6 @@ final class AgentModeRunService {
             terminalSessionBinder: { hooks.bindTerminalSession($0) }
         )
         headlessRunner = HeadlessAgentModeRunner(
-            headlessProviderFactory: dependencies.headlessProviderFactory,
             hooks: hooks,
             terminalCommitBarrier: terminalCommitBarrier
         )
@@ -153,9 +148,7 @@ final class AgentModeRunService {
         acpRunner = ACPIntegratedAgentModeRunner(
             hooks: hooks,
             terminalCommitBarrier: terminalCommitBarrier,
-            toolTrackingHooks: toolTrackingHooks,
-            providerFactory: dependencies.acpProviderFactory,
-            controllerFactory: dependencies.acpControllerFactory
+            toolTrackingHooks: toolTrackingHooks
         )
     }
 
@@ -229,10 +222,15 @@ final class AgentModeRunService {
             && session.selfCompactState.active?.admittedSupport == .acpAdvertisedCommand
     }
 
-    @discardableResult
-    func startRun(
+    enum StartPreparation {
+        case completed(CodexAgentModeCoordinator.NativeSendOutcome?)
+        case resources(AgentRunResourceRequest)
+    }
+
+    func prepareRun(
         tabID: UUID,
         session: AgentTabSession,
+        workspace: AgentRunWorkspaceInput,
         initialUserMessage: String,
         initialMessageForRun: String,
         attachments: [AgentFileAttachment],
@@ -245,7 +243,7 @@ final class AgentModeRunService {
         localComposerCandidate: UUID? = nil,
         initialUserItemID: UUID? = nil,
         preparedClaudeEvents: ClaudeAttemptEventReservation? = nil
-    ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
+    ) async -> StartPreparation {
         var claudeEventsTransferred = false
         defer {
             if !claudeEventsTransferred, let preparedClaudeEvents {
@@ -261,12 +259,12 @@ final class AgentModeRunService {
         }
         guard stopFence?.permitsStart(of: session) ?? true else {
             startOutcome?.recordStartFailure(message: "This scheduled run was cancelled by Stop.")
-            return nil
+            return .completed(nil)
         }
-        assert(session.tabID == tabID, "AgentModeRunService.startRun requires the originating tab ID to match the AgentTabSession tab ID")
+        assert(session.tabID == tabID, "AgentModeRunService.prepareRun requires the originating tab ID to match the AgentTabSession tab ID")
         if let message = session.operationAdmissionFailureMessage {
             startOutcome?.recordStartFailure(message: message)
-            return session.selectedAgent == .codexExec ? .preDispatchRejected(message: message) : nil
+            return .completed(session.selectedAgent == .codexExec ? .preDispatchRejected(message: message) : nil)
         }
         let selectedAgent = session.selectedAgent
         if let selfCompactDispatchID {
@@ -278,7 +276,7 @@ final class AgentModeRunService {
                   (selfCompactDispatchID.stage == .compact) == (providerControlCommand != nil)
             else {
                 startOutcome?.recordStartFailure(message: nil)
-                return nil
+                return .completed(nil)
             }
         }
         // A control command is only ever routed to a runtime that dispatches it natively and
@@ -288,19 +286,19 @@ final class AgentModeRunService {
         {
             let message = "\(selectedAgent.displayName) does not support this provider command."
             startOutcome?.recordStartFailure(message: message)
-            return nil
+            return .completed(nil)
         }
         let runtimePermission = dependencies.providerRuntimePermissionResolver(selectedAgent, session.permissionProfile)
         let workspacePath: String?
         do {
-            workspacePath = try dependencies.workspacePathProvider(session)
+            workspacePath = try workspace.resolve(bindings: session.worktreeBindings)
         } catch {
             let message = Self.providerStartupFailureMessage(for: error)
             await failBeforeProviderStartup(session: session, message: message)
             // The non-Codex return is `nil`, which is indistinguishable from success. The recorder is
             // the only channel that tells a caller this run never reached a provider.
             startOutcome?.recordStartFailure(message: message)
-            return selectedAgent == .codexExec ? .failed(message: message) : nil
+            return .completed(selectedAgent == .codexExec ? .failed(message: message) : nil)
         }
 
         // Every path that reaches a provider from here is a new turn, and a new turn is exactly what
@@ -321,11 +319,10 @@ final class AgentModeRunService {
                 stopFence: stopFence
             )
             startOutcome?.record(codexOutcome: outcome)
-            return outcome
+            return .completed(outcome)
         }
 
-        let acpRunRequest = Self.makeACPRunRequest(
-            session: session,
+        let acpRunRequest = session.acpRunInput.makeRequest(
             workspacePath: workspacePath,
             attachments: attachments,
             runtimePermission: runtimePermission
@@ -375,38 +372,47 @@ final class AgentModeRunService {
                 preparedEvents: preparedClaudeEvents,
                 startOutcome: startOutcome
             )
-            return nil
+            return .completed(nil)
         }
         if let acpRunRequest {
             candidateTransferred = true
-            await acpRunner.startRun(
+            let resources = await acpRunner.prepareRun(
                 tabID: tabID,
                 session: session,
+                workspace: workspace,
                 initialUserMessage: initialUserMessage,
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,
                 runRequest: acpRunRequest,
+                startOutcome: startOutcome,
                 providerControlCommand: providerControlCommand,
                 makeLease: makeLease,
                 stopFence: stopFence,
                 localComposerCandidate: localComposerCandidate
             )
+            if let resources {
+                return .resources(resources)
+            }
             recordNonCodexStartOutcome(startOutcome, session: session)
-            return nil
+            return .completed(nil)
         }
         candidateTransferred = true
-        await headlessRunner.startRun(
+        let resources = await headlessRunner.prepareRun(
             tabID: tabID,
             session: session,
             initialUserMessage: initialUserMessage,
             initialMessageForRun: initialMessageForRun,
             attachments: attachments,
             makeLease: makeLease,
+            startOutcome: startOutcome,
             stopFence: stopFence,
             localComposerCandidate: localComposerCandidate
         )
+        if let resources {
+            return .resources(resources)
+        }
         recordNonCodexStartOutcome(startOutcome, session: session)
-        return nil
+        return .completed(nil)
     }
 
     /// Classifies a non-Codex runner return as accepted or rejected-before-startup.
@@ -452,16 +458,19 @@ final class AgentModeRunService {
             steeringDebugLog("[AgentRunSteeringWake] ACP active submit guard rejected agent=\(selectedAgent.rawValue) state=\(session.runState.rawValue) attachments=\(attachments.count) runID=\(String(describing: session.runID)) targetRunID=\(String(describing: targetRunID)) attempt=\(String(describing: session.activeRunAttemptID)) targetAttempt=\(String(describing: targetRunAttemptID)) hasController=\(session.acpController != nil) controllerMatches=\(session.acpController === targetController)")
             return false
         }
+        guard let admission = session.acpWorkspaceAdmission, admission.isCurrent(for: session) else {
+            steeringDebugLog("[AgentRunSteeringWake] ACP workspace admission refused tab=\(session.tabID) missing=\(session.acpWorkspaceAdmission == nil) transitioning=\(session.bindingTransitionInProgress) bindingMatches=\(session.acpWorkspaceAdmission?.binding == session.currentRestorationBindingToken) ownerMatches=\(session.acpWorkspaceAdmission?.ownership == session.activeRunOwnership)")
+            return false
+        }
         let workspacePath: String?
         do {
-            workspacePath = try dependencies.workspacePathProvider(session)
+            workspacePath = try admission.input.resolve(bindings: session.worktreeBindings)
         } catch {
             let message = Self.providerStartupFailureMessage(for: error)
             await failBeforeProviderStartup(session: session, message: message)
             return false
         }
-        guard let runRequest = Self.makeACPRunRequest(
-            session: session,
+        guard let runRequest = session.acpRunInput.makeRequest(
             workspacePath: workspacePath,
             attachments: attachments,
             runtimePermission: runtimePermission
@@ -480,39 +489,6 @@ final class AgentModeRunService {
         )
         steeringDebugLog("[AgentRunSteeringWake] ACP active submit runner returned sent=\(sent) agent=\(selectedAgent.rawValue) model=\(runRequest.modelString ?? "default") runID=\(String(describing: targetRunID)) attempt=\(String(describing: targetRunAttemptID))")
         return sent
-    }
-
-    static func makeACPRunRequest(
-        session: AgentTabSession,
-        workspacePath: String?,
-        attachments: [AgentFileAttachment],
-        runtimePermission: AgentProviderRuntimePermissionBinding
-    ) -> ACPRunRequest? {
-        let selectedAgent = session.selectedAgent
-        guard selectedAgent.acpProviderID != nil else { return nil }
-        let selectedModelString = session.selectedModelRaw == AgentModel.defaultModel.rawValue
-            ? nil
-            : session.selectedModelRaw
-        return ACPRunRequest(
-            agentKind: selectedAgent,
-            modelString: selectedModelString,
-            workspacePath: workspacePath,
-            resumeSessionID: session.providerSessionID,
-            attachments: attachments,
-            taskLabelKind: session.mcpControlContext?.taskLabelKind,
-            sessionModeID: runtimePermission.acpSessionModeID,
-            autoApproveAllToolPermissions: runtimePermission.autoApproveAllACPToolPermissions,
-            launchPermissionMode: runtimePermission.acpLaunchPermissionMode,
-            // Resolve pins for whichever ACP provider is selected, not Cursor alone: OpenCode
-            // effort pins ride this same path, and narrowing it to `.cursor` silently drops them.
-            modelParameterSelections: selectedAgent.acpProviderID.map { providerID in
-                ACPModelParameterResolver.effectiveSelections(
-                    providerID: providerID,
-                    selectedModelRaw: session.selectedModelRaw,
-                    persistedSelections: session.acpModelParameterSelections
-                )
-            } ?? []
-        )
     }
 
     @discardableResult
@@ -1321,7 +1297,7 @@ final class AgentModeRunService {
             .filter { !$0.isEmpty }
         releaseUnconsumedClaudeSupersedingProtection(for: instructions, session: session)
         session.pendingClaudeSteeringInstructions.removeAll(where: shouldRestore)
-        restoreClaudeSteeringDrafts(drafts, tabID: tabID, strategy: strategy)
+        restoreClaudeSteeringDrafts(drafts, session: session, strategy: strategy)
     }
 
     /// Restores only the leading stale instructions so newer queued work remains eligible for a new flush task.
@@ -1339,17 +1315,17 @@ final class AgentModeRunService {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         releaseUnconsumedClaudeSupersedingProtection(for: instructions, session: session)
-        restoreClaudeSteeringDrafts(drafts, tabID: tabID, strategy: strategy)
+        restoreClaudeSteeringDrafts(drafts, session: session, strategy: strategy)
     }
 
     private func restoreClaudeSteeringDrafts(
         _ drafts: [String],
-        tabID: UUID,
+        session: AgentTabSession,
         strategy: DraftRestorationStrategy
     ) {
         guard !drafts.isEmpty else { return }
         let combined = drafts.joined(separator: "\n")
-        hooks.queuedWorkRecovery.restoreDraftText(tabID, combined, "Restored queued steering messages", strategy)
+        hooks.queuedWorkRecovery.restoreDraftText(session, combined, "Restored queued steering messages", strategy)
     }
 
     private func restoreAllQueuedDraftsForExecutionLocationChange(
@@ -1365,7 +1341,7 @@ final class AgentModeRunService {
         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         .filter { !$0.isEmpty }
         guard !drafts.isEmpty else { return }
-        hooks.queuedWorkRecovery.restoreDraftText(tabID, drafts.joined(separator: "\n"), "Restored queued messages after changing execution location", strategy)
+        hooks.queuedWorkRecovery.restoreDraftText(session, drafts.joined(separator: "\n"), "Restored queued messages after changing execution location", strategy)
     }
 
     /// Concatenates all queued Claude steering draft texts and restores them to the composer.
@@ -1385,10 +1361,10 @@ final class AgentModeRunService {
     private func restoreLocalACPSteeringDrafts(
         _ instructions: [AgentTabSession.ACPSteeringInstruction],
         tabID: UUID,
-        session: AgentTabSession? = nil,
+        session: AgentTabSession,
         stopFence: AgentRunStartStopFence? = nil
     ) {
-        if let stopFence, let session,
+        if let stopFence,
            !hooks.queuedWorkRecovery.isCurrentSessionBinding(session, stopFence)
         {
             return
@@ -1398,7 +1374,7 @@ final class AgentModeRunService {
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         guard !drafts.isEmpty else { return }
         hooks.queuedWorkRecovery.restoreDraftText(
-            tabID, drafts.joined(separator: "\n"), "Restored local ACP steering after Stop", .prependAlways
+            session, drafts.joined(separator: "\n"), "Restored local ACP steering after Stop", .prependAlways
         )
     }
 
@@ -1412,7 +1388,7 @@ final class AgentModeRunService {
         session.acpSteeringFlushID = nil
         restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
         session.pendingClaudeSteeringInstructions.removeAll()
-        restoreLocalACPSteeringDrafts(session.pendingACPSteeringInstructions, tabID: tabID)
+        restoreLocalACPSteeringDrafts(session.pendingACPSteeringInstructions, tabID: tabID, session: session)
         if let scheduled = session.scheduledACPFollowUp {
             session.scheduledACPFollowUp = nil
             let drafts = ([AgentTabSession.ScheduledACPFollowUp.QueuedInstruction(
@@ -1422,7 +1398,7 @@ final class AgentModeRunService {
                 .compactMap(\.instruction.localDraftText)
             if !drafts.isEmpty {
                 hooks.queuedWorkRecovery.restoreDraftText(
-                    tabID, drafts.joined(separator: "\n"), "Restored local ACP follow-up after Stop", .prependAlways
+                    session, drafts.joined(separator: "\n"), "Restored local ACP follow-up after Stop", .prependAlways
                 )
             }
         }
@@ -1431,7 +1407,7 @@ final class AgentModeRunService {
             .compactMap(\.localDraftText)
         if !localPending.isEmpty {
             hooks.queuedWorkRecovery.restoreDraftText(
-                tabID, localPending.joined(separator: "\n"),
+                session, localPending.joined(separator: "\n"),
                 "Restored local queued instructions after Stop", .prependAlways
             )
         }

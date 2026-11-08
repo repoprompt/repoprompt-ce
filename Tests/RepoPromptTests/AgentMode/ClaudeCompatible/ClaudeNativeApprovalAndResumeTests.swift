@@ -847,7 +847,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             var accepted = 0
             coordinator.installHostCapabilities(.init(
                 isSessionCurrent: { $0 === session }, requestUIRefresh: { _, _ in }, scheduleSave: { _ in },
-                stageClaudeResumeRecoveryHandoff: { _ in }, prependPendingHandoff: { text, _ in text },
+                stageClaudeResumeRecoveryHandoff: { _ in true }, prependPendingHandoff: { text, _ in text },
                 decorateAgentSessionLinkPrompt: { text, _, _ in .init(text: text, claim: nil, mustAbortDispatch: false) },
                 acquireAgentSessionLinkPhysicalDispatch: { _, _ in true },
                 recordAgentSessionLinkPhysicalDispatchNotAttempted: { _, _ in notAttempted += 1 },
@@ -1687,7 +1687,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
         session.appendItem(row)
         let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
-        await service.startRun(
+        await h.host.test_composeRunService(service).startRun(
             tabID: session.tabID, session: session, initialUserMessage: row.text,
             initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
         )
@@ -1725,7 +1725,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
         session.appendItem(row)
         let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
-        await service.startRun(
+        await h.host.test_composeRunService(service).startRun(
             tabID: session.tabID, session: session, initialUserMessage: row.text,
             initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
         )
@@ -1756,7 +1756,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
             let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
             session.appendItem(row)
             let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
-            await service.startRun(
+            await h.host.test_composeRunService(service).startRun(
                 tabID: session.tabID, session: session, initialUserMessage: row.text,
                 initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
             )
@@ -1799,7 +1799,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
         session.appendItem(row)
         let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
-        await service.startRun(
+        await h.host.test_composeRunService(service).startRun(
             tabID: session.tabID, session: session, initialUserMessage: row.text,
             initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
         )
@@ -1822,7 +1822,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         let gate = Gate()
         h.host.claudeCoordinator.installHostCapabilities(.init(
             isSessionCurrent: { $0 === session }, requestUIRefresh: { _, _ in }, scheduleSave: { _ in },
-            stageClaudeResumeRecoveryHandoff: { _ in }, prependPendingHandoff: { text, _ in text },
+            stageClaudeResumeRecoveryHandoff: { _ in true }, prependPendingHandoff: { text, _ in text },
             qualifyAgentSessionLinkProviderInputRoute: { _, _ in await gate.wait()
                 return .unavailable
             },
@@ -1854,7 +1854,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
         session.appendItem(row)
         let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
-        await service.startRun(
+        await h.host.test_composeRunService(service).startRun(
             tabID: session.tabID, session: session, initialUserMessage: row.text,
             initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
         )
@@ -1877,7 +1877,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         defer { h.host.test_beforeACPToolIdleWait = nil }
         h.host.claudeCoordinator.installHostCapabilities(.init(
             isSessionCurrent: { $0 === session }, requestUIRefresh: { _, _ in }, scheduleSave: { _ in },
-            stageClaudeResumeRecoveryHandoff: { _ in }, prependPendingHandoff: { text, _ in text },
+            stageClaudeResumeRecoveryHandoff: { _ in true }, prependPendingHandoff: { text, _ in text },
             qualifyAgentSessionLinkProviderInputRoute: { _, _ in .unavailable },
             hasCurrentAgentSessionLinkProviderInputRoute: { _, _ in false },
             decorateAgentSessionLinkPrompt: { text, _, _ in .init(text: text, claim: nil, mustAbortDispatch: false) },
@@ -1914,7 +1914,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
         session.appendItem(row)
         let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
-        await service.startRun(
+        await h.host.test_composeRunService(service).startRun(
             tabID: session.tabID, session: session, initialUserMessage: row.text,
             initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
         )
@@ -1994,7 +1994,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
             let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
             session.appendItem(row)
             let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
-            await service.startRun(
+            await h.host.test_composeRunService(service).startRun(
                 tabID: session.tabID, session: session, initialUserMessage: row.text,
                 initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
             )
@@ -2018,7 +2018,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
         session.appendItem(row)
         let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
-        await service.startRun(
+        await h.host.test_composeRunService(service).startRun(
             tabID: session.tabID, session: session, initialUserMessage: row.text,
             initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
         )
@@ -2183,7 +2183,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         await until("provider adoption has already finished") { session.runState == .running && listener.adoptionTask == nil }
         let owner = try XCTUnwrap(session.activeRunOwnership)
         let refused = AgentRunStartOutcomeRecorder()
-        await h.service.startRun(tabID: session.tabID, session: session, initialUserMessage: "contending startup", initialMessageForRun: "contending startup", attachments: [], startOutcome: refused)
+        await h.host.test_composeRunService(h.service).startRun(tabID: session.tabID, session: session, initialUserMessage: "contending startup", initialMessageForRun: "contending startup", attachments: [], startOutcome: refused)
         XCTAssertFalse(refused.outcome.didStart, "Another active owner must not overwrite a startup refusal as accepted")
         XCTAssertEqual(session.activeRunOwnership, owner)
         let row = AgentChatItem.user("local after adoption", sequenceIndex: session.nextSequenceIndex)
@@ -2227,7 +2227,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         await h.host.claudeCoordinator.shutdownClaudeSession(session)
         await replacement.setImmediateReplyDuringSend(true)
         let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
-        await service.startRun(
+        await h.host.test_composeRunService(service).startRun(
             tabID: session.tabID, session: session, initialUserMessage: "fresh replacement input",
             initialMessageForRun: "fresh replacement input", attachments: [], preparedClaudeEvents: reservation
         )
@@ -2259,7 +2259,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         XCTAssertTrue(listener.subscription === reservation.subscription)
         await controller.setImmediateReplyDuringSend(true)
         let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
-        await service.startRun(
+        await h.host.test_composeRunService(service).startRun(
             tabID: session.tabID, session: session, initialUserMessage: "host start",
             initialMessageForRun: "host start", attachments: [], preparedClaudeEvents: reservation
         )
@@ -2348,7 +2348,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         // Refuse the real coordinator's route gate, before its physical input boundary.
         h.host.claudeCoordinator.installHostCapabilities(.init(
             isSessionCurrent: { $0 === session }, requestUIRefresh: { _, _ in }, scheduleSave: { _ in },
-            stageClaudeResumeRecoveryHandoff: { _ in }, prependPendingHandoff: { text, _ in text },
+            stageClaudeResumeRecoveryHandoff: { _ in true }, prependPendingHandoff: { text, _ in text },
             qualifyAgentSessionLinkProviderInputRoute: { _, _ in await gate.wait()
                 return .unavailable
             },
@@ -2376,7 +2376,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
             let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
             session.appendItem(row)
             let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
-            await service.startRun(
+            await h.host.test_composeRunService(service).startRun(
                 tabID: session.tabID, session: session, initialUserMessage: row.text,
                 initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
             )
@@ -2391,7 +2391,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
             let gate = Gate()
             h.host.claudeCoordinator.installHostCapabilities(.init(
                 isSessionCurrent: { $0 === session }, requestUIRefresh: { _, _ in }, scheduleSave: { _ in },
-                stageClaudeResumeRecoveryHandoff: { _ in }, prependPendingHandoff: { text, _ in text },
+                stageClaudeResumeRecoveryHandoff: { _ in true }, prependPendingHandoff: { text, _ in text },
                 qualifyAgentSessionLinkProviderInputRoute: { _, _ in await gate.wait()
                     return .unavailable
                 },
@@ -2727,7 +2727,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         }
         await controller.setImmediateReplyDuringSend(true)
         let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
-        await service.startRun(
+        await h.host.test_composeRunService(service).startRun(
             tabID: session.tabID, session: session, initialUserMessage: row.text,
             initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
         )

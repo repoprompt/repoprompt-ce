@@ -55,7 +55,7 @@ final class OracleBackgroundAwareness {
         if cachedRevision != version.generation || cachedEpoch != version.epoch {
             cachedEpoch = version.epoch
             cachedRevision = version.generation
-            let open = registry.snapshot(for: owner, includeFinished: false).invocations
+            let open = registry.liveInvocations(for: owner)
             if let first = open.last {
                 let ready = open.reduce(0) { $0 + $1.laneOutcomes.values.count(where: { $0 == .completed }) }
                 let remaining = open.count - 1

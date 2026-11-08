@@ -94,7 +94,7 @@ extension AgentModeViewModel {
             return answer
         }
 
-        guard !agentSelfCompactHasCompetingWriter(session, sessionID: endpoint.sessionID) else {
+        guard agentSelfCompactHasExclusiveWriter(session, endpoint: endpoint) else {
             return .blocked(reason: "session_not_exclusive")
         }
         guard !session.selfCompactPersistenceWarning,
@@ -107,7 +107,7 @@ extension AgentModeViewModel {
               session.runID == origin.runID,
               session.activeRunOwnership?.attemptID == origin.runAttemptID
         else { return .unavailable }
-        guard !agentSelfCompactHasCompetingWriter(session, sessionID: endpoint.sessionID) else {
+        guard agentSelfCompactHasExclusiveWriter(session, endpoint: endpoint) else {
             return .blocked(reason: "session_not_exclusive")
         }
         switch support {
@@ -159,7 +159,7 @@ extension AgentModeViewModel {
               agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
               session.selfCompactState.active?.id == attempt.id
         else { return .blocked(reason: "busy") }
-        guard !agentSelfCompactHasCompetingWriter(session, sessionID: endpoint.sessionID) else {
+        guard agentSelfCompactHasExclusiveWriter(session, endpoint: endpoint) else {
             var state = session.selfCompactState
             state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
             session.selfCompactState = state
@@ -182,7 +182,7 @@ extension AgentModeViewModel {
                 return .blocked(reason: "persistence_pending")
             }
             if session.selfCompactState.active?.id == requestID,
-               agentSelfCompactHasCompetingWriter(session, sessionID: endpoint.sessionID)
+               !agentSelfCompactHasExclusiveWriter(session, endpoint: endpoint, allowRetiringWriter: true)
             {
                 return .blocked(reason: "session_not_exclusive")
             }
@@ -230,15 +230,15 @@ extension AgentModeViewModel {
         return snapshot
     }
 
-    private func agentSelfCompactHasCompetingWriter(_ session: TabSession, sessionID: UUID) -> Bool {
-        let sameWindowWriter = sessions.values.contains { other in
-            other !== session && other.activeAgentSessionID == sessionID
-        }
-        return sameWindowWriter || WindowStatesManager.shared.allWindows.contains { window in
-            window.agentModeViewModel.sessions.values.contains { other in
-                other !== session && other.activeAgentSessionID == sessionID
-            }
-        }
+    private func agentSelfCompactHasExclusiveWriter(_ session: TabSession, endpoint: DomainAgentSessionLinkEndpointIdentity, allowRetiringWriter: Bool = false) -> Bool {
+        // A window census misses independent runtime scopes. Use the same exact writer
+        // authority as persistence, before reserving a request or spending its key.
+        guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+            workspaceID: endpoint.workspaceID, sessionID: endpoint.sessionID
+        ) else { return false }
+        return writer.session === session && writer.binding.tabID == endpoint.tabID
+            && writer.binding.generation == endpoint.persistentBindingGeneration
+            && (allowRetiringWriter || !writer.scope.isRetiring)
     }
 
     func agentSelfCompactTerminalSettled(
@@ -332,7 +332,7 @@ extension AgentModeViewModel {
             && endpoint.sessionID == owner.sessionID
             && endpoint.persistentBindingGeneration == owner.persistentBindingGeneration
             && endpoint.bindingTransitionGeneration == owner.bindingTransitionGeneration
-            && !agentSelfCompactHasCompetingWriter(session, sessionID: owner.sessionID)
+            && agentSelfCompactHasExclusiveWriter(session, endpoint: endpoint)
     }
 
     /// Evaluation can release a stale parked note without requiring a send that the note itself

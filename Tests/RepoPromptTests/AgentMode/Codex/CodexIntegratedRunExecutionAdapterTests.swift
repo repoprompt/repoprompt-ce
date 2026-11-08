@@ -219,7 +219,7 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
             computerUseCompanionReady: { true }, computerUseReservedEntryExists: { false },
             codexHookApprovalSettings: GlobalSettingsStore.shared
         )
-        coordinator.attach(viewModel: viewModel)
+        viewModel.configureCodexRuntime(coordinator)
         XCTAssertEqual(coordinator.nativeSlashCommandAvailabilityMessage(.computerUse, argumentsText: "", session: session), message)
         let requestID = UUID()
         session.codexComputerUseArmingRequestID = requestID
