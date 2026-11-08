@@ -5757,3 +5757,37 @@ saved-target loading/composition and prepared-window removal are not M9.2 work. 
 still cancels its run: close-preserves-run and handoff/drain belong to **M9.4**. Do not remove the
 mutable host-workspace resource fence until resource identity is safely pinned; writer identity
 alone does not authorize use of a different window's context or launch path.
+
+### M9.2 partial milestone: MCP registration and cancellation claim receipts
+
+MCP activation now retains its admitted creation/restored command across setup instead of
+accepting a fresh lookup after each suspension. Registration, generation advancement and the
+registration cancellation receipt moved into `AgentSessionMCPRuntime`; the domain store remains
+registration authority and resident/consent revalidation remains separate from writer admission.
+The cancellation receipt retains the exact writer incarnation. Its originating teardown check
+allows retirement and binding preparation, but rejects conflicting claims, identical-binding
+reacquisition and reinstallation. Readiness/hydration and dirty-state changes do not rotate the
+claim; the live index was not weakened to make an obsolete cancellation receipt reusable.
+
+Review found that merely refusing post-installation reacquisition left half-installed control
+behind. Failure now removes an unchanged provisional activation receipt and its registration,
+without clearing a newer activation/context/generation or successor instruction. Permission,
+origin and auto-edit rollback only restores values that this attempt actually wrote and still
+owns. The regression covers reacquisition before visibility and after provisional installation,
+plus conflict cancellation and the existing no-presenter lifetime/retirement/transition drain.
+Broader parameter tests now explicitly install restored, workspace-qualified writers where they
+previously attempted MCP parameter mutations on unbound local drafts; their parameter, busy-state,
+rollback and rejection assertions are unchanged.
+
+This retires the VM registration transaction, not the remaining activation/permission setup,
+deactivation, control routing or inner execution cancellation adapters. Those remain M9.2;
+no saved-target host or presentation handoff/drain policy was changed.
+
+Validation: `609aa56d-5bdf-4bf7-88a6-6e5de2b5e371` passed **137 focused tests**. Both products
+passed `34ca534b-10ed-4175-b6af-b4e22033260a`; full lint passed
+`6ac666a6-fdf1-42b5-993a-11aaa3570b8c`, followed by a passing scoped check for the final
+fixture-only property correction. Fresh index passed **1241/1360** wrong-way file edges and
+**53/66** largest-cycle components. Three emitted touched-file warning signatures matched the
+baseline; none were new. The first run exposed abandoned-registration cleanup and unbound
+parameter fixtures; the second stopped on two incorrect test property names. Neither is a pass.
+No live-app or full-suite validation was run.

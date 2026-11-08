@@ -835,6 +835,53 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         XCTAssertNil(remaining)
     }
 
+    func testControlActivationCannotPublishOrRollBackAcrossWriterReacquisition() async throws {
+        for afterInstallation in [false, true] {
+            let window = try await makeWindow()
+            let viewModel = window.agentModeViewModel
+            let sessionID = UUID()
+            let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+            let command = try XCTUnwrap(viewModel.runtimeCommand(sessionID: sessionID))
+            let scope = command.writer.scope
+            let binding = session.currentRestorationBindingToken
+            var reachedBoundary = false
+            var installed: AgentMCPControlContext?
+            @MainActor func reacquire() {
+                reachedBoundary = true
+                installed = session.mcpControlContext
+                let sessions = scope.sessions
+                scope.replaceSessions(sessions.filter { $0.key != session.tabID })
+                scope.replaceSessions(sessions)
+                XCTAssertEqual(session.currentRestorationBindingToken, binding)
+                XCTAssertFalse(command.isCurrent)
+                session.waitingPrompt = "Successor instruction"
+                session.mcpFollowUpRunPending = false
+            }
+            if afterInstallation {
+                viewModel.test_afterMCPControlSetupAwait = { _ in reacquire() }
+            } else {
+                viewModel.test_afterMCPControlRegistration = { _ in reacquire() }
+            }
+            do {
+                _ = try await viewModel.mcpActivateControlContext(
+                    forTabID: session.tabID, sessionID: sessionID, originatingConnectionID: nil, startPending: true
+                )
+                XCTFail("An admitted activation must not adopt a reacquired writer")
+            } catch { XCTAssertTrue(error is MCPError) }
+            viewModel.test_afterMCPControlRegistration = nil
+            viewModel.test_afterMCPControlSetupAwait = nil
+            XCTAssertTrue(reachedBoundary)
+            XCTAssertNil(session.mcpControlContext, "An unchanged provisional activation must not survive its failed installation")
+            XCTAssertFalse(session.mcpFollowUpRunPending, "Preserve the successor's changed pending value")
+            XCTAssertEqual(session.waitingPrompt, "Successor instruction")
+            let registration = await AgentRunSessionStore.currentRegistration(for: sessionID)
+            XCTAssertNil(registration, "The failed attempt's registration must not survive with an obsolete cancellation receipt")
+            if afterInstallation { XCTAssertNotNil(installed) } else { XCTAssertNil(installed) }
+            XCTAssertFalse(session.isMCPOriginated, "The uncommitted activation cannot finish permission/origin setup")
+            await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+        }
+    }
+
     func testLateRealGrantRefusesInstallationAndSurvivesEligibilityAudit() async throws {
         let window = try await makeWindow()
         let viewModel = window.agentModeViewModel

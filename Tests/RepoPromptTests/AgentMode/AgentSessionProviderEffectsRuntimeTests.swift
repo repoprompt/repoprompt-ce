@@ -634,12 +634,20 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
         var cancellations = 0
         let registration: AgentRunSessionStore.Registration
         do {
-            let capability = try AgentSessionMCPRuntime.ControlActivationCancellation(
-                scope: XCTUnwrap(scope), session: session, activationID: activationID
+            guard case let .unique(writer) = try XCTUnwrap(scope).resolveWriter(sessionID: sessionID) else {
+                return XCTFail("Expected an exclusive cancellation writer")
+            }
+            let capability = AgentSessionMCPRuntime.ControlActivationCancellation(
+                writer: writer, activationID: activationID
             ) { exact in
                 XCTAssertIdentical(exact, session)
                 cancellations += 1
             }
+            session.hasLoadedPersistedState = true
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            session.isDirty = true
+            XCTAssertTrue(writer.isCurrent, "Hydration/readiness and dirty projections do not rotate the live claim")
+            XCTAssertTrue(capability.permitsPublication)
             registration = await store.register(sessionID: sessionID) { await capability.cancel(registration: $0) }
         }
         session.mcpControlContext = .init(
@@ -673,12 +681,51 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
         _ = await store.shutdown()
     }
 
+    func testControlCancellationRequiresTheOriginalExclusiveClaim() async throws {
+        for introduceConflict in [false, true] {
+            let f = try await makeFixture()
+            guard case let .unique(writer) = f.scope.resolveWriter(sessionID: f.registration.sessionID) else {
+                return XCTFail("Expected original writer")
+            }
+            var cancellations = 0
+            let capability = try AgentSessionMCPRuntime.ControlActivationCancellation(
+                writer: writer, activationID: XCTUnwrap(f.session.mcpControlContext).activationID
+            ) { _ in cancellations += 1 }
+            XCTAssertTrue(capability.permitsPublication)
+            let binding = f.session.currentRestorationBindingToken
+            let originalSessions = f.scope.sessions
+            if introduceConflict {
+                // Normal admission refuses this claim. Inject only to exercise legacy corruption.
+                let replica = f.scope.makeSession(tabID: UUID())
+                XCTAssertEqual(f.scope.bindingRejection(f.registration.sessionID, on: replica), .conflictingWriter)
+                replica.installPersistentSessionBinding(.init(
+                    tabID: replica.tabID, sessionID: f.registration.sessionID, workspaceID: writer.identity.workspaceID
+                ))
+                f.scope.replaceSessions(originalSessions.merging([replica.tabID: replica]) { original, _ in original })
+            } else {
+                let sessions = f.scope.sessions
+                f.scope.replaceSessions([:])
+                f.scope.replaceSessions(sessions)
+            }
+            XCTAssertEqual(f.session.currentRestorationBindingToken, binding)
+            XCTAssertFalse(capability.permitsPublication)
+            f.session.waitingPrompt = "Do not cancel successor work"
+            await capability.cancel(registration: f.registration)
+            XCTAssertEqual(cancellations, 0)
+            XCTAssertEqual(f.session.waitingPrompt, "Do not cancel successor work")
+            f.scope.replaceSessions(originalSessions)
+        }
+    }
+
     func testPendingActivationCancellationDoesNotCancelPreviouslyInstalledControl() async throws {
         let f = try await makeFixture()
         let previous = f.session.mcpControlContext
         var cancellations = 0
+        guard case let .unique(writer) = f.scope.resolveWriter(sessionID: f.registration.sessionID) else {
+            return XCTFail("Expected an exclusive cancellation writer")
+        }
         let pending = AgentSessionMCPRuntime.ControlActivationCancellation(
-            scope: f.scope, session: f.session, activationID: UUID()
+            writer: writer, activationID: UUID()
         ) { _ in cancellations += 1 }
         XCTAssertTrue(pending.permitsPublication)
         f.scope.beginRetirement()

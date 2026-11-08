@@ -102,6 +102,17 @@ final class AgentSessionRuntimeStore {
             return nil
         }
 
+        /// Originating teardown may run while binding preparation has suspended command
+        /// admission. It still belongs to this exact, exclusive claim, never a reacquisition.
+        /// This is not permission to publish control or start another operation.
+        var ownsPersistentClaim: Bool {
+            !scope.hasReleasedWriterClaims
+                && scope.sessions[session.tabID] === session
+                && session.persistentSessionBindingIdentity == binding
+                && scope.liveClaimByTabID[session.tabID]?.incarnationID == identity.incarnationID
+                && !scope.store.hasOtherClaim(sessionID: binding.sessionID, scope: scope, session: session)
+        }
+
         var isCurrent: Bool {
             guard let workspaceID = binding.workspaceID,
                   case let .unique(current) = scope.store.resolveWriter(workspaceID: workspaceID, sessionID: binding.sessionID)

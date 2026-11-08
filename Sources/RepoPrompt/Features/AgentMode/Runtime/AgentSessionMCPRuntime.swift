@@ -196,41 +196,29 @@ final class AgentSessionMCPRuntime {
     /// joins the existing run service's teardown, never a replacement session's run.
     @MainActor
     final class ControlActivationCancellation {
-        private let scope: AgentSessionRuntimeStore.Scope
-        private let session: AgentTabSession
-        private let binding: AgentSessionRestorationBindingToken?
+        private let writer: AgentSessionRuntimeStore.Writer
+        private var session: AgentTabSession {
+            writer.session
+        }
+
         private let activationID: UUID
         private let activationGeneration: UInt64
         private let cancelInstalledRun: (AgentTabSession) async -> Void
         private(set) var cancellationRequested = false
 
         init(
-            scope: AgentSessionRuntimeStore.Scope, session: AgentTabSession,
+            writer: AgentSessionRuntimeStore.Writer,
             activationID: UUID, cancelInstalledRun: @escaping (AgentTabSession) async -> Void
         ) {
-            self.scope = scope
-            self.session = session
-            binding = session.currentRestorationBindingToken
+            self.writer = writer
             self.activationID = activationID
-            activationGeneration = session.mcpControlActivationGeneration
+            activationGeneration = writer.session.mcpControlActivationGeneration
             self.cancelInstalledRun = cancelInstalledRun
         }
 
         var permitsPublication: Bool {
-            !cancellationRequested && !scope.isRetiring && isCurrent
-        }
-
-        private var isCurrent: Bool {
-            ownsPersistentIncarnation
-                && session.currentRestorationBindingToken == binding
-                && !session.bindingTransitionInProgress
+            !cancellationRequested && !writer.scope.isRetiring && writer.isCurrent
                 && session.mcpControlActivationGeneration == activationGeneration
-        }
-
-        private var ownsPersistentIncarnation: Bool {
-            !scope.hasReleasedWriterClaims
-                && scope.sessions[session.tabID] === session
-                && binding != nil && session.persistentSessionBindingIdentity == binding?.bindingIdentity
         }
 
         func cancel(registration: AgentRunSessionStore.Registration) async {
@@ -238,7 +226,7 @@ final class AgentSessionMCPRuntime {
             // An installed run still needs its drain while deactivation/binding preparation is
             // in progress. Do not require setup's transition generation, but never cross into a
             // replacement persistent binding, even when its UUIDs or context were copied.
-            guard ownsPersistentIncarnation,
+            guard writer.ownsPersistentClaim,
                   session.activeAgentSessionID == registration.sessionID,
                   let context = session.mcpControlContext,
                   context.activationID == activationID,
@@ -247,6 +235,67 @@ final class AgentSessionMCPRuntime {
             AgentSessionInteractionRuntime.cancelPendingInstruction(for: session)
             await cancelInstalledRun(session)
         }
+    }
+
+    struct ControlRegistration {
+        let registration: AgentRunSessionStore.Registration
+        let generation: UInt64
+        let cancellation: ControlActivationCancellation
+    }
+
+    /// Registration and its cancellation receipt are one runtime-owned operation. The domain
+    /// store retains the originating writer before suspension; setup never acquires a successor.
+    func registerControlActivation(
+        command: AgentSessionRuntimeStore.Command, activationID: UUID,
+        revalidateAdmission: () throws -> Void
+    ) async throws -> ControlRegistration {
+        let writer = command.writer
+        guard writer.scope === scope, command.isCurrent, let execution = writer.scope.execution else {
+            throw MCPError.invalidParams("The requested agent session writer changed before MCP control activation.")
+        }
+        try revalidateAdmission()
+        let session = writer.session
+        session.mcpControlCleanupTask?.cancel()
+        session.mcpControlActivationGeneration &+= 1
+        let generation = session.mcpControlActivationGeneration
+        let cancellation = ControlActivationCancellation(writer: writer, activationID: activationID) { exact in
+            await execution.cancelRun(
+                tabID: exact.tabID, session: exact,
+                intent: .runtimeShutdown, completion: .terminalTeardownCompleted
+            )
+        }
+        let handler: DomainAgentRunSessionStore.RegistrationCancellationHandler = { registration in
+            await cancellation.cancel(registration: registration)
+        }
+        let registration: AgentRunSessionStore.Registration
+        switch await AgentRunSessionStore.claimResumableSession(
+            sessionID: writer.identity.sessionID, cancellationHandler: handler
+        ) {
+        case let .accepted(claimed):
+            registration = claimed
+        case .unavailable, .alreadyActive:
+            try revalidateAdmission()
+            guard command.isCurrent, cancellation.permitsPublication else {
+                throw MCPError.invalidParams("The MCP control activation was cancelled or superseded during registration.")
+            }
+            registration = await AgentRunSessionStore.register(
+                sessionID: writer.identity.sessionID, cancellationHandler: handler
+            )
+        case .shuttingDown:
+            throw MCPError.internalError("The Agent session runtime is shutting down and cannot activate a control session.")
+        }
+        guard registration.generation != 0 else {
+            throw MCPError.internalError("The Agent session runtime is shutting down and cannot activate a control session.")
+        }
+        do { try revalidateAdmission() } catch {
+            await AgentRunSessionStore.cleanup(registration: registration)
+            throw error
+        }
+        guard command.isCurrent, cancellation.permitsPublication else {
+            await AgentRunSessionStore.cleanup(registration: registration)
+            throw MCPError.invalidParams("The MCP control activation was cancelled or superseded during registration.")
+        }
+        return .init(registration: registration, generation: generation, cancellation: cancellation)
     }
 
     /// Prepare the existing domain epoch without a presentation owner. Recovery installs its
@@ -301,7 +350,7 @@ final class AgentSessionMCPRuntime {
         // results are eligible for missing-record recovery through registerIfMissing.
         if case .rejected = result {
             let cancellation = ControlActivationCancellation(
-                scope: scope, session: session, activationID: originalContext.activationID,
+                writer: writer, activationID: originalContext.activationID,
                 cancelInstalledRun: cancelInstalledRun
             )
             recoveryCancellation = cancellation
