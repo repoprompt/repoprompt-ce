@@ -5189,3 +5189,97 @@ Validation:
 Canonical writer admission, saved-host construction, remaining terminal self-compaction/worktree
 commands, exact runtime routing and presentation-only close/handoff integration remain open. This
 checkpoint does not establish final full-suite, hosted CI or live-smoke qualification.
+
+### M9.1 scope freeze and merge-safety audit (2026-11-08, PR #1655, refs #1406)
+
+PR #1655 is **M9.1: behaviour-preserving runtime ownership extraction**, not completion of M9.
+The existing session objects, observation, streaming, derived transcript work, usage/timing,
+attachment retention, draft/handoff handling, save queue/payload transaction, MCP state publication,
+interaction effects, link execution, startup and follow-up producers now have named runtime owners.
+The VM forwards to those owners and supplies legacy app composition and optional presentation.
+No persisted schema or provider protocol changes. User-visible behaviour is unchanged, including
+**today's ordinary window-close-cancels-run behaviour**; this PR does not turn close into a
+presentation-only detach. Existing prepared managed-session behaviour remains intact.
+
+Merged main `bb68ff0d29ef8582a4636fa615ec6acd374a011a` with merge commit `360705f61`.
+The stopped worker's terminal-transcript materialisation stash remains untouched and excluded.
+
+#### Audit and bounded repair
+
+- The scope's session map and reverse binding index are the live-object storage; VM accessors
+  forward to that map. Runtime observation owns source/run callbacks; the exact-object presentation
+  sink forwards attached UI refresh, transcript, activity, draft and terminal notifications. The
+  ordinary close path detaches that sink **after** its cancellation/drain, not before terminal UI.
+- Saves use the existing creation/restoration/binding admission and exact save token, one scope save
+  queue and durable payload writer. Retention completes before final prepared-host save/release.
+  `finishRetiringPreparedOversightOwner` deliberately retains an unsettled writer, reports a warning
+  and retries on explicit visit/shutdown. Releasing its infrastructure after failed durability would
+  discard that retry capability; the review's suggested unconditional teardown was not applied.
+- Prepared-owner release occurs after `invalidateWindow`, observer/census subscription removal,
+  close/presentation detach and final save. It is not a second live UI writer. Ordinary close retains
+  its existing lifetime/disposal policy; no new presentation-only claim-release policy was added.
+- Runtime startup checks retirement and Stop before dispatch. `AgentModeRunService.prepareRun`
+  reaches the ACP runner's synchronous attempt/`.running` prologue before its first provider await;
+  close therefore sees and cancels that run. Moving the producer join ahead of cancellation could
+  instead strand close behind provider work. Existing guarded close/start coverage remains required.
+- Production live session construction uses `Scope.makeSession`; the remaining direct constructors
+  are a slash-suggestion scratch object and a tracker teardown placeholder, not admitted writers.
+  `AgentSavedSessionTargetLoader` is called by `WindowStatesManager+AgentSessionLinks`, not dead code.
+  The early-refusal placement of the follow-up flag cleanup is unchanged from main, not a newly
+  introduced second queue/owner.
+- The whole reported watchdog class initially passed (43 cases), so a single green run did not
+  establish absence of the reported successor-attempt failure. Source tracing found a same-run
+  observer lifetime race: a cancelled predecessor connection lookup could unregister a replacement
+  observer by run ID. A deterministic gated network witness failed before repair with **0 callbacks
+  instead of 1** (`d2e74659-0276-4302-a07b-268672cac1d1`). Cleanup now carries the existing registration
+  token through lookup and Task hops and refuses a predecessor token. Both callback and continuation
+  APIs use that token; no new observer authority or queue was introduced. This mechanism also exists
+  in main's unchanged tracker code; its historical CI scheduling trigger is not proven. The original
+  exact-association/duplicate-dispatch assertions remain unchanged, with no timeout or retry increase.
+- Explicitly discarded the runtime footer helper's result, removing a new extraction warning.
+  Existing unrelated warnings are not silently presented as a warning-free repository.
+
+One independent selected-boundary review covered scope/observation/persistence/presentation,
+startup/continuation and prepared-host teardown. Its lifecycle hypotheses were checked against the
+actual callers and synchronous runner admission, rather than applied speculatively. This is a source
+and local-test audit, not a live UI/hosted-CI receipt; the overseer owns those checks.
+
+#### Compatibility adapter retirement inventory
+
+These are deliberate temporary composition/forwarding adapters, not claims that M9 is complete.
+Entries group the forwarding methods for the named owner; no duplicate copy of its runtime maps
+is intended to remain.
+
+| Remaining adapter / boundary | Retirement segment |
+| --- | --- |
+| `AgentSessionRuntimeStore.Writer` resolution used by carrier census; legacy exact-object admission and VM binding/creation inputs | M9.2a establishes the writer admission contract; M9.2b routes callers through it |
+| VM `sessions` proxy, UI side effects around replacement, `AgentTabSession` forwarding aliases, scope lifetime tied to the legacy host | M9.2b writer routing; M9.4 presentation/lifetime handoff |
+| VM interaction command forwarding and `interactionRuntime` provider/approval composition | M9.2b |
+| VM `AgentSessionLink*` forwarding methods / `_modify` storage access and `linkExecutionRuntime.Commands` endpoint/start/composer/self-compact inputs | M9.2b; workspace inputs completed in M9.3 |
+| VM `makeRunStartEnvironment`, `makeFollowUpLaunch`, `AgentModeRunComposition` workspace/resource factories and weak host preparation callbacks | M9.2b routing; M9.3 window-free host composition |
+| VM stream forwarding / lazy `_ = runService`, weak runtime service/coordinator back-pointers and Claude tool-hook installation | M9.2b explicit host-owned routing/composition |
+| VM `configureCodexRuntime`, provider/UI model and Computer Use presentation attachment | M9.3 host composition; M9.4 presentation detach |
+| VM `mcpRuntime` route/metadata adapter, `MCPRunRouteBindings`, `MCPToolExecutionRuntime` app/server composition | M9.2b canonical routing; M9.3 route/catalog host composition |
+| `installPersistenceComposition`: workspace catalog, names, suppression, creation/save admission | M9.3 |
+| VM save/token/flush forwarding methods and `AgentSessionPersistenceRuntime.Presentation` commit/UI callbacks | M9.2b writer routing; M9.4 optional presentation |
+| `attachmentRuntime.configuration` location/current-root adapter and preview invalidation | M9.3 canonical storage inputs; M9.4 presentation invalidation |
+| VM provider-input/workspace-source and resume-handoff composition, draft/usage/timing/transcript forwarding | M9.2b commands; M9.3 workspace/context composition |
+| VM terminal preparation/self-compaction/provider-switch/worktree-relocation settlement callbacks | M9.2b command ownership; M9.4 final presentation drain (stashed terminal work is not in M9.1) |
+| `synchronizeRunPresentationAttachments`, `detachRunPresentation`, UI refresh/notification projections and legacy `prepareForWindowClose` retirement | M9.4 |
+| `WindowState` prepared owner, `AgentSessionCarrierResolver` weak prepared-owner registry and window census | M9.3 |
+| `AgentSavedSessionTargetLoader` window-catalog caller adapter (loader itself remains the point-read implementation) | M9.3 |
+
+Remaining plan: **M9.2a** writer admission contract; **M9.2b** routing through that writer;
+**M9.3** window-free saved-target host; **M9.4** presentation detach/drain and #1406 closeout.
+The later app-free target move remains M10. PR #1655 references, and does not close, #1406.
+
+Focused wrap-up validation:
+- Initial whole watchdog class: `17b16884-2d95-45ff-8d09-063750f5b381`, **43 tests**, passed.
+- Deterministic pre-fix cancellation witness: `d2e74659-0276-4302-a07b-268672cac1d1`, **1 test**,
+  failed at its expected successor callback count (0 rather than 1).
+- Post-fix `65445f3d-9617-49f7-bb31-e58bbff2c878`: **166 tests**, zero failures: watchdog 44,
+  handoff inheritance 100, persistence runtime 9, presentation runtime 4 and runtime store 9.
+  The extra `AgentSessionProviderEffectsRuntimeTests` filter was a filename, not a suite, and
+  selected no cases; it is not included in that count. Its actual suites are covered by the full gate.
+- Scoped SwiftFormat 0.61.1: 0/3 files needed changes. Final Swift lint
+  `e9d03c82-fe20-4fef-a0ca-1c52163cd718` passed (0/2142 files require formatting).

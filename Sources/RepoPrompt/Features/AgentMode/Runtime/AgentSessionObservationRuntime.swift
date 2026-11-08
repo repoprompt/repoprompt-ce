@@ -135,7 +135,7 @@ final class AgentSessionObservationRuntime {
         session.onRunStateChanged = { [self] session in
             guard let scope else { return }
             if !session.runState.isActive {
-                scope.turnTiming.completeNextAgentTurnRuntimeFooterIfNeeded(for: session, endedAt: Date())
+                _ = scope.turnTiming.completeNextAgentTurnRuntimeFooterIfNeeded(for: session, endedAt: Date())
             }
             if scope.sessions[session.tabID] === session, !scope.hasReleasedWriterClaims,
                session.hasLoadedPersistedState, session.runState != .idle,
