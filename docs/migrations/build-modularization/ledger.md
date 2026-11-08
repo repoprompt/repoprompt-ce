@@ -5693,3 +5693,67 @@ spawn-stamp authorization and obsolete duplicate-install fixtures were failed re
 Review prompted first-transaction projection assertions and a precise raw-writer refusal witness;
 the inspection hold avoids assuming that an idle prepared adapter survives an unrelated disk await.
 No live-app or full-suite validation was run.
+
+### M9.2 partial milestone: provider-initiated Claude adoption
+
+Claude provider-turn adoption now enters the canonical scope directly. The coordinator holds a
+weak scope resource reference rather than an `adoptProviderTurn` view-model callback. The scope
+selects/adopts the exact writer command, and the installed run service retains it through terminal
+publication and MCP epoch preparation. The actual provider-epoch body moved from the VM to
+`AgentSessionMCPRuntime`; copied control-context ambiguity remains a separate veto and no longer
+sets a pending-follow-up flag before refusal. Domain epoch acceptance is not dispatch permission.
+
+A refusal carries its originating writer back to the coordinator and rechecks that capability at
+the synchronous payload mutation. Retirement may refuse and drain that same writer; reacquisition
+must not receive its error row, run-state mutation, follow-up cleanup or save. A superseded operation
+retires only the captured unadopted listener/controller, disables its presentation callback, and
+never selects the replacement controller after suspension. Review caught the initially stranded
+provider-turn case; the correction cancels pending permissions without re-adopting on a retry.
+
+The regressions cover epoch suspension followed by retirement, identical-binding writer
+reacquisition, replacement controllers, entry admission refusal and control-context ambiguity.
+They assert pending work is resolved, successor state is untouched, and a still-current origin can
+acknowledge the accepted epoch without dispatch. Actual epoch preparation works without a
+presentation sink. Broader listener event/tool hooks and ordinary runner dispatch remain M9.2 work;
+this does not change presentation close or introduce a M9.4 handoff/drain policy.
+
+Validation: `dc86af3d-f7d7-4a76-9f29-e526ad69418c` passed **134 focused tests**. Both products
+passed `3b788eb2-9f07-4b97-9b20-09748b66136d`; full lint passed
+`e226517d-43d4-4be1-8a69-db2051b2d4c2`. Fresh index passed **1241/1360** wrong-way file
+edges and **53/66** largest-cycle components. Two emitted touched-file warning signatures matched
+the baseline; none were new. Earlier 123/124-test receipts preceded the review repair and final
+callback/receipt retirement and are not the final qualification. No live-app or full-suite
+validation was run.
+
+### M9.2 remaining inventory and completion checks
+
+Size is a rough implementation/test surface, not a time estimate: **S** = 1–2 files, **M** =
+3–5 files, **L** = 6+ files or a broad caller/fixture migration. These groups reconcile the M9.1
+adapter inventory with the partial milestones above; none is deferred merely because it is large.
+
+| Remaining M9.2 routing/retirement group | Size | Concrete boundary still to retire |
+| --- | --- | --- |
+| Binding, creation and hydration | L | VM binding/creation inputs, `prepareSessionForRunStart`, `performPersistedSessionLoad` and first-save admission callbacks; pin exact origin through inner IO, not only the outer startup fence |
+| Startup, continuation and provider execution | L | Remaining `makeRunStartEnvironment`/`makeFollowUpLaunch` command callbacks, composition → run service → runner resource/physical-dispatch boundaries; keep originating terminal cleanup distinct from new admission |
+| Link Steer, local/provider input and self-compaction | L | VM Steer/submission bodies, remaining `linkExecutionRuntime.Commands` start/self-compact callbacks, provider input release and link storage/forwarding adapters |
+| MCP control and routing | L | VM control-session/metadata lookup and mutation, activation/cancellation, `MCPRunRouteBindings` and tool service target selection; app/server resource composition remains separately identified |
+| Administration and worktree commands | L | `SessionAdminWindows.owningViewModel` command selection, delegation fork, worktree transition/merge bodies and their scope-authorized commit boundaries; placement/model/effort cutovers above are already active |
+| Interaction and provider approval commands | M | VM interaction forwarding and mutation callbacks in provider/approval composition, separate from user-facing consent presentation |
+| Provider event/tool-hook and terminal follow-up routing | L | Remaining weak service/coordinator hooks, Claude tool-hook installation, self-compaction/provider-switch-generation/worktree-relocation terminal callbacks; terminal transcript materialization is already runtime-owned |
+| Persistence and payload forwarding retirement | M–L | VM save/token/flush forwarding plus provider-input/resume-handoff, draft/usage/timing/transcript aliases and mutable session-proxy access; remove obsolete call paths, not just wrap them |
+
+Done means: (1) query/command/event boundaries carry exact session/workspace/incarnation and the
+appropriate writer/command capability and durable acknowledgement; absent, unique and conflicting
+writers remain distinct, with causal race and persistence coverage; (2) MCP, admin, scope and link
+mutation entries consume that writer rather than selecting a window or invoking a VM command body,
+while authorization and the four disjoint link owners remain unchanged; (3) caller/body searches
+show each M9.2-assigned adapter retired as its replacement activates, with only explicitly documented
+resource or presentation composition left; and (4) focused regression receipts, both products,
+full lint attempt, fresh index and zero new touched-file warnings qualify the final boundary.
+
+Boundary notes: the current private prepared owner and its inspection/transaction holds remain
+**M9.3** adapters; their idle retirement is not a promise of presentation lifetime. Window-free
+saved-target loading/composition and prepared-window removal are not M9.2 work. Closing a presenter
+still cancels its run: close-preserves-run and handoff/drain belong to **M9.4**. Do not remove the
+mutable host-workspace resource fence until resource identity is safely pinned; writer identity
+alone does not authorize use of a different window's context or launch path.

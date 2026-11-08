@@ -2216,6 +2216,120 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         await h.host.claudeCoordinator.shutdownClaudeSession(session)
     }
 
+    func testProviderAdoptionCannotCrossWriterIncarnationsDuringEpochPreparation() async throws {
+        for change in ["reacquire", "replaceController", "retire"] {
+            let retires = change == "retire"
+            let replacement = change == "replaceController" ? MonitorFakeNativeController() : nil
+            let f = try await fixture(mcp: true)
+            let command = try XCTUnwrap(f.harness.host.runtimeCommand(sessionID: XCTUnwrap(f.session.activeAgentSessionID)))
+            let writer = command.writer
+            let binding = f.session.currentRestorationBindingToken
+            let gate = Gate()
+            f.harness.host.test_setAfterMCPStoreEpochBegan { await gate.wait() }
+            defer { gate.open()
+                f.harness.host.test_setAfterMCPStoreEpochBegan(nil)
+            }
+            try await feed(assistant("provider work held at epoch acknowledgement"), f.controller)
+            await until("provider epoch preparation is held") { gate.isWaiting }
+            let adoption = try XCTUnwrap(f.listener.adoptionTask)
+            XCTAssertTrue(f.session.mcpFollowUpRunPending)
+            if retires {
+                writer.scope.beginRetirement()
+            } else {
+                let sessions = writer.scope.sessions
+                writer.scope.replaceSessions([:])
+                writer.scope.replaceSessions(sessions)
+                let successor = try XCTUnwrap(f.harness.host.runtimeCommand(sessionID: writer.identity.sessionID))
+                XCTAssertNotEqual(successor.writer.identity, writer.identity)
+                // This now belongs to the successor, even with copied binding/context values.
+                f.session.mcpFollowUpRunPending = true
+                if let replacement { f.session.claudeController = replacement }
+            }
+            XCTAssertFalse(command.isCurrent)
+            XCTAssertEqual(f.session.currentRestorationBindingToken, binding)
+            gate.open()
+            await adoption.value
+            XCTAssertNil(f.session.activeRunOwnership)
+            XCTAssertNil(f.listener.subscription)
+            XCTAssertNil(f.session.agentTask)
+            XCTAssertEqual(
+                f.session.runState,
+                retires ? .failed : .completed,
+                "The still-current retiring writer may refuse; a successor must not receive its failure"
+            )
+            if retires { XCTAssertNil(f.session.claudeController) }
+            else if let replacement {
+                XCTAssertTrue(f.session.claudeController === replacement)
+                let shutdowns = await replacement.shutdownCount
+                XCTAssertEqual(shutdowns, 0, "Old adoption cleanup must never cancel the replacement controller")
+            } else { XCTAssertTrue(f.session.claudeController === f.controller) }
+            XCTAssertNil(f.listener.pendingProviderTurnID)
+            XCTAssertFalse(f.listener.isBusy)
+            XCTAssertFalse(f.harness.host.claudeCoordinator.hasPendingProviderWork(for: f.session))
+            if !retires {
+                let hasTurn = await f.controller.hasTurnInFlight
+                XCTAssertFalse(hasTurn, "The exact unadopted controller must not strand provider work")
+                XCTAssertFalse(f.session.items.contains { $0.kind == .error })
+            }
+            XCTAssertEqual(f.session.mcpFollowUpRunPending, !retires)
+            XCTAssertEqual(
+                f.session.mcpControlContext?.preparedEpoch != nil,
+                retires,
+                "Only the still-current retiring writer may acknowledge the accepted epoch"
+            )
+            let epoch = try await AgentRunSessionStore.currentEpoch(for: XCTUnwrap(f.session.mcpControlContext).registration)
+            XCTAssertNotNil(epoch, "Domain acceptance is not dispatch permission")
+            await cleanup(f)
+        }
+    }
+
+    func testProviderAdmissionRefusalRetiresPendingPermissionsInsteadOfStrandingThem() async throws {
+        for retires in [false, true] {
+            let f = try await fixture(mcp: true)
+            let command = try XCTUnwrap(f.harness.host.runtimeCommand(sessionID: XCTUnwrap(f.session.activeAgentSessionID)))
+            if retires { command.writer.scope.beginRetirement() }
+            else { f.session.recordRestorationTerminal(.loadFailed) }
+            XCTAssertTrue(command.writer.isCurrent)
+            XCTAssertFalse(command.isCurrent)
+            try await feed(["type": "control_request", "request_id": "inadmissible-provider", "request": ["subtype": "can_use_tool", "tool_name": "Bash", "input": ["command": "echo fixture"]]], f.controller)
+            await until("inadmissible provider permissions are retired") { f.session.claudeController == nil }
+            XCTAssertFalse(f.session.mcpFollowUpRunPending)
+            XCTAssertEqual(f.session.runState, .failed)
+            XCTAssertNil(f.session.activeRunOwnership)
+            XCTAssertNil(f.listener.pendingProviderTurnID)
+            XCTAssertFalse(f.listener.isBusy)
+            let epoch = try await AgentRunSessionStore.currentEpoch(for: XCTUnwrap(f.session.mcpControlContext).registration)
+            XCTAssertNil(epoch)
+            await cleanup(f)
+        }
+    }
+
+    func testProviderEpochKeepsControlContextAmbiguityVetoWithoutPresentation() async throws {
+        let f = try await fixture(mcp: true)
+        let command = try XCTUnwrap(f.harness.host.runtimeCommand(sessionID: XCTUnwrap(f.session.activeAgentSessionID)))
+        let writer = command.writer
+        let other = writer.scope.makeSession(tabID: UUID())
+        other.mcpControlContext = f.session.mcpControlContext
+        var sessions = writer.scope.sessions
+        sessions[other.tabID] = other
+        writer.scope.replaceSessions(sessions)
+        XCTAssertTrue(command.isCurrent, "An unbound control-context copy is not a competing persistent writer")
+        let refused = await writer.scope.mcp.prepareClaudeProviderEpoch(command: command, fence: .init(session: f.session))
+        XCTAssertFalse(refused)
+        XCTAssertFalse(f.session.mcpFollowUpRunPending, "A control-context veto must not advertise an admitted follow-up")
+        let registration = try XCTUnwrap(f.session.mcpControlContext).registration
+        let before = await AgentRunSessionStore.currentEpoch(for: registration)
+        XCTAssertNil(before)
+        sessions.removeValue(forKey: other.tabID)
+        writer.scope.replaceSessions(sessions)
+        let attachment = writer.scope.presentation.attach(f.session, sink: .init(activityChanged: { _, _ in }, refresh: { _, _, _ in }, turnComplete: { _ in }, turnFailed: { _, _ in }))
+        writer.scope.presentation.detach(attachment)
+        let prepared = await writer.scope.mcp.prepareClaudeProviderEpoch(command: command, fence: .init(session: f.session))
+        XCTAssertTrue(prepared, "Runtime epoch preparation does not require a presentation sink")
+        XCTAssertEqual(f.session.mcpControlContext?.preparedEpoch, f.session.mcpControlContext?.currentEpoch)
+        await cleanup(f)
+    }
+
     func testInternalCancellationDuringPendingAdoptionPreservesQueuedLocalWork() async throws {
         let f = try await fixture(mcp: true)
         let gate = Gate()

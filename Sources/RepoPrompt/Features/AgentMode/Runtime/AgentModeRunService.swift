@@ -5,6 +5,19 @@ import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 
+extension AgentSessionRuntimeStore.Scope {
+    /// Provider events enter through the canonical scope, never through a presenter callback.
+    func adoptClaudeProviderTurn(session: AgentTabSession, listener: ClaudeControllerEventListener, turnID: UUID, fence: AgentRunStartStopFence) async -> AgentModeRunService.ClaudeProviderTurnAdoption {
+        guard sessions[session.tabID] === session else { return .superseded }
+        guard let sessionID = session.activeAgentSessionID else { return .superseded }
+        let resolution = resolveWriter(sessionID: sessionID)
+        guard case let .unique(writer) = resolution,
+              writer.scope === self, writer.session === session else { return .superseded }
+        guard case let .success(command) = writer.admitCommand(), let execution else { return .refused(writer) }
+        return await execution.adoptClaudeProviderTurn(command: command, listener: listener, turnID: turnID, fence: fence)
+    }
+}
+
 @MainActor
 final class AgentModeRunService {
     struct Dependencies {
@@ -152,19 +165,42 @@ final class AgentModeRunService {
         )
     }
 
+    enum ClaudeProviderTurnAdoption {
+        case accepted
+        case refused(AgentSessionRuntimeStore.Writer)
+        /// A late result is not permission to run refusal cleanup against a successor.
+        case superseded
+    }
+
     func adoptClaudeProviderTurn(
-        session: AgentTabSession,
+        command: AgentSessionRuntimeStore.Command,
         listener: ClaudeControllerEventListener,
         turnID: UUID,
-        fence: AgentRunStartStopFence,
-        prepareEpoch: () async -> Bool
-    ) async -> Bool {
+        fence: AgentRunStartStopFence
+    ) async -> ClaudeProviderTurnAdoption {
+        let writer = command.writer
+        let session = writer.session
+        guard writer.scope.execution === self else { return .refused(writer) }
+        guard command.isCurrent else { return writer.isCurrent ? .refused(writer) : .superseded }
+        let activation = session.mcpControlActivationGeneration
+        defer {
+            if writer.isCurrent || writer.scope.sessions[session.tabID] !== session,
+               session.currentRestorationBindingToken == writer.identity.restoration,
+               session.mcpControlActivationGeneration == activation, fence.permitsStart(of: session),
+               listener.subscription == nil || session.activeRunOwnership != nil
+            {
+                session.mcpFollowUpRunPending = false
+                writer.scope.mcp.handleObservedMCPStateChange(for: session)
+            }
+        }
         await listener.awaitTerminalPublication()
+        guard command.isCurrent else { return writer.isCurrent ? .refused(writer) : .superseded }
         if let previous = session.lastTerminalCommitRevision {
             await terminalCommitBarrier.awaitTerminalPublication(for: previous.ownership, lifecycle: session.runLifecycle)
+            guard command.isCurrent else { return writer.isCurrent ? .refused(writer) : .superseded }
         }
         if session.mcpControlContext != nil, session.lastTerminalCommitRevision != nil {
-            guard case .accepted = session.runLifecycle.lastTerminalPublicationResult else { return false }
+            guard case .accepted = session.runLifecycle.lastTerminalPublicationResult else { return .refused(writer) }
         }
         guard !Task.isCancelled, listener.isCurrent(), fence.permitsStart(of: session),
               listener.pendingProviderTurnID == turnID, listener.subscription == nil,
@@ -172,13 +208,15 @@ final class AgentModeRunService {
               !session.runLifecycle.terminalCommitInProgress,
               !session.runState.isActive, session.agentTask == nil,
               session.pendingInstructions.isEmpty, session.operationAdmissionFailureMessage == nil
-        else { return listener.subscription != nil }
-        guard await prepareEpoch(), !Task.isCancelled, listener.isCurrent(), fence.permitsStart(of: session),
+        else { return listener.subscription != nil ? .accepted : .refused(writer) }
+        let prepared = await writer.scope.mcp.prepareClaudeProviderEpoch(command: command, fence: fence)
+        guard command.isCurrent else { return writer.isCurrent ? .refused(writer) : .superseded }
+        guard prepared, !Task.isCancelled, listener.isCurrent(), fence.permitsStart(of: session),
               listener.pendingProviderTurnID == turnID, listener.subscription == nil, listener.runtimeFailure == nil,
               !session.runState.isActive, session.agentTask == nil, session.pendingInstructions.isEmpty,
               session.operationAdmissionFailureMessage == nil
-        else { return listener.subscription != nil }
-        return claudeRunner.adoptProviderTurn(session: session, listener: listener, turnID: turnID)
+        else { return listener.subscription != nil ? .accepted : .refused(writer) }
+        return claudeRunner.adoptProviderTurn(session: session, listener: listener, turnID: turnID) ? .accepted : .refused(writer)
     }
 
     func oracleToolSettlementCallbacks(

@@ -2777,22 +2777,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 self?.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
             }
         )
-        capabilities.adoptProviderTurn = { [weak self] session, listener, turnID, fence in
-            guard let self else { return false }
-            let activation = session.mcpControlActivationGeneration
-            defer {
-                if sessions[session.tabID] === session, session.mcpControlActivationGeneration == activation,
-                   fence.permitsStart(of: session),
-                   listener.subscription == nil || session.activeRunOwnership != nil
-                {
-                    session.mcpFollowUpRunPending = false
-                    handleObservedMCPStateChange(for: session)
-                }
-            }
-            return await runService.adoptClaudeProviderTurn(session: session, listener: listener, turnID: turnID, fence: fence) {
-                await self.prepareClaudeProviderEpoch(session: session, fence: fence)
-            }
-        }
+        capabilities.sessionRuntime = runtimeSessionStore
         capabilities.cleanupProviderRun = { [weak self] session, runID in
             guard let self else { return }
             await cleanupMCPRunRoutingIfPresent(boundSessionID: boundSessionID(for: session.tabID), liveSession: session, explicitRunID: runID, reason: "claudeNative.providerInitiated")
@@ -2813,39 +2798,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         }
         return false
-    }
-
-    private func prepareClaudeProviderEpoch(session: TabSession, fence: AgentRunStartStopFence) async -> Bool {
-        guard sessions[session.tabID] === session, fence.permitsStart(of: session), !Task.isCancelled else { return false }
-        session.mcpFollowUpRunPending = true
-        handleObservedMCPStateChange(for: session)
-        guard let original = session.mcpControlContext else { return true }
-        let activation = session.mcpControlActivationGeneration
-        if original.preparedEpoch == nil {
-            do {
-                try await withMCPRunEpochTransition(sessionID: original.sessionID, kind: .relatedFollowUp) {
-                    guard await self.mcpRuntime.prepareWaitTrackingForRunStart(session: session, stopFence: fence) else { throw CancellationError() }
-                }
-            } catch { return false }
-        }
-        guard !Task.isCancelled, fence.permitsStart(of: session), sessions[session.tabID] === session,
-              session.mcpControlActivationGeneration == activation,
-              let context = session.mcpControlContext,
-              context.activationID == original.activationID,
-              let prepared = context.preparedEpoch, context.currentEpoch == prepared,
-              mcpControlledSession(sessionID: context.sessionID) === session
-        else { return false }
-        let storeEpoch = await AgentRunSessionStore.currentEpoch(for: context.registration)
-        let snapshot = await AgentRunSessionStore.snapshot(for: context.registration)
-        guard !Task.isCancelled, fence.permitsStart(of: session), sessions[session.tabID] === session,
-              session.mcpControlActivationGeneration == activation,
-              session.mcpControlContext?.registration == context.registration,
-              session.mcpControlContext?.preparedEpoch == prepared,
-              storeEpoch == prepared, snapshot?.status.isTerminal != true,
-              prepared.activationID == context.activationID,
-              prepared.registrationGeneration == context.registration.generation
-        else { return false }
-        return true
     }
 
     init(

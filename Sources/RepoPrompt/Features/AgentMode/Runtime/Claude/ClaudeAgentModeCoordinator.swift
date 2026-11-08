@@ -86,7 +86,7 @@ final class ClaudeAgentModeCoordinator {
         let requestUIRefresh: @MainActor (_ session: AgentTabSession, _ urgent: Bool) -> Void
         let scheduleSave: @MainActor (_ session: AgentTabSession) -> Void
         var cleanupProviderRun: @MainActor (AgentTabSession, UUID) async -> Void = { _, _ in }
-        var adoptProviderTurn: @MainActor (AgentTabSession, ClaudeControllerEventListener, UUID, AgentRunStartStopFence) async -> Bool = { _, _, _, _ in false }
+        weak var sessionRuntime: AgentSessionRuntimeStore.Scope?
         let stageClaudeResumeRecoveryHandoff: @MainActor (_ session: AgentTabSession) async -> Bool
         let prependPendingHandoff: @MainActor (_ text: String, _ session: AgentTabSession) -> String
         /// `routeWait` is non-nil only for a controller this send launched; see
@@ -491,13 +491,34 @@ final class ClaudeAgentModeCoordinator {
                 session.mcpFollowUpRunPending = true
                 hostCapabilities.requestUIRefresh(session, false)
             }
+            let installation = listener.installationWitness
+            let controller = session.claudeController
             listener.adoptionTask = Task { [weak self, weak session, weak listener] in
                 guard let self, let session, let listener else { return }
-                let accepted = await hostCapabilities.adoptProviderTurn(session, listener, id, fence)
-                guard listener.isCurrent(), controllerListeners[session.tabID] === listener else { return }
+                let adoption = await hostCapabilities.sessionRuntime?.adoptClaudeProviderTurn(session: session, listener: listener, turnID: id, fence: fence) ?? .superseded
+                guard listener.hasInstallation(installation) else { return }
                 listener.adoptionTask = nil
-                if !accepted, listener.pendingProviderTurnID == id {
-                    await refuseProviderTurn(session, listener: listener)
+                let superseded: Bool = switch adoption {
+                case .superseded: true
+                case let .refused(writer): !writer.isCurrent
+                case .accepted: false
+                }
+                if superseded {
+                    // Retire only the captured, unadopted transport. No session failure,
+                    // payload save, follow-up flag or replacement controller is touched.
+                    guard listener.subscription == nil, listener.pendingProviderTurnID == id,
+                          session.activeRunOwnership == nil || session.claudeController.map(ObjectIdentifier.init) != controller.map(ObjectIdentifier.init)
+                    else { return }
+                    if controllerListeners[session.tabID] === listener { controllerListeners.removeValue(forKey: session.tabID) }
+                    listener.onBusyChanged = nil
+                    listener.isCurrent = { false }
+                    listener.retire()
+                    await controller?.shutdown()
+                    return
+                }
+                guard listener.isCurrent(), controllerListeners[session.tabID] === listener else { return }
+                if case let .refused(writer) = adoption, listener.pendingProviderTurnID == id {
+                    refuseProviderTurn(session, listener: listener, writer: writer)
                 }
             }
         }
@@ -578,9 +599,11 @@ final class ClaudeAgentModeCoordinator {
         hostCapabilities.requestUIRefresh(session, true)
     }
 
-    private func refuseProviderTurn(_ session: AgentTabSession, listener: ClaudeControllerEventListener) async {
-        guard listener.isCurrent(), controllerListeners[session.tabID] === listener else { return }
+    private func refuseProviderTurn(_ session: AgentTabSession, listener: ClaudeControllerEventListener, writer: AgentSessionRuntimeStore.Writer) {
+        guard writer.session === session, writer.isCurrent,
+              listener.isCurrent(), controllerListeners[session.tabID] === listener else { return }
         // Retiring this exact controller cancels every pending permission without authorizing tools.
+        session.mcpFollowUpRunPending = false
         retireIdleController(session, listener: listener, error: "RepoPrompt stopped Claude work because it could not attach it to this session.")
     }
 

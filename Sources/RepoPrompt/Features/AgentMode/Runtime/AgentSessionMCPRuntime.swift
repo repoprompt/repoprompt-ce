@@ -144,6 +144,52 @@ final class AgentSessionMCPRuntime {
             && session.mcpControlContext?.preparedEpoch != nil
     }
 
+    /// Provider-initiated turns use the same exact writer and domain epoch as host starts.
+    /// A successful domain acknowledgement does not authorize a superseded adoption.
+    func prepareClaudeProviderEpoch(command: AgentSessionRuntimeStore.Command, fence: AgentRunStartStopFence) async -> Bool {
+        let writer = command.writer
+        let session = writer.session
+        guard writer.scope === scope, command.isCurrent, fence.permitsStart(of: session), !Task.isCancelled else { return false }
+        guard let original = session.mcpControlContext else {
+            session.mcpFollowUpRunPending = true
+            handleObservedMCPStateChange(for: session)
+            return command.isCurrent
+        }
+        let activation = session.mcpControlActivationGeneration
+        /// Persistent ownership and control-context routing are separate checks. An unbound
+        /// object with a copied control context must still veto an otherwise unique writer.
+        func isCurrentControl() -> Bool {
+            command.isCurrent && !Task.isCancelled && fence.permitsStart(of: session)
+                && session.mcpControlActivationGeneration == activation
+                && session.mcpControlContext?.activationID == original.activationID
+                && writer.scope.sessions.values.count(where: { $0.mcpControlContext?.sessionID == original.sessionID }) == 1
+        }
+        guard isCurrentControl(), original.sessionID == writer.identity.sessionID,
+              original.registration.sessionID == writer.identity.sessionID else { return false }
+        session.mcpFollowUpRunPending = true
+        handleObservedMCPStateChange(for: session)
+        guard isCurrentControl() else { return false }
+        if original.preparedEpoch == nil {
+            do {
+                try await withEpochTransition(command: command, kind: .relatedFollowUp) {
+                    guard await self.prepareWaitTrackingForRunStart(session: session, stopFence: fence) else { throw CancellationError() }
+                }
+            } catch { return false }
+        }
+        guard isCurrentControl(), let context = session.mcpControlContext,
+              let prepared = context.preparedEpoch, context.currentEpoch == prepared else { return false }
+        let storeEpoch = await AgentRunSessionStore.currentEpoch(for: context.registration)
+        guard isCurrentControl() else { return false }
+        let snapshot = await AgentRunSessionStore.snapshot(for: context.registration)
+        guard isCurrentControl(), session.mcpControlContext?.registration == context.registration,
+              session.mcpControlContext?.preparedEpoch == prepared,
+              session.mcpControlContext?.currentEpoch == prepared,
+              storeEpoch == prepared, snapshot?.status.isTerminal != true,
+              prepared.activationID == context.activationID,
+              prepared.registrationGeneration == context.registration.generation else { return false }
+        return true
+    }
+
     /// The domain registration owns this capability before control is published. It retains
     /// the exact runtime scope, not its optional presenter, until domain cleanup/drain releases it.
     /// A cancellation delivered during setup prevents publication; one delivered afterwards
