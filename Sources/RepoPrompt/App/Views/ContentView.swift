@@ -37,6 +37,10 @@ struct ContentView: View {
             ContentViewToolbarContent(
                 windowState: viewModel.state,
                 recommendationWizardViewModel: recommendationWizardViewModel,
+                onCreateWorkspace: {
+                    viewModel.workspaceManager.creationDraft = WorkspaceManagerViewModel.WorkspaceCreationDraft()
+                    showWorkspaceSetup = true
+                },
                 showRecommendationsPopover: $showRecommendationsPopover,
                 showMCPServerPopover: $showMCPServerPopover
             )
