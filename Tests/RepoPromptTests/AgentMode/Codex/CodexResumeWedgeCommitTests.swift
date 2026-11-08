@@ -85,6 +85,39 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         )
     }
 
+    func testContextWindowSnapshotSurvivesReconnectAndResetsWithConversation() async throws {
+        let suite = "codex-window-reconnect-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        CodexContextWindowPreferences.setSelection(.tokens500K, defaults: defaults)
+        let fixture = makeFixture([], shouldManageCodexTooling: false)
+        let factory = WedgeControllerFactory(plans: [[.timeout], [.success(Self.oldThreadID)], [.success("new-thread")]])
+        var received: [CodexContextWindowPreferences.Selection] = []
+        let coordinator = CodexAgentModeCoordinator(
+            windowID: 1,
+            runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
+            codexControllerFactory: { runID, _, _, _, _, _, enabled, _, selection in
+                received.append(selection)
+                return factory.make(runID: runID, computerUseEnabled: enabled)
+            },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            routeOwnerValidator: { _, _, _, _ in true },
+            shouldManageCodexTooling: false,
+            codexHookApprovalSettings: GlobalSettingsStore.shared,
+            preferenceDefaults: defaults
+        )
+        coordinator.attach(viewModel: fixture.viewModel)
+        await coordinator.ensureCodexNativeSession(session: fixture.session)
+        XCTAssertEqual(received, [.tokens500K])
+        CodexContextWindowPreferences.setSelection(.tokens1M, defaults: defaults)
+        await coordinator.ensureCodexNativeSession(session: fixture.session)
+        XCTAssertEqual(received, [.tokens500K, .tokens500K])
+        coordinator.clearCodexSessionState(fixture.session)
+        await coordinator.ensureCodexNativeSession(session: fixture.session)
+        XCTAssertEqual(received, [.tokens500K, .tokens500K, .tokens1M])
+        await coordinator.shutdownCodexSession(fixture.session)
+    }
+
     func testStreamEndCancelsOnlyCurrentControllersTransportFallback() async throws {
         for retired in [true, false] {
             let fixture = makeFixture([[.success("listener-thread")]], shouldManageCodexTooling: false)

@@ -7077,7 +7077,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             desiredFeatureState = refreshedFeatureState
 
             if session.codexController == nil {
-                let contextWindowSelection = session.codexContextWindowForBinding(current: CodexContextWindowPreferences.selection())
+                let contextWindowSelection = session.codexContextWindowForBinding(current: CodexContextWindowPreferences.selection(defaults: preferenceDefaults))
                 let controller = codexControllerFactory(
                     runID,
                     session.tabID,
