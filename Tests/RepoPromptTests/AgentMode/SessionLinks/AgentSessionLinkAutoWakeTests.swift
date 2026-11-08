@@ -54,10 +54,14 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
 
     /// Exact value-only placement for these runtime tests. Required execution commands explicitly
     /// refuse provider starts; none delegates through a window, workspace VM or agent VM.
-    private func fixture(isAvailable: @escaping @MainActor () -> Bool = { true }) throws -> Fixture {
+    private func fixture(
+        isAvailable: @escaping @MainActor () -> Bool = { true },
+        workspace: WorkspaceModel? = nil,
+        start: (@MainActor (AgentTabSession, String, AgentRunStartOutcomeRecorder?) async -> Void)? = nil
+    ) throws -> Fixture {
         let scope = AgentSessionRuntimeStore().makeScope()
         let session = AgentTabSession(tabID: UUID())
-        let workspaceID = UUID(), sessionID = UUID()
+        let workspaceID = workspace?.id ?? UUID(), sessionID = UUID()
         session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: workspaceID))
         session.recordRestorationAuthoritative(.persistedPayloadApplied)
         session.hasLoadedPersistedState = true
@@ -79,10 +83,13 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                       session.bindingTransitionGeneration == endpoint.bindingTransitionGeneration else { return nil }
                 return endpoint
             },
-            prepareSwitch: { _, _, _, _, _, _ in .failure(.targetStopped) },
-            acquireSwitch: { session, _ in session.pendingHandoff.providerSwitchDelivery == nil },
-            acceptSwitch: { session, _ in XCTAssertNil(session.pendingHandoff.providerSwitchDelivery) },
-            start: { _, _, _, _ in XCTFail("This fixture must never launch a provider")
+            workspaceID: { _ in workspaceID },
+            augment: { _, input, _, _, _ in input },
+            initialMessage: { _, input in input },
+            modelDisplayName: { $0.selectedModelRaw },
+            start: { session, text, _, outcome, _ in
+                if let start { await start(session, text, outcome) }
+                else { XCTFail("This fixture must never launch a provider") }
                 return nil
             },
             resume: { _, _, _, _, _, _ in XCTFail("No waiting continuation is installed")
@@ -90,10 +97,215 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             },
             settleSelfCompact: { session in XCTAssertNil(session.selfCompactState.active) },
             selfCompactBlocksWake: { $0.selfCompactState.blocksAutomaticWake },
-            composerTarget: { _, _ in nil }, claimComposer: { _ in nil },
-            composerIsCurrent: { _ in false }, releaseComposer: { _ in false }
+            composerTarget: { [weak session] _, _ in
+                guard workspace != nil, let session else { return nil }
+                return AgentComposerSubmitTarget(
+                    tabID: session.tabID, route: .existingAgentSession,
+                    expectedSourceTabSessionIdentity: ObjectIdentifier(session),
+                    expectedSourceAgentSessionID: sessionID, expectedPersistentBindingIdentity: binding,
+                    expectedBindingTransitionGeneration: session.bindingTransitionGeneration,
+                    expectedRunState: session.runState, expectedRunID: session.runID,
+                    expectedRunAttemptID: session.activeRunAttemptID,
+                    expectedSubmissionToken: session.composerSubmissionToken, expectedInitialStartLocation: nil
+                )
+            },
+            claimComposer: { [weak session] attempt in
+                guard let session, session.activeComposerSubmitAttempt == nil else { return nil }
+                session.activeComposerSubmitAttempt = attempt
+                return AgentSessionComposerSubmitClaim(attempt: attempt, sourceSession: session, draftMutationGeneration: session.draftMutationGeneration)
+            },
+            composerIsCurrent: { [weak scope] claim in
+                scope?.sessions[claim.sourceSession.tabID] === claim.sourceSession
+                    && claim.sourceSession.persistentSessionBindingIdentity == claim.attempt.target.expectedPersistentBindingIdentity
+                    && claim.sourceSession.activeComposerSubmitAttempt?.id == claim.attempt.id
+            },
+            releaseComposer: { claim in
+                guard claim.sourceSession.activeComposerSubmitAttempt?.id == claim.attempt.id else { return false }
+                claim.sourceSession.activeComposerSubmitAttempt = nil
+                return true
+            }
         ), diagnostics: NoopAgentSessionLinkCatalogEventSink())
+        if let workspace {
+            scope.persistence.composition = .init(
+                workspace: { workspace }, workspaceWithID: { $0 == workspace.id ? workspace : nil },
+                displayName: { _ in "Runtime send" }, isSuppressed: { false }, bypassesSuppression: { false },
+                isPreparedSavedHost: { true }, saveAdmission: { _ in nil },
+                creationIsCurrent: { $0.session.creationHandleIsCurrent($0) },
+                admitBinding: { $0.activeAgentSessionID.map { .init(sessionID: $0, creation: nil) } }
+            )
+        }
         return Fixture(scope: scope, session: session, runtime: runtime, endpoint: endpoint)
+    }
+
+    private func candidate(_ f: Fixture) -> AgentSessionLinkEndpointCandidate {
+        .init(
+            windowID: f.endpoint.windowID,
+            workspaceID: f.endpoint.workspaceID,
+            tabID: f.endpoint.tabID,
+            sessionID: f.endpoint.sessionID,
+            persistentBindingGeneration: f.endpoint.persistentBindingGeneration,
+            bindingTransitionGeneration: f.endpoint.bindingTransitionGeneration,
+            isTopLevel: true,
+            hasLoadedPersistedState: true,
+            bindingTransitionInProgress: false,
+            isClosing: false,
+            isMCPControlled: false,
+            isMCPOriginated: false,
+            roleAllowsOutboundMonitoring: true,
+            displayName: "Runtime send",
+            providerDisplayName: nil,
+            locationLabel: nil,
+            restorationReadiness: f.session.qualifiedRestorationReadiness
+        )
+    }
+
+    private func request(_ f: Fixture) -> AgentSessionLinkSendRequest {
+        .init(
+            linkID: UUID(),
+            linkGeneration: 1,
+            observerEndpoint: f.endpoint,
+            observerDisplayName: "Sender",
+            message: "An attributed durable instruction",
+            workflow: nil
+        )
+    }
+
+    func testWindowFreeSendPersistsBeforeStartAndRetainsDeliveryWhenStopWinsAfterWrite() async throws {
+        for stopAfterWrite in [false, true] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("M9Send-\(UUID())")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let workspace = WorkspaceModel(name: "Runtime send", repoPaths: [], customStoragePath: root)
+            var starts = 0
+            let f = try fixture(workspace: workspace, start: { session, text, outcome in
+                let saved = try? await AgentSessionDataService.shared.loadAgentSession(id: XCTUnwrap(session.activeAgentSessionID), for: workspace)
+                XCTAssertEqual(saved?.effectiveItemCount, 1, "A real durable row must precede provider dispatch")
+                XCTAssertTrue(text.contains("An attributed durable instruction"))
+                starts += 1
+                outcome?.recordAccepted()
+            })
+            let session = f.session
+            f.scope.persistence.saver = { payload, workspace, count in
+                let url = try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count)
+                if stopAfterWrite { session.stopState.invalidateScheduledStarts() }
+                return url
+            }
+            let result = await f.runtime.agentSessionLinkPerformSend(to: candidate(f), request: request(f), liveness: {
+                .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false)
+            }, commitAuthorization: { .committed })
+            guard case let .delivered(delivery) = result else { return XCTFail("Durable acceptance must survive a later dispatch refusal: \(result)") }
+            XCTAssertEqual(delivery.deliveryState, stopAfterWrite ? .persisted : .runStarted)
+            XCTAssertEqual(starts, stopAfterWrite ? 0 : 1)
+            XCTAssertEqual(f.session.items.count, 1)
+            XCTAssertEqual(f.session.items.first?.dispatchedProviderText == nil, stopAfterWrite)
+            XCTAssertNil(f.session.activeComposerSubmitAttempt)
+            XCTAssertNil(f.scope.persistence.presentation)
+            f.session.saveDebounceTask?.cancel()
+            try await f.scope.persistence.flushSaveRequired(for: f.session.tabID, workspaceID: workspace.id).get()
+        }
+    }
+
+    func testWindowFreePartialSendWriteRequiresDurableCompensationAndRestoresAnchors() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("M9SendRollback-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let workspace = WorkspaceModel(name: "Runtime rollback", repoPaths: [], customStoragePath: root)
+        let f = try fixture(workspace: workspace)
+        var writes = 0
+        f.scope.persistence.saver = { payload, workspace, count in
+            writes += 1
+            let url = try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count)
+            if writes == 1 { throw NSError(domain: "M9AfterDisk", code: 1) }
+            return url
+        }
+        let result = await f.runtime.agentSessionLinkPerformSend(to: candidate(f), request: request(f), liveness: {
+            .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false)
+        }, commitAuthorization: { .committed })
+        guard case .blocked(.persistenceFailed) = result else { return XCTFail("A confirmed compensating write, not the first error, proves refusal: \(result)") }
+        XCTAssertEqual(writes, 2)
+        XCTAssertTrue(f.session.items.isEmpty)
+        XCTAssertTrue(f.session.pendingTurnRuntimeAnchors.isEmpty)
+        XCTAssertNil(f.session.activeComposerSubmitAttempt)
+        let saved = try await AgentSessionDataService.shared.loadAgentSession(id: f.endpoint.sessionID, for: workspace)
+        XCTAssertEqual(saved?.effectiveItemCount, 0)
+        f.session.saveDebounceTask?.cancel()
+    }
+
+    func testRetiredRuntimeKeepsAlreadyDurableRetryDeliveredAndReleasesClaim() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("M9RetiredSend-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let workspace = WorkspaceModel(name: "Retired send", repoPaths: [], customStoragePath: root)
+        let f = try fixture(workspace: workspace)
+        let item = AgentChatItem.user("Already accepted", sequenceIndex: 0)
+        f.session.appendItem(item)
+        try await f.scope.persistence.flushSaveRequired(for: f.session.tabID, workspaceID: workspace.id).get()
+        let target = try XCTUnwrap(f.runtime.makeComposerSubmitTarget(tabID: f.session.tabID, session: f.session))
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "")
+        let claim = try XCTUnwrap(f.runtime.commands.claimComposer(attempt))
+        f.scope.beginRetirement()
+        XCTAssertFalse(f.scope.releaseWriterClaimsAfterDrain(), "An admitted send claim is still owned work")
+        XCTAssertTrue(f.runtime.releaseComposerSubmitClaim(claim))
+        XCTAssertTrue(f.scope.releaseWriterClaimsAfterDrain())
+        let result = await f.runtime.startPersistedNoncomposerTurn(
+            session: f.session, tabID: f.session.tabID, claim: claim, savedItemID: item.id,
+            acceptedAt: item.timestamp, providerMessage: "Already accepted", stopFence: .init(session: f.session),
+            dispatchIsCurrent: { true }
+        )
+        guard case let .delivered(receipt) = result else { return XCTFail("An accepted row cannot become undelivered after owner retirement") }
+        XCTAssertEqual(receipt.deliveryState, .persisted)
+        XCTAssertEqual(receipt.targetItemID, item.id)
+        XCTAssertNil(f.session.activeComposerSubmitAttempt)
+        let saved = try await AgentSessionDataService.shared.loadAgentSession(id: f.endpoint.sessionID, for: workspace)
+        XCTAssertEqual(saved?.effectiveItemCount, 1)
+    }
+
+    func testWindowFreeTurnTimingRollbackRestoresPriorFooterAnchorAndElapsedTimer() throws {
+        let f = try fixture()
+        let original = AgentChatItem.user("Original", sequenceIndex: 0)
+        let response = AgentChatItem(kind: .assistant, text: "Original reply", sequenceIndex: 1)
+        let baseline = Date(timeIntervalSince1970: 1)
+        f.session.setItemsSilently([original, response], reason: .persistedSessionHydration)
+        f.session.runState = .running
+        f.session.activeAgentRunStartedAt = baseline
+        let anchor = AgentTabSession.AgentTurnRuntimeAnchor(userItemID: original.id, userSequenceIndex: 0, startedAt: baseline)
+        f.session.pendingTurnRuntimeAnchors = [anchor]
+        let optimistic = AgentChatItem.user("Not dispatched", sequenceIndex: 2)
+        let rollback = f.scope.turnTiming.recordAgentTurnUserAnchor(for: f.session, userItem: optimistic)
+        f.session.appendItem(optimistic)
+        XCTAssertNotNil(f.session.agentMessageRuntimeFootersByItemID[response.id])
+        XCTAssertEqual(f.session.activeAgentRunStartedAt, optimistic.timestamp)
+        _ = f.session.removeItem(at: 2)
+        f.scope.turnTiming.rollbackAgentTurnUserAnchor(rollback, session: f.session)
+        XCTAssertNil(f.session.agentMessageRuntimeFootersByItemID[response.id])
+        XCTAssertEqual(f.session.pendingTurnRuntimeAnchors.map(\.userItemID), [original.id])
+        XCTAssertEqual(f.session.activeAgentRunStartedAt, baseline)
+    }
+
+    func testWindowFreeSendAuthorizationRefusalOrRebindHasNoDurableEffects() async throws {
+        for rebind in [false, true] {
+            let workspace = WorkspaceModel(name: "Admission only", repoPaths: [])
+            let f = try fixture(workspace: workspace)
+            var writes = 0
+            f.scope.persistence.saver = { _, _, _ in writes += 1
+                throw CancellationError()
+            }
+            var commits = 0
+            let result = await f.runtime.agentSessionLinkPerformSend(to: candidate(f), request: request(f), liveness: {
+                .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false)
+            }, commitAuthorization: {
+                commits += 1
+                if rebind {
+                    f.session.installPersistentSessionBinding(.init(tabID: f.session.tabID, sessionID: f.endpoint.sessionID, workspaceID: workspace.id))
+                    return .committed
+                }
+                return .managementRevoked
+            })
+            guard case let .blocked(reason) = result else { return XCTFail("Rebind/revocation must refuse before a row: \(result)") }
+            XCTAssertEqual(commits, 1)
+            XCTAssertEqual(reason, rebind ? .endpointPostSession : .managementRevoked)
+            XCTAssertEqual(writes, 0)
+            XCTAssertTrue(f.session.items.isEmpty)
+            XCTAssertTrue(f.session.pendingTurnRuntimeAnchors.isEmpty)
+            XCTAssertNil(f.session.activeComposerSubmitAttempt)
+        }
     }
 
     func testWindowFreeInventoryHoldsAndClaimsRetainOneOwnerWithoutPresentation() throws {

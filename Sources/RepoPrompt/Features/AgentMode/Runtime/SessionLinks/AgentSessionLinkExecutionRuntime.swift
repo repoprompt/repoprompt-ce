@@ -26,10 +26,11 @@ final class AgentSessionLinkExecutionRuntime {
         /// A nonvisual host supplies its own lifetime independently of presentation.
         let isAvailable: @MainActor () -> Bool
         let endpoint: @MainActor (UUID) -> DomainAgentSessionLinkEndpointIdentity?
-        let prepareSwitch: @MainActor (AgentTabSession, String, Bool, String?, UUID?, @escaping @MainActor () -> Bool) async -> Result<AgentProviderSwitchSendPreparation?, AgentSessionLinkSendFailure>
-        let acquireSwitch: @MainActor (AgentTabSession, AgentSessionLinkPromptDispatchID) -> Bool
-        let acceptSwitch: @MainActor (AgentTabSession, AgentSessionLinkDispatchContext?) -> Void
-        let start: @MainActor (AgentTabSession, String, AgentDirectRunStartOptions, AgentProviderSwitchSendPreparation?) async -> CodexAgentModeCoordinator.NativeSendOutcome?
+        let workspaceID: @MainActor (AgentTabSession) -> UUID?
+        let augment: @MainActor (AgentTabSession, String, [AgentFileAttachment], [AgentTaggedFileAttachment], Bool) async -> String
+        let initialMessage: @MainActor (AgentTabSession, String) async -> String
+        let modelDisplayName: @MainActor (AgentTabSession) -> String
+        let start: @MainActor (AgentTabSession, String, AgentDirectRunStartOptions, AgentRunStartOutcomeRecorder?, AgentProviderSwitchSendPreparation?) async -> CodexAgentModeCoordinator.NativeSendOutcome?
         let resume: @MainActor (AgentTabSession, String, AgentSessionLinkOutboundPromptClaim?, UserInstructionResponse.Origin, AgentSessionLinkProviderInputRelease.Proof?, String?) -> Bool
         let settleSelfCompact: @MainActor (AgentTabSession) -> Void
         let selfCompactBlocksWake: @MainActor (AgentTabSession) -> Bool
@@ -39,7 +40,13 @@ final class AgentSessionLinkExecutionRuntime {
         let releaseComposer: @MainActor (AgentComposerSubmitClaim) -> Bool
     }
 
-    private weak var scope: AgentSessionRuntimeStore.Scope?
+    private(set) weak var scope: AgentSessionRuntimeStore.Scope?
+    struct PendingSendEffect {
+        let sessionIdentity: ObjectIdentifier
+        let task: Task<Void, Never>
+    }
+
+    var pendingSendEffects: [UUID: PendingSendEffect] = [:]
     let commands: Commands
     let catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink
     var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
@@ -113,27 +120,9 @@ final class AgentSessionLinkExecutionRuntime {
         session.clearAgentSessionLinkWaitingOnAfterAcceptedTurn()
     }
 
-    func providerSwitchAcquirePhysicalDispatch(session: AgentTabSession, dispatchID: AgentSessionLinkPromptDispatchID) -> Bool {
-        commands.acquireSwitch(session, dispatchID)
-    }
-
-    func providerSwitchRecordPhysicalAcceptance(session: AgentTabSession, context: AgentSessionLinkDispatchContext?) {
-        commands.acceptSwitch(session, context)
-    }
-
-    func providerSwitchSendAdmission(
-        session: AgentTabSession, input: String, skipsAugmentation: Bool,
-        inputAlreadyIncludesSupplement: Bool = false,
-        supplementalInput: String? = nil, autoWakeID: UUID? = nil,
-        isCurrent: @escaping @MainActor () -> Bool
-    ) async -> Result<AgentProviderSwitchSendPreparation?, AgentSessionLinkSendFailure> {
-        precondition(skipsAugmentation)
-        return await commands.prepareSwitch(session, input, inputAlreadyIncludesSupplement, supplementalInput, autoWakeID, isCurrent)
-    }
-
-    func startAgentRun(tabID: UUID, initialMessage: String, directStartOptions: AgentDirectRunStartOptions, providerSwitchPreparation: AgentProviderSwitchSendPreparation?) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
+    func startAgentRun(tabID: UUID, initialMessage: String, directStartOptions: AgentDirectRunStartOptions, startOutcome: AgentRunStartOutcomeRecorder? = nil, providerSwitchPreparation: AgentProviderSwitchSendPreparation?) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         guard let session = sessions[tabID] else { return nil }
-        return await commands.start(session, initialMessage, directStartOptions, providerSwitchPreparation)
+        return await commands.start(session, initialMessage, directStartOptions, startOutcome, providerSwitchPreparation)
     }
 
     func resumeWaitingInstructionContinuation(session: AgentTabSession, providerText: String, claim: AgentSessionLinkOutboundPromptClaim?, origin: UserInstructionResponse.Origin, inputProof: AgentSessionLinkProviderInputRelease.Proof?, undecoratedProviderText: String?) -> Bool {

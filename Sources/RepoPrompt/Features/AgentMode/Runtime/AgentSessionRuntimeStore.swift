@@ -129,6 +129,7 @@ final class AgentSessionRuntimeStore {
         fileprivate let store: AgentSessionRuntimeStore
         let presentation = AgentSessionPresentationRuntime()
         let usage = AgentSessionUsageRuntime()
+        lazy var turnTiming = AgentSessionTurnTimingRuntime(presentation: presentation)
         private var interactionRuntime: AgentSessionInteractionRuntime?
 
         func interactions(routeID: Int, approvalStore: ApplyEditsApprovalStore) -> AgentSessionInteractionRuntime {
@@ -178,10 +179,12 @@ final class AgentSessionRuntimeStore {
         @discardableResult
         func releaseWriterClaimsAfterDrain() -> Bool {
             guard isRetiring, saveQueue.inFlightSessionIDs.isEmpty, !attachments.hasPendingRetention,
+                  linkExecution?.pendingSendEffects.isEmpty != false,
                   sessions.values.allSatisfy({ session in
-                      !session.runState.isActive && !session.terminalCommitInProgress && (!session.isDirty || session.activeAgentSessionID.map {
-                          AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: $0)
-                      } == true)
+                      !session.runState.isActive && session.activeComposerSubmitAttempt == nil
+                          && !session.terminalCommitInProgress && (!session.isDirty || session.activeAgentSessionID.map {
+                              AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: $0)
+                          } == true)
                   }) else { return false }
             replaceSessions([:])
             hasReleasedWriterClaims = true

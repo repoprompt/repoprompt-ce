@@ -4653,3 +4653,53 @@ Independent canonical writer admission, real saved execution host construction, 
 command composition, runtime-addressed routing and presentation-preserving handoff/drain still
 need their production cutover. No push, PR edit, merge, visible app lifecycle action or M10
 move occurred.
+
+### M9 continuation — runtime-owned send acceptance and turn timing (2026-11-08)
+
+Published the six accumulated commits through `e9e1834fd` after the normal push preflight.
+The requested isolated `SessionAdminInventoryReadTests` rerun, ticket
+`abbe8c1f-8f93-47d0-9475-b1c66a8ffe24`, passed **76 tests**, including the reported
+reduced-capability approval-card failure. Its fixture now persists the exact saved target
+before requesting approval; the one-card assertion and authorization guards remain intact.
+Hosted CI monitoring is delegated to the overseer; this receipt is local, not a CI-green claim.
+
+Moved provider-switch send preparation, physical acceptance, managed-send authorization and
+post-hop checks, durable row acceptance, compensating persistence and already-accepted start
+retry into the existing scope-owned link execution runtime. The existing composer claim,
+provider-switch record, persistence service and link authorization remain the authorities.
+The VM retains only compatibility wrappers and the still-required canonical placement,
+provider-input composition and start-command adapters. Shared turn anchor/footer/timer changes
+now belong to `AgentSessionTurnTimingRuntime`; elapsed-time publication is optional presentation.
+No invisible window or view model is needed by the concrete transaction or timing algorithms.
+
+Accepted provider-switch persistence effects retain their exact scope/session and are joined
+before terminal publication and legacy close. Retirement also refuses writer release while
+an existing composer claim or send effect remains. Review caught a durable-retry regression
+in the newly added scope guards: owner retirement after acceptance must return the existing
+persisted receipt, not report the row undelivered. Every refusal releases the original claim;
+new admissions are refused while retiring without invalidating originating final writes.
+
+Five additional standalone cases cover real-disk acceptance before dispatch, Stop after the
+write without a provider start, a thrown error after disk followed by confirmed compensation,
+authorization revocation and same-ID rebinding without writes, already-durable retry after
+retirement, and rollback of prior timer/footer anchors. These augment the four existing runtime
+cases; no timing budgets or production authority checks were weakened.
+
+Initial focused tickets `8f5014de-3146-44d0-9cec-b0ee96719de6` and
+`86b3f27f-235a-4127-9a44-f3ab7e6a60d8` passed **81** and **84** tests respectively.
+After review fixes, `244713d3-9639-45d9-b4c9-86446825086a` passed **86 tests**:
+provider switch 39, live send transaction 34, link execution runtime 9 and presentation 4.
+Integration ticket `ea3e330f-3014-41aa-9004-b38ddb3df8eb` passed **261 tests** (MCP
+steer/resume 27 and link runtime bridge 234). Its misspelled worktree filter matched no tests;
+the corrected separate `ab395398-8400-4a6a-b7b2-7eee680a0032` passed all **42** worktree
+binding-admission tests. Both products passed `344ecb3d-818e-4286-b486-6a7fb57f8667`.
+Lint `e6126003-810d-400c-9e9f-6c77cae714cf` found one trailing blank line in the thin VM
+adapter; scoped formatting removed it, and final `b61d1571-5732-4711-88a6-ebb8d9ee6cb4`
+passed. That formatting-only correction does not change the tested executable statements.
+One independent review and staged contribution preflight apply; no compiler-index baseline
+or diagnostic budget was raised.
+
+Independent writer admission, canonical saved-run host construction, remaining command
+composition, runtime-addressed routing and presentation-preserving handoff/drain remain open.
+This transaction cutover is not M9 completion. Final full-suite, aggregate-warning and live-smoke
+qualification remain open; no visible app lifecycle action or M10 target move occurred.
