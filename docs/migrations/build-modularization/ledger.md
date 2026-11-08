@@ -5360,3 +5360,44 @@ outside this narrow append repair; it must be considered before enabling the dor
   wrong-way file edges and **53/66** largest-cycle components.
 - No new compiler warnings in the three touched Swift files. The two emitted VM actor-isolation
   warnings are at unchanged lines 2839/3128, already matched to main in the prior audit.
+
+#### M9.1 post-merge CI follow-up: transcript fixture admission and cold Oracle awareness
+
+Investigated the overseer's two repeated hosted failures on merge head `58c0355f9`, without reading
+CI logs. Neither a relaxed assertion nor a larger timing budget is included.
+
+- **Transcript root cause:** the shared native-render fixture reused a fixed session UUID across
+  windows and ignored a refused binding installation. A preceding fixture could still own that
+  identity while retiring. The production writer fence correctly refused the duplicate, leaving
+  the new fixture unbound; its delayed save then allocated an identity and republished canonical
+  rows over the synthetic error snapshot. Restoring that snapshot for the tail/Bash update rendered
+  the error rows again. Local `ffda720a-203c-4eab-9879-4be5e303d6bc` reproduced the two assertions;
+  a temporary rollback to the `0310838a9` Swift tree also reproduced them under
+  `6a3ad72b-fda5-4407-9b9c-eaab4cd45c66`. Interval tracing and binding diagnostics in
+  `21cdd92c-6710-45cb-91f3-512731508ecb` confirmed `retiring=true`, `installed=nil`, `actual=nil`.
+  All temporary instrumentation was removed.
+- With explicit overseer approval, the shared fixture now allocates a unique session UUID and
+  asserts installation and the exact resulting identity. This repairs all sibling diagnostics
+  using that helper. Nearby restoration fixtures already allocate UUIDs per fixture; retention
+  fixtures use fresh UUIDs and unwrap installation. The production writer fence is unchanged.
+  `testRowBoundaryIsolatesSettledErrorsAndUnrelatedBashUpdates` additionally exercises a completed
+  debounced save and asserts unchanged binding and transcript snapshot: a properly bound session's
+  delayed save does not allocate a new identity or republish settled rows. The existing quiet gate,
+  render counts and budgets remain unchanged; the save assertion runs before that gate.
+- **Oracle root cause:** cold provider awareness used the process-wide discovery snapshot, scanning
+  every owner's entries and retained history to describe at most four live invocations. Awareness
+  now uses an exact-owner live-ID index, inserted at admission and removed only after cleanup joins.
+  Entries remain authoritative; discovery/history semantics and ordering are unchanged. Existing
+  tests gained running, cancelling, abort, settled, rebound, reopen and 300-owner equivalence checks.
+  The original isolated suite passed locally (`f8c104c5-57ad-4a26-b3ed-e11a52a0f161`), but its largest
+  300-owner cold sample was **413 µs**, versus **19 µs** after indexing
+  (`c95405bb-142a-4712-a8d4-2b551b57cbe4`). These are local measurements, not hosted timing claims.
+- Validation: `8ddce1a2-9590-441f-8c55-44d74ab9b735` passed **41 tests** (Oracle 20, persistence 9,
+  retention 12). Final `95ff0a85-ad37-4be6-9a2d-8a1c486e19dd` passed **127 tests**, with **2 existing
+  opt-in diagnostic skips** (sidebar restoration 14, pane presentation 42, pane publication 4,
+  restoration lifecycle 64, tail diagnostics 3 passed/2 skipped). No failed cases.
+- Scoped formatting and lint `29c6f62a-124a-4790-80a3-8b79f7c4a838` passed. Both products passed
+  `16ae87c0-94bf-4297-9b1f-198a430db3cc`; fresh index remained **1242/1360** wrong-way file edges and
+  **53/66** largest-cycle components. No new compiler warnings in the four touched Swift files.
+  One bounded independent review completed; its save/quiet-gate ordering recommendation was applied.
+  Hosted full-suite status and live smoke remain overseer-owned; no visible app lifecycle action ran.
