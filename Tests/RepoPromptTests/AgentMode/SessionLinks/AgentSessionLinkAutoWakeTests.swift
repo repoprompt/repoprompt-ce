@@ -94,7 +94,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
     }
 
     func testStartupRetainsExactScopeAndRefusesChangesAcrossPreparationWithoutPresentation() async throws {
-        for change in ["entryRefusal", "stop", "replacement", "binding", "retirement", "workspace"] {
+        for change in ["entryRefusal", "stop", "replacement", "binding", "retirement", "reacquired", "workspace"] {
             var f: Fixture? = try fixture()
             let session = try XCTUnwrap(f).session
             let startup = try XCTUnwrap(f).scope.startup
@@ -159,7 +159,12 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                     tabID: session.tabID, sessionID: XCTUnwrap(session.activeAgentSessionID), workspaceID: workspaceID
                 ))
             case "retirement": owner?.beginRetirement()
-            default: workspaceID = UUID()
+            case "workspace": workspaceID = UUID()
+            default:
+                let binding = session.currentRestorationBindingToken
+                owner?.replaceSessions([:])
+                owner?.replaceSessions([session.tabID: session])
+                XCTAssertEqual(session.currentRestorationBindingToken, binding, "Claim reacquisition alone invalidates preparation")
             }
             f = nil
             XCTAssertNotNil(owner, "An in-flight preparation owns its scope, not a presentation")
@@ -172,50 +177,107 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         }
     }
 
-    func testStartupDoesNotAcknowledgeAReboundAttemptAfterInputSuspension() async throws {
+    func testBoundStartupKeepsWriterAcrossAuthoritativeRestoration() async throws {
         let f = try fixture()
         let session = f.session
-        let gate = AutoWakeCatalogAuthorityGate()
-        let outcome = AgentRunStartOutcomeRecorder()
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: f.endpoint.sessionID, workspaceID: f.endpoint.workspaceID))
+        XCTAssertFalse(session.permitsBoundOperationAndSave)
+        guard case let .unique(writer) = f.scope.resolveWriter(sessionID: f.endpoint.sessionID) else {
+            return XCTFail("A bound writer exists before hydration")
+        }
         var preparations = 0
-        XCTAssertNil(session.mcpControlContext, "This ordinary start has no MCP epoch to prepare")
-        f.scope.mcp.test_afterEpochBegan = { XCTFail("An ordinary start must not create an MCP epoch") }
-        let environment = AgentSessionRunStartRuntime.Environment(
+        var starts = 0
+        let outcome = AgentRunStartOutcomeRecorder()
+        var environment = AgentSessionRunStartRuntime.Environment(
             currentWorkspaceID: { f.endpoint.workspaceID },
-            prepareSession: { _ in preparations += 1 },
+            prepareSession: { exact in
+                preparations += 1
+                exact.recordRestorationAuthoritative(.persistedPayloadApplied)
+                XCTAssertTrue(writer.isCurrent, "Hydration keeps the admitted incarnation")
+            },
             availabilityFailure: { _ in nil },
             bindSession: { .init(sessionID: $0.activeAgentSessionID!, creation: nil) },
-            commitCreation: { _ in XCTFail("Already persisted identity must not claim new creation")
+            commitCreation: { _ in XCTFail("Existing writer is not a creation")
                 return false
             },
-            providerSwitchRefusal: { _ in "Provider switch pending" },
-            prepareProviderSwitch: { _, _, _ in XCTFail("Unexpected switch preparation")
+            providerSwitchRefusal: { _ in "Unexpected switch" },
+            prepareProviderSwitch: { _, _, _ in XCTFail("Unexpected switch")
                 return nil
             },
-            augment: { text, _, _, _, _, _ in _ = await gate.requirement()
-                return text
-            },
-            initialMessage: { _, text in text },
-            composition: { preconditionFailure("A rebound attempt must not construct execution") }
+            augment: { text, _, _, _, _, _ in text }, initialMessage: { _, text in text },
+            composition: { preconditionFailure("The test intercepts provider dispatch") }
         )
-        let coordinator = ClaudeAgentModeCoordinator(windowID: 401, workspacePathProvider: { _ in nil })
-        let task = Task {
-            await f.scope.startup.start(
-                session: session, initialMessage: "Stale augmented input", startOutcome: outcome,
-                claudeCoordinator: coordinator, links: f.runtime, environment: environment
-            )
+        environment.test_startOverride = { _, _, _ in starts += 1
+            return true
         }
-        await gate.waitUntilEntered()
+        _ = await f.scope.startup.start(
+            session: session, initialMessage: "Hydrated input", startOutcome: outcome,
+            claudeCoordinator: .init(windowID: 401, workspacePathProvider: { _ in nil }),
+            links: f.runtime, environment: environment
+        )
         XCTAssertEqual(preparations, 2)
-        XCTAssertNil(session.mcpControlContext, "Passing epoch preparation must not create control for an ordinary start")
-        try session.installPersistentSessionBinding(.init(
-            tabID: session.tabID, sessionID: XCTUnwrap(session.activeAgentSessionID), workspaceID: f.endpoint.workspaceID
-        ))
-        await gate.open()
-        _ = await task.value
-        XCTAssertFalse(outcome.outcome.didStart)
-        XCTAssertNil(session.activeRunOwnership)
-        XCTAssertTrue(session.items.isEmpty)
+        XCTAssertEqual(starts, 1)
+        XCTAssertTrue(outcome.outcome.didStart)
+        XCTAssertTrue(writer.isCurrent)
+    }
+
+    func testStartupDoesNotAcknowledgeAReboundAttemptAfterInputSuspension() async throws {
+        for reacquire in [false, true] {
+            let f = try fixture()
+            let session = f.session
+            let gate = AutoWakeCatalogAuthorityGate()
+            let outcome = AgentRunStartOutcomeRecorder()
+            var preparations = 0
+            XCTAssertNil(session.mcpControlContext, "This ordinary start has no MCP epoch to prepare")
+            f.scope.mcp.test_afterEpochBegan = { XCTFail("An ordinary start must not create an MCP epoch") }
+            let environment = AgentSessionRunStartRuntime.Environment(
+                currentWorkspaceID: { f.endpoint.workspaceID },
+                prepareSession: { _ in preparations += 1 },
+                availabilityFailure: { _ in nil },
+                bindSession: { .init(sessionID: $0.activeAgentSessionID!, creation: nil) },
+                commitCreation: { _ in XCTFail("Already persisted identity must not claim new creation")
+                    return false
+                },
+                providerSwitchRefusal: { _ in "Provider switch pending" },
+                prepareProviderSwitch: { _, _, _ in XCTFail("Unexpected switch preparation")
+                    return nil
+                },
+                augment: { text, _, _, _, _, _ in _ = await gate.requirement()
+                    return text
+                },
+                initialMessage: { _, text in XCTFail("Stale augmentation cannot proceed to initial-message preparation")
+                    return text
+                },
+                composition: { preconditionFailure("A rebound attempt must not construct execution") }
+            )
+            let coordinator = ClaudeAgentModeCoordinator(windowID: 401, workspacePathProvider: { _ in nil })
+            let task = Task {
+                await f.scope.startup.start(
+                    session: session, initialMessage: "Stale augmented input", startOutcome: outcome,
+                    claudeCoordinator: coordinator, links: f.runtime, environment: environment
+                )
+            }
+            await gate.waitUntilEntered()
+            XCTAssertEqual(preparations, 2)
+            XCTAssertNil(session.mcpControlContext, "Passing epoch preparation must not create control for an ordinary start")
+            if reacquire {
+                let binding = session.currentRestorationBindingToken
+                f.scope.replaceSessions([:])
+                f.scope.replaceSessions([session.tabID: session])
+                XCTAssertEqual(session.currentRestorationBindingToken, binding)
+            } else {
+                try session.installPersistentSessionBinding(.init(
+                    tabID: session.tabID, sessionID: XCTUnwrap(session.activeAgentSessionID), workspaceID: f.endpoint.workspaceID
+                ))
+            }
+            session.mcpFollowUpRunPending = true
+            await gate.open()
+            _ = await task.value
+            XCTAssertFalse(outcome.outcome.didStart)
+            XCTAssertNil(session.activeRunOwnership)
+            XCTAssertTrue(session.items.isEmpty)
+            XCTAssertTrue(session.mcpFollowUpRunPending, "Old cleanup cannot clear the successor's pending marker")
+        }
     }
 
     func testFollowUpProducerRetainsScopeAndJoinsBeforeWriterReleaseWithoutPresentation() async throws {

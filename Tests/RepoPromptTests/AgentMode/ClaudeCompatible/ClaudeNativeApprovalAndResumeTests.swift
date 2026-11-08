@@ -1509,13 +1509,14 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
     private func fixture(mcp: Bool = false, write: @escaping @Sendable (Data) throws -> Void = { _ in }) async throws -> Fixture {
         let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
         let session = harness.host.session(for: UUID())
-        let controlledSessionID = mcp ? UUID() : nil
-        if let controlledSessionID {
-            XCTAssertNil(harness.host.test_bindingRejection(sessionID: controlledSessionID, on: session))
-            session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: controlledSessionID, workspaceID: UUID()))
-            session.recordRestorationAuthoritative(.persistedPayloadApplied)
-            XCTAssertNotNil(try harness.host.runtimeCommand(sessionID: controlledSessionID))
-        }
+        // A live provider conversation already has a persistent runtime writer, whether or
+        // not its turn is MCP-controlled. Unbound local creation is covered separately.
+        let persistentSessionID = UUID()
+        XCTAssertNil(harness.host.test_bindingRejection(sessionID: persistentSessionID, on: session))
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: persistentSessionID, workspaceID: UUID()))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertNotNil(try harness.host.runtimeCommand(sessionID: persistentSessionID))
+        let controlledSessionID = mcp ? persistentSessionID : nil
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
         session.runState = .completed
@@ -2092,13 +2093,14 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
             return creations > 1 ? replacement ?? controller : controller
         })
         let session = harness.host.session(for: UUID())
-        let controlledSessionID = mcp ? UUID() : nil
-        if let controlledSessionID {
-            XCTAssertNil(harness.host.test_bindingRejection(sessionID: controlledSessionID, on: session))
-            session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: controlledSessionID, workspaceID: UUID()))
-            session.recordRestorationAuthoritative(.persistedPayloadApplied)
-            XCTAssertNotNil(try harness.host.runtimeCommand(sessionID: controlledSessionID))
-        }
+        // A live provider conversation already has a persistent runtime writer, whether or
+        // not its turn is MCP-controlled. Unbound local creation is covered separately.
+        let persistentSessionID = UUID()
+        XCTAssertNil(harness.host.test_bindingRejection(sessionID: persistentSessionID, on: session))
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: persistentSessionID, workspaceID: UUID()))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertNotNil(try harness.host.runtimeCommand(sessionID: persistentSessionID))
+        let controlledSessionID = mcp ? persistentSessionID : nil
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
         session.runState = .completed

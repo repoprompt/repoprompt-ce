@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import MCP
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptMCPServer
@@ -56,6 +57,59 @@ final class AgentSessionMCPRuntime {
     #if DEBUG
         var test_afterEpochBegan: (@MainActor () async -> Void)?
     #endif
+
+    struct StagedEpochTransition {
+        let writer: AgentSessionRuntimeStore.Writer
+        let activationID: UUID
+        let registration: AgentRunSessionStore.Registration
+        let token: UUID
+    }
+
+    func stageEpochTransition(
+        command: AgentSessionRuntimeStore.Command, kind: AgentRunEpochTransitionKind
+    ) -> StagedEpochTransition? {
+        let writer = command.writer
+        guard writer.scope === scope, command.isCurrent,
+              var context = writer.session.mcpControlContext,
+              context.sessionID == writer.identity.sessionID,
+              context.registration.sessionID == writer.identity.sessionID else { return nil }
+        let token = UUID()
+        context.pendingEpochTransition = .init(token: token, kind: kind, expectedCurrentEpoch: context.currentEpoch)
+        writer.session.mcpControlContext = context
+        return .init(writer: writer, activationID: context.activationID, registration: context.registration, token: token)
+    }
+
+    /// Cleanup belongs to the originating receipt, not a fresh session-ID lookup. Retirement
+    /// may drain an admitted operation, but a reacquired writer or replacement activation must
+    /// never have its pending transition cleared by the old operation's failure.
+    func clearStagedEpochTransition(_ staged: StagedEpochTransition) {
+        let writer = staged.writer
+        guard writer.scope === scope,
+              writer.isCurrent || writer.scope.sessions[writer.session.tabID] !== writer.session,
+              writer.session.currentRestorationBindingToken == writer.identity.restoration,
+              var context = writer.session.mcpControlContext,
+              context.activationID == staged.activationID, context.registration == staged.registration,
+              context.preparedEpoch == nil, context.pendingEpochTransition?.token == staged.token else { return }
+        context.pendingEpochTransition = nil
+        writer.session.mcpControlContext = context
+    }
+
+    func withEpochTransition<T>(
+        command: AgentSessionRuntimeStore.Command, kind: AgentRunEpochTransitionKind,
+        operation: () async throws -> T
+    ) async throws -> T {
+        guard let staged = stageEpochTransition(command: command, kind: kind) else {
+            throw MCPError.invalidParams("The requested agent run is no longer active.")
+        }
+        do {
+            return try await Self.epochTransitionToken.withValue(staged.token) {
+                try await operation()
+            }
+        } catch {
+            clearStagedEpochTransition(staged)
+            throw error
+        }
+    }
 
     /// The runtime supplies execution/cancellation; a presenter is never required to prepare
     /// a controlled turn. Ordinary non-MCP starts do not construct provider resources.

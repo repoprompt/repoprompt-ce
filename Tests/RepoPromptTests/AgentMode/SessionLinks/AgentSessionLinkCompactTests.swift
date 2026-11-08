@@ -5,6 +5,7 @@ import RepoPromptAIContracts
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 import XCTest
 
 /// Live-view-model coverage for the overseer `compact` transaction.
@@ -73,6 +74,8 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         codexStallWatchdogPollIntervalNanos: UInt64? = nil,
         codexSnapshotLatestTurnStatus: CodexNativeSessionController.TurnStatus? = nil
     ) throws -> Fixture {
+        // These fixtures persist provider model pins without launching the app bootstrap.
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
         let events = LiveSendEventLog()
         let driftHook = AgentSessionLinkSendTransactionLiveTests.LiveSendDriftHook()
         let claude = CompactRecordingNativeController()

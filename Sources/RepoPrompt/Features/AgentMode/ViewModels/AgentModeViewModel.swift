@@ -7990,50 +7990,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         handleObservedMCPStateChange(for: session)
     }
 
-    @discardableResult
-    func stageMCPRunEpochTransition(
-        sessionID: UUID,
-        kind: AgentRunEpochTransitionKind
-    ) -> UUID? {
-        guard let session = mcpControlledSession(sessionID: sessionID),
-              var context = session.mcpControlContext
-        else { return nil }
-        let token = UUID()
-        context.pendingEpochTransition = AgentRunEpochTransitionIntent(
-            token: token,
-            kind: kind,
-            expectedCurrentEpoch: context.currentEpoch
-        )
-        session.mcpControlContext = context
-        return token
-    }
-
-    func clearStagedMCPRunEpochTransition(sessionID: UUID, token: UUID) {
-        guard let session = mcpControlledSession(sessionID: sessionID),
-              var context = session.mcpControlContext,
-              context.preparedEpoch == nil,
-              context.pendingEpochTransition?.token == token
-        else { return }
-        context.pendingEpochTransition = nil
-        session.mcpControlContext = context
-    }
-
     func withMCPRunEpochTransition<T>(
         sessionID: UUID,
         kind: AgentRunEpochTransitionKind,
         operation: () async throws -> T
     ) async throws -> T {
-        guard let token = stageMCPRunEpochTransition(sessionID: sessionID, kind: kind) else {
+        guard let command = try runtimeCommand(sessionID: sessionID) else {
             throw MCPError.invalidParams("The requested agent run is no longer active.")
         }
-        do {
-            return try await AgentSessionMCPRuntime.epochTransitionToken.withValue(token) {
-                try await operation()
-            }
-        } catch {
-            clearStagedMCPRunEpochTransition(sessionID: sessionID, token: token)
-            throw error
-        }
+        return try await command.writer.scope.mcp.withEpochTransition(command: command, kind: kind, operation: operation)
     }
 
     func mcpSnapshot(sessionID: UUID) -> AgentRunMCPSnapshot? {

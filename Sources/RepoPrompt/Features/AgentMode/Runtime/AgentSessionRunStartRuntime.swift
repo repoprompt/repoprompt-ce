@@ -58,8 +58,30 @@ final class AgentSessionRunStartRuntime {
               !owner.isRetiring, !owner.hasReleasedWriterClaims else { return nil }
         defer { withExtendedLifetime(owner) {} }
         let tabID = session.tabID
+        var writer: AgentSessionRuntimeStore.Writer?
+        if let sessionID = session.activeAgentSessionID {
+            guard case let .unique(existing) = owner.resolveWriter(sessionID: sessionID),
+                  existing.scope === owner, existing.session === session
+            else {
+                let message = "The session no longer has an exclusive runtime writer."
+                startOutcome?.recordStartFailure(message: message)
+                return .failed(message: message)
+            }
+            writer = existing
+        }
+        // Writer currency is independent of presentation. Until the remaining host resource
+        // adapters are replaced, their workspace must also stay pinned: a current writer is not
+        // permission to consume another workspace's context or provider launch path.
+        let originalBindingToken = session.currentRestorationBindingToken
+        let originalWorkspaceID = environment.currentWorkspaceID()
+        func resourcesAreCurrent() -> Bool {
+            environment.currentWorkspaceID() == originalWorkspaceID
+        }
         func isCurrent() -> Bool {
-            owner.sessions[tabID] === session && !owner.isRetiring && !owner.hasReleasedWriterClaims
+            guard owner.sessions[tabID] === session, !owner.isRetiring, !owner.hasReleasedWriterClaims,
+                  resourcesAreCurrent() else { return false }
+            if let writer { return writer.isCurrent }
+            return session.currentRestorationBindingToken == originalBindingToken
         }
         if session.pendingHandoff.providerSwitchDelivery != nil, providerSwitchPreparation == nil {
             let message = environment.providerSwitchRefusal(session)
@@ -82,8 +104,6 @@ final class AgentSessionRunStartRuntime {
             return true
         }
         guard periodicStartIsCurrent() else { return nil }
-        let originalBindingToken = session.currentRestorationBindingToken
-        let originalWorkspaceID = environment.currentWorkspaceID()
         let originalStopFence = directStartOptions.stopFence ?? AgentRunStartStopFence(session: session)
         var preparedClaudeEvents: ClaudeAttemptEventReservation?
         var claudeEventsTransferred = false
@@ -108,16 +128,15 @@ final class AgentSessionRunStartRuntime {
             // only a plain local instruction can transfer to the existing steering owner.
             if let adoption = claudeCoordinator.pendingProviderAdoption(for: session) {
                 await adoption.value
-                guard originalStopFence.permitsStart(of: session), isCurrent(),
-                      session.currentRestorationBindingToken == originalBindingToken,
-                      environment.currentWorkspaceID() == originalWorkspaceID
+                guard originalStopFence.permitsStart(of: session), isCurrent()
                 else {
                     startOutcome?.recordStartFailure(message: nil)
                     return nil
                 }
             }
             if session.runState.isActive {
-                guard session.activeRunOwnership.map({ session.claudeTerminalAnchor?.0 == $0 }) == true,
+                guard let writer, case .success = writer.admitCommand(), let execution = owner.execution,
+                      session.activeRunOwnership.map({ session.claudeTerminalAnchor?.0 == $0 }) == true,
                       directStartOptions.localComposerCandidate != nil,
                       directStartOptions.periodicWakeID == nil, directStartOptions.laneUpdateWakeID == nil,
                       directStartOptions.providerControlCommand == nil, directStartOptions.selfCompactDispatchID == nil,
@@ -132,7 +151,7 @@ final class AgentSessionRunStartRuntime {
                 if existingItem == nil { session.appendItem(userItem) }
                 if let owner = session.activeRunOwnership { session.claudeTerminalAnchor = (owner, .exact(userItem.id)) }
                 guard queueClaudeSteering(
-                    session: session, service: environment.composition().execution,
+                    session: session, service: execution,
                     wrappedText: initialMessage, attachments: attachments,
                     taggedFiles: taggedFileAttachments, draftText: initialMessage, userItem: userItem,
                     localComposerCandidate: directStartOptions.localComposerCandidate,
@@ -157,10 +176,7 @@ final class AgentSessionRunStartRuntime {
             }
         }
         await environment.prepareSession(session)
-        guard isCurrent(),
-              session.currentRestorationBindingToken == originalBindingToken,
-              environment.currentWorkspaceID() == originalWorkspaceID,
-              originalStopFence.permitsStart(of: session) else { return nil }
+        guard isCurrent(), originalStopFence.permitsStart(of: session) else { return nil }
         if let message = session.operationAdmissionFailureMessage {
             startOutcome?.recordStartFailure(message: message)
             return .failed(message: message)
@@ -174,7 +190,12 @@ final class AgentSessionRunStartRuntime {
             return .failed(message: message)
         }
         defer {
-            if session.mcpFollowUpRunPending, session.scheduledACPFollowUp == nil {
+            // A failed preparation cannot clear a successor's follow-up marker. The original
+            // writer may still drain during retirement; admission is not required for cleanup.
+            let ownsCleanup = writer.map {
+                $0.isCurrent || (owner.sessions[tabID] !== session && session.currentRestorationBindingToken == $0.restoration)
+            } ?? isCurrent()
+            if ownsCleanup, session.mcpFollowUpRunPending, session.scheduledACPFollowUp == nil {
                 session.mcpFollowUpRunPending = false
                 owner.mcp.handleObservedMCPStateChange(for: session)
             }
@@ -184,17 +205,27 @@ final class AgentSessionRunStartRuntime {
             startOutcome?.recordStartFailure(message: message)
             return .failed(message: message)
         }
+        if writer == nil {
+            guard case let .unique(created) = owner.resolveWriter(sessionID: bindingAdmission.sessionID),
+                  created.scope === owner, created.session === session else { return nil }
+            writer = created
+        }
+        guard let writer, writer.identity.sessionID == bindingAdmission.sessionID, isCurrent() else { return nil }
         if let directCreation = bindingAdmission.creation, await !environment.commitCreation(directCreation) {
             let message = "The new session could not save its initial configuration. Retry saving it before starting a run."
             startOutcome?.recordStartFailure(message: message)
             return .failed(message: message)
         }
-        let startBindingToken = session.currentRestorationBindingToken
+        guard isCurrent() else { return nil }
         let stopFence = directStartOptions.stopFence ?? AgentRunStartStopFence(session: session)
         guard stopFence.permitsStart(of: session) else {
             startOutcome?.recordStartFailure(message: "This scheduled run was cancelled by Stop.")
             return nil
         }
+        await environment.prepareSession(session)
+        guard periodicStartIsCurrent(), stopFence.permitsStart(of: session), isCurrent(),
+              session.operationAdmissionFailureMessage == nil,
+              case let .success(command) = writer.admitCommand() else { return nil }
         // The one provider-neutral fence for an automatic lane-update turn, placed here because this
         // is the last app-owned instant before *every* provider family (Codex start/fallback, Claude
         // native, ACP prompt, headless stream) is reached through `runComposition.startRun`.
@@ -218,13 +249,8 @@ final class AgentSessionRunStartRuntime {
                 return nil
             }
         }
-        await environment.prepareSession(session)
-        guard periodicStartIsCurrent(), stopFence.permitsStart(of: session),
-              isCurrent(), session.currentRestorationBindingToken == startBindingToken,
-              session.operationAdmissionFailureMessage == nil else { return nil }
         guard await owner.mcp.prepareWaitTrackingForRunStart(session: session, stopFence: stopFence) else { return nil }
-        guard periodicStartIsCurrent(), stopFence.permitsStart(of: session),
-              isCurrent(), session.currentRestorationBindingToken == startBindingToken,
+        guard periodicStartIsCurrent(), stopFence.permitsStart(of: session), command.isCurrent, resourcesAreCurrent(),
               session.operationAdmissionFailureMessage == nil else { return nil }
         // A lane update has no user-authored base instruction, so every augmentation this applies —
         // skill context, tagged-file expansion, attachment rendering, staged handoff — is user-only
@@ -233,6 +259,7 @@ final class AgentSessionRunStartRuntime {
         let switchMessages: (user: String, initial: String)?
         if session.pendingHandoff.providerSwitchDelivery != nil {
             switchMessages = await environment.prepareProviderSwitch(providerSwitchPreparation, session, stopFence)
+            guard command.isCurrent, resourcesAreCurrent(), stopFence.permitsStart(of: session), periodicStartIsCurrent() else { return nil }
             guard switchMessages != nil else {
                 let message = environment.providerSwitchRefusal(session)
                 startOutcome?.recordStartFailure(message: message)
@@ -249,6 +276,7 @@ final class AgentSessionRunStartRuntime {
                 directStartOptions.ignoresPendingHandoff, directStartOptions.skipsSlashExpansion
             )
         }
+        guard command.isCurrent, resourcesAreCurrent(), stopFence.permitsStart(of: session), periodicStartIsCurrent() else { return nil }
         // A provider control command is exactly its fixed native text: prepending initial-thread
         // context would make it ordinary prose the provider no longer recognizes as a command.
         let initialMessageForRun = if let switchMessages { switchMessages.initial } else { directStartOptions.providerControlCommand != nil
@@ -256,8 +284,7 @@ final class AgentSessionRunStartRuntime {
             ? augmentedInitialMessage
             : await environment.initialMessage(session, augmentedInitialMessage)
         }
-        guard periodicStartIsCurrent(), stopFence.permitsStart(of: session),
-              isCurrent(), session.currentRestorationBindingToken == startBindingToken,
+        guard periodicStartIsCurrent(), stopFence.permitsStart(of: session), command.isCurrent, resourcesAreCurrent(),
               session.operationAdmissionFailureMessage == nil else { return nil }
         let preparedCodexFallbackContext = codexFallbackContext.map { context in
             AgentTabSession.CodexFallbackSubmissionContext(
@@ -276,10 +303,12 @@ final class AgentSessionRunStartRuntime {
 
         #if DEBUG
             if await environment.test_startOverride?(session, augmentedInitialMessage, initialMessageForRun) == true {
+                guard command.isCurrent, resourcesAreCurrent(), stopFence.permitsStart(of: session), periodicStartIsCurrent() else { return nil }
                 startOutcome?.recordAccepted()
                 return nil
             }
         #endif
+        guard command.isCurrent, resourcesAreCurrent(), stopFence.permitsStart(of: session), periodicStartIsCurrent() else { return nil }
         guard preparedClaudeEvents?.listener.isCurrent() != false else {
             recordClaudeStartRefusal()
             return nil

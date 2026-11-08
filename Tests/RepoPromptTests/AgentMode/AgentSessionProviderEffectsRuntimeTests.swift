@@ -521,6 +521,58 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
         _ = await store.shutdown()
     }
 
+    func testStagedEpochCleanupUsesOriginatingWriterAndTransitionReceipt() async throws {
+        for change in ["retiring", "detached", "reacquired", "rebound", "successor", "prepared"] {
+            let f = try await makeFixture()
+            guard case let .unique(writer) = f.scope.resolveWriter(sessionID: f.sessionID),
+                  case let .success(command) = writer.admitCommand() else { return XCTFail("Expected an admitted writer") }
+            let staged = try XCTUnwrap(f.scope.mcp.stageEpochTransition(command: command, kind: .steering))
+            XCTAssertEqual(f.session.mcpControlContext?.pendingEpochTransition?.token, staged.token)
+            var successorToken: UUID?
+            switch change {
+            case "retiring": f.scope.beginRetirement()
+            case "detached": f.scope.replaceSessions([:])
+            case "reacquired":
+                f.scope.replaceSessions([:])
+                f.scope.replaceSessions([f.session.tabID: f.session])
+            case "rebound":
+                f.session.installPersistentSessionBinding(.init(tabID: f.session.tabID, sessionID: f.sessionID, workspaceID: writer.identity.workspaceID))
+            case "successor":
+                successorToken = try XCTUnwrap(f.scope.mcp.stageEpochTransition(command: command, kind: .relatedFollowUp)).token
+            default: f.session.mcpControlContext?.preparedEpoch = f.epoch
+            }
+            f.scope.mcp.clearStagedEpochTransition(staged)
+            if change == "retiring" || change == "detached" {
+                XCTAssertNil(f.session.mcpControlContext?.pendingEpochTransition, "Admitted cleanup must drain: \(change)")
+            } else {
+                XCTAssertEqual(f.session.mcpControlContext?.pendingEpochTransition?.token, successorToken ?? staged.token, change)
+            }
+            if change != "successor", change != "prepared" {
+                XCTAssertNil(f.scope.mcp.stageEpochTransition(command: command, kind: .steering), "Stale commands cannot stage: \(change)")
+            }
+        }
+    }
+
+    func testEpochTransitionTaskLocalAndFailureCleanupAreRuntimeOwned() async throws {
+        enum Refusal: Error { case refused }
+        let f = try await makeFixture()
+        guard case let .unique(writer) = f.scope.resolveWriter(sessionID: f.sessionID),
+              case let .success(command) = writer.admitCommand() else { return XCTFail("Expected an admitted writer") }
+        XCTAssertNil(AgentSessionMCPRuntime.epochTransitionToken.get())
+        do {
+            try await f.scope.mcp.withEpochTransition(command: command, kind: .steering) {
+                let token = try XCTUnwrap(AgentSessionMCPRuntime.epochTransitionToken.get())
+                XCTAssertEqual(f.session.mcpControlContext?.pendingEpochTransition?.token, token)
+                f.scope.beginRetirement()
+                throw Refusal.refused
+            }
+            XCTFail("Expected the originating error")
+        } catch Refusal.refused {}
+        XCTAssertNil(f.session.mcpControlContext?.pendingEpochTransition)
+        XCTAssertNil(AgentSessionMCPRuntime.epochTransitionToken.get())
+        XCTAssertTrue(writer.isCurrent, "Retirement does not suppress originating cleanup")
+    }
+
     func testEpochAdmissionAndAcknowledgementCannotCrossWriterIncarnations() async {
         for refusal in ["unrestored", "retiring", "conflict", "reacquired"] {
             let domain = makeCancellationStore()

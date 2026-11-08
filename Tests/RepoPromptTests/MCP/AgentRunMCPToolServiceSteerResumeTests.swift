@@ -1230,8 +1230,9 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
                         _ = session.beginRunAttempt(source: "public-cancel-pending-started")
                         session.runState = .running
                     case .successorEpoch:
-                        let successor = try XCTUnwrap(viewModel.stageMCPRunEpochTransition(sessionID: sessionID, kind: .steering))
-                        XCTAssertNotEqual(successor, originalTransition)
+                        let command = try XCTUnwrap(viewModel.runtimeCommand(sessionID: sessionID))
+                        let successor = try XCTUnwrap(viewModel.mcpRuntime.stageEpochTransition(command: command, kind: .steering))
+                        XCTAssertNotEqual(successor.token, originalTransition)
                     case .pendingRevision:
                         session.mcpFollowUpRunPendingUpdatedAt = originalPendingRevision.addingTimeInterval(1)
                     case .scheduledProducer:
@@ -1283,7 +1284,8 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
             originatingConnectionID: nil, startPending: startPending
         )
         if startPending {
-            _ = try XCTUnwrap(window.agentModeViewModel.stageMCPRunEpochTransition(sessionID: sessionID, kind: .steering))
+            let command = try XCTUnwrap(window.agentModeViewModel.runtimeCommand(sessionID: sessionID))
+            _ = try XCTUnwrap(window.agentModeViewModel.mcpRuntime.stageEpochTransition(command: command, kind: .steering))
         } else {
             await window.agentModeViewModel.mcpRuntime.prepareWaitTrackingForRunStart(
                 session: session, stopFence: .init(session: session)

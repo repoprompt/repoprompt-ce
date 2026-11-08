@@ -5553,3 +5553,40 @@ checks on all seven final Swift files. Fresh index passed **1241/1360** wrong-wa
 baseline; none were new. Earlier iterations exposed unbound test control fixtures; a periodic ACP
 response-gate timeout did not recur in either subsequent run, with its assertions and timeout unchanged.
 Those failed/cancelled runs are not qualification receipts. No live-app or full-suite validation was run.
+
+### M9.2 partial milestone: pinned run-start writers and epoch-transition receipts
+
+Run-start captures the exact writer before bound-session preparation and retains its incarnation
+across hydration, creation acknowledgement and input preparation. A local creation's writer is
+captured synchronously after binding and before awaiting the first save. Ordinary command admission
+follows authoritative restoration. The separate host-workspace resource fence remains until the
+mutable context/provider-path adapters are replaced: writer currency cannot authorize consuming
+another workspace's resources. Lane claims
+and subsequent epoch/input steps are fenced by that command. Same-binding claim reacquisition is
+not a continuation of the old start, and failed preparation cannot clear a successor's follow-up
+marker. The active Claude steering branch uses the scope's installed execution service.
+
+Epoch-transition staging, task-local execution and failure cleanup now belong to the MCP runtime.
+A staged receipt retains its originating writer and control activation. Cleanup can drain after
+retirement or detachment, but cannot clear a replacement writer, rebound session, newer transition
+or prepared epoch. The view-model compatibility entry resolves a runtime command, not a controlled
+tab through UI selection; its staging and cleanup implementations are removed.
+
+Coverage adds restoration under a stable writer, same-binding claim reacquisition during
+load/input preparation, preservation of the host-resource drift fence, and transition cleanup
+across retirement, detachment and replacement. The compact test fixture now installs the app model
+identity policy before persisting model pins; a combined run exposed its missing bootstrap. This
+changes no behavior assertion or production settings policy. Remaining input, binding, creation,
+provider-dispatch and broader routing callbacks are still M9.2 work, not deferred to M9.3.
+Native-Claude fixtures with an already-live provider conversation now install a workspace-qualified
+writer for local as well as MCP-controlled turns; the adoption, steering and lifecycle assertions remain
+unchanged. Unbound local creation continues to have separate composer/restoration coverage.
+
+Validation: `fdfe7678-1220-47ee-acfe-229320d65b4a` passed **509 focused tests**, including
+writer/epoch, link, native-Claude, restoration, composer/workflow and re-prompt paths. Both products
+passed `8d1ede22-ae29-4242-b104-68738c2d3874`; full lint passed
+`36fda4dd-65da-472c-a7c7-f2e8f72b8b56`. Fresh index passed **1241/1360** wrong-way edges
+and **53/66** largest-cycle components. Six emitted touched-file warning signatures matched the
+existing baseline; none were new. Earlier missing-import failures, the settings-bootstrap trap and
+the canceled unbound-provider-fixture run are not passing receipts. No live-app or full-suite
+validation was run.
