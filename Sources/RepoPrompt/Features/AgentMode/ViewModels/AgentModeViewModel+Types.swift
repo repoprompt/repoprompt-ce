@@ -903,16 +903,8 @@ extension AgentModeViewModel {
     /// (e.g., steering send failed, or the user cancelled the run while messages were queued).
     typealias DraftRestorationEvent = AgentComposerDraftRestorationEvent
 
-    struct SlashSkillToken: Equatable {
-        let name: String
-        let tokenRange: NSRange
-        let argumentsRange: NSRange
-    }
-
-    struct ResolvedSlashSkillInvocation: Equatable {
-        let definition: AgentSkillDefinition
-        let token: SlashSkillToken
-    }
+    typealias SlashSkillToken = AgentSlashSkillToken
+    typealias ResolvedSlashSkillInvocation = AgentResolvedSlashSkillInvocation
 
     /// Internal for cross-file AgentModeViewModel extension access after the mechanical file split.
     struct ResolvedNativeSlashCommand: Equatable {

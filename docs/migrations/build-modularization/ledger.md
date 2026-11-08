@@ -4874,3 +4874,43 @@ The execution seam still has workspace/carrier inputs and coordinator dependenci
 Canonical independent writer admission, real window-free saved-host composition, runtime-addressed
 routing, presentation-preserving execution/handoff/drain and final full qualification remain open.
 This is not M9 completion or a fresh hosted/live-smoke receipt.
+
+### M9 continuation — runtime-owned provider-input construction (2026-11-08)
+
+`AgentSessionProviderInputRuntime` now owns the actual slash-skill parser, resolution and prompt
+expansion, attachment rendering, tagged-file resolution/packaging, conversation history and headless
+message construction. Scope composition retains the existing skill catalog and recorder; it does not
+create another catalog or select a window. Workspace paths, the concrete content store and lookup
+scope are explicit inputs. The existing readable-file service, worktree projection and token budget
+remain authoritative. Neutral in-memory skill token values replace VM-nested implementation types;
+compatibility forwarding entry points preserve existing callers without persisted schema changes.
+
+The headless run hook retains the concrete input and link runtimes rather than calling a weak VM and
+substituting an empty system prompt. History rebuilding still re-owes the supplement through the
+existing claim owner. Input finishing preserves the currency check before attachment rendering and
+handoff staging, and the handoff runtime still refuses a replaced object. The VM continues to supply
+workspace lookup and startup composition; this is not an independent canonical host yet.
+
+Added runtime tests construct no WindowState, PromptViewModel or WorkspaceManagerViewModel. They
+exercise real worktree file content with logical-path display, duplicate packaging avoidance,
+explicit-root skill discovery, native compact versus explicit skill namespace, refused publication
+into a fresh catalog, non-empty headless system prompts/history, current handoff staging, refusal
+before staging, history-bypass after staging and replacement-object refusal. Existing VM/provider
+integration tests remain in the focused run.
+
+Validation:
+- `91af4b7b-9485-4c2a-b6c1-726d18056513` passed **164 tests** before the final review coverage.
+- Final `3c8f52df-857d-449d-b55d-e9f5ee4a61c1` passed **179 tests**: composer submission 39,
+  file-tag/worktree 17, provider switch 39, link execution runtime 15, native/headless adapter 31,
+  and Claude approval/resume 38. Counts come from named XCTest suites, not empty wrappers.
+- Both products passed `ab56ecc5-fc8c-4311-9214-3ca7292717e4`; lint passed
+  `e366e05e-2df0-48cb-b1be-a351739a16ea` on the same Swift tree.
+- Fresh compiler-index check passed **1240/1360** wrong-way file edges and **53/66** largest-cycle
+  components (1130 files, 156323 symbols). No budget or baseline was raised.
+- Scoped formatting and one independent review completed. Source verification confirmed the legacy
+  scope/catalog/recorder are immutable, link execution holds its scope weakly, and skill-refresh
+  forwarding had no omitted side effect. Mandatory staged contribution preflight applies before commit.
+
+Canonical writer admission, window-free saved-host composition, remaining context/startup/terminal
+commands, runtime-addressed routing and presentation-preserving execution/handoff/drain remain open.
+This is not full-suite, aggregate-warning, hosted-CI or live-smoke qualification, and not M9 completion.

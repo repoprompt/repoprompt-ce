@@ -45,6 +45,54 @@ private actor AutoWakeCatalogAuthorityGate {
 /// Runtime ownership without constructing a presentation or a window-backed execution host.
 @MainActor
 final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
+    func testProviderInputBuildsHistoryAndStagesOnlyCurrentHandoffWithoutPresentation() async throws {
+        let f = try fixture()
+        let input = AgentSessionProviderInputRuntime(skillCatalog: AgentSkillCatalog())
+        f.session.setItemsSilently([
+            AgentChatItem(kind: .user, text: "Original question", sequenceIndex: 0),
+            AgentChatItem(kind: .assistant, text: "Original response", sequenceIndex: 1)
+        ], reason: .persistedSessionHydration)
+        AgentSessionTranscriptRefreshRuntime.refreshDerivedTranscriptState(for: f.session)
+        let history = input.buildHeadlessAgentMessage(
+            session: f.session, initialMessageForRun: "Next turn", attachments: [], links: f.runtime
+        )
+        XCTAssertFalse(history.systemPrompt.isEmpty)
+        XCTAssertTrue(history.userMessage.contains("<previous_conversation>"), history.userMessage)
+        XCTAssertTrue(history.userMessage.contains("Original response"), history.userMessage)
+        XCTAssertTrue(history.userMessage.contains("<current_instruction>\nNext turn"), history.userMessage)
+
+        f.session.pendingHandoff = .init(payload: "<forked_session>Continuity</forked_session>", createdAt: Date())
+        let refused = await input.finishUserMessage(
+            "Next turn", attachments: [], taggedFileAttachments: [], agent: f.session.selectedAgent,
+            context: nil, session: f.session, handoff: f.scope.handoff,
+            ignoresPendingHandoff: false, isCurrent: { false }
+        )
+        XCTAssertEqual(refused, "Next turn")
+        XCTAssertFalse(f.session.pendingHandoff.isStagedForSend)
+        let staged = await input.finishUserMessage(
+            "Next turn", attachments: [], taggedFileAttachments: [], agent: f.session.selectedAgent,
+            context: nil, session: f.session, handoff: f.scope.handoff,
+            ignoresPendingHandoff: false, isCurrent: { true }
+        )
+        XCTAssertTrue(staged.contains("<forked_session>Continuity</forked_session>"), staged)
+        XCTAssertTrue(f.session.pendingHandoff.isStagedForSend)
+        let replay = input.buildHeadlessAgentMessage(session: f.session, initialMessageForRun: staged, attachments: [], links: f.runtime)
+        XCTAssertEqual(replay.userMessage, staged, "A staged handoff must not also replay the local history")
+        XCTAssertFalse(replay.systemPrompt.isEmpty)
+
+        f.session.pendingHandoff.isStagedForSend = false
+        let successor = AgentTabSession(tabID: f.session.tabID)
+        f.scope.replaceSessions([successor.tabID: successor])
+        let stale = await input.finishUserMessage(
+            "Next turn", attachments: [], taggedFileAttachments: [], agent: f.session.selectedAgent,
+            context: nil, session: f.session, handoff: f.scope.handoff,
+            ignoresPendingHandoff: false, isCurrent: { true }
+        )
+        XCTAssertEqual(stale, "Next turn")
+        XCTAssertFalse(f.session.pendingHandoff.isStagedForSend)
+        XCTAssertFalse(successor.pendingHandoff.hasPayload)
+    }
+
     private struct Fixture {
         let scope: AgentSessionRuntimeStore.Scope
         let session: AgentTabSession

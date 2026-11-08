@@ -156,6 +156,20 @@ final class AgentSessionRuntimeStore {
             return runtime
         }
 
+        private var providerInputRuntime: AgentSessionProviderInputRuntime?
+
+        /// Install once from host composition. The legacy VM has an immutable private scope,
+        /// catalog and recorder; presentation attachment must reuse this service, not reconfigure it.
+        func providerInput(skillCatalog: AgentSkillCatalog, perfRecorder: any AgentModePerfRecording) -> AgentSessionProviderInputRuntime {
+            if let providerInputRuntime {
+                precondition(providerInputRuntime.skillCatalog === skillCatalog)
+                return providerInputRuntime
+            }
+            let runtime = AgentSessionProviderInputRuntime(skillCatalog: skillCatalog, perfRecorder: perfRecorder)
+            providerInputRuntime = runtime
+            return runtime
+        }
+
         lazy var observation = AgentSessionObservationRuntime(scope: self)
 
         /// Construct the actual observed runtime object; UI defaults and saved hydration are

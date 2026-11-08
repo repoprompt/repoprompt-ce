@@ -1,10 +1,57 @@
 @testable import RepoPromptApp
 import RepoPromptFileSystem
 import RepoPromptFoundation
+import RepoPromptInstrumentation
 @testable import RepoPromptWorkspaceContext
 import XCTest
 
 final class AgentFileTagWorktreeResolutionTests: XCTestCase {
+    @MainActor
+    func testRuntimeProviderInputUsesCapturedWorktreeContentWithoutPresentation() async throws {
+        let fixture = try await makeBoundFixture(includeBranchOnly: false)
+        let lookup = await makeLookupContext(fixture: fixture)
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let catalog = AgentSkillCatalog(homeDirectoryURL: fixture.logicalRoot.appendingPathComponent("home"))
+        let input = scope.providerInput(skillCatalog: catalog, perfRecorder: NoopAgentModePerfRecorder())
+        XCTAssertTrue(input === scope.providerInput(skillCatalog: catalog, perfRecorder: NoopAgentModePerfRecorder()))
+        let text = await input.finishUserMessage(
+            "Inspect @Sources/App.swift", attachments: [], taggedFileAttachments: [], agent: .claudeCode,
+            context: .init(store: fixture.store, lookup: lookup), session: nil,
+            handoff: scope.handoff, ignoresPendingHandoff: true, isCurrent: { true }
+        )
+        XCTAssertTrue(text.contains("let origin = \"worktree\""), text)
+        XCTAssertFalse(text.contains("let origin = \"base\""), text)
+        XCTAssertFalse(text.contains(fixture.worktreeRoot.path), text)
+        XCTAssertEqual(text.components(separatedBy: "<file_contents>").count - 1, 1)
+        let repeated = await input.finishUserMessage(
+            text, attachments: [], taggedFileAttachments: [], agent: .claudeCode,
+            context: .init(store: fixture.store, lookup: lookup), session: nil,
+            handoff: scope.handoff, ignoresPendingHandoff: true, isCurrent: { true }
+        )
+        XCTAssertEqual(repeated, text)
+    }
+
+    @MainActor
+    func testRuntimeSkillExpansionUsesExplicitRootsAndPreservesNativeCompactNamespace() async throws {
+        let root = try makeTemporaryRoot(name: "RuntimeProviderSkills")
+        let commands = root.appendingPathComponent(".claude/commands")
+        try FileManager.default.createDirectory(at: commands, withIntermediateDirectories: true)
+        try "---\ndescription: Runtime skill\n---\nInspect $ARGUMENTS".write(to: commands.appendingPathComponent("compact.md"), atomically: true, encoding: .utf8)
+        let catalog = AgentSkillCatalog(homeDirectoryURL: root.appendingPathComponent("home"))
+        let input = AgentSessionProviderInputRuntime(skillCatalog: catalog)
+        let native = await input.expandSlashSkillInvocationIfNeeded("/compact retain this", agentKind: .claudeCode, workspacePaths: [root.path])
+        XCTAssertEqual(native, "/compact retain this")
+        let expanded = await input.expandSlashSkillInvocationIfNeeded("/skill:compact retain this", agentKind: .claudeCode, workspacePaths: [root.path])
+        XCTAssertTrue(expanded.contains("<selected_skill_context name=\"compact\""), expanded)
+        XCTAssertTrue(expanded.contains("<user_instructions>\nretain this\n</user_instructions>"), expanded)
+        XCTAssertFalse(expanded.contains("$ARGUMENTS"), expanded)
+        let freshCatalog = AgentSkillCatalog(homeDirectoryURL: root.appendingPathComponent("home"))
+        let unpublished = AgentSessionProviderInputRuntime(skillCatalog: freshCatalog)
+        let refused = await unpublished.expandSlashSkillInvocationIfNeeded("/skill:compact do not publish", agentKind: .claudeCode, workspacePaths: [root.path], shouldPublishCatalog: { false })
+        XCTAssertEqual(refused, "/skill:compact do not publish")
+        XCTAssertNil(freshCatalog.resolve(name: "compact"), "A refused discovery must not publish a skill catalog")
+    }
+
     @MainActor
     func testExpandedBoundWorktreeSuggestionUsesLogicalPathAndSubtitle() async throws {
         let fixture = try await makeBoundFixture(includeBranchOnly: true)
