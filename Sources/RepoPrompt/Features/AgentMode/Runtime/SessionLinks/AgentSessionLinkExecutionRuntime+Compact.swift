@@ -163,7 +163,7 @@ extension AgentSessionLinkExecutionRuntime {
             noticeRevision: 0,
             rawDraftSnapshot: ""
         )
-        guard let claim = commands.claimComposer(attempt) else {
+        guard let claim = claimComposerSubmitAttempt(attempt) else {
             return .blocked(.targetNotIdle)
         }
 

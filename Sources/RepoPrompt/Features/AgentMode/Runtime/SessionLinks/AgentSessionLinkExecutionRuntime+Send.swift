@@ -384,7 +384,7 @@ extension AgentSessionLinkExecutionRuntime {
             // empty snapshot cannot match a real draft and therefore cannot clear the user's text.
             rawDraftSnapshot: ""
         )
-        guard let claim = commands.claimComposer(attempt) else {
+        guard let claim = claimComposerSubmitAttempt(attempt) else {
             return .blocked(.targetNotIdle)
         }
 

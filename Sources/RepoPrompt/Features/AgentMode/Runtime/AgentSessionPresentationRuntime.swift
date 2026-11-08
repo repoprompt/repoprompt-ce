@@ -20,6 +20,7 @@ final class AgentSessionPresentationRuntime {
         var assistantDelta: ((AgentTabSession, Int, UInt64) -> Void)?
         var derivedTranscript: ((AgentTabSession) -> Void)?
         var prepareTerminal: ((AgentTabSession) -> Void)?
+        var composerClaim: ((AgentTabSession) -> Void)?
         var binding: ((AgentTabSession) -> Void)?
         var elapsedTime: ((AgentTabSession) -> Void)?
         var runState: ((AgentTabSession) -> Void)?
@@ -55,6 +56,11 @@ final class AgentSessionPresentationRuntime {
         activeUISyncSuppressionDepth += 1
         defer { activeUISyncSuppressionDepth -= 1 }
         return try body()
+    }
+
+    func composerClaimChanged(_ session: AgentTabSession) {
+        sink(for: session)?.composerClaim?(session)
+        requestUIRefresh(for: session, urgent: true)
     }
 
     func prepareTerminalPublication(_ session: AgentTabSession) {

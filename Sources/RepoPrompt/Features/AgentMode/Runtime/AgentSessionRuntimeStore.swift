@@ -225,6 +225,7 @@ final class AgentSessionRuntimeStore {
         let presentation = AgentSessionPresentationRuntime()
         let usage = AgentSessionUsageRuntime()
         lazy var turnTiming = AgentSessionTurnTimingRuntime(presentation: presentation)
+        lazy var submissions = AgentSessionComposerSubmitRuntime(scope: self)
         private var interactionRuntime: AgentSessionInteractionRuntime?
 
         func interactions(routeID: Int, approvalStore: ApplyEditsApprovalStore) -> AgentSessionInteractionRuntime {

@@ -265,6 +265,30 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
     }
 
+    func testProgrammaticComposerClaimIgnoresLocalWorkspaceSwitchAndSidebarProjection() throws {
+        let fixture = try makeFixture()
+        defer {
+            fixture.viewModel.test_setWorkspaceSwitchInFlight(false)
+            fixture.session.saveDebounceTask?.cancel()
+        }
+        let runtime = fixture.viewModel.linkExecutionRuntime
+        let command = try XCTUnwrap(runtime.admit(fixture.candidate))
+        fixture.session.draftText = "untouched local draft"
+        let generation = fixture.session.draftMutationGeneration
+        fixture.viewModel.test_setWorkspaceSwitchInFlight(true)
+        fixture.manager.workspaces[0].composeTabs[0].activeAgentSessionID = UUID()
+        XCTAssertTrue(command.isCurrent)
+        XCTAssertNil(fixture.viewModel.makeComposerSubmitTarget(tabID: fixture.session.tabID, session: fixture.session))
+        let target = try XCTUnwrap(runtime.makeComposerSubmitTarget(tabID: fixture.session.tabID, session: fixture.session))
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "")
+        let claim = try XCTUnwrap(runtime.claimComposerSubmitAttempt(attempt))
+        XCTAssertTrue(runtime.composerSubmitClaimIsCurrent(claim))
+        XCTAssertEqual(fixture.session.draftText, "untouched local draft")
+        XCTAssertEqual(fixture.session.draftMutationGeneration, generation)
+        XCTAssertTrue(runtime.releaseComposerSubmitClaim(claim))
+        XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
+    }
+
     func testTerminalMaterializationUsesWriterWhileSidebarMismatchStillRefusesPresentation() async throws {
         let fixture = try makeFixture()
         defer { fixture.session.saveDebounceTask?.cancel() }

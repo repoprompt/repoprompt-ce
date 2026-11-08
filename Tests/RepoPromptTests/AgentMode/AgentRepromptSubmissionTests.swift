@@ -227,7 +227,7 @@ final class AgentRepromptSubmissionTests: XCTestCase {
     func testKeptRecoveryRequiresExactDraftAndTransfersOriginalClassificationOnlyOnce() async throws {
         let fixture = try await AgentRepromptTestFixture()
         defer { fixture.cleanUp() }
-        _ = fixture.viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: fixture.session)
+        try fixture.installPersistentWriter()
         fixture.session.installRunID(UUID())
         fixture.session.runState = .running
         fixture.session.isMCPInstructionDispatchInProgress = true
@@ -328,7 +328,7 @@ final class AgentRepromptSubmissionTests: XCTestCase {
             for enabled in [false, true] {
                 let fixture = try await AgentRepromptTestFixture()
                 defer { fixture.cleanUp() }
-                _ = fixture.viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: fixture.session)
+                try fixture.installPersistentWriter()
                 fixture.session.installRunID(UUID())
                 fixture.session.runState = .running
                 fixture.session.isMCPInstructionDispatchInProgress = true
@@ -413,7 +413,7 @@ final class AgentRepromptSubmissionTests: XCTestCase {
     func testAutoSendPublishesOnlyAtSuccessAndUsesFreshDispatchClaimOnce() async throws {
         let fixture = try await AgentRepromptTestFixture()
         defer { fixture.cleanUp() }
-        _ = fixture.viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: fixture.session)
+        try fixture.installPersistentWriter()
         fixture.session.installRunID(UUID())
         fixture.session.runState = .running
         fixture.session.isMCPInstructionDispatchInProgress = true
@@ -714,7 +714,7 @@ final class AgentRepromptSubmissionTests: XCTestCase {
         for change in ["run-review", "stop-stream", "managed-review", "edited-review"] {
             let fixture = try await AgentRepromptTestFixture()
             defer { fixture.cleanUp() }
-            _ = fixture.viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: fixture.session)
+            try fixture.installPersistentWriter()
             fixture.session.hasLoadedPersistedState = true
             fixture.session.recordRestorationAuthoritative(.persistedPayloadApplied)
             fixture.session.installRunID(UUID())
@@ -1011,7 +1011,7 @@ final class AgentRepromptSubmissionTests: XCTestCase {
     func testRealSecondSendTreatsGeneratedNativeSlashAsText() async throws {
         let fixture = try await AgentRepromptTestFixture()
         defer { fixture.cleanUp() }
-        _ = fixture.viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: fixture.session)
+        try fixture.installPersistentWriter()
         fixture.session.installRunID(UUID())
         fixture.session.runState = .running
         fixture.session.isMCPInstructionDispatchInProgress = true
@@ -1095,7 +1095,7 @@ final class AgentRepromptSubmissionTests: XCTestCase {
         for wrapper in 0 ..< 4 {
             let fixture = try await AgentRepromptTestFixture()
             defer { fixture.cleanUp() }
-            _ = fixture.viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: fixture.session)
+            try fixture.installPersistentWriter()
             fixture.session.installRunID(UUID())
             fixture.session.runState = .running
             fixture.session.isMCPInstructionDispatchInProgress = true

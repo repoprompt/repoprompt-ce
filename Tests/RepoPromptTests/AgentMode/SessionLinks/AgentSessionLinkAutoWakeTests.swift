@@ -404,34 +404,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 return nil
             },
             settleSelfCompact: { session in XCTAssertNil(session.selfCompactState.active) },
-            selfCompactBlocksWake: { $0.selfCompactState.blocksAutomaticWake },
-            composerTarget: { [weak session] _, _ in
-                guard workspace != nil, let session else { return nil }
-                return AgentComposerSubmitTarget(
-                    tabID: session.tabID, route: .existingAgentSession,
-                    expectedSourceTabSessionIdentity: ObjectIdentifier(session),
-                    expectedSourceAgentSessionID: sessionID, expectedPersistentBindingIdentity: binding,
-                    expectedBindingTransitionGeneration: session.bindingTransitionGeneration,
-                    expectedRunState: session.runState, expectedRunID: session.runID,
-                    expectedRunAttemptID: session.activeRunAttemptID,
-                    expectedSubmissionToken: session.composerSubmissionToken, expectedInitialStartLocation: nil
-                )
-            },
-            claimComposer: { [weak session] attempt in
-                guard let session, session.activeComposerSubmitAttempt == nil else { return nil }
-                session.activeComposerSubmitAttempt = attempt
-                return AgentSessionComposerSubmitClaim(attempt: attempt, sourceSession: session, draftMutationGeneration: session.draftMutationGeneration)
-            },
-            composerIsCurrent: { [weak scope] claim in
-                scope?.sessions[claim.sourceSession.tabID] === claim.sourceSession
-                    && claim.sourceSession.persistentSessionBindingIdentity == claim.attempt.target.expectedPersistentBindingIdentity
-                    && claim.sourceSession.activeComposerSubmitAttempt?.id == claim.attempt.id
-            },
-            releaseComposer: { claim in
-                guard claim.sourceSession.activeComposerSubmitAttempt?.id == claim.attempt.id else { return false }
-                claim.sourceSession.activeComposerSubmitAttempt = nil
-                return true
-            }
+            selfCompactBlocksWake: { $0.selfCompactState.blocksAutomaticWake }
         ), diagnostics: NoopAgentSessionLinkCatalogEventSink())
         runtime.test_endpointRead = onEndpointRead
         if let workspace {
@@ -548,7 +521,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         try await f.scope.persistence.flushSaveRequired(for: f.session.tabID, workspaceID: workspace.id).get()
         let target = try XCTUnwrap(f.runtime.makeComposerSubmitTarget(tabID: f.session.tabID, session: f.session))
         let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "")
-        let claim = try XCTUnwrap(f.runtime.commands.claimComposer(attempt))
+        let claim = try XCTUnwrap(f.runtime.claimComposerSubmitAttempt(attempt))
         f.scope.beginRetirement()
         XCTAssertFalse(f.scope.releaseWriterClaimsAfterDrain(), "An admitted send claim is still owned work")
         XCTAssertTrue(f.runtime.releaseComposerSubmitClaim(claim))

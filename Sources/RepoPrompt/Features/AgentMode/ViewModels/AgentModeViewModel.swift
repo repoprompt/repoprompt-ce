@@ -938,7 +938,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var cancellationRequestID: UUID?
     }
 
-    var freshTaskRoutingByTabID: [UUID: FreshTaskRoutingOwnership] = [:]
+    var composerSubmitRuntime: AgentSessionComposerSubmitRuntime {
+        runtimeSessionStore.submissions
+    }
+
+    var freshTaskRoutingByTabID: [UUID: FreshTaskRoutingOwnership] {
+        get { composerSubmitRuntime.freshTaskRoutingByTabID }
+        set { composerSubmitRuntime.freshTaskRoutingByTabID = newValue }
+    }
+
     var autoWorkflowJudgments: [UUID: Task<DecisionOutcome, Never>] = [:]
     #if DEBUG
         var test_autoWorkflowCatalog: [AgentWorkflowDefinition]?
@@ -2155,6 +2163,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     guard let self, sessions[session.tabID] === session else { return }
                     removePendingUIRefresh(for: session.tabID)
                 },
+                composerClaim: { [weak self] session in
+                    guard let self, sessions[session.tabID] === session, currentTabID == session.tabID else { return }
+                    syncComposerUIState(tabID: session.tabID)
+                },
                 binding: { [weak self] session in
                     guard let self, sessions[session.tabID] === session else { return }
                     updateBindingsFromSession(session)
@@ -3352,14 +3364,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 )
             },
             settleSelfCompact: { [weak self] session in self?.agentSelfCompactSettleStaleParkedNote(session) },
-            selfCompactBlocksWake: { [weak self] session in self?.agentSelfCompactBlocksNotificationWake(session) ?? true },
-            composerTarget: { [weak self] tabID, session in self?.makeComposerSubmitTarget(tabID: tabID, session: session) },
-            claimComposer: { [weak self] attempt in
-                guard let self, case let .claimed(claim) = claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: false) else { return nil }
-                return claim
-            },
-            composerIsCurrent: { [weak self] claim in self?.composerSubmitClaimIsCurrent(claim) == true },
-            releaseComposer: { [weak self] claim in self?.releaseComposerSubmitClaim(claim) == true }
+            selfCompactBlocksWake: { [weak self] session in self?.agentSelfCompactBlocksNotificationWake(session) ?? true }
         ), diagnostics: catalogDiagnosticsSink)
         runtime.codexCoordinator = codexCoordinator
         runtime.perfRecorder = perfRecorder
@@ -18797,103 +18802,34 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             resyncAfterRejectedSubmitTarget(target)
             return .rejected(rejection)
         }
-        guard let session = sessions[target.tabID] else {
-            let rejection = AgentComposerSubmitClaimRejection.missingSession
-            logRejectedSubmitTarget(target, session: nil, reason: rejection.diagnosticReason, attempt: attempt)
-            resyncAfterRejectedSubmitTarget(target)
-            return .rejected(rejection)
-        }
-        guard ObjectIdentifier(session) == attempt.sourceTabSessionIdentity else {
-            let rejection = AgentComposerSubmitClaimRejection.sourceSessionIdentityMismatch
-            logRejectedSubmitTarget(target, session: session, reason: rejection.diagnosticReason, attempt: attempt)
-            resyncAfterRejectedSubmitTarget(target)
-            return .rejected(rejection)
-        }
-        if let routing = freshTaskRoutingByTabID[target.tabID] {
-            let rejection = AgentComposerSubmitClaimRejection.activeAttemptExists(activeAttemptID: routing.requestID)
-            logRejectedSubmitTarget(
-                target,
-                session: session,
-                reason: rejection.diagnosticReason,
-                attempt: attempt
-            )
-            resyncAfterRejectedSubmitTarget(target)
-            return .rejected(rejection)
-        }
-        if let activeAttempt = session.activeComposerSubmitAttempt {
-            let rejection = AgentComposerSubmitClaimRejection.activeAttemptExists(activeAttemptID: activeAttempt.id)
-            logRejectedSubmitTarget(
-                target,
-                session: session,
-                reason: rejection.diagnosticReason,
-                attempt: attempt,
-                activeAttempt: activeAttempt
-            )
-            resyncAfterRejectedSubmitTarget(target)
-            return .rejected(rejection)
-        }
-        if let rejectionReason = submitTargetRejectionReason(target, session: session) {
-            let rejection = AgentComposerSubmitClaimRejection.targetRejected(reason: rejectionReason)
-            logRejectedSubmitTarget(target, session: session, reason: rejectionReason, attempt: attempt)
-            resyncAfterRejectedSubmitTarget(target)
-            return .rejected(rejection)
-        }
-        if session.isPreparingInitialWorktree {
-            let rejection = AgentComposerSubmitClaimRejection.initialWorktreePreparationInProgress
-            logRejectedSubmitTarget(target, session: session, reason: rejection.diagnosticReason, attempt: attempt)
-            resyncAfterRejectedSubmitTarget(target)
-            return .rejected(rejection)
-        }
-        if session.isChangingExecutionLocation {
-            let rejection = AgentComposerSubmitClaimRejection.executionLocationChangeInProgress
-            logRejectedSubmitTarget(target, session: session, reason: rejection.diagnosticReason, attempt: attempt)
-            resyncAfterRejectedSubmitTarget(target)
-            return .rejected(rejection)
-        }
-
-        session.activeComposerSubmitAttempt = attempt
-        session.composerSubmissionToken = UUID()
-        let claim = AgentComposerSubmitClaim(
-            attempt: attempt,
-            sourceSession: session,
-            draftMutationGeneration: session.draftMutationGeneration
+        let result = composerSubmitRuntime.claim(
+            attempt,
+            presentationRejection: submitTargetRejectionReason(target, session: sessions[target.tabID]),
+            publishesPresentation: false
         )
-        if requireActiveTabOwnership { adoptRepromptPreparation(into: claim) }
-        if currentTabID == target.tabID {
-            syncComposerUIState(tabID: target.tabID)
+        switch result {
+        case let .claimed(claim):
+            if requireActiveTabOwnership { adoptRepromptPreparation(into: claim) }
+            // Transfer local preparation before publishing the rotated submission token. An
+            // earlier UI refresh would invalidate and discard that still-unadopted preparation.
+            runtimeSessionStore.presentation.composerClaimChanged(claim.sourceSession)
+            logComposerSubmitClaimAccepted(claim)
+        case let .rejected(rejection):
+            logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: rejection.diagnosticReason, attempt: attempt)
+            resyncAfterRejectedSubmitTarget(target)
         }
-        requestUIRefresh(tabID: target.tabID, urgent: true)
-        logComposerSubmitClaimAccepted(claim)
-        return .claimed(claim)
+        return result
     }
 
     func composerSubmitClaimIsCurrent(_ claim: AgentComposerSubmitClaim) -> Bool {
-        let attempt = claim.attempt
-        return ObjectIdentifier(claim.sourceSession) == attempt.sourceTabSessionIdentity
-            && sessions[attempt.sourceTabID] === claim.sourceSession
-            && claim.sourceSession.activeComposerSubmitAttempt?.id == attempt.id
+        composerSubmitRuntime.isCurrent(claim)
     }
 
     @discardableResult
     func releaseComposerSubmitClaim(_ claim: AgentComposerSubmitClaim) -> Bool {
-        let attempt = claim.attempt
-        let sourceSession = claim.sourceSession
-        guard ObjectIdentifier(sourceSession) == attempt.sourceTabSessionIdentity,
-              sourceSession.activeComposerSubmitAttempt?.id == attempt.id
-        else {
-            logComposerSubmitClaimRelease(claim, accepted: false)
-            return false
-        }
-
-        sourceSession.activeComposerSubmitAttempt = nil
-        if sessions[attempt.sourceTabID] === sourceSession,
-           currentTabID == attempt.sourceTabID
-        {
-            syncComposerUIState(tabID: attempt.sourceTabID)
-        }
-        requestUIRefresh(tabID: attempt.sourceTabID, urgent: true)
-        logComposerSubmitClaimRelease(claim, accepted: true)
-        return true
+        let released = claim.scope.submissions.release(claim)
+        logComposerSubmitClaimRelease(claim, accepted: released)
+        return released
     }
 
     private func clearComposerDraftIfUnchanged(for claim: AgentComposerSubmitClaim) {

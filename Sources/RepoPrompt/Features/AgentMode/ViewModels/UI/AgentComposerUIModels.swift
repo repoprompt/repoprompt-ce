@@ -170,6 +170,8 @@ struct AgentComposerSubmitTarget: Equatable {
     /// One-shot render identity claimed before submission performs any async work.
     let expectedSubmissionToken: UUID
     let expectedInitialStartLocation: AgentModeViewModel.InitialStartLocation?
+    /// Persistent targets capture the writer incarnation as well as the binding generation.
+    var expectedWriterIdentity: AgentSessionRuntimeStore.WriterIdentity?
 }
 
 struct AgentComposerSubmitAttempt: Equatable {

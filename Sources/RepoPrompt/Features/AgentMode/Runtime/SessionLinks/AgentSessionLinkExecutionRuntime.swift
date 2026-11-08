@@ -5,12 +5,6 @@ import RepoPromptInstrumentation
 import RepoPromptMCPServer
 import RepoPromptSettingsCore
 
-struct AgentSessionComposerSubmitClaim {
-    let attempt: AgentComposerSubmitAttempt
-    let sourceSession: AgentTabSession
-    let draftMutationGeneration: UInt64
-}
-
 /// Scope-owned provider-input composition and wake scheduling. Membership authority, passive
 /// delivery, claim accounting and wake reservations retain their existing, disjoint owners.
 /// Commands are required composition inputs, not optional presentation callbacks. The legacy
@@ -34,10 +28,6 @@ final class AgentSessionLinkExecutionRuntime {
         let start: @MainActor (AgentTabSession, String, AgentDirectRunStartOptions, AgentRunStartOutcomeRecorder?, AgentProviderSwitchSendPreparation?) async -> CodexAgentModeCoordinator.NativeSendOutcome?
         let settleSelfCompact: @MainActor (AgentTabSession) -> Void
         let selfCompactBlocksWake: @MainActor (AgentTabSession) -> Bool
-        let composerTarget: @MainActor (UUID?, AgentTabSession?) -> AgentComposerSubmitTarget?
-        let claimComposer: @MainActor (AgentComposerSubmitAttempt) -> AgentComposerSubmitClaim?
-        let composerIsCurrent: @MainActor (AgentComposerSubmitClaim) -> Bool
-        let releaseComposer: @MainActor (AgentComposerSubmitClaim) -> Bool
     }
 
     private(set) weak var scope: AgentSessionRuntimeStore.Scope?
@@ -152,15 +142,27 @@ final class AgentSessionLinkExecutionRuntime {
     }
 
     func makeComposerSubmitTarget(tabID: UUID?, session: AgentTabSession?) -> AgentComposerSubmitTarget? {
-        commands.composerTarget(tabID, session)
+        guard let scope, let tabID, let session = session ?? scope.sessions[tabID],
+              session.tabID == tabID, let id = session.activeAgentSessionID,
+              case let .unique(writer) = scope.resolveWriter(sessionID: id),
+              writer.scope === scope, writer.session === session,
+              let command = try? writer.admitCommand().get() else { return nil }
+        return scope.submissions.programmaticTarget(command)
+    }
+
+    func claimComposerSubmitAttempt(_ attempt: AgentComposerSubmitAttempt) -> AgentComposerSubmitClaim? {
+        guard let scope, attempt.target.route == .existingAgentSession,
+              case let .claimed(claim) = scope.submissions.claim(attempt) else { return nil }
+        return claim
     }
 
     func composerSubmitClaimIsCurrent(_ claim: AgentComposerSubmitClaim) -> Bool {
-        commands.composerIsCurrent(claim)
+        scope === claim.scope && claim.scope.submissions.isCurrent(claim)
     }
 
     @discardableResult
     func releaseComposerSubmitClaim(_ claim: AgentComposerSubmitClaim) -> Bool {
-        commands.releaseComposer(claim)
+        guard scope === claim.scope else { return false }
+        return claim.scope.submissions.release(claim)
     }
 }

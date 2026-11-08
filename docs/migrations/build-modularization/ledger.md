@@ -5486,3 +5486,37 @@ passed `ec61e564-fbc6-4b80-9cc3-dad8195e8bc4`; full lint passed
 including the new runtime tests. Fresh index remained **1239/1360** wrong-way file edges and
 **53/66** largest-cycle components. Three emitted touched-file warning signatures matched the prior
 baseline; no new warnings were introduced. Live-app and full-suite validation were not run.
+
+### M9.2 partial milestone: runtime-owned composer submission claims
+
+`AgentSessionComposerSubmitRuntime` now owns the shared check-and-mutate, currency and release
+implementation for the existing session submission attempt and token. Its scope retains the sole
+fresh-task routing map; no parallel claim ledger was added. Existing-session targets carry the exact
+writer identity, and accepted claims retain their originating scope and command. A copied binding
+cannot revive a target after the scope releases and reacquires its writer claim. Cleanup can still
+release the originating attempt after retirement or replacement without clearing a successor.
+
+Programmatic link targets use only the admitted writer, not local focus, sidebar metadata, draft text
+or workspace-switch presentation state. The four composer target/claim/currency/release callbacks
+are removed from `AgentSessionLinkExecutionRuntime.Commands`. Local composer preparation retains
+its presentation checks and the unbound creation route; its first binding remains the existing
+creation owner's responsibility. Optional presentation notifications mirror the resulting claim.
+Local re-prompt preparation transfers to the new claim before its token change is published to UI;
+the broader re-prompt suites exposed and protect this ordering. Programmatic claims need no such
+local preparation. The other start, input, self-compaction and command-routing adapters remain open
+M9.2 work.
+
+Coverage includes claims without presentation, exact incarnation replacement, retirement cleanup,
+first binding of a local draft, and a real VM whose local workspace switch/sidebar mismatch cannot
+block a valid programmatic claim. Four isolated routing fixtures now install workspace-qualified
+restored writers; the delayed-handoff fixture carries the exact writer identity so it continues to
+prove the specific durable execution-location blocker rather than failing an unrelated identity check.
+
+Validation: `e4e842d1-2a5b-4dbf-99b3-86ef21f99e94` passed **458 focused tests**, including
+local draft, workflow and re-prompt integration as well as writer, link, compaction, restoration and
+handoff cases. Both products passed `d784a8d3-6c1c-4c02-9aaf-9c3572cb5d67`; full lint passed
+`a1435b83-511a-4c3d-a78e-244025cff613`, with an explicit scoped check for the new runtime file.
+Fresh index passed **1241/1360** wrong-way file edges and **53/66** largest-cycle components.
+Six emitted touched-file warning signatures matched the previous baseline; none were new.
+Earlier runs exposed the legacy unscoped fixtures and the local publication-order regression;
+those failures are not qualification receipts. No live-app or full-suite validation was run.

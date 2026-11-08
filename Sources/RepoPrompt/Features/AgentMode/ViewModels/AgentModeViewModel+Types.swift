@@ -117,36 +117,8 @@ extension AgentModeViewModel {
 
     typealias AgentComposerSubmitClaim = AgentSessionComposerSubmitClaim
 
-    enum AgentComposerSubmitClaimRejection: Equatable {
-        case missingSession
-        case sourceSessionIdentityMismatch
-        case activeAttemptExists(activeAttemptID: UUID)
-        case targetRejected(reason: String)
-        case initialWorktreePreparationInProgress
-        case executionLocationChangeInProgress
-
-        var diagnosticReason: String {
-            switch self {
-            case .missingSession:
-                "missing_session"
-            case .sourceSessionIdentityMismatch:
-                "source_session_identity_mismatch"
-            case .activeAttemptExists:
-                "existing_claim"
-            case let .targetRejected(reason):
-                reason
-            case .initialWorktreePreparationInProgress:
-                "initial_worktree_preparation_in_progress"
-            case .executionLocationChangeInProgress:
-                "execution_location_change_in_progress"
-            }
-        }
-    }
-
-    enum AgentComposerSubmitClaimResult {
-        case claimed(AgentComposerSubmitClaim)
-        case rejected(AgentComposerSubmitClaimRejection)
-    }
+    typealias AgentComposerSubmitClaimRejection = AgentSessionComposerSubmitClaimRejection
+    typealias AgentComposerSubmitClaimResult = AgentSessionComposerSubmitClaimResult
 
     typealias RunInteractionStateChangeReason = AgentRunInteractionStateChangeReason
 
