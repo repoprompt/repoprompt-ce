@@ -4958,3 +4958,46 @@ Validation:
 Independent canonical writer admission, window-free saved-host composition, remaining runtime
 commands/routing, presentation-preserving execution and full final qualification remain open.
 This is not full-suite, aggregate-warning, hosted-CI or live-smoke qualification, and not M9 completion.
+
+### M9 continuation — MCP execution bookkeeping without presentation (2026-11-08)
+
+Moved the actual tool-token maps, run/connection indexes, ended counts, idle continuations and
+child-run wait scopes from `MCPServerViewModel` into `MCPToolExecutionRuntime`. The legacy server
+forwards to that same storage; it retains contextual run resolution and the legacy single-slot UI.
+Codex/Claude steering queries and cancellation, plus run-service idle waiting, retain the concrete
+owner instead of weakly consulting a server presentation. Close-safety publication is optional and
+weakly bound to the presenter. Registration, connection isolation, captured-timeout expiration and
+exact cursor wake behavior retain their existing algorithms.
+
+Review identified a completion-lifetime gap: retaining the tracker while leaving completion behind
+weak VM cleanup could strand tracked tools. The existing once-only completion claim, instrumentation
+and unregistration now live with the execution owner; only clearing the matching UI slot is optional.
+The existing lock-protected cleanup claim was relocated unchanged, not replaced by a second lock or
+new unchecked-Sendable escape hatch. Cancellation still unregisters steering bookkeeping immediately:
+zero tracked executions is explicitly **not** proof that physical side effects have drained.
+
+Coverage adds standalone token/connection isolation and duplicate completion, idle continuation
+completion/cancellation with owner lifetime, overlapping child scopes with captured timeout expiry,
+and actual server disposal followed by retained runtime completion. Existing provider steering,
+Context Builder abort and physical file-read cancellation tests remain intact. Assertions/timeouts
+were not weakened; a new unused weak-variable warning was corrected to an immutable weak binding.
+
+Validation:
+- `62033390-ad47-4a69-8629-f9a7f33c5048` passed **151 tests** before the review completion fix.
+- Final `1636c4e7-17e8-4464-912d-5e306c063e2f` passed **188 tests**: MCP idle/runtime 6,
+  MCP transport 4, Claude approval/resume 38, Codex resume/wedge 74, managed ACP steering 29,
+  Context Builder abort 1 and physical content-read cancellation 36.
+- Both products passed `688e2c5a-102d-4216-8f5d-dfca46ee6712`; lint passed
+  `1c27cc07-0894-4de4-bfb7-889c8b571f57` on the same Swift tree.
+- Fresh compiler index passed **1241/1360** wrong-way file edges and **53/66** largest-cycle
+  components (1132 files, 156429 symbols), with no baseline increase.
+- Scoped formatting and one independent review completed. Source tracing confirmed the server is
+  assigned only during VM initialization and the tool canceller is immutable/purely forwarded;
+  capturing its actual execution owner therefore does not skip a later replacement mechanism.
+  Mandatory staged contribution preflight applies before commit.
+
+Canonical writer admission, saved-target host composition, domain-backed route/catalog/context
+admission and remaining startup/terminal commands still require the main M9 cutover. In particular,
+legacy child-wake publication/origin callbacks and tool bootstrap still depend on window composition.
+This checkpoint is not full-suite, aggregate-warning, hosted-CI or live-smoke qualification and does
+not establish presentation-preserving managed execution or M9 completion.

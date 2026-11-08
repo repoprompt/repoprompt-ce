@@ -2926,8 +2926,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 reason: reason
             )
         }
-        mcpRunToolCanceller = { [weak mcpServer] runID, reason in
-            mcpServer?.cancelActiveToolsForRun(runID: runID, reason: reason) ?? 0
+        mcpRunToolCanceller = { [tools = mcpServer.toolExecutionRuntime] runID, reason in
+            tools.cancelActiveToolsForRun(runID: runID, reason: reason)
         }
         providerConversationCleanupRegistry = ProviderConversationCleanupRegistry()
         shouldManageCodexTooling = true
@@ -2942,11 +2942,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 providerBindingService.codexCapabilitiesForLaunch(isMCPRelated: isMCPRelated)
             },
             codexHookApprovalSettings: GlobalSettingsStore.shared,
-            activeToolQuery: { [weak mcpServer] runID in
-                mcpServer?.hasActiveToolExecutions(runID: runID) ?? false
+            activeToolQuery: { [tools = mcpServer.toolExecutionRuntime] runID in
+                tools.hasActiveToolExecutions(runID: runID)
             },
-            activeAgentRunWaitQuery: { [weak mcpServer] runID in
-                mcpServer?.hasActiveChildAgentRunWaits(runID: runID) ?? false
+            activeAgentRunWaitQuery: { [tools = mcpServer.toolExecutionRuntime] runID in
+                tools.hasActiveChildAgentRunWaits(runID: runID)
             },
             stallWatchdogProbeThreshold: 90,
             stallWatchdogRecoveryThreshold: 300,
@@ -2958,18 +2958,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         claudeCoordinator = ClaudeAgentModeCoordinator(
             windowID: windowID,
             workspacePathProvider: sessionWorkspacePathProvider,
-            awaitNoActiveMCPTools: { [weak mcpServer] runID in
-                guard let mcpServer else { return }
-                try await mcpServer.awaitNoActiveToolExecutions(runID: runID)
+            awaitNoActiveMCPTools: { [tools = mcpServer.toolExecutionRuntime] runID in
+                try await tools.awaitNoActiveToolExecutions(runID: runID)
             },
-            toolEndedCount: { [weak mcpServer] runID in
-                mcpServer?.toolEndedCount(runID: runID) ?? 0
+            toolEndedCount: { [tools = mcpServer.toolExecutionRuntime] runID in
+                tools.toolEndedCount(runID: runID)
             },
-            hasActiveMCPTools: { [weak mcpServer] runID in
-                mcpServer?.hasActiveToolExecutions(runID: runID) ?? false
+            hasActiveMCPTools: { [tools = mcpServer.toolExecutionRuntime] runID in
+                tools.hasActiveToolExecutions(runID: runID)
             },
-            hasActiveChildAgentRunWaits: { [weak mcpServer] runID in
-                mcpServer?.hasActiveChildAgentRunWaits(runID: runID) ?? false
+            hasActiveChildAgentRunWaits: { [tools = mcpServer.toolExecutionRuntime] runID in
+                tools.hasActiveChildAgentRunWaits(runID: runID)
             },
             autoEffortConfigurationProvider: { [modelRouterSettingsStore] in modelRouterSettingsStore.autoEffortConfiguration() }
         )
@@ -3159,8 +3158,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             self.mcpServerEnabler = mcpServerEnabler
             self.mcpRunRoutingCleaner = mcpRunRoutingCleaner
             self.mcpRunToolCanceller = mcpRunToolCanceller
-                ?? { [weak testMCPServer] runID, reason in
-                    testMCPServer?.cancelActiveToolsForRun(runID: runID, reason: reason) ?? 0
+                ?? { [tools = testMCPServer?.toolExecutionRuntime] runID, reason in
+                    tools?.cancelActiveToolsForRun(runID: runID, reason: reason) ?? 0
                 }
             self.providerConversationCleanupRegistry = providerConversationCleanupRegistry
             self.shouldManageCodexTooling = shouldManageCodexTooling
@@ -3189,12 +3188,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 authRecovery: testCodexManagedAuthRecovery ?? CodexManagedAuthRecoveryService.shared,
                 codexHookApprovalSettings: testCodexHookApprovalSettingsProvider ?? GlobalSettingsStore.shared,
                 activeToolQuery: testCodexActiveToolQuery
-                    ?? { [weak testMCPServer] runID in
-                        testMCPServer?.hasActiveToolExecutions(runID: runID) ?? false
+                    ?? { [tools = testMCPServer?.toolExecutionRuntime] runID in
+                        tools?.hasActiveToolExecutions(runID: runID) ?? false
                     },
                 activeAgentRunWaitQuery: testCodexActiveAgentRunWaitQuery
-                    ?? { [weak testMCPServer] runID in
-                        testMCPServer?.hasActiveChildAgentRunWaits(runID: runID) ?? false
+                    ?? { [tools = testMCPServer?.toolExecutionRuntime] runID in
+                        tools?.hasActiveChildAgentRunWaits(runID: runID) ?? false
                     },
                 activeAgentRunWaitDrain: testCodexActiveAgentRunWaitDrain
                     ?? { [weak testMCPServer] runID, _, source, steeringMessage in
@@ -3222,14 +3221,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 windowID: testWindowID,
                 workspacePathProvider: sessionWorkspacePathProvider,
                 claudeControllerFactory: claudeControllerFactory,
-                toolEndedCount: { [weak testMCPServer] runID in
-                    testMCPServer?.toolEndedCount(runID: runID) ?? 0
+                toolEndedCount: { [tools = testMCPServer?.toolExecutionRuntime] runID in
+                    tools?.toolEndedCount(runID: runID) ?? 0
                 },
-                hasActiveMCPTools: { [weak testMCPServer] runID in
-                    testMCPServer?.hasActiveToolExecutions(runID: runID) ?? false
+                hasActiveMCPTools: { [tools = testMCPServer?.toolExecutionRuntime] runID in
+                    tools?.hasActiveToolExecutions(runID: runID) ?? false
                 },
-                hasActiveChildAgentRunWaits: { [weak testMCPServer] runID in
-                    testMCPServer?.hasActiveChildAgentRunWaits(runID: runID) ?? false
+                hasActiveChildAgentRunWaits: { [tools = testMCPServer?.toolExecutionRuntime] runID in
+                    tools?.hasActiveChildAgentRunWaits(runID: runID) ?? false
                 },
                 autoEffortConfigurationProvider: { [testModelRouterSettingsStore] in testModelRouterSettingsStore.autoEffortConfiguration() }
             )
@@ -3757,22 +3756,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             bindPendingOracleReviewContext: { tabID, runID in
                 publication.mcpBindPendingAgentRunOracleReviewContext(tabID: tabID, runID: runID)
             },
-            cancelMCPToolsForRun: { [weak self] runID, reason in
-                self?.cancelActiveToolsForRun(runID: runID, reason: reason)
+            cancelMCPToolsForRun: { [mcpRunToolCanceller] runID, reason in
+                mcpRunToolCanceller(runID, reason)
             },
-            awaitNoActiveMCPTools: { [weak self] runID in
-                guard let self else { return }
+            awaitNoActiveMCPTools: { [weak self, tools = mcpServer?.toolExecutionRuntime] runID in
                 #if DEBUG
-                    if let test_beforeACPToolIdleWait {
-                        try await test_beforeACPToolIdleWait()
+                    if let hook = self?.test_beforeACPToolIdleWait {
+                        try await hook()
                         return
                     }
                 #endif
-                guard let mcp = mcpServer else { return }
-                try await mcp.awaitNoActiveToolExecutions(runID: runID)
+                try await tools?.awaitNoActiveToolExecutions(runID: runID)
             },
-            activeAgentRunWaitQuery: { [weak self] runID in
-                self?.mcpServer?.hasActiveChildAgentRunWaits(runID: runID) ?? false
+            activeAgentRunWaitQuery: { [tools = mcpServer?.toolExecutionRuntime] runID in
+                tools?.hasActiveChildAgentRunWaits(runID: runID) ?? false
             },
             childAgentRunWaitDrainTimeoutSeconds: Self.childAgentRunWaitDrainTimeoutSeconds
         )
