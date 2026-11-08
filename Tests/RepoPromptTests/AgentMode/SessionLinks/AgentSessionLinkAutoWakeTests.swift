@@ -393,6 +393,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         )
         let runtime = scope.makeLinkExecution(routeID: endpoint.windowID, commands: .init(
             isAvailable: isAvailable,
+            modelAvailability: { .init() },
             workspaceID: { _ in workspaceID },
             augment: { _, input, _, _, _ in input },
             initialMessage: { _, input in input },

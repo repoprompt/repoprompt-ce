@@ -27,6 +27,8 @@ final class AgentSessionPresentationRuntime {
         var worktreeOperations: ((AgentTabSession) -> Void)?
         var draftChanged: ((AgentTabSession, String) -> Void)?
         var draftRestored: ((AgentTabSession, AgentComposerDraftRestorationEvent) -> Void)?
+        var modelConfiguration: ((AgentTabSession, AgentModelCatalogRuntime.Selection) -> Void)?
+        var reasoningEffort: ((AgentTabSession) -> Void)?
     }
 
     struct Attachment: Equatable {
@@ -77,6 +79,14 @@ final class AgentSessionPresentationRuntime {
 
     func draftRestored(_ session: AgentTabSession, event: AgentComposerDraftRestorationEvent) {
         sink(for: session)?.draftRestored?(session, event)
+    }
+
+    func modelConfigurationChanged(_ session: AgentTabSession, selection: AgentModelCatalogRuntime.Selection) {
+        sink(for: session)?.modelConfiguration?(session, selection)
+    }
+
+    func reasoningEffortChanged(_ session: AgentTabSession) {
+        sink(for: session)?.reasoningEffort?(session)
     }
 
     func oversightBindingChanged(_ session: AgentTabSession) {

@@ -796,9 +796,18 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
                 let session = window.agentModeViewModel.session(for: tabID)
                 session.selectedAgent = .claudeCode
                 session.hasLoadedPersistedState = true
-                _ = try XCTUnwrap(window.agentModeViewModel.test_installPersistentSessionBinding(
-                    sessionID: sessionID, on: session
-                ))
+                if window === first {
+                    _ = try XCTUnwrap(window.agentModeViewModel.test_installPersistentSessionBinding(
+                        sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+                    ))
+                } else {
+                    XCTAssertEqual(window.agentModeViewModel.test_bindingRejection(sessionID: sessionID, on: session), .conflictingWriter)
+                    XCTAssertNil(window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session))
+                    XCTAssertNil(session.persistentSessionBindingIdentity)
+                    // Discovery still diagnoses legacy corruption, even though normal installation
+                    // now refuses a second writer. Inject only for this read-only census witness.
+                    session.testInstallPersistentSessionBinding(sessionID: sessionID)
+                }
             }
             manager.allWindows = [first, second]
             let firstCandidate = try XCTUnwrap(first.agentModeViewModel.agentSessionLinkCandidates(isWindowClosing: false).first)
@@ -827,6 +836,8 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
                 }
             }
 
+            XCTAssertNil(manager.agentSessionLinkModelCandidate(for: firstCandidate.domainEndpoint))
+            XCTAssertNil(manager.agentSessionLinkModelCandidate(for: secondCandidate.domainEndpoint), "No model command may elect one conflicting writer")
             try assertQueries("Both routable windows retain the shared UUID")
             XCTAssertEqual(manager.agentSessionLinkCandidates().count, 2)
             manager.allWindows = [first, first, second]
@@ -841,7 +852,10 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             let duplicateTabID = UUID()
             workspace.workspaces[0].composeTabs.append(ComposeTabState(id: duplicateTabID, name: "Duplicate", activeAgentSessionID: sessionID))
             let duplicate = vm.session(for: duplicateTabID)
-            _ = vm.test_installPersistentSessionBinding(sessionID: sessionID, on: duplicate)
+            XCTAssertEqual(vm.test_bindingRejection(sessionID: sessionID, on: duplicate), .conflictingWriter)
+            XCTAssertNil(vm.test_installPersistentSessionBinding(sessionID: sessionID, on: duplicate))
+            XCTAssertNil(duplicate.persistentSessionBindingIdentity)
+            duplicate.testInstallPersistentSessionBinding(sessionID: sessionID)
             duplicate.hasLoadedPersistedState = true
             try assertQueries("Duplicate UUID in distinct tabs and windows")
             XCTAssertEqual(manager.agentSessionLinkCandidates().count, 3)

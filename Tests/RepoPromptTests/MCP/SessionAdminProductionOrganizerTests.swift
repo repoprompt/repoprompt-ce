@@ -247,16 +247,34 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
     }
 
     private func installStopRun(
-        in window: WindowState, tabID: UUID, sessionID: UUID
-    ) -> AgentModeViewModel.TabSession {
+        in window: WindowState, tabID: UUID, sessionID: UUID, injectConflictingWriter: Bool = false
+    ) throws -> AgentModeViewModel.TabSession {
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
-        session.testInstallPersistentSessionBinding(sessionID: sessionID)
+        window.agentModeViewModel.test_installLiveSession(session)
+        if injectConflictingWriter {
+            XCTAssertEqual(window.agentModeViewModel.test_bindingRejection(sessionID: sessionID, on: session), .conflictingWriter)
+            XCTAssertNil(window.agentModeViewModel.test_installPersistentSessionBinding(
+                sessionID: sessionID, on: session
+            ))
+            XCTAssertNil(session.persistentSessionBindingIdentity)
+            // Deliberately inject corrupt legacy state to exercise the resolver's defensive
+            // conflict path. Ordinary writer admission above must refuse this second claim.
+            _ = session.beginPersistentBindingTransition()
+            try session.installPersistentSessionBinding(.init(
+                tabID: tabID, sessionID: sessionID, workspaceID: XCTUnwrap(window.workspaceManager.activeWorkspaceID)
+            ))
+        } else {
+            _ = try XCTUnwrap(window.agentModeViewModel.test_installPersistentSessionBinding(
+                sessionID: sessionID, on: session
+            ))
+        }
+        XCTAssertEqual(session.persistentSessionBindingIdentity?.workspaceID, window.workspaceManager.activeWorkspaceID)
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
         session.runState = .running
         session.installRunID(UUID())
         _ = session.beginRunAttempt(source: "session-admin-stop-integration")
-        window.agentModeViewModel.test_installLiveSession(session)
         return session
     }
 
@@ -378,7 +396,7 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
                 try await withStopCarrierWindows(count: 2) { windows, _, tab, target in
                     let cold = windows[0]
                     let live = windows[1]
-                    let session = installStopRun(in: live, tabID: tab.id, sessionID: target)
+                    let session = try installStopRun(in: live, tabID: tab.id, sessionID: target)
                     var cancelledObjects: [ObjectIdentifier] = []
                     live.agentModeViewModel.test_setBeforeCancellationCommit { candidate in
                         cancelledObjects.append(ObjectIdentifier(candidate))
@@ -403,7 +421,9 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
     func testStopRejectsDistinctLiveObjectsAtTheSameCanonicalAddress() async throws {
         try await MCPSharedServerTestLease.shared.withLease { _ in
             try await withStopCarrierWindows(count: 2) { windows, _, tab, target in
-                let sessions = windows.map { installStopRun(in: $0, tabID: tab.id, sessionID: target) }
+                let sessions = try windows.enumerated().map {
+                    try installStopRun(in: $0.element, tabID: tab.id, sessionID: target, injectConflictingWriter: $0.offset > 0)
+                }
                 let generations = sessions.map(\.stopState.cancellationGeneration)
                 let runIDs = sessions.map(\.runID)
                 var cancellationCommits = 0
@@ -429,7 +449,7 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
             for change in ["revoked", "rebound", "duplicate_carrier"] {
                 try await withStopCarrierWindows(count: 1) { windows, _, tab, target in
                     let window = windows[0]
-                    let session = installStopRun(in: window, tabID: tab.id, sessionID: target)
+                    let session = try installStopRun(in: window, tabID: tab.id, sessionID: target)
                     let generation = session.stopState.cancellationGeneration
                     let runID = session.runID
                     var cancellationCommits = 0
@@ -468,7 +488,7 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
             try await withStopCarrierWindows(count: 1) { windows, _, tab, target in
                 let window = windows[0]
                 let viewModel = window.agentModeViewModel
-                let session = installStopRun(in: window, tabID: tab.id, sessionID: target)
+                let session = try installStopRun(in: window, tabID: tab.id, sessionID: target)
                 var completedObjects: [ObjectIdentifier] = []
                 viewModel.test_setBeforeCancellationCommit { candidate in
                     completedObjects.append(ObjectIdentifier(candidate))

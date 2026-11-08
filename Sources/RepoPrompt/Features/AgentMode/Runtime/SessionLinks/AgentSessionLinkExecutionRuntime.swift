@@ -3,6 +3,7 @@ import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import RepoPromptMCPServer
+import RepoPromptSettingsCore
 
 struct AgentSessionComposerSubmitClaim {
     let attempt: AgentComposerSubmitAttempt
@@ -25,6 +26,7 @@ final class AgentSessionLinkExecutionRuntime {
         /// adapter phase this preserves the old all-or-nothing late-hook behavior after VM loss.
         /// A nonvisual host supplies its own lifetime independently of presentation.
         let isAvailable: @MainActor () -> Bool
+        let modelAvailability: @MainActor () -> AgentModelCatalog.AvailabilityContext?
         let workspaceID: @MainActor (AgentTabSession) -> UUID?
         let augment: @MainActor (AgentTabSession, String, [AgentFileAttachment], [AgentTaggedFileAttachment], Bool) async -> String
         let initialMessage: @MainActor (AgentTabSession, String) async -> String

@@ -1004,8 +1004,11 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
     func agentSessionLinkModelCandidate(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> AgentSessionLinkEndpointCandidate? {
-        guard let window = modelRoutingWindow(withID: endpoint.windowID) else { return nil }
-        return window.agentModeViewModel.agentSessionLinkModelCandidate(for: endpoint)
+        guard !isTerminating,
+              case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+                  sessionID: endpoint.sessionID, expectedWorkspaceID: endpoint.workspaceID
+              ), let runtime = writer.scope.linkExecution else { return nil }
+        return runtime.agentSessionLinkModelCandidate(for: endpoint)
     }
 
     func agentSessionLinkBootstrapState(
@@ -1037,12 +1040,12 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         reauthorize: @MainActor () async -> AgentSessionLinkSendCommitOutcome
     ) async -> AgentSessionLinkModelOutcome {
         guard !isTerminating else { return .blocked(.shuttingDown) }
-        guard let window = modelRoutingWindow(withID: candidate.windowID) else {
+        guard let runtime = agentSessionLinkCommandRuntime(for: candidate) else {
             return .blocked(.endpointHost)
         }
-        return await window.agentModeViewModel.agentSessionLinkPerformSetModel(
+        return await runtime.agentSessionLinkPerformSetModel(
             to: candidate, modelID: modelID, liveness: liveness,
-            availability: { window.apiSettingsViewModel.agentAvailability }, reauthorize: reauthorize
+            availability: runtime.commands.modelAvailability, reauthorize: reauthorize
         )
     }
 

@@ -312,18 +312,17 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
     ) async -> SessionAdminLifecycleOutcome {
         if let refusal = await prepareIfUnloaded(sessionID, isStillAuthorized: isStillAuthorized) { return refusal }
         let windows = WindowStatesManager.shared
-        guard let owner = SessionAdminWindows.runtimeOwner(for: sessionID),
-              let candidate = windows.agentSessionLinkCandidates(forSessionIDs: [sessionID], includeLocation: false)[sessionID]?.only,
-              candidate.windowID == owner.location.window.windowID,
-              let modelCandidate = windows.agentSessionLinkModelCandidate(for: candidate.domainEndpoint)
+        guard let command = try? SessionAdminWindows.command(for: sessionID),
+              let runtime = command.writer.scope.linkExecution,
+              let endpoint = runtime.agentSessionLinkObserverEndpoint(tabID: command.writer.session.tabID),
+              let modelCandidate = runtime.agentSessionLinkModelCandidate(for: endpoint)
         else { return .blocked("The target session is not live.") }
-        let endpoint = candidate.domainEndpoint
         // Same commit seam as `agent_session_link set_model`; the scope lease is the final fence.
         let outcome = await windows.agentSessionLinkPerformSetModel(
             to: modelCandidate,
             modelID: modelID,
             liveness: {
-                let live = SessionAdminWindows.isCurrent(owner) && windows.agentSessionLinkModelCandidate(for: endpoint) != nil
+                let live = command.isCurrent && runtime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint
                 return AgentSessionLinkSendLiveness(
                     observerEndpointIsLive: isStillAuthorized(), targetEndpointIsLive: live, targetWindowIsClosing: false
                 )
@@ -350,12 +349,13 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         isStillAuthorized: @escaping @MainActor () -> Bool
     ) async -> SessionAdminLifecycleOutcome {
         if let refusal = await prepareIfUnloaded(sessionID, isStillAuthorized: isStillAuthorized) { return refusal }
-        guard let owner = SessionAdminWindows.runtimeOwner(for: sessionID) else {
+        guard let command = try? SessionAdminWindows.command(for: sessionID),
+              let runtime = command.writer.scope.linkExecution
+        else {
             return .blocked("The target session is not live.")
         }
-        return owner.location.window.agentModeViewModel.delegationSetReasoningEffort(
-            sessionID: sessionID, effort: effort,
-            isStillAuthorized: { isStillAuthorized() && SessionAdminWindows.isCurrent(owner) }
+        return runtime.delegationSetReasoningEffort(
+            command: command, effort: effort, isStillAuthorized: isStillAuthorized
         )
     }
 

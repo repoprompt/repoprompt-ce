@@ -5401,3 +5401,32 @@ outside this narrow append repair; it must be considered before enabling the dor
   wrong-way file edges and **53/66** largest-cycle components.
 - No new compiler warnings in the three touched Swift files. The two emitted VM actor-isolation
   warnings are at unchanged lines 2839/3128, already matched to main in the prior audit.
+
+### M9.2 partial milestone: writer-owned model and effort configuration
+
+`AgentSessionLinkExecutionRuntime+Model` now owns the model admission, final authorization hop,
+exact-incarnation recheck, payload mutation and persistence scheduling. Its configuration-only
+candidate comes from the unique runtime writer, not a window or sidebar election. The link host
+and administrative model/effort hosts resolve that writer directly. Model availability remains a
+read-only host resource input; losing it refuses admission rather than inventing availability.
+
+The old VM mutation bodies are removed. Optional exact-object presentation sinks mirror accepted
+model/effort changes into composer UI; no runtime commit depends on their presence. Deferred MCP
+publication holds and rechecks the originating writer. Effort changes recheck both the scope lease
+and writer after the authorization callback, including synchronous rebinding during that callback.
+Model readiness, catalogue revalidation, same-provider restriction and no-provider-dispatch semantics
+remain intact. Configuration tests cover detached presentation, retirement and actual runtime rebind
+at the final fence, as well as revoked effort authority and no partial changes.
+
+This retires the model/effort mutation callbacks only. Other link commands, MCP routing, terminal
+preparation and the remaining M9.2 adapters above are still open; this is not M9.2 completion.
+
+Validation: `71aceefa-22f2-43f0-aac5-8bd00d0822f2` passed **529 focused tests**. The broader
+set also required updating legacy discovery/cancellation fixtures: ordinary duplicate installation
+is explicitly refused before raw corrupt state is injected for defensive census tests, and restored
+Stop fixtures use workspace-qualified bindings rather than unscoped test identities. No fail-closed
+assertions were removed. Both products passed `82732df7-5430-48e9-a954-fceed87ec97d`; full lint
+passed `2a4ede2a-600b-415f-95cb-74fd08d901a4`, followed by scoped checks covering all 12 changed
+Swift files and the final fixture correction. Nine existing touched-file warning signatures were
+matched to prior logs; no new warnings were introduced. Earlier compile/fixture failures are not
+counted as successful validation.

@@ -2184,6 +2184,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 draftRestored: { [weak self] session, event in
                     guard let self, sessions[session.tabID] === session else { return }
                     publishDraftRestoration(event)
+                },
+                modelConfiguration: { [weak self] session, selection in
+                    self?.publishSessionLinkModelConfiguration(session, selection: selection)
+                },
+                reasoningEffort: { [weak self] session in
+                    guard let self, sessions[session.tabID] === session, currentTabID == session.tabID else { return }
+                    let restoring = isRestoringState
+                    isRestoringState = true
+                    defer { isRestoringState = restoring }
+                    selectedReasoningEffortRaw = session.selectedReasoningEffortRaw
                 }
             ))
         }
@@ -3314,6 +3324,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     lazy var linkExecutionRuntime: AgentSessionLinkExecutionRuntime = {
         let runtime = runtimeSessionStore.makeLinkExecution(routeID: windowID, commands: .init(
             isAvailable: { [weak self] in self != nil },
+            modelAvailability: { [weak apiSettings = promptManager?.apiSettingsViewModel] in apiSettings?.agentAvailability },
             workspaceID: { [weak self] session in
                 guard let self, sessions[session.tabID] === session else { return nil }
                 return workspaceManager?.activeWorkspaceID
