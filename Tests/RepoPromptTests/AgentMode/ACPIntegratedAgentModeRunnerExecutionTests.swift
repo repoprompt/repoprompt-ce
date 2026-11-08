@@ -316,7 +316,7 @@ final class ACPToolObservationCorrelationTests: XCTestCase {
 
     private func fixture(toolTrackingHooks: AgentToolTrackingHooks = .noOp) -> (AgentSessionLinkRunnerHarness, AgentTabSession, ACPIntegratedAgentModeRunner) {
         let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
-        let runner = ACPIntegratedAgentModeRunner(hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(), toolTrackingHooks: toolTrackingHooks, providerFactory: { _, _ in nil }, controllerFactory: { provider, request in try ACPAgentSessionController(provider: provider, runRequest: request) })
+        let runner = ACPIntegratedAgentModeRunner(hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(), toolTrackingHooks: toolTrackingHooks)
         return (harness, harness.makeSession(agent: .devin), runner)
     }
 
@@ -334,6 +334,140 @@ final class ACPToolObservationCorrelationTests: XCTestCase {
 
 @MainActor
 final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
+    func testComposedStartupRefusalSettlesOnlyItsOwnAttemptAndCannotAcknowledgeSuccessor() async {
+        for replacesAttempt in [false, true] {
+            let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+            let session = harness.makeSession(agent: .devin)
+            let provider = AgentSessionLinkCapturingACPProvider(providerID: .devin, commandPath: "/usr/bin/false")
+            let entered = expectation(description: "Construction is held after execution admission")
+            var release: CheckedContinuation<Void, Never>?
+            defer { release?.resume() }
+            var controllerConstructions = 0
+            let resources = AgentRunProviderComposition(
+                headless: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
+                acp: { _, _ in
+                    await withCheckedContinuation { continuation in release = continuation
+                        entered.fulfill()
+                    }
+                    return provider
+                },
+                controller: { provider, request in
+                    controllerConstructions += 1
+                    return try ACPAgentSessionController(provider: provider, runRequest: request)
+                }
+            )
+            let composition = AgentModeRunComposition(execution: harness.service, resources: resources)
+            let outcome = AgentRunStartOutcomeRecorder()
+            let fence = AgentRunStartStopFence(session: session)
+            let start = Task { await composition.startRun(
+                tabID: session.tabID, session: session, initialUserMessage: "turn", initialMessageForRun: "turn",
+                attachments: [], startOutcome: outcome, stopFence: fence
+            ) }
+            await fulfillment(of: [entered], timeout: 3)
+            let originating = session.activeRunOwnership
+            if replacesAttempt {
+                await harness.service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+                session.beginRunAttempt(source: "successor while old construction settles")
+                session.installRunID(UUID())
+                session.runState = .running
+            } else {
+                // A producer fence can be withdrawn before a cancellation command publishes terminal.
+                session.stopState.invalidateScheduledStarts()
+            }
+            let expectedOwner = session.activeRunOwnership
+            release?.resume()
+            release = nil
+            _ = await start.value
+            XCTAssertFalse(outcome.outcome.didStart, "A different active attempt is not evidence this request installed work")
+            XCTAssertEqual(controllerConstructions, 0)
+            XCTAssertEqual(provider.supportCallCount, 0)
+            XCTAssertNil(session.acpController)
+            if replacesAttempt {
+                XCTAssertNotEqual(expectedOwner, originating)
+                XCTAssertEqual(session.activeRunOwnership, expectedOwner)
+                XCTAssertEqual(session.runState, .running)
+                await harness.service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+            } else {
+                XCTAssertEqual(session.runState, .cancelled, "Refusal must not strand a running attempt without a task")
+                XCTAssertNil(session.activeRunOwnership)
+            }
+        }
+    }
+
+    func testPreparedHeadlessConstructionIsOneShotAndStopFencesFactoryInvocation() async throws {
+        var constructions = 0
+        let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in
+            constructions += 1
+            return AgentSessionLinkCapturingHeadlessProvider()
+        })
+        let session = harness.makeSession(agent: .claudeCode)
+        let runner = harness.makeHeadlessRunner()
+        let request = await runner.prepareRun(
+            tabID: session.tabID, session: session, initialUserMessage: "turn",
+            initialMessageForRun: "turn", attachments: [],
+            makeLease: { harness.makeLease(runID: $0, tabID: session.tabID) }
+        )
+        let prepared = try XCTUnwrap(request)
+        XCTAssertEqual(constructions, 0, "Execution must not construct a provider while admitting the turn")
+        await harness.service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+        await harness.resources.fulfill(prepared)
+        await harness.resources.fulfill(prepared)
+        XCTAssertEqual(constructions, 0, "A cancelled preparation cannot construct, including a repeated delivery")
+        XCTAssertNil(session.provider)
+        XCTAssertEqual(session.runState, .cancelled)
+    }
+
+    func testStoppedACPProviderConstructionCannotConstructControllerOrInstallSuccessor() async {
+        let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+        let session = harness.makeSession(agent: .devin)
+        let runner = ACPIntegratedAgentModeRunner(hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(), toolTrackingHooks: .noOp)
+        let provider = AgentSessionLinkCapturingACPProvider(providerID: .devin, commandPath: "/usr/bin/false")
+        let entered = expectation(description: "Provider construction held outside execution")
+        var release: CheckedContinuation<Void, Never>?
+        defer { release?.resume() }
+        var providerConstructions = 0
+        var controllerConstructions = 0
+        let resources = AgentRunProviderComposition(
+            headless: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
+            acp: { _, _ in
+                providerConstructions += 1
+                await withCheckedContinuation { continuation in
+                    release = continuation
+                    entered.fulfill()
+                }
+                return provider
+            },
+            controller: { provider, request in
+                controllerConstructions += 1
+                return try ACPAgentSessionController(provider: provider, runRequest: request)
+            }
+        )
+        let prepared = await runner.prepareRun(
+            tabID: session.tabID, session: session, initialUserMessage: "turn", initialMessageForRun: "turn", attachments: [],
+            runRequest: ACPRunRequest(agentKind: .devin, modelString: nil, workspacePath: nil, resumeSessionID: nil, attachments: [], taskLabelKind: nil),
+            makeLease: { harness.makeLease(runID: $0, tabID: session.tabID) }
+        )
+        XCTAssertNotNil(prepared)
+        XCTAssertEqual(providerConstructions, 0)
+        let construction = Task { await resources.fulfill(prepared) }
+        await fulfillment(of: [entered], timeout: 3)
+        await resources.fulfill(prepared)
+        XCTAssertEqual(providerConstructions, 1, "Repeated delivery during construction cannot invoke a second factory")
+        await harness.service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+        let terminal = session.lastTerminalCommitRevision
+        release?.resume()
+        release = nil
+        await construction.value
+        await resources.fulfill(prepared)
+        XCTAssertEqual(providerConstructions, 1)
+        XCTAssertEqual(controllerConstructions, 0)
+        XCTAssertEqual(provider.supportCallCount, 0, "A stale provider must not perform support work")
+        XCTAssertNil(session.acpController)
+        XCTAssertEqual(session.lastTerminalCommitRevision, terminal)
+        XCTAssertEqual(session.runState, .cancelled)
+        XCTAssertTrue(provider.promptedMessages.isEmpty)
+    }
+
     override func setUp() {
         super.setUp()
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
@@ -601,10 +735,7 @@ final class AgentToolResultPayloadRetentionTests: XCTestCase {
         let session = harness.makeSession(agent: .devin)
         let runner = ACPIntegratedAgentModeRunner(
             hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(),
-            toolTrackingHooks: .noOp, providerFactory: { _, _ in nil },
-            controllerFactory: { provider, request in
-                try ACPAgentSessionController(provider: provider, runRequest: request)
-            }
+            toolTrackingHooks: .noOp
         )
         func deliver(status: String, output: Any? = nil, content: Any? = nil) throws {
             var update: [String: Any] = [
@@ -649,10 +780,7 @@ final class AgentToolResultPayloadRetentionTests: XCTestCase {
                 let session = harness.makeSession(agent: .devin)
                 let runner = ACPIntegratedAgentModeRunner(
                     hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(),
-                    toolTrackingHooks: .noOp, providerFactory: { _, _ in nil },
-                    controllerFactory: { provider, request in
-                        try ACPAgentSessionController(provider: provider, runRequest: request)
-                    }
+                    toolTrackingHooks: .noOp
                 )
                 func deliver(_ status: String, output: Any? = nil) throws -> AIStreamResult {
                     var update: [String: Any] = [
@@ -699,10 +827,7 @@ final class AgentToolResultPayloadRetentionTests: XCTestCase {
             let session = harness.makeSession(agent: .devin)
             let runner = ACPIntegratedAgentModeRunner(
                 hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(),
-                toolTrackingHooks: .noOp, providerFactory: { _, _ in nil },
-                controllerFactory: { provider, request in
-                    try ACPAgentSessionController(provider: provider, runRequest: request)
-                }
+                toolTrackingHooks: .noOp
             )
             let invocationID = UUID()
             for result in [snapshot, #"{"status":"completed"}"#] {

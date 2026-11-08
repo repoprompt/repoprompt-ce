@@ -1329,12 +1329,12 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
             recipient.runState = .idle
             var physicalProviderID: ObjectIdentifier?
             var physicalRunID: UUID?
-            await runner.startRun(tabID: recipient.tabID, session: recipient, initialUserMessage: "ordinary input", initialMessageForRun: "ordinary input", attachments: [], makeLease: { runID in
+            await harness.resources.fulfill(runner.prepareRun(tabID: recipient.tabID, session: recipient, initialUserMessage: "ordinary input", initialMessageForRun: "ordinary input", attachments: [], makeLease: { runID in
                 let lease = harness.makeLease(runID: runID, tabID: recipient.tabID)
                 physicalProviderID = ObjectIdentifier(lease)
                 physicalRunID = runID
                 return lease
-            })
+            }))
             await recipient.agentTask?.value
             // Failed terminal cleanup clears runID. Inspect the exact dispatched context, not
             // the empty recipient or a newly minted context that would re-owe either outcome.

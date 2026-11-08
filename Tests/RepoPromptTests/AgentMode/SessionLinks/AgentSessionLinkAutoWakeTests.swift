@@ -5785,7 +5785,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         fixture.session.oversight.pendingAutoWake?.phase = .preparingDispatch
         fixture.session.oversight.pendingAutoWake?.periodicComposerAttemptID = submission.id
         return Task { @MainActor in
-            _ = await harness.service.startRun(
+            _ = await harness.composition.startRun(
                 tabID: fixture.tabID, session: fixture.session,
                 initialUserMessage: AgentModeViewModel.periodicWakeMessage,
                 initialMessageForRun: AgentModeViewModel.periodicWakeMessage, attachments: []

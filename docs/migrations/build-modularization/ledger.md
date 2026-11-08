@@ -4829,3 +4829,48 @@ Validation:
 Canonical writer admission, window-free saved-host composition, provider construction outside the
 execution seam, runtime-addressed routing and presentation-preserving handoff/drain still remain.
 This is not M9 completion, full-suite qualification or a fresh hosted/live-smoke receipt.
+
+### M9 continuation — provider construction outside execution (2026-11-08)
+
+`AgentModeRunComposition` now owns the three headless/ACP provider/controller factories. The run
+service and runners no longer retain or invoke them. Execution performs its existing admission,
+attachment reservation, run-attempt and lease setup, then returns an immutable construction request
+with a one-shot handoff qualified by the originating attempt, binding and Stop fence. Composition
+constructs the requested resource and returns its result to that same runner. ACP support remains
+in execution, between provider and controller construction; stale startup refuses before support
+or controller construction. Existing live-runtime reuse and provider-command paths do not construct
+replacement resources.
+
+Refusal settles through the existing terminal barrier and lease cleanup, not a second lifecycle
+manager. A newer binding or attempt cannot be terminalized by an old preparation. The existing start
+receipt records acceptance at actual provider-task installation, not from a successor's running
+state after suspension. Repeated fulfillment, including while an async factory is held, cannot
+construct twice. Pending-start cancellation remains installed before visibility by the earlier
+atomic domain-registration work.
+
+Three added execution tests cover deferred headless construction, held ACP construction with Stop,
+no late support/controller side effects, repeated fulfillment, Stop-generation-only refusal, and
+replacement-attempt survival without a false old-start receipt. Existing harnesses now exercise
+actual product composition instead of placing factories back inside execution.
+
+Validation:
+- `f75890f1-dd44-4fff-8f87-b582d26b653d` passed **82 tests** before review corrections.
+- `4dc7cef1-7329-427a-ace1-9b77473b6f4d` failed compilation before tests because the new binding
+  fences used an incorrect property name. They now use `currentRestorationBindingToken`.
+- Final `1ef980ca-5004-482a-ab2d-bdb8da3c91c3` passed **299 tests**: ACP execution 14, quiet
+  lifecycle 25, waiting ownership 2, self-compact ACP settlement 24, ACP background settlement 4,
+  ACP compact runner 8 and transaction 6, auto-wake 127, native/headless prompt adapter 31,
+  Claude approval/resume 38, and Oracle cancellation 20. Corrected class filters include all three
+  ACP compact suites; the earlier filename-shaped filter was not counted as coverage.
+- Both products passed `c52b22b5-7c1d-4e06-a5ba-ae889c520237`; lint passed
+  `4545d0e7-c1f7-4d64-82c4-a04fe4a6dad9`. Explicit strong capture in the outer ACP handoff preserves
+  the installed task's weak session capture and removes the newly introduced capture warning.
+- Fresh compiler-index check passed **1237/1360** wrong-way file edges and **53/66** largest-cycle
+  components (1129 files, 156258 symbols), using the just-built product closure.
+- Scoped formatting and one independent review completed; mandatory staged contribution preflight
+  applies before commit. No assertion, timeout, warning budget or architectural ratchet was relaxed.
+
+The execution seam still has workspace/carrier inputs and coordinator dependencies to replace.
+Canonical independent writer admission, real window-free saved-host composition, runtime-addressed
+routing, presentation-preserving execution/handoff/drain and final full qualification remain open.
+This is not M9 completion or a fresh hosted/live-smoke receipt.

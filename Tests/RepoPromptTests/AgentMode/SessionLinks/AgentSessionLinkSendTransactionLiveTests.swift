@@ -613,7 +613,7 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         XCTAssertTrue(fixture.events.savedItemsContainAttributedRow(id: row.id))
     }
 
-    /// Regression for the non-Codex reporting gap: `AgentModeRunService.startRun` returns `nil` for
+    /// Regression for the non-Codex reporting gap: `AgentModeRunComposition.startRun` returns `nil` for
     /// both success and pre-start failure on Claude/ACP/headless, so an unresolvable execution
     /// workspace used to be reported to the observer as `run_started`.
     func testNonCodexPreProviderStartFailureReportsRunStartFailed() async throws {

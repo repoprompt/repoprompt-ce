@@ -890,6 +890,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     let clearConsumedAttachmentsAfterProviderConsumption: Bool
     let applyEditsApprovalStore: ApplyEditsApprovalStore
     private lazy var runService: AgentModeRunService = makeRunService()
+    private lazy var runProviderComposition = AgentRunProviderComposition(
+        headless: headlessProviderFactory, acp: acpProviderFactory, controller: acpControllerFactory
+    )
+    private var runComposition: AgentModeRunComposition {
+        AgentModeRunComposition(execution: runService, resources: runProviderComposition)
+    }
 
     func providerSwitchTerminalIsSettled(_ session: TabSession) -> Bool {
         runService.providerSwitchTerminalIsSettled(session)
@@ -1359,6 +1365,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 runService = makeRunService(mcpServerEnabler: mcpServerEnabler, connectionPolicyInstaller: connectionPolicyInstaller, expectedPIDPolicyArmer: expectedPIDPolicyArmer)
             }
             return runService
+        }
+
+        func test_composeRunService(_ execution: AgentModeRunService) -> AgentModeRunComposition {
+            AgentModeRunComposition(execution: execution, resources: runProviderComposition)
         }
 
         func test_consumeClaudeTerminalEvents(
@@ -3731,9 +3741,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let publication = mcpRuntime
         let dependencies = AgentModeRunService.Dependencies(
             windowID: windowID,
-            headlessProviderFactory: headlessProviderFactory,
-            acpProviderFactory: acpProviderFactory,
-            acpControllerFactory: acpControllerFactory,
             connectionPolicyInstaller: connectionPolicyInstaller ?? self.connectionPolicyInstaller,
             expectedPIDPolicyArmer: expectedPIDPolicyArmer ?? { spec in
                 guard spec.requiresExpectedAgentPID, let clientName = spec.clientName else {
@@ -19513,7 +19520,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         candidateTransferred = true
         claudeEventsTransferred = true
-        return await runService.startRun(
+        return await runComposition.startRun(
             tabID: tabID,
             session: session,
             initialUserMessage: augmentedInitialMessage,

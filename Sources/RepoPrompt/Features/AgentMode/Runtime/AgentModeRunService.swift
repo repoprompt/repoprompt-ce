@@ -9,9 +9,6 @@ import RepoPromptInstrumentation
 final class AgentModeRunService {
     struct Dependencies {
         let windowID: Int
-        let headlessProviderFactory: AgentRunExecutionContracts.HeadlessProviderFactory
-        let acpProviderFactory: AgentRunExecutionContracts.ACPProviderFactory
-        let acpControllerFactory: AgentRunExecutionContracts.ACPControllerFactory
         let connectionPolicyInstaller: AgentRunExecutionContracts.ConnectionPolicyInstaller
         let expectedPIDPolicyArmer: (MCPBootstrapLeaseSpec) async -> Bool
         let mcpServerEnabler: AgentRunExecutionContracts.MCPServerEnabler
@@ -136,7 +133,6 @@ final class AgentModeRunService {
             terminalSessionBinder: { hooks.bindTerminalSession($0) }
         )
         headlessRunner = HeadlessAgentModeRunner(
-            headlessProviderFactory: dependencies.headlessProviderFactory,
             hooks: hooks,
             terminalCommitBarrier: terminalCommitBarrier
         )
@@ -153,9 +149,7 @@ final class AgentModeRunService {
         acpRunner = ACPIntegratedAgentModeRunner(
             hooks: hooks,
             terminalCommitBarrier: terminalCommitBarrier,
-            toolTrackingHooks: toolTrackingHooks,
-            providerFactory: dependencies.acpProviderFactory,
-            controllerFactory: dependencies.acpControllerFactory
+            toolTrackingHooks: toolTrackingHooks
         )
     }
 
@@ -229,8 +223,12 @@ final class AgentModeRunService {
             && session.selfCompactState.active?.admittedSupport == .acpAdvertisedCommand
     }
 
-    @discardableResult
-    func startRun(
+    enum StartPreparation {
+        case completed(CodexAgentModeCoordinator.NativeSendOutcome?)
+        case resources(AgentRunResourceRequest)
+    }
+
+    func prepareRun(
         tabID: UUID,
         session: AgentTabSession,
         initialUserMessage: String,
@@ -245,7 +243,7 @@ final class AgentModeRunService {
         localComposerCandidate: UUID? = nil,
         initialUserItemID: UUID? = nil,
         preparedClaudeEvents: ClaudeAttemptEventReservation? = nil
-    ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
+    ) async -> StartPreparation {
         var claudeEventsTransferred = false
         defer {
             if !claudeEventsTransferred, let preparedClaudeEvents {
@@ -261,12 +259,12 @@ final class AgentModeRunService {
         }
         guard stopFence?.permitsStart(of: session) ?? true else {
             startOutcome?.recordStartFailure(message: "This scheduled run was cancelled by Stop.")
-            return nil
+            return .completed(nil)
         }
-        assert(session.tabID == tabID, "AgentModeRunService.startRun requires the originating tab ID to match the AgentTabSession tab ID")
+        assert(session.tabID == tabID, "AgentModeRunService.prepareRun requires the originating tab ID to match the AgentTabSession tab ID")
         if let message = session.operationAdmissionFailureMessage {
             startOutcome?.recordStartFailure(message: message)
-            return session.selectedAgent == .codexExec ? .preDispatchRejected(message: message) : nil
+            return .completed(session.selectedAgent == .codexExec ? .preDispatchRejected(message: message) : nil)
         }
         let selectedAgent = session.selectedAgent
         if let selfCompactDispatchID {
@@ -278,7 +276,7 @@ final class AgentModeRunService {
                   (selfCompactDispatchID.stage == .compact) == (providerControlCommand != nil)
             else {
                 startOutcome?.recordStartFailure(message: nil)
-                return nil
+                return .completed(nil)
             }
         }
         // A control command is only ever routed to a runtime that dispatches it natively and
@@ -288,7 +286,7 @@ final class AgentModeRunService {
         {
             let message = "\(selectedAgent.displayName) does not support this provider command."
             startOutcome?.recordStartFailure(message: message)
-            return nil
+            return .completed(nil)
         }
         let runtimePermission = dependencies.providerRuntimePermissionResolver(selectedAgent, session.permissionProfile)
         let workspacePath: String?
@@ -300,7 +298,7 @@ final class AgentModeRunService {
             // The non-Codex return is `nil`, which is indistinguishable from success. The recorder is
             // the only channel that tells a caller this run never reached a provider.
             startOutcome?.recordStartFailure(message: message)
-            return selectedAgent == .codexExec ? .failed(message: message) : nil
+            return .completed(selectedAgent == .codexExec ? .failed(message: message) : nil)
         }
 
         // Every path that reaches a provider from here is a new turn, and a new turn is exactly what
@@ -321,7 +319,7 @@ final class AgentModeRunService {
                 stopFence: stopFence
             )
             startOutcome?.record(codexOutcome: outcome)
-            return outcome
+            return .completed(outcome)
         }
 
         let acpRunRequest = session.acpRunInput.makeRequest(
@@ -374,38 +372,46 @@ final class AgentModeRunService {
                 preparedEvents: preparedClaudeEvents,
                 startOutcome: startOutcome
             )
-            return nil
+            return .completed(nil)
         }
         if let acpRunRequest {
             candidateTransferred = true
-            await acpRunner.startRun(
+            let resources = await acpRunner.prepareRun(
                 tabID: tabID,
                 session: session,
                 initialUserMessage: initialUserMessage,
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,
                 runRequest: acpRunRequest,
+                startOutcome: startOutcome,
                 providerControlCommand: providerControlCommand,
                 makeLease: makeLease,
                 stopFence: stopFence,
                 localComposerCandidate: localComposerCandidate
             )
+            if let resources {
+                return .resources(resources)
+            }
             recordNonCodexStartOutcome(startOutcome, session: session)
-            return nil
+            return .completed(nil)
         }
         candidateTransferred = true
-        await headlessRunner.startRun(
+        let resources = await headlessRunner.prepareRun(
             tabID: tabID,
             session: session,
             initialUserMessage: initialUserMessage,
             initialMessageForRun: initialMessageForRun,
             attachments: attachments,
             makeLease: makeLease,
+            startOutcome: startOutcome,
             stopFence: stopFence,
             localComposerCandidate: localComposerCandidate
         )
+        if let resources {
+            return .resources(resources)
+        }
         recordNonCodexStartOutcome(startOutcome, session: session)
-        return nil
+        return .completed(nil)
     }
 
     /// Classifies a non-Codex runner return as accepted or rejected-before-startup.
