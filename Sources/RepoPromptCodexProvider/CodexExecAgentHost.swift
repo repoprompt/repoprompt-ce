@@ -19,6 +19,7 @@ package protocol CodexExecAgentHost {
     func serverEntries() -> [CodexExecServerEntry]
     func brokenServers() async -> Set<String>
     func addBrokenServer(_ name: String) async
+    func contextWindowOverrideArguments() -> [String]
     func toolOverrideArguments() -> [String]
     func serverOverrideArguments(entries: [CodexExecServerEntry], brokenServers: Set<String>) -> [String]
     func fallbackModel(attemptedModel: String?, errorDetail: String) -> String?

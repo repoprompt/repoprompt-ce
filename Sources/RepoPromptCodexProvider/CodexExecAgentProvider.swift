@@ -49,6 +49,7 @@ package final class CodexExecAgentProvider: HeadlessAgentProvider {
         serverEntries: [CodexExecServerEntry],
         brokenServers: Set<String>,
         fullAccess: Bool = false,
+        contextWindowArguments: [String] = [],
         host: any CodexExecAgentHost
     ) -> (args: [String], modelSpecifier: CodexModelSpecifier) {
         var args: [String] = []
@@ -66,6 +67,7 @@ package final class CodexExecAgentProvider: HeadlessAgentProvider {
         // Add exec subcommand and its arguments.
         args.append("exec")
         args.append(contentsOf: modelCLIArgs.configArgs)
+        args.append(contentsOf: contextWindowArguments)
         args.append(contentsOf: toolOverrideArgs)
         args.append(contentsOf: serverOverrideArgs)
         args.append(contentsOf: ["--json", "--skip-git-repo-check"])
@@ -183,6 +185,7 @@ package final class CodexExecAgentProvider: HeadlessAgentProvider {
                     var attemptModelString = self.config.modelString
                     var didRetryBrokenServer = false
                     var didRetryModelFallback = false
+                    let contextWindowArguments = self.host.contextWindowOverrideArguments()
 
                     while attemptNumber < maxAttempts {
                         attemptNumber += 1
@@ -220,6 +223,7 @@ package final class CodexExecAgentProvider: HeadlessAgentProvider {
                                     serverEntries: serverEntries,
                                     brokenServers: brokenServers,
                                     fullAccess: config.fullAccess,
+                                    contextWindowArguments: contextWindowArguments,
                                     host: self.host
                                 )
                                 let args = command.args

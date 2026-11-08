@@ -208,7 +208,7 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
         var controllerCreated = false
         let coordinator = CodexAgentModeCoordinator(
             windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
-            codexControllerFactory: { _, _, _, _, _, _, _, _ in
+            codexControllerFactory: { _, _, _, _, _, _, _, _, _ in
                 controllerCreated = true
                 XCTFail("Rejected runtime must not launch")
                 return self.makeController(options: .agentModeDefault())
@@ -808,7 +808,7 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
     }
 
     private func makeCoordinator(ready: Bool = true, collision: Bool = false) -> CodexAgentModeCoordinator {
-        CodexAgentModeCoordinator(windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) }, codexControllerFactory: { _, _, _, _, _, _, _, _ in fatalError("Admission tests must not launch a controller") }, connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in }, shouldManageCodexTooling: false, computerUseRuntimeUnavailableMessage: { nil }, computerUseCompanionReady: { ready }, computerUseReservedEntryExists: { collision }, codexHookApprovalSettings: GlobalSettingsStore.shared)
+        CodexAgentModeCoordinator(windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) }, codexControllerFactory: { _, _, _, _, _, _, _, _, _ in fatalError("Admission tests must not launch a controller") }, connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in }, shouldManageCodexTooling: false, computerUseRuntimeUnavailableMessage: { nil }, computerUseCompanionReady: { ready }, computerUseReservedEntryExists: { collision }, codexHookApprovalSettings: GlobalSettingsStore.shared)
     }
 }
 

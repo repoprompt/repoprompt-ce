@@ -43,7 +43,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             testWorkspacePath: FileManager.default.temporaryDirectory.path,
             shouldManageCodexTooling: shouldManageCodexTooling,
             codexControllerFactory: { runID, _, _, _, _, _ in factory.make(runID: runID) },
-            codexControllerFactoryWithComputerUse: { runID, _, _, _, _, _, enabled, _ in
+            codexControllerFactoryWithComputerUse: { runID, _, _, _, _, _, enabled, _, _ in
                 factory.make(runID: runID, computerUseEnabled: enabled)
             },
             mcpServerEnabler: mcpServerEnabler,
@@ -1484,7 +1484,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
     ) -> CodexAgentModeCoordinator {
         let coordinator = CodexAgentModeCoordinator(
             windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
-            codexControllerFactory: { runID, _, _, _, _, _, enabled, _ in factory(runID, enabled) },
+            codexControllerFactory: { runID, _, _, _, _, _, enabled, _, _ in factory(runID, enabled) },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
             shouldManageCodexTooling: false, computerUseRuntimeUnavailableMessage: { nil }, computerUseCompanionReady: { true },
             computerUseReservedEntryExists: { false },
@@ -1503,7 +1503,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         var routeChecks = 0
         let coordinator = CodexAgentModeCoordinator(
             windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
-            codexControllerFactory: { runID, _, _, _, _, _, _, _ in
+            codexControllerFactory: { runID, _, _, _, _, _, _, _, _ in
                 WedgeFakeCodexController(runID: runID, responses: [.success("uncommitted-computer-use")])
             },
             connectionPolicyInstaller: { clientName, windowID, tools, oneShot, reason, ttl, tabID, runID, additional, purpose, label, externalControl, requiresPID in
