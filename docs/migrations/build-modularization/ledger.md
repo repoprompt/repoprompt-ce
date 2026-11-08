@@ -5089,3 +5089,53 @@ presentation. Existing cold-compaction coverage detaches presentation before boo
 its physical dispatch assertions. Canonical writer admission, saved-host construction, remaining
 startup/terminal commands, runtime routing and close/handoff/drain integration remain open. Full
 suite, final hosted CI and live smoke are not established by this checkpoint.
+
+### M9 continuation — runtime-owned startup orchestration (2026-11-08)
+
+`AgentSessionRunStartRuntime` now owns the actual startup sequence, exact-object lifetime,
+Claude event reservation, Stop and restoration fences, existing configured-creation ordering,
+lane prompt admission and final resource-composition dispatch. The VM supplies per-request
+workspace, hydration, binding and provider-switch inputs; it no longer implements the sequence.
+These inputs still depend on legacy presentation composition. This is not a canonical writer or
+window-free saved-host cutover.
+
+The same owner implements Claude steering enqueue for both startup and ordinary steering.
+Its accepted producer retains the exact runtime scope and existing run service until settlement,
+rather than disappearing with a weak presentation task. A refused generic steering request uses
+existing candidate/managed-turn compensation; persistence addresses the original object, not a
+recycled tab UUID. No new queue, creation authority, run registration or terminal lifecycle was
+introduced. Entry refusal settles the original composer candidate, and the binding admission
+result retains the original non-nil admission semantics rather than adding an unowned post-CAS
+failure branch.
+
+Two standalone tests exercise real scoped session state without constructing WindowState,
+PromptViewModel or WorkspaceManagerViewModel. Held preparation proves scope retention and
+refusal after Stop, replacement, same-ID rebinding, retirement or workspace change. Held input
+augmentation proves that a rebound attempt cannot dispatch or acknowledge a successor. Existing
+integration tests continue to exercise actual provider dispatch and first-save authority.
+
+Validation:
+- Initial `9bd87393-24ed-44d5-a9bc-cf4dad987303` failed test compilation before execution because
+  the new fixture read `didStart` from the recorder rather than its outcome; the API use was fixed.
+- `504f787b-6b5f-4586-a267-2a553ebb30e2` passed **373 tests**. Its misspelled composer filter
+  matched none; supplemental `cdfed2c5-556b-457d-ba33-f8af09d48ee3` passed all **39** actual
+  `AgentComposerSubmissionAttemptTests` cases.
+- Final `1bb0101b-ca69-4495-b94a-f191052ad480` passed **412 tests** with the corrected composer
+  filter and final admission parity: ACP execution 15, composer submission 39, provider switch 39,
+  MCP steer/resume 27, native self-compaction 25, terminal scheduling 8, first-save 47, auto-wake
+  127, compact transactions 30, scoped link execution 17 and Claude approval/resume 38.
+- Final both-product build `b15d5edb-3b83-41c7-ae67-ef135b9ab1ad` and lint
+  `f61da792-f571-46c8-8cc4-2213f6db8ef2` passed. Earlier product/lint receipts
+  `319cf290-3242-4b9b-8622-fe921eeb1bb7` and `f3d55921-9741-463d-b96c-cf2e5a13e22e` predate
+  the final admission adjustment.
+- Fresh final compiler index passed **1241/1360** wrong-way file edges and **53/66** largest-cycle
+  components (1134 files, 156564 symbols), with no baseline increase. Final focused compilation
+  reported no compiler warnings in the four touched Swift files; aggregate warning qualification
+  is still separate.
+- Scoped formatting and one independent review completed. Review fixes cover entry candidate
+  cleanup, refused steering receipts and original binding-commit ordering. Mandatory staged
+  contribution preflight applies before commit.
+
+Canonical workspace/admission inputs, saved-host construction, remaining terminal/follow-up
+ownership, exact runtime routing and presentation-detach/drain integration remain open. Full-suite,
+final hosted CI and live smoke are not established by this checkpoint.

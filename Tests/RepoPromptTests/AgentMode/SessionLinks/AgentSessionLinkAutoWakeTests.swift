@@ -93,6 +93,131 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         XCTAssertFalse(successor.pendingHandoff.hasPayload)
     }
 
+    func testStartupRetainsExactScopeAndRefusesChangesAcrossPreparationWithoutPresentation() async throws {
+        for change in ["entryRefusal", "stop", "replacement", "binding", "retirement", "workspace"] {
+            var f: Fixture? = try fixture()
+            let session = try XCTUnwrap(f).session
+            let startup = try XCTUnwrap(f).scope.startup
+            let links = try XCTUnwrap(f).runtime
+            weak let owner = try XCTUnwrap(f).scope
+            var workspaceID = try XCTUnwrap(f).endpoint.workspaceID
+            let gate = AutoWakeCatalogAuthorityGate()
+            let outcome = AgentRunStartOutcomeRecorder()
+            let item = AgentChatItem.user("Retained original input", sequenceIndex: session.nextSequenceIndex)
+            session.appendItem(item)
+            let candidateFence = AgentRunStartStopFence(session: session)
+            let candidate = session.registerLocalComposerCandidate(itemID: item.id, at: session.items.count - 1)
+            let environment = AgentSessionRunStartRuntime.Environment(
+                currentWorkspaceID: { workspaceID },
+                prepareSession: { _ in _ = await gate.requirement() },
+                availabilityFailure: { _ in XCTFail("Changed preparation must not reach provider availability")
+                    return "Refused"
+                },
+                bindSession: { _ in XCTFail("Changed preparation must not bind or allocate a session")
+                    return nil
+                },
+                commitCreation: { _ in XCTFail("Changed preparation must not acknowledge creation")
+                    return false
+                },
+                prepareEpoch: { _, _ in XCTFail("Changed preparation must not publish a new epoch") },
+                providerSwitchRefusal: { _ in "Provider switch pending" },
+                prepareProviderSwitch: { _, _, _ in XCTFail("Unexpected switch preparation")
+                    return nil
+                },
+                augment: { text, _, _, _, _, _ in XCTFail("Changed preparation must not augment input")
+                    return text
+                },
+                initialMessage: { _, text in XCTFail("Changed preparation must not build initial context")
+                    return text
+                },
+                composition: { preconditionFailure("Changed preparation must not construct execution") }
+            )
+            let coordinator = ClaudeAgentModeCoordinator(windowID: 401, workspacePathProvider: { _ in nil })
+            let task = Task {
+                await startup.start(
+                    session: session, initialMessage: "Do not dispatch stale work",
+                    directStartOptions: .init(localComposerCandidate: candidate), startOutcome: outcome,
+                    claudeCoordinator: coordinator, links: links, environment: environment
+                )
+            }
+            if change == "entryRefusal" {
+                owner?.beginRetirement()
+                _ = await task.value
+                f = nil
+                XCTAssertFalse(session.hasLocalComposerCandidate(itemID: item.id, fence: candidateFence))
+                XCTAssertEqual(session.items.last?.userInputOrigin, .localComposer)
+                XCTAssertFalse(outcome.outcome.didStart)
+                XCTAssertNil(owner)
+                continue
+            }
+            await gate.waitUntilEntered()
+            switch change {
+            case "stop": session.stopState.invalidateScheduledStarts()
+            case "replacement": owner?.replaceSessions([session.tabID: AgentTabSession(tabID: session.tabID)])
+            case "binding":
+                try session.installPersistentSessionBinding(.init(
+                    tabID: session.tabID, sessionID: XCTUnwrap(session.activeAgentSessionID), workspaceID: workspaceID
+                ))
+            case "retirement": owner?.beginRetirement()
+            default: workspaceID = UUID()
+            }
+            f = nil
+            XCTAssertNotNil(owner, "An in-flight preparation owns its scope, not a presentation")
+            await gate.open()
+            _ = await task.value
+            XCTAssertFalse(outcome.outcome.didStart, change)
+            XCTAssertFalse(session.hasLocalComposerCandidate(itemID: item.id, fence: candidateFence), change)
+            XCTAssertNil(session.activeRunOwnership, change)
+            XCTAssertNil(owner, "Refused preparation must release its scope: \(change)")
+        }
+    }
+
+    func testStartupDoesNotAcknowledgeAReboundAttemptAfterInputSuspension() async throws {
+        let f = try fixture()
+        let session = f.session
+        let gate = AutoWakeCatalogAuthorityGate()
+        let outcome = AgentRunStartOutcomeRecorder()
+        var preparations = 0
+        var epochs = 0
+        let environment = AgentSessionRunStartRuntime.Environment(
+            currentWorkspaceID: { f.endpoint.workspaceID },
+            prepareSession: { _ in preparations += 1 },
+            availabilityFailure: { _ in nil },
+            bindSession: { .init(sessionID: $0.activeAgentSessionID!, creation: nil) },
+            commitCreation: { _ in XCTFail("Already persisted identity must not claim new creation")
+                return false
+            },
+            prepareEpoch: { _, _ in epochs += 1 },
+            providerSwitchRefusal: { _ in "Provider switch pending" },
+            prepareProviderSwitch: { _, _, _ in XCTFail("Unexpected switch preparation")
+                return nil
+            },
+            augment: { text, _, _, _, _, _ in _ = await gate.requirement()
+                return text
+            },
+            initialMessage: { _, text in text },
+            composition: { preconditionFailure("A rebound attempt must not construct execution") }
+        )
+        let coordinator = ClaudeAgentModeCoordinator(windowID: 401, workspacePathProvider: { _ in nil })
+        let task = Task {
+            await f.scope.startup.start(
+                session: session, initialMessage: "Stale augmented input", startOutcome: outcome,
+                claudeCoordinator: coordinator, links: f.runtime, environment: environment
+            )
+        }
+        await gate.waitUntilEntered()
+        XCTAssertEqual(preparations, 2)
+        XCTAssertEqual(epochs, 1)
+        try session.installPersistentSessionBinding(.init(
+            tabID: session.tabID, sessionID: XCTUnwrap(session.activeAgentSessionID), workspaceID: f.endpoint.workspaceID
+        ))
+        await gate.open()
+        _ = await task.value
+        XCTAssertFalse(outcome.outcome.didStart)
+        XCTAssertNil(session.activeRunOwnership)
+        XCTAssertTrue(session.items.isEmpty)
+    }
+
     private struct Fixture {
         let scope: AgentSessionRuntimeStore.Scope
         let session: AgentTabSession

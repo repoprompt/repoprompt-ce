@@ -171,6 +171,7 @@ final class AgentSessionRuntimeStore {
         }
 
         lazy var observation = AgentSessionObservationRuntime(scope: self)
+        lazy var startup = AgentSessionRunStartRuntime(scope: self)
 
         /// Construct the actual observed runtime object; UI defaults and saved hydration are
         /// applied by composition before admitting it into this scope's binding index.
