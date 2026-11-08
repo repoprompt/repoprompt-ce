@@ -1120,8 +1120,8 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         )
     }
 
-    /// Routes the compaction transaction to the exact owning window, with the same terminating and
-    /// closing refusals as a send. Nothing here focuses or activates the window.
+    /// Routes compaction through the exact runtime writer. Presentation liveness remains a
+    /// separate admission input; it never elects the mutation owner.
     func agentSessionLinkPerformCompact(
         to candidate: AgentSessionLinkEndpointCandidate,
         request: AgentSessionLinkCompactRequest,
@@ -1129,10 +1129,10 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
     ) async -> AgentSessionLinkSendTransactionOutcome {
         guard !isTerminating else { return .blocked(.shuttingDown) }
-        guard let window = window(withID: candidate.windowID), !window.isClosing else {
+        guard let runtime = agentSessionLinkCommandRuntime(for: candidate) else {
             return .blocked(.endpointHost)
         }
-        return await window.agentModeViewModel.agentSessionLinkPerformCompact(
+        return await runtime.agentSessionLinkPerformCompact(
             to: candidate,
             request: request,
             liveness: liveness,

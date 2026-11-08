@@ -3454,7 +3454,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let commands = await slashSession?.claudeController?.availableSlashCommands() ?? []
             guard requestIsCurrent() else { return [] }
             let canCompact: Bool = if let slashSession {
-                await agentSessionLinkCompactSupport(for: slashSession) == .claudeCode
+                await linkExecutionRuntime.agentSessionLinkCompactSupport(for: slashSession) == .claudeCode
             } else {
                 false
             }

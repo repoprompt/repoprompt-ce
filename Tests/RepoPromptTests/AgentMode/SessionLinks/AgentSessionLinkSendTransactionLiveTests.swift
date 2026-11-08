@@ -1273,6 +1273,12 @@ final class LiveSendEventLog: @unchecked Sendable {
         return index
     }
 
+    func count(_ event: Event) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return events.count(where: { $0 == event })
+    }
+
     func contains(_ event: Event) -> Bool {
         lock.lock()
         defer { lock.unlock() }

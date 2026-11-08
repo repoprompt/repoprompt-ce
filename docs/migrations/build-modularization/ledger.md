@@ -5430,3 +5430,33 @@ passed `2a4ede2a-600b-415f-95cb-74fd08d901a4`, followed by scoped checks coverin
 Swift files and the final fixture correction. Nine existing touched-file warning signatures were
 matched to prior logs; no new warnings were introduced. Earlier compile/fixture failures are not
 counted as successful validation.
+
+### M9.2 partial milestone: writer-owned managed compaction
+
+The managed Compact transaction and shared native compaction leaves now live in
+`AgentSessionLinkExecutionRuntime+Compact`; the link host resolves the exact runtime writer instead
+of selecting a window. The transaction retains its command through authorization, support queries
+and required persistence. Workspace identity comes from that capability. Retirement before the
+request row refuses mutation; retirement after accepted persistence retains the request and withholds
+provider dispatch. A failed write after writer replacement reports indeterminate persistence without
+removing the originating row or issuing a compensating save against the successor.
+
+The VM Compact implementation is removed, and self-compaction calls the shared runtime native leaf.
+The self-compaction scheduler and the existing composer/start resource adapters remain explicitly
+open M9.2 work, alongside Steer and the other routing adapters above. This milestone does not change
+window close behavior or claim window-free provider composition.
+
+Regression coverage includes pre-commit retirement, retirement during save, and writer replacement
+inside a failed save with an exact one-save assertion. Legacy conflict fixtures now assert the
+canonical endpoint is unavailable while both claims remain, preserving all no-mutation assertions.
+The suspended Codex-resume fixture invalidates the runtime binding rather than merely clearing a
+sidebar projection.
+
+Validation: `191cba3e-7436-4db5-b185-e213564d5263` passed **171 focused tests**, including
+managed Claude/Codex/ACP compaction, autonomous delivery, shared self-compaction and Send regressions.
+Both products passed `cfbe482e-27ed-4795-aff4-866140959c65`; full lint passed
+`7ca65a07-a26a-4f77-9943-4871f280025d`, with scoped checks covering the new runtime file and final
+test edits. Fresh index check passed **1239/1360** wrong-way file edges and **53/66** largest-cycle
+components. A newly introduced test trailing-closure warning was fixed before the final passing run;
+remaining touched-source warning signatures match the prior baseline. No live-app or full-suite
+validation is claimed.

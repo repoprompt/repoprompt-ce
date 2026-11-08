@@ -250,7 +250,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
                 if !Task.isCancelled { XCTFail("Managed compact routing fixture failed: \(error)") }
             }
         } : nil
-        let outcome = await fixture.viewModel.agentSessionLinkPerformCompact(
+        let outcome = await fixture.viewModel.linkExecutionRuntime.agentSessionLinkPerformCompact(
             to: fixture.candidate,
             request: request,
             liveness: liveness,
@@ -276,12 +276,12 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
                 .noProviderSession
             default: .notSupported
             }
-            let support = await fixture.viewModel.agentSessionLinkCompactSupport(for: fixture.session)
+            let support = await fixture.viewModel.linkExecutionRuntime.agentSessionLinkCompactSupport(for: fixture.session)
             XCTAssertEqual(support, expected, "\(agent)")
         }
         for agent in [AgentProviderKind.claudeCode, .codexExec] {
             let fixture = try makeFixture(agent: agent, providerConversation: false)
-            let support = await fixture.viewModel.agentSessionLinkCompactSupport(for: fixture.session)
+            let support = await fixture.viewModel.linkExecutionRuntime.agentSessionLinkCompactSupport(for: fixture.session)
             XCTAssertEqual(
                 support,
                 .noProviderSession,
@@ -625,8 +625,10 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         let refused = await fixture.viewModel.agentSelfCompactMCPAdmission(
             endpoint: endpoint, origin: origin, note: "keep this note", idempotencyKey: "window-free-conflict"
         )
-        guard case let .blocked(reason) = refused else { return XCTFail("The nonvisual writer must block admission") }
-        XCTAssertEqual(reason, "session_not_exclusive")
+        guard case .conflicting = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: endpoint.sessionID) else {
+            return XCTFail("The fixture must retain both runtime claims")
+        }
+        guard case .unavailable = refused else { return XCTFail("A conflicting writer makes the canonical endpoint unavailable") }
         XCTAssertNil(fixture.session.selfCompactState.active)
         XCTAssertNil(fixture.session.selfCompactState.latest, "Pre-admission refusal must not consume a reservation or produce a recovery record")
         XCTAssertFalse(fixture.events.contains(.save))
@@ -843,8 +845,10 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
             endpoint: endpoint, origin: origin,
             note: "continue", idempotencyKey: "duplicate-writer-key"
         )
-        guard case let .blocked(reason) = result else { return XCTFail("Expected nonexclusive refusal") }
-        XCTAssertEqual(reason, "session_not_exclusive")
+        guard case .conflicting = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: endpoint.sessionID) else {
+            return XCTFail("The fixture must retain both runtime claims")
+        }
+        guard case .unavailable = result else { return XCTFail("A duplicate runtime claim must not produce an endpoint") }
         XCTAssertNil(fixture.session.selfCompactState.active)
         XCTAssertFalse(fixture.events.contains(.save))
     }
@@ -939,6 +943,52 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         XCTAssertEqual(fixture.session.items.count, before)
         let sent = await fixture.claude.sentMessages
         XCTAssertTrue(sent.isEmpty)
+    }
+
+    func testCompactRejectsRetirementAtAuthorizationWithoutPartialEffects() async throws {
+        let fixture = try makeFixture()
+        let before = fixture.session.items.count
+        let outcome = await compact(fixture, commit: {
+            self.retireRuntime(in: fixture)
+            return .committed
+        })
+        XCTAssertEqual(outcome, .blocked(.endpointInvalidated))
+        XCTAssertEqual(fixture.session.items.count, before)
+        XCTAssertFalse(fixture.events.contains(.save))
+        XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
+        XCTAssertFalse(fixture.session.isComposerSubmissionInFlight)
+    }
+
+    func testCompactFailedSaveAfterWriterReplacementNeverCompensatesAgainstSuccessor() async throws {
+        let fixture = try makeFixture(saverBehavior: .failFirst)
+        let before = fixture.session.items.count
+        let replacementID = UUID()
+        fixture.driftHook.duringDeliveryFlush = {
+            do {
+                _ = try XCTUnwrap(fixture.viewModel.test_installPersistentSessionBinding(
+                    sessionID: replacementID, on: fixture.session, updateWorkspaceMetadata: true
+                ))
+                fixture.session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            } catch { XCTFail("Replacement fixture failed: \(error)") }
+        }
+        let outcome = await compact(fixture)
+        XCTAssertEqual(outcome, .blocked(.persistenceIndeterminate))
+        XCTAssertEqual(fixture.session.activeAgentSessionID, replacementID)
+        XCTAssertEqual(fixture.events.count(.save), 1, "No compensating save may target the successor")
+        XCTAssertEqual(fixture.session.items.count, before + 1, "Unconfirmed originating row is not rolled back into the successor")
+        XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
+        XCTAssertFalse(fixture.session.isComposerSubmissionInFlight)
+    }
+
+    func testCompactRetirementDuringSaveRetainsRequestButWithholdsDispatch() async throws {
+        let fixture = try makeFixture()
+        fixture.driftHook.duringDeliveryFlush = { self.retireRuntime(in: fixture) }
+        let outcome = await compact(fixture)
+        guard case let .delivered(delivery) = outcome else { return XCTFail("Originating save must settle: \(outcome)") }
+        XCTAssertEqual(delivery.deliveryState, .persisted)
+        XCTAssertTrue(fixture.events.contains(.save))
+        XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
+        XCTAssertFalse(fixture.session.isComposerSubmissionInFlight)
     }
 
     func testDriftAfterTheDurableRecordWithholdsDispatch() async throws {
@@ -1093,7 +1143,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         XCTAssertFalse(fixture.session.isComposerSubmissionInFlight, "The claim is released")
     }
 
-    func testWorkspaceChangeDuringCodexResumeWithholdsCompactionAfterExactThreadReturns() async throws {
+    func testWorkspaceBindingTransitionDuringCodexResumeWithholdsCompactionAfterExactThreadReturns() async throws {
         let gate = TestReleaseFence(name: "compact Codex resume")
         let fixture = try makeFixture(agent: .codexExec, shouldManageCodexTooling: true, codexResumeGate: gate)
         fixture.session.codexConversationID = "lifecycle"
@@ -1104,6 +1154,9 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         }
         guard await gate.waitUntilEntered() else { return }
 
+        // A real workspace transition invalidates the runtime binding; changing only the
+        // sidebar's active workspace is a presentation edit, not a writer handoff.
+        _ = fixture.session.beginPersistentBindingTransition()
         fixture.manager.activeWorkspace = nil
         gate.release()
         let outcome = await operation.value

@@ -101,7 +101,7 @@ extension AgentModeViewModel {
               endpoint.persistentBindingGeneration != nil
         else { return .blocked(reason: "session_not_exclusive") }
 
-        let support = await agentSessionLinkCompactSupport(for: session)
+        let support = await linkExecutionRuntime.agentSessionLinkCompactSupport(for: session)
         guard sessions[endpoint.tabID] === session,
               agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
               session.runID == origin.runID,
@@ -126,7 +126,7 @@ extension AgentModeViewModel {
             || readiness.hasPendingApplyEditsReview || readiness.hasPendingWorktreeMergeReview
         if hasInteraction { return .blocked(reason: "pending_interaction") }
         guard AgentSessionLinkDeliveryReadiness.evaluate(snapshot: readiness) == .ready,
-              !Self.agentSessionLinkCompactHasQueuedProviderWork(session)
+              !AgentSessionLinkExecutionRuntime.agentSessionLinkCompactHasQueuedProviderWork(session)
         else { return .blocked(reason: "busy") }
 
         guard let accepted = agentSelfCompactSchedule(
@@ -305,7 +305,7 @@ extension AgentModeViewModel {
                 self?.agentSelfCompactHasActiveMCPTools(runID: runID) ?? false
             },
             support: { [weak self] in
-                await self?.agentSessionLinkCompactSupport(for: session) ?? .notSupported
+                await self?.linkExecutionRuntime.agentSessionLinkCompactSupport(for: session) ?? .notSupported
             },
             dispatch: { [weak self] requestID, support, stillAdmissible in
                 guard let self else { return false }
@@ -384,7 +384,7 @@ extension AgentModeViewModel {
 
         let ready: @MainActor () -> Bool = { [weak self] in
             guard let self, stillAdmissible(), composerSubmitClaimIsCurrent(claim),
-                  !Self.agentSessionLinkCompactHasQueuedProviderWork(session),
+                  !AgentSessionLinkExecutionRuntime.agentSessionLinkCompactHasQueuedProviderWork(session),
                   workspaceManager?.activeWorkspace?.id == owner.workspaceID
             else { return false }
             return AgentSessionLinkDeliveryReadiness.evaluate(
@@ -419,7 +419,7 @@ extension AgentModeViewModel {
         state.active?.usedTokensBeforeCompact = session.vouchedContextCount?.tokens
         session.selfCompactState = state
         session.selfCompactNativeCompletion = agentSelfCompactNativeCompletion(for: session)
-        let result = await agentSessionLinkDispatchNativeCompact(
+        let result = await linkExecutionRuntime.agentSessionLinkDispatchNativeCompact(
             session: session,
             tabID: owner.tabID,
             support: support,
@@ -491,7 +491,7 @@ extension AgentModeViewModel {
         defer { releaseComposerSubmitClaim(claim) }
         let ready: @MainActor () -> Bool = { [weak self] in
             guard let self, stillAdmissible(), composerSubmitClaimIsCurrent(claim),
-                  !Self.agentSessionLinkCompactHasQueuedProviderWork(session),
+                  !AgentSessionLinkExecutionRuntime.agentSessionLinkCompactHasQueuedProviderWork(session),
                   agentSelfCompactOwnerIsCurrent(owner, session: session),
                   workspaceManager?.activeWorkspace?.id == owner.workspaceID
             else { return false }
