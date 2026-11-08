@@ -187,3 +187,124 @@ final class AgentSessionTranscriptRuntimeTests: XCTestCase {
         try body(XCTUnwrap(payload))
     }
 }
+
+@MainActor
+final class AgentSessionObservationRuntimeTests: XCTestCase {
+    @MainActor
+    private struct Fixture {
+        let store = AgentSessionRuntimeStore()
+        let scope: AgentSessionRuntimeStore.Scope
+        let session: AgentTabSession
+        let binding: AgentPersistentSessionBindingIdentity
+
+        init() {
+            scope = store.makeScope()
+            session = scope.makeSession(tabID: UUID())
+            binding = .init(tabID: session.tabID, sessionID: UUID(), workspaceID: UUID())
+            scope.replaceSessions([session.tabID: session])
+            session.installPersistentSessionBinding(binding)
+            session.hasLoadedPersistedState = true
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        }
+
+        func stageTranscript() -> Task<Void, Never>? {
+            session.appendItem(.user("request", sequenceIndex: 0))
+            session.appendItem(.assistant("complete answer", sequenceIndex: 1))
+            return session.derivedTranscriptRefreshTask
+        }
+    }
+
+    func testTerminalMaterializesWithoutPresentationAndDuringRetirement() async throws {
+        for retiring in [false, true] {
+            let f = Fixture()
+            let pending = try XCTUnwrap(f.stageTranscript())
+            XCTAssertTrue(f.session.transcript.turns.isEmpty)
+            guard case let .unique(writer) = f.store.resolveWriter(sessionID: f.binding.sessionID) else {
+                return XCTFail("Expected exact writer")
+            }
+            if retiring { f.scope.beginRetirement() }
+            f.scope.observation.prepareTerminalPublication(for: f.session)
+            XCTAssertFalse(f.session.transcript.turns.isEmpty)
+            XCTAssertNil(f.session.derivedTranscriptRefreshTask)
+            XCTAssertNil(f.session.pendingDerivedTranscriptRefreshReason)
+            XCTAssertTrue(writer.isCurrent)
+            XCTAssertFalse(f.scope.presentation.isActiveUISyncSuppressed)
+            let protection = AgentSessionTranscriptRefreshRuntime.transcriptProjectionProtection(for: f.session)
+            XCTAssertTrue(AgentSessionTranscriptRefreshRuntime.canReuseDerivedTranscriptForSave(
+                for: f.session, projectionProtection: protection
+            ))
+            let generation = f.session.derivedTranscriptRefreshGeneration
+            f.scope.observation.prepareTerminalPublication(for: f.session)
+            XCTAssertEqual(f.session.derivedTranscriptRefreshGeneration, generation, "Already-current terminal projection is reused")
+            await pending.value
+        }
+    }
+
+    func testTerminalCannotRefreshAReplacementIntroducedByOptionalPresentationCleanup() async throws {
+        let f = Fixture()
+        let pending = try XCTUnwrap(f.stageTranscript())
+        let generation = f.session.derivedTranscriptRefreshGeneration
+        var cleanupCount = 0
+        let attachment = f.scope.presentation.attach(f.session, sink: .init(
+            activityChanged: { _, _ in }, refresh: { _, _, _ in },
+            turnComplete: { _ in }, turnFailed: { _, _ in },
+            prepareTerminal: { session in
+                cleanupCount += 1
+                session.installPersistentSessionBinding(.init(
+                    tabID: session.tabID, sessionID: UUID(), workspaceID: f.binding.workspaceID
+                ))
+                session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            }
+        ))
+        f.scope.observation.prepareTerminalPublication(for: f.session)
+        XCTAssertEqual(cleanupCount, 1)
+        XCTAssertTrue(f.session.transcript.turns.isEmpty)
+        XCTAssertEqual(f.session.derivedTranscriptRefreshGeneration, generation)
+        XCTAssertFalse(f.scope.presentation.isActiveUISyncSuppressed)
+        f.scope.presentation.detach(attachment)
+        pending.cancel()
+        await pending.value
+    }
+
+    func testConflictingWriterRefusesTerminalRefreshWithoutInvokingPresentation() async throws {
+        let f = Fixture()
+        let pending = try XCTUnwrap(f.stageTranscript())
+        let otherScope = f.store.makeScope()
+        let other = AgentTabSession(tabID: UUID())
+        otherScope.replaceSessions([other.tabID: other])
+        XCTAssertEqual(otherScope.bindingRejection(f.binding.sessionID, on: other), .conflictingWriter)
+        // Deliberate legacy corruption after proving ordinary admission refuses the second claim.
+        other.installPersistentSessionBinding(.init(
+            tabID: other.tabID, sessionID: f.binding.sessionID, workspaceID: f.binding.workspaceID
+        ))
+        guard case .conflicting = f.store.resolveWriter(sessionID: f.binding.sessionID) else {
+            return XCTFail("Expected competing claims")
+        }
+        var cleanupCount = 0
+        let attachment = f.scope.presentation.attach(f.session, sink: .init(
+            activityChanged: { _, _ in }, refresh: { _, _, _ in },
+            turnComplete: { _ in }, turnFailed: { _, _ in },
+            prepareTerminal: { _ in cleanupCount += 1 }
+        ))
+        f.scope.observation.prepareTerminalPublication(for: f.session)
+        XCTAssertFalse(f.scope.observation.canSynchronizeDerivedTranscript(for: f.session))
+        XCTAssertEqual(cleanupCount, 0)
+        XCTAssertTrue(f.session.transcript.turns.isEmpty)
+        f.scope.presentation.detach(attachment)
+        pending.cancel()
+        await pending.value
+        otherScope.replaceSessions([:])
+    }
+
+    func testUnboundDraftProjectionIsNotAPersistentTerminalWriter() {
+        let store = AgentSessionRuntimeStore()
+        let scope = store.makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        scope.replaceSessions([session.tabID: session])
+        session.appendItem(.user("local draft", sequenceIndex: 0))
+        XCTAssertFalse(scope.observation.canSynchronizeDerivedTranscript(for: session))
+        XCTAssertTrue(scope.observation.canSynchronizeDerivedTranscript(for: session, requiringLoadedPersistedState: false))
+        scope.observation.prepareTerminalPublication(for: session)
+        XCTAssertTrue(session.transcript.turns.isEmpty)
+    }
+}

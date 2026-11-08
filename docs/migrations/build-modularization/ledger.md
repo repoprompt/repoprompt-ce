@@ -5460,3 +5460,29 @@ test edits. Fresh index check passed **1239/1360** wrong-way file edges and **53
 components. A newly introduced test trailing-closure warning was fixed before the final passing run;
 remaining touched-source warning signatures match the prior baseline. No live-app or full-suite
 validation is claimed.
+
+### M9.2 partial milestone: writer-owned terminal transcript preparation
+
+The terminal publication hook now captures `AgentSessionObservationRuntime`, not a weak view model.
+That runtime owns derived-transcript catch-up and requires the exact unique persistent writer before
+terminal materialization. It retains and rechecks that writer across optional synchronous presentation
+cleanup, including rebinding from the cleanup callback. Accepted terminal work can finish during
+retirement; it does not acquire a new command or introduce another terminal settlement owner.
+
+`AgentSessionPresentationRuntime` owns UI-sync suppression and optional pending-UI cleanup. Sidebar
+identity still gates presentation, separately from runtime materialization: moving a sidebar projection
+does not elect a different writer, and it does not permit old rows to publish into that presentation.
+Unbound local drafts may build their ordinary derived projection but cannot pose as persistent terminal
+writers. No Stop drain is joined from terminal publication, because Stop already awaits terminal work.
+
+Coverage exercises detached presentation, retirement, replacement during optional cleanup, conflicting
+writers, unbound drafts, and a real VM whose sidebar mismatch refuses UI publication while the writer
+still materializes its transcript. Other event-boundary and routing adapters remain M9.2 work; this
+retires only the weak terminal-preparation callback and the VM's transcript catch-up implementation.
+
+Validation: `d5d8b993-4b7c-48d1-8da8-812e4a6bacb5` passed **266 focused tests**. Both products
+passed `ec61e564-fbc6-4b80-9cc3-dad8195e8bc4`; full lint passed
+`6462d785-fc13-4532-8d29-9ee6afec72cb`, followed by scoped checks on all five final Swift files,
+including the new runtime tests. Fresh index remained **1239/1360** wrong-way file edges and
+**53/66** largest-cycle components. Three emitted touched-file warning signatures matched the prior
+baseline; no new warnings were introduced. Live-app and full-suite validation were not run.

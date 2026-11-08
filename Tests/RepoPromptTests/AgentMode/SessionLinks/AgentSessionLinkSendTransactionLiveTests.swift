@@ -265,6 +265,28 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
     }
 
+    func testTerminalMaterializationUsesWriterWhileSidebarMismatchStillRefusesPresentation() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.session.saveDebounceTask?.cancel() }
+        let command = try XCTUnwrap(fixture.viewModel.linkExecutionRuntime.admit(fixture.candidate))
+        XCTAssertTrue(fixture.viewModel.canBuildOrPublishActiveTranscriptBindings(for: fixture.session))
+        fixture.session.appendItem(.user("terminal request", sequenceIndex: fixture.session.nextSequenceIndex))
+        fixture.session.appendItem(.assistant("terminal answer", sequenceIndex: fixture.session.nextSequenceIndex))
+        let pending = fixture.session.derivedTranscriptRefreshTask
+        fixture.manager.workspaces[0].composeTabs[0].activeAgentSessionID = UUID()
+        XCTAssertTrue(command.isCurrent)
+        XCTAssertFalse(fixture.viewModel.canBuildOrPublishActiveTranscriptBindings(for: fixture.session))
+
+        command.writer.scope.observation.prepareTerminalPublication(for: fixture.session)
+        XCTAssertNil(fixture.session.derivedTranscriptRefreshTask)
+        let protection = AgentSessionTranscriptRefreshRuntime.transcriptProjectionProtection(for: fixture.session)
+        XCTAssertTrue(AgentSessionTranscriptRefreshRuntime.canReuseDerivedTranscriptForSave(
+            for: fixture.session, projectionProtection: protection
+        ))
+        XCTAssertFalse(fixture.viewModel.canBuildOrPublishActiveTranscriptBindings(for: fixture.session))
+        await pending?.value
+    }
+
     func testSetModelRejectsRetirementDuringReauthorizationWithoutPartialCommit() async throws {
         let fixture = try makeFixture()
         let command = try XCTUnwrap(fixture.viewModel.linkExecutionRuntime.admit(fixture.candidate))

@@ -150,6 +150,69 @@ final class AgentSessionObservationRuntime {
         scope?.mcp.installStateObservation(for: session)
     }
 
+    /// Derived projections may follow an unbound local draft, but a persistent session must
+    /// belong to this scope's unique writer. Sidebar projections never elect that writer.
+    /// The loaded-state exception preserves cancelled local source-drift presentation only.
+    func canSynchronizeDerivedTranscript(
+        for session: AgentTabSession,
+        requiringLoadedPersistedState: Bool = true
+    ) -> Bool {
+        guard let scope, scope.sessions[session.tabID] === session,
+              !scope.hasReleasedWriterClaims, !session.bindingTransitionInProgress,
+              session.hasLoadedPersistedState || !requiringLoadedPersistedState
+        else { return false }
+        guard let sessionID = session.activeAgentSessionID else { return true }
+        guard case let .unique(writer) = scope.resolveWriter(sessionID: sessionID),
+              writer.scope === scope, writer.session === session else { return false }
+        return writer.isCurrent
+    }
+
+    /// The terminal barrier invokes this after settling attempt state and before capturing its
+    /// publication revision. Use the originating writer, not new-command admission: retirement
+    /// must still finish an accepted turn. Optional presentation cleanup cannot replace that writer.
+    func prepareTerminalPublication(for session: AgentTabSession) {
+        guard let scope, let sessionID = session.activeAgentSessionID,
+              case let .unique(writer) = scope.resolveWriter(sessionID: sessionID),
+              writer.scope === scope, writer.session === session else { return }
+        scope.presentation.prepareTerminalPublication(session)
+        guard writer.isCurrent else { return }
+        scope.presentation.withActiveUISyncSuppressed {
+            catchUpDerivedTranscriptIfNeeded(for: session, reason: .liveMutation, publishPresentation: false)
+        }
+    }
+
+    @discardableResult
+    func catchUpDerivedTranscriptIfNeeded(
+        for session: AgentTabSession,
+        reason: AgentDerivedTranscriptRefreshReason,
+        validateProjectionIntegrity: Bool = false,
+        publishPresentation: Bool = true
+    ) -> Bool {
+        guard canSynchronizeDerivedTranscript(for: session) else { return false }
+        guard !session.items.isEmpty || !session.transcript.turns.isEmpty else { return false }
+        let protection = AgentSessionTranscriptRefreshRuntime.transcriptProjectionProtection(for: session, transcript: session.transcript)
+        let canReuse = AgentSessionTranscriptRefreshRuntime.canReuseDerivedTranscriptForSave(for: session, projectionProtection: protection)
+        let projectionLooksStale = validateProjectionIntegrity && canReuse && derivedTranscriptProjectionLooksStale(for: session)
+        guard !canReuse || projectionLooksStale else { return false }
+        session.derivedTranscriptRefreshGeneration &+= 1
+        session.derivedTranscriptRefreshTask?.cancel()
+        session.derivedTranscriptRefreshTask = nil
+        let scheduledReason = session.pendingDerivedTranscriptRefreshReason ?? reason
+        session.pendingDerivedTranscriptRefreshReason = nil
+        AgentSessionTranscriptRefreshRuntime.refreshDerivedTranscriptState(for: session, reason: scheduledReason)
+        if publishPresentation { scope?.presentation.derivedTranscriptChanged(session) }
+        return true
+    }
+
+    private func derivedTranscriptProjectionLooksStale(for session: AgentTabSession) -> Bool {
+        guard !session.transcript.turns.isEmpty else { return false }
+        let expectedCounts = AgentTranscriptProjectionBuilder.projectionCounts(for: session.transcript)
+        if session.transcriptProjectionCounts != expectedCounts { return true }
+        let visibleRowCount = session.transcriptProjection.archivedRows.count + session.transcriptProjection.workingRows.count
+        let workingRowCount = session.workingTranscriptProjection.workingRows.count
+        return max(visibleRowCount, workingRowCount) < expectedCounts.defaultPresentedRowCount
+    }
+
     private func scheduleOversightPresentation(for session: AgentTabSession) {
         Task { @MainActor [weak self, weak session] in
             guard let self, let session, let scope, scope.sessions[session.tabID] === session else { return }

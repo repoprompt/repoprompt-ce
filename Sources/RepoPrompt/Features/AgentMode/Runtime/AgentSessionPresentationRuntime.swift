@@ -19,6 +19,7 @@ final class AgentSessionPresentationRuntime {
         let turnFailed: (AgentTabSession, String?) -> Void
         var assistantDelta: ((AgentTabSession, Int, UInt64) -> Void)?
         var derivedTranscript: ((AgentTabSession) -> Void)?
+        var prepareTerminal: ((AgentTabSession) -> Void)?
         var binding: ((AgentTabSession) -> Void)?
         var elapsedTime: ((AgentTabSession) -> Void)?
         var runState: ((AgentTabSession) -> Void)?
@@ -43,6 +44,22 @@ final class AgentSessionPresentationRuntime {
     }
 
     private var entries: [ObjectIdentifier: Entry] = [:]
+    private var activeUISyncSuppressionDepth = 0
+
+    var isActiveUISyncSuppressed: Bool {
+        activeUISyncSuppressionDepth > 0
+    }
+
+    @discardableResult
+    func withActiveUISyncSuppressed<T>(_ body: () throws -> T) rethrows -> T {
+        activeUISyncSuppressionDepth += 1
+        defer { activeUISyncSuppressionDepth -= 1 }
+        return try body()
+    }
+
+    func prepareTerminalPublication(_ session: AgentTabSession) {
+        sink(for: session)?.prepareTerminal?(session)
+    }
 
     func attach(_ session: AgentTabSession, sink: Sink) -> Attachment {
         entries = entries.filter { $0.value.session != nil }

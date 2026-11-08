@@ -945,9 +945,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     #endif
 
     var isRestoringState = false
-    private var activeUISyncSuppressionDepth = 0
     private var isActiveUISyncSuppressed: Bool {
-        activeUISyncSuppressionDepth > 0
+        runtimeSessionStore.presentation.isActiveUISyncSuppressed
     }
 
     /// Last `AgentSessionRunState` the sidebar attention system observed for
@@ -1873,9 +1872,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     @discardableResult
     private func withActiveUISyncSuppressed<T>(_ body: () throws -> T) rethrows -> T {
-        activeUISyncSuppressionDepth += 1
-        defer { activeUISyncSuppressionDepth -= 1 }
-        return try body()
+        try runtimeSessionStore.presentation.withActiveUISyncSuppressed(body)
     }
 
     var activeTranscriptAnalyticsSnapshot: AgentTranscriptAnalyticsSnapshot {
@@ -2153,6 +2150,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 derivedTranscript: { [weak self] session in
                     guard let self, sessions[session.tabID] === session else { return }
                     publishDerivedTranscriptState(for: session)
+                },
+                prepareTerminal: { [weak self] session in
+                    guard let self, sessions[session.tabID] === session else { return }
+                    removePendingUIRefresh(for: session.tabID)
                 },
                 binding: { [weak self] session in
                     guard let self, sessions[session.tabID] === session else { return }
@@ -3783,6 +3784,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         expectedPIDPolicyArmer: ((MCPBootstrapLeaseSpec) async -> Bool)? = nil
     ) -> AgentModeRunService {
         let publication = mcpRuntime
+        let observation = runtimeSessionStore.observation
         let dependencies = AgentModeRunService.Dependencies(
             windowID: windowID,
             connectionPolicyInstaller: connectionPolicyInstaller ?? self.connectionPolicyInstaller,
@@ -3887,8 +3889,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             ),
             interactions: interactionRuntime.makeRunHooks(),
             terminalSettlement: .init(
-                prepareTerminalPublication: { [weak self] session in
-                    self?.prepareTerminalPublication(for: session)
+                prepareTerminalPublication: { session in
+                    observation.prepareTerminalPublication(for: session)
                 },
                 makeTerminalPublicationEnvelope: { session, ownership, terminalState, providerRunID, failureReason in
                     publication.makeTerminalPublicationEnvelope(
@@ -6830,7 +6832,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private func publishRetainedLocalProjection(_ session: TabSession) -> Bool {
         guard session.tabID == currentTabID,
               retainsCancelledLocalDrift(session),
-              canSynchronizeDerivedTranscript(for: session, requiringLoadedPersistedState: false)
+              canPresentDerivedTranscript(for: session, requiringLoadedPersistedState: false)
         else { return false }
         guard retainsCancelledLocalDrift(session) else { return false }
         _ = publishTranscriptPresentation(from: session)
@@ -6841,7 +6843,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// completion, recording proof or marking the binding hydrated, then settle `.cancelled`.
     private func synchronizeCancelledLocalProjection(_ session: TabSession, attempt: AgentPersistedLoadAttempt?) {
         if session.tabID == currentTabID,
-           canSynchronizeDerivedTranscript(for: session, requiringLoadedPersistedState: false)
+           canPresentDerivedTranscript(for: session, requiringLoadedPersistedState: false)
         {
             refreshDerivedTranscriptState(for: session, reason: .liveMutation, publishActivePresentation: false)
             if let attempt, attempt.scope == transcriptPresentationScope(for: session) {
@@ -7828,17 +7830,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     func handleObservedMCPStateChange(for session: TabSession) {
         mcpRuntime.handleObservedMCPStateChange(for: session)
-    }
-
-    private func prepareTerminalPublication(for session: TabSession) {
-        removePendingUIRefresh(for: session.tabID)
-        withActiveUISyncSuppressed {
-            catchUpDerivedTranscriptIfNeeded(
-                for: session,
-                reason: .liveMutation,
-                publishActivePresentation: false
-            )
-        }
     }
 
     private func makeTerminalPublicationEnvelope(
@@ -12562,33 +12553,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return promptManager == nil
     }
 
-    /// Canonical ownership predicate for synchronizing a session's derived transcript.
-    ///
-    /// Unlike active presentation ownership, this intentionally permits background sessions.
-    /// `requiringLoadedPersistedState: false` is reserved for the cancelled current-source-drift
-    /// local projection (§4.3); every other caller keeps the strict default.
-    private func canSynchronizeDerivedTranscript(
+    /// Presentation eligibility is separate from runtime transcript materialization. A sidebar
+    /// that has moved to another saved conversation must not display this writer's old rows.
+    /// The loaded-state exception is reserved for cancelled local source-drift projection (§4.3).
+    private func canPresentDerivedTranscript(
         for session: TabSession,
         requiringLoadedPersistedState: Bool = true
     ) -> Bool {
-        guard sessions[session.tabID] === session,
-              !session.bindingTransitionInProgress,
-              session.hasLoadedPersistedState || !requiringLoadedPersistedState
-        else {
-            return false
-        }
-        if let binding = session.persistentSessionBindingIdentity {
-            guard binding.tabID == session.tabID,
-                  binding.sessionID == session.activeAgentSessionID
-            else {
-                return false
-            }
-            if let workspaceManager,
-               workspaceManager.activeAgentSessionID(forTabID: session.tabID) != binding.sessionID
-            {
-                return false
-            }
-        }
+        guard runtimeSessionStore.observation.canSynchronizeDerivedTranscript(
+            for: session, requiringLoadedPersistedState: requiringLoadedPersistedState
+        ) else { return false }
+        if let binding = session.persistentSessionBindingIdentity,
+           let workspaceManager,
+           workspaceManager.activeAgentSessionID(forTabID: session.tabID) != binding.sessionID
+        { return false }
         return true
     }
 
@@ -12598,7 +12576,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Headless/test harness contexts without a prompt manager may also keep publishing the
     /// already-owned transcript presentation, preserving the existing publication fallback.
     func canBuildOrPublishActiveTranscriptBindings(for session: TabSession) -> Bool {
-        guard canSynchronizeDerivedTranscript(for: session) else { return false }
+        guard canPresentDerivedTranscript(for: session) else { return false }
         if currentTabID == session.tabID {
             return true
         }
@@ -13743,31 +13721,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         validateProjectionIntegrity: Bool = false,
         publishActivePresentation: Bool = true
     ) -> Bool {
-        guard canSynchronizeDerivedTranscript(for: session) else { return false }
-        guard !session.items.isEmpty || !session.transcript.turns.isEmpty else { return false }
-        let projectionProtection = transcriptProjectionProtection(
-            for: session,
-            transcript: session.transcript
+        runtimeSessionStore.observation.catchUpDerivedTranscriptIfNeeded(
+            for: session, reason: reason,
+            validateProjectionIntegrity: validateProjectionIntegrity,
+            publishPresentation: publishActivePresentation
         )
-        let canReuseDerivedTranscript = canReuseDerivedTranscriptForSave(
-            for: session,
-            projectionProtection: projectionProtection
-        )
-        let projectionLooksStale = validateProjectionIntegrity
-            && canReuseDerivedTranscript
-            && derivedTranscriptProjectionLooksStale(for: session)
-        guard !canReuseDerivedTranscript || projectionLooksStale else { return false }
-        session.derivedTranscriptRefreshGeneration &+= 1
-        session.derivedTranscriptRefreshTask?.cancel()
-        session.derivedTranscriptRefreshTask = nil
-        let scheduledReason = session.pendingDerivedTranscriptRefreshReason ?? reason
-        session.pendingDerivedTranscriptRefreshReason = nil
-        refreshDerivedTranscriptState(
-            for: session,
-            reason: scheduledReason,
-            publishActivePresentation: publishActivePresentation
-        )
-        return true
     }
 
     @discardableResult
@@ -13782,19 +13740,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             reason: reason,
             validateProjectionIntegrity: validateProjectionIntegrity
         )
-    }
-
-    private func derivedTranscriptProjectionLooksStale(for session: TabSession) -> Bool {
-        guard !session.transcript.turns.isEmpty else { return false }
-        let expectedCounts = AgentTranscriptProjectionBuilder.projectionCounts(for: session.transcript)
-        if session.transcriptProjectionCounts != expectedCounts {
-            return true
-        }
-        let visibleRowCount = session.transcriptProjection.archivedRows.count
-            + session.transcriptProjection.workingRows.count
-        let workingRowCount = session.workingTranscriptProjection.workingRows.count
-        let presentedRowCount = max(visibleRowCount, workingRowCount)
-        return presentedRowCount < expectedCounts.defaultPresentedRowCount
     }
 
     func canReuseDerivedTranscriptForSave(for session: TabSession, projectionProtection: AgentTranscriptProjectionProtection) -> Bool {
