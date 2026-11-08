@@ -233,6 +233,19 @@ final class AgentSessionRuntimeStore {
             store.resolveWriter(sessionID: sessionID, expectedWorkspaceID: expectedWorkspaceID)
         }
 
+        /// Reconstitute an originating receipt from its stored value identity, never from
+        /// today's occupant. Binding preparation may drain this claim; admission still uses
+        /// Writer.isCurrent and admitCommand. No claim is created by this lookup.
+        func originatingWriter(identity: WriterIdentity, session: AgentTabSession) -> Writer? {
+            guard identity.scopeID == id,
+                  identity.restoration.bindingIdentity == session.persistentSessionBindingIdentity else { return nil }
+            let writer = Writer(
+                scope: self, session: session, binding: identity.restoration.bindingIdentity,
+                restoration: identity.restoration, identity: identity
+            )
+            return writer.ownsPersistentClaim ? writer : nil
+        }
+
         let presentation = AgentSessionPresentationRuntime()
         let usage = AgentSessionUsageRuntime()
         lazy var turnTiming = AgentSessionTurnTimingRuntime(presentation: presentation)

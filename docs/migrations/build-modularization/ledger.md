@@ -5864,3 +5864,36 @@ and **53/66** largest-cycle components. Two emitted touched-file warning signatu
 the baseline; none were new. The first run passed 151 tests but failed the new successor's
 approval-value assertion, exposing the skipped-ownership case described above; it is not a
 qualification pass. No live-app or full-suite validation was run.
+
+### M9.2 partial: control-context writer provenance and runtime routing
+
+Every control context now carries the value identity of its installing writer; registration
+replacement preserves it. The approval override receipt is immutable and explicit at every
+constructor. Runtime control lookup consumes the existing claim index, exact scope/object and
+incarnation rather than accepting a newly acquired writer with an old context. The independent
+scope-local duplicate-context veto remains, including an unbound copied context. Live registration,
+cursor, snapshot and observed-publication routes refuse obsolete contexts; epoch staging,
+preparation and cancellation compare the same stored identity. Follow-up mutation and control
+lookup bodies have moved out of the view model, while their compatibility callers remain open.
+
+Originating teardown is deliberately a separate route: the local single-holder lookup can still
+remove an obsolete exact context and registration after claim reacquisition. It grants no writer
+or new-command capability. Clearing an originating follow-up mask can drain retirement or binding
+preparation; setting it requires command admission. Review caught both cleanup distinctions, and
+tests cover refusal followed by actual teardown and an unblocked ordinary start. Cross-scope
+copied-registration resource protection and remaining MCP/tool callers are still M9.2 work.
+Canonical terminal snapshot construction remains with the original settlement path.
+
+Synthetic context fixtures now obtain a real indexed identity rather than fabricating authority.
+The broader presentation suites also retain the metadata-index assertions separately from writer
+identity: sidebar order/removal cannot re-elect the runtime workspace, and an in-flight binding
+transition has no command endpoint until it completes. No M9.3 host or M9.4 lifetime policy changed.
+
+Validation: `f466f8a9-95b8-428b-8f60-d2dd4b15f71a` passed **567 focused tests**, including
+control/epoch/cancellation, creation/restoration, Claude adoption, handoff, runtime-bridge and
+presentation/status-pill suites. Full lint passed `0af624b0-a7e2-4a66-8719-ec338849f961`;
+the final presentation-only fixture update also passed pinned format/lint checks. The initial
+run stopped at a fixture argument-order compile error; the next passed 556 tests but exposed
+four presentation tests still expecting pre-cutover window-derived endpoints. Neither failed
+run is a qualification pass. Product/index/warning evidence will accompany the priority M9.1/main
+integration before the next push. No live-app or full-suite validation was run.

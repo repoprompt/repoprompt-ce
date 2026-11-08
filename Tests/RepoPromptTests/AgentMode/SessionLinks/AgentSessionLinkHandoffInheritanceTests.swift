@@ -2917,7 +2917,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     if drift == "taskRole" {
                         let id = try XCTUnwrap(session.activeAgentSessionID)
                         let registration = await AgentRunSessionStore.register(sessionID: id)
-                        session.mcpControlContext = .init(sessionID: id, activationID: UUID(), registration: registration, currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil, originatingConnectionID: nil, interactionTransport: .mcp(sessionID: id, originatingConnectionID: nil), suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: session.autoEditEnabled, taskLabelKind: .explore)
+                        session.mcpControlContext = try .init(sessionID: id, activationID: UUID(), writerIdentity: controlWriterIdentity(for: session), registration: registration, currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil, originatingConnectionID: nil, interactionTransport: .mcp(sessionID: id, originatingConnectionID: nil), suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: session.autoEditEnabled, taskLabelKind: .explore, autoEditOverride: nil)
                         XCTAssertNotEqual(vm.providerSwitchInstructionStrings(session), preparation.instructions)
                         XCTAssertTrue(AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(toolName: "history", taskLabelKind: session.mcpControlContext?.taskLabelKind), "This role change affects composition, not history availability")
                     }
@@ -4083,7 +4083,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         let expected = !controlled && kind == "oversize" ? "Too long to send with the handover." : failure.message
                         if controlled {
                             let registration = await AgentRunSessionStore.register(sessionID: sessionID)
-                            session.mcpControlContext = .init(sessionID: sessionID, activationID: UUID(), registration: registration, currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil, originatingConnectionID: nil, interactionTransport: .mcp(sessionID: sessionID, originatingConnectionID: nil), suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: session.autoEditEnabled, taskLabelKind: .explore)
+                            session.mcpControlContext = try .init(sessionID: sessionID, activationID: UUID(), writerIdentity: controlWriterIdentity(for: session), registration: registration, currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil, originatingConnectionID: nil, interactionTransport: .mcp(sessionID: sessionID, originatingConnectionID: nil), suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: session.autoEditEnabled, taskLabelKind: .explore, autoEditOverride: nil)
                             vm.test_setMCPControlledTabIDs([session.tabID])
                             do {
                                 _ = try await vm.mcpDispatchInstruction(sessionID: sessionID, text: "MCP retained request", allowStartingRun: true)
@@ -4154,13 +4154,13 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         if controlled {
                             let sessionID = try XCTUnwrap(session.activeAgentSessionID)
                             let registration = await AgentRunSessionStore.register(sessionID: sessionID)
-                            session.mcpControlContext = AgentModeViewModel.AgentMCPControlContext(
-                                sessionID: sessionID, activationID: UUID(), registration: registration,
+                            session.mcpControlContext = try AgentModeViewModel.AgentMCPControlContext(
+                                sessionID: sessionID, activationID: UUID(), writerIdentity: controlWriterIdentity(for: session), registration: registration,
                                 currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
                                 originatingConnectionID: nil,
                                 interactionTransport: .mcp(sessionID: sessionID, originatingConnectionID: nil),
                                 suppressUserNotifications: true, forceAutoEditEnabled: false,
-                                autoEditEnabledBeforeOverride: session.autoEditEnabled, taskLabelKind: .explore
+                                autoEditEnabledBeforeOverride: session.autoEditEnabled, taskLabelKind: .explore, autoEditOverride: nil
                             )
                             vm.test_setMCPControlledTabIDs([session.tabID])
                             var finished = false

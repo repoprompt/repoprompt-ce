@@ -15,6 +15,7 @@ struct AgentRunEpochTransitionIntent: Equatable {
 struct AgentMCPControlContext: Equatable {
     let sessionID: UUID
     let activationID: UUID
+    let writerIdentity: AgentSessionRuntimeStore.WriterIdentity
     let registration: AgentRunSessionStore.Registration
     var currentEpoch: AgentRunTurnEpoch?
     var preparedEpoch: AgentRunTurnEpoch?
@@ -27,12 +28,13 @@ struct AgentMCPControlContext: Equatable {
     /// The task label kind for this MCP-controlled run (e.g. explore, engineer).
     /// Used to customize tool advertisement and system prompts for role-specific behavior.
     let taskLabelKind: AgentModelCatalog.TaskLabelKind?
-    var autoEditOverride: ApplyEditsApprovalStore.AutoEditOverride?
+    let autoEditOverride: ApplyEditsApprovalStore.AutoEditOverride?
 
     func replacingRegistration(_ registration: AgentRunSessionStore.Registration) -> Self {
         Self(
             sessionID: sessionID,
             activationID: activationID,
+            writerIdentity: writerIdentity,
             registration: registration,
             currentEpoch: currentEpoch,
             preparedEpoch: preparedEpoch,
@@ -79,6 +81,45 @@ final class AgentSessionMCPRuntime {
         }
     }
 
+    /// Only selects an exact receipt for teardown. This deliberately does not grant a
+    /// writer: an abandoned context must remain removable after its claim was superseded.
+    func controlSessionForTeardown(sessionID: UUID) -> AgentTabSession? {
+        guard let scope else { return nil }
+        let matches = scope.sessions.values.filter { $0.mcpControlContext?.sessionID == sessionID }
+        return matches.count == 1 ? matches.first : nil
+    }
+
+    /// Control provenance and live writer uniqueness are independent fences. Even an
+    /// unbound copied context preserves the existing local ambiguity veto.
+    func controlledWriter(sessionID: UUID) -> AgentSessionRuntimeStore.Writer? {
+        guard let scope, let session = controlSessionForTeardown(sessionID: sessionID),
+              let context = session.mcpControlContext,
+              context.writerIdentity.sessionID == sessionID,
+              context.registration.sessionID == sessionID else { return nil }
+        return scope.originatingWriter(identity: context.writerIdentity, session: session)
+    }
+
+    func registration(sessionID: UUID) -> AgentRunSessionStore.Registration? {
+        guard let writer = controlledWriter(sessionID: sessionID), writer.isCurrent else { return nil }
+        return writer.session.mcpControlContext?.registration
+    }
+
+    func waitCursor(sessionID: UUID) -> AgentRunSessionStore.WaitCursor? {
+        guard let writer = controlledWriter(sessionID: sessionID), writer.isCurrent,
+              let context = writer.session.mcpControlContext else { return nil }
+        return .init(registration: context.registration, epoch: context.currentEpoch)
+    }
+
+    func setFollowUpRunPending(sessionID: UUID, _ pending: Bool) {
+        guard let writer = controlledWriter(sessionID: sessionID),
+              writer.session.mcpFollowUpRunPending != pending else { return }
+        if pending {
+            guard case .success = writer.admitCommand() else { return }
+        }
+        writer.session.mcpFollowUpRunPending = pending
+        handleObservedMCPStateChange(for: writer.session)
+    }
+
     struct StagedEpochTransition {
         let writer: AgentSessionRuntimeStore.Writer
         let activationID: UUID
@@ -92,6 +133,7 @@ final class AgentSessionMCPRuntime {
         let writer = command.writer
         guard writer.scope === scope, command.isCurrent,
               var context = writer.session.mcpControlContext,
+              context.writerIdentity == writer.identity,
               context.sessionID == writer.identity.sessionID,
               context.registration.sessionID == writer.identity.sessionID else { return nil }
         let token = UUID()
@@ -109,6 +151,7 @@ final class AgentSessionMCPRuntime {
               writer.isCurrent || writer.scope.sessions[writer.session.tabID] !== writer.session,
               writer.session.currentRestorationBindingToken == writer.identity.restoration,
               var context = writer.session.mcpControlContext,
+              context.writerIdentity == writer.identity,
               context.activationID == staged.activationID, context.registration == staged.registration,
               context.preparedEpoch == nil, context.pendingEpochTransition?.token == staged.token else { return }
         context.pendingEpochTransition = nil
@@ -141,6 +184,7 @@ final class AgentSessionMCPRuntime {
               case let .unique(writer) = scope.resolveWriter(sessionID: sessionID),
               writer.scope === scope, writer.session === session,
               case let .success(command) = writer.admitCommand(),
+              context.writerIdentity == writer.identity,
               context.sessionID == sessionID, context.registration.sessionID == sessionID,
               stopFence.permitsStart(of: session), !session.runState.isActive,
               let execution = scope.execution else { return false }
@@ -161,6 +205,7 @@ final class AgentSessionMCPRuntime {
         // An accepted epoch may have been acknowledged for the originating object after
         // Stop or retirement. That acknowledgement is not permission to dispatch a turn.
         return command.isCurrent && stopFence.permitsStart(of: session)
+            && session.mcpControlContext?.writerIdentity == writer.identity
             && session.mcpControlContext?.activationID == context.activationID
             && session.mcpControlContext?.preparedEpoch != nil
     }
@@ -182,10 +227,11 @@ final class AgentSessionMCPRuntime {
         func isCurrentControl() -> Bool {
             command.isCurrent && !Task.isCancelled && fence.permitsStart(of: session)
                 && session.mcpControlActivationGeneration == activation
+                && session.mcpControlContext?.writerIdentity == writer.identity
                 && session.mcpControlContext?.activationID == original.activationID
                 && writer.scope.sessions.values.count(where: { $0.mcpControlContext?.sessionID == original.sessionID }) == 1
         }
-        guard isCurrentControl(), original.sessionID == writer.identity.sessionID,
+        guard isCurrentControl(), original.writerIdentity == writer.identity, original.sessionID == writer.identity.sessionID,
               original.registration.sessionID == writer.identity.sessionID else { return false }
         session.mcpFollowUpRunPending = true
         handleObservedMCPStateChange(for: session)
@@ -250,6 +296,7 @@ final class AgentSessionMCPRuntime {
             guard writer.ownsPersistentClaim,
                   session.activeAgentSessionID == registration.sessionID,
                   let context = session.mcpControlContext,
+                  context.writerIdentity == writer.identity,
                   context.activationID == activationID,
                   context.registration == registration
             else { return }
@@ -336,6 +383,7 @@ final class AgentSessionMCPRuntime {
         defer { withExtendedLifetime(command) {} }
         guard stopFence.permitsStart(of: session), !session.runState.isActive,
               let originalContext = session.mcpControlContext,
+              originalContext.writerIdentity == writer.identity,
               originalContext.sessionID == sessionID, originalContext.registration.sessionID == sessionID
         else { return }
         if originalContext.preparedEpoch != nil {
@@ -380,6 +428,7 @@ final class AgentSessionMCPRuntime {
             guard command.isCurrent, stopFence.permitsStart(of: session),
                   session.mcpControlActivationGeneration == activationGeneration,
                   let context = session.mcpControlContext,
+                  context.writerIdentity == originalContext.writerIdentity,
                   context.activationID == originalContext.activationID,
                   context.registration == originalContext.registration,
                   context.currentEpoch == originalContext.currentEpoch,
@@ -394,6 +443,7 @@ final class AgentSessionMCPRuntime {
             guard command.isCurrent, cancellation.permitsPublication, stopFence.permitsStart(of: session),
                   session.mcpControlActivationGeneration == activationGeneration,
                   let context = session.mcpControlContext,
+                  context.writerIdentity == originalContext.writerIdentity,
                   context.activationID == originalContext.activationID,
                   context.registration == originalContext.registration,
                   context.currentEpoch == originalContext.currentEpoch
@@ -420,6 +470,7 @@ final class AgentSessionMCPRuntime {
               !session.bindingTransitionInProgress,
               session.mcpControlActivationGeneration == activationGeneration,
               var context = session.mcpControlContext,
+              context.writerIdentity == originalContext.writerIdentity,
               context.activationID == originalContext.activationID,
               context.registration == originalContext.registration,
               context.currentEpoch == originalContext.currentEpoch || context.currentEpoch == epoch
@@ -547,6 +598,10 @@ final class AgentSessionMCPRuntime {
         canonicalFailureReason: AgentRunMCPSnapshot.FailureReason? = nil
     ) -> AgentRunMCPSnapshot? {
         guard let context = session.mcpControlContext else { return nil }
+        if canonicalTerminalState == nil {
+            guard let writer = controlledWriter(sessionID: context.sessionID),
+                  writer.session === session, writer.isCurrent else { return nil }
+        }
         let interaction = canonicalTerminalState == nil ? mcpPendingInteraction(for: session) : nil
         let status: AgentRunMCPSnapshot.Status = {
             if let canonicalTerminalState {
@@ -1115,15 +1170,16 @@ final class AgentSessionMCPRuntime {
         activationID: UUID,
         registration: AgentRunSessionStore.Registration
     ) -> Bool {
-        guard let session = scope?.sessions[tabID],
-              let context = session.mcpControlContext
+        guard let writer = controlledWriter(sessionID: sessionID), writer.isCurrent,
+              writer.session.tabID == tabID,
+              let context = writer.session.mcpControlContext
         else {
             return false
         }
         return context.sessionID == sessionID
             && context.activationID == activationID
             && context.registration == registration
-            && session.activeAgentSessionID == sessionID
+            && writer.identity.sessionID == sessionID
     }
 
     func handleObservedMCPStateChange(

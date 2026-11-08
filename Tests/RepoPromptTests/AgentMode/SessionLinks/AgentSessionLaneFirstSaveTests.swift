@@ -118,14 +118,17 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
     /// refuses to capture an app-owned linked overseer. These races test proof revocation and
     /// rollback, not capture admission; the production didSet and release path still run.
     private func installDeniedRoleControlFixture(on session: AgentTabSession, sessionID: UUID) async {
+        guard let identity = try? controlWriterIdentity(for: session) else {
+            return XCTFail("The denied-role fixture requires its real persistent writer")
+        }
         let registration = await AgentRunSessionStore.register(sessionID: sessionID)
         session.mcpControlContext = AgentModeViewModel.AgentMCPControlContext(
-            sessionID: sessionID, activationID: UUID(), registration: registration,
+            sessionID: sessionID, activationID: UUID(), writerIdentity: identity, registration: registration,
             currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
             originatingConnectionID: nil,
             interactionTransport: .mcp(sessionID: sessionID, originatingConnectionID: nil),
             suppressUserNotifications: true, forceAutoEditEnabled: false,
-            autoEditEnabledBeforeOverride: session.autoEditEnabled, taskLabelKind: .explore
+            autoEditEnabledBeforeOverride: session.autoEditEnabled, taskLabelKind: .explore, autoEditOverride: nil
         )
     }
 

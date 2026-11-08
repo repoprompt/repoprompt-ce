@@ -7925,41 +7925,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func mcpControlledSession(sessionID: UUID) -> TabSession? {
-        let matches = sessions.values.filter { $0.mcpControlContext?.sessionID == sessionID }
-        guard matches.count == 1 else {
-            if matches.count > 1 {
-                #if DEBUG
-                    perfRecorder.event(
-                        "mcp.routing.ambiguousControlContext",
-                        fields: [
-                            "sessionID": sessionID.uuidString,
-                            "candidateTabIDs": matches.map(\.tabID.uuidString).sorted().joined(separator: ",")
-                        ]
-                    )
-                #endif
-            }
-            return nil
-        }
-        return matches[0]
+        mcpRuntime.controlledWriter(sessionID: sessionID)?.session
     }
 
     func mcpRegistration(sessionID: UUID) -> AgentRunSessionStore.Registration? {
-        mcpControlledSession(sessionID: sessionID)?.mcpControlContext?.registration
+        mcpRuntime.registration(sessionID: sessionID)
     }
 
     func mcpWaitCursor(sessionID: UUID) -> AgentRunSessionStore.WaitCursor? {
-        guard let context = mcpControlledSession(sessionID: sessionID)?.mcpControlContext else { return nil }
-        return .init(registration: context.registration, epoch: context.currentEpoch)
+        mcpRuntime.waitCursor(sessionID: sessionID)
     }
 
     /// Marks a controlled session as having a follow-up run pending so that
     /// `mcpSnapshot(for:)` returns `.running` during the async gap before the
     /// new run actually starts. Cleared automatically by `startAgentRun`.
     func setMCPFollowUpRunPending(sessionID: UUID, _ pending: Bool) {
-        guard let session = mcpControlledSession(sessionID: sessionID) else { return }
-        guard session.mcpFollowUpRunPending != pending else { return }
-        session.mcpFollowUpRunPending = pending
-        handleObservedMCPStateChange(for: session)
+        mcpRuntime.setFollowUpRunPending(sessionID: sessionID, pending)
     }
 
     func withMCPRunEpochTransition<T>(
@@ -11402,7 +11383,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         cleanupSessionStore: Bool = false
     ) async {
         mcpRemoveAgentRunOracleReviewContexts(sessionID: sessionID)
-        guard let session = mcpControlledSession(sessionID: sessionID),
+        guard let session = mcpRuntime.controlSessionForTeardown(sessionID: sessionID),
               let context = session.mcpControlContext,
               context.sessionID == sessionID
         else {
@@ -11422,8 +11403,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessionID: UUID,
         expectedContext: AgentMCPControlContext
     ) async -> Bool {
-        guard let session = mcpControlledSession(sessionID: sessionID),
+        guard let session = mcpRuntime.controlSessionForTeardown(sessionID: sessionID),
               let context = session.mcpControlContext,
+              context.writerIdentity == expectedContext.writerIdentity,
               context.activationID == expectedContext.activationID,
               context.registration == expectedContext.registration,
               !session.runState.isActive
@@ -11441,7 +11423,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         registration: AgentRunSessionStore.Registration,
         reactivatedTarget: MCPSessionTarget?
     ) async -> Bool {
-        guard let session = mcpControlledSession(sessionID: sessionID),
+        guard let session = mcpRuntime.controlSessionForTeardown(sessionID: sessionID),
               let context = session.mcpControlContext,
               context.sessionID == sessionID,
               context.activationID == activationID,

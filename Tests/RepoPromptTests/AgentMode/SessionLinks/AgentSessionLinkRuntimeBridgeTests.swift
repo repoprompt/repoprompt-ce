@@ -3436,19 +3436,22 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             let observer = fixture.observer
             let session = AgentModeViewModel.TabSession(tabID: observer.tabID)
             session.beginPersistentBindingTransition()
-            try session.installPersistentSessionBinding(.init(tabID: observer.tabID, sessionID: observer.sessionID, generation: XCTUnwrap(observer.persistentBindingGeneration)))
+            try session.installPersistentSessionBinding(.init(tabID: observer.tabID, sessionID: observer.sessionID, generation: XCTUnwrap(observer.persistentBindingGeneration), workspaceID: observer.workspaceID))
+            let scope = AgentSessionRuntimeStore().makeScope()
+            scope.replaceSessions([session.tabID: session])
+            let controlIdentity = try controlWriterIdentity(for: session, scope: scope)
             session.hasLoadedPersistedState = true
             session.recordRestorationAuthoritative(.persistedPayloadApplied)
             let registration = await AgentRunSessionStore.register(sessionID: observer.sessionID)
             addTeardownBlock { await AgentRunSessionStore.cleanup(registration: registration) }
             func context(_ kind: AgentModelCatalog.TaskLabelKind) -> AgentModeViewModel.AgentMCPControlContext {
                 .init(
-                    sessionID: observer.sessionID, activationID: UUID(), registration: registration,
+                    sessionID: observer.sessionID, activationID: UUID(), writerIdentity: controlIdentity, registration: registration,
                     currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
                     originatingConnectionID: nil,
                     interactionTransport: .mcp(sessionID: observer.sessionID, originatingConnectionID: nil),
                     suppressUserNotifications: true, forceAutoEditEnabled: false,
-                    autoEditEnabledBeforeOverride: session.autoEditEnabled, taskLabelKind: kind
+                    autoEditEnabledBeforeOverride: session.autoEditEnabled, taskLabelKind: kind, autoEditOverride: nil
                 )
             }
             if input == "role-policy" { session.mcpControlContext = context(.pair) }

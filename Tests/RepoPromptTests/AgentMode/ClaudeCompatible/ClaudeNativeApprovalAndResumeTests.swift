@@ -1531,9 +1531,10 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         session.claudeController = controller
         if let id = controlledSessionID {
             let registration = await AgentRunSessionStore.register(sessionID: id)
-            session.mcpControlContext = .init(
+            session.mcpControlContext = try .init(
                 sessionID: id,
                 activationID: UUID(),
+                writerIdentity: controlWriterIdentity(for: session),
                 registration: registration,
                 currentEpoch: nil,
                 preparedEpoch: nil,
@@ -1543,7 +1544,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
                 suppressUserNotifications: true,
                 forceAutoEditEnabled: false,
                 autoEditEnabledBeforeOverride: false,
-                taskLabelKind: .pair
+                taskLabelKind: .pair, autoEditOverride: nil
             )
         }
         let installed = await harness.host.claudeCoordinator.test_installEventListener(for: session)
@@ -2112,11 +2113,11 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         let installed = await harness.host.claudeCoordinator.test_installEventListener(for: session)
         if let id = controlledSessionID {
             let registration = await AgentRunSessionStore.register(sessionID: id)
-            session.mcpControlContext = .init(
-                sessionID: id, activationID: UUID(), registration: registration,
+            session.mcpControlContext = try .init(
+                sessionID: id, activationID: UUID(), writerIdentity: controlWriterIdentity(for: session), registration: registration,
                 currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
                 originatingConnectionID: nil, interactionTransport: .mcp(sessionID: id, originatingConnectionID: nil),
-                suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: .pair
+                suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: .pair, autoEditOverride: nil
             )
         }
         return try (harness, session, controller, XCTUnwrap(installed))
@@ -3045,7 +3046,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
                 session = live
                 let registered = await AgentRunSessionStore.register(sessionID: sessionID)
                 storeRegistration = registered
-                live.mcpControlContext = .init(sessionID: sessionID, activationID: UUID(), registration: registered, currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil, originatingConnectionID: nil, interactionTransport: .mcp(sessionID: sessionID, originatingConnectionID: nil), suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: .pair)
+                live.mcpControlContext = try .init(sessionID: sessionID, activationID: UUID(), writerIdentity: controlWriterIdentity(for: live), registration: registered, currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil, originatingConnectionID: nil, interactionTransport: .mcp(sessionID: sessionID, originatingConnectionID: nil), suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: .pair, autoEditOverride: nil)
                 let controller = MonitorFakeNativeController()
                 let runID = UUID()
                 runIDs.append(runID)

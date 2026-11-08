@@ -99,6 +99,7 @@ extension AgentSessionMCPRuntime {
         let activatedContext = AgentMCPControlContext(
             sessionID: sessionID,
             activationID: activationID,
+            writerIdentity: writer.identity,
             registration: registration,
             currentEpoch: nil,
             preparedEpoch: nil,

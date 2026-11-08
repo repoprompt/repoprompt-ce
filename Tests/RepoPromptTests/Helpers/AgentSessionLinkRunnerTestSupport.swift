@@ -8,6 +8,20 @@ import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import XCTest
 
+/// Context fixtures must use the real admitted claim, including pending-restoration claims;
+/// a fabricated identity would hide precisely the routing failures these tests exercise.
+@MainActor
+func controlWriterIdentity(
+    for session: AgentTabSession, scope: AgentSessionRuntimeStore.Scope? = nil
+) throws -> AgentSessionRuntimeStore.WriterIdentity {
+    let id = try XCTUnwrap(session.activeAgentSessionID)
+    let resolution = scope?.resolveWriter(sessionID: id) ?? AgentSessionRuntimeStore.shared.resolveWriter(sessionID: id)
+    guard case let .unique(writer) = resolution, writer.session === session else {
+        throw NSError(domain: "Control fixture requires an exact runtime writer", code: 1)
+    }
+    return writer.identity
+}
+
 /// Runner-level harness for the cross-window oversight prompt supplement.
 ///
 /// Builds the real `HeadlessAgentModeRunner` / `ACPIntegratedAgentModeRunner` (through
