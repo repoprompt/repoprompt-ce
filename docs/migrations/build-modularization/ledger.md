@@ -5339,3 +5339,24 @@ stash remain excluded and preserved. PR #1655 stays draft; no live-app lifecycle
   the new watchdog/fixture code emitted no new diagnostics in focused compilation. This is not a
   claim that the repository has no existing warnings; the clean hosted aggregate ratchet remains
   separate. Final Swift-tree lint: `e58f94fa-e23f-4c2b-beb6-fff6dfa2113e`, passed.
+
+#### M9.1 review follow-up: incremental Claude reasoning preview
+
+Addressed review comment `4506135560` (review `5817795307`): the pre-existing assignment, preserved
+by the move, now appends reasoning chunks before the unchanged 4000-character suffix trim.
+The production feature remains disabled; the existing DEBUG VM test hook reaches a shared private
+enabled-path helper without changing the flag, production guard or status timing. A deterministic
+regression covers an assembled last-line preview, a subsequent complete multiline thinking block,
+and the exact retained suffix/4000-character bound. Block-boundary/snapshot deduplication remains
+outside this narrow append repair; it must be considered before enabling the dormant feature.
+
+- Pre-fix witness `e1777397-9e0b-4083-8647-04695a954a89`: one test failed with last-fragment preview
+  and a 12-character buffer after the final chunk. An earlier attempt failed to compile the test
+  fixture's missing factory argument and is not a behavioral red receipt.
+- Final `47c2c344-480a-4c60-b623-a1f36f3bfb2d`: **57 tests passed** — stream runtime 6, quiet check-in
+  lifecycle 25, Claude native turn correlation 26. One bounded independent diff review completed.
+- Scoped SwiftFormat and lint `ca1f336c-2821-4beb-9fd1-ba4ea71d005f` passed.
+- Both products `6b6da9b4-6667-4bd6-aa4b-6d327ee4570b` passed; fresh index remained **1242/1360**
+  wrong-way file edges and **53/66** largest-cycle components.
+- No new compiler warnings in the three touched Swift files. The two emitted VM actor-isolation
+  warnings are at unchanged lines 2839/3128, already matched to main in the prior audit.
