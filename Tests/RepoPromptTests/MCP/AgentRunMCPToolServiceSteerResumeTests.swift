@@ -835,6 +835,105 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         XCTAssertNil(remaining)
     }
 
+    func testRuntimeControlActivationOwnsPermissionsAndRollbackWithoutPresentation() async throws {
+        for (detachPresentation, revokeAfterApproval) in [(true, false), (true, true), (false, false), (false, true)] {
+            let window = try await makeWindow()
+            let viewModel = window.agentModeViewModel
+            let sessionID = UUID()
+            let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+            let command = try XCTUnwrap(viewModel.runtimeCommand(sessionID: sessionID))
+            let runtime = command.writer.scope.mcp
+            let presentation = command.writer.scope.presentation
+            if detachPresentation {
+                // Replace the VM sink, then detach its exact token: activation has no UI recipient.
+                let attachment = presentation.attach(session, sink: .init(
+                    activityChanged: { _, _ in }, refresh: { _, _, _ in },
+                    turnComplete: { _ in }, turnFailed: { _, _ in }
+                ))
+                presentation.detach(attachment)
+            }
+            let approvals = viewModel.applyEditsApprovalStore
+            let approvalScope = viewModel.applyEditsScope(for: session.tabID)
+            // Use the installed resource, not an unrelated actor whose initial subscription
+            // snapshot could race this test's manually assigned session value.
+            try await AsyncTestWait.waitUntil("approval-store subscription initialized") {
+                await MainActor.run { session.applyEditsApprovalSubscriptionID != nil }
+            }
+            await approvals.setAutoEditEnabled(false, for: approvalScope, updateGlobalDefault: false)
+            try await AsyncTestWait.waitUntil("approval-store disabled state projected") {
+                await MainActor.run { !session.autoEditEnabled }
+            }
+            let priorOrigin = session.isMCPOriginated
+            let priorProfile = session.permissionProfile
+            var setupBoundaries = 0
+            var revoked = false
+            runtime.test_afterMCPControlSetupAwait = { _ in
+                setupBoundaries += 1
+                XCTAssertFalse(viewModel.mcpControlledTabIDs.contains(session.tabID), "Provisional setup is not a completed UI projection")
+                if setupBoundaries == 2 {
+                    let approval = await approvals.autoEditEnabled(for: approvalScope)
+                    XCTAssertTrue(approval, "The actual approval actor must have accepted the override")
+                    XCTAssertTrue(session.autoEditEnabled)
+                    revoked = revokeAfterApproval
+                }
+            }
+            defer { runtime.test_afterMCPControlSetupAwait = nil }
+            do {
+                let context = try await runtime.activateControlContext(
+                    command: command, activationID: UUID(), originatingConnectionID: nil,
+                    taskLabelKind: nil, startPending: true, markSessionAsMCPOriginated: true,
+                    requireInactiveRunState: true,
+                    resources: .init(
+                        approvalStore: approvals,
+                        approvalScope: approvalScope,
+                        providerBindings: viewModel.providerBindingService,
+                        perfRecorder: viewModel.perfRecorder
+                    ),
+                    revalidateAdmission: { ownership in
+                        if revoked { throw MCPError.invalidParams("Consent revoked after approval") }
+                        if case let .installed(context, generation) = ownership {
+                            XCTAssertEqual(session.mcpControlContext, context)
+                            XCTAssertEqual(session.mcpControlActivationGeneration, generation)
+                        }
+                    }
+                )
+                XCTAssertFalse(revokeAfterApproval)
+                XCTAssertEqual(session.mcpControlContext, context)
+                XCTAssertTrue(session.mcpFollowUpRunPending)
+                XCTAssertTrue(session.isMCPOriginated)
+                XCTAssertEqual(session.permissionProfile, viewModel.providerBindingService.permissionProfileForMCPActivation(
+                    isSubagent: true, provider: session.selectedAgent.providerBindingID
+                ))
+            } catch {
+                XCTAssertTrue(revokeAfterApproval)
+                XCTAssertTrue(String(describing: error).contains("Consent revoked after approval"))
+            }
+            XCTAssertEqual(setupBoundaries, 2)
+            XCTAssertTrue(command.isCurrent)
+            XCTAssertEqual(
+                viewModel.mcpControlledTabIDs.contains(session.tabID),
+                !detachPresentation && !revokeAfterApproval,
+                "Only an attached presentation projects completed control; rollback removes its projection"
+            )
+            let approval = await approvals.autoEditEnabled(for: approvalScope)
+            XCTAssertEqual(approval, !revokeAfterApproval)
+            if revokeAfterApproval {
+                XCTAssertNil(session.mcpControlContext)
+                XCTAssertFalse(session.mcpFollowUpRunPending)
+                XCTAssertEqual(session.isMCPOriginated, priorOrigin)
+                XCTAssertEqual(session.permissionProfile, priorProfile)
+                try await AsyncTestWait.waitUntil("approval-store rollback projected") {
+                    await MainActor.run { !session.autoEditEnabled }
+                }
+                XCTAssertFalse(session.autoEditEnabled)
+                let registration = await AgentRunSessionStore.currentRegistration(for: sessionID)
+                XCTAssertNil(registration)
+            }
+            runtime.test_afterMCPControlSetupAwait = nil
+            await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+        }
+    }
+
     func testControlActivationCannotPublishOrRollBackAcrossWriterReacquisition() async throws {
         for afterInstallation in [false, true] {
             let window = try await makeWindow()

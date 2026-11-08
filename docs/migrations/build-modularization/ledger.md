@@ -5791,3 +5791,36 @@ fixture-only property correction. Fresh index passed **1241/1360** wrong-way fil
 baseline; none were new. The first run exposed abandoned-registration cleanup and unbound
 parameter fixtures; the second stopped on two incorrect test property names. Neither is a pass.
 No live-app or full-suite validation was run.
+
+### M9.2 partial milestone: runtime control installation and permission rollback
+
+`AgentSessionMCPRuntime.activateControlContext` now owns context installation, pending/origin
+state, provider permission policy, the real approval-store override, and exact provisional
+rollback. The VM installation body and DEBUG hook storage are removed. Composition supplies
+concrete approval/settings resources and a synchronous, read-only phase-specific resident
+consent fence; the admitted writer remains fixed through registration and permission awaits.
+The existing domain registration and cancellation owners are unchanged.
+
+Control UI membership and active bindings are an optional presentation projection after setup
+commits, or after rollback. Attached and detached cases exercise the same runtime transaction;
+consent revoked after the approval actor accepted its override restores the originating values
+and removes the exact provisional registration. Review caught an unintended post-installation
+inactive-run check: it was restricted to the resident phase to preserve the existing contract.
+Presentation is projected before observed MCP publication. The old VM permission and observed
+state helpers were checked: they forward to the same provider-policy and runtime owners.
+
+This retires the installation/permission mutation callback path, not the remaining host
+preflight/hydration/reset preparation, deactivation, control lookup/tool routing or inner
+provider execution. Those remain M9.2 items in the inventory above. Approval resources and UI
+projection are distinct from command authority; no M9.3 saved-host or M9.4 lifetime policy changed.
+
+Validation: `36066335-60d1-4edf-b644-183e4b61d4c2` passed **138 focused tests**. Both products
+passed `72f78cf7-ce4b-418f-9e6b-4686db31d673`; full lint passed
+`c14ae264-c79d-4060-a659-b3e963a26c3f`, with explicit scoped checks for the new runtime file
+and final test-only fixture correction. Fresh index passed **1242/1360** wrong-way file edges
+and **53/66** largest-cycle components. Two emitted touched-file warning signatures matched
+the baseline; none were new. The first compile caught two missing imports. The next run passed
+all 137 existing tests but exposed an unrelated approval actor in the new fixture; the final
+fixture uses the installed actor and observes subscription/state acknowledgement, preserving
+all rollback assertions. Neither earlier run qualifies this milestone. No live-app or full-suite
+validation was run.

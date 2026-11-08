@@ -31,6 +31,7 @@ final class AgentSessionPresentationRuntime {
         var draftRestored: ((AgentTabSession, AgentComposerDraftRestorationEvent) -> Void)?
         var modelConfiguration: ((AgentTabSession, AgentModelCatalogRuntime.Selection) -> Void)?
         var reasoningEffort: ((AgentTabSession) -> Void)?
+        var mcpControl: ((AgentTabSession, Bool) -> Void)?
     }
 
     struct Attachment: Equatable {
@@ -86,6 +87,10 @@ final class AgentSessionPresentationRuntime {
 
     func assistantDeltaApplied(_ session: AgentTabSession, sourceItemsRevision: Int, flushGeneration: UInt64) {
         sink(for: session)?.assistantDelta?(session, sourceItemsRevision, flushGeneration)
+    }
+
+    func mcpControlChanged(_ session: AgentTabSession, controlled: Bool) {
+        sink(for: session)?.mcpControl?(session, controlled)
     }
 
     func permissionsChanged(_ session: AgentTabSession) {

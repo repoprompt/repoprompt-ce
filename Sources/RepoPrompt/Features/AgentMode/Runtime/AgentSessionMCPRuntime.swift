@@ -56,7 +56,25 @@ final class AgentSessionMCPRuntime {
 
     #if DEBUG
         var test_afterEpochBegan: (@MainActor () async -> Void)?
+        var test_afterMCPControlActivation: (@MainActor (AgentTabSession) async -> Void)?
+        var test_afterMCPControlRegistration: (@MainActor (UUID) async -> Void)?
+        var test_afterMCPControlSetupAwait: (@MainActor (AgentTabSession) async -> Void)?
     #endif
+
+    enum ControlActivationOwnership {
+        case resident
+        case installed(context: AgentMCPControlContext, generation: UInt64)
+
+        @MainActor
+        func matches(_ session: AgentTabSession) -> Bool {
+            switch self {
+            case .resident:
+                AgentModeViewModel.isMCPResidentAppOwned(session)
+            case let .installed(context, generation):
+                session.mcpControlContext == context && session.mcpControlActivationGeneration == generation
+            }
+        }
+    }
 
     struct StagedEpochTransition {
         let writer: AgentSessionRuntimeStore.Writer

@@ -1159,7 +1159,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         private var test_afterExplicitTabSessionReady: (@MainActor () async -> Void)?
         private var test_afterProvisionalExistingTabBindingInstalled: (@MainActor () async -> Void)?
         private var test_afterDurableExplicitTabSessionBinding: (@MainActor () async -> Void)?
-        var test_afterMCPControlActivation: (@MainActor (TabSession) async -> Void)?
+        var test_afterMCPControlActivation: (@MainActor (TabSession) async -> Void)? {
+            get { mcpRuntime.test_afterMCPControlActivation }
+            set { mcpRuntime.test_afterMCPControlActivation = newValue }
+        }
+
         /// Passive: runs synchronously in the real switch listener right after it queues the existing
         /// `handleWorkspaceSwitch` task for `owner`.
         var test_afterWorkspaceSwitchAdoptionQueued: (@MainActor (SessionIndexOwner) -> Void)?
@@ -1207,8 +1211,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     #if DEBUG
         var test_beforeRestorationHydrationAdmission: (@MainActor () async -> Void)?
         var test_restorationHydrationTaskDidFinish: (@MainActor () -> Void)?
-        var test_afterMCPControlRegistration: (@MainActor (UUID) async -> Void)?
-        var test_afterMCPControlSetupAwait: (@MainActor (TabSession) async -> Void)?
+        var test_afterMCPControlRegistration: (@MainActor (UUID) async -> Void)? {
+            get { mcpRuntime.test_afterMCPControlRegistration }
+            set { mcpRuntime.test_afterMCPControlRegistration = newValue }
+        }
+
+        var test_afterMCPControlSetupAwait: (@MainActor (TabSession) async -> Void)? {
+            get { mcpRuntime.test_afterMCPControlSetupAwait }
+            set { mcpRuntime.test_afterMCPControlSetupAwait = newValue }
+        }
+
         /// Holds lane creation after provenance is installed and before configuration.
         var test_afterOversightLaneProvision: (@MainActor (UUID) async -> Void)?
         /// Runs after Handoff's async payload/tab work and before the captured source worktree
@@ -2200,6 +2212,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     isRestoringState = true
                     defer { isRestoringState = restoring }
                     selectedReasoningEffortRaw = session.selectedReasoningEffortRaw
+                },
+                mcpControl: { [weak self] session, controlled in
+                    guard let self, sessions[session.tabID] === session else { return }
+                    if controlled { mcpControlledTabIDs.insert(session.tabID) }
+                    else { mcpControlledTabIDs.remove(session.tabID) }
+                    if session.tabID == currentTabID { updateBindingsFromSession(session) }
                 }
             ))
         }
@@ -10664,7 +10682,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         }
         let activationBindingToken = session.currentRestorationBindingToken
-        var activationOwnership: MCPActivationOwnership = .resident
         func requireActivationOwner() throws {
             guard activationCommand.isCurrent else {
                 throw MCPError.invalidParams("The requested agent session writer changed during MCP control activation.")
@@ -10677,7 +10694,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             try requireSessionConfigurationAdmission(session, creationHandle: creationHandle)
             if creationHandle == nil {
                 try mcpRequireActivationOwnerFence(
-                    residentActivationTarget, session: session, ownership: activationOwnership
+                    residentActivationTarget, session: session, ownership: .resident
                 )
             }
         }
@@ -10717,188 +10734,24 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
         try requireActivationOwner()
-        let admission = try await activationWriter.scope.mcp.registerControlActivation(
-            command: activationCommand, activationID: activationID, revalidateAdmission: requireActivationOwner
-        )
-        let activationGeneration = admission.generation
-        let cancellation = admission.cancellation
-        let registration = admission.registration
-        // This hook models the actor hop after runtime registration revalidation and before
-        // visibility. The host must still recheck its pinned command and consent afterwards.
-        #if DEBUG
-            await test_afterMCPControlRegistration?(activationID)
-        #endif
-        do {
-            try requireActivationOwner()
-        } catch {
-            await AgentRunSessionStore.cleanup(registration: registration)
-            throw error
-        }
-        guard registration.generation != 0 else {
-            throw MCPError.internalError(
-                "The Agent session runtime is shutting down and cannot activate a control session."
-            )
-        }
-        guard cancellation.permitsPublication,
-              sessions[tabID] === session,
-              session.activeAgentSessionID == sessionID,
-              !session.bindingTransitionInProgress,
-              session.mcpControlActivationGeneration == activationGeneration
-        else {
-            await AgentRunSessionStore.cleanup(registration: registration)
-            throw MCPError.invalidParams("The requested agent session binding changed before MCP control activation.")
-        }
-        if requireInactiveRunState, session.runState.isActive {
-            await AgentRunSessionStore.cleanup(registration: registration)
-            throw MCPError.invalidParams(
-                "The requested agent session became active before MCP control activation."
-            )
-        }
-        let priorAutoEditEnabled = existingContext?.sessionID == sessionID
-            ? existingContext?.autoEditEnabledBeforeOverride ?? session.autoEditEnabled
-            : session.autoEditEnabled
-        let activatedContext = AgentMCPControlContext(
-            sessionID: sessionID,
-            activationID: activationID,
-            registration: registration,
-            currentEpoch: nil,
-            preparedEpoch: nil,
-            pendingEpochTransition: nil,
-            originatingConnectionID: originatingConnectionID,
-            interactionTransport: .mcp(
-                sessionID: sessionID,
-                originatingConnectionID: originatingConnectionID
+        return try await activationWriter.scope.mcp.activateControlContext(
+            command: activationCommand, activationID: activationID,
+            originatingConnectionID: originatingConnectionID, taskLabelKind: taskLabelKind,
+            startPending: startPending, markSessionAsMCPOriginated: markSessionAsMCPOriginated,
+            requireInactiveRunState: requireInactiveRunState,
+            resources: .init(
+                approvalStore: applyEditsApprovalStore,
+                approvalScope: applyEditsScope(for: tabID),
+                providerBindings: providerBindingService,
+                perfRecorder: perfRecorder
             ),
-            suppressUserNotifications: true,
-            forceAutoEditEnabled: true,
-            autoEditEnabledBeforeOverride: priorAutoEditEnabled,
-            taskLabelKind: taskLabelKind
-        )
-        let priorMCPOriginated = session.isMCPOriginated
-        let priorPermissionProfile = session.permissionProfile
-        var didOverrideAutoEdit = false
-        var didMarkMCPOriginated = false
-        var installedPermissionProfile: AgentPermissionProfile?
-        // Observers can publish as soon as control is installed. Establish pending status before
-        // setup suspends, so an idle session cannot publish a sticky terminal snapshot for this start.
-        session.mcpFollowUpRunPending = startPending
-        session.mcpControlContext = activatedContext
-        // Publication transfers ownership from the app-owned admission to this exact control context.
-        activationOwnership = .installed(context: activatedContext, generation: activationGeneration)
-        func releaseFailedInstalledActivation() async {
-            // An unchanged activation ID/generation/context is this attempt's provisional
-            // write even if its writer claim was lost. Remove that receipt, not successor work.
-            guard sessions[tabID] === session,
-                  session.currentRestorationBindingToken == activationBindingToken,
-                  session.mcpControlActivationGeneration == activationGeneration,
-                  session.mcpControlContext == activatedContext
-            else {
-                let current = sessions[tabID]
-                if let current, current.mcpControlContext?.registration == registration,
-                   current !== session || current.mcpControlActivationGeneration != activationGeneration
-                   || current.mcpControlContext != activatedContext
-                {
-                    // A successor still owns this registration, including a new epoch on the same activation.
-                    return
+            revalidateAdmission: { ownership in
+                try self.requireSessionConfigurationAdmission(session, creationHandle: creationHandle)
+                if creationHandle == nil {
+                    try self.mcpRequireActivationOwnerFence(residentActivationTarget, session: session, ownership: ownership)
                 }
-                // A removed or rebound original without a successor must not leak its registration.
-                await AgentRunSessionStore.cleanup(registration: registration)
-                return
             }
-            session.mcpControlActivationGeneration &+= 1
-            session.mcpControlContext = nil
-            if session.mcpFollowUpRunPending == startPending { session.mcpFollowUpRunPending = false }
-            mcpControlledTabIDs.remove(tabID)
-            if didMarkMCPOriginated, session.isMCPOriginated { session.isMCPOriginated = priorMCPOriginated }
-            if let installedPermissionProfile, session.permissionProfile == installedPermissionProfile {
-                session.permissionProfile = priorPermissionProfile
-            }
-            let restoreAutoEdit = didOverrideAutoEdit && session.autoEditEnabled
-            if restoreAutoEdit { session.autoEditEnabled = priorAutoEditEnabled }
-            if tabID == currentTabID {
-                updateBindingsFromSession(session)
-            }
-            if restoreAutoEdit {
-                await applyEditsApprovalStore.setAutoEditEnabled(
-                    priorAutoEditEnabled, for: applyEditsScope(for: tabID), updateGlobalDefault: false
-                )
-            }
-            await AgentRunSessionStore.cleanup(registration: registration)
-        }
-        #if DEBUG
-            await test_afterMCPControlSetupAwait?(session)
-        #endif
-        guard cancellation.permitsPublication,
-              sessions[tabID] === session,
-              session.currentRestorationBindingToken == activationBindingToken,
-              session.mcpControlActivationGeneration == activationGeneration,
-              session.mcpControlContext == activatedContext
-        else {
-            await releaseFailedInstalledActivation()
-            throw MCPError.invalidParams("The MCP control activation was superseded during setup.")
-        }
-        do { try requireActivationOwner() } catch {
-            await releaseFailedInstalledActivation()
-            throw error
-        }
-        mcpControlledTabIDs.insert(tabID)
-        if markSessionAsMCPOriginated {
-            // Mark session as MCP-originated so cleanup can scope to MCP sessions only.
-            didMarkMCPOriginated = true
-            session.isMCPOriginated = true
-        }
-        // MCP-controlled sessions use the sub-agent permission policy, even when
-        // they are top-level MCP starts without a parent session.
-        session.permissionProfile = permissionProfileForMCPActivation(session: session)
-        installedPermissionProfile = session.permissionProfile
-        #if DEBUG
-            perfRecorder.event("mcp.routing.activateControlContext", tabID: tabID, fields: [
-                "sessionID": sessionID.uuidString,
-                "parentSessionID": session.parentSessionID?.uuidString ?? "nil",
-                "originatingConnectionID": originatingConnectionID?.uuidString ?? "nil",
-                "taskLabel": taskLabelKind?.rawValue ?? "nil",
-                "startPending": String(startPending),
-                "markSessionAsMCPOriginated": String(markSessionAsMCPOriginated),
-                "requireInactiveRunState": String(requireInactiveRunState),
-                "activationID": activationID.uuidString,
-                "permissionProfile": String(describing: session.permissionProfile),
-                "selectedAgent": session.selectedAgent.rawValue,
-                "selectedModel": session.selectedModelRaw
-            ])
-        #endif
-        if priorAutoEditEnabled != true {
-            didOverrideAutoEdit = true
-            session.autoEditEnabled = true
-            await applyEditsApprovalStore.setAutoEditEnabled(
-                true,
-                for: applyEditsScope(for: tabID),
-                updateGlobalDefault: false
-            )
-            #if DEBUG
-                await test_afterMCPControlSetupAwait?(session)
-            #endif
-        }
-        guard cancellation.permitsPublication,
-              sessions[tabID] === session,
-              session.currentRestorationBindingToken == activationBindingToken,
-              session.mcpControlActivationGeneration == activationGeneration,
-              session.mcpControlContext == activatedContext
-        else {
-            await releaseFailedInstalledActivation()
-            throw MCPError.invalidParams("The MCP control activation was superseded during setup.")
-        }
-        do { try requireActivationOwner() } catch {
-            await releaseFailedInstalledActivation()
-            throw error
-        }
-        if tabID == currentTabID {
-            updateBindingsFromSession(session)
-        }
-        handleObservedMCPStateChange(for: session)
-        #if DEBUG
-            await test_afterMCPControlActivation?(session)
-        #endif
-        return activatedContext
+        )
     }
 
     /// Closes the provisional recovery claim once a target becomes externally real.

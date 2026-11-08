@@ -49,20 +49,7 @@ extension AgentModeViewModel {
         target.window != nil && mcpActivationTargetIsCurrent(target)
     }
 
-    enum MCPActivationOwnership {
-        case resident
-        case installed(context: AgentMCPControlContext, generation: UInt64)
-
-        @MainActor
-        func matches(_ session: TabSession) -> Bool {
-            switch self {
-            case .resident:
-                AgentModeViewModel.isMCPResidentAppOwned(session)
-            case let .installed(context, generation):
-                session.mcpControlContext == context && session.mcpControlActivationGeneration == generation
-            }
-        }
-    }
+    typealias MCPActivationOwnership = AgentSessionMCPRuntime.ControlActivationOwnership
 
     private func mcpActivationTargetIsCurrent(
         _ target: MCPResidentTarget, ownership: MCPActivationOwnership = .resident
