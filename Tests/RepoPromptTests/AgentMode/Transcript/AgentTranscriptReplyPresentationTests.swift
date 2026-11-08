@@ -218,6 +218,7 @@ final class AgentTranscriptReplyPresentationTests: XCTestCase {
         XCTAssertEqual(liveGroups.map(\.id), doneGroups.map(\.id))
         XCTAssertEqual(liveGroups.map(\.primaryAnchor), doneGroups.map(\.primaryAnchor))
     }
+
     func testReplyStateCarriesAcrossSpans() throws {
         func make(_ replyInFirstSpan: Bool) throws -> (AgentTranscript, UUID, UUID) {
             var (transcript, ids) = fixture(interrupted: true)
@@ -241,8 +242,12 @@ final class AgentTranscriptReplyPresentationTests: XCTestCase {
                 first.activities = Array(tools.prefix(2))
                 second.activities = [a] + Array(tools.dropFirst(2))
             }
-            for index in first.activities.indices { first.activities[index].sequenceIndex = index + 1 }
-            for index in second.activities.indices { second.activities[index].sequenceIndex = first.activities.count + index + 1 }
+            for index in first.activities.indices {
+                first.activities[index].sequenceIndex = index + 1
+            }
+            for index in second.activities.indices {
+                second.activities[index].sequenceIndex = first.activities.count + index + 1
+            }
             transcript.turns[0].responseSpans = [first, second]
             transcript.turns[0].conclusionActivityID = nil
             return (transcript, a.id, b.id)
@@ -273,7 +278,9 @@ final class AgentTranscriptReplyPresentationTests: XCTestCase {
         var tools = original.activities.filter { $0.itemKind == .toolCall || $0.itemKind == .toolResult }
         a.sequenceIndex = 1
         b.sequenceIndex = 3
-        for i in tools.indices { tools[i].sequenceIndex = 10 + i }
+        for i in tools.indices {
+            tools[i].sequenceIndex = 10 + i
+        }
         var first = original
         first.activities = [a, tools[0], tools[1]]
         first.activities[1].sequenceIndex = 5
@@ -288,7 +295,7 @@ final class AgentTranscriptReplyPresentationTests: XCTestCase {
         XCTAssertEqual(replyBlocks.flatMap(\.activityIDs), ids)
     }
 
-    func testStartedAtChangeInvalidatesCompletedTurnCache() throws {
+    func testStartedAtChangeInvalidatesCompletedTurnCache() {
         var (transcript, _) = fixture(interrupted: false)
         transcript.turns[0].terminalState = .completed
         transcript.turns[0].completedAt = nil
@@ -303,7 +310,7 @@ final class AgentTranscriptReplyPresentationTests: XCTestCase {
         XCTAssertEqual(reused.projection.workingBlocks.flatMap(\.rows).first { $0.text == "synthetic conclusion" }?.timestamp, transcript.turns[0].startedAt)
     }
 
-    func testQuietConclusionUsesLocalAnswerForCount() throws {
+    func testQuietConclusionUsesLocalAnswerForCount() {
         let answer = AgentChatItem.assistant("ordinary answer", sequenceIndex: 1)
         let quiet = AgentChatItem.assistant("quiet", sequenceIndex: 2)
         var transcript = AgentTranscriptIO.importLegacyItems([.user("question", sequenceIndex: 0), answer, quiet])
@@ -323,7 +330,9 @@ final class AgentTranscriptReplyPresentationTests: XCTestCase {
         var answer = try XCTUnwrap(span.activities.first { $0.id == ids[0] })
         var tools = span.activities.filter { $0.itemKind == .toolCall || $0.itemKind == .toolResult }
         answer.sequenceIndex = 3
-        for i in tools.indices { tools[i].sequenceIndex = i < 2 ? i + 1 : i + 2 }
+        for i in tools.indices {
+            tools[i].sequenceIndex = i < 2 ? i + 1 : i + 2
+        }
         transcript.turns[0].responseSpans[0].activities = Array(tools.prefix(2)) + [answer] + Array(tools.dropFirst(2))
         transcript.turns[0].conclusionActivityID = nil
         let projection = AgentTranscriptProjectionBuilder.buildWithCaches(from: transcript, turnCaches: [:], replyPresentation: true).projection
@@ -346,7 +355,9 @@ final class AgentTranscriptReplyPresentationTests: XCTestCase {
         var answer = try XCTUnwrap(original.activities.first { $0.id == ids[0] })
         answer.sequenceIndex = 3
         var tools = original.activities.filter { $0.itemKind == .toolCall || $0.itemKind == .toolResult }
-        for i in tools.indices { tools[i].sequenceIndex = i < 2 ? i + 1 : i < 4 ? i + 2 : i + 6 }
+        for i in tools.indices {
+            tools[i].sequenceIndex = i < 2 ? i + 1 : i < 4 ? i + 2 : i + 6
+        }
         var first = original
         first.activities = tools
         var second = AgentTranscriptProviderResponseSpan(startedAt: original.startedAt)
@@ -402,8 +413,10 @@ final class AgentTranscriptReplyPresentationTests: XCTestCase {
             for index in 0 ..< count {
                 let id = UUID()
                 let name = companion && index < 2 ? "mcp__computer-use__click" : "Bash"
-                items.append(.toolCall(name: name, invocationID: id, argsJSON: "{}", sequenceIndex: sequence)); sequence += 1
-                items.append(.toolResult(name: name, invocationID: id, resultJSON: "{}", isError: false, sequenceIndex: sequence)); sequence += 1
+                items.append(.toolCall(name: name, invocationID: id, argsJSON: "{}", sequenceIndex: sequence))
+                sequence += 1
+                items.append(.toolResult(name: name, invocationID: id, resultJSON: "{}", isError: false, sequenceIndex: sequence))
+                sequence += 1
             }
             items.append(reply)
             var transcript = AgentTranscriptIO.importLegacyItems(items)
@@ -490,7 +503,9 @@ final class AgentTranscriptReplyPresentationTests: XCTestCase {
         var second = AgentTranscriptProviderResponseSpan(startedAt: original.startedAt)
         second.lifecycle = .completed
         second.activities = Array(tools[2 ..< 4])
-        for i in second.activities.indices { second.activities[i].sequenceIndex = i + 10 }
+        for i in second.activities.indices {
+            second.activities[i].sequenceIndex = i + 10
+        }
         transcript.turns[0].responseSpans = [first, second]
         transcript.turns[0].conclusionActivityID = conclusion.id
         let blocks = AgentTranscriptProjectionBuilder.buildWithCaches(from: transcript, turnCaches: [:], replyPresentation: true).projection.workingBlocks
@@ -505,7 +520,10 @@ final class AgentTranscriptReplyPresentationTests: XCTestCase {
         var a = try XCTUnwrap(original.activities.first { $0.id == ids[0] })
         var conclusion = try XCTUnwrap(original.activities.first { $0.id == ids[1] })
         var tools = Array(original.activities.filter { $0.itemKind == .toolCall || $0.itemKind == .toolResult }.prefix(2))
-        a.sequenceIndex = 1; tools[0].sequenceIndex = 2; conclusion.sequenceIndex = 3; tools[1].sequenceIndex = 4
+        a.sequenceIndex = 1
+        tools[0].sequenceIndex = 2
+        conclusion.sequenceIndex = 3
+        tools[1].sequenceIndex = 4
         var first = original
         first.activities = [a, conclusion]
         var second = AgentTranscriptProviderResponseSpan(startedAt: original.startedAt)
@@ -525,7 +543,9 @@ final class AgentTranscriptReplyPresentationTests: XCTestCase {
         var quiet = try XCTUnwrap(original.activities.first { $0.itemKind == .assistant })
         quiet.quietCheckInWakeID = UUID()
         quiet.sequenceIndex = 2
-        for i in tools.indices { tools[i].sequenceIndex = i == 0 ? 1 : i + 2 }
+        for i in tools.indices {
+            tools[i].sequenceIndex = i == 0 ? 1 : i + 2
+        }
         transcript.turns[0].responseSpans[0].activities = [tools[0], quiet] + Array(tools.dropFirst())
         transcript.turns[0].conclusionActivityID = nil
         transcript.turns[0].quietLocal = AgentTranscriptQuietLocalTurn(summary: nil, conclusionActivityID: nil, completedAt: nil)
@@ -560,7 +580,8 @@ final class AgentTranscriptReplyPresentationTests: XCTestCase {
             return Date.timeIntervalSinceReferenceDate - start
         }
         let small = make(150), large = make(300)
-        _ = elapsed(small); _ = elapsed(large)
+        _ = elapsed(small)
+        _ = elapsed(large)
         let t1 = elapsed(small), t2 = elapsed(large)
         print("MULTISPAN_GROWTH_SECONDS=\(t1),\(t2)")
         XCTAssertLessThan(t2, t1 * 4 + 0.1)
@@ -572,7 +593,9 @@ final class AgentTranscriptReplyPresentationTests: XCTestCase {
         var leading = try XCTUnwrap(original.activities.first { $0.id == ids[0] })
         leading.sequenceIndex = 1
         var tools = original.activities.filter { $0.itemKind == .toolCall || $0.itemKind == .toolResult }
-        for i in tools.indices { tools[i].sequenceIndex = i < 2 ? i + 2 : i < 4 ? i + 3 : i + 7 }
+        for i in tools.indices {
+            tools[i].sequenceIndex = i < 2 ? i + 2 : i < 4 ? i + 3 : i + 7
+        }
         var first = original
         first.activities = [leading] + tools
         let item = AgentChatItem.assistant("conclusion", sequenceIndex: 4)
@@ -595,7 +618,9 @@ final class AgentTranscriptReplyPresentationTests: XCTestCase {
     func testMovingConclusionInDetailedTailPreservesHistorySummary() throws {
         var (transcript, _) = fixture(interrupted: false)
         transcript.turns[0].request = nil
-        for i in transcript.turns[0].responseSpans[0].activities.indices { transcript.turns[0].responseSpans[0].activities[i].sequenceIndex *= 2 }
+        for i in transcript.turns[0].responseSpans[0].activities.indices {
+            transcript.turns[0].responseSpans[0].activities[i].sequenceIndex *= 2
+        }
         let item = AgentChatItem.assistant("conclusion", sequenceIndex: 100)
         let conclusion = AgentTranscriptIO.importLegacyItems([.user("q", sequenceIndex: 0), item]).turns[0].responseSpans[0].activities[0]
         transcript.turns[0].responseSpans[0].activities.append(conclusion)
@@ -618,7 +643,9 @@ final class AgentTranscriptReplyPresentationTests: XCTestCase {
         var assistant = try XCTUnwrap(original.activities.first { $0.id == ids[0] })
         assistant.sequenceIndex = 2
         var tools = original.activities.filter { $0.itemKind == .toolCall || $0.itemKind == .toolResult }
-        for i in tools.indices { tools[i].sequenceIndex = i < 2 ? i + 4 : i < 4 ? i + 5 : i + 9 }
+        for i in tools.indices {
+            tools[i].sequenceIndex = i < 2 ? i + 4 : i < 4 ? i + 5 : i + 9
+        }
         var first = original
         first.activities = [assistant] + tools
         let invocation = UUID()
@@ -641,7 +668,9 @@ final class AgentTranscriptReplyPresentationTests: XCTestCase {
         var assistant = try XCTUnwrap(original.activities.first { $0.id == ids[0] })
         assistant.sequenceIndex = 3
         var tools = original.activities.filter { $0.itemKind == .toolCall || $0.itemKind == .toolResult }
-        for i in tools.indices { tools[i].sequenceIndex = i + 5 }
+        for i in tools.indices {
+            tools[i].sequenceIndex = i + 5
+        }
         let conclusion = AgentChatItem.assistant("conclusion", sequenceIndex: 1)
         let conclusionActivity = AgentTranscriptIO.importLegacyItems([.user("q", sequenceIndex: 0), conclusion]).turns[0].responseSpans[0].activities[0]
         var first = original
@@ -710,14 +739,17 @@ final class AgentTranscriptReplyPresentationTests: XCTestCase {
             let original = transcript.turns[0].responseSpans[0]
             var answer = try XCTUnwrap(original.activities.first { $0.id == ids[0] })
             var narration = try XCTUnwrap(original.activities.first { $0.id == ids[1] })
-            answer.sequenceIndex = 1; narration.sequenceIndex = 3
+            answer.sequenceIndex = 1
+            narration.sequenceIndex = 3
             let item = AgentChatItem.toolCall(name: "tool", invocationID: UUID(), argsJSON: "{}", sequenceIndex: 2)
             let execution = AgentTranscriptToolExecution(stableExecutionID: "placeholder", toolName: "tool", invocationID: item.toolInvocationID, argsJSON: "{}", resultJSON: nil, toolIsError: nil, status: .unknown)
             var suppressed = AgentTranscriptActivity(from: item, toolExecution: execution)
             suppressed.text = ""
             XCTAssertTrue(AgentTranscriptToolVisibilityPolicy.shouldSuppressActivity(suppressed))
             var tools = original.activities.filter { $0.itemKind == .toolCall || $0.itemKind == .toolResult }
-            for i in tools.indices { tools[i].sequenceIndex = i + 4 }
+            for i in tools.indices {
+                tools[i].sequenceIndex = i + 4
+            }
             var first = original
             if multiple {
                 first.activities = [answer, suppressed]
@@ -742,7 +774,10 @@ final class AgentTranscriptReplyPresentationTests: XCTestCase {
         var answer = try XCTUnwrap(original.activities.first { $0.id == ids[0] })
         var narration = try XCTUnwrap(original.activities.first { $0.id == ids[1] })
         var tools = Array(original.activities.filter { $0.itemKind == .toolCall || $0.itemKind == .toolResult }.prefix(2))
-        answer.sequenceIndex = 1; tools[0].sequenceIndex = 2; narration.sequenceIndex = 3; tools[1].sequenceIndex = 4
+        answer.sequenceIndex = 1
+        tools[0].sequenceIndex = 2
+        narration.sequenceIndex = 3
+        tools[1].sequenceIndex = 4
         var first = original
         first.activities = [answer] + tools
         var second = AgentTranscriptProviderResponseSpan(startedAt: original.startedAt)
@@ -761,7 +796,9 @@ final class AgentTranscriptReplyPresentationTests: XCTestCase {
             var answer = try XCTUnwrap(span.activities.first { $0.id == ids[0] })
             var tools = span.activities.filter { $0.itemKind == .toolCall || $0.itemKind == .toolResult }
             answer.sequenceIndex = 3
-            for i in tools.indices { tools[i].sequenceIndex = i < 2 ? i + 1 : i + 2 }
+            for i in tools.indices {
+                tools[i].sequenceIndex = i < 2 ? i + 1 : i + 2
+            }
             transcript.turns[0].responseSpans[0].activities = Array(tools.prefix(2)) + [answer] + Array(tools.dropFirst(2))
             transcript.turns[0].retentionTier = tier
             transcript.turns[0].conclusionActivityID = nil
@@ -819,5 +856,4 @@ final class AgentTranscriptReplyPresentationTests: XCTestCase {
             }
         }
     }
-
 }
