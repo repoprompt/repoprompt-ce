@@ -255,7 +255,10 @@ extension AgentSessionLinkExecutionRuntime {
     /// The exact pending fingerprint stays suppressed until a genuinely new eligible change.
     func agentSessionLinkRetractAutoWakeForUserStop(_ session: TabSession) {
         session.oversight.invalidatePeriodicIdleSpan()
-        guard let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID),
+        // A late Stop still retires its original object's periodic span, but must not resolve
+        // a replacement's endpoint and cancel namespace-addressed wake work on that object.
+        guard sessions[session.tabID] === session,
+              let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID),
               let attempt = session.oversight.pendingAutoWake,
               attempt.observerEndpoint == endpoint
         else { return }

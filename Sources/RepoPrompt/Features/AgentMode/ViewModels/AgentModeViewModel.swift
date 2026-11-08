@@ -3903,8 +3903,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     await publication.signalMCPInstructionDelivered(for: session)
                 }
             ),
-            prepareForCancellation: { [weak self] session, intent, origin in
-                self?.prepareAgentRunCancellation(session: session, intent: intent, origin: origin)
+            prepareForCancellation: { [interactions = interactionRuntime, links = linkExecutionRuntime] session, intent, origin in
+                interactions.prepareRunCancellation(session: session, intent: intent, origin: origin, links: links)
             },
             oracleCancellationDrain: { $0.oracleBackgroundDrain }
         )
@@ -20646,23 +20646,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         intent: DomainAgentRunCancellationIntent,
         origin: AgentModeRunService.CancellationOrigin
     ) -> (@MainActor () async -> Void)? {
-        cancelPendingInstruction(for: session)
-        let providerTeardown = claudeCoordinator.cancelPendingProviderAdoption(for: session)
-        // Every cancellation fences this session's own deferred starts.
-        session.stopState.invalidateScheduledStarts()
-        // Overseer-facing withdrawal belongs to an explicit user or managed Stop only.
-        guard intent == .userStop, origin == .explicitStop else { return providerTeardown }
-        closeOracleBackground(for: session)
-        session.stopState.invalidateQueuedDeliveries()
-        session.mcpFollowUpRunPending = false
-        agentSessionLinkRetractAutoWakeForUserStop(session)
-        if let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID) {
-            AgentSessionLinkRuntimeBridge.shared.withdrawCancellableInboundPendingSends(
-                to: endpoint,
-                requiringNoCommittedDrain: false
-            )
-        }
-        return providerTeardown
+        interactionRuntime.prepareRunCancellation(session: session, intent: intent, origin: origin, links: linkExecutionRuntime)
     }
 
     private func cancelPendingInstruction(for session: TabSession) {
@@ -22508,35 +22492,20 @@ extension AgentModeViewModel: WorkspaceSwitchSessionProviderDelegate {
 extension AgentModeViewModel {
     @discardableResult
     func closeOracleBackground(for session: AgentTabSession) -> Task<Void, Never>? {
-        guard let owner = session.oracleBackgroundOwner else { return nil }
-        let drain = OracleBackgroundInvocationRegistry.shared.close(owner)
-        session.oracleBackgroundDrain = drain
-        session.oracleBackgroundAwareness.resetContext()
-        return drain
+        runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).closeOracleBackground(for: session)
     }
 
     @discardableResult
     func awaitOracleBackgroundDrain(for session: AgentTabSession, timeout: TimeInterval = 30) async -> Bool {
-        guard let owner = session.oracleBackgroundOwner else { return true }
-        let registry = OracleBackgroundInvocationRegistry.shared
-        guard let drain = closeOracleBackground(for: session) else { return true }
-        if registry.isDrained(owner) { return true }
-        let settled = await OracleBackgroundInvocationRegistry.awaitDrain(drain, timeout: timeout)
-        return settled && sessions[session.tabID] === session && session.persistentSessionBindingIdentity == owner.binding
+        await runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).awaitOracleBackgroundDrain(for: session, timeout: timeout)
     }
 
     func closeOracleBackgroundWindowAdmission() {
-        for session in sessions.values {
-            closeOracleBackground(for: session)
-        }
+        runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).closeOracleBackgroundAdmission()
     }
 
     func joinOracleBackgroundWindowDrain() async {
-        let drains = sessions.values.compactMap { closeOracleBackground(for: $0) }
-        guard !OracleBackgroundInvocationRegistry.shared.isShuttingDown else { return }
-        for drain in drains {
-            await drain.value
-        }
+        await runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).joinOracleBackgroundDrain()
     }
 }
 

@@ -56,6 +56,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
     /// tests exercising dispatch; none delegates through a window, workspace VM or agent VM.
     private func fixture(
         isAvailable: @escaping @MainActor () -> Bool = { true },
+        onEndpointRead: @escaping @MainActor () -> Void = {},
         workspace: WorkspaceModel? = nil,
         start: (@MainActor (AgentTabSession, String, AgentRunStartOutcomeRecorder?) async -> Void)? = nil
     ) throws -> Fixture {
@@ -78,6 +79,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         let runtime = scope.makeLinkExecution(commands: .init(
             isAvailable: isAvailable,
             endpoint: { [weak scope, weak session] tabID in
+                onEndpointRead()
                 guard let session, scope?.sessions[tabID] === session,
                       session.persistentSessionBindingIdentity == binding,
                       session.bindingTransitionGeneration == endpoint.bindingTransitionGeneration else { return nil }
@@ -303,6 +305,108 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             XCTAssertTrue(f.session.pendingTurnRuntimeAnchors.isEmpty)
             XCTAssertNil(f.session.activeComposerSubmitAttempt)
         }
+    }
+
+    func testRuntimeCancellationSeparatesInternalLifecycleFromExplicitStopWithoutPresentation() async throws {
+        let cases: [(DomainAgentRunCancellationIntent, AgentModeRunService.CancellationOrigin, Bool, Bool)] = [
+            (.runtimeShutdown, .internalLifecycle, false, false), (.userStop, .internalLifecycle, false, false),
+            (.userStop, .explicitStop, true, false), (.userStop, .explicitStop, true, true)
+        ]
+        for (intent, origin, withdraws, replacesObject) in cases {
+            var endpointReads = 0
+            let f = try fixture(onEndpointRead: { endpointReads += 1 })
+            let interactions = f.scope.interactions(routeID: f.endpoint.windowID, approvalStore: ApplyEditsApprovalStore())
+            let owner = try OracleBackgroundInvocationRegistry.Owner(workspaceID: f.endpoint.workspaceID, binding: XCTUnwrap(f.session.persistentSessionBindingIdentity))
+            f.session.oracleBackgroundOwner = owner
+            defer { try? OracleBackgroundInvocationRegistry.shared.remove(owner) }
+            f.session.mcpFollowUpRunPending = true
+            let startFence = AgentRunStartStopFence(session: f.session)
+            let explicitGeneration = f.session.stopState.explicitStopGeneration
+            let installed = expectation(description: "Runtime instruction cancellation capability")
+            let waiter = Task { @MainActor in
+                try await withCheckedThrowingContinuation { continuation in
+                    f.session.instructionWaitID = UUID()
+                    f.session.instructionContinuation = continuation
+                    f.session.waitingPrompt = "Continue?"
+                    installed.fulfill()
+                }
+            }
+            await fulfillment(of: [installed], timeout: 3)
+            let replacement = AgentTabSession(tabID: f.session.tabID)
+            try replacement.installPersistentSessionBinding(XCTUnwrap(f.session.persistentSessionBindingIdentity))
+            replacement.mcpFollowUpRunPending = true
+            let replacementStop = replacement.stopState.explicitStopGeneration
+            if replacesObject { f.scope.replaceSessions([replacement.tabID: replacement]) }
+            endpointReads = 0
+            XCTAssertNil(interactions.prepareRunCancellation(session: f.session, intent: intent, origin: origin, links: f.runtime))
+            if replacesObject {
+                XCTAssertEqual(endpointReads, 0, "Stale Stop may not resolve a replacement's endpoint, even with equal binding values")
+                XCTAssertEqual(replacement.stopState.cancellationCount, 0)
+                XCTAssertEqual(replacement.stopState.explicitStopGeneration, replacementStop)
+                XCTAssertTrue(replacement.mcpFollowUpRunPending)
+            }
+            do { _ = try await waiter.value
+                XCTFail("Cancellation must settle the original instruction waiter")
+            } catch { XCTAssertTrue(error is CancellationError) }
+            XCTAssertFalse(startFence.permitsStart(of: f.session))
+            XCTAssertEqual(f.session.stopState.cancellationCount, 1)
+            XCTAssertEqual(f.session.stopState.explicitStopGeneration != explicitGeneration, withdraws)
+            XCTAssertEqual(f.session.mcpFollowUpRunPending, !withdraws)
+            XCTAssertEqual(OracleBackgroundInvocationRegistry.shared.admissionIsClosed(for: owner), withdraws)
+            XCTAssertNil(f.session.instructionContinuation)
+            XCTAssertNil(f.session.instructionWaitID)
+            XCTAssertNil(f.session.waitingPrompt)
+            await f.session.oracleBackgroundDrain?.value
+        }
+    }
+
+    func testRuntimeStopJoinsOracleCleanupAndRetainsOriginalScopeWithoutPresentation() async throws {
+        var f: Fixture? = try fixture()
+        let session = try XCTUnwrap(f?.session)
+        let links = try XCTUnwrap(f?.runtime)
+        let interactions = try XCTUnwrap(f?.scope).interactions(routeID: 401, approvalStore: ApplyEditsApprovalStore())
+        weak let scope = f?.scope
+        let owner = try OracleBackgroundInvocationRegistry.Owner(workspaceID: XCTUnwrap(f?.endpoint.workspaceID), binding: XCTUnwrap(session.persistentSessionBindingIdentity))
+        session.oracleBackgroundOwner = owner
+        let registry = OracleBackgroundInvocationRegistry.shared
+        let entered = expectation(description: "Oracle preparation owns an outstanding effect")
+        var release: CheckedContinuation<Void, Never>?
+        defer { release?.resume() }
+        let request = Task {
+            try await registry.start(owner: owner, runID: UUID(), invocationID: UUID(), admissionIsCurrent: { true }) { _ in
+                await withCheckedContinuation { continuation in
+                    release = continuation
+                    entered.fulfill()
+                }
+                try Task.checkCancellation()
+            }
+        }
+        await fulfillment(of: [entered], timeout: 3)
+        interactions.prepareRunCancellation(session: session, intent: .userStop, origin: .explicitStop, links: links)
+        XCTAssertTrue(registry.admissionIsClosed(for: owner))
+        XCTAssertFalse(registry.isDrained(owner), "A Stop request is not a cleanup acknowledgment")
+        let joining = expectation(description: "Runtime joins the original Oracle effect")
+        var drainFinished = false
+        let drain = Task {
+            joining.fulfill()
+            let result = await interactions.awaitOracleBackgroundDrain(for: session, timeout: 3)
+            drainFinished = true
+            return result
+        }
+        await fulfillment(of: [joining], timeout: 3)
+        f = nil
+        XCTAssertNotNil(scope)
+        XCTAssertFalse(drainFinished)
+        release?.resume()
+        release = nil
+        let drained = await drain.value
+        XCTAssertTrue(drained)
+        do { _ = try await request.value
+            XCTFail("Stopped preparation must not publish a receipt")
+        } catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertTrue(registry.isDrained(owner))
+        XCTAssertNil(scope, "The joined operation releases its scope without a presenter")
+        try registry.remove(owner)
     }
 
     func testWindowFreeInstructionResumeAccountsOriginAndAcknowledgesAfterSingleDelivery() async throws {
@@ -5200,6 +5304,10 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         XCTAssertTrue(fixture.viewModel.agentSessionLinkPeriodicWakeIsEligible(fixture.session, endpoint: endpoint))
         _ = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
         fixture.session.oversight.pendingAutoWake?.phase = .preparingDispatch
+        // Hold the producer at the physical-dispatch boundary. Readiness reconciliation is
+        // independently allowed to cancel it on deletion; that must not win this test's race.
+        fixture.session.oversight.periodicObservation?.cancel()
+        fixture.session.oversight.periodicObservation = nil
         let rawID = AgentSessionLinkPromptDispatchID.headlessRun(runID: UUID())
         _ = fixture.viewModel.agentSessionLinkDecoratedProviderText(
             "periodic", session: fixture.session, dispatchID: rawID

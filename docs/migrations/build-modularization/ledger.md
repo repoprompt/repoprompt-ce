@@ -4787,3 +4787,45 @@ This removes VM-owned session-observation execution, not the remaining compositi
 Independent canonical writer admission, the prepared-window replacement, provider/start composition,
 runtime routing and presentation-preserving handoff/drain remain open. Products, fresh compiler
 index, full suite, aggregate warning qualification and live smoke are not newly qualified here.
+
+### M9 continuation — runtime-owned cancellation preparation and Oracle drain (2026-11-08)
+
+Run-service cancellation preparation now retains the concrete interaction/link runtimes instead of
+calling a weak VM. The existing cancellation, Oracle invocation, provider adoption and wake owners
+remain authoritative. Internal cancellation fences deferred starts but does not perform explicit
+Stop withdrawal. Exact-object checks prevent an old session from resolving a recycled tab's endpoint
+or cancelling that replacement's provider adoption/wake work, including equal binding values.
+Actual Oracle close/join bodies moved to the interaction runtime; pending joins retain the original
+scope through cleanup. VM compatibility entry points remain for existing callers and do not eagerly
+construct provider coordinators for an otherwise empty close.
+
+Two window-free runtime cases cover internal versus explicit Stop, exactly-once instruction
+settlement, replacement refusal, and a real held Oracle preparation. Closing admission is explicitly
+not a cleanup acknowledgment; the scope stays alive until the outstanding effect drains.
+
+The recurring periodic-deletion fixture failure is now causally explained. While committed deletion
+cleanup was held, a queued Combine readiness notification legitimately reconciled periodic
+eligibility and cancelled the prepared wake before the test's physical-dispatch assertion. A forced
+notification reproduced `cancelled.preDispatch.eligibility_lost` through the periodic subscription.
+This test now disconnects only that subscription after preparing its real wake, isolating the
+transport fence it intends to test. All original state/inventory/dispatch assertions remain; no
+production deletion policy, timeout or expected phase changed. Temporary probes were removed.
+
+Validation:
+- Initial `8d9eda0b-a1b8-46a2-aa71-76e06c8e012f` passed **111 tests** before the final stale-object fence.
+- `4ea2888b-d849-4372-9328-9b04cd54a4b4` ran **238 tests**, with the periodic-deletion case failing.
+  Exact-case `91ef7e7e-6253-4097-9988-87ef48e418e6` and whole auto-wake suite
+  `14d2a37a-b4ce-4195-8453-624cb260e623` passed before controlled reproduction; those retries were
+  not treated as proof of a baseline flake. Diagnostic `0003d271-2862-43f7-b306-79ae16135fc0`
+  intentionally failed the unchanged assertion after forcing the readiness event, confirming the path.
+- Final `6a28e279-ecd8-4e5a-b5ce-298e3886ff12` passed **240 tests**: runtime 14, auto-wake 127,
+  MCP steer/resume 27, Codex prompt adapter 41 and native/headless prompt adapter 31.
+- Both products passed `481d09d8-fff1-43f0-8094-89166835243f`; lint passed
+  `d599176d-e655-426d-aae2-2281d479fffc` on the final Swift tree. Fresh compiler-index check passed
+  **1236/1360** wrong-way file edges and **53/66** largest-cycle components (1127 files, 156174 symbols).
+- Scoped formatting, one independent review and mandatory staged contribution preflight apply.
+  No baseline, warning budget or test assertion was weakened.
+
+Canonical writer admission, window-free saved-host composition, provider construction outside the
+execution seam, runtime-addressed routing and presentation-preserving handoff/drain still remain.
+This is not M9 completion, full-suite qualification or a fresh hosted/live-smoke receipt.
