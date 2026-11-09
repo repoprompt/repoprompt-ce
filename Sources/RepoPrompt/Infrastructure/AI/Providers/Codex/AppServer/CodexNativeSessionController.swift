@@ -185,6 +185,7 @@ protocol CodexSessionControlling: AnyObject {
         acceptedDispatchTurnID: String
     ) async -> Bool
     func interruptUserTurn(expectedTurnID: String) async throws -> CodexTurnInterruptReceipt
+    func interruptUserTurn(expectedThreadID: String, expectedTurnID: String, answering receipt: CodexServerRequestReceipt) async throws -> CodexTurnInterruptReceipt
     func reconcileAndInterruptCurrentTurn() async throws -> CodexTurnInterruptReceipt
     func compactThread() async throws
     func getThreadGoal() async throws -> CodexNativeSessionController.ThreadGoal?
@@ -205,7 +206,15 @@ protocol CodexSessionControlling: AnyObject {
     func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome
     func shutdown() async
     func revokeComputerUseAutoApproval()
-    func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async
+    @discardableResult
+    func respondToServerRequest(receipt: CodexServerRequestReceipt, result: [String: Any]) async -> CodexServerResponseDelivery
+}
+
+/// Written means the originating transport accepted the response line, not that Codex acted on it.
+enum CodexServerResponseDelivery: Equatable {
+    case written
+    case refused
+    case failed
 }
 
 extension CodexSessionControlling {
@@ -901,7 +910,7 @@ final class CodexNativeSessionController {
     private let clientShutdownBehavior: ClientShutdownBehavior
     private let expectedMCPClientName: String?
     private let requestExecutor: (@Sendable (String, [String: Any]?, TimeInterval?) async throws -> [String: Any])?
-    private let serverRequestResponseExecutor: (@Sendable (CodexAppServerRequestID, [String: Any]) async throws -> Void)?
+    private let serverRequestResponseExecutor: (@Sendable (CodexServerRequestReceipt, [String: Any]) async throws -> Void)?
     private let hookTrustFaultInjection: HookTrustFaultInjection
     private let rawEventFileLoggingEnabled: Bool
     private var rawEventLogFileURL: URL?
@@ -1533,7 +1542,7 @@ final class CodexNativeSessionController {
         clientShutdownBehavior: ClientShutdownBehavior = .none,
         expectedMCPClientName: String? = nil,
         requestExecutor: (@Sendable (String, [String: Any]?, TimeInterval?) async throws -> [String: Any])? = nil,
-        serverRequestResponseExecutor: (@Sendable (CodexAppServerRequestID, [String: Any]) async throws -> Void)? = nil,
+        serverRequestResponseExecutor: (@Sendable (CodexServerRequestReceipt, [String: Any]) async throws -> Void)? = nil,
         hookTrustFaultInjection: HookTrustFaultInjection = .init(),
         perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) {
@@ -2483,7 +2492,20 @@ final class CodexNativeSessionController {
         }
     }
 
+    private enum TurnInterruptOrigin {
+        case standalone
+        case answering(CodexServerRequestReceipt, threadID: String)
+    }
+
     func interruptUserTurn(expectedTurnID: String) async throws -> CodexTurnInterruptReceipt {
+        try await interruptUserTurn(expectedTurnID: expectedTurnID, origin: .standalone)
+    }
+
+    func interruptUserTurn(expectedThreadID: String, expectedTurnID: String, answering receipt: CodexServerRequestReceipt) async throws -> CodexTurnInterruptReceipt {
+        try await interruptUserTurn(expectedTurnID: expectedTurnID, origin: .answering(receipt, threadID: expectedThreadID))
+    }
+
+    private func interruptUserTurn(expectedTurnID: String, origin: TurnInterruptOrigin) async throws -> CodexTurnInterruptReceipt {
         guard let threadID else { throw CodexAppServerClient.ClientError.invalidResponse }
         guard let expectedTurnID = Self.nonEmptyString(expectedTurnID) else {
             throw CodexAppServerClient.ClientError.invalidResponse
@@ -2495,14 +2517,20 @@ final class CodexNativeSessionController {
             )
         }
         do {
-            _ = try await performRequest(
-                method: "turn/interrupt",
-                params: [
-                    "threadId": threadID,
-                    "turnId": expectedTurnID
-                ],
-                timeout: options.requestTimeout
-            )
+            let params = ["threadId": threadID, "turnId": expectedTurnID]
+            switch origin {
+            case .standalone:
+                _ = try await performRequest(method: "turn/interrupt", params: params, timeout: options.requestTimeout)
+            case let .answering(receipt, expectedThreadID):
+                guard threadID == expectedThreadID else { throw CodexAppServerClient.ClientError.invalidResponse }
+                // This reply's follow-up must not use whichever wire exists after suspension.
+                _ = try await client.request(
+                    method: "turn/interrupt",
+                    params: params,
+                    timeout: options.requestTimeout,
+                    answering: receipt
+                )
+            }
             return CodexTurnInterruptReceipt(interruptedTurnID: expectedTurnID)
         } catch let error as CodexAppServerClient.ClientError {
             throw Self.mapSteerRequestError(error, expectedTurnID: expectedTurnID)
@@ -5014,8 +5042,8 @@ final class CodexNativeSessionController {
             pendingTurnFailureScopeOrder.removeAll(keepingCapacity: true)
         }
 
-        func test_handleServerRequest(method: String, params: [String: CodexJSONValue]) async {
-            await handleServerRequest(.init(id: .int(42), method: method, params: params))
+        func test_handleServerRequest(receipt: CodexServerRequestReceipt, method: String, params: [String: CodexJSONValue]) async {
+            await handleServerRequest(.init(receipt: receipt, method: method, params: params))
         }
 
         func test_computerUseApprovalPolicy() async throws -> (CodexAgentToolPreferences.ApprovalPolicy, CodexAgentToolPreferences.ApprovalReviewer) {
@@ -5270,31 +5298,33 @@ final class CodexNativeSessionController {
 
         switch Self.classifyServerRequestMethod(method) {
         case .approval:
-            if let approval = buildApprovalRequest(id: request.id, method: method, params: params) {
+            if let approval = buildApprovalRequest(receipt: request.receipt, method: method, params: params) {
                 await emit(.approvalRequest(approval))
                 return
             }
             do {
                 try await client.respondToServerRequestError(
-                    id: request.id,
+                    receipt: request.receipt,
                     code: -32602,
                     message: "Unsupported approval request payload for method: \(method)"
                 )
             } catch {
-                await emit(.error("Codex approval request response failed: \(error.localizedDescription)"))
+                if !logStaleServerResponseRefusal(error, receipt: request.receipt) {
+                    await emit(.error("Codex approval request response failed: \(error.localizedDescription)"))
+                }
                 return
             }
             await emit(.error("Codex approval request could not be parsed (\(method))."))
         case .requestUserInput:
             guard let userInputRequest = Self.parseRequestUserInputRequest(
-                requestID: request.id,
+                receipt: request.receipt,
                 method: method,
                 params: params,
                 activeThreadID: threadID,
                 currentTurnID: routingCurrentTurnID
             ) else {
                 await emitServerRequestIssue(
-                    requestID: request.id,
+                    receipt: request.receipt,
                     method: method,
                     kind: .requestUserInputInvalidParams,
                     code: -32602,
@@ -5304,7 +5334,7 @@ final class CodexNativeSessionController {
             }
             await emit(.requestUserInput(userInputRequest))
         case .authTokensRefresh:
-            await handleChatgptAuthTokensRefreshServerRequest(request.id, method: method, params: params)
+            await handleChatgptAuthTokensRefreshServerRequest(request.receipt, method: method, params: params)
         case .mcpElicitation:
             let autoApproveCompanion = shouldAutoApproveComputerUseCompanion(params: params)
             let autoApproveHost = Self.isRepoPromptMCPElicitationRequest(params: params)
@@ -5312,7 +5342,7 @@ final class CodexNativeSessionController {
                 logComputerUseApprovalDecision(path: .mcpElicitation, params: params, outcome: "accept")
                 await emitAutoApprovedServerRequestActivity(method: method, params: params)
                 await respondToServerRequest(
-                    id: request.id,
+                    receipt: request.receipt,
                     result: [
                         "action": "accept",
                         "content": [String: Any](),
@@ -5322,14 +5352,14 @@ final class CodexNativeSessionController {
                 return
             }
             guard let elicitationRequest = Self.parseMCPElicitationRequest(
-                requestID: request.id,
+                receipt: request.receipt,
                 method: method,
                 params: params,
                 activeThreadID: threadID,
                 currentTurnID: routingCurrentTurnID
             ) else {
                 await emitServerRequestIssue(
-                    requestID: request.id,
+                    receipt: request.receipt,
                     method: method,
                     kind: .mcpElicitationInvalidParams,
                     code: -32602,
@@ -5344,7 +5374,7 @@ final class CodexNativeSessionController {
             let hostApprovalResult = Self.repoPromptPermissionsAutoApprovalResult(params: params)
             if autoApproveCompanion,
                let permission = Self.parsePermissionsRequest(
-                   requestID: request.id,
+                   receipt: request.receipt,
                    method: method,
                    params: params,
                    activeThreadID: threadID,
@@ -5353,7 +5383,7 @@ final class CodexNativeSessionController {
             {
                 logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "accept")
                 await emitAutoApprovedServerRequestActivity(method: method, params: params)
-                await respondToServerRequest(id: request.id, result: [
+                await respondToServerRequest(receipt: request.receipt, result: [
                     "permissions": permission.permissionsObject, "scope": "turn", "strictAutoReview": false
                 ])
                 return
@@ -5361,18 +5391,18 @@ final class CodexNativeSessionController {
             if let approvalResult = hostApprovalResult {
                 logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "accept")
                 await emitAutoApprovedServerRequestActivity(method: method, params: params)
-                await respondToServerRequest(id: request.id, result: approvalResult)
+                await respondToServerRequest(receipt: request.receipt, result: approvalResult)
                 return
             }
             guard let permissionsRequest = Self.parsePermissionsRequest(
-                requestID: request.id,
+                receipt: request.receipt,
                 method: method,
                 params: params,
                 activeThreadID: threadID,
                 currentTurnID: routingCurrentTurnID
             ) else {
                 await emitServerRequestIssue(
-                    requestID: request.id,
+                    receipt: request.receipt,
                     method: method,
                     kind: .permissionsRequestUnsupported,
                     code: -32602,
@@ -5384,7 +5414,7 @@ final class CodexNativeSessionController {
             await emit(.permissionsRequest(permissionsRequest))
         case .dynamicToolUnsupported:
             await emitServerRequestIssue(
-                requestID: request.id,
+                receipt: request.receipt,
                 method: method,
                 kind: .dynamicToolCallUnsupported,
                 code: -32001,
@@ -5393,7 +5423,7 @@ final class CodexNativeSessionController {
         case .unknownUnsupported:
             let message = "Unsupported Codex server request method: \(method)"
             await emitServerRequestIssue(
-                requestID: request.id,
+                receipt: request.receipt,
                 method: method,
                 kind: .unsupportedMethod,
                 code: -32601,
@@ -5412,34 +5442,56 @@ final class CodexNativeSessionController {
         )))
     }
 
-    func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async {
+    @discardableResult
+    func respondToServerRequest(receipt: CodexServerRequestReceipt, result: [String: Any]) async -> CodexServerResponseDelivery {
         #if DEBUG
             writeRawEventLogRecord(
                 kind: "serverRequest.respond",
                 payload: [
-                    "requestID": id.displayValue,
+                    "requestID": receipt.requestID.displayValue,
                     "result": result
                 ]
             )
         #endif
         do {
             if let serverRequestResponseExecutor {
-                try await serverRequestResponseExecutor(id, result)
+                try await serverRequestResponseExecutor(receipt, result)
             } else {
-                try await client.respondToServerRequest(id: id, result: result)
+                try await client.respondToServerRequest(receipt: receipt, result: result)
             }
+            return .written
+        } catch let error as CodexAppServerClient.ClientError {
+            if logStaleServerResponseRefusal(error, receipt: receipt) { return .refused }
+            await emit(.error("Codex server request response failed: \(error.localizedDescription)"))
+            return .failed
         } catch {
             await emit(.error("Codex server request response failed: \(error.localizedDescription)"))
+            return .failed
         }
     }
 
+    /// Refusing an old origin is not an error in the current provider run. In particular, an
+    /// unscoped `.error` here could terminalize a successor on the same controller after reconnect.
+    private func logStaleServerResponseRefusal(_ error: Error, receipt: CodexServerRequestReceipt) -> Bool {
+        guard let clientError = error as? CodexAppServerClient.ClientError,
+              case let .staleServerRequest(reason) = clientError else { return false }
+        #if DEBUG
+            writeRawEventLogRecord(kind: "serverRequest.refused", payload: [
+                "requestID": receipt.requestID.displayValue,
+                "transportGeneration": receipt.transportGeneration,
+                "reason": reason.rawValue
+            ])
+        #endif
+        return true
+    }
+
     private func buildApprovalRequest(
-        id: CodexAppServerRequestID,
+        receipt: CodexServerRequestReceipt,
         method: String,
         params: [String: Any]
     ) -> AgentApprovalRequest? {
         Self.parseApprovalRequest(
-            requestID: id,
+            receipt: receipt,
             method: method,
             params: params,
             activeThreadID: threadID,
@@ -5448,13 +5500,13 @@ final class CodexNativeSessionController {
     }
 
     private func handleChatgptAuthTokensRefreshServerRequest(
-        _ requestID: CodexAppServerRequestID,
+        _ receipt: CodexServerRequestReceipt,
         method: String,
         params: [String: Any]
     ) async {
-        guard let refreshRequest = Self.parseChatgptAuthTokensRefreshRequest(requestID: requestID, params: params) else {
+        guard let refreshRequest = Self.parseChatgptAuthTokensRefreshRequest(requestID: receipt.requestID, params: params) else {
             await emitServerRequestIssue(
-                requestID: requestID,
+                receipt: receipt,
                 method: method,
                 kind: .authTokensRefreshInvalidParams,
                 code: -32602,
@@ -5464,7 +5516,7 @@ final class CodexNativeSessionController {
         }
         guard let handler = options.authTokensRefreshHandler else {
             await emitServerRequestIssue(
-                requestID: requestID,
+                receipt: receipt,
                 method: method,
                 kind: .authTokensRefreshUnavailable,
                 code: -32001,
@@ -5480,7 +5532,7 @@ final class CodexNativeSessionController {
             let suffix = detail.isEmpty ? "" : " \(detail)"
             let message = "Codex requested account/chatgptAuthTokens/refresh, but RepoPrompt failed to provide refreshed ChatGPT tokens.\(suffix)"
             await emitServerRequestIssue(
-                requestID: requestID,
+                receipt: receipt,
                 method: method,
                 kind: .authTokensRefreshFailed,
                 code: -32002,
@@ -5489,11 +5541,7 @@ final class CodexNativeSessionController {
             return
         }
         await emitAutoApprovedServerRequestActivity(method: method, params: params)
-        do {
-            try await client.respondToServerRequest(id: requestID, result: response.payload)
-        } catch {
-            await emit(.error("Codex server request response failed: \(error.localizedDescription)"))
-        }
+        await respondToServerRequest(receipt: receipt, result: response.payload)
     }
 
     private func logComputerUseApprovalDecision(path: CodexComputerUseWorkflow.ApprovalDecisionPath, params: [String: Any], outcome: String) {
@@ -5521,12 +5569,13 @@ final class CodexNativeSessionController {
     }
 
     static func parseMCPElicitationRequest(
-        requestID: CodexAppServerRequestID,
+        receipt: CodexServerRequestReceipt,
         method: String,
         params: [String: Any],
         activeThreadID: String?,
         currentTurnID: String?
     ) -> AgentMCPElicitationRequest? {
+        let requestID = receipt.requestID
         guard let rawParamsJSON = encodeJSONObjectString(params) else {
             return nil
         }
@@ -5561,7 +5610,7 @@ final class CodexNativeSessionController {
             in: params,
             keys: ["defaultContent", "default_content", "content"]
         )
-        let requestSeed = "mcp-elicitation|\(requestID.displayValue)|\(method)|\(threadID)|\(turnID)|\(itemID)"
+        let requestSeed = "mcp-elicitation|\(receipt.identitySeed)|\(method)|\(threadID)|\(turnID)|\(itemID)"
         var details: [AgentApprovalDetail] = []
         func appendDetail(_ label: String, _ value: String?, isCode: Bool = false) {
             guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return }
@@ -5585,7 +5634,7 @@ final class CodexNativeSessionController {
         appendDetail("Default Content", defaultContentJSON, isCode: true)
         appendDetail("Raw Request", rawParamsJSON, isCode: true)
         return AgentMCPElicitationRequest(
-            requestID: requestID,
+            receipt: receipt,
             method: method,
             threadID: threadID,
             turnID: turnID,
@@ -5649,7 +5698,7 @@ final class CodexNativeSessionController {
     }
 
     private func emitServerRequestIssue(
-        requestID: CodexAppServerRequestID,
+        receipt: CodexServerRequestReceipt,
         method: String,
         kind: ServerRequestIssue.Kind,
         code: Int,
@@ -5657,15 +5706,17 @@ final class CodexNativeSessionController {
     ) async {
         do {
             try await client.respondToServerRequestError(
-                id: requestID,
+                receipt: receipt,
                 code: code,
                 message: message
             )
         } catch {
-            await emit(.error("Codex server request response failed: \(error.localizedDescription)"))
+            if !logStaleServerResponseRefusal(error, receipt: receipt) {
+                await emit(.error("Codex server request response failed: \(error.localizedDescription)"))
+            }
             return
         }
-        await emit(.serverRequestIssue(.init(requestID: requestID, method: method, kind: kind, message: message)))
+        await emit(.serverRequestIssue(.init(requestID: receipt.requestID, method: method, kind: kind, message: message)))
     }
 
     private static func classifyServerRequestMethod(_ method: String) -> ServerRequestRouting {
@@ -5709,7 +5760,7 @@ final class CodexNativeSessionController {
     }
 
     static func parseRequestUserInputRequest(
-        requestID: CodexAppServerRequestID,
+        receipt: CodexServerRequestReceipt,
         method: String,
         params: [String: Any],
         activeThreadID: String?,
@@ -5778,7 +5829,7 @@ final class CodexNativeSessionController {
         }
 
         return AgentRequestUserInputRequest(
-            requestID: requestID,
+            receipt: receipt,
             method: method,
             threadID: threadID,
             turnID: turnID,
@@ -5790,7 +5841,7 @@ final class CodexNativeSessionController {
     }
 
     static func parsePermissionsRequest(
-        requestID: CodexAppServerRequestID,
+        receipt: CodexServerRequestReceipt,
         method: String,
         params: [String: Any],
         activeThreadID: String?,
@@ -5819,7 +5870,7 @@ final class CodexNativeSessionController {
 
         let reason = firstString(in: params, keys: ["reason"])
         let permissionsID = AgentPermissionsRequest.stableID(
-            requestID: requestID,
+            receipt: receipt,
             method: method,
             threadID: threadID,
             turnID: turnID,
@@ -5854,7 +5905,7 @@ final class CodexNativeSessionController {
 
         return AgentPermissionsRequest(
             id: permissionsID,
-            requestID: requestID,
+            receipt: receipt,
             method: method,
             threadID: threadID,
             turnID: turnID,
@@ -5867,12 +5918,13 @@ final class CodexNativeSessionController {
     }
 
     static func parseApprovalRequest(
-        requestID: CodexAppServerRequestID,
+        receipt: CodexServerRequestReceipt,
         method: String,
         params: [String: Any],
         activeThreadID: String?,
         currentTurnID: String?
     ) -> AgentApprovalRequest? {
+        let requestID = receipt.requestID
         let explicitThreadID = notificationThreadID(from: params)
             ?? firstString(in: params, keys: ["thread"])
         if let activeThreadID, let explicitThreadID, explicitThreadID != activeThreadID {
@@ -5953,7 +6005,7 @@ final class CodexNativeSessionController {
         }()
 
         let approvalID = AgentApprovalRequest.stableID(
-            requestID: .codex(requestID),
+            requestID: .codex(receipt),
             method: method,
             kind: kind,
             threadID: threadID,
@@ -5963,7 +6015,7 @@ final class CodexNativeSessionController {
         func makeRequest(details: [AgentApprovalDetail]) -> AgentApprovalRequest {
             AgentApprovalRequest(
                 id: approvalID,
-                requestID: .codex(requestID),
+                requestID: .codex(receipt),
                 method: method,
                 kind: kind,
                 threadID: threadID,

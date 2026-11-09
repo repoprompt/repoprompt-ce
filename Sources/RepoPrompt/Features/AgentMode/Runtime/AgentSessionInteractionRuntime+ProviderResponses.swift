@@ -4,8 +4,8 @@ import RepoPromptDomainRuntime
 @MainActor
 extension AgentSessionInteractionRuntime {
     /// Consume consent synchronously from the captured writer. A true result acknowledges local
-    /// consumption and tracked dispatch, not provider delivery. The captured controller preserves
-    /// existing response routing; transport-generation fencing remains a separate M9.2b obligation.
+    /// consumption and tracked dispatch, not provider delivery. Each response carries its ingress
+    /// receipt; the client refuses a replacement transport at the physical write.
     @discardableResult
     func submitApprovalDecision(command: AgentSessionRuntimeStore.Command, requestID: UUID, decision: AgentApprovalDecision) -> Bool {
         let session = command.writer.session
@@ -13,7 +13,7 @@ extension AgentSessionInteractionRuntime {
               let request = session.pendingApproval, request.id == requestID,
               decision != .accept || request.supportsPlainApprove else { return false }
         switch request.requestID {
-        case let .codex(providerRequestID):
+        case let .codex(receipt):
             guard let controller = session.codexController,
                   CodexAgentModeCoordinator.allowsApprovalDecision(decision, request: request, session: session),
                   let result = CodexAgentModeCoordinator.buildApprovalResult(decision: decision, request: request) else { return false }
@@ -21,7 +21,7 @@ extension AgentSessionInteractionRuntime {
             Self.reconcileInteractiveRunState(session)
             publishRunInteractionStateChange(for: session, reason: .approvalResponseSubmitted)
             performEffect(for: session) {
-                await controller.respondToServerRequest(id: providerRequestID, result: result)
+                await controller.respondToServerRequest(receipt: receipt, result: result)
             }
         case let .claudeControl(providerRequestID):
             guard let controller = session.claudeController else { return false }
@@ -46,7 +46,7 @@ extension AgentSessionInteractionRuntime {
 
     /// Match the existing authoritative turn tuple before capturing a cancel follow-up. The
     /// controller's expected-turn API remains the final fence after the response suspension.
-    private func responseTurnID(for session: AgentTabSession) -> String? {
+    private func responseTurn(for session: AgentTabSession) -> (threadID: String, turnID: String)? {
         guard let controller = session.codexController,
               let identity = session.codexAuthoritativeActiveTurn,
               identity.controllerInstanceID == ObjectIdentifier(controller),
@@ -54,7 +54,7 @@ extension AgentSessionInteractionRuntime {
               identity.threadID == session.codexConversationID,
               identity.runID == session.runID,
               identity.runAttemptID == session.activeRunAttemptID else { return nil }
-        return identity.turnID
+        return (identity.threadID, identity.turnID)
     }
 
     @discardableResult
@@ -65,17 +65,17 @@ extension AgentSessionInteractionRuntime {
               let controller = session.codexController,
               CodexAgentModeCoordinator.computerUseAllowsDecision(decision, session: session) else { return false }
         let result = CodexAgentModeCoordinator.buildPermissionsResult(decision: decision, request: request)
-        let turnID = responseTurnID(for: session)
+        let turn = responseTurn(for: session)
         session.pendingPermissionsRequest = nil
         Self.reconcileInteractiveRunState(session)
         publishRunInteractionStateChange(for: session, reason: .permissionsResponseSubmitted)
         scope?.presentation.makeRunHooks().requestUIRefresh(session, true)
         performEffect(for: session) {
-            await controller.respondToServerRequest(id: request.requestID, result: result)
+            let delivery = await controller.respondToServerRequest(receipt: request.receipt, result: result)
             // Never discover a new current turn after the response suspension. Without an
             // originating authoritative turn, cancellation only settles the permission request.
-            if case .cancel = decision, let turnID {
-                _ = try? await controller.interruptUserTurn(expectedTurnID: turnID)
+            if case .cancel = decision, delivery == .written, let turn {
+                _ = try? await controller.interruptUserTurn(expectedThreadID: turn.threadID, expectedTurnID: turn.turnID, answering: request.receipt)
             }
         }
         return true
@@ -87,7 +87,7 @@ extension AgentSessionInteractionRuntime {
         guard command.writer.scope === scope, command.isCurrent,
               let request = session.pendingMCPElicitationRequest, request.id == requestID,
               let controller = session.codexController else { return false }
-        let turnID = responseTurnID(for: session)
+        let turn = responseTurn(for: session)
         session.pendingMCPElicitationRequest = nil
         if !session.queuedMCPElicitationRequests.isEmpty {
             session.pendingMCPElicitationRequest = session.queuedMCPElicitationRequests.removeFirst()
@@ -97,9 +97,9 @@ extension AgentSessionInteractionRuntime {
         scope?.presentation.makeRunHooks().requestUIRefresh(session, true)
         scope?.mcp.handleObservedMCPStateChange(for: session)
         performEffect(for: session) {
-            await controller.respondToServerRequest(id: request.requestID, result: response.jsonObject)
-            if response.action == .cancel, let turnID {
-                _ = try? await controller.interruptUserTurn(expectedTurnID: turnID)
+            let delivery = await controller.respondToServerRequest(receipt: request.receipt, result: response.jsonObject)
+            if response.action == .cancel, delivery == .written, let turn {
+                _ = try? await controller.interruptUserTurn(expectedThreadID: turn.threadID, expectedTurnID: turn.turnID, answering: request.receipt)
             }
         }
         return true
@@ -121,7 +121,7 @@ extension AgentSessionInteractionRuntime {
         scope?.presentation.bindingChanged(session)
         scope?.presentation.makeRunHooks().requestUIRefresh(session, true)
         performEffect(for: session) {
-            await controller?.respondToServerRequest(id: request.requestID, result: response.jsonObject)
+            await controller?.respondToServerRequest(receipt: request.receipt, result: response.jsonObject)
         }
         return true
     }

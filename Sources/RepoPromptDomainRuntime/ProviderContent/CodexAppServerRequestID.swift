@@ -27,10 +27,35 @@ package enum CodexAppServerRequestID: Hashable {
         }
     }
 
+    package var identityComponent: String {
+        switch self {
+        case let .int(value): "int:\(value)"
+        case let .string(value): "string:\(value.utf8.count):\(value)"
+        }
+    }
+
     package var displayValue: String {
         switch self {
         case let .int(value): String(value)
         case let .string(value): value
         }
+    }
+}
+
+/// Origin of a server request, stamped by the client that read it. Never reconstruct this
+/// from the current transport when answering a previously received request.
+package struct CodexServerRequestReceipt: Hashable {
+    package let clientInstanceID: UUID
+    package let transportGeneration: UInt64
+    package let requestID: CodexAppServerRequestID
+
+    package init(clientInstanceID: UUID, transportGeneration: UInt64, requestID: CodexAppServerRequestID) {
+        self.clientInstanceID = clientInstanceID
+        self.transportGeneration = transportGeneration
+        self.requestID = requestID
+    }
+
+    package var identitySeed: String {
+        "codex|\(clientInstanceID.uuidString)|\(transportGeneration)|\(requestID.identityComponent)"
     }
 }

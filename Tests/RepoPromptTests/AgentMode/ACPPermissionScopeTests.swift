@@ -929,7 +929,7 @@ final class ACPApprovalAvailabilityTests: XCTestCase {
 
     func testOtherProvidersKeepPlainApproveAndUnknownACPAvailabilityFailsClosed() {
         let request = AgentApprovalRequest(
-            requestID: .codex(.int(1)), method: "requestApproval", kind: .commandExecution,
+            requestID: .codex(.fixture(.int(1))), method: "requestApproval", kind: .commandExecution,
             threadID: "thread", turnID: "turn", itemID: "item"
         )
         XCTAssertTrue(request.supportsPlainApprove)
@@ -1008,7 +1008,7 @@ final class CodexApprovalChoiceTests: XCTestCase {
                 params["availableDecisions"] = try JSONSerialization.jsonObject(with: Data(encoded.utf8), options: .fragmentsAllowed)
             }
             let request = try XCTUnwrap(CodexNativeSessionController.parseApprovalRequest(
-                requestID: .int(1), method: "item/commandExecution/requestApproval", params: params,
+                receipt: .fixture(.int(1)), method: "item/commandExecution/requestApproval", params: params,
                 activeThreadID: "thread", currentTurnID: "turn"
             ))
             XCTAssertEqual(request.availableDecisions == nil, encoded == nil || encoded == "null", label)
@@ -1089,7 +1089,7 @@ final class CodexApprovalChoiceTests: XCTestCase {
             "availableDecisions": [["acceptWithExecpolicyAmendment": ["execpolicy_amendment": ["git", "status"]]]]
         ]
         let request = try XCTUnwrap(CodexNativeSessionController.parseApprovalRequest(
-            requestID: .int(1), method: "item/commandExecution/requestApproval", params: params,
+            receipt: .fixture(.int(1)), method: "item/commandExecution/requestApproval", params: params,
             activeThreadID: "thread", currentTurnID: "turn"
         ))
         let equal = AgentApprovalDecision.acceptWithExecpolicyAmendment(" [ \"git\", \"status\" ] ")
@@ -1099,7 +1099,7 @@ final class CodexApprovalChoiceTests: XCTestCase {
         var withoutProposal = params
         withoutProposal.removeValue(forKey: "proposedExecpolicyAmendment")
         let advertisedOnly = try XCTUnwrap(CodexNativeSessionController.parseApprovalRequest(
-            requestID: .int(1), method: "item/commandExecution/requestApproval", params: withoutProposal,
+            receipt: .fixture(.int(1)), method: "item/commandExecution/requestApproval", params: withoutProposal,
             activeThreadID: "thread", currentTurnID: "turn"
         ))
         XCTAssertEqual(advertisedOnly.rememberedDecision, request.rememberedDecision)
@@ -1139,7 +1139,7 @@ final class CodexApprovalChoiceTests: XCTestCase {
 
         let legacy = try parsedRequest(#"{"threadId":"thread","command":"git status"}"#)
         let fileChange = AgentApprovalRequest(
-            requestID: .codex(.int(1)), method: "item/fileChange/requestApproval", kind: .fileChange,
+            requestID: .codex(.fixture(.int(1))), method: "item/fileChange/requestApproval", kind: .fileChange,
             threadID: "thread", turnID: "turn", itemID: "file"
         )
         XCTAssertTrue(legacy.allows(equal))
@@ -1213,7 +1213,7 @@ final class CodexApprovalChoiceTests: XCTestCase {
         let cancelOnly = try parsedRequest(#"{"threadId":"thread","command":"git status","availableDecisions":["cancel"]}"#)
         let network = try parsedRequest(#"{"threadId":"thread","command":"git status","availableDecisions":["accept","acceptForSession","cancel"]}"#)
         let fileChange = AgentApprovalRequest(
-            requestID: .codex(.int(1)), method: "item/fileChange/requestApproval", kind: .fileChange,
+            requestID: .codex(.fixture(.int(1))), method: "item/fileChange/requestApproval", kind: .fileChange,
             threadID: "thread", turnID: "turn", itemID: "file"
         )
         let cases: [(AgentApprovalRequest, String, String?, [AgentNotificationAction], String)] = [
@@ -1257,12 +1257,13 @@ final class CodexApprovalChoiceTests: XCTestCase {
         }
 
         func shutdown() async {}
-        func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async {
+        func respondToServerRequest(receipt: CodexServerRequestReceipt, result: [String: Any]) async -> CodexServerResponseDelivery {
             do {
                 let data = try JSONSerialization.data(withJSONObject: result, options: .sortedKeys)
-                recorder.record("\(id.displayValue):\(String(decoding: data, as: UTF8.self))")
+                recorder.record("\(receipt.requestID.displayValue):\(String(decoding: data, as: UTF8.self))")
             } catch { XCTFail("Invalid wire result: \(error)") }
             sent.fulfill()
+            return .written
         }
     }
 
@@ -1284,7 +1285,7 @@ final class CodexApprovalChoiceTests: XCTestCase {
             JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any], "Fixture must be a JSON object"
         )
         return try XCTUnwrap(CodexNativeSessionController.parseApprovalRequest(
-            requestID: .int(1), method: "item/commandExecution/requestApproval", params: params,
+            receipt: .fixture(.int(1)), method: "item/commandExecution/requestApproval", params: params,
             activeThreadID: "thread", currentTurnID: "turn"
         ), "Codex fixture must parse: \(json)")
     }

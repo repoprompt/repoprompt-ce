@@ -10043,8 +10043,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             guard session.runState.isActive else { return }
             clearCodexPendingAuthRetryTurn(session)
             sealAssistantBoundary(session)
-            let alreadyPending = session.pendingMCPElicitationRequest?.requestID == request.requestID
-            let alreadyQueued = session.queuedMCPElicitationRequests.contains { $0.requestID == request.requestID }
+            let alreadyPending = session.pendingMCPElicitationRequest?.receipt == request.receipt
+            let alreadyQueued = session.queuedMCPElicitationRequests.contains { $0.receipt == request.receipt }
             guard !alreadyPending, !alreadyQueued else { return }
             if session.pendingMCPElicitationRequest == nil {
                 session.pendingMCPElicitationRequest = request
@@ -10063,7 +10063,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             let computerUseArmed = session.codexControllerFeatureState?.computerUseEnabled == true
             if !computerUseArmed, Self.shouldAutoApproveCodexMCPToolRequest(request) {
                 let response = Self.buildAutoApprovalResponse(for: request)
-                await session.codexController?.respondToServerRequest(id: request.requestID, result: response.jsonObject)
+                await session.codexController?.respondToServerRequest(receipt: request.receipt, result: response.jsonObject)
                 return
             }
             let autoApproveCompanion = CodexComputerUseWorkflow.automaticallyApprovesCompanion(
@@ -10081,12 +10081,12 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                     path: .requestUserInput, server: request.repoPromptAutoApprovalVerified ? MCPIntegrationHelper.repoPromptMCPServerName : "computer-use", armed: true,
                     approvalPolicy: session.permissionProfile.codexApprovalPolicy, sandboxMode: session.permissionProfile.codexSandboxMode, outcome: "accept"
                 )
-                await controller.respondToServerRequest(id: request.requestID, result: response.jsonObject)
+                await controller.respondToServerRequest(receipt: request.receipt, result: response.jsonObject)
                 return
             }
             let request = computerUseArmed ? request.computerUseReviewRequest : request
-            let alreadyPending = session.pendingUserInputRequest?.requestID == request.requestID
-            let alreadyQueued = session.queuedUserInputRequests.contains { $0.requestID == request.requestID }
+            let alreadyPending = session.pendingUserInputRequest?.receipt == request.receipt
+            let alreadyQueued = session.queuedUserInputRequests.contains { $0.receipt == request.receipt }
             guard !alreadyPending, !alreadyQueued else {
                 return
             }

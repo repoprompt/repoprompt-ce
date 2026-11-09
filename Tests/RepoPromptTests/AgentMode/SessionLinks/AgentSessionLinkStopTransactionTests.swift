@@ -581,7 +581,7 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
             expectedRunID: fixture.session.runID,
             expectedActiveAgentSessionID: fixture.session.activeAgentSessionID,
             expectedRunAttemptID: ownership.attemptID,
-            expectedPendingUserInputRequestID: nil
+            expectedPendingUserInputReceipt: nil
         )
         let entered = AgentSessionLinkStopSignal<Void>()
         let release = AgentSessionLinkStopSignal<Void>()
@@ -624,6 +624,28 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
 
         release.finish(())
         XCTAssertFalse(fixture.session.stopState.isStopping(binding: binding), "late cleanup cannot reclaim the gate")
+    }
+
+    func testParkedInputCancelRefusesReusedRequestIDFromReplacementTransport() async throws {
+        let fixture = try makeFixture()
+        fixture.session.runState = .waitingForUser
+        fixture.session.installRunID(UUID())
+        let ownership = fixture.session.beginRunAttempt(source: "parked-input-reconnect")
+        let original = CodexServerRequestReceipt.fixture(.int(42), generation: 1)
+        let successor = CodexServerRequestReceipt.fixture(.int(42), generation: 2)
+        fixture.session.pendingUserInputRequest = .init(
+            receipt: successor, method: "item/tool/requestUserInput", threadID: "thread", turnID: "turn", itemID: "item", questions: []
+        )
+        let target = AgentRunCancelTarget(
+            tabID: fixture.tabID, expectedRunID: fixture.session.runID,
+            expectedActiveAgentSessionID: fixture.session.activeAgentSessionID,
+            expectedRunAttemptID: ownership.attemptID, expectedPendingUserInputReceipt: original
+        )
+        let accepted = await fixture.viewModel.cancelAgentRun(target: target)
+        XCTAssertFalse(accepted, "A reused wire ID cannot authorize an old card to stop the successor")
+        XCTAssertEqual(fixture.session.pendingUserInputRequest?.receipt, successor)
+        XCTAssertEqual(fixture.session.activeRunAttemptID, ownership.attemptID)
+        XCTAssertEqual(fixture.session.runState, .waitingForUser)
     }
 
     func testAuditRebindDuringSaveCannotClaimOriginalRowPersisted() async throws {

@@ -30,7 +30,7 @@ package struct AgentRequestUserInputQuestion: Hashable {
 
 package struct AgentRequestUserInputRequest: Identifiable, Hashable {
     package let id: UUID
-    package let requestID: CodexAppServerRequestID
+    package let receipt: CodexServerRequestReceipt
     package let method: String
     package let threadID: String
     package let turnID: String
@@ -43,7 +43,7 @@ package struct AgentRequestUserInputRequest: Identifiable, Hashable {
 
     package init(
         id: UUID? = nil,
-        requestID: CodexAppServerRequestID,
+        receipt: CodexServerRequestReceipt,
         method: String,
         threadID: String,
         turnID: String,
@@ -54,13 +54,13 @@ package struct AgentRequestUserInputRequest: Identifiable, Hashable {
         computerUseCompanionVerified: Bool = false
     ) {
         self.id = id ?? Self.stableID(
-            requestID: requestID,
+            receipt: receipt,
             method: method,
             threadID: threadID,
             turnID: turnID,
             itemID: itemID
         )
-        self.requestID = requestID
+        self.receipt = receipt
         self.method = method
         self.threadID = threadID
         self.turnID = turnID
@@ -72,21 +72,21 @@ package struct AgentRequestUserInputRequest: Identifiable, Hashable {
     }
 
     package static func stableID(
-        requestID: CodexAppServerRequestID,
+        receipt: CodexServerRequestReceipt,
         method: String,
         threadID: String,
         turnID: String,
         itemID: String
     ) -> UUID {
         StableUserInteractionIdentity.uuid(
-            from: "request-user-input|\(requestID.displayValue)|\(method)|\(threadID)|\(turnID)|\(itemID)"
+            from: "request-user-input|\(receipt.identitySeed)|\(method)|\(threadID)|\(turnID)|\(itemID)"
         )
     }
 }
 
 package struct AgentMCPElicitationRequest: Identifiable, Hashable {
     package let id: UUID
-    package let requestID: CodexAppServerRequestID
+    package let receipt: CodexServerRequestReceipt
     package let method: String
     package let threadID: String
     package let turnID: String
@@ -103,7 +103,7 @@ package struct AgentMCPElicitationRequest: Identifiable, Hashable {
 
     package init(
         id: UUID? = nil,
-        requestID: CodexAppServerRequestID,
+        receipt: CodexServerRequestReceipt,
         method: String,
         threadID: String,
         turnID: String,
@@ -119,13 +119,13 @@ package struct AgentMCPElicitationRequest: Identifiable, Hashable {
         details: [AgentApprovalDetail] = []
     ) {
         self.id = id ?? Self.stableID(
-            requestID: requestID,
+            receipt: receipt,
             method: method,
             threadID: threadID,
             turnID: turnID,
             itemID: itemID
         )
-        self.requestID = requestID
+        self.receipt = receipt
         self.method = method
         self.threadID = threadID
         self.turnID = turnID
@@ -142,21 +142,21 @@ package struct AgentMCPElicitationRequest: Identifiable, Hashable {
     }
 
     package static func stableID(
-        requestID: CodexAppServerRequestID,
+        receipt: CodexServerRequestReceipt,
         method: String,
         threadID: String,
         turnID: String,
         itemID: String
     ) -> UUID {
         StableUserInteractionIdentity.uuid(
-            from: "mcp-elicitation-request|\(requestID.displayValue)|\(method)|\(threadID)|\(turnID)|\(itemID)"
+            from: "mcp-elicitation-request|\(receipt.identitySeed)|\(method)|\(threadID)|\(turnID)|\(itemID)"
         )
     }
 }
 
 package struct AgentPermissionsRequest: Identifiable, Hashable {
     package let id: UUID
-    package let requestID: CodexAppServerRequestID
+    package let receipt: CodexServerRequestReceipt
     package let method: String
     package let threadID: String
     package let turnID: String
@@ -168,7 +168,7 @@ package struct AgentPermissionsRequest: Identifiable, Hashable {
 
     package init(
         id: UUID? = nil,
-        requestID: CodexAppServerRequestID,
+        receipt: CodexServerRequestReceipt,
         method: String,
         threadID: String,
         turnID: String,
@@ -179,13 +179,13 @@ package struct AgentPermissionsRequest: Identifiable, Hashable {
         details: [AgentApprovalDetail] = []
     ) {
         self.id = id ?? Self.stableID(
-            requestID: requestID,
+            receipt: receipt,
             method: method,
             threadID: threadID,
             turnID: turnID,
             itemID: itemID
         )
-        self.requestID = requestID
+        self.receipt = receipt
         self.method = method
         self.threadID = threadID
         self.turnID = turnID
@@ -197,14 +197,14 @@ package struct AgentPermissionsRequest: Identifiable, Hashable {
     }
 
     package static func stableID(
-        requestID: CodexAppServerRequestID,
+        receipt: CodexServerRequestReceipt,
         method: String,
         threadID: String,
         turnID: String,
         itemID: String
     ) -> UUID {
         StableUserInteractionIdentity.uuid(
-            from: "permissions-request|\(requestID.displayValue)|\(method)|\(threadID)|\(turnID)|\(itemID)"
+            from: "permissions-request|\(receipt.identitySeed)|\(method)|\(threadID)|\(turnID)|\(itemID)"
         )
     }
 }

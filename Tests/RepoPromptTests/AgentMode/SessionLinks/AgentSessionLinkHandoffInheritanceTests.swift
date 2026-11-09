@@ -3337,7 +3337,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 session.beginRunAttempt(source: "test.forceSwitchInteraction")
                 session.waitingPrompt = "answer?"
                 session.pendingApproval = AgentApprovalRequest(
-                    requestID: .codex(.int(1)),
+                    requestID: .codex(.fixture(.int(1))),
                     method: "item/commandExecution/requestApproval",
                     kind: .commandExecution, threadID: "t", turnID: "t", itemID: "i"
                 )
@@ -3663,7 +3663,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     session.pendingHandoff = .init(payload: "foreign-slot", createdAt: Date())
                     if awaitingApproval {
                         session.pendingApproval = AgentApprovalRequest(
-                            requestID: .codex(.int(1)),
+                            requestID: .codex(.fixture(.int(1))),
                             method: "item/commandExecution/requestApproval",
                             kind: .commandExecution, threadID: "t", turnID: "t", itemID: "i"
                         )

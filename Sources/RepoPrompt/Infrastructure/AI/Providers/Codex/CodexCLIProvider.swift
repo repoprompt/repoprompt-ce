@@ -1238,7 +1238,7 @@ final class CodexCLIProvider: AIProvider {
                 return message
             case .processNotRunning:
                 return "Codex app-server process is not running."
-            case .processExited, .stdoutFrameBudgetExceeded:
+            case .processExited, .stdoutFrameBudgetExceeded, .staleServerRequest:
                 return clientError.localizedDescription
             case .invalidResponse:
                 return "Codex app-server returned an invalid response."

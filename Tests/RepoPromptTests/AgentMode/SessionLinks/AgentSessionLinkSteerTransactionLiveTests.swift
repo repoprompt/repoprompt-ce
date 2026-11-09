@@ -425,7 +425,7 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         makeRunning(fixture)
         fixture.session.runState = .waitingForApproval
         fixture.session.pendingApproval = AgentApprovalRequest(
-            requestID: .codex(.int(7)),
+            requestID: .codex(.fixture(.int(7))),
             method: "item/commandExecution/requestApproval",
             kind: .commandExecution,
             threadID: "thread",

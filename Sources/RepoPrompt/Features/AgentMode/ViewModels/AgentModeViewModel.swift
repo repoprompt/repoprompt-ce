@@ -18318,14 +18318,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     func makeRunCancelTarget(
         tabID: UUID,
         session: TabSession,
-        expectedPendingUserInputRequestID: CodexAppServerRequestID? = nil
+        expectedPendingUserInputReceipt: CodexServerRequestReceipt? = nil
     ) -> AgentRunCancelTarget {
         AgentRunCancelTarget(
             tabID: tabID,
             expectedRunID: session.runID,
             expectedActiveAgentSessionID: session.activeAgentSessionID,
             expectedRunAttemptID: session.activeRunAttemptID,
-            expectedPendingUserInputRequestID: expectedPendingUserInputRequestID
+            expectedPendingUserInputReceipt: expectedPendingUserInputReceipt
         )
     }
 
@@ -18415,8 +18415,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if session.activeRunAttemptID != target.expectedRunAttemptID {
             return "run_attempt_id_mismatch"
         }
-        if let expectedPendingUserInputRequestID = target.expectedPendingUserInputRequestID,
-           session.pendingUserInputRequest?.requestID != expectedPendingUserInputRequestID
+        if let expectedPendingUserInputReceipt = target.expectedPendingUserInputReceipt,
+           session.pendingUserInputRequest?.receipt != expectedPendingUserInputReceipt
         {
             return "pending_user_input_request_mismatch"
         }
@@ -18439,8 +18439,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     "liveAgentSessionID": perfRecorder.shortID(session?.activeAgentSessionID),
                     "expectedRunAttemptID": perfRecorder.shortID(target.expectedRunAttemptID),
                     "liveRunAttemptID": perfRecorder.shortID(session?.activeRunAttemptID),
-                    "expectedPendingInputRequestID": target.expectedPendingUserInputRequestID?.displayValue ?? "nil",
-                    "livePendingInputRequestID": session?.pendingUserInputRequest?.requestID.displayValue ?? "nil",
+                    "expectedPendingInputRequestID": target.expectedPendingUserInputReceipt?.requestID.displayValue ?? "nil",
+                    "livePendingInputRequestID": session?.pendingUserInputRequest?.receipt.requestID.displayValue ?? "nil",
                     "liveRunState": session?.runState.rawValue ?? "missing"
                 ]
             )

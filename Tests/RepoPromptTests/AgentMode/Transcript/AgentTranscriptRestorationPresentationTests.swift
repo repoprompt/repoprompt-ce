@@ -3829,7 +3829,7 @@ extension AgentTranscriptRestorationLifecycleTests {
             let binding = session.persistentSessionBindingIdentity
             let transition = session.bindingTransitionGeneration
             let approval = AgentApprovalRequest(
-                requestID: .codex(.int(7)), method: "item/commandExecution/requestApproval",
+                requestID: .codex(.fixture(.int(7))), method: "item/commandExecution/requestApproval",
                 kind: .commandExecution, threadID: "thread", turnID: "turn", itemID: "pending"
             )
             session.pendingApproval = approval

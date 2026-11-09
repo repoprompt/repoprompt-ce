@@ -6377,3 +6377,65 @@ Merged-tree push gates:
 These are local selected-suite/product receipts, not full-suite, live-app, release or hosted-CI
 qualification. The provider transport receipt fence and remaining ledger routing groups are open;
 M9.2b is not complete.
+
+#### M9.2b checkpoint 6 — originating Codex response and cancel-follow-up receipts
+
+Server-request ingress now carries a required `CodexServerRequestReceipt` containing the client
+instance UUID, the reading transport generation and the typed wire request ID. Recovery parsing
+and termination-buffer flushes retain that ingress generation. The raw-ID response APIs are
+retired: client response/error writes validate the receipt synchronously next to the physical
+write, without an intervening await. A same-client reconnect or a different client cannot reuse
+an old response capability. No parallel lifecycle manager or outstanding-request registry was
+added. The pinned Codex sender uses monotonically allocated request IDs within one sender; the
+receipt distinguishes reconnects and integer/string wire-ID kinds rather than inventing another
+local ordinal.
+
+User-input, permissions, elicitation and Codex approval identities now include that receipt;
+Claude/ACP identity seeds and explicit test ID overrides are unchanged. Coordinator dedup and
+the parked-input Cancel card carry the same origin instead of comparing only the raw ID. The
+runtime still acknowledges synchronous command consumption, not provider delivery. Its tracked
+response effect receives a separate written/refused/failed outcome. Only a written cancellation
+response may issue an interrupt, with the original thread, authoritative turn and receipt. The
+client checks this answering receipt at the actor-owned write boundary, before pending-request/
+timer bookkeeping and without suspension before the write; ordinary standalone Stop remains separate. No later-turn discovery
+fallback was restored.
+
+New stale-origin refusals are non-terminal: they are returned/logged rather than emitted as a
+generic controller error that could fail a successor run. Genuine write errors retain their
+existing error path. Existing consent/provenance policy and auth-refresh liveness emission order
+are preserved. Broader provider-event error routing, Claude/ACP physical reply semantics and the
+remaining inventory are not claimed complete.
+
+Causal coverage exercises real client transport replacement and foreign-client refusal, exact
+wire ID kinds, no pending timeout state after refused follow-up, original-thread/turn protection,
+tracked response outcomes, deferred auth refresh across reconnect, and an old parked-input Cancel
+card confronting the same raw ID on a new generation. Existing computer-use consent assertions
+remain unchanged; its recorder now accepts both explicit fixture IDs (42 and 43) rather than
+silently dropping the newly distinct permissions reply. One review was completed; compile-only
+migration errors and the successor-terminal-error concern were addressed. A new unnecessary
+`await` warning in the test was removed rather than spending warning-ratchet headroom.
+
+Checkpoint 6 validation:
+- Focused `0dee9a45-1de5-444b-816e-36dd1f962c78`: **424 executed, one skipped, zero failures**.
+  Earlier attempts were compile-only migration failures; the first executing run found the
+  recorder's obsolete single-ID filter. No policy assertion or timing budget was relaxed.
+- Broad 109-suite selection `632dc0eb-4682-4072-8b93-928c5acc11f0`: **2125 executed,
+  nine skipped, zero failures**, including every SessionLinks suite and admission/sidebar/
+  lane-policy suites. Isolated HandoffInheritance `a0df5251-2370-4164-81b0-1b00632397d7`:
+  **104 passed**, scale **7.49s** (broad **5.22s**). The historical render/scale inherited baseline
+  remains separately tracked; the integrated flake fixes and current budgets are unchanged.
+- Complete owning `RepoPromptCodexProviderTests` module `633ff8d7-4590-4d05-b661-c5139067ef5e`:
+  **20 passed**. Both products `f3732ca1-9e02-4fcf-9752-378d86eee160` and full lint
+  `ea18afea-ed9f-47ce-8899-1e4076b56c98` passed. Fresh index remains **1243/1360** wrong-way
+  file edges and **53/66** largest cycle components; no ratchet baseline changed.
+- Actual compile-log occurrence comparison across **30 touched Swift files** against retained
+  exact-base compilation has **4** VM, **3** native-controller, **17** resume/wedge,
+  **2** runtime-bridge and **5** steer-transaction warnings, matching baseline counts. Other
+  touched files have zero, including the final recompiled integration fixture after removing
+  its unnecessary `await`. The provider client decreased from one baseline occurrence to zero.
+  **No positive occurrence deltas**; not a zero-total-warning claim. Existing unhandled domain
+  JSON-fixture resource warnings are unchanged.
+
+These are local selected/module/product receipts, not full-suite, live-app, release or hosted-CI
+qualification. Remaining interaction review/lifecycle, event and other routing groups are open;
+M9.2b is not complete.

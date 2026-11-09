@@ -631,7 +631,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
                 ]]]
             ]
             if let server { params["serverName"] = server }
-            let request = try XCTUnwrap(CodexNativeSessionController.parseRequestUserInputRequest(requestID: .int(91), method: "item/tool/requestUserInput", params: params, activeThreadID: Self.oldThreadID, currentTurnID: "legacy-turn"))
+            let request = try XCTUnwrap(CodexNativeSessionController.parseRequestUserInputRequest(receipt: .fixture(.int(91)), method: "item/tool/requestUserInput", params: params, activeThreadID: Self.oldThreadID, currentTurnID: "legacy-turn"))
             await fixture.coordinator.test_handleCodexNativeEvent(.requestUserInput(request), session: fixture.session, sourceController: controller)
             if autoApproved {
                 XCTAssertNil(fixture.session.pendingUserInputRequest, "Verified RepoPrompt tools must retain their normal approval policy")
@@ -659,7 +659,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
     }
 
     private func makeLegacyApprovalRequest() -> AgentRequestUserInputRequest {
-        .init(requestID: .int(91), method: "item/tool/requestUserInput", threadID: Self.oldThreadID, turnID: "legacy-turn", itemID: "legacy-approval", questions: [
+        .init(receipt: .fixture(.int(91)), method: "item/tool/requestUserInput", threadID: Self.oldThreadID, turnID: "legacy-turn", itemID: "legacy-approval", questions: [
             .init(id: "mcp_tool_call_approval_read_file", header: "MCP approval", question: "Allow this tool?", isOther: true, isSecret: false, options: [
                 .init(label: "Allow", description: "One call"),
                 .init(label: "Allow for this session", description: "Remember"),
@@ -783,7 +783,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertTrue(source.items.isEmpty, "The source must not receive the destination's turn")
         try await assertComputerUseProviderStart(fixture, session: destination)
         let controller = try XCTUnwrap(fixture.factory.controllers.first)
-        let approval = AgentApprovalRequest(requestID: .codex(.int(91)), method: "item/commandExecution/requestApproval", kind: .commandExecution, threadID: "submission-thread", turnID: "first-turn", itemID: "first-approval")
+        let approval = AgentApprovalRequest(requestID: .codex(.fixture(.int(91))), method: "item/commandExecution/requestApproval", kind: .commandExecution, threadID: "submission-thread", turnID: "first-turn", itemID: "first-approval")
         await fixture.coordinator.test_handleCodexNativeEvent(.approvalRequest(approval), session: destination, sourceController: controller)
         XCTAssertEqual(destination.pendingApproval?.id, approval.id)
         // This is the card's capture expression, without test-only restoration or binding repair:
@@ -1155,7 +1155,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertTrue(first.didSend)
         await coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "computer-use-turn"), session: session, sourceController: controller)
         let permission = AgentApprovalRequest(
-            requestID: .codex(.int(90)),
+            requestID: .codex(.fixture(.int(90))),
             method: "item/commandExecution/requestApproval",
             kind: .commandExecution,
             threadID: "computer-use-thread",
@@ -2665,13 +2665,14 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
         lock.withLock { qaAnswers }
     }
 
-    func respondToServerRequest(id _: CodexAppServerRequestID, result: [String: Any]) async {
+    func respondToServerRequest(receipt _: CodexServerRequestReceipt, result: [String: Any]) async -> CodexServerResponseDelivery {
         lock.withLock {
             qaResponses += 1
             if let answers = result["answers"] as? [String: [String: Any]] {
                 qaAnswers = answers.compactMapValues { $0["answers"] as? [String] }
             }
         }
+        return .written
     }
 
     var computerUseAutoApprovalRevoked = false
@@ -3240,8 +3241,8 @@ extension CodexResumeWedgeCommitTests {
                         CodexNativeSessionController(
                             client: CodexAppServerClient(), runID: runID, tabID: f.session.tabID,
                             windowID: -1, workspacePaths: .uniform(nil),
-                            serverRequestResponseExecutor: { id, result in
-                                let frame = try JSONSerialization.data(withJSONObject: ["id": id.jsonValue, "result": result])
+                            serverRequestResponseExecutor: { receipt, result in
+                                let frame = try JSONSerialization.data(withJSONObject: ["id": receipt.requestID.jsonValue, "result": result])
                                 await responses.record(frame)
                             }
                         )
@@ -3270,7 +3271,7 @@ extension CodexResumeWedgeCommitTests {
                             // Actual optional snake-case wire field, absent or explicitly null.
                             params["turn_id"] = scope == "null-turn" ? .null : nil
                         }
-                        await source.test_handleServerRequest(method: method, params: params)
+                        await source.test_handleServerRequest(receipt: .fixture(.int(42)), method: method, params: params)
                     }
                     if source !== current {
                         await source.shutdown()
@@ -4004,7 +4005,7 @@ extension CodexResumeWedgeCommitTests {
                 await source.test_installThreadState(threadID: Self.oldThreadID, authoritativeTurnID: "refresh-turn", routingTurnID: "refresh-turn")
                 await f.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "refresh-turn"), session: f.session, sourceController: current)
                 if scope != "no-request" {
-                    await source.test_handleServerRequest(method: method, params: [
+                    await source.test_handleServerRequest(receipt: .fixture(.int(42), generation: client.debugTransportGeneration(), clientID: client.instanceID), method: method, params: [
                         "reason": .string("unauthorized"), "previousAccountId": .string("fixture-account"),
                         "threadId": .string(scope == "foreign-thread" ? "other-thread" : Self.oldThreadID),
                         "turnId": .string(scope == "foreign-turn" ? "other-turn" : "refresh-turn")

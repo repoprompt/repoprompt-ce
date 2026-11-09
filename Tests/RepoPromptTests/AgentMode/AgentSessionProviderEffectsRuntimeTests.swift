@@ -1497,7 +1497,7 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         let session = questionSession(in: scope)
         let runtime = scope.interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
         let pending = AgentRequestUserInputRequest(
-            requestID: .string("input"), method: "item/tool/requestUserInput", threadID: "thread", turnID: "turn", itemID: "item",
+            receipt: .fixture(.string("input")), method: "item/tool/requestUserInput", threadID: "thread", turnID: "turn", itemID: "item",
             questions: [.init(id: "answer", header: "Answer", question: "Which files?", isOther: true, isSecret: false, options: [])]
         )
         session.pendingUserInputRequest = pending
@@ -2043,19 +2043,18 @@ final class AgentProviderResponseCommandTests: XCTestCase {
         case approval, permissions, elicitation, userInput
 
         @MainActor
-        func install(on session: AgentTabSession) -> UUID {
-            let id = UUID()
+        func install(on session: AgentTabSession, receipt: CodexServerRequestReceipt = .fixture(.int(1)), id: UUID? = UUID()) -> UUID {
             switch self {
             case .approval:
-                session.pendingApproval = .init(id: id, requestID: .codex(.int(1)), method: "item/commandExecution/requestApproval", kind: .commandExecution, threadID: "thread", turnID: "turn", itemID: "item")
+                session.pendingApproval = .init(id: id, requestID: .codex(receipt), method: "item/commandExecution/requestApproval", kind: .commandExecution, threadID: "thread", turnID: "turn", itemID: "item")
             case .permissions:
-                session.pendingPermissionsRequest = .init(id: id, requestID: .int(1), method: "item/permissions/requestApproval", threadID: "thread", turnID: "turn", itemID: "item", cwd: "/tmp", permissionsJSON: "{}")
+                session.pendingPermissionsRequest = .init(id: id, receipt: receipt, method: "item/permissions/requestApproval", threadID: "thread", turnID: "turn", itemID: "item", cwd: "/tmp", permissionsJSON: "{}")
             case .elicitation:
-                session.pendingMCPElicitationRequest = .init(id: id, requestID: .int(1), method: "mcpServer/elicitation/request", threadID: "thread", turnID: "turn", itemID: "item", rawParamsJSON: "{}")
+                session.pendingMCPElicitationRequest = .init(id: id, receipt: receipt, method: "mcpServer/elicitation/request", threadID: "thread", turnID: "turn", itemID: "item", rawParamsJSON: "{}")
             case .userInput:
-                session.pendingUserInputRequest = .init(id: id, requestID: .int(1), method: "item/tool/requestUserInput", threadID: "thread", turnID: "turn", itemID: "item", questions: [])
+                session.pendingUserInputRequest = .init(id: id, receipt: receipt, method: "item/tool/requestUserInput", threadID: "thread", turnID: "turn", itemID: "item", questions: [])
             }
-            return id
+            return pendingID(on: session)!
         }
 
         @MainActor
@@ -2187,6 +2186,39 @@ final class AgentProviderResponseCommandTests: XCTestCase {
         }
     }
 
+    func testOriginatingInteractionIdentityAndDeliveryFenceCancelFollowUps() async throws {
+        for kind in Kind.allCases {
+            for delivery in [CodexServerResponseDelivery.written, .refused, .failed] {
+                let store = AgentSessionRuntimeStore()
+                let scope = store.makeScope()
+                let session = install(in: scope)
+                let runtime = scope.interactions(routeID: 1, approvalStore: ApplyEditsApprovalStore())
+                let controller = ResponseController(delivery: delivery)
+                session.codexController = controller
+                session.codexConversationID = "thread"
+                session.beginRunAttempt(source: "response-origin test")
+                session.codexAuthoritativeActiveTurn = try .init(threadID: "thread", turnID: "original-turn", turnKind: .user, controllerInstanceID: ObjectIdentifier(controller), controllerGeneration: session.codexControllerGeneration, runID: session.runID, runAttemptID: XCTUnwrap(session.activeRunAttemptID))
+                let captured = try command(scope, session)
+                let staleID = kind.install(on: session, receipt: .fixture(.int(1), generation: 1), id: nil)
+                let origin = CodexServerRequestReceipt.fixture(.int(1), generation: 2)
+                let successorID = kind.install(on: session, receipt: origin, id: nil)
+                XCTAssertNotEqual(staleID, successorID)
+                XCTAssertFalse(kind.submit(runtime, command: captured, id: staleID), "A current writer must not make a stale card current")
+                XCTAssertEqual(kind.pendingID(on: session), successorID)
+                XCTAssertTrue(kind.submit(runtime, command: captured, id: successorID), "Acknowledges local consumption, not provider delivery")
+                await runtime.drainPendingEffects()
+                let sent = await controller.receipts.count
+                let interrupts = await controller.receipts.interrupts
+                let origins = await controller.receipts.interruptOrigins
+                XCTAssertEqual(sent, 1)
+                let shouldInterrupt = delivery == .written && (kind == .permissions || kind == .elicitation)
+                XCTAssertEqual(interrupts, shouldInterrupt ? ["original-turn"] : [])
+                XCTAssertEqual(origins, shouldInterrupt ? [origin] : [])
+                XCTAssertNil(kind.pendingID(on: session))
+            }
+        }
+    }
+
     func testMissingProviderDoesNotAcknowledgePermissionsOrElicitation() throws {
         let store = AgentSessionRuntimeStore()
         let scope = store.makeScope()
@@ -2208,6 +2240,7 @@ final class AgentProviderResponseCommandTests: XCTestCase {
         var count = 0
         var completed = 0
         var interrupts: [String] = []
+        var interruptOrigins: [CodexServerRequestReceipt] = []
         var reconciliations = 0
         private var waiter: CheckedContinuation<Void, Never>?
         func respond(entered: XCTestExpectation?) async {
@@ -2228,6 +2261,11 @@ final class AgentProviderResponseCommandTests: XCTestCase {
             interrupts.append(id)
         }
 
+        func interrupt(_ id: String, origin: CodexServerRequestReceipt) {
+            interrupts.append(id)
+            interruptOrigins.append(origin)
+        }
+
         func reconcile() {
             reconciliations += 1
         }
@@ -2236,8 +2274,10 @@ final class AgentProviderResponseCommandTests: XCTestCase {
     private final class ResponseController: CodexSessionControllerPassiveStubDefaults {
         let receipts = Receipts()
         let entered: XCTestExpectation?
-        init(entered: XCTestExpectation? = nil) {
+        let delivery: CodexServerResponseDelivery
+        init(entered: XCTestExpectation? = nil, delivery: CodexServerResponseDelivery = .written) {
             self.entered = entered
+            self.delivery = delivery
         }
 
         var events: AsyncStream<CodexNativeSessionController.Event> {
@@ -2245,12 +2285,19 @@ final class AgentProviderResponseCommandTests: XCTestCase {
         }
 
         func shutdown() async {}
-        func respondToServerRequest(id _: CodexAppServerRequestID, result _: [String: Any]) async {
+        func respondToServerRequest(receipt _: CodexServerRequestReceipt, result _: [String: Any]) async -> CodexServerResponseDelivery {
             await receipts.respond(entered: entered)
+            return delivery
         }
 
         func interruptUserTurn(expectedTurnID: String) async throws -> CodexTurnInterruptReceipt {
             await receipts.interrupt(expectedTurnID)
+            return .init(interruptedTurnID: expectedTurnID)
+        }
+
+        func interruptUserTurn(expectedThreadID: String, expectedTurnID: String, answering receipt: CodexServerRequestReceipt) async throws -> CodexTurnInterruptReceipt {
+            XCTAssertEqual(expectedThreadID, "thread")
+            await receipts.interrupt(expectedTurnID, origin: receipt)
             return .init(interruptedTurnID: expectedTurnID)
         }
 
