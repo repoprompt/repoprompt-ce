@@ -586,6 +586,60 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
         XCTAssertTrue(ordinaryStart, "A removed stale context must not permanently block ordinary starts")
     }
 
+    func testCrossScopeCopiedControlCannotReleaseStructuralHolderDuringConflict() async throws {
+        for (conflictingClaim, sharesRegistration) in [(false, true), (true, true), (false, false), (true, false)] {
+            let store = AgentSessionRuntimeStore()
+            let approvals = ApplyEditsApprovalStore()
+            let address = ApplyEditsApprovalScope(windowID: 42, tabID: UUID())
+            await approvals.setAutoEditEnabled(false, for: address, updateGlobalDefault: false)
+            let override = await approvals.prepareAutoEditOverride(for: address)
+            let applied = await approvals.applyAutoEditOverride(override)
+            XCTAssertTrue(applied)
+            let f = try await makeFixture(store: store, autoEditOverride: override)
+            let context = try XCTUnwrap(f.session.mcpControlContext)
+            let otherRegistration = await AgentRunSessionStore.register(sessionID: UUID())
+            addTeardownBlock { await AgentRunSessionStore.cleanup(registration: otherRegistration) }
+            let copiedContext = sharesRegistration ? context : context.replacingRegistration(otherRegistration)
+            let original = try XCTUnwrap(f.scope.mcp.controlledWriter(sessionID: f.sessionID))
+            let other = store.makeScope()
+            let copy = AgentTabSession(tabID: UUID())
+            copy.mcpControlContext = copiedContext
+            other.replaceSessions([copy.tabID: copy])
+            if conflictingClaim {
+                XCTAssertEqual(other.bindingRejection(f.sessionID, on: copy), .conflictingWriter)
+                // Bypass admission only to model corrupt competing claims. Production must refuse this.
+                copy.installPersistentSessionBinding(.init(
+                    tabID: copy.tabID, sessionID: f.sessionID, workspaceID: original.identity.workspaceID
+                ))
+                guard case .conflicting = store.resolveWriter(sessionID: f.sessionID) else {
+                    return XCTFail("Expected raw conflict")
+                }
+                XCTAssertFalse(original.ownsPersistentClaim)
+            }
+            let removedCopy = await other.mcp.deactivateControlContext(
+                session: copy, expectedContext: copiedContext, approvalStore: approvals, cleanupRegistration: true
+            )
+            XCTAssertFalse(removedCopy, "A copied context cannot release the structural holder's resources")
+            XCTAssertEqual(copy.mcpControlContext, copiedContext)
+            let protectedOverride = await approvals.autoEditEnabled(for: address)
+            XCTAssertTrue(protectedOverride, "Protection must cover approval receipts independently of registration equality")
+            let current = await AgentRunSessionStore.currentRegistration(for: f.sessionID)
+            XCTAssertEqual(current, f.registration)
+            XCTAssertEqual(f.session.mcpControlContext, context)
+
+            f.session.runState = .completed
+            let removedOwner = await f.scope.mcp.deactivateControlContext(
+                session: f.session, expectedContext: context, approvalStore: approvals, cleanupRegistration: true
+            )
+            XCTAssertTrue(removedOwner, "A raw conflict must not turn the copied receipt into a cleanup owner")
+            let released = await AgentRunSessionStore.currentRegistration(for: f.sessionID)
+            XCTAssertNil(released)
+            let restored = await approvals.autoEditEnabled(for: address)
+            XCTAssertFalse(restored)
+            XCTAssertEqual(copy.mcpControlContext, copiedContext)
+        }
+    }
+
     func testOriginControlLookupSurvivesRetirementAndBindingPreparationButNotNewWork() async throws {
         let f = try await makeFixture()
         let writer = try XCTUnwrap(f.scope.mcp.controlledWriter(sessionID: f.sessionID))
@@ -1055,8 +1109,10 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
         }
     }
 
-    private func makeFixture() async throws -> Fixture {
-        let fixture = try await Fixture.make()
+    private func makeFixture(
+        store: AgentSessionRuntimeStore? = nil, autoEditOverride: ApplyEditsApprovalStore.AutoEditOverride? = nil
+    ) async throws -> Fixture {
+        let fixture = try await Fixture.make(store: store ?? AgentSessionRuntimeStore(), autoEditOverride: autoEditOverride)
         let registration = fixture.registration
         addTeardownBlock { await AgentRunSessionStore.cleanup(registration: registration) }
         return fixture
@@ -1070,8 +1126,8 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
         let registration: AgentRunSessionStore.Registration
         let epoch: AgentRunTurnEpoch
 
-        static func make() async throws -> Fixture {
-            let scope = AgentSessionRuntimeStore().makeScope()
+        static func make(store: AgentSessionRuntimeStore, autoEditOverride: ApplyEditsApprovalStore.AutoEditOverride?) async throws -> Fixture {
+            let scope = store.makeScope()
             let session = AgentTabSession(tabID: UUID())
             let sessionID = UUID(), activationID = UUID()
             session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: UUID()))
@@ -1084,7 +1140,7 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
             guard case let .accepted(epoch) = await AgentRunSessionStore.beginEpoch(registration: registration, activationID: activationID, expectedCurrentEpoch: nil, transitionKind: .initial) else {
                 throw NSError(domain: "MCP runtime fixture epoch", code: 1)
             }
-            session.mcpControlContext = try .init(sessionID: sessionID, activationID: activationID, writerIdentity: controlWriterIdentity(for: session, scope: scope), registration: registration, currentEpoch: epoch, preparedEpoch: nil, pendingEpochTransition: nil, originatingConnectionID: nil, interactionTransport: .mcp(sessionID: sessionID, originatingConnectionID: nil), suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: .pair, autoEditOverride: nil)
+            session.mcpControlContext = try .init(sessionID: sessionID, activationID: activationID, writerIdentity: controlWriterIdentity(for: session, scope: scope), registration: registration, currentEpoch: epoch, preparedEpoch: nil, pendingEpochTransition: nil, originatingConnectionID: nil, interactionTransport: .mcp(sessionID: sessionID, originatingConnectionID: nil), suppressUserNotifications: true, forceAutoEditEnabled: autoEditOverride != nil, autoEditEnabledBeforeOverride: false, taskLabelKind: .pair, autoEditOverride: autoEditOverride)
             return .init(scope: scope, session: session, sessionID: sessionID, registration: registration, epoch: epoch)
         }
 
@@ -1104,6 +1160,15 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         session.recordRestorationAuthoritative(.persistedPayloadApplied)
         scope.replaceSessions([tabID: session])
         return session
+    }
+
+    private func questionCommand(in scope: AgentSessionRuntimeStore.Scope?, for session: AgentTabSession) throws -> AgentSessionRuntimeStore.Command {
+        let scope = try XCTUnwrap(scope)
+        let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+        guard case let .unique(writer) = scope.resolveWriter(sessionID: sessionID), writer.session === session else {
+            throw NSError(domain: "Expected exact question writer", code: 1)
+        }
+        return try writer.admitCommand().get()
     }
 
     private func runtimeQuestion() -> AgentAskUserInteraction {
@@ -1126,6 +1191,92 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         ))
     }
 
+    func testMCPQuestionCancellationOwnsInvocationBeforeAndAfterInstallation() async throws {
+        let coordinator = MCPAskUserPresentationCoordinator()
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = questionSession(in: scope)
+        let runtime = scope.interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
+        let command = try questionCommand(in: scope, for: session)
+        let question = runtimeQuestion()
+
+        let earlyID = UUID()
+        _ = await coordinator.cancel(requestID: earlyID)
+        do {
+            _ = try await MCPAskUserToolProvider.withAgentQuestionPresentation(requestID: earlyID, coordinator: coordinator) {
+                XCTFail("A cancelled registration must never begin preparation or publish a question")
+                return try await runtime.askUser(command: command, interaction: question)
+            }
+            XCTFail("Early cancellation must refuse presentation")
+        } catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertNil(session.pendingAskUser)
+
+        // A cancellation during an uncancellable preparation await joins that invocation and
+        // reaches the runtime's cancellation check before any pending state can be installed.
+        for external in [false, true] {
+            let preparingID = UUID()
+            let preparing = expectation(description: "question preparation entered")
+            var releasePreparation: CheckedContinuation<Void, Never>?
+            let cancelled = expectation(description: "exact preparation task cancelled")
+            let invocation = Task {
+                try await MCPAskUserToolProvider.withAgentQuestionPresentation(requestID: preparingID, coordinator: coordinator) {
+                    await withTaskCancellationHandler {
+                        await withCheckedContinuation { continuation in
+                            releasePreparation = continuation
+                            preparing.fulfill()
+                        }
+                    } onCancel: { cancelled.fulfill() }
+                    return try await runtime.askUser(command: command, interaction: question)
+                }
+            }
+            await fulfillment(of: [preparing], timeout: 3)
+            var cancellationReturned = false
+            let cancellation = Task {
+                if external { _ = await coordinator.cancel(requestID: preparingID) }
+                else { invocation.cancel()
+                    _ = await invocation.result
+                }
+                cancellationReturned = true
+            }
+            await fulfillment(of: [cancelled], timeout: 3)
+            XCTAssertFalse(cancellationReturned, "Cancellation must join the original preparation")
+            releasePreparation?.resume()
+            releasePreparation = nil
+            await cancellation.value
+            do { _ = try await invocation.value
+                XCTFail("Cancelled preparation must not present")
+            } catch { XCTAssertTrue(error is CancellationError) }
+            XCTAssertNil(session.pendingAskUser)
+            XCTAssertTrue(runtime.questionWaits.isEmpty)
+        }
+
+        let installed = expectation(description: "registered question installed")
+        let attachment = observeQuestionInstallation(scope: scope, session: session, installed: installed)
+        let installedID = UUID()
+        let original = Task {
+            try await MCPAskUserToolProvider.withAgentQuestionPresentation(requestID: installedID, coordinator: coordinator) {
+                try await runtime.askUser(command: command, interaction: question)
+            }
+        }
+        await fulfillment(of: [installed], timeout: 3)
+        scope.presentation.detach(attachment)
+        let replacement = questionSession(in: scope, tabID: session.tabID)
+        let replacementInstalled = expectation(description: "replacement with reused public question ID")
+        let replacementAttachment = observeQuestionInstallation(scope: scope, session: replacement, installed: replacementInstalled)
+        let successor = Task { try await runtime.askUser(command: questionCommand(in: scope, for: replacement), interaction: question) }
+        await fulfillment(of: [replacementInstalled], timeout: 3)
+        scope.presentation.detach(replacementAttachment)
+        let cancelled = await coordinator.cancel(requestID: installedID)
+        XCTAssertTrue(cancelled)
+        XCTAssertNil(session.askUserContinuation, "External cancellation joins the exact runtime wait")
+        XCTAssertNotNil(replacement.askUserContinuation)
+        do { _ = try await original.value
+            XCTFail("Original question should be cancelled")
+        } catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertTrue(try runtime.skipAskUser(command: questionCommand(in: scope, for: replacement), interactionID: question.id))
+        _ = try await successor.value
+        XCTAssertTrue(runtime.questionWaits.isEmpty)
+    }
+
     func testQuestionCreationRetainsScopeUntilResponseWithoutPresentation() async throws {
         var scope: AgentSessionRuntimeStore.Scope? = AgentSessionRuntimeStore().makeScope()
         let session = try questionSession(in: XCTUnwrap(scope))
@@ -1134,22 +1285,22 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         let installed = expectation(description: "runtime question published")
         let attachment = try observeQuestionInstallation(scope: XCTUnwrap(scope), session: session, installed: installed)
         weak let owner = scope
-        let task = Task { try await runtime.askUser(session: session, interaction: question) }
+        let task = Task { try await runtime.askUser(command: questionCommand(in: runtime.scope, for: session), interaction: question) }
         await fulfillment(of: [installed], timeout: 3)
         scope?.presentation.detach(attachment)
-        do { _ = try await runtime.askUser(session: session, interaction: runtimeQuestion())
+        do { _ = try await runtime.askUser(command: questionCommand(in: runtime.scope, for: session), interaction: runtimeQuestion())
             XCTFail("A second question must not replace the admitted request")
         } catch { XCTAssertTrue(String(describing: error).contains("already waiting")) }
         XCTAssertEqual(session.pendingAskUser?.interaction.id, question.id)
         scope = nil
         XCTAssertNotNil(owner, "An admitted question owns its runtime, not its presentation")
-        runtime.skipAskUser(session: session, interactionID: question.id)
+        XCTAssertTrue(try runtime.skipAskUser(command: questionCommand(in: runtime.scope, for: session), interactionID: question.id))
         let response = try await task.value
         XCTAssertTrue(response.skipped)
         XCTAssertNil(session.pendingAskUser)
         XCTAssertNil(session.askUserContinuation)
         XCTAssertNil(session.askUserTimeoutTask)
-        XCTAssertTrue(runtime.questionWaitIDs.isEmpty)
+        XCTAssertTrue(runtime.questionWaits.isEmpty)
         XCTAssertNil(owner)
     }
 
@@ -1160,13 +1311,13 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         let question = runtimeQuestion()
         let firstInstalled = expectation(description: "original question")
         let firstAttachment = observeQuestionInstallation(scope: scope, session: original, installed: firstInstalled)
-        let first = Task { try await runtime.askUser(session: original, interaction: question) }
+        let first = Task { try await runtime.askUser(command: questionCommand(in: scope, for: original), interaction: question) }
         await fulfillment(of: [firstInstalled], timeout: 3)
         scope.presentation.detach(firstAttachment)
         let replacement = questionSession(in: scope, tabID: original.tabID)
         let secondInstalled = expectation(description: "replacement question")
         let secondAttachment = observeQuestionInstallation(scope: scope, session: replacement, installed: secondInstalled)
-        let second = Task { try await runtime.askUser(session: replacement, interaction: question) }
+        let second = Task { try await runtime.askUser(command: questionCommand(in: scope, for: replacement), interaction: question) }
         await fulfillment(of: [secondInstalled], timeout: 3)
         scope.presentation.detach(secondAttachment)
         first.cancel()
@@ -1176,10 +1327,86 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         XCTAssertNil(original.askUserContinuation)
         XCTAssertEqual(replacement.pendingAskUser?.interaction.id, question.id)
         XCTAssertNotNil(replacement.askUserContinuation)
-        runtime.skipAskUser(session: replacement, interactionID: question.id)
+        XCTAssertTrue(try runtime.skipAskUser(command: questionCommand(in: scope, for: replacement), interactionID: question.id))
         let response = try await second.value
         XCTAssertTrue(response.skipped)
-        XCTAssertTrue(runtime.questionWaitIDs.isEmpty)
+        XCTAssertTrue(runtime.questionWaits.isEmpty)
+    }
+
+    func testQuestionResponseRejectsReacquiredAndConflictingWriterCommands() async throws {
+        for conflict in [false, true] {
+            let writers = AgentSessionRuntimeStore()
+            let scope = writers.makeScope()
+            let session = questionSession(in: scope)
+            let command = try questionCommand(in: scope, for: session)
+            let runtime = scope.interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
+            let question = AgentAskUserInteraction(title: "Writer-fenced question", timeoutSeconds: 600, questions: [
+                AgentAskUserQuestion(id: "answer", question: "Which files?", options: [], allowsMultiple: false, allowsCustom: true),
+                AgentAskUserQuestion(id: "reason", question: "Why?", options: [], allowsMultiple: false, allowsCustom: true)
+            ])
+            let installed = expectation(description: "question ready for writer refusal")
+            let attachment = observeQuestionInstallation(scope: scope, session: session, installed: installed)
+            let task = Task { try await runtime.askUser(command: questionCommand(in: runtime.scope, for: session), interaction: question) }
+            addTeardownBlock { task.cancel()
+                _ = try? await task.value
+            }
+            await fulfillment(of: [installed], timeout: 3)
+            scope.presentation.detach(attachment)
+            let draft = AgentAskUserDraft(customResponse: "Sources only")
+            XCTAssertTrue(runtime.updateAskUserDraft(command: command, interactionID: question.id, questionID: "answer", draft: draft))
+            XCTAssertTrue(runtime.updateAskUserQuestionIndex(command: command, interactionID: question.id, index: 1))
+            XCTAssertTrue(runtime.noteAskUserCardActivity(command: command, interactionID: question.id))
+            let timeoutGeneration = session.pendingAskUserTimeoutGeneration
+            let timeoutStart = session.pendingAskUser?.timeoutStartedAt
+            XCTAssertFalse(runtime.updateAskUserDraft(command: command, interactionID: question.id, questionID: "missing", draft: draft))
+            XCTAssertFalse(runtime.updateAskUserQuestionIndex(command: command, interactionID: question.id, index: 2))
+            XCTAssertFalse(runtime.noteAskUserCardActivity(command: command, interactionID: UUID()))
+            let other = writers.makeScope()
+            let foreignRuntime = other.interactions(routeID: 43, approvalStore: ApplyEditsApprovalStore())
+            XCTAssertFalse(foreignRuntime.updateAskUserDraft(command: command, interactionID: question.id, questionID: "answer", draft: .init(customResponse: "Foreign scope")))
+            XCTAssertFalse(foreignRuntime.updateAskUserQuestionIndex(command: command, interactionID: question.id, index: 0))
+            XCTAssertFalse(foreignRuntime.noteAskUserCardActivity(command: command, interactionID: question.id))
+            if conflict {
+                let copy = AgentTabSession(tabID: UUID())
+                other.replaceSessions([copy.tabID: copy])
+                XCTAssertEqual(other.bindingRejection(command.identity.sessionID, on: copy), .conflictingWriter)
+                copy.installPersistentSessionBinding(.init(tabID: copy.tabID, sessionID: command.identity.sessionID, workspaceID: command.identity.workspaceID))
+                guard case .conflicting = scope.resolveWriter(sessionID: command.identity.sessionID) else {
+                    return XCTFail("Expected raw conflicting writer claims")
+                }
+            } else {
+                scope.replaceSessions([:])
+                scope.replaceSessions([session.tabID: session])
+            }
+            XCTAssertFalse(runtime.updateAskUserDraft(command: command, interactionID: question.id, questionID: "answer", draft: .init(customResponse: "Stale card")))
+            XCTAssertFalse(runtime.updateAskUserQuestionIndex(command: command, interactionID: question.id, index: 0))
+            XCTAssertFalse(runtime.noteAskUserCardActivity(command: command, interactionID: question.id))
+            XCTAssertEqual(session.pendingAskUser?.draftsByQuestionID["answer"], draft)
+            XCTAssertEqual(session.pendingAskUser?.currentQuestionIndex, 1)
+            XCTAssertEqual(session.pendingAskUserTimeoutGeneration, timeoutGeneration)
+            XCTAssertEqual(session.pendingAskUser?.timeoutStartedAt, timeoutStart)
+            XCTAssertFalse(runtime.skipAskUser(command: command, interactionID: question.id))
+            let submitted = try runtime.submitAskUserResponse(command: command, interactionID: question.id, draftsByQuestionID: [:])
+            XCTAssertFalse(submitted)
+            XCTAssertEqual(session.pendingAskUser?.interaction.id, question.id)
+            XCTAssertNotNil(session.askUserContinuation)
+            other.replaceSessions([:])
+            let fresh = try questionCommand(in: scope, for: session)
+            if conflict {
+                XCTAssertTrue(runtime.skipAskUser(command: fresh, interactionID: question.id))
+                let response = try await task.value
+                XCTAssertTrue(response.skipped)
+            } else {
+                XCTAssertTrue(fresh.isCurrent)
+                XCTAssertFalse(runtime.skipAskUser(command: fresh, interactionID: question.id), "A new claim cannot answer the old claim's question")
+                XCTAssertFalse(runtime.updateAskUserDraft(command: fresh, interactionID: question.id, questionID: "answer", draft: .init(customResponse: "New claim")))
+                task.cancel()
+                do { _ = try await task.value
+                    XCTFail("Only the original cancellation may settle this wait")
+                } catch { XCTAssertTrue(error is CancellationError) }
+            }
+            XCTAssertNil(session.askUserContinuation)
+        }
     }
 
     func testQuestionTimeoutRearmRejectsOldGenerationAndReturnsDraftAfterDetach() async throws {
@@ -1189,30 +1416,79 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         let question = runtimeQuestion()
         let installed = expectation(description: "question before timeout rearm")
         let attachment = observeQuestionInstallation(scope: scope, session: session, installed: installed)
-        let task = Task { try await runtime.askUser(session: session, interaction: question) }
+        let task = Task { try await runtime.askUser(command: questionCommand(in: runtime.scope, for: session), interaction: question) }
         await fulfillment(of: [installed], timeout: 3)
         scope.presentation.detach(attachment)
-        runtime.updateAskUserDraft(session: session, interactionID: question.id, questionID: "answer", draft: .init(customResponse: "Sources only"))
+        let command = try questionCommand(in: scope, for: session)
+        XCTAssertTrue(runtime.updateAskUserDraft(command: command, interactionID: question.id, questionID: "answer", draft: .init(customResponse: "Sources only")))
+        let waitID = try XCTUnwrap(runtime.questionWaits[ObjectIdentifier(session)]?.id)
         let oldGeneration = session.pendingAskUserTimeoutGeneration
-        runtime.noteAskUserCardActivity(session: session, interactionID: question.id)
+        XCTAssertTrue(runtime.noteAskUserCardActivity(command: command, interactionID: question.id))
         let currentGeneration = session.pendingAskUserTimeoutGeneration
         XCTAssertNotEqual(oldGeneration, currentGeneration)
-        runtime.expireAskUserTimeout(for: session, interactionID: question.id, generation: oldGeneration)
+        runtime.expireAskUserTimeout(for: session, interactionID: question.id, waitID: waitID, generation: oldGeneration)
         XCTAssertNotNil(session.askUserContinuation)
         scope.replaceSessions([:])
-        runtime.expireAskUserTimeout(for: session, interactionID: question.id, generation: currentGeneration)
+        runtime.expireAskUserTimeout(for: session, interactionID: question.id, waitID: waitID, generation: currentGeneration)
         let response = try await task.value
         XCTAssertTrue(response.timedOut)
         XCTAssertEqual(response.answersByQuestionID["answer"]?.customResponse, "Sources only")
         XCTAssertNil(session.askUserTimeoutTask)
-        XCTAssertFalse(runtime.cancelAskUserInteraction(session: session, interactionID: question.id))
-        XCTAssertTrue(runtime.questionWaitIDs.isEmpty)
+        XCTAssertFalse(runtime.cancelAskUserInteraction(session: session, interactionID: question.id, waitID: waitID))
+        XCTAssertTrue(runtime.questionWaits.isEmpty)
         scope.replaceSessions([session.tabID: session])
         let immediate = AgentAskUserInteraction(id: question.id, timeoutSeconds: 0, questions: question.questions)
-        let immediateResponse = try await runtime.askUser(session: session, interaction: immediate)
+        let immediateResponse = try await runtime.askUser(command: questionCommand(in: runtime.scope, for: session), interaction: immediate)
         XCTAssertTrue(immediateResponse.timedOut, "Exercise the actual scheduled timer as well as the stale-generation fence")
         XCTAssertNil(session.askUserTimeoutTask)
-        XCTAssertTrue(runtime.questionWaitIDs.isEmpty)
+        XCTAssertTrue(runtime.questionWaits.isEmpty)
+    }
+
+    func testOriginQuestionTimeoutRepaintsButCannotReconcileSuccessorRun() async throws {
+        for mutation in ["reacquire", "rebind", "attempt"] {
+            let scope = AgentSessionRuntimeStore().makeScope()
+            let session = questionSession(in: scope)
+            let runtime = scope.interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
+            let command = try questionCommand(in: scope, for: session)
+            let question = runtimeQuestion()
+            let installed = expectation(description: "question before \(mutation)")
+            let attachment = observeQuestionInstallation(scope: scope, session: session, installed: installed)
+            let task = Task { try await runtime.askUser(command: command, interaction: question) }
+            await fulfillment(of: [installed], timeout: 3)
+            scope.presentation.detach(attachment)
+            XCTAssertTrue(runtime.updateAskUserDraft(command: command, interactionID: question.id, questionID: "answer", draft: .init(customResponse: "Original draft")))
+            let waitID = try XCTUnwrap(runtime.questionWaits[ObjectIdentifier(session)]?.id)
+            let generation = session.pendingAskUserTimeoutGeneration
+            var bindings = 0
+            var interactions = 0
+            let repaint = scope.presentation.attach(session, sink: .init(
+                activityChanged: { _, _ in }, refresh: { _, _, _ in }, turnComplete: { _ in }, turnFailed: { _, _ in },
+                binding: { _ in bindings += 1 }, interaction: { _ in interactions += 1 }
+            ))
+            if mutation == "reacquire" {
+                scope.replaceSessions([:])
+                scope.replaceSessions([session.tabID: session])
+                let fresh = try questionCommand(in: scope, for: session)
+                XCTAssertFalse(runtime.skipAskUser(command: fresh, interactionID: question.id))
+            } else if mutation == "rebind" {
+                session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: command.identity.workspaceID))
+                session.runState = .waitingForUser
+            } else {
+                session.beginRunAttempt(source: "successor question timeout test")
+                session.runState = .waitingForUser
+            }
+            runtime.expireAskUserTimeout(for: session, interactionID: question.id, waitID: waitID, generation: generation)
+            let response = try await task.value
+            XCTAssertTrue(response.timedOut)
+            XCTAssertEqual(response.answersByQuestionID["answer"]?.customResponse, "Original draft")
+            XCTAssertNil(session.askUserContinuation)
+            XCTAssertEqual(session.runState, mutation == "reacquire" ? .running : .waitingForUser)
+            // A new run attempt retains the same writer; a changed claim gets only the narrow,
+            // exact-object UI projection, never binding/save publication from the old writer.
+            XCTAssertEqual(bindings, mutation == "attempt" ? 1 : 0)
+            XCTAssertEqual(interactions, mutation == "attempt" ? 0 : 1)
+            scope.presentation.detach(repaint)
+        }
     }
 
     func testQuestionCancellationBeforeAdmissionOrRetirementCannotPublishPendingState() async throws {
@@ -1220,19 +1496,20 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         let session = questionSession(in: scope)
         let runtime = scope.interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
         let question = runtimeQuestion()
-        let task = Task { try await runtime.askUser(session: session, interaction: question) }
+        let task = Task { try await runtime.askUser(command: questionCommand(in: runtime.scope, for: session), interaction: question) }
         task.cancel()
         do { _ = try await task.value
             XCTFail("An already cancelled request must not be installed")
         } catch { XCTAssertTrue(error is CancellationError) }
+        let command = try questionCommand(in: scope, for: session)
         scope.beginRetirement()
-        do { _ = try await runtime.askUser(session: session, interaction: question)
+        do { _ = try await runtime.askUser(command: command, interaction: question)
             XCTFail("Retiring owner must refuse a new question")
         } catch { XCTAssertTrue(String(describing: error).contains("unavailable")) }
         XCTAssertNil(session.pendingAskUser)
         XCTAssertNil(session.askUserContinuation)
         XCTAssertNil(session.askUserTimeoutTask)
-        XCTAssertTrue(runtime.questionWaitIDs.isEmpty)
+        XCTAssertTrue(runtime.questionWaits.isEmpty)
     }
 
     func testRetainedInteractionRuntimeDoesNotRetainProviderCommandOwnersThroughTerminalHooks() async throws {
@@ -1244,7 +1521,7 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         )
         viewModel?.ensureRunServiceMaterializedForRunStart()
         let runtime = try XCTUnwrap(viewModel?.interactionRuntime)
-        weak let codex = runtime.codexCommands
+        weak let codex = viewModel?.codexCoordinator
         weak let claude = runtime.claudeCommands
         XCTAssertNotNil(codex)
         XCTAssertNotNil(claude)
@@ -1252,29 +1529,23 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         viewModel = nil
         XCTAssertNil(codex, "The terminal binder retains interaction hooks, not their provider command owners")
         XCTAssertNil(claude)
-        XCTAssertNil(runtime.codexCommands)
+        XCTAssertNil(runtime.observer, "The remaining provider-state observer must also be weak")
         XCTAssertNil(runtime.claudeCommands)
     }
 
     func testManagedQuestionResponseOwnsExactScopeAcrossAuthorizationWithoutPresentation() async throws {
         var scope: AgentSessionRuntimeStore.Scope? = AgentSessionRuntimeStore().makeScope()
-        let session = AgentTabSession(tabID: UUID())
-        scope?.replaceSessions([session.tabID: session])
+        let session = try questionSession(in: XCTUnwrap(scope))
         let runtime = try XCTUnwrap(scope).interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
         weak let retainedScope = scope
         let question = AgentAskUserInteraction(title: "Scope", questions: [
             AgentAskUserQuestion(id: "scope", question: "Which files?", options: [], allowsMultiple: false, allowsCustom: true)
         ])
         let installed = expectation(description: "question continuation installed")
-        let answered = Task { @MainActor in
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<AgentAskUserResponse, Error>) in
-                session.pendingAskUser = AgentAskUserPendingState(interaction: question)
-                session.askUserContinuation = continuation
-                session.runState = .waitingForQuestion
-                installed.fulfill()
-            }
-        }
+        let attachment = try observeQuestionInstallation(scope: XCTUnwrap(scope), session: session, installed: installed)
+        let answered = Task { try await runtime.askUser(command: questionCommand(in: runtime.scope, for: session), interaction: question) }
         await fulfillment(of: [installed], timeout: 3)
+        scope?.presentation.detach(attachment)
         let request = try AgentSessionLinkInteractionResponseRequest(
             interactionID: question.id,
             payload: AgentRunMCPToolService.parseResponsePayload(args: ["skip": .bool(true)])
@@ -1305,26 +1576,23 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
     }
 
     func testManagedResponseRechecksGrantObjectAndBindingAfterAuthorization() async throws {
-        for mutation in ["revoke", "rebind", "replace"] {
+        for mutation in ["revoke", "rebind", "replace", "reacquire"] {
             let scope = AgentSessionRuntimeStore().makeScope()
             let session = AgentTabSession(tabID: UUID())
             let sessionID = UUID()
             let workspaceID = UUID()
             session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: workspaceID))
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
             scope.replaceSessions([session.tabID: session])
             let runtime = scope.interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
             let question = AgentAskUserInteraction(title: "Scope", questions: [
                 AgentAskUserQuestion(id: "scope", question: "Which files?", options: [], allowsMultiple: false, allowsCustom: true)
             ])
             let installed = expectation(description: "question installed before \(mutation)")
-            let answered = Task { @MainActor in
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<AgentAskUserResponse, Error>) in
-                    session.pendingAskUser = AgentAskUserPendingState(interaction: question)
-                    session.askUserContinuation = continuation
-                    installed.fulfill()
-                }
-            }
+            let attachment = observeQuestionInstallation(scope: scope, session: session, installed: installed)
+            let answered = Task { try await runtime.askUser(command: questionCommand(in: scope, for: session), interaction: question) }
             await fulfillment(of: [installed], timeout: 3)
+            scope.presentation.detach(attachment)
             let request = try AgentSessionLinkInteractionResponseRequest(
                 interactionID: question.id,
                 payload: AgentRunMCPToolService.parseResponsePayload(args: ["skip": .bool(true)])
@@ -1345,6 +1613,9 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
                 session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: workspaceID))
             } else if mutation == "replace" {
                 scope.replaceSessions([session.tabID: AgentTabSession(tabID: session.tabID)])
+            } else if mutation == "reacquire" {
+                scope.replaceSessions([:])
+                scope.replaceSessions([session.tabID: session])
             }
             gate.release()
             let outcome = await submitted.value
@@ -1360,11 +1631,10 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
 
     func testManagedUserInputDoesNotAcknowledgeMissingProviderRoute() async throws {
         let scope = AgentSessionRuntimeStore().makeScope()
-        let session = AgentTabSession(tabID: UUID())
-        scope.replaceSessions([session.tabID: session])
+        let session = questionSession(in: scope)
         let runtime = scope.interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
         let pending = AgentRequestUserInputRequest(
-            requestID: .string("input"), method: "item/tool/requestUserInput", threadID: "thread", turnID: "turn", itemID: "item",
+            receipt: .fixture(.string("input")), method: "item/tool/requestUserInput", threadID: "thread", turnID: "turn", itemID: "item",
             questions: [.init(id: "answer", header: "Answer", question: "Which files?", isOther: true, isSecret: false, options: [])]
         )
         session.pendingUserInputRequest = pending
@@ -1413,6 +1683,91 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         XCTAssertEqual(session.runState, .waitingForUser)
         AgentSessionInteractionRuntime.cancelPendingInstruction(for: session)
         XCTAssertNil(session.waitingPrompt)
+    }
+
+    func testApplyEditsDecisionUsesCapturedWriterAndAcknowledgesExactReview() async throws {
+        for drift in ["none", "removed", "reacquired", "conflict", "retired", "successorReview"] {
+            let writers = AgentSessionRuntimeStore()
+            let scope = writers.makeScope()
+            let session = AgentTabSession(tabID: UUID())
+            let binding = AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: UUID(), workspaceID: UUID())
+            session.installPersistentSessionBinding(binding)
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            scope.replaceSessions([session.tabID: session])
+            guard case let .unique(writer) = scope.resolveWriter(sessionID: binding.sessionID) else {
+                return XCTFail("Expected the initial unique writer")
+            }
+            let command = try writer.admitCommand().get()
+            let approvals = ApplyEditsApprovalStore()
+            let runtime = scope.interactions(routeID: 42, approvalStore: approvals)
+            let address = runtime.approvalScope(for: session)
+            let (subscription, stream) = await approvals.subscribe(scope: address)
+            var snapshots = stream.makeAsyncIterator()
+            _ = await snapshots.next()
+            let original = Task { await approvals.requestReview(scope: address, path: "original", unifiedDiff: "diff", timeoutSeconds: 60) }
+            let firstSnapshot = await snapshots.next()
+            let first = try XCTUnwrap(firstSnapshot?.pendingReview)
+            session.pendingApplyEditsReview = first
+            let gate = TestReleaseFence(name: "writer-routed approval decision")
+            runtime.test_beforeApprovalDecision = { await gate.enterAndWait() }
+            addTeardownBlock {
+                gate.release()
+                await runtime.drainPendingEffects()
+                await approvals.cleanupScope(address)
+                await approvals.unsubscribe(scope: address, id: subscription)
+                _ = await original.value
+            }
+            let submission = Task { await runtime.submitApplyEditsReviewDecision(command: command, reviewID: first.id, decision: .accept) }
+            guard await gate.waitUntilEntered() else { return }
+            let other = writers.makeScope()
+            var successor: Task<ApplyEditsReviewDecision, Never>?
+            var expectedReviewID = first.id
+            switch drift {
+            case "removed":
+                scope.replaceSessions([:])
+            case "reacquired":
+                scope.replaceSessions([:])
+                scope.replaceSessions([session.tabID: session])
+            case "conflict":
+                let duplicate = AgentTabSession(tabID: UUID())
+                other.replaceSessions([duplicate.tabID: duplicate])
+                XCTAssertEqual(other.bindingRejection(binding.sessionID, on: duplicate), .conflictingWriter)
+                duplicate.installPersistentSessionBinding(.init(tabID: duplicate.tabID, sessionID: binding.sessionID, workspaceID: binding.workspaceID))
+                guard case .conflicting = writers.resolveWriter(sessionID: binding.sessionID) else {
+                    return XCTFail("Raw competing claim must remain conflicting")
+                }
+            case "retired":
+                scope.beginRetirement()
+            case "successorReview":
+                successor = Task { await approvals.requestReview(scope: address, path: "successor", unifiedDiff: "diff", timeoutSeconds: 60) }
+                _ = await snapshots.next() // original cancellation
+                let next = await snapshots.next()
+                expectedReviewID = try XCTUnwrap(next?.pendingReview?.id)
+            // Deliberately leave the local projection stale: the store receipt is authoritative.
+            default: break
+            }
+            gate.release()
+            let applied = await submission.value
+            XCTAssertEqual(applied, drift == "none", drift)
+            await runtime.drainPendingEffects(for: session)
+            let (checkID, currentStream) = await approvals.subscribe(scope: address)
+            var current = currentStream.makeAsyncIterator()
+            let snapshot = await current.next()
+            XCTAssertEqual(snapshot?.pendingReview?.id, drift == "none" ? nil : expectedReviewID, drift)
+            await approvals.unsubscribe(scope: address, id: checkID)
+            if drift != "none" {
+                let settled = await approvals.resolveReview(scope: address, reviewID: expectedReviewID, decision: .reject(reason: "test cleanup"))
+                XCTAssertTrue(settled, "The stale command must not consume the pending receipt")
+            }
+            let duplicateSettlement = await approvals.resolveReview(scope: address, reviewID: first.id, decision: .accept)
+            XCTAssertFalse(duplicateSettlement)
+            let originalResult = await original.value
+            if drift == "none" { XCTAssertEqual(originalResult, .accept) }
+            if let successor {
+                let result = await successor.value
+                XCTAssertEqual(result, .reject(reason: "test cleanup"))
+            }
+        }
     }
 
     func testLateApprovalCancellationDrainsOriginalEffectWithoutCancellingSuccessorReview() async throws {
@@ -1641,7 +1996,7 @@ final class AgentSessionCodexRuntimeEffectsTests: XCTestCase {
     private func makeCoordinator(scope: AgentSessionRuntimeStore.Scope) -> CodexAgentModeCoordinator {
         let coordinator = CodexAgentModeCoordinator(
             windowID: -901, runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
-            codexControllerFactory: { _, _, _, _, _, _, _, _ in fatalError("Event handling must not launch a controller") },
+            codexControllerFactory: { _, _, _, _, _, _, _, _, _ in fatalError("Event handling must not launch a controller") },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
             shouldManageCodexTooling: false, codexHookApprovalSettings: GlobalSettingsStore.shared
         )
@@ -1816,5 +2171,276 @@ final class AgentSessionHandoffRuntimeTests: XCTestCase {
         XCTAssertEqual(session.pendingHandoff.payload, "old")
         XCTAssertEqual(replacement.pendingHandoff.payload, "new")
         XCTAssertEqual(runtime.prependPendingHandoffIfNeeded("input", session: session), "input")
+    }
+}
+
+@MainActor
+final class AgentProviderResponseCommandTests: XCTestCase {
+    private enum Kind: CaseIterable {
+        case approval, permissions, elicitation, userInput
+
+        @MainActor
+        func install(on session: AgentTabSession, receipt: CodexServerRequestReceipt = .fixture(.int(1)), id: UUID? = UUID()) -> UUID {
+            switch self {
+            case .approval:
+                session.pendingApproval = .init(id: id, requestID: .codex(receipt), method: "item/commandExecution/requestApproval", kind: .commandExecution, threadID: "thread", turnID: "turn", itemID: "item")
+            case .permissions:
+                session.pendingPermissionsRequest = .init(id: id, receipt: receipt, method: "item/permissions/requestApproval", threadID: "thread", turnID: "turn", itemID: "item", cwd: "/tmp", permissionsJSON: "{}")
+            case .elicitation:
+                session.pendingMCPElicitationRequest = .init(id: id, receipt: receipt, method: "mcpServer/elicitation/request", threadID: "thread", turnID: "turn", itemID: "item", rawParamsJSON: "{}")
+            case .userInput:
+                session.pendingUserInputRequest = .init(id: id, receipt: receipt, method: "item/tool/requestUserInput", threadID: "thread", turnID: "turn", itemID: "item", questions: [])
+            }
+            return pendingID(on: session)!
+        }
+
+        @MainActor
+        func pendingID(on session: AgentTabSession) -> UUID? {
+            switch self {
+            case .approval: session.pendingApproval?.id
+            case .permissions: session.pendingPermissionsRequest?.id
+            case .elicitation: session.pendingMCPElicitationRequest?.id
+            case .userInput: session.pendingUserInputRequest?.id
+            }
+        }
+
+        @MainActor
+        func submit(_ runtime: AgentSessionInteractionRuntime, command: AgentSessionRuntimeStore.Command, id: UUID) -> Bool {
+            switch self {
+            case .approval: runtime.submitApprovalDecision(command: command, requestID: id, decision: .cancel)
+            case .permissions: runtime.submitPermissionsDecision(command: command, requestID: id, decision: .cancel)
+            case .elicitation: runtime.submitMCPElicitationResponse(command: command, requestID: id, response: .init(action: .cancel))
+            case .userInput: runtime.submitUserInputResponse(command: command, requestID: id, response: .init(answersByQuestionID: [:]))
+            }
+        }
+    }
+
+    private func install(in scope: AgentSessionRuntimeStore.Scope) -> AgentTabSession {
+        let session = AgentTabSession(tabID: UUID())
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: UUID()))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        scope.replaceSessions([session.tabID: session])
+        return session
+    }
+
+    private func command(_ scope: AgentSessionRuntimeStore.Scope, _ session: AgentTabSession) throws -> AgentSessionRuntimeStore.Command {
+        guard case let .unique(writer) = try scope.resolveWriter(sessionID: XCTUnwrap(session.activeAgentSessionID)), writer.session === session else {
+            throw NSError(domain: "Expected exact response writer", code: 1)
+        }
+        return try writer.admitCommand().get()
+    }
+
+    func testResponseCommandsRejectWriterDriftAndDuplicateConsumption() async throws {
+        for kind in Kind.allCases {
+            for conflict in [false, true] {
+                let store = AgentSessionRuntimeStore()
+                let scope = store.makeScope()
+                let other = store.makeScope()
+                let session = install(in: scope)
+                let runtime = scope.interactions(routeID: 1, approvalStore: ApplyEditsApprovalStore())
+                let captured = try command(scope, session)
+                let controller = ResponseController()
+                session.codexController = controller
+                let id = kind.install(on: session)
+                if conflict {
+                    let duplicate = AgentTabSession(tabID: UUID())
+                    other.replaceSessions([duplicate.tabID: duplicate])
+                    XCTAssertEqual(other.bindingRejection(captured.identity.sessionID, on: duplicate), .conflictingWriter)
+                    duplicate.installPersistentSessionBinding(.init(tabID: duplicate.tabID, sessionID: captured.identity.sessionID, workspaceID: captured.identity.workspaceID))
+                    duplicate.recordRestorationAuthoritative(.persistedPayloadApplied)
+                    guard case .conflicting = scope.resolveWriter(sessionID: captured.identity.sessionID) else {
+                        return XCTFail("Expected raw conflicting writer claims")
+                    }
+                } else {
+                    scope.replaceSessions([:])
+                    scope.replaceSessions([session.tabID: session])
+                }
+                XCTAssertFalse(kind.submit(runtime, command: captured, id: id), "\(kind), conflict=\(conflict)")
+                XCTAssertEqual(kind.pendingID(on: session), id)
+                await runtime.drainPendingEffects()
+                let rejectedCount = await controller.receipts.count
+                XCTAssertEqual(rejectedCount, 0)
+                other.replaceSessions([:])
+                let current = try command(scope, session)
+                XCTAssertTrue(kind.submit(runtime, command: current, id: id))
+                XCTAssertFalse(kind.submit(runtime, command: current, id: id))
+                await runtime.drainPendingEffects()
+                let sentCount = await controller.receipts.count
+                XCTAssertEqual(sentCount, 1)
+            }
+        }
+    }
+
+    func testConsumedResponseDrainsOriginalControllerWithoutInterruptingLaterTurn() async throws {
+        for kind in Kind.allCases {
+            for turn in ["unknown", "current", "foreignController"] {
+                let store = AgentSessionRuntimeStore()
+                let scope = store.makeScope()
+                let session = install(in: scope)
+                let runtime = scope.interactions(routeID: 1, approvalStore: ApplyEditsApprovalStore())
+                let entered = expectation(description: "original response entered")
+                let controller = ResponseController(entered: entered)
+                session.codexController = controller
+                session.codexConversationID = "thread"
+                session.beginRunAttempt(source: "response command test")
+                let foreignController = ResponseController()
+                if turn != "unknown" {
+                    session.codexAuthoritativeActiveTurn = try .init(threadID: "thread", turnID: "original-turn", turnKind: .user, controllerInstanceID: ObjectIdentifier(turn == "foreignController" ? foreignController : controller), controllerGeneration: session.codexControllerGeneration, runID: session.runID, runAttemptID: XCTUnwrap(session.activeRunAttemptID))
+                }
+                let id = kind.install(on: session)
+                XCTAssertTrue(try kind.submit(runtime, command: command(scope, session), id: id))
+                await fulfillment(of: [entered], timeout: 3)
+                let successor = kind.install(on: session)
+                // A later turn on the same controller must not be discovered by a cancel follow-up.
+                session.codexAuthoritativeActiveTurn = try .init(threadID: "thread", turnID: "later-turn", turnKind: .user, controllerInstanceID: ObjectIdentifier(controller), controllerGeneration: session.codexControllerGeneration, runID: session.runID, runAttemptID: XCTUnwrap(session.activeRunAttemptID))
+                let replacement = ResponseController()
+                session.codexController = replacement
+                scope.replaceSessions([:])
+                var drained = false
+                let drainStarted = expectation(description: "response drain entered")
+                let drain = Task {
+                    drainStarted.fulfill()
+                    await runtime.drainPendingEffects(for: session)
+                    drained = true
+                }
+                await fulfillment(of: [drainStarted], timeout: 3)
+                XCTAssertFalse(drained, "Drain must still own the suspended provider send")
+                await controller.receipts.release()
+                await drain.value
+                XCTAssertTrue(drained)
+                let completed = await controller.receipts.completed
+                XCTAssertEqual(completed, 1, "Drain acknowledges the completed send, not just its admission")
+                let count = await controller.receipts.count
+                let interrupts = await controller.receipts.interrupts
+                let reconciliations = await controller.receipts.reconciliations
+                let replacementCount = await replacement.receipts.count
+                XCTAssertEqual(count, 1)
+                XCTAssertEqual(replacementCount, 0)
+                XCTAssertEqual(kind.pendingID(on: session), successor)
+                XCTAssertEqual(reconciliations, 0, "Cancellation may not discover a later turn")
+                XCTAssertEqual(interrupts, turn == "current" && (kind == .permissions || kind == .elicitation) ? ["original-turn"] : [])
+            }
+        }
+    }
+
+    func testOriginatingInteractionIdentityAndDeliveryFenceCancelFollowUps() async throws {
+        for kind in Kind.allCases {
+            for delivery in [CodexServerResponseDelivery.written, .refused, .failed] {
+                let store = AgentSessionRuntimeStore()
+                let scope = store.makeScope()
+                let session = install(in: scope)
+                let runtime = scope.interactions(routeID: 1, approvalStore: ApplyEditsApprovalStore())
+                let controller = ResponseController(delivery: delivery)
+                session.codexController = controller
+                session.codexConversationID = "thread"
+                session.beginRunAttempt(source: "response-origin test")
+                session.codexAuthoritativeActiveTurn = try .init(threadID: "thread", turnID: "original-turn", turnKind: .user, controllerInstanceID: ObjectIdentifier(controller), controllerGeneration: session.codexControllerGeneration, runID: session.runID, runAttemptID: XCTUnwrap(session.activeRunAttemptID))
+                let captured = try command(scope, session)
+                let staleID = kind.install(on: session, receipt: .fixture(.int(1), generation: 1), id: nil)
+                let origin = CodexServerRequestReceipt.fixture(.int(1), generation: 2)
+                let successorID = kind.install(on: session, receipt: origin, id: nil)
+                XCTAssertNotEqual(staleID, successorID)
+                XCTAssertFalse(kind.submit(runtime, command: captured, id: staleID), "A current writer must not make a stale card current")
+                XCTAssertEqual(kind.pendingID(on: session), successorID)
+                XCTAssertTrue(kind.submit(runtime, command: captured, id: successorID), "Acknowledges local consumption, not provider delivery")
+                await runtime.drainPendingEffects()
+                let sent = await controller.receipts.count
+                let interrupts = await controller.receipts.interrupts
+                let origins = await controller.receipts.interruptOrigins
+                XCTAssertEqual(sent, 1)
+                let shouldInterrupt = delivery == .written && (kind == .permissions || kind == .elicitation)
+                XCTAssertEqual(interrupts, shouldInterrupt ? ["original-turn"] : [])
+                XCTAssertEqual(origins, shouldInterrupt ? [origin] : [])
+                XCTAssertNil(kind.pendingID(on: session))
+            }
+        }
+    }
+
+    func testMissingProviderDoesNotAcknowledgePermissionsOrElicitation() throws {
+        let store = AgentSessionRuntimeStore()
+        let scope = store.makeScope()
+        let session = install(in: scope)
+        let runtime = scope.interactions(routeID: 1, approvalStore: ApplyEditsApprovalStore())
+        let captured = try command(scope, session)
+        for kind in [Kind.permissions, .elicitation] {
+            let id = kind.install(on: session)
+            let resolution: AgentPendingInteractionResolution = switch kind {
+            case .permissions: try .permissions(request: XCTUnwrap(session.pendingPermissionsRequest), decision: .decline)
+            default: try .mcpElicitation(request: XCTUnwrap(session.pendingMCPElicitationRequest), response: .init(action: .decline))
+            }
+            XCTAssertThrowsError(try runtime.applyPendingInteractionResolution(resolution, command: captured))
+            XCTAssertEqual(kind.pendingID(on: session), id)
+        }
+    }
+
+    private actor Receipts {
+        var count = 0
+        var completed = 0
+        var interrupts: [String] = []
+        var interruptOrigins: [CodexServerRequestReceipt] = []
+        var reconciliations = 0
+        private var waiter: CheckedContinuation<Void, Never>?
+        func respond(entered: XCTestExpectation?) async {
+            count += 1
+            defer { completed += 1 }
+            guard let entered else { return }
+            await withCheckedContinuation { waiter = $0
+                entered.fulfill()
+            }
+        }
+
+        func release() {
+            waiter?.resume()
+            waiter = nil
+        }
+
+        func interrupt(_ id: String) {
+            interrupts.append(id)
+        }
+
+        func interrupt(_ id: String, origin: CodexServerRequestReceipt) {
+            interrupts.append(id)
+            interruptOrigins.append(origin)
+        }
+
+        func reconcile() {
+            reconciliations += 1
+        }
+    }
+
+    private final class ResponseController: CodexSessionControllerPassiveStubDefaults {
+        let receipts = Receipts()
+        let entered: XCTestExpectation?
+        let delivery: CodexServerResponseDelivery
+        init(entered: XCTestExpectation? = nil, delivery: CodexServerResponseDelivery = .written) {
+            self.entered = entered
+            self.delivery = delivery
+        }
+
+        var events: AsyncStream<CodexNativeSessionController.Event> {
+            AsyncStream { $0.finish() }
+        }
+
+        func shutdown() async {}
+        func respondToServerRequest(receipt _: CodexServerRequestReceipt, result _: [String: Any]) async -> CodexServerResponseDelivery {
+            await receipts.respond(entered: entered)
+            return delivery
+        }
+
+        func interruptUserTurn(expectedTurnID: String) async throws -> CodexTurnInterruptReceipt {
+            await receipts.interrupt(expectedTurnID)
+            return .init(interruptedTurnID: expectedTurnID)
+        }
+
+        func interruptUserTurn(expectedThreadID: String, expectedTurnID: String, answering receipt: CodexServerRequestReceipt) async throws -> CodexTurnInterruptReceipt {
+            XCTAssertEqual(expectedThreadID, "thread")
+            await receipts.interrupt(expectedTurnID, origin: receipt)
+            return .init(interruptedTurnID: expectedTurnID)
+        }
+
+        func reconcileAndInterruptCurrentTurn() async throws -> CodexTurnInterruptReceipt {
+            await receipts.reconcile()
+            return .init(interruptedTurnID: "later-turn")
+        }
     }
 }

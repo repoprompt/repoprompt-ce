@@ -165,6 +165,7 @@ final class CodexCLIProvider: AIProvider {
         let requestedModelIdentifier = modelIdentifier(for: model)
         let fallbackReasoningEffort = model.defaultReasoningEffort
         let serviceTier = model.codexServiceTier
+        let contextWindowSelection = CodexContextWindowPreferences.selection()
 
         return AsyncThrowingStream { continuation in
             let streamID = UUID()
@@ -189,6 +190,7 @@ final class CodexCLIProvider: AIProvider {
                         fallbackReasoningEffort: fallbackReasoningEffort,
                         serviceTier: serviceTier,
                         requestID: streamID,
+                        contextWindowSelection: contextWindowSelection,
                         continuation: continuation
                     )
                     continuation.finish()
@@ -286,6 +288,7 @@ final class CodexCLIProvider: AIProvider {
         var currentExcludeServers = excludeServers
         var didRetryBrokenServer = false
         var didRetryManagedAuthRecovery = false
+        let contextWindowSelection = CodexContextWindowPreferences.selection()
 
         while true {
             do {
@@ -297,7 +300,8 @@ final class CodexCLIProvider: AIProvider {
                         fallbackReasoningEffort: nil,
                         excludeServers: currentExcludeServers,
                         appServerClient: appServerClient,
-                        requestTimeout: appliedTimeout
+                        requestTimeout: appliedTimeout,
+                        contextWindowSelection: contextWindowSelection
                     )
                 }
                 return text.lowercased().contains("ok")
@@ -342,6 +346,7 @@ final class CodexCLIProvider: AIProvider {
         fallbackReasoningEffort: String?,
         serviceTier: String?,
         requestID: UUID,
+        contextWindowSelection: CodexContextWindowPreferences.Selection,
         continuation: AsyncThrowingStream<AIStreamResult, Error>.Continuation
     ) async throws {
         var attempt = 0
@@ -369,6 +374,7 @@ final class CodexCLIProvider: AIProvider {
                         excludeServers: brokenServers,
                         appServerClient: appServerClient,
                         requestTimeout: defaultRequestTimeout,
+                        contextWindowSelection: contextWindowSelection,
                         continuation: continuation
                     )
                 }
@@ -465,6 +471,7 @@ final class CodexCLIProvider: AIProvider {
         excludeServers: Set<String>,
         appServerClient: CodexAppServerClient?,
         requestTimeout: TimeInterval,
+        contextWindowSelection: CodexContextWindowPreferences.Selection,
         continuation: AsyncThrowingStream<AIStreamResult, Error>.Continuation
     ) async throws {
         let selection = appServerSelection(
@@ -475,7 +482,8 @@ final class CodexCLIProvider: AIProvider {
         let controller = makeInteractiveSessionController(
             appServerClient: appServerClient,
             excludeServers: excludeServers,
-            requestTimeout: requestTimeout
+            requestTimeout: requestTimeout,
+            contextWindowSelection: contextWindowSelection
         )
 
         var responseUsageByID: [String: CodexNativeSessionController.ResponseUsage] = [:]
@@ -706,7 +714,8 @@ final class CodexCLIProvider: AIProvider {
         serviceTier: String? = nil,
         excludeServers: Set<String>,
         appServerClient: CodexAppServerClient?,
-        requestTimeout: TimeInterval
+        requestTimeout: TimeInterval,
+        contextWindowSelection: CodexContextWindowPreferences.Selection
     ) async throws -> String {
         let selection = appServerSelection(
             requestedModelIdentifier: requestedModelIdentifier,
@@ -716,7 +725,8 @@ final class CodexCLIProvider: AIProvider {
         let controller = makeInteractiveSessionController(
             appServerClient: appServerClient,
             excludeServers: excludeServers,
-            requestTimeout: requestTimeout
+            requestTimeout: requestTimeout,
+            contextWindowSelection: contextWindowSelection
         )
 
         let timeoutMonitor = startTurnTimeoutMonitor(timeout: requestTimeout, controller: controller)
@@ -970,7 +980,8 @@ final class CodexCLIProvider: AIProvider {
     func makeInteractiveSessionController(
         appServerClient: CodexAppServerClient?,
         excludeServers: Set<String>,
-        requestTimeout: TimeInterval
+        requestTimeout: TimeInterval,
+        contextWindowSelection: CodexContextWindowPreferences.Selection = .codexDefault
     ) -> CodexSessionControlling {
         if let sessionControllerFactory {
             return sessionControllerFactory(excludeServers, requestTimeout)
@@ -981,7 +992,8 @@ final class CodexCLIProvider: AIProvider {
 
         let options = interactiveSessionOptions(
             excludeServers: excludeServers,
-            requestTimeout: requestTimeout
+            requestTimeout: requestTimeout,
+            contextWindowSelection: contextWindowSelection
         )
 
         return CodexNativeSessionController(
@@ -1043,13 +1055,16 @@ final class CodexCLIProvider: AIProvider {
         )
     }
 
-    func interactiveConfigOverrides(excludeServers: Set<String>) -> [String: Any] {
+    func interactiveConfigOverrides(excludeServers: Set<String>, contextWindowSelection: CodexContextWindowPreferences.Selection = .codexDefault) -> [String: Any] {
         let serverEntries = MCPIntegrationHelper.codexMCPServerEntries()
         let toolPolicy = Self.interactiveToolPolicy()
         var overrides = CodexOverrides.appServerConfigMap(
             toolPolicy: toolPolicy,
             featurePolicy: .defaultDisabled
         )
+        for (key, value) in CodexContextWindowPreferences.overrides(contextWindowSelection) {
+            overrides[key] = value
+        }
         let mcpOverrides = CodexOverrides.appServerMCPServerMap(
             entries: serverEntries,
             policy: .disableAll(exceptBroken: excludeServers)
@@ -1062,9 +1077,10 @@ final class CodexCLIProvider: AIProvider {
 
     func interactiveSessionOptions(
         excludeServers: Set<String>,
-        requestTimeout: TimeInterval
+        requestTimeout: TimeInterval,
+        contextWindowSelection: CodexContextWindowPreferences.Selection = .codexDefault
     ) -> CodexNativeSessionController.Options {
-        let configOverrides = interactiveConfigOverrides(excludeServers: excludeServers)
+        let configOverrides = interactiveConfigOverrides(excludeServers: excludeServers, contextWindowSelection: contextWindowSelection)
         return CodexNativeSessionController.Options(
             requestTimeout: requestTimeout,
             exactResponseUsageEnabled: true,
@@ -1238,7 +1254,7 @@ final class CodexCLIProvider: AIProvider {
                 return message
             case .processNotRunning:
                 return "Codex app-server process is not running."
-            case .processExited, .stdoutFrameBudgetExceeded:
+            case .processExited, .stdoutFrameBudgetExceeded, .staleServerRequest:
                 return clientError.localizedDescription
             case .invalidResponse:
                 return "Codex app-server returned an invalid response."

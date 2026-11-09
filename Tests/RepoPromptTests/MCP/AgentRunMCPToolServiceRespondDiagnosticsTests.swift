@@ -241,7 +241,7 @@ final class AgentRunMCPToolServiceRespondDiagnosticsTests: XCTestCase {
             let id = UUID()
             session.pendingApproval = AgentApprovalRequest(
                 id: id,
-                requestID: .codex(.int(1)),
+                requestID: .codex(.fixture(.int(1))),
                 method: "item/requestApproval",
                 kind: kind,
                 threadID: "thread",
@@ -288,7 +288,7 @@ final class AgentRunMCPToolServiceRespondDiagnosticsTests: XCTestCase {
             let id = UUID()
             session.pendingPermissionsRequest = AgentPermissionsRequest(
                 id: id,
-                requestID: .int(2),
+                receipt: .fixture(.int(2)),
                 method: "item/permissions/requestApproval",
                 threadID: "thread",
                 turnID: "turn",

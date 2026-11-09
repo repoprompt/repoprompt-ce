@@ -1,5 +1,7 @@
 import Foundation
+import os
 import RepoPromptCodexProvider
+import RepoPromptDomainRuntime
 import RepoPromptShared
 import XCTest
 
@@ -189,6 +191,94 @@ final class CodexAppServerTransportOwnerTests: XCTestCase {
         entered.continuation.finish()
         released.continuation.finish()
         await client.stop()
+    }
+
+    func testServerResponseAndCancelFollowUpCannotCrossTransportOrClient() async throws {
+        let frames = OSAllocatedUnfairLock(initialState: [Data]())
+        let sent = AsyncStream<Data>.makeStream()
+        let host = FixtureCodexLaunchHost(root: FileManager.default.temporaryDirectory, executable: URL(fileURLWithPath: "/unused"))
+        let client = CodexAppServerClient(launchHost: host, writeFrameHandler: { _, frame in
+            frames.withLock { $0.append(frame) }
+            sent.continuation.yield(frame)
+        }, expectedAgentPIDRegistrar: .init(register: { _, _, _ in XCTFail("Unexpected PID registration") }, clear: { _, _, _ in XCTFail("Unexpected PID clearance") }))
+        await client.debugInstallTestTransport()
+        let firstGeneration = await client.debugTransportGeneration()
+        var requests = await client.subscribeServerRequests().makeAsyncIterator()
+        let incoming = Data("{\"id\":7,\"method\":\"item/tool/requestUserInput\",\"params\":{}}\n".utf8)
+        await client.debugIngestStdoutChunk(incoming, generation: firstGeneration)
+        let firstValue = await requests.next()
+        let first = try XCTUnwrap(firstValue)
+        XCTAssertEqual(first.receipt.clientInstanceID, client.instanceID)
+        XCTAssertEqual(first.receipt.transportGeneration, firstGeneration)
+        await client.debugIngestStdoutChunk(incoming, generation: firstGeneration)
+        let duplicate = await requests.next()
+        XCTAssertEqual(duplicate?.receipt, first.receipt, "Replay in one generation retains identity")
+        try await client.respondToServerRequest(receipt: first.receipt, result: ["accepted": true])
+        XCTAssertEqual(frames.withLock { $0.count }, 1)
+        await client.stop()
+        await assertResponseRefused(client, receipt: first.receipt, reason: .transportUnavailable)
+
+        await client.debugInstallTestTransport()
+        let successorGeneration = await client.debugTransportGeneration()
+        XCTAssertNotEqual(firstGeneration, successorGeneration)
+        var successorRequests = await client.subscribeServerRequests().makeAsyncIterator()
+        await client.debugIngestStdoutChunk(incoming, generation: successorGeneration)
+        let successorValue = await successorRequests.next()
+        let successor = try XCTUnwrap(successorValue)
+        XCTAssertNotEqual(successor.receipt, first.receipt)
+        await assertResponseRefused(client, receipt: first.receipt, reason: .generationMismatch)
+        do {
+            _ = try await client.request(method: "turn/interrupt", params: ["threadId": "thread", "turnId": "reused-turn"], answering: first.receipt)
+            XCTFail("A delivered response does not authorize a follow-up on a replacement transport")
+        } catch let error as CodexAppServerClient.ClientError {
+            guard case .staleServerRequest(.generationMismatch) = error else { return XCTFail("Unexpected refusal: \(error)") }
+        }
+        let pending = await client.debugPendingRequestCount()
+        let timers = await client.debugTimeoutTaskCount()
+        XCTAssertEqual(pending, 0)
+        XCTAssertEqual(timers, 0)
+        XCTAssertEqual(frames.withLock { $0.count }, 1, "Neither stale response nor cancel follow-up writes")
+
+        let other = CodexAppServerClient(launchHost: host, writeFrameHandler: { _, _ in XCTFail("Foreign receipt must not write") }, expectedAgentPIDRegistrar: .init(register: { _, _, _ in XCTFail("Unexpected PID registration") }, clear: { _, _, _ in XCTFail("Unexpected PID clearance") }))
+        await other.debugInstallTestTransport()
+        await assertResponseRefused(other, receipt: successor.receipt, reason: .foreignClient)
+        await other.stop()
+        try await client.respondToServerRequest(receipt: successor.receipt, result: ["accepted": true])
+        await client.debugIngestStdoutChunk(Data("{\"id\":\"7\",\"method\":\"unknown\",\"params\":{}}\n".utf8), generation: successorGeneration)
+        let stringValue = await successorRequests.next()
+        let stringRequest = try XCTUnwrap(stringValue)
+        XCTAssertNotEqual(stringRequest.receipt.identitySeed, successor.receipt.identitySeed)
+        try await client.respondToServerRequestError(receipt: stringRequest.receipt, message: "Unsupported")
+        let written = frames.withLock { $0 }
+        XCTAssertEqual(written.count, 3)
+        let numericReply = try XCTUnwrap(try JSONSerialization.jsonObject(with: written[1]) as? [String: Any])
+        let stringReply = try XCTUnwrap(try JSONSerialization.jsonObject(with: written[2]) as? [String: Any])
+        XCTAssertEqual(numericReply["id"] as? Int, 7)
+        XCTAssertEqual(stringReply["id"] as? String, "7")
+
+        // Standalone Stop is not a response follow-up and still targets the current transport.
+        let stop = Task { try await client.request(method: "turn/interrupt", params: ["threadId": "thread", "turnId": "current-turn"]) }
+        for await frame in sent.stream {
+            let payload = try XCTUnwrap(try JSONSerialization.jsonObject(with: frame) as? [String: Any])
+            guard payload["method"] as? String == "turn/interrupt" else { continue }
+            let id = try XCTUnwrap(payload["id"] as? Int)
+            await client.debugIngestStdoutChunk(Data("{\"id\":\(id),\"result\":{}}\n".utf8), generation: successorGeneration)
+            break
+        }
+        _ = try await stop.value
+        XCTAssertEqual(frames.withLock { $0.count }, 4)
+        await client.stop()
+        sent.continuation.finish()
+    }
+
+    private func assertResponseRefused(_ client: CodexAppServerClient, receipt: CodexServerRequestReceipt, reason: CodexAppServerClient.ServerRequestRefusal) async {
+        do {
+            try await client.respondToServerRequest(receipt: receipt, result: [:])
+            XCTFail("Expected response refusal")
+        } catch let error as CodexAppServerClient.ClientError {
+            guard case let .staleServerRequest(actual) = error else { return XCTFail("Unexpected error: \(error)") }
+            XCTAssertEqual(actual, reason)
+        } catch { XCTFail("Unexpected error: \(error)") }
     }
 
     private func beginRequest(_ client: CodexAppServerClient, method: String) -> Task<[String: Any], Error> {

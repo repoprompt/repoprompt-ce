@@ -1,16 +1,14 @@
 import Foundation
 
-/// User-editable wording preferences, never the rewriter's safety/output contract.
+/// User-editable rewrite guidance, separate from the rewriter's input-safety/output protocol.
 package enum AgentRepromptGuidance {
     package static let maximumUTF8Bytes = 16 * 1024
     package static let defaultText = """
-    Rewrite my message so it is clear and direct for an implementing agent. Keep my intent, scope, voice, named entities and explicit constraints. Keep my wording where it already communicates well; improve organization rather than replacing my voice.
+    Clarify my message without changing the task. Unpack clearly implied meaning when thin; compress repetition when sprawling; minimally edit clear messages. Short does not mean incomplete.
 
-    Write natural Markdown. Use headings only when a long, multi-part message needs them. Include acceptance criteria only when I stated the outcomes.
+    Preserve every ask, constraint, condition, permission, priority and uncertainty. Keep questions distinct from actions. Keep names, identifiers and quotes exact. Remove venting without losing the problem or urgency.
 
-    State what I said, plainly and with confidence. Do not guess at what I might mean, suggest files, or point out what I left unsaid.
-
-    For a short, trivial or already-clear message, return it near-identically. Do not expand it into a formal task plan.
+    Never invent facts, requirements, solutions, steps, tests or success criteria. Use the shortest sufficient Markdown: no fixed template, duplicated sections, unsolicited suggestions or commentary. Delete anything that adds work or merely adds words.
     """
 
     package static func normalizedOverride(_ text: String?) -> String? {

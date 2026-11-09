@@ -6134,3 +6134,571 @@ pinned scoped formatting changed zero files. The failed broad run is not a quali
 No local full-suite, live-app, release or hosted-CI success is claimed. No CI logs were read.
 After the validated M9.2a push and PR update, this lane stops feature work; only CI failures
 reported by the overseer are assigned to it. M9.2b belongs to the fresh follow-on session.
+
+### M9.2b checkpoint 1 — copied control resources and provisional unwind (2026-11-09)
+
+The copied-resource portion of the MCP inventory is implemented. Cleanup recognizes the
+structural installation holder in the existing scope/tab/incarnation index, independently of
+unique-writer admission. A copied registration or approval receipt in another scope cannot
+release the holder's resources, including under a deliberately corrupted conflicting claim.
+No parallel registry or lifecycle manager was added; the scope-local ambiguity veto remains.
+
+Failed activation now unwinds its exact provisional context on the original object after
+removal, replacement or rebinding. Payload restoration is limited to the original restoration
+token. The former same-tab-occupant-as-successor heuristic is retired: a copied occupant does
+not own the abandoned registration. A progressed installation or freshly registered successor
+keeps its resources. Causal coverage exercises registration and approval-only copies, raw
+conflicts, removal, real binding transition, copied replacement, registration recovery and an
+actual nested successor activation, including resource release and payload-setting assertions.
+
+Validation for this checkpoint:
+- Focused `AgentSessionMCPRuntimeTests`, `AgentSessionRuntimeStoreTests` and
+  `AgentRunMCPToolServiceSteerResumeTests`: **62 passed, 0 failures**, Conductor
+  `66c4764a-ce7b-46aa-89be-db81ed27eacc`. The earlier 61-pass/1-failure run exposed a new
+  fixture that reinstalled the same binding without advancing its restoration generation;
+  it now performs a real binding transition and retains the preservation assertion.
+- Both products passed `539c31b8-ce1f-42d6-af65-e743c32efb3d`.
+- Full lint passed `e0ea1090-c1cd-4a1f-8a49-c2617055c510`; final test-only edits also passed
+  pinned SwiftFormat 0.61.1 and scoped strict SwiftLint.
+- Fresh index: **1242/1360** wrong-way file edges, **53/66** largest-cycle components;
+  no baseline changes. An index query during the running test correctly refused freshness;
+  the post-completion check above passed.
+- Actual cold compile and final incremental logs contain **zero warning occurrences in each
+  touched Swift file** (not merely zero new warning signatures). Product logs were checked too.
+- One Oracle review completed; settings and successor assertions were strengthened afterward.
+  No full-suite, live-app, release or hosted-CI success is claimed; no CI logs were read.
+
+**Still open:** every other M9.2b inventory group above, including remaining MCP metadata/tool
+selection and VM adapter retirement. The review also identified a pre-existing first-setup-await
+progression concern: an epoch/registration can advance before permission setup finishes, retaining
+a partially configured control despite the failed activation response. Second-boundary progression
+is covered here; first-boundary completion/unwind remains in the control-routing inventory.
+M9.3 saved-target composition and M9.4 presentation/handoff/drain remain out of scope.
+
+### M9.2b checkpoint 2 — apply-edits review response routing (2026-11-09)
+
+The apply-edits review card captures the canonical writer command when rendered, rather than
+selecting a tab/window again when clicked. `AgentModeViewModel.submitApplyEditsReviewDecision`
+and its untracked approval-store task are removed. The interaction runtime validates the exact
+writer and review, tracks the admitted effect in its existing drain, revalidates before dispatch,
+and joins the store's exact-review Boolean acknowledgement. Actor-hop completion never writes
+back to a successor session. The approval store still owns review settlement; ordinary originating
+Stop/cancellation cleanup retains its separate exact-receipt path.
+
+The causal matrix covers successful settlement, removal, claim reacquisition, raw conflicting
+writers (after typed admission refusal), retirement and an undisplayed successor review. A stale
+command must leave the receipt pending, and duplicate/stale review settlement returns false.
+`AgentSessionInteractionRuntimeTests` passed **13 tests, 0 failures**, Conductor
+`4417a5d7-24ac-4def-8f77-8207620922c2`; pinned scoped formatting and strict lint passed.
+The actual compile emitted zero warnings in the six touched Swift files. The filter also named
+`ApplyEditsApprovalStoreTests`, which does not exist; no separate store-suite coverage is claimed.
+Caller/body search leaves only the runtime method and its two card calls; the notification
+architecture inventory now names this runtime path. This checkpoint does not complete other
+interaction/provider-approval routing or any other outstanding M9.2b group.
+
+### M9.2b checkpoint 3 — question responses and managed admission (2026-11-09)
+
+Ask-user submit/skip/resolve now require the captured canonical writer command and acknowledge
+whether the pending continuation was actually consumed. A stale command cannot change drafts or
+consume a continuation. The card captures the rendered writer; notification replies perform exact
+writer admission; MCP response parsing now passes the command directly to the interaction runtime.
+Managed responses capture the same capability before authorization and recheck it after the await,
+including same-object claim reacquisition rather than only binding/object equality. The existing
+endpoint/grant checks, one-time approval policy and provider decision checks remain in place.
+
+Actual Agent Mode VM methods retired: both `submitAskUserResponse` overloads, `skipAskUser`,
+private `resolveAskUserResponse`, the `applyPendingInteractionResolution` forwarding body, and
+unused `noteQuestionCardActivity`/`submitQuestionResponse`/`skipQuestion` legacy shims. Searches
+confirm only the runtime response implementation remains in Agent Mode. Context Builder's
+separate question implementation is unchanged. Draft/index/activity forwarding and other provider
+response bodies remain open; this is not completion of the interaction group.
+
+Validation for checkpoints 2–3:
+- Final focused run: **280 passed, 0 failures**, Conductor
+  `c6f8c97b-36f6-471a-a8d4-4b6f6a5db571`, covering interaction runtime, notification actions,
+  Codex approval choices, MCP response diagnostics and session-link runtime bridge suites.
+  The preceding 277-pass/3-failure run exposed three unbound/unrestored response fixtures;
+  these now install restored writers while retaining their outcome/continuation assertions.
+  Added reacquisition and raw-conflict response refusal plus authorization-await reacquisition.
+- Final both-product build: `a2570571-0b36-4e96-96fe-5f303c5d7115`, completed successfully.
+  Its waiter briefly timed out contacting the daemon; the same ticket's terminal status, not
+  the waiter exit, establishes completion. Earlier products `bb87508f-3c25-43fc-849b-656be1dcd6af`
+  also passed before the final guard/test changes.
+- Full lint: `46a045a9-3846-4ef3-9e8f-6ff2726f16f7` passed, **0/2144** files needing formatting.
+  The first attempt overlapped scoped formatting and failed on the VM file; a stable-source,
+  cache-independent formatter check passed before the full retry. Final guard/fixture changes
+  additionally passed scoped pinned formatting and strict lint.
+- Fresh index: **1242/1360**, **53/66**; baseline unchanged.
+- **Corrected during checkpoint 4:** the earlier zero-occurrence warning audit missed ANSI-coded
+  diagnostics. The exact-base compile has four occurrences in `AgentModeViewModel.swift` and one
+  in `AgentRunMCPToolServiceSteerResumeTests.swift`; earlier M9.2b compilation logs also contain
+  these baseline diagnostics. An additional unused-`try?` result in `AgentModeView.swift` introduced
+  by checkpoint 3 is fixed in checkpoint 4. Incremental logs that did not compile a file are not
+  evidence of zero warnings. Final validation compares ANSI-stripped occurrence counts per file.
+  Existing runtime SwiftUI diagnostics in untouched `AgentSessionRows.swift` remain distinct from
+  compiler warnings.
+- No full-suite, live-app, release or hosted-CI success is claimed; no CI logs were read.
+
+All remaining M9.2b inventory and the first-control-setup progression concern remain open.
+
+#### M9.2b checkpoint 4 — question draft and activity commands
+
+Question draft edits, page selection and timeout rearming now consume the same exact writer
+command captured when the card is rendered. They acknowledge only a changed, current pending
+question with a live continuation. Cross-scope commands, reacquired claims and raw writer
+conflicts cannot alter drafts, page index or timeout generation. The existing response-refusal
+witness now covers these mutations, valid detached-presentation editing and invalid question/page
+inputs without changing its budgets or response assertions. Originating timeout/cancellation
+cleanup remains independent of fresh writer admission.
+
+Removed Agent Mode VM `updateAskUserDraft`, `updateAskUserQuestionIndex` and
+`noteAskUserCardActivity` methods; source/caller searches leave only runtime commands and direct
+card calls. Context Builder's separate implementation is untouched. An optional exact-object
+presentation notification preserves activity's narrow interaction refresh instead of refreshing
+all bindings on every user activity. This callback projects state only; it cannot admit writes.
+Question creation/loading and provider response bodies remain open. No endpoint/incarnation
+lookup or run-ownership publication implementation was changed.
+
+Validation history (including the superseded provisional attribution and its resolution):
+Scoped pinned formatting/strict lint and full lint `21294799-7c5f-406a-be01-1c43c035172e`
+passed. The newly required all-SessionLinks/admission/sidebar/lane-policy baseline at `cc4a92e`
+(`45c434ff-4704-4037-a241-6cba394225e8`) ran **1867 tests**, with **8 skipped** and **19 failing
+cases / 43 failure diagnostics**. The six suites reported by M9.2a account for 17 failing cases.
+Two additional `AgentSessionLinkHandoffInheritanceTests` cases failed: the cold-Claude picker
+composer-body equality assertion (60 vs 50) and the provider-switch scale budget (12.05s vs 10s).
+These were escalated before another push. Checkpoint-4 test `7a21c8a9-54c9-4a76-b487-363db21a14de`
+and product `3de0c87a-da48-464c-9142-6f87cf92a503` were cancelled for the exact-base comparison;
+neither is a passing validation receipt.
+
+**Known intermittent, overseer-classified:** the handoff suite is load-correlated, not yet
+root-caused. Exact base `e42006ff8` passed **104/104** (`62638293-1672-43c2-a1bc-51ad5efdf872`,
+scale 5.36s), and intermediate `a29638caf` passed **104/104**
+(`b7f54fd6-682b-420b-97fd-732ee299fae6`, scale 7.63s). The first focused `cc4a92e` run
+(`39fadef7-7bc7-438a-8085-104ab3375f5b`) failed composer counts (65/55 and 93/83), scale
+(32.85s), and a controlled-MCP refusal case. Subsequent head runs passed: the three isolated
+cases with temporary render logging (`0f81cab3-f271-4329-a9d4-9d72bf49c55c`, scale 6.29s),
+the full **104/104** with logging (`0c0aad6e-6787-4e66-b20f-cf90d94abfed`, scale 5.10s),
+and unmodified **104/104** (`c3d0c54a-8deb-49e9-a415-cabba6e805db`, scale **4.93s**).
+All temporary diagnostics were removed; no causal production fix is claimed. The failing runs
+overlapped other agent-lane work. The overseer permits pushing with this explicit classification,
+requires the suite at every push gate, and requires stopping to root-cause any recurrence using
+repeated head/base comparisons. **No assertions or budgets changed.** The complete selection plus
+the interaction-runtime suite then ran on checkpoint 4:
+`179f4f7a-a5d1-43a5-8436-92a9f9c8b9be` executed **1881 tests**, **8 skipped**, **17 failing
+cases / 37 diagnostics**. The focused interaction-runtime suite passed; handoff scale passed
+at **6.47s**, but the composer assertion recurred (**33 vs 23**). Per the overseer's condition,
+the push is stopped and repeated exact-head/base investigation is required. Products
+`c4c7d1b7-7dee-44c1-9305-6b1297ba0af0` and full lint
+`35cb539e-8e56-4f2a-828e-539ae76cd98e` passed.
+
+**Inherited-baseline classification (supersedes the provisional attribution above):** exact base
+`e42006ff8` reproduced both failures under the same broad 90-suite selection
+(`905e68ed-7ce6-4c29-9820-3aa89a77dc5b`): composer **30 vs 26**, scale **10.76s**;
+**1867 tests**, **8 skipped**, **18 failing cases / 38 diagnostics**. Unchanged head and base each
+passed three consecutive isolated **104-test** runs. Head tickets:
+`6a2cc95b-22e8-4ed5-a3ff-d5e48d54417b`, `ed8ff23c-48a0-4a8e-88ef-afb1a543a505`,
+`916662a7-1cc9-4d77-bb79-2f9425704baa`; base tickets:
+`dc3947a3-5340-494f-af41-5af3d0b5305b`, `62d5d409-9ae3-4f8f-99ce-791d806e1ebb`,
+`e00e9c76-2780-44b5-a0bc-ce7fcd73e947`.
+The overseer assigns root-cause work to a separate flake lane and releases this checkpoint to push:
+**HandoffInheritance render/scale: inherited baseline (reproduces on base `e42006ff8` under broad
+load; isolated 3×104 pass on base and head); tracked separately.** Later push gates continue to
+require an isolated handoff-suite pass. No assertion, budget or production composer path changed.
+
+The corrected compiler-warning audit compares complete ANSI-stripped diagnostic occurrence counts
+for all **16 touched Swift files**: base `62638293…` and checkpoint-4 `179f4f7a…` each report
+**four** in `AgentModeViewModel.swift`, **one** in `AgentRunMCPToolServiceSteerResumeTests.swift`,
+and **zero** in the other touched files. The new unused-`try?` result warning is absent after the
+explicit discard fix. The both-product incremental log adds no warnings; it is not treated as an
+independent full recompilation of every touched file.
+
+Final checkpoint-4 receipts after restoring the candidate source:
+- **118 passed, 0 failures** (104 handoff + 14 interaction runtime),
+  `6f4ef934-09d1-4929-8a6e-e0578400415b`; scale **6.46s**. The complete warning occurrence
+  audit again matches the base's four VM and one steer/resume-test diagnostics, with no additions.
+- Both products passed: `b5d86978-223c-426d-a770-e151be08df76`.
+- Full lint `35cb539e-8e56-4f2a-828e-539ae76cd98e` passed on the same Swift source.
+- Fresh index after final products: **1242/1360** wrong-way edges, **53/66** cycle components;
+  no baseline changes.
+- Broad-suite baseline failures are disclosed above; no full-suite, live-app, release or hosted-CI
+  success is claimed. This is a validated checkpoint, not completion of M9.2b.
+
+#### M9.2a integration into M9.2b — `ddf34184a`
+
+Normal merge of `ddf34184a177b47e41ab61f6a198556d3bd65df9` into checkpoint-4
+`d2e1af2415845769e06a54ad4e0186e85a866f21`; no rebase or force-push. The automatic merge was
+conflict-free. Both the M9.2a peer-admission/Stop changes and Codex parked-input/attempt fences
+remain intact, alongside M9.2b's captured interaction commands. The incoming fixture and warning
+repairs are preserved, not replaced with looser assertions.
+
+Merged-tree validation:
+- All SessionLinks suites, admission/sidebar/lane-policy, interaction runtime and Codex resume/wedge:
+  `c5ed5a92-6890-44d5-b634-11e96782da84`, **1956 executed, 8 skipped, one failing case / three
+  diagnostics**. All six previously failing suite families now pass: concurrent workspace admission,
+  lane policy, sidebar tab filtering, monitor pill props, link prompt view-model and Codex prompt
+  adapter. The handoff suite passed **104/104**, with scale **6.82s**, in this broad run.
+- The separate handoff run `b0dc9055-853e-4456-8a47-fb3420b3e07b` had one scale failure,
+  **11.30s vs 10s**; render assertions passed. The overseer explicitly classifies this as the
+  inherited baseline owned by the separate flake lane and permits this integration push.
+- **Additional intermittent:** `AgentSessionLinkLateQualificationTests.testReconnectionCannotInheritPredecessorOffer`
+  was the broad run's sole failing case: a 3-second retention-edge timeout, cancellation, and MCP
+  `tools[23].inputSchema.properties.sort.enum[2]` decoding error. It then passed in isolation on
+  both the merged candidate (`4bbacb04-271a-4011-bf4a-f0503f140edc`) and exact `ddf34184a` in a
+  temporary detached worktree (`924b06e8-c805-42c2-9918-1122dc58e415`): each executed **12 tests,
+  1 skipped, 0 failures**. Per the overseer's explicit rule this broad-only result is recorded as
+  intermittent and does not block pushing. Its cause is **not** established, and the schema error
+  is not dismissed as a load symptom. No MCP tool-schema/argument-definition or decoding source
+  differs from `ddf34184a`; no schema, assertion or timeout was changed. The temporary worktree was
+  removed after validation; Conductor retains its logs.
+- Both products `0de5d882-3782-40e3-9b25-7d947f0e34a9` and full lint
+  `5b3c641b-7efa-4eea-9ec9-ce3d55653642` passed. Fresh index: **1242/1360**, **53/66**; no ratchet
+  baseline changes.
+- ANSI-stripped warning occurrence audit over **24 Swift files** (M9.2b diff plus incoming merge
+  paths): exact-base and merged compile logs each contain **4** VM diagnostics, **6** in
+  `AgentSessionLinkPromptAdapterTests.swift`, **1** in `AgentRunMCPToolServiceSteerResumeTests.swift`,
+  and **0** in the other audited files. **No positive occurrence deltas.**
+
+No full-suite or hosted-CI success is claimed for M9.2b. The overseer reports #1659 green at this
+base; this lane did not read CI logs. The previously frozen endpoint/incarnation and run-ownership
+paths may be worked on after this validated integration, as authorized. M9.2b remains incomplete.
+
+#### M9.2b checkpoint 5 — provider-response body cutover
+
+The interaction runtime now owns the actual Codex/Claude/ACP approval, Codex permissions,
+MCP elicitation and user-input response bodies. Each explicit response synchronously checks its
+captured writer command and pending interaction UUID, consumes once, and admits a tracked effect.
+Cards capture the command at render; notifications admit the exact addressed session. MCP and
+managed responses retain their synchronous authorization-to-consumption boundary. Permissions and
+elicitation can no longer report success when the controller route is absent or the request was
+not consumed. The coordinator response bodies, VM mutation forwarders and runtime's Codex command
+callback are deleted, rather than retained as forwarding adapters. Claude cancellation composition
+remains because provider-adoption cancellation is a separate outstanding path.
+
+A response's Boolean acknowledges **local consumption and dispatch admission**, not provider delivery.
+Controller response methods still return Void and report transport failures separately. Ordinary
+UI user-input and ACP nil-controller local settlement are pre-existing behavior preserved here.
+MCP/managed user-input requires a controller before consuming, preserving the existing missing-route
+refusal contract instead of acknowledging a response that has no provider route. Codex responses still target the captured
+controller's current transport: the client can reconnect and requests do not carry its existing
+transport generation. Ingress-stamped transport receipt validation at the client's actual write is
+**required remaining M9.2b work**, not solved by a pre-send main-actor writer check. Event-side
+auto-approvals still need their own physical receipt fence; the existing MCP-input auto-answer now
+joins its existing event handler rather than launching an untracked response task.
+
+Cancel follow-ups use only an authoritative turn tuple matching the consumed request's controller,
+thread, generation and run attempt. The old fallback that asynchronously discovered and interrupted
+a later current turn is removed. With no matching authoritative turn, cancellation settles the
+request without guessing an interrupt target. The controller's expected-turn API is the final fence.
+
+Causal coverage checks duplicate consumption, same-object claim reacquisition and raw writer
+conflicts, original-controller dispatch after replacement, successor prompt preservation, tracked
+drain completion, foreign-controller/unknown turn cancellation, missing-controller MCP refusal and
+fresh composer first-turn approval through the card's command expression. Existing computer-use,
+ACP and approval-choice assertions remain. The unchecked VM approval overload is retired; its
+rejection assertion now exercises a repeated captured-command denial instead. Production run-start
+already commits fresh creation and admits a restored command before dispatch; no creation bypass
+was introduced. Review was performed once for this slice; its drain-witness and turn-tuple hardening
+recommendations were incorporated. No transport exactness or full M9.2b completion is claimed.
+
+Initial focused validation caught and repaired obsolete test references to retired APIs, three
+nonisolated test-table helpers accessing main-actor session state, a missing-provider managed-input
+acknowledgement regression, and a coordinator fixture's attempt still tied to its pre-binding
+identity. The fixture now explicitly opens and asserts an attempt for its restored binding; terminal
+publication/turn-count assertions are unchanged. No timing budgets were adjusted.
+
+Checkpoint validation before integrating the next M9.2a base:
+- Focused `c3b13943-6d01-4223-aa59-65c6fb763449`: **129 passed, zero failures**, including the
+  three new response-command tests and the fresh-composer first-provider-approval witness.
+- Scoped pinned formatting and strict lint passed; the three response-command tests were then
+  consolidated unchanged into the existing provider-effects test file to preserve the testable-app
+  import-file ratchet (**339**, not **340**). The resulting **13 Swift files** were scoped-checked
+  again; executable test names and behavioral assertions are unchanged. Full lint
+  `164ca997-3f5d-4c18-82bb-a49ea80efcaf` passed; subsequent test-fixture/route fixes were scoped
+  formatted and linted again.
+- Actual compile logs show at most **4** VM warning occurrences and **17** in
+  `CodexResumeWedgeCommitTests.swift`, with zero in the other touched files. The exact `ddf34184a`
+  baseline compile (`924b06e8…`) has the same **4/17** counts; no positive occurrence deltas.
+- The broader SessionLinks/isolated-handoff, product and fresh-index push gates are still required
+  after the requested normal integration of the updated M9.2a branch. This is not a push or a
+  complete M9.2b validation receipt.
+
+#### M9.2b checkpoint 5 integration — M9.2a `8d3b3d1ac`
+
+Normally merged `8d3b3d1ac52cd4d6b804b3393b81ed8b56f8101a` onto checkpoint 5
+`424d76bb6`. The only textual conflict placed two helpers at the same runtime-store insertion
+point; both the structural copied-control holder check and incoming control-read identity check
+are retained. Incoming control reads remain available across writer transitions, while mutations
+still require exact command admission. The non-terminal unavailable wait result and main's #1664
+flake-test fixes are preserved. No rebase, history rewrite or assertion/budget relaxation.
+
+Merged-tree push gates:
+- Broad 105-suite selection `41fb6f2b-26d3-4d2d-9761-9878f60b83c6`: **2086 executed,
+  8 skipped, zero failures**. Includes every SessionLinks suite, admission/sidebar/lane-policy,
+  all provider-effects classes, MCP steer/resume, and the affected response/coordinator suites.
+  This reruns the former six M9.2a failure families and the prior LateQualification intermittent.
+- Isolated HandoffInheritance `702b763c-1d82-4b09-8d45-9ccc94200ff2`: **104 passed**;
+  scale **4.47s** (broad run **5.13s**). Historical render/scale failures were inherited baseline
+  (reproduced on `e42006ff8` under broad load; isolated 3×104 passed on base and head), tracked
+  separately; this integration includes the subsequently merged flake fixes.
+- Both products `1020e342-b65a-4418-8304-129d81154958` and full lint
+  `1da826d5-83b6-43ca-a387-fe1f61fb4b80` passed. Fresh compiler index: **1243/1360** wrong-way
+  file edges and **53/66** largest cycle components. The new response-body file introduces its
+  payload dependency on `ViewModels/AgentTabSession.swift`; the count increased by one from the
+  prior checkpoint. No ratchet baseline was changed; payload ownership retirement remains open.
+- Warning occurrence audit across **18 Swift files**, using actual merged compilation and the
+  retained exact `ddf34184a` baseline compilation: **4** VM, **3** MCP tool-service, **17** Codex
+  resume/wedge, **1** MCP steer/resume diagnostic occurrences, zero in the other audited paths.
+  Counts match the baseline; **no positive deltas**. This is not a zero-total-warning claim.
+- Local `make ci-app-test-runner-selftest`: the sandboxed attempt could not execute `ps` and
+  failed process-supervision assertions. The approved unsandboxed rerun passed **200 tests**
+  across eight groups. No harness source or assertions were changed to obtain the pass.
+
+These are local selected-suite/product receipts, not full-suite, live-app, release or hosted-CI
+qualification. The provider transport receipt fence and remaining ledger routing groups are open;
+M9.2b is not complete.
+
+#### M9.2b checkpoint 6 — originating Codex response and cancel-follow-up receipts
+
+Server-request ingress now carries a required `CodexServerRequestReceipt` containing the client
+instance UUID, the reading transport generation and the typed wire request ID. Recovery parsing
+and termination-buffer flushes retain that ingress generation. The raw-ID response APIs are
+retired: client response/error writes validate the receipt synchronously next to the physical
+write, without an intervening await. A same-client reconnect or a different client cannot reuse
+an old response capability. No parallel lifecycle manager or outstanding-request registry was
+added. The pinned Codex sender uses monotonically allocated request IDs within one sender; the
+receipt distinguishes reconnects and integer/string wire-ID kinds rather than inventing another
+local ordinal.
+
+User-input, permissions, elicitation and Codex approval identities now include that receipt;
+Claude/ACP identity seeds and explicit test ID overrides are unchanged. Coordinator dedup and
+the parked-input Cancel card carry the same origin instead of comparing only the raw ID. The
+runtime still acknowledges synchronous command consumption, not provider delivery. Its tracked
+response effect receives a separate written/refused/failed outcome. Only a written cancellation
+response may issue an interrupt, with the original thread, authoritative turn and receipt. The
+client checks this answering receipt at the actor-owned write boundary, before pending-request/
+timer bookkeeping and without suspension before the write; ordinary standalone Stop remains separate. No later-turn discovery
+fallback was restored.
+
+New stale-origin refusals are non-terminal: they are returned/logged rather than emitted as a
+generic controller error that could fail a successor run. Genuine write errors retain their
+existing error path. Existing consent/provenance policy and auth-refresh liveness emission order
+are preserved. Broader provider-event error routing, Claude/ACP physical reply semantics and the
+remaining inventory are not claimed complete.
+
+Causal coverage exercises real client transport replacement and foreign-client refusal, exact
+wire ID kinds, no pending timeout state after refused follow-up, original-thread/turn protection,
+tracked response outcomes, deferred auth refresh across reconnect, and an old parked-input Cancel
+card confronting the same raw ID on a new generation. Existing computer-use consent assertions
+remain unchanged; its recorder now accepts both explicit fixture IDs (42 and 43) rather than
+silently dropping the newly distinct permissions reply. One review was completed; compile-only
+migration errors and the successor-terminal-error concern were addressed. A new unnecessary
+`await` warning in the test was removed rather than spending warning-ratchet headroom.
+
+Checkpoint 6 validation:
+- Focused `0dee9a45-1de5-444b-816e-36dd1f962c78`: **424 executed, one skipped, zero failures**.
+  Earlier attempts were compile-only migration failures; the first executing run found the
+  recorder's obsolete single-ID filter. No policy assertion or timing budget was relaxed.
+- Broad 109-suite selection `632dc0eb-4682-4072-8b93-928c5acc11f0`: **2125 executed,
+  nine skipped, zero failures**, including every SessionLinks suite and admission/sidebar/
+  lane-policy suites. Isolated HandoffInheritance `a0df5251-2370-4164-81b0-1b00632397d7`:
+  **104 passed**, scale **7.49s** (broad **5.22s**). The historical render/scale inherited baseline
+  remains separately tracked; the integrated flake fixes and current budgets are unchanged.
+- Complete owning `RepoPromptCodexProviderTests` module `633ff8d7-4590-4d05-b661-c5139067ef5e`:
+  **20 passed**. Both products `f3732ca1-9e02-4fcf-9752-378d86eee160` and full lint
+  `ea18afea-ed9f-47ce-8899-1e4076b56c98` passed. Fresh index remains **1243/1360** wrong-way
+  file edges and **53/66** largest cycle components; no ratchet baseline changed.
+- Actual compile-log occurrence comparison across **30 touched Swift files** against retained
+  exact-base compilation has **4** VM, **3** native-controller, **17** resume/wedge,
+  **2** runtime-bridge and **5** steer-transaction warnings, matching baseline counts. Other
+  touched files have zero, including the final recompiled integration fixture after removing
+  its unnecessary `await`. The provider client decreased from one baseline occurrence to zero.
+  **No positive occurrence deltas**; not a zero-total-warning claim. Existing unhandled domain
+  JSON-fixture resource warnings are unchanged.
+
+These are local selected/module/product receipts, not full-suite, live-app, release or hosted-CI
+qualification. Remaining interaction review/lifecycle, event and other routing groups are open;
+M9.2b is not complete.
+
+#### M9.2b integration — M9.2a squash and #1665 measurement boundary
+
+Normally merged #1665 (`633fab2c9`) as `fbb18c248`, retaining the receipt fixture changes and
+incoming scale measurement boundary. Before the explicitly authorized ancestry-only merge,
+`git merge-tree --write-tree 8d3b3d1ac 633fab2c9` produced tree
+`1387934b9959fd690cdd4f3165556ee396eb7f09`; its diff against the exact squash
+`ade839433d93ee4f2736f7900c300cf1dcfb4244` was empty. Commit `ded91e12e` used `-s ours`
+against that exact SHA only; its first-parent tree diff is empty. The earlier local ancestry
+commit also pointed to that same squash, but was re-recorded against its explicit SHA after the
+overseer warned that the shared `origin/main` ref had advanced. The ledger was preserved before
+the explicitly authorized reset; no published history was rewritten.
+
+A subsequent **normal** merge integrates main `7442551fc`, including #1666 (`59926156a`)
+interactive sidebar-menu test opt-in and #1656's batched lane-binding census. These changes are
+not discarded by the ancestry-only merge. No rebase or force-push.
+
+The incoming test now times the provider-switch workload after manufacturing its 300 saved-chat
+fixtures, and reports excluded fixture cost separately. Its ten-second ceiling covers a smaller
+explicit workload; this is not evidence of lower end-to-end persistence latency.
+
+Latest merged-tree validation:
+- Broad `d4137980-3754-4add-a215-f2d8a6bbee97`: **2126 executed, 22 skipped, zero failures**.
+  Includes all SessionLinks suites, sidebar/menu, lane/admission and receipt-response suites.
+  #1656's `AgentSessionLaneFirstSaveTests` passed **48** cases. Hosted sidebar menu coverage
+  executed **18**, with **13** interactive-tracking opt-in skips and zero failures; those
+  additional skips are #1666's intended desktop-focus protection, not new local exclusions.
+- Isolated HandoffInheritance `d667ebe5-edf9-4fc6-a329-a296d5e13162`: **104 passed**. The
+  new measured workload was **1.40s**, with **9.91s** excluded fixture setup; broad measured
+  **0.93s**, excluding **4.61s** setup. These are not comparable to the old end-to-end ceiling.
+- Both products `a17291a7-46f7-4589-97d5-791c18aa2005` passed; the final fresh index remains
+  **1243/1360** wrong-way edges and **53/66** largest cycle, with no baseline changes. Full lint
+  `d1046166-51dd-4457-915b-7a82186c5308` passed. `make conductor-selftest` initially failed
+  because the sandbox denied `ps`; the approved unsandboxed rerun passed **372 tests across
+  22 groups**. No test or process-supervision behavior was weakened.
+- The four incoming main Swift files are byte-identical to `7442551fc`; actual compilation has
+  **four** sidebar-menu warning occurrences, matching the retained base's **four**, and zero
+  in the other three files or handoff fixture. The checkpoint-6 warning audit remains applicable
+  to the unchanged receipt implementation. No positive occurrence deltas.
+
+The prior exact-squash-only gates also passed, but do not substitute for these newer-main gates.
+M9.2b remains open; no full-suite, live-app, release or hosted-CI qualification is claimed.
+
+#### M9.2b checkpoint 7 — worktree review lifecycle, not the VCS apply pipeline
+
+Moved the actual review installation, timeout, response and settlement bodies into the existing
+interaction runtime. One non-persisted wait record owns the continuation, timer and originating
+writer identity. New admission and UI/MCP responses require the canonical command; a reacquired
+claim cannot consume an older wait. MCP now reports refusal instead of silently acknowledging an
+unconsumed review. The card captures its command at render time. Removed the VM's review-install
+body, response/cancel/finish forwarding and duplicate cancellation-operation update.
+
+The timer and run teardown settle the exact originating wait without a tab lookup, even after
+presentation detach or writer loss. Operation mutation, explicit publication and save are gated
+by the originating persistent claim. Removing the original run's blocker reconciles its derived
+state only while the binding and run/attempt still match; a rebound binding or successor attempt
+is not reconciled. Acceptance alone does not schedule an unchanged-operation save. The VM captures
+its command before preview authorization/revalidation, checks it afterward, and checks it again
+before acting on an accepted result. Non-accept outcomes never return through a stale tab-keyed
+cancellation save. If admission is suspended before an accepted waiter resumes, no apply starts;
+claim-owned cleanup can record that abandoned decision instead.
+
+One review was completed. Its enum-label compile issue and original-run derived-state issue were
+addressed. Removed-symbol scans found no remaining callers; the existing presentation handler
+still invokes the index/sidebar/current-tab interaction projection. Causal tests cover synchronous
+publication ordering, refusal and duplicate settlement, raw conflicts, same-object reacquisition
+and rebound, detached expiry, a newer same-tab waiter, actual timer execution and exact save-request
+counts. Three tests were added to the existing worktree-review suite, with no relaxed assertions
+or budgets. VM authorization-await/accepted-resumption ordering is source-checked, not covered by
+a new injected VCS test seam. The existing load reconciler already cancels persisted
+`awaitingApproval` operations whose continuations cannot survive relaunch; no new recovery owner
+or schema was added.
+
+Still open: ask-user creation and its MCP external cancellation callback need an exact per-wait
+cutover; hook review and the administrative VCS apply/preview/continue/abort pipeline remain open.
+In particular, later VCS awaits/result persistence are not claimed writer-complete by this slice.
+
+Checkpoint 7 validation (in progress): focused `3ac6ba2f-8c61-4dbf-b76b-6c1512a415cf`
+passed **30 tests** (12 worktree review, 14 interaction runtime, four MCP response diagnostics).
+Full lint `db47ec13-1167-46bc-9730-a5cf4edaa14f` passed. Actual compile occurrence counts across
+eight touched Swift files match retained base: **four VM warnings**, zero in the other seven;
+no positive deltas. Isolated handoff `ca3933c9-925e-4fd1-bf40-293f7da6689f` passed **104**;
+both products `79696295-0c5d-496a-9d39-a24deadeb420` passed. Broad
+`da19f3fe-d82c-4aa4-b788-1098b30b4340` is **failed/incomplete**, not a pass: XCTest exited
+with signal 11 during LiveDiscovery's queued-observation Stop case. The local crash report places
+`EXC_BAD_ACCESS` in `CodexNativeSessionController.shutdown` clearing
+`completedCanonicalItemScopes`, via coordinator retirement; it has no Swift overlapping-access
+or exclusivity diagnostic. Isolated head `744fd8ac-fc82-4f83-9f29-3c6ef2cd091d` executed **36**,
+with four skips and zero failures. Exact base `7bd6f8188`, tested after preserving checkpoint 7
+in stash, executed **36**, with four skips and three timeout failures
+(`testW3RegisteredRingClaudeFirstDoesNotEchoQuietClosures`,
+`testW3RepromptRequiresAcceptedDeclarationBeforeFrameAndNoLaterTool`,
+`testW3SilentUndeclaredCloseRemainsOrdinary`) on ticket
+`1608955d-c234-4b0f-99d7-c8b7d85bea88`; no crash reproduced there. Checkpoint 7 was restored.
+These isolated results do not classify the signal-11 cause. Source shows direct fixture shutdown
+of the same decoder that Stop retires through the coordinator, with no controller-level joining
+or event-mutex acquisition in shutdown. Production lifecycle repair and a passing broad gate are
+required before this checkpoint can be pushed. No full-suite, live-app, release or hosted-CI
+qualification; M9.2b remains open.
+
+Shutdown blocker repair (validation in progress): the controller now owns one locked, joinable
+shutdown task, including direct retirement callers outside the coordinator's existing deduplication.
+Cancelled callers join the same task. It closes event delivery, serializes stream retirement with
+installation, and then drains the existing event mutex before clearing event-derived state; the
+async mutexes are never nested. PID/client cleanup remains owned by that task, and deinit's fallback
+is reserved for controllers never explicitly retired. Recovery refuses a retired controller rather
+than acknowledging skipped installation. No coordinator or LiveDiscovery test cleanup was changed.
+
+The state-writer audit found production collection mutation in the existing event-mutex paths;
+the transport-exit path also checks its stream ownership token before acquiring that mutex.
+`CodexAppServerClient.request` has explicit task-cancellation settlement, rather than relying on
+its request timeout. Current production auth-refresh callbacks are nil. These source facts and the
+new join/drain tests establish the repaired contract, not proof of the observed SIGSEGV's exact
+interleaving. The first focused repair run `6207eabb-fc08-410e-9532-5b2f9e07e9dd` passed **32**.
+A separate review of this blocker fix prompted the early delivery cutoff and explicit recovery
+refusal. Tests additionally cover cancelled concurrent callers, handler-before-clear ordering,
+stream cutoff before drain, terminal-state cleanup, physical client stop and controller release.
+Final validation: `e12119cf-f382-4662-917f-a51357da39c7` passed **70 executed, four skipped,
+zero failures**, including all 36 LiveDiscovery cases. Broad
+`c79a0de3-86cc-4068-9ad3-621bbe9fafec` passed **2,145 executed, 22 skipped, zero failures**
+(2,134 app, seven domain, four provider), including all SessionLinks and the admission/sidebar/
+lane-policy families. Isolated handoff `3f728727-9045-40ec-8c56-1d33e557d5e7` passed **104**;
+both products `86e50746-bb5b-45e5-ac4d-fa0b8c6351a6` passed. Full lint
+`0e44824c-5641-4034-8d72-108bc84f6973` passed; the subsequent nonthrowing-lock-helper compile
+repair was scoped-formatted and strict-linted before the final passing runs. The intermediate
+`05441d1c-9771-4835-8940-47d180123082` was a compile failure, not a test pass.
+
+Fresh post-build index: **1,244/1,360 wrong-way edges, 53/66 largest-cycle components**; baseline
+unchanged. The new review runtime retains app-local edges to the existing review DTO/operation
+helpers in `AgentModeViewModel+WorktreeMerge` and to `AgentTabSession`; no target-move closure is
+claimed. Actual final compilation across 11 touched Swift files matches retained base warning
+occurrences: **four VM, three native-controller, two native-interrupt-test**, zero in the other
+eight files. No positive occurrence deltas. No permanent trace, sanitizer run, live-app smoke,
+full-suite or hosted-CI qualification is claimed. The repaired join/drain contract and passing
+broad rerun release this checkpoint's local push hold; M9.2b's remaining inventory stays open.
+
+#### M9.2b checkpoint 8 — question admission and exact MCP cancellation
+
+Question creation now requires the canonical command. The VM captures the writer before hydration,
+retains the existing object/restoration and MutationTarget checks, and admits that same writer after
+readiness; refusal remains a typed MCP error. Availability requires the same local writer but does
+not require hydration to have completed. There is no absent/unbound or conflicting-writer fallback.
+The existing question wait-ID map now records originating writer, run and attempt identities.
+Responses, drafts, page changes and activity must match the original writer, not a fresh claim on
+the same payload. Timer/caller cancellation additionally carries the exact wait ID, so a reused
+public interaction ID cannot identify a successor wait. Timeout zero keeps its immediate-expiry
+meaning. Cleanup releases the original continuation after detachment; it reconciles only the same
+binding/run/attempt and performs writer publication only with the originating claim. A live,
+reacquired/rebound payload receives only the existing exact-object interaction projection to hide
+its cleared card, never stale binding/save publication or reconciliation of a successor run.
+
+The Agent Mode MCP path now owns the exact question invocation behind a registration start gate.
+External cancellation cancels and joins that task, including preparation, instead of re-resolving a
+window/tab and cancelling by public interaction ID. The VM cancel adapter is retired. Early or
+refused registration cannot begin presentation. Context Builder retains its separate run-scoped
+path. Membership `owns` remains for observation and composite managed-response checks; it is no
+longer question-creation admission. No M9.3a-owned composition file changed.
+
+One review prompted typed refusal mapping, exact-object interaction-only repaint after claim loss,
+and external-cancellation/preparation coverage. Two existing managed-response fixtures and the
+multiple-choice link fixture now install a real runtime wait instead of fabricating continuation
+state; no production bypass was added. New causal coverage includes early registration cancellation,
+caller and coordinator cancellation joining a held preparation, a same-tab/public-ID successor,
+reacquired-claim response refusal, and original timeout versus rebound/successor-attempt state.
+The VM hydration-await mutation itself remains source-reviewed rather than injected by a new test
+seam. The broad provider-native cancellation hook and hook-review workflow remain open, as do the
+other M9.2b inventory groups; this is not interaction or milestone closeout.
+
+Initial focused `56dd16b6-0b54-4c53-afc2-fa35c6d45208` failed compilation because observation/
+managed-response callers still require `owns`; those uses were retained, not silently tightened.
+Focused `ca6d1dd8-a3c4-45c6-a6a5-18dc7b8b5a3b` executed **276**, with one failing new fixture:
+its supposedly held preparation used the cancellation-aware `TestReleaseFence`. Replacing that
+fixture with an explicitly held continuation preserves the join assertion. Final focused
+`c9a4c042-df87-4d8c-8aa8-489febac55bd` passed **276**, zero failures. Full lint
+`e819afd7-e90b-4f91-9e9f-669fd478b204` passed; the subsequent fixture-only correction was
+scoped-formatted and strict-linted. Broad `2e823a28-4d7d-48c9-9fa7-88863af32adc` passed
+**2,147 executed, 22 skipped, zero failures** (2,136 app, seven domain, four provider), including
+all SessionLinks and admission/sidebar/lane-policy suites. Isolated handoff
+`6f31a359-349c-4a55-be80-2bf7b3bf7d23` passed **104**. Both products
+`f161b52e-9736-462e-a3b5-fd03bcd8e940` passed. Fresh index remains **1,244/1,360 wrong-way
+edges, 53/66 largest-cycle components**; no baseline change. Actual compile warning occurrence
+counts across seven touched Swift files match retained base: **four VM, two link-runtime-bridge
+test warnings**, zero in the other five. No positive occurrence delta. No full-suite, live-app,
+release or hosted-CI qualification is claimed; M9.2b remains open.

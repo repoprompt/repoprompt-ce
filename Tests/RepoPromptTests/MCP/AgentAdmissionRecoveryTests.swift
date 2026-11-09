@@ -4921,6 +4921,10 @@ import XCTest
             CodexTurnInterruptReceipt(interruptedTurnID: expectedTurnID)
         }
 
+        func interruptUserTurn(expectedThreadID _: String, expectedTurnID: String, answering _: CodexServerRequestReceipt) async throws -> CodexTurnInterruptReceipt {
+            CodexTurnInterruptReceipt(interruptedTurnID: expectedTurnID)
+        }
+
         func reconcileAndInterruptCurrentTurn() async throws -> CodexTurnInterruptReceipt {
             CodexTurnInterruptReceipt(interruptedTurnID: "agent-admission-test")
         }
@@ -4958,6 +4962,8 @@ import XCTest
 
         func cancelCurrentTurn() async {}
         func shutdown() async {}
-        func respondToServerRequest(id _: CodexAppServerRequestID, result _: [String: Any]) async {}
+        func respondToServerRequest(receipt _: CodexServerRequestReceipt, result _: [String: Any]) async -> CodexServerResponseDelivery {
+            .written
+        }
     }
 #endif

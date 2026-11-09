@@ -540,8 +540,7 @@ final class AgentTabSession: ObservableObject {
 
     var applyEditsApprovalSubscriptionID: UUID?
     var applyEditsApprovalSubscriptionTask: Task<Void, Never>?
-    var worktreeMergeReviewContinuation: CheckedContinuation<WorktreeMergeReviewDecision, Never>?
-    var worktreeMergeReviewTimeoutTask: Task<Void, Never>?
+    var worktreeMergeReviewWait: AgentWorktreeMergeReviewWait?
     /// External MCP control attachment. Its presence and effective task label determine whether this
     /// exact session may act as an oversight observer.
     var mcpControlContext: AgentMCPControlContext? {
@@ -1451,6 +1450,20 @@ final class AgentTabSession: ObservableObject {
     ///
     /// Never persisted: it describes a live process-local controller generation.
     var codexSessionLinkCatalogRepairCycle: AgentSessionLinkCodexCatalogRepair.Cycle?
+    /// Retained across controller replacements, but not persisted across cold restoration.
+    var codexContextWindowSelection: CodexContextWindowPreferences.Selection?
+
+    func clearCodexConversationIdentity() {
+        codexConversationID = nil
+        codexContextWindowSelection = nil
+    }
+
+    func codexContextWindowForBinding(current: CodexContextWindowPreferences.Selection) -> CodexContextWindowPreferences.Selection {
+        if let selection = codexContextWindowSelection { return selection }
+        codexContextWindowSelection = current
+        return current
+    }
+
     /// The permission profile the current Codex controller was created with.
     /// Used to detect when MCP control changes require controller recycling.
     var codexControllerPermissionProfile: AgentModeViewModel.AgentPermissionProfile?

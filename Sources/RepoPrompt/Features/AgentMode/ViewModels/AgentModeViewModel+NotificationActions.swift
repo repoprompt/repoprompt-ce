@@ -22,7 +22,9 @@ extension AgentModeViewModel: AgentNotificationActionTarget {
     }
 
     func notificationSubmitApproval(tabID: UUID, requestID: UUID, decision: AgentApprovalDecision) -> Bool {
-        submitApprovalDecision(tabID: tabID, requestID: requestID, decision: decision)
+        guard let session = sessions[tabID], let sessionID = session.activeAgentSessionID,
+              let command = try? runtimeCommand(sessionID: sessionID), command.writer.session === session else { return false }
+        return interactionRuntime.submitApprovalDecision(command: command, requestID: requestID, decision: decision)
     }
 
     func notificationDeclinePermissions(tabID: UUID, requestID: UUID) -> Bool {
@@ -32,8 +34,9 @@ extension AgentModeViewModel: AgentNotificationActionTarget {
         else {
             return false
         }
-        codexCoordinator.submitPermissionsDecision(session: session, request: request, decision: .decline)
-        return session.pendingPermissionsRequest?.id != requestID
+        guard let sessionID = session.activeAgentSessionID,
+              let command = try? runtimeCommand(sessionID: sessionID), command.writer.session === session else { return false }
+        return interactionRuntime.submitPermissionsDecision(command: command, requestID: request.id, decision: .decline)
     }
 
     func notificationSubmitAskUser(
@@ -44,16 +47,18 @@ extension AgentModeViewModel: AgentNotificationActionTarget {
         guard let session = sessions[tabID], session.pendingAskUser?.interaction.id == interactionID else {
             return false
         }
-        try submitAskUserResponse(tabID: tabID, interactionID: interactionID, draftsByQuestionID: draftsByQuestionID)
-        return session.pendingAskUser?.interaction.id != interactionID
+        guard let sessionID = session.activeAgentSessionID,
+              let command = try runtimeCommand(sessionID: sessionID), command.writer.session === session else { return false }
+        return try interactionRuntime.submitAskUserResponse(command: command, interactionID: interactionID, draftsByQuestionID: draftsByQuestionID)
     }
 
     func notificationSkipAskUser(tabID: UUID, interactionID: UUID) -> Bool {
         guard let session = sessions[tabID], session.pendingAskUser?.interaction.id == interactionID else {
             return false
         }
-        skipAskUser(tabID: tabID, interactionID: interactionID)
-        return session.pendingAskUser?.interaction.id != interactionID
+        guard let sessionID = session.activeAgentSessionID,
+              let command = try? runtimeCommand(sessionID: sessionID), command.writer.session === session else { return false }
+        return interactionRuntime.skipAskUser(command: command, interactionID: interactionID)
     }
 
     func notificationSubmitUserInput(tabID: UUID, requestID: UUID, answers: [String: [String]]) -> Bool {
@@ -63,12 +68,13 @@ extension AgentModeViewModel: AgentNotificationActionTarget {
         else {
             return false
         }
-        submitUserInputResponse(
-            tabID: tabID,
-            requestID: request.requestID,
+        guard let sessionID = session.activeAgentSessionID,
+              let command = try? runtimeCommand(sessionID: sessionID), command.writer.session === session else { return false }
+        return interactionRuntime.submitUserInputResponse(
+            command: command,
+            requestID: request.id,
             response: AgentRequestUserInputResponse(answersByQuestionID: answers)
         )
-        return session.pendingUserInputRequest?.id != requestID
     }
 
     /// Sends `text` through the composer submission path, including the waiting-instruction resume.

@@ -1100,7 +1100,7 @@ final class AgentSessionActivationFocusTests: XCTestCase {
         XCTAssertFalse(AgentRunInteractionUISnapshot.isQuestionFocusKey("approval:1"))
         func approval(_ requestID: Int) -> AgentApprovalRequest {
             AgentApprovalRequest(
-                requestID: .codex(.int(requestID)),
+                requestID: .codex(.fixture(.int(requestID))),
                 method: "item/commandExecution/requestApproval",
                 kind: .commandExecution,
                 threadID: "thread",

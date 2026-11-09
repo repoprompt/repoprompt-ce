@@ -22,6 +22,7 @@ final class AgentSessionPresentationRuntime {
         var prepareTerminal: ((AgentTabSession) -> Void)?
         var composerClaim: ((AgentTabSession) -> Void)?
         var binding: ((AgentTabSession) -> Void)?
+        var interaction: ((AgentTabSession) -> Void)?
         var elapsedTime: ((AgentTabSession) -> Void)?
         var runState: ((AgentTabSession) -> Void)?
         var oversightBinding: ((AgentTabSession) -> Void)?
@@ -131,6 +132,10 @@ final class AgentSessionPresentationRuntime {
 
     func bindingChanged(_ session: AgentTabSession) {
         sink(for: session)?.binding?(session)
+    }
+
+    func interactionChanged(_ session: AgentTabSession) {
+        sink(for: session)?.interaction?(session)
     }
 
     func derivedTranscriptChanged(_ session: AgentTabSession) {

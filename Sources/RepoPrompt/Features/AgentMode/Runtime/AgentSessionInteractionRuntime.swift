@@ -21,18 +21,16 @@ enum AgentRunInteractionStateChangeReason: String, Equatable {
 @MainActor
 final class AgentSessionInteractionRuntime {
     private(set) weak var scope: AgentSessionRuntimeStore.Scope?
-    private(set) weak var codexCommands: CodexAgentModeCoordinator?
     private(set) weak var claudeCommands: ClaudeAgentModeCoordinator?
 
-    func installProviderCommands(codex: CodexAgentModeCoordinator, claude: ClaudeAgentModeCoordinator) {
-        precondition(codexCommands == nil || codexCommands === codex)
+    func installClaudeCancellationCommands(_ claude: ClaudeAgentModeCoordinator) {
         precondition(claudeCommands == nil || claudeCommands === claude)
-        codexCommands = codex
         claudeCommands = claude
     }
 
     /// Admit an effect synchronously, retaining its exact owner until the effect has joined.
-    func performEffect(for session: AgentTabSession, operation: @escaping @MainActor () async -> Void) {
+    @discardableResult
+    func performEffect(for session: AgentTabSession, operation: @escaping @MainActor () async -> Void) -> Task<Void, Never> {
         let id = UUID()
         let owner = scope
         let task = Task { [self, owner] in
@@ -43,15 +41,23 @@ final class AgentSessionInteractionRuntime {
             await operation()
         }
         pendingEffects[id] = PendingEffect(sessionIdentity: ObjectIdentifier(session), task: task)
+        return task
     }
 
     let routeID: Int
     let approvalStore: ApplyEditsApprovalStore
     weak var observer: (any AgentRunInteractionStateObserving)?
     private var subscriptions: [ObjectIdentifier: UUID] = [:]
-    // Request-lifetime identities fence delayed caller cancellation from a subsequent question,
-    // even when a caller reuses its public interaction ID on the same session object.
-    var questionWaitIDs: [ObjectIdentifier: UUID] = [:]
+    /// Request-lifetime identities fence delayed caller cancellation from a subsequent question,
+    /// even when a caller reuses its public interaction ID on the same session object.
+    struct QuestionWait {
+        let id: UUID
+        let writer: AgentSessionRuntimeStore.WriterIdentity
+        let runID: UUID?
+        let runAttemptID: UUID?
+    }
+
+    var questionWaits: [ObjectIdentifier: QuestionWait] = [:]
     private struct CancellationCutoff {
         weak var session: AgentTabSession?
         let instant: ContinuousClock.Instant
@@ -67,6 +73,7 @@ final class AgentSessionInteractionRuntime {
 
     #if DEBUG
         var test_beforeApprovalCancellation: (@MainActor () async -> Void)?
+        var test_beforeApprovalDecision: (@MainActor () async -> Void)?
     #endif
 
     init(scope: AgentSessionRuntimeStore.Scope, routeID: Int, approvalStore: ApplyEditsApprovalStore) {
@@ -211,38 +218,6 @@ final class AgentSessionInteractionRuntime {
         }
     }
 
-    func finishPendingWorktreeMergeReview(session: AgentTabSession) {
-        session.worktreeMergeReviewTimeoutTask?.cancel()
-        session.worktreeMergeReviewTimeoutTask = nil
-        session.worktreeMergeReviewContinuation = nil
-        session.pendingWorktreeMergeReview = nil
-        Self.reconcileInteractiveRunState(session)
-        scope?.presentation.makeRunHooks().requestUIRefresh(session, true)
-    }
-
-    func cancelPendingWorktreeMergeReview(for session: AgentTabSession, reason: String) {
-        let operationID = session.pendingWorktreeMergeReview?.operationID
-        let continuation = session.worktreeMergeReviewContinuation
-        finishPendingWorktreeMergeReview(session: session)
-        if let operationID {
-            do {
-                try AgentWorktreeMergeCoordinator.update(operationID: operationID, in: &session.worktreeMergeOperations) {
-                    $0.status = .cancelled
-                    $0.completedAt = Date()
-                    $0.lastError = reason
-                }
-                session.isDirty = true
-                scope?.presentation.worktreeOperationsChanged(session)
-                scope?.mcp.handleObservedMCPStateChange(for: session)
-                scope?.presentation.bindingChanged(session)
-                scope?.persistence.scheduleSave(for: session)
-            } catch {
-                // Preserve the existing best-effort cancellation when the operation was removed.
-            }
-        }
-        continuation?.resume(returning: .cancelled(reason: reason))
-    }
-
     static func reconcileInteractiveRunState(_ session: AgentTabSession) {
         let nextState: AgentSessionRunState? = if session.pendingApplyEditsReview != nil || session.pendingWorktreeMergeReview != nil || session.pendingApproval != nil || session.hasPendingCodexHookReviewRequest || session.pendingPermissionsRequest != nil || session.pendingMCPElicitationRequest != nil {
             .waitingForApproval
@@ -279,6 +254,7 @@ final class AgentSessionInteractionRuntime {
     }
 
     func cancelPendingQuestion(for session: AgentTabSession) {
+        questionWaits.removeValue(forKey: ObjectIdentifier(session))
         Self.invalidatePendingAskUserTimeout(for: session)
         let continuation = session.askUserContinuation
         session.askUserContinuation = nil

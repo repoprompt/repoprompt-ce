@@ -600,7 +600,7 @@ extension AgentRequestUserInputRequest {
     var computerUseReviewRequest: AgentRequestUserInputRequest {
         guard questions.contains(where: \.isLegacyMCPToolApproval) else { return self }
         return .init(
-            id: id, requestID: requestID, method: method, threadID: threadID,
+            id: id, receipt: receipt, method: method, threadID: threadID,
             turnID: turnID, itemID: itemID, askedAt: askedAt,
             questions: questions.map { question in
                 guard question.isLegacyMCPToolApproval else { return question }

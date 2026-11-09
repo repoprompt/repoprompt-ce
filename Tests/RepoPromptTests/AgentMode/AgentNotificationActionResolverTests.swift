@@ -236,7 +236,7 @@ final class AgentNotificationActionResolverTests: XCTestCase {
         let id = UUID()
         session.pendingPermissionsRequest = AgentPermissionsRequest(
             id: id,
-            requestID: .int(1),
+            receipt: .fixture(.int(1)),
             method: "item/permissions/requestApproval",
             threadID: "t",
             turnID: "t",
@@ -295,7 +295,7 @@ final class AgentNotificationActionResolverTests: XCTestCase {
         let id = UUID()
         session.pendingUserInputRequest = AgentRequestUserInputRequest(
             id: id,
-            requestID: .int(9),
+            receipt: .fixture(.int(9)),
             method: "item/tool/requestUserInput",
             threadID: "t",
             turnID: "t",

@@ -43,7 +43,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             testWorkspacePath: FileManager.default.temporaryDirectory.path,
             shouldManageCodexTooling: shouldManageCodexTooling,
             codexControllerFactory: { runID, _, _, _, _, _ in factory.make(runID: runID) },
-            codexControllerFactoryWithComputerUse: { runID, _, _, _, _, _, enabled, _ in
+            codexControllerFactoryWithComputerUse: { runID, _, _, _, _, _, enabled, _, _ in
                 factory.make(runID: runID, computerUseEnabled: enabled)
             },
             mcpServerEnabler: mcpServerEnabler,
@@ -88,6 +88,73 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         )
     }
 
+    func testContextWindowSnapshotSurvivesReconnectAndResetsWithConversation() async throws {
+        let suite = "codex-window-reconnect-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        CodexContextWindowPreferences.setSelection(.tokens500K, defaults: defaults)
+        let fixture = makeFixture([], shouldManageCodexTooling: false)
+        let factory = WedgeControllerFactory(plans: [[.timeout], [.success(Self.oldThreadID)], [.success("new-thread")]])
+        var received: [CodexContextWindowPreferences.Selection] = []
+        let coordinator = CodexAgentModeCoordinator(
+            windowID: 1,
+            runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
+            codexControllerFactory: { runID, _, _, _, _, _, enabled, _, selection in
+                received.append(selection)
+                return factory.make(runID: runID, computerUseEnabled: enabled)
+            },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            routeOwnerValidator: { _, _, _, _ in true },
+            shouldManageCodexTooling: false,
+            codexHookApprovalSettings: GlobalSettingsStore.shared,
+            preferenceDefaults: defaults
+        )
+        fixture.viewModel.configureCodexRuntime(coordinator)
+        await coordinator.ensureCodexNativeSession(session: fixture.session)
+        XCTAssertEqual(received, [.tokens500K])
+        CodexContextWindowPreferences.setSelection(.tokens1M, defaults: defaults)
+        await coordinator.ensureCodexNativeSession(session: fixture.session)
+        XCTAssertEqual(received, [.tokens500K, .tokens500K])
+        coordinator.clearCodexSessionState(fixture.session)
+        await coordinator.ensureCodexNativeSession(session: fixture.session)
+        XCTAssertEqual(received, [.tokens500K, .tokens500K, .tokens1M])
+        await coordinator.shutdownCodexSession(fixture.session)
+    }
+
+    func testProviderSwitchClearsContextWindowSnapshotForNewConversation() async throws {
+        let suite = "codex-window-provider-switch-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        CodexContextWindowPreferences.setSelection(.tokens500K, defaults: defaults)
+        let fixture = makeFixture([], freshSession: true, shouldManageCodexTooling: false)
+        let factory = WedgeControllerFactory(plans: [[.success("first-thread")], [.success("new-thread")]])
+        var received: [CodexContextWindowPreferences.Selection] = []
+        let coordinator = CodexAgentModeCoordinator(
+            windowID: 1,
+            runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
+            codexControllerFactory: { runID, _, _, _, _, _, enabled, _, selection in
+                received.append(selection)
+                return factory.make(runID: runID, computerUseEnabled: enabled)
+            },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            routeOwnerValidator: { _, _, _, _ in true },
+            shouldManageCodexTooling: false,
+            codexHookApprovalSettings: GlobalSettingsStore.shared,
+            preferenceDefaults: defaults
+        )
+        fixture.viewModel.configureCodexRuntime(coordinator)
+        await coordinator.ensureCodexNativeSession(session: fixture.session)
+        XCTAssertEqual(received, [.tokens500K])
+        CodexContextWindowPreferences.setSelection(.tokens1M, defaults: defaults)
+        coordinator.handleProviderSwitch(from: .codexExec, to: .claudeCode, session: fixture.session)
+        fixture.session.selectedAgent = .claudeCode
+        coordinator.handleProviderSwitch(from: .claudeCode, to: .codexExec, session: fixture.session)
+        fixture.session.selectedAgent = .codexExec
+        await coordinator.ensureCodexNativeSession(session: fixture.session)
+        XCTAssertEqual(received, [.tokens500K, .tokens1M])
+        await coordinator.shutdownCodexSession(fixture.session)
+    }
+
     private final class RuntimeHookSettings: CodexHookApprovalSettingsProviding {
         let strictWorkspaceID = UUID()
         var lastWorkspaceID: UUID?
@@ -107,7 +174,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         let factory = WedgeControllerFactory(plans: [[]])
         let coordinator = CodexAgentModeCoordinator(
             windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
-            codexControllerFactory: { runID, _, _, _, _, _, _, _ in factory.make(runID: runID) },
+            codexControllerFactory: { runID, _, _, _, _, _, _, _, _ in factory.make(runID: runID) },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
             shouldManageCodexTooling: false, codexHookApprovalSettings: settings
         )
@@ -565,19 +632,20 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         session.codexControllerFeatureState = .init(computerUseEnabled: true, goalSupportEnabled: false, reasoningSummariesEnabled: false, memoriesEnabled: false, capabilities: .disabled)
         let request = makeLegacyApprovalRequest()
         let questionID = try XCTUnwrap(request.questions.first?.id)
+        let command = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: installRestoredBinding(fixture)))
         await fixture.coordinator.test_handleCodexNativeEvent(.requestUserInput(request), session: session, sourceController: controller)
         XCTAssertEqual(session.pendingUserInputRequest?.id, request.id, "Frozen armed scope must surface approval even with the global setting OFF")
         XCTAssertEqual(session.pendingUserInputRequest?.questions.first?.options.map(\.label), ["Allow", "Deny"], "Remembered and unknown approval options must not be offered")
         // Continue probing submission even on the known-bad autoanswer path.
         if session.pendingUserInputRequest == nil { session.pendingUserInputRequest = request }
         for remembered in ["Allow for this session", "AlwaysAllow", "Allow forever", "user_note: Allow for this session"] {
-            fixture.viewModel.submitUserInputResponse(tabID: session.tabID, requestID: request.requestID, response: .init(answersByQuestionID: [questionID: [remembered]]))
+            fixture.viewModel.interactionRuntime.submitUserInputResponse(command: command, requestID: request.id, response: .init(answersByQuestionID: [questionID: [remembered]]))
             XCTAssertEqual(session.pendingUserInputRequest?.id, request.id, "Rejected answers must preserve the pending review: \(remembered)")
             if session.pendingUserInputRequest == nil { session.pendingUserInputRequest = request }
         }
-        fixture.viewModel.submitUserInputResponse(tabID: session.tabID, requestID: .int(999), response: .init(answersByQuestionID: [questionID: ["Allow"]]))
+        fixture.viewModel.interactionRuntime.submitUserInputResponse(command: command, requestID: UUID(), response: .init(answersByQuestionID: [questionID: ["Allow"]]))
         XCTAssertEqual(session.pendingUserInputRequest?.id, request.id, "A stale request ID must not consume the prompt")
-        fixture.viewModel.submitUserInputResponse(tabID: session.tabID, requestID: request.requestID, response: .init(answersByQuestionID: [questionID: ["Allow"]]))
+        fixture.viewModel.interactionRuntime.submitUserInputResponse(command: command, requestID: request.id, response: .init(answersByQuestionID: [questionID: ["Allow"]]))
         try await AsyncTestWait.waitUntil("explicit one-shot legacy answer", timeout: 4) { controller.qaUserInputAnswers[questionID] == ["Allow"] }
         XCTAssertEqual(controller.qaResponseCount, 1, "Only the explicit one-shot response may reach the controller")
         XCTAssertNil(session.pendingUserInputRequest)
@@ -630,7 +698,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
                 ]]]
             ]
             if let server { params["serverName"] = server }
-            let request = try XCTUnwrap(CodexNativeSessionController.parseRequestUserInputRequest(requestID: .int(91), method: "item/tool/requestUserInput", params: params, activeThreadID: Self.oldThreadID, currentTurnID: "legacy-turn"))
+            let request = try XCTUnwrap(CodexNativeSessionController.parseRequestUserInputRequest(receipt: .fixture(.int(91)), method: "item/tool/requestUserInput", params: params, activeThreadID: Self.oldThreadID, currentTurnID: "legacy-turn"))
             await fixture.coordinator.test_handleCodexNativeEvent(.requestUserInput(request), session: fixture.session, sourceController: controller)
             if autoApproved {
                 XCTAssertNil(fixture.session.pendingUserInputRequest, "Verified RepoPrompt tools must retain their normal approval policy")
@@ -658,7 +726,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
     }
 
     private func makeLegacyApprovalRequest() -> AgentRequestUserInputRequest {
-        .init(requestID: .int(91), method: "item/tool/requestUserInput", threadID: Self.oldThreadID, turnID: "legacy-turn", itemID: "legacy-approval", questions: [
+        .init(receipt: .fixture(.int(91)), method: "item/tool/requestUserInput", threadID: Self.oldThreadID, turnID: "legacy-turn", itemID: "legacy-approval", questions: [
             .init(id: "mcp_tool_call_approval_read_file", header: "MCP approval", question: "Allow this tool?", isOther: true, isSecret: false, options: [
                 .init(label: "Allow", description: "One call"),
                 .init(label: "Allow for this session", description: "Remember"),
@@ -781,6 +849,19 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertFalse(source.isCodexComputerUseArmed)
         XCTAssertTrue(source.items.isEmpty, "The source must not receive the destination's turn")
         try await assertComputerUseProviderStart(fixture, session: destination)
+        let controller = try XCTUnwrap(fixture.factory.controllers.first)
+        let approval = AgentApprovalRequest(requestID: .codex(.fixture(.int(91))), method: "item/commandExecution/requestApproval", kind: .commandExecution, threadID: "submission-thread", turnID: "first-turn", itemID: "first-approval")
+        await fixture.coordinator.test_handleCodexNativeEvent(.approvalRequest(approval), session: destination, sourceController: controller)
+        XCTAssertEqual(destination.pendingApproval?.id, approval.id)
+        // This is the card's capture expression, without test-only restoration or binding repair:
+        // first-save admission must complete before the first provider prompt is answerable.
+        let responseCommand = try XCTUnwrap(vm.activeSession?.activeAgentSessionID.flatMap { try? vm.runtimeCommand(sessionID: $0) })
+        XCTAssertTrue(responseCommand.writer.session === destination)
+        XCTAssertTrue(vm.interactionRuntime.submitApprovalDecision(command: responseCommand, requestID: approval.id, decision: .accept))
+        XCTAssertFalse(vm.interactionRuntime.submitApprovalDecision(command: responseCommand, requestID: approval.id, decision: .accept))
+        await vm.interactionRuntime.drainPendingEffects(for: destination)
+        XCTAssertEqual(controller.qaResponseCount, 1)
+        XCTAssertNil(destination.pendingApproval)
     }
 
     func testLocalComputerUseComposerExistingSessionArmsAndStartsProvider() async throws {
@@ -1082,6 +1163,11 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         CodexComputerUseWorkflow.setEnabledForTesting(true)
         defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
         let fixture = makeFixture([])
+        let responseSessionID = try installRestoredBinding(fixture)
+        // This coordinator-level fixture starts its synthetic attempt before binding. Reopen it
+        // against the restored binding now required by the real interaction command boundary.
+        let restoredOwnership = fixture.session.beginRunAttempt(source: "computer-use.restored-response-fixture")
+        XCTAssertTrue(fixture.session.isCurrentRunAttemptForCurrentBinding(restoredOwnership, expectedRunID: fixture.session.runID))
         var flags: [Bool] = []
         var controllers: [WedgeFakeCodexController] = []
         let coordinator = makeComputerUseCoordinator(fixture: fixture) { runID, enabled in
@@ -1136,7 +1222,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertTrue(first.didSend)
         await coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "computer-use-turn"), session: session, sourceController: controller)
         let permission = AgentApprovalRequest(
-            requestID: .codex(.int(90)),
+            requestID: .codex(.fixture(.int(90))),
             method: "item/commandExecution/requestApproval",
             kind: .commandExecution,
             threadID: "computer-use-thread",
@@ -1146,9 +1232,10 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         await coordinator.test_handleCodexNativeEvent(.approvalRequest(permission), session: session, sourceController: controller)
         XCTAssertEqual(session.pendingApproval?.id, permission.id)
         XCTAssertEqual(controller.qaResponseCount, 0)
-        coordinator.submitApprovalDecision(session: session, decision: .acceptForSession)
+        let command = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: responseSessionID))
+        fixture.viewModel.interactionRuntime.submitApprovalDecision(command: command, requestID: permission.id, decision: .acceptForSession)
         XCTAssertEqual(session.pendingApproval?.id, permission.id, "Remembered permission must remain rejected")
-        coordinator.submitApprovalDecision(session: session, decision: .accept)
+        fixture.viewModel.interactionRuntime.submitApprovalDecision(command: command, requestID: permission.id, decision: .accept)
         try await AsyncTestWait.waitUntil("one explicit permission response", timeout: 4) { controller.qaResponseCount == 1 }
         XCTAssertNil(session.pendingApproval)
         let followUp = await coordinator.sendCodexNativeMessage(session: session, text: "continue locally", attachments: [], fallbackContext: context(true))
@@ -1491,6 +1578,28 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertFalse(session.isCodexComputerUseArmed)
     }
 
+    func testRestoringDifferentCodexConversationClearsOnlyItsWindowSnapshot() {
+        let fixture = makeFixture([])
+        fixture.session.codexContextWindowSelection = .tokens500K
+        var persisted = AgentSession(id: UUID(), name: "Hydration")
+        persisted.codexConversationID = Self.oldThreadID
+        persisted.codexRolloutPath = Self.oldRolloutPath
+        fixture.coordinator.restoreCodexMetadata(from: persisted, session: fixture.session)
+        XCTAssertEqual(fixture.session.codexContextWindowSelection, .tokens500K)
+        persisted.codexConversationID = "another-thread"
+        persisted.codexRolloutPath = "/tmp/another-rollout.jsonl"
+        fixture.coordinator.restoreCodexMetadata(from: persisted, session: fixture.session)
+        XCTAssertEqual(fixture.session.codexConversationID, "another-thread")
+        XCTAssertNil(fixture.session.codexContextWindowSelection)
+        XCTAssertEqual(fixture.session.codexContextWindowForBinding(current: .tokens1M), .tokens1M)
+        persisted.codexConversationID = nil
+        persisted.codexRolloutPath = nil
+        fixture.session.codexConversationID = nil
+        fixture.session.codexRolloutPath = nil
+        fixture.coordinator.restoreCodexMetadata(from: persisted, session: fixture.session)
+        XCTAssertNil(fixture.session.codexContextWindowSelection)
+    }
+
     func testComputerUseSessionShutdownAndPersistedRestoreDoNotRearm() async throws {
         CodexComputerUseWorkflow.setEnabledForTesting(true)
         defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
@@ -1547,7 +1656,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
     ) -> CodexAgentModeCoordinator {
         let coordinator = CodexAgentModeCoordinator(
             windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
-            codexControllerFactory: { runID, _, _, _, _, _, enabled, _ in factory(runID, enabled) },
+            codexControllerFactory: { runID, _, _, _, _, _, enabled, _, _ in factory(runID, enabled) },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
             shouldManageCodexTooling: false, computerUseRuntimeUnavailableMessage: { nil }, computerUseCompanionReady: { true },
             computerUseReservedEntryExists: { false },
@@ -1566,7 +1675,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         var routeChecks = 0
         let coordinator = CodexAgentModeCoordinator(
             windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
-            codexControllerFactory: { runID, _, _, _, _, _, _, _ in
+            codexControllerFactory: { runID, _, _, _, _, _, _, _, _ in
                 WedgeFakeCodexController(runID: runID, responses: [.success("uncommitted-computer-use")])
             },
             connectionPolicyInstaller: { clientName, windowID, tools, oneShot, reason, ttl, tabID, runID, additional, purpose, label, externalControl, requiresPID in
@@ -2645,13 +2754,14 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
         lock.withLock { qaAnswers }
     }
 
-    func respondToServerRequest(id _: CodexAppServerRequestID, result: [String: Any]) async {
+    func respondToServerRequest(receipt _: CodexServerRequestReceipt, result: [String: Any]) async -> CodexServerResponseDelivery {
         lock.withLock {
             qaResponses += 1
             if let answers = result["answers"] as? [String: [String: Any]] {
                 qaAnswers = answers.compactMapValues { $0["answers"] as? [String] }
             }
         }
+        return .written
     }
 
     var computerUseAutoApprovalRevoked = false
@@ -3220,8 +3330,8 @@ extension CodexResumeWedgeCommitTests {
                         CodexNativeSessionController(
                             client: CodexAppServerClient(), runID: runID, tabID: f.session.tabID,
                             windowID: -1, workspacePaths: .uniform(nil),
-                            serverRequestResponseExecutor: { id, result in
-                                let frame = try JSONSerialization.data(withJSONObject: ["id": id.jsonValue, "result": result])
+                            serverRequestResponseExecutor: { receipt, result in
+                                let frame = try JSONSerialization.data(withJSONObject: ["id": receipt.requestID.jsonValue, "result": result])
                                 await responses.record(frame)
                             }
                         )
@@ -3250,7 +3360,7 @@ extension CodexResumeWedgeCommitTests {
                             // Actual optional snake-case wire field, absent or explicitly null.
                             params["turn_id"] = scope == "null-turn" ? .null : nil
                         }
-                        await source.test_handleServerRequest(method: method, params: params)
+                        await source.test_handleServerRequest(receipt: .fixture(.int(42)), method: method, params: params)
                     }
                     if source !== current {
                         await source.shutdown()
@@ -3984,7 +4094,7 @@ extension CodexResumeWedgeCommitTests {
                 await source.test_installThreadState(threadID: Self.oldThreadID, authoritativeTurnID: "refresh-turn", routingTurnID: "refresh-turn")
                 await f.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "refresh-turn"), session: f.session, sourceController: current)
                 if scope != "no-request" {
-                    await source.test_handleServerRequest(method: method, params: [
+                    await source.test_handleServerRequest(receipt: .fixture(.int(42), generation: client.debugTransportGeneration(), clientID: client.instanceID), method: method, params: [
                         "reason": .string("unauthorized"), "previousAccountId": .string("fixture-account"),
                         "threadId": .string(scope == "foreign-thread" ? "other-thread" : Self.oldThreadID),
                         "turnId": .string(scope == "foreign-turn" ? "other-turn" : "refresh-turn")
