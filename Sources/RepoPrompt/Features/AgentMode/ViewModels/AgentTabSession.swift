@@ -1440,6 +1440,11 @@ final class AgentTabSession: ObservableObject {
     /// Retained across controller replacements, but not persisted across cold restoration.
     var codexContextWindowSelection: CodexContextWindowPreferences.Selection?
 
+    func clearCodexConversationIdentity() {
+        codexConversationID = nil
+        codexContextWindowSelection = nil
+    }
+
     func codexContextWindowForBinding(current: CodexContextWindowPreferences.Selection) -> CodexContextWindowPreferences.Selection {
         if let selection = codexContextWindowSelection { return selection }
         codexContextWindowSelection = current
