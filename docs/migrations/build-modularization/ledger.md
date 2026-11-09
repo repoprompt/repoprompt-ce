@@ -6439,3 +6439,45 @@ Checkpoint 6 validation:
 These are local selected/module/product receipts, not full-suite, live-app, release or hosted-CI
 qualification. Remaining interaction review/lifecycle, event and other routing groups are open;
 M9.2b is not complete.
+
+#### M9.2b integration — M9.2a squash and #1665 measurement boundary
+
+Normally merged #1665 (`633fab2c9`) as `fbb18c248`, retaining the receipt fixture changes and
+incoming scale measurement boundary. Before the explicitly authorized ancestry-only merge,
+`git merge-tree --write-tree 8d3b3d1ac 633fab2c9` produced tree
+`1387934b9959fd690cdd4f3165556ee396eb7f09`; its diff against the exact squash
+`ade839433d93ee4f2736f7900c300cf1dcfb4244` was empty. Commit `ded91e12e` used `-s ours`
+against that exact SHA only; its first-parent tree diff is empty. The earlier local ancestry
+commit also pointed to that same squash, but was re-recorded against its explicit SHA after the
+overseer warned that the shared `origin/main` ref had advanced. The ledger was preserved before
+the explicitly authorized reset; no published history was rewritten.
+
+A subsequent **normal** merge integrates main `7442551fc`, including #1666 (`59926156a`)
+interactive sidebar-menu test opt-in and #1656's batched lane-binding census. These changes are
+not discarded by the ancestry-only merge. No rebase or force-push.
+
+The incoming test now times the provider-switch workload after manufacturing its 300 saved-chat
+fixtures, and reports excluded fixture cost separately. Its ten-second ceiling covers a smaller
+explicit workload; this is not evidence of lower end-to-end persistence latency.
+
+Latest merged-tree validation:
+- Broad `d4137980-3754-4add-a215-f2d8a6bbee97`: **2126 executed, 22 skipped, zero failures**.
+  Includes all SessionLinks suites, sidebar/menu, lane/admission and receipt-response suites.
+  #1656's `AgentSessionLaneFirstSaveTests` passed **48** cases. Hosted sidebar menu coverage
+  executed **18**, with **13** interactive-tracking opt-in skips and zero failures; those
+  additional skips are #1666's intended desktop-focus protection, not new local exclusions.
+- Isolated HandoffInheritance `d667ebe5-edf9-4fc6-a329-a296d5e13162`: **104 passed**. The
+  new measured workload was **1.40s**, with **9.91s** excluded fixture setup; broad measured
+  **0.93s**, excluding **4.61s** setup. These are not comparable to the old end-to-end ceiling.
+- Both products `a17291a7-46f7-4589-97d5-791c18aa2005` passed; the final fresh index remains
+  **1243/1360** wrong-way edges and **53/66** largest cycle, with no baseline changes. Full lint
+  `d1046166-51dd-4457-915b-7a82186c5308` passed. `make conductor-selftest` initially failed
+  because the sandbox denied `ps`; the approved unsandboxed rerun passed **372 tests across
+  22 groups**. No test or process-supervision behavior was weakened.
+- The four incoming main Swift files are byte-identical to `7442551fc`; actual compilation has
+  **four** sidebar-menu warning occurrences, matching the retained base's **four**, and zero
+  in the other three files or handoff fixture. The checkpoint-6 warning audit remains applicable
+  to the unchanged receipt implementation. No positive occurrence deltas.
+
+The prior exact-squash-only gates also passed, but do not substitute for these newer-main gates.
+M9.2b remains open; no full-suite, live-app, release or hosted-CI qualification is claimed.
