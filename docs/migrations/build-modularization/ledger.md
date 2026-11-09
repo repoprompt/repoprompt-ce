@@ -5340,6 +5340,85 @@ stash remain excluded and preserved. PR #1655 stays draft; no live-app lifecycle
   claim that the repository has no existing warnings; the clean hosted aggregate ratchet remains
   separate. Final Swift-tree lint: `e58f94fa-e23f-4c2b-beb6-fff6dfa2113e`, passed.
 
+### M9.3a phase A: window-free saved-target loading groundwork
+
+This phase deliberately **does not cut over execution or retire prepared windows**. The overseer
+split those changes into phase B, after M9.2b (#1662), because today's provider/start, MCP and link
+composition still requires the excluded VM/window seams. Existing prepared-window execution and
+ordinary close-cancels-run behavior remain unchanged. This does not complete M9.3 or #1406.
+
+`AgentSavedSessionTargetLoader.loadRuntime` joins the existing UUID metadata point reader to
+`AgentSessionDataService.preparePersistedHydration`, `AgentSessionHydrationRuntime` and a
+caller-retained `AgentSessionRuntimeStore.Scope`. A cold load publishes only a restoration-pending
+claim before payload IO; it starts no provider and cannot admit a command until hydration commits.
+An existing canonical writer is reused, never elected from UI replicas. Conflicts, unavailable
+writers, cancellation, lost consent and changed catalog/storage evidence refuse admission. Failed
+load receipts distinguish released loading claims from effects that must remain with their owner.
+
+`AgentSessionStorageInputs` supplies catalog point reads, display names, suppression and attachment
+storage to the existing persistence/attachment runtimes. It owns no catalog, session map, lifecycle
+or save queue. Creation still requires the exact explicit configured-creation transaction; merely
+having a binding cannot turn a required flush into first-save admission. The ordinary VM attachment
+root uses the same root calculation; preview invalidation remains presentation-owned (M9.4).
+
+The load/composition API is **phase-B groundwork, not yet a production saved-target host**. Phase B
+must supply current canonical catalog reads and carrier/provenance fences; copying an immutable
+workspace snapshot into these closures does not qualify as live catalog authority. Phase A does
+not replace those checks with a disk-only catalog or add another subscribed workspace store.
+
+#### Phase-B cutover dependency and retirement plan
+
+| Cutover seam | Dependency on M9.2b / required replacement | Retired branch at activation |
+| --- | --- | --- |
+| Run service/provider-input composition | Consume M9.2b's scope-owned commands and provider/terminal settlement; compose real `AgentModeRunService`, continuation, attempt and terminal owners with canonical workspace/context/API-settings inputs | VM-captured `makeRunService` hooks, `makeRunStartEnvironment`, `makeFollowUpLaunch` and `AgentModeRunComposition` workspace factories for saved execution |
+| MCP route/catalog host | Consume canonical M9.2b `AgentSessionMCPRuntime` and `AgentRunMCPToolService` routing; install and withdraw a runtime route without constructing an MCP/window VM | Prepared `WindowState` route and window lookup as execution-owner lookup |
+| Link endpoint/command host | Consume M9.2b `Runtime/SessionLinks/*` command routing; expose exact scope writer candidates, observations and publication, preserving link/notices/claim/wake ownership | `agentSessionLinkOwningViewModel` and prepared-window census paths for saved endpoints |
+| Provider/coordinator host | Use M9.2b's explicit coordinator/service composition; supply real provider availability, input, cancellation, self-compaction and worktree settlement, not no-op hooks | Saved-host `configureCodexRuntime`/VM provider callbacks (presentation detach remains M9.4) |
+| Saved catalog and hydration caller | Read the canonical workspace authority, revalidate carrier/provenance and storage over IO, invoke `loadRuntime`, then compose on the **returned writer's scope**; retain existing-writer handling rather than constructing a second host | `resolveSavedOversightLocation` window-catalog adapter and `prepareSavedOversightSession` prepared-window construction/hydration path |
+| Prepared owner lifetime | Keep the existing scope/store, run service, attempt owner, domain run registration and terminal barrier; join final effects/save before releasing the exact writer | `WindowState.makePreparedSessionOwner`, `tearDownPreparedSessionOwner`, `preparedOversightWindows`/retiring maps, `AgentSessionCarrierResolver.preparedSessionRuntimes` weak registry and `addingPreparedRuntimeCarriers` |
+| Host storage | Install canonical `AgentSessionStorageInputs` composition with live suppression/names/admission and the actual provider-switch save fence | Saved-host `installPersistenceComposition` window inputs and `attachmentRuntime.configuration` location/current-root adapter; optional UI callbacks remain M9.4 |
+
+Phase B must activate the executable replacement and retire those branches together. Required
+qualification includes no-window **execution**, provider/route failure and cancellation before
+publication, zero/one/conflicting writers, deletion/revocation during IO, actual durable writes and
+partial-effect receipts. Loading-only tests are not that execution receipt. Live app/hosted CI
+qualification is separate; phase A performs no visible app lifecycle action.
+
+Validation (base `7442551fc891adc2d66c6e750a1073507f212873`, 2026-11-09):
+
+- Final focused loading/metadata/persistence/transcript gate: ticket
+  `dd3ab4aa-a151-46f0-b115-c722f87da84c`, **34 passed, zero failures**, including 11
+  real-persistence runtime-loading tests in the existing saved-target test file. The prior
+  focused ticket `f803b8d8-fdf2-49d0-824d-a737c6f4f236` also passed all 34 before file
+  consolidation. Initial ticket `47c4ea36-25a3-4265-9fd9-fc96debd196d` was canceled before
+  review fixes; it is not a pass.
+- Related SessionLinks/handoff, restoration/first-save/writer/worktree admission, sidebar,
+  attachment, save and observation suites: `100ae90f-0ada-461e-9169-6c5ef16383a6`,
+  **493 passed, zero failures** across 30 suites.
+- Both products (`RepoPrompt`, `repoprompt-mcp`):
+  `56b6fa89-946f-4657-a803-0c7bb7cc5604`, passed. Subsequent edits only consolidated tests
+  and recorded receipts; product sources did not change.
+- Full lint `70aca56d-c118-44a2-a26d-6377c45408ec`: passed (0/2,147 formatting changes;
+  strict SwiftLint passed). Final consolidated test file was checked with pinned SwiftFormat
+  0.61.1; all six touched Swift files passed scoped strict SwiftLint with cache disabled.
+- Compiler-index check after final test completion: passed, wrong-way file edges
+  **1,248/1,360**, largest cycle components **53/66**. An earlier check overlapped the next
+  coordinated build's fingerprint invalidation and correctly refused unknown freshness;
+  no baseline was raised.
+- Compiler warning occurrences in the fresh focused build and product logs, then the final
+  focused log: **0 each** for `AgentSessionAttachmentRuntime.swift`,
+  `AgentSessionStorageInputs.swift`, `AgentSavedSessionTargetLoader+Runtime.swift`,
+  `AgentModeViewModel+DraftsAttachments.swift`, `AgentSavedSessionTargetLoaderTests.swift`
+  and `AgentSessionPersistenceRuntimeTests.swift`. The two new source files have base count
+  zero because they did not exist. Existing-file base counts were **not independently
+  rebuilt**; current zero proves no increase over any nonnegative base count, not an exact
+  historical count. Unrelated existing compiler/package warnings remain outside this claim.
+- One independent source review completed; its ownership, first-save and partial-effect
+  concerns were addressed or explicitly documented. Import-count preflight initially refused
+  a separate test file (340/339); consolidating into the existing file preserves the 339
+  ratchet rather than weakening it. No live app launch, stop, relaunch or live execution smoke
+  was performed; production window-free execution remains phase B.
+
 ### M9.2 in progress: writer admission, placement, and Send/Stop routing
 
 This is a partial routing milestone, not completion of M9.2 or #1406.
