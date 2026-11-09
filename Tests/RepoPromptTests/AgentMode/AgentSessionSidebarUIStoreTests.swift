@@ -679,9 +679,12 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
 @MainActor
 final class AgentSidebarTabFilterTests: XCTestCase {
     private let base = Date(timeIntervalSince1970: 1_800_000_000)
+    /// Live writer identities are process-global. Independent sidebar fixtures must not
+    /// contend with sessions still draining from another test's view model.
+    private let identityPrefix = String(UUID().uuidString.prefix(24))
 
     private func id(_ value: Int) -> UUID {
-        UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", value))!
+        UUID(uuidString: identityPrefix + String(format: "%012d", value))!
     }
 
     private func row(
@@ -833,9 +836,13 @@ final class AgentSidebarTabFilterTests: XCTestCase {
             XCTAssertEqual(collapseState(viewModel, tabs: tabs), .unavailable, "\(tab) has nothing to fold")
         }
 
-        let threaded = pinnedThreadTabs()
+        var threaded = pinnedThreadTabs()
+        // This second live model is a different fixture, not a replica of the first writer.
+        for index in threaded.indices {
+            threaded[index].activeAgentSessionID = UUID()
+        }
         let threadedModel = makeViewModel()
-        installSessions(for: threaded, on: threadedModel, childParent: id(101))
+        installSessions(for: threaded, on: threadedModel, childParent: threaded[0].activeAgentSessionID)
         XCTAssertEqual(collapseState(threadedModel, tabs: threaded, search: "Parent"), .unavailable)
     }
 

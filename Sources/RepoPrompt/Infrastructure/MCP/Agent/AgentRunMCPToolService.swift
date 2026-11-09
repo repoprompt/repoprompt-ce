@@ -1536,7 +1536,7 @@ struct AgentRunMCPToolService {
         var stopped = false
         var outcomeSnapshot: AgentRunMCPSnapshot?
         if target.pendingStart {
-            admitted = viewModel.withdrawPendingStartForSessionLink(session: target.session, admission: admission)
+            admitted = viewModel.linkExecutionRuntime.withdrawPendingStartForSessionLink(session: target.session, admission: admission)
             if admitted { outcomeSnapshot = viewModel.mcpSnapshot(for: target.session) }
         } else {
             guard let ownership = target.ownership else {
@@ -1557,7 +1557,7 @@ struct AgentRunMCPToolService {
                     }
                 }
             )
-            admitted = await viewModel.cancelAgentRunForSessionLink(
+            admitted = await viewModel.linkExecutionRuntime.cancelAgentRunForSessionLink(
                 session: target.session, admission: admission, outcomeRecorder: recorder,
                 completion: .terminalPublished
             )
@@ -1930,6 +1930,21 @@ struct AgentRunMCPToolService {
         )
     }
 
+    /// An ambiguous read receipt is not evidence that a run terminated. Do not elect a
+    /// context or invent progress; return a non-terminal retry result without enrolling a
+    /// waiter against an arbitrary registration.
+    private func unavailableControlReadSnapshot(sessionID: UUID, agentModeVM: AgentModeViewModel) -> AgentRunMCPSnapshot? {
+        guard case .unavailable = agentModeVM.mcpRuntime.controlRead(sessionID: sessionID) else { return nil }
+        return AgentRunMCPSnapshot(
+            sessionID: sessionID, tabID: nil, sessionName: nil, agentRaw: nil,
+            agentDisplayName: nil, modelRaw: nil, reasoningEffortRaw: nil,
+            status: .running, statusText: "Control read identity is ambiguous. Retry agent_run.wait after the binding is settled.",
+            latestAssistantPreview: nil, interaction: nil, transcriptItemCount: 0,
+            updatedAt: Date(), parentSessionID: nil, failureReason: nil,
+            worktreeBindings: [], activeWorktreeMerges: [], worktreeBindingState: .unknown
+        )
+    }
+
     private func waitForInterestingState(
         sessionID: UUID,
         agentModeVM: AgentModeViewModel,
@@ -1942,6 +1957,11 @@ struct AgentRunMCPToolService {
         liveSnapshot _: AgentRunMCPSnapshot? = nil
     ) async throws -> Value {
         guard let initialCursor = agentModeVM.mcpWaitCursor(sessionID: sessionID) else {
+            if let unavailable = unavailableControlReadSnapshot(sessionID: sessionID, agentModeVM: agentModeVM) {
+                var object = unavailable.asObject()
+                object["_meta"] = .object(["wait_result": .string("unavailable")])
+                return .object(object)
+            }
             throw MCPError.invalidParams(agentRunExpiredHandleRecoveryNote)
         }
         let clock = ContinuousClock()
@@ -2316,6 +2336,14 @@ struct AgentRunMCPToolService {
             sessionIDs.compactMap { agentModeVM.mcpWaitCursor(sessionID: $0) }
         }
         guard !cursors.isEmpty else {
+            for sessionID in sessionIDs {
+                if let unavailable = await unavailableControlReadSnapshot(sessionID: sessionID, agentModeVM: agentModeVM) {
+                    return decoratedMultiWaitValue(
+                        snapshot: unavailable, sessionIDs: sessionIDs, result: "unavailable",
+                        pendingSessionIDs: sessionIDs
+                    )
+                }
+            }
             return decoratedMultiWaitValue(
                 snapshot: Self.agentRunExpiredSnapshot(sessionID: sessionIDs[0]),
                 sessionIDs: sessionIDs,
@@ -3328,7 +3356,8 @@ struct AgentRunMCPToolService {
             return providedSnapshot
         }
         guard let registration else {
-            return Self.agentRunExpiredSnapshot(sessionID: sessionID)
+            return unavailableControlReadSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
+                ?? Self.agentRunExpiredSnapshot(sessionID: sessionID)
         }
         if let liveSnapshot = agentModeVM.mcpSnapshot(registration: registration) {
             return liveSnapshot

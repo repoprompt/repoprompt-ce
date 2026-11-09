@@ -693,7 +693,9 @@ final class AgentMonitorPillPropsTests: XCTestCase {
         XCTAssertTrue(captured.inbound.isEmpty)
         XCTAssertFalse(captured.isOverseer)
 
-        session.beginPersistentBindingTransition()
+        let generation = session.beginPersistentBindingTransition()
+        XCTAssertNil(viewModel.agentSessionLinkObserverEndpoint(tabID: tabID))
+        session.finishPersistentBindingTransition(generation: generation)
         let rebound = try AgentSessionLinkEndpointTestSupport.endpoint(viewModel, tabID: tabID)
         XCTAssertNotEqual(endpoint, rebound)
         XCTAssertEqual(viewModel.currentMonitorPillProps().endpoint, rebound)

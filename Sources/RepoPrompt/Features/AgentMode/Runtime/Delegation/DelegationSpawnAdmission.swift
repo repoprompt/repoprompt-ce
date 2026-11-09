@@ -186,7 +186,7 @@ enum DelegationSpawnAdmission {
         let noToolRepair = "No grant, capability, or session_admin call repairs this."
         switch subreason {
         case "creator_replicated":
-            return "Your session is presented by more than one window or tab, so no single canonical owner can prove which delegation scope counts this creation. Close the duplicate presentation of this session (keep one tab), then retry. \(noToolRepair)"
+            return "Your session has replicated presentations without a unique restored runtime writer, so the delegation scope that counts this creation cannot be proved. An agreeing duplicate presentation is allowed when one runtime writer owns the session. Restore the owning session or resolve its conflicting runtime bindings, then retry. \(noToolRepair)"
         case "creator_ancestry_conflict":
             return "An organizational ancestor of your session has conflicting or unproven placement (a duplicated or stale tab binding), so the delegation scope that counts this creation cannot be proved. Close or resolve that ancestor's conflicting presentation, then retry. \(noToolRepair)"
         default:

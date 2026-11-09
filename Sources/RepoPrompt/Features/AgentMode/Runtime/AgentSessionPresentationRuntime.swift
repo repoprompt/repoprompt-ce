@@ -19,6 +19,8 @@ final class AgentSessionPresentationRuntime {
         let turnFailed: (AgentTabSession, String?) -> Void
         var assistantDelta: ((AgentTabSession, Int, UInt64) -> Void)?
         var derivedTranscript: ((AgentTabSession) -> Void)?
+        var prepareTerminal: ((AgentTabSession) -> Void)?
+        var composerClaim: ((AgentTabSession) -> Void)?
         var binding: ((AgentTabSession) -> Void)?
         var elapsedTime: ((AgentTabSession) -> Void)?
         var runState: ((AgentTabSession) -> Void)?
@@ -27,6 +29,9 @@ final class AgentSessionPresentationRuntime {
         var worktreeOperations: ((AgentTabSession) -> Void)?
         var draftChanged: ((AgentTabSession, String) -> Void)?
         var draftRestored: ((AgentTabSession, AgentComposerDraftRestorationEvent) -> Void)?
+        var modelConfiguration: ((AgentTabSession, AgentModelCatalogRuntime.Selection) -> Void)?
+        var reasoningEffort: ((AgentTabSession) -> Void)?
+        var mcpControl: ((AgentTabSession, Bool) -> Void)?
     }
 
     struct Attachment: Equatable {
@@ -41,6 +46,27 @@ final class AgentSessionPresentationRuntime {
     }
 
     private var entries: [ObjectIdentifier: Entry] = [:]
+    private var activeUISyncSuppressionDepth = 0
+
+    var isActiveUISyncSuppressed: Bool {
+        activeUISyncSuppressionDepth > 0
+    }
+
+    @discardableResult
+    func withActiveUISyncSuppressed<T>(_ body: () throws -> T) rethrows -> T {
+        activeUISyncSuppressionDepth += 1
+        defer { activeUISyncSuppressionDepth -= 1 }
+        return try body()
+    }
+
+    func composerClaimChanged(_ session: AgentTabSession) {
+        sink(for: session)?.composerClaim?(session)
+        requestUIRefresh(for: session, urgent: true)
+    }
+
+    func prepareTerminalPublication(_ session: AgentTabSession) {
+        sink(for: session)?.prepareTerminal?(session)
+    }
 
     func attach(_ session: AgentTabSession, sink: Sink) -> Attachment {
         entries = entries.filter { $0.value.session != nil }
@@ -63,6 +89,10 @@ final class AgentSessionPresentationRuntime {
         sink(for: session)?.assistantDelta?(session, sourceItemsRevision, flushGeneration)
     }
 
+    func mcpControlChanged(_ session: AgentTabSession, controlled: Bool) {
+        sink(for: session)?.mcpControl?(session, controlled)
+    }
+
     func permissionsChanged(_ session: AgentTabSession) {
         sink(for: session)?.permissions?(session)
     }
@@ -77,6 +107,14 @@ final class AgentSessionPresentationRuntime {
 
     func draftRestored(_ session: AgentTabSession, event: AgentComposerDraftRestorationEvent) {
         sink(for: session)?.draftRestored?(session, event)
+    }
+
+    func modelConfigurationChanged(_ session: AgentTabSession, selection: AgentModelCatalogRuntime.Selection) {
+        sink(for: session)?.modelConfiguration?(session, selection)
+    }
+
+    func reasoningEffortChanged(_ session: AgentTabSession) {
+        sink(for: session)?.reasoningEffort?(session)
     }
 
     func oversightBindingChanged(_ session: AgentTabSession) {

@@ -1,8 +1,10 @@
 import Combine
 import Foundation
+import MCP
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptMCPServer
+import RepoPromptShared
 
 struct AgentRunEpochTransitionIntent: Equatable {
     let token: UUID
@@ -13,6 +15,7 @@ struct AgentRunEpochTransitionIntent: Equatable {
 struct AgentMCPControlContext: Equatable {
     let sessionID: UUID
     let activationID: UUID
+    let writerIdentity: AgentSessionRuntimeStore.WriterIdentity
     let registration: AgentRunSessionStore.Registration
     var currentEpoch: AgentRunTurnEpoch?
     var preparedEpoch: AgentRunTurnEpoch?
@@ -25,11 +28,13 @@ struct AgentMCPControlContext: Equatable {
     /// The task label kind for this MCP-controlled run (e.g. explore, engineer).
     /// Used to customize tool advertisement and system prompts for role-specific behavior.
     let taskLabelKind: AgentModelCatalog.TaskLabelKind?
+    let autoEditOverride: ApplyEditsApprovalStore.AutoEditOverride?
 
     func replacingRegistration(_ registration: AgentRunSessionStore.Registration) -> Self {
         Self(
             sessionID: sessionID,
             activationID: activationID,
+            writerIdentity: writerIdentity,
             registration: registration,
             currentEpoch: currentEpoch,
             preparedEpoch: preparedEpoch,
@@ -39,7 +44,8 @@ struct AgentMCPControlContext: Equatable {
             suppressUserNotifications: suppressUserNotifications,
             forceAutoEditEnabled: forceAutoEditEnabled,
             autoEditEnabledBeforeOverride: autoEditEnabledBeforeOverride,
-            taskLabelKind: taskLabelKind
+            taskLabelKind: taskLabelKind,
+            autoEditOverride: autoEditOverride
         )
     }
 }
@@ -49,47 +55,261 @@ struct AgentMCPControlContext: Equatable {
 /// attachment is not required to build snapshots, wake waiters or publish a committed turn.
 @MainActor
 final class AgentSessionMCPRuntime {
+    /// Boxed storage preserves the runtime-sized task-local contract (#1039).
+    nonisolated static let epochTransitionToken = BoxedTaskLocal<UUID?>(nil)
+
+    #if DEBUG
+        var test_afterEpochBegan: (@MainActor () async -> Void)?
+        var test_afterMCPControlActivation: (@MainActor (AgentTabSession) async -> Void)?
+        var test_afterMCPControlRegistration: (@MainActor (UUID) async -> Void)?
+        var test_afterMCPControlSetupAwait: (@MainActor (AgentTabSession) async -> Void)?
+        var test_afterMCPControlDetached: (@MainActor (AgentTabSession) async -> Void)?
+    #endif
+
+    enum ControlActivationOwnership {
+        case resident
+        case installed(context: AgentMCPControlContext, generation: UInt64)
+
+        @MainActor
+        func matches(_ session: AgentTabSession) -> Bool {
+            switch self {
+            case .resident:
+                AgentModeViewModel.isMCPResidentAppOwned(session)
+            case let .installed(context, generation):
+                session.mcpControlContext == context && session.mcpControlActivationGeneration == generation
+            }
+        }
+    }
+
+    /// Only selects an exact receipt for teardown. This deliberately does not grant a
+    /// writer: an abandoned context must remain removable after its claim was superseded.
+    func controlSessionForTeardown(sessionID: UUID) -> AgentTabSession? {
+        guard let scope else { return nil }
+        let matches = scope.sessions.values.filter { $0.mcpControlContext?.sessionID == sessionID }
+        return matches.count == 1 ? matches.first : nil
+    }
+
+    /// Control provenance and live writer uniqueness are independent fences. Even an
+    /// unbound copied context preserves the existing local ambiguity veto.
+    func controlledWriter(sessionID: UUID) -> AgentSessionRuntimeStore.Writer? {
+        guard let scope, let session = controlSessionForTeardown(sessionID: sessionID),
+              let context = session.mcpControlContext,
+              context.writerIdentity.sessionID == sessionID,
+              context.registration.sessionID == sessionID else { return nil }
+        return scope.originatingWriter(identity: context.writerIdentity, session: session)
+    }
+
+    enum ControlReadResolution {
+        case available(AgentTabSession)
+        case unavailable
+        case expired
+
+        var session: AgentTabSession? {
+            if case let .available(session) = self { return session }
+            return nil
+        }
+    }
+
+    /// Select only the context installed on this exact claim, not an unbound copy or a
+    /// replacement incarnation. Conflicting write claims do not expire an existing read receipt.
+    func controlRead(sessionID: UUID, registration: AgentRunSessionStore.Registration? = nil) -> ControlReadResolution {
+        guard let scope else { return .expired }
+        let matches = scope.sessions.values.filter { session in
+            guard let context = session.mcpControlContext,
+                  context.sessionID == sessionID, context.writerIdentity.sessionID == sessionID,
+                  context.registration.sessionID == sessionID,
+                  registration == nil || context.registration == registration else { return false }
+            return scope.matchesControlReadIdentity(context.writerIdentity, session: session)
+        }
+        guard matches.count <= 1 else { return .unavailable }
+        return matches.first.map(ControlReadResolution.available) ?? .expired
+    }
+
+    func registration(sessionID: UUID) -> AgentRunSessionStore.Registration? {
+        controlRead(sessionID: sessionID).session?.mcpControlContext?.registration
+    }
+
+    func waitCursor(sessionID: UUID) -> AgentRunSessionStore.WaitCursor? {
+        guard let context = controlRead(sessionID: sessionID).session?.mcpControlContext else { return nil }
+        return .init(registration: context.registration, epoch: context.currentEpoch)
+    }
+
+    func setFollowUpRunPending(sessionID: UUID, _ pending: Bool) {
+        guard let writer = controlledWriter(sessionID: sessionID),
+              writer.session.mcpFollowUpRunPending != pending else { return }
+        if pending {
+            guard case .success = writer.admitCommand() else { return }
+        }
+        writer.session.mcpFollowUpRunPending = pending
+        handleObservedMCPStateChange(for: writer.session)
+    }
+
+    struct StagedEpochTransition {
+        let writer: AgentSessionRuntimeStore.Writer
+        let activationID: UUID
+        let registration: AgentRunSessionStore.Registration
+        let token: UUID
+    }
+
+    func stageEpochTransition(
+        command: AgentSessionRuntimeStore.Command, kind: AgentRunEpochTransitionKind
+    ) -> StagedEpochTransition? {
+        let writer = command.writer
+        guard writer.scope === scope, command.isCurrent,
+              var context = writer.session.mcpControlContext,
+              context.writerIdentity == writer.identity,
+              context.sessionID == writer.identity.sessionID,
+              context.registration.sessionID == writer.identity.sessionID else { return nil }
+        let token = UUID()
+        context.pendingEpochTransition = .init(token: token, kind: kind, expectedCurrentEpoch: context.currentEpoch)
+        writer.session.mcpControlContext = context
+        return .init(writer: writer, activationID: context.activationID, registration: context.registration, token: token)
+    }
+
+    /// Cleanup belongs to the originating receipt, not a fresh session-ID lookup. Retirement
+    /// may drain an admitted operation, but a reacquired writer or replacement activation must
+    /// never have its pending transition cleared by the old operation's failure.
+    func clearStagedEpochTransition(_ staged: StagedEpochTransition) {
+        let writer = staged.writer
+        guard writer.scope === scope,
+              writer.isCurrent || writer.scope.sessions[writer.session.tabID] !== writer.session,
+              writer.session.currentRestorationBindingToken == writer.identity.restoration,
+              var context = writer.session.mcpControlContext,
+              context.writerIdentity == writer.identity,
+              context.activationID == staged.activationID, context.registration == staged.registration,
+              context.preparedEpoch == nil, context.pendingEpochTransition?.token == staged.token else { return }
+        context.pendingEpochTransition = nil
+        writer.session.mcpControlContext = context
+    }
+
+    func withEpochTransition<T>(
+        command: AgentSessionRuntimeStore.Command, kind: AgentRunEpochTransitionKind,
+        operation: () async throws -> T
+    ) async throws -> T {
+        guard let staged = stageEpochTransition(command: command, kind: kind) else {
+            throw MCPError.invalidParams("The requested agent run is no longer active.")
+        }
+        do {
+            return try await Self.epochTransitionToken.withValue(staged.token) {
+                try await operation()
+            }
+        } catch {
+            clearStagedEpochTransition(staged)
+            throw error
+        }
+    }
+
+    /// The runtime supplies execution/cancellation; a presenter is never required to prepare
+    /// a controlled turn. Ordinary non-MCP starts do not construct provider resources.
+    @discardableResult
+    func prepareWaitTrackingForRunStart(session: AgentTabSession, stopFence: AgentRunStartStopFence) async -> Bool {
+        guard let context = session.mcpControlContext else { return true }
+        guard let scope, let sessionID = session.activeAgentSessionID,
+              case let .unique(writer) = scope.resolveWriter(sessionID: sessionID),
+              writer.scope === scope, writer.session === session,
+              case let .success(command) = writer.admitCommand(),
+              context.writerIdentity == writer.identity,
+              context.sessionID == sessionID, context.registration.sessionID == sessionID,
+              stopFence.permitsStart(of: session), !session.runState.isActive,
+              let execution = scope.execution else { return false }
+        if context.preparedEpoch != nil { return true }
+        #if DEBUG
+            let afterEpoch = test_afterEpochBegan
+        #else
+            let afterEpoch: (@MainActor () async -> Void)? = nil
+        #endif
+        await prepareRunEpoch(
+            session: session, stopFence: stopFence,
+            transitionToken: Self.epochTransitionToken.get(), store: AgentRunSessionStore.shared,
+            cancelInstalledRun: { exact in
+                await execution.cancelRun(tabID: exact.tabID, session: exact, intent: .runtimeShutdown, completion: .terminalTeardownCompleted)
+            },
+            afterEpochBegan: afterEpoch
+        )
+        // An accepted epoch may have been acknowledged for the originating object after
+        // Stop or retirement. That acknowledgement is not permission to dispatch a turn.
+        return command.isCurrent && stopFence.permitsStart(of: session)
+            && session.mcpControlContext?.writerIdentity == writer.identity
+            && session.mcpControlContext?.activationID == context.activationID
+            && session.mcpControlContext?.preparedEpoch != nil
+    }
+
+    /// Provider-initiated turns use the same exact writer and domain epoch as host starts.
+    /// A successful domain acknowledgement does not authorize a superseded adoption.
+    func prepareClaudeProviderEpoch(command: AgentSessionRuntimeStore.Command, fence: AgentRunStartStopFence) async -> Bool {
+        let writer = command.writer
+        let session = writer.session
+        guard writer.scope === scope, command.isCurrent, fence.permitsStart(of: session), !Task.isCancelled else { return false }
+        guard let original = session.mcpControlContext else {
+            session.mcpFollowUpRunPending = true
+            handleObservedMCPStateChange(for: session)
+            return command.isCurrent
+        }
+        let activation = session.mcpControlActivationGeneration
+        /// Persistent ownership and control-context routing are separate checks. An unbound
+        /// object with a copied control context must still veto an otherwise unique writer.
+        func isCurrentControl() -> Bool {
+            command.isCurrent && !Task.isCancelled && fence.permitsStart(of: session)
+                && session.mcpControlActivationGeneration == activation
+                && session.mcpControlContext?.writerIdentity == writer.identity
+                && session.mcpControlContext?.activationID == original.activationID
+                && writer.scope.sessions.values.count(where: { $0.mcpControlContext?.sessionID == original.sessionID }) == 1
+        }
+        guard isCurrentControl(), original.writerIdentity == writer.identity, original.sessionID == writer.identity.sessionID,
+              original.registration.sessionID == writer.identity.sessionID else { return false }
+        session.mcpFollowUpRunPending = true
+        handleObservedMCPStateChange(for: session)
+        guard isCurrentControl() else { return false }
+        if original.preparedEpoch == nil {
+            do {
+                try await withEpochTransition(command: command, kind: .relatedFollowUp) {
+                    guard await self.prepareWaitTrackingForRunStart(session: session, stopFence: fence) else { throw CancellationError() }
+                }
+            } catch { return false }
+        }
+        guard isCurrentControl(), let context = session.mcpControlContext,
+              let prepared = context.preparedEpoch, context.currentEpoch == prepared else { return false }
+        let storeEpoch = await AgentRunSessionStore.currentEpoch(for: context.registration)
+        guard isCurrentControl() else { return false }
+        let snapshot = await AgentRunSessionStore.snapshot(for: context.registration)
+        guard isCurrentControl(), session.mcpControlContext?.registration == context.registration,
+              session.mcpControlContext?.preparedEpoch == prepared,
+              session.mcpControlContext?.currentEpoch == prepared,
+              storeEpoch == prepared, snapshot?.status.isTerminal != true,
+              prepared.activationID == context.activationID,
+              prepared.registrationGeneration == context.registration.generation else { return false }
+        return true
+    }
+
     /// The domain registration owns this capability before control is published. It retains
     /// the exact runtime scope, not its optional presenter, until domain cleanup/drain releases it.
     /// A cancellation delivered during setup prevents publication; one delivered afterwards
     /// joins the existing run service's teardown, never a replacement session's run.
     @MainActor
     final class ControlActivationCancellation {
-        private let scope: AgentSessionRuntimeStore.Scope
-        private let session: AgentTabSession
-        private let binding: AgentSessionRestorationBindingToken?
+        private let writer: AgentSessionRuntimeStore.Writer
+        private var session: AgentTabSession {
+            writer.session
+        }
+
         private let activationID: UUID
         private let activationGeneration: UInt64
         private let cancelInstalledRun: (AgentTabSession) async -> Void
         private(set) var cancellationRequested = false
 
         init(
-            scope: AgentSessionRuntimeStore.Scope, session: AgentTabSession,
+            writer: AgentSessionRuntimeStore.Writer,
             activationID: UUID, cancelInstalledRun: @escaping (AgentTabSession) async -> Void
         ) {
-            self.scope = scope
-            self.session = session
-            binding = session.currentRestorationBindingToken
+            self.writer = writer
             self.activationID = activationID
-            activationGeneration = session.mcpControlActivationGeneration
+            activationGeneration = writer.session.mcpControlActivationGeneration
             self.cancelInstalledRun = cancelInstalledRun
         }
 
         var permitsPublication: Bool {
-            !cancellationRequested && !scope.isRetiring && isCurrent
-        }
-
-        private var isCurrent: Bool {
-            ownsPersistentIncarnation
-                && session.currentRestorationBindingToken == binding
-                && !session.bindingTransitionInProgress
+            !cancellationRequested && !writer.scope.isRetiring && writer.isCurrent
                 && session.mcpControlActivationGeneration == activationGeneration
-        }
-
-        private var ownsPersistentIncarnation: Bool {
-            !scope.hasReleasedWriterClaims
-                && scope.sessions[session.tabID] === session
-                && binding != nil && session.persistentSessionBindingIdentity == binding?.bindingIdentity
         }
 
         func cancel(registration: AgentRunSessionStore.Registration) async {
@@ -97,15 +317,77 @@ final class AgentSessionMCPRuntime {
             // An installed run still needs its drain while deactivation/binding preparation is
             // in progress. Do not require setup's transition generation, but never cross into a
             // replacement persistent binding, even when its UUIDs or context were copied.
-            guard ownsPersistentIncarnation,
+            guard writer.ownsPersistentClaim,
                   session.activeAgentSessionID == registration.sessionID,
                   let context = session.mcpControlContext,
+                  context.writerIdentity == writer.identity,
                   context.activationID == activationID,
                   context.registration == registration
             else { return }
             AgentSessionInteractionRuntime.cancelPendingInstruction(for: session)
             await cancelInstalledRun(session)
         }
+    }
+
+    struct ControlRegistration {
+        let registration: AgentRunSessionStore.Registration
+        let generation: UInt64
+        let cancellation: ControlActivationCancellation
+    }
+
+    /// Registration and its cancellation receipt are one runtime-owned operation. The domain
+    /// store retains the originating writer before suspension; setup never acquires a successor.
+    func registerControlActivation(
+        command: AgentSessionRuntimeStore.Command, activationID: UUID,
+        revalidateAdmission: () throws -> Void
+    ) async throws -> ControlRegistration {
+        let writer = command.writer
+        guard writer.scope === scope, command.isCurrent, let execution = writer.scope.execution else {
+            throw MCPError.invalidParams("The requested agent session writer changed before MCP control activation.")
+        }
+        try revalidateAdmission()
+        let session = writer.session
+        session.mcpControlCleanupTask?.cancel()
+        session.mcpControlActivationGeneration &+= 1
+        let generation = session.mcpControlActivationGeneration
+        let cancellation = ControlActivationCancellation(writer: writer, activationID: activationID) { exact in
+            await execution.cancelRun(
+                tabID: exact.tabID, session: exact,
+                intent: .runtimeShutdown, completion: .terminalTeardownCompleted
+            )
+        }
+        let handler: DomainAgentRunSessionStore.RegistrationCancellationHandler = { registration in
+            await cancellation.cancel(registration: registration)
+        }
+        let registration: AgentRunSessionStore.Registration
+        switch await AgentRunSessionStore.claimResumableSession(
+            sessionID: writer.identity.sessionID, cancellationHandler: handler
+        ) {
+        case let .accepted(claimed):
+            registration = claimed
+        case .unavailable, .alreadyActive:
+            try revalidateAdmission()
+            guard command.isCurrent, cancellation.permitsPublication else {
+                throw MCPError.invalidParams("The MCP control activation was cancelled or superseded during registration.")
+            }
+            registration = await AgentRunSessionStore.register(
+                sessionID: writer.identity.sessionID, cancellationHandler: handler
+            )
+        case .shuttingDown:
+            throw MCPError.internalError("The Agent session runtime is shutting down and cannot activate a control session.")
+        }
+        guard registration.generation != 0 else {
+            throw MCPError.internalError("The Agent session runtime is shutting down and cannot activate a control session.")
+        }
+        do { try revalidateAdmission() } catch {
+            await AgentRunSessionStore.cleanup(registration: registration)
+            throw error
+        }
+        guard command.isCurrent, cancellation.permitsPublication else {
+            await AgentRunSessionStore.cleanup(registration: registration)
+            throw MCPError.invalidParams("The MCP control activation was cancelled or superseded during registration.")
+        }
+        return .init(registration: registration, generation: generation, cancellation: cancellation)
     }
 
     /// Prepare the existing domain epoch without a presentation owner. Recovery installs its
@@ -118,10 +400,15 @@ final class AgentSessionMCPRuntime {
         cancelInstalledRun: @escaping @MainActor (AgentTabSession) async -> Void,
         afterEpochBegan: (@MainActor () async -> Void)? = nil
     ) async {
-        guard let scope, !scope.isRetiring, !scope.hasReleasedWriterClaims, scope.sessions[session.tabID] === session else { return }
-        defer { withExtendedLifetime(scope) {} }
+        guard let scope, let sessionID = session.activeAgentSessionID,
+              case let .unique(writer) = scope.resolveWriter(sessionID: sessionID),
+              writer.scope === scope, writer.session === session,
+              case let .success(command) = writer.admitCommand() else { return }
+        defer { withExtendedLifetime(command) {} }
         guard stopFence.permitsStart(of: session), !session.runState.isActive,
-              let originalContext = session.mcpControlContext
+              let originalContext = session.mcpControlContext,
+              originalContext.writerIdentity == writer.identity,
+              originalContext.sessionID == sessionID, originalContext.registration.sessionID == sessionID
         else { return }
         if originalContext.preparedEpoch != nil {
             return
@@ -156,15 +443,16 @@ final class AgentSessionMCPRuntime {
         // results are eligible for missing-record recovery through registerIfMissing.
         if case .rejected = result {
             let cancellation = ControlActivationCancellation(
-                scope: scope, session: session, activationID: originalContext.activationID,
+                writer: writer, activationID: originalContext.activationID,
                 cancelInstalledRun: cancelInstalledRun
             )
             recoveryCancellation = cancellation
             // Control activation already requires a persistent incarnation. An unbound or
             // retiring projection cannot recover a missing registration as a new writer.
-            guard stopFence.permitsStart(of: session),
+            guard command.isCurrent, stopFence.permitsStart(of: session),
                   session.mcpControlActivationGeneration == activationGeneration,
                   let context = session.mcpControlContext,
+                  context.writerIdentity == originalContext.writerIdentity,
                   context.activationID == originalContext.activationID,
                   context.registration == originalContext.registration,
                   context.currentEpoch == originalContext.currentEpoch,
@@ -176,9 +464,10 @@ final class AgentSessionMCPRuntime {
             else {
                 return
             }
-            guard cancellation.permitsPublication, stopFence.permitsStart(of: session),
+            guard command.isCurrent, cancellation.permitsPublication, stopFence.permitsStart(of: session),
                   session.mcpControlActivationGeneration == activationGeneration,
                   let context = session.mcpControlContext,
+                  context.writerIdentity == originalContext.writerIdentity,
                   context.activationID == originalContext.activationID,
                   context.registration == originalContext.registration,
                   context.currentEpoch == originalContext.currentEpoch
@@ -195,14 +484,17 @@ final class AgentSessionMCPRuntime {
             )
         }
         await afterEpochBegan?()
-        // Preserve an already-admitted original epoch even if presentation/scope membership
-        // changed during the actor hop. Only new recovery control requires publication admission.
+        // Preserve an already-admitted epoch on a detached original object. A still-installed
+        // object must retain its writer incarnation: release/reacquisition is a successor even
+        // when the binding token was copied. Recovery additionally requires control admission.
         guard recoveryCancellation?.permitsPublication != false,
+              writer.isCurrent || scope.sessions[session.tabID] !== session,
               case let .accepted(epoch) = result,
               stopFence.binding == session.persistentSessionBindingIdentity,
               !session.bindingTransitionInProgress,
               session.mcpControlActivationGeneration == activationGeneration,
               var context = session.mcpControlContext,
+              context.writerIdentity == originalContext.writerIdentity,
               context.activationID == originalContext.activationID,
               context.registration == originalContext.registration,
               context.currentEpoch == originalContext.currentEpoch || context.currentEpoch == epoch
@@ -224,8 +516,7 @@ final class AgentSessionMCPRuntime {
         session.mcpControlContext = context
         // An accepted epoch belongs to this binding even if Stop won during the actor hop.
         // Retain it unconsumed for the next start; never leave the store ahead of its owner.
-        guard scope.sessions[session.tabID] === session, !scope.hasReleasedWriterClaims,
-              !scope.isRetiring, stopFence.permitsStart(of: session), !Task.isCancelled else { return }
+        guard command.isCurrent, stopFence.permitsStart(of: session), !Task.isCancelled else { return }
         session.mcpFollowUpRunPendingUpdatedAt = Date()
         if !session.mcpFollowUpRunPending {
             session.mcpFollowUpRunPending = true
@@ -240,6 +531,22 @@ final class AgentSessionMCPRuntime {
 
     private weak var scope: AgentSessionRuntimeStore.Scope?
     var metadata: Metadata?
+    /// Recovery claims are runtime state. The workspace check remains a read-only resource
+    /// input until the window-free catalog host is installed; it never selects a writer.
+    var outstandingProvisionalTargets: [UUID: AgentModeViewModel.MCPSessionTarget] = [:]
+    var workspaceHasProvisionalClaim: ((UUID, UUID) -> Bool)?
+
+    func settledSession(for writer: AgentSessionRuntimeStore.Writer) -> AgentTabSession? {
+        guard writer.scope === scope, writer.isCurrent,
+              workspaceHasProvisionalClaim?(writer.identity.workspaceID, writer.identity.sessionID) != true,
+              !outstandingProvisionalTargets.values.contains(where: { target in
+                  target.sessionID == writer.identity.sessionID
+                      && target.recoveryClaim?.state != .accepted
+                      && target.recoveryClaim?.state != .complete
+              }) else { return nil }
+        return writer.session
+    }
+
     /// Retains the actual mapping projection, never its presentation model. Cleanup
     /// shares this storage; transport and owner-availability fences reject stale maps.
     private var runRoute: (id: Int, bindings: MCPRunRouteBindings)?
@@ -315,6 +622,33 @@ final class AgentSessionMCPRuntime {
         canonicalFailureReason: AgentRunMCPSnapshot.FailureReason? = nil
     ) -> AgentRunMCPSnapshot? {
         guard let context = session.mcpControlContext else { return nil }
+        if canonicalTerminalState == nil {
+            guard let writer = controlledWriter(sessionID: context.sessionID),
+                  writer.session === session, writer.isCurrent else { return nil }
+        }
+        return buildSnapshot(
+            for: session, context: context, canonicalTerminalState: canonicalTerminalState,
+            canonicalProviderRunID: canonicalProviderRunID, canonicalFailureReason: canonicalFailureReason,
+            mayClearStaleMasks: true
+        )
+    }
+
+    func mcpReadSnapshot(for session: AgentTabSession) -> AgentRunMCPSnapshot? {
+        guard let context = session.mcpControlContext,
+              controlRead(sessionID: context.sessionID, registration: context.registration).session === session else { return nil }
+        let writer = controlledWriter(sessionID: context.sessionID)
+        return buildSnapshot(
+            for: session, context: context, canonicalTerminalState: nil,
+            canonicalProviderRunID: nil, canonicalFailureReason: nil,
+            mayClearStaleMasks: writer?.session === session && writer?.isCurrent == true
+        )
+    }
+
+    private func buildSnapshot(
+        for session: AgentTabSession, context: AgentMCPControlContext,
+        canonicalTerminalState: AgentSessionRunState?, canonicalProviderRunID: UUID?,
+        canonicalFailureReason: AgentRunMCPSnapshot.FailureReason?, mayClearStaleMasks: Bool
+    ) -> AgentRunMCPSnapshot {
         let interaction = canonicalTerminalState == nil ? mcpPendingInteraction(for: session) : nil
         let status: AgentRunMCPSnapshot.Status = {
             if let canonicalTerminalState {
@@ -364,7 +698,7 @@ final class AgentSessionMCPRuntime {
             let supersedingMaskIsStale = session.pendingSupersedingTurnCompletions > 0
                 && session.pendingSupersedingTurnCompletionsUpdatedAt.map { now.timeIntervalSince($0) > 15 } == true
             if let terminalStatus,
-               context.currentEpoch != nil,
+               mayClearStaleMasks, context.currentEpoch != nil,
                followUpMaskIsStale || supersedingMaskIsStale,
                session.agentTask == nil,
                session.pendingInstructions.isEmpty,
@@ -883,15 +1217,16 @@ final class AgentSessionMCPRuntime {
         activationID: UUID,
         registration: AgentRunSessionStore.Registration
     ) -> Bool {
-        guard let session = scope?.sessions[tabID],
-              let context = session.mcpControlContext
+        guard let writer = controlledWriter(sessionID: sessionID), writer.isCurrent,
+              writer.session.tabID == tabID,
+              let context = writer.session.mcpControlContext
         else {
             return false
         }
         return context.sessionID == sessionID
             && context.activationID == activationID
             && context.registration == registration
-            && session.activeAgentSessionID == sessionID
+            && writer.identity.sessionID == sessionID
     }
 
     func handleObservedMCPStateChange(
@@ -1164,6 +1499,50 @@ final class AgentSessionMCPRuntime {
         }
         delegatedAgentRunOracleReviewContextsByKey[key] = delegated
         return delegated
+    }
+
+    /// Detach this exact receipt synchronously. All suspension below names only resources
+    /// owned by that receipt, never the session-ID occupant found after an actor hop.
+    @discardableResult
+    func deactivateControlContext(
+        session: AgentTabSession, expectedContext: AgentMCPControlContext,
+        approvalStore: ApplyEditsApprovalStore, cleanupRegistration: Bool,
+        requireInactive: Bool = false
+    ) async -> Bool {
+        guard let scope, scope.sessions[session.tabID] === session,
+              session.mcpControlContext == expectedContext,
+              // Preserve the old scope-local control ambiguity veto until context identity
+              // routing replaces it. A copied context must not release the original's resources.
+              scope.sessions.values.count(where: { $0.mcpControlContext?.sessionID == expectedContext.sessionID }) == 1,
+              !requireInactive || !session.runState.isActive else { return false }
+        mcpRemoveAgentRunOracleReviewContexts(sessionID: expectedContext.sessionID)
+        codexCoordinator?.handleMCPControlReset(
+            for: session, reason: "Codex queued follow-up was cancelled because MCP control was deactivated."
+        )
+        session.mcpControlActivationGeneration &+= 1
+        let generation = session.mcpControlActivationGeneration
+        session.mcpControlCleanupTask?.cancel()
+        session.mcpControlCleanupTask = nil
+        session.mcpFollowUpRunPending = false
+        if expectedContext.forceAutoEditEnabled {
+            session.autoEditEnabled = expectedContext.autoEditEnabledBeforeOverride
+        }
+        session.mcpControlContext = nil
+        session.permissionProfile = .userConfigured
+        scope.presentation.mcpControlChanged(session, controlled: false)
+        scope.presentation.permissionsChanged(session)
+        #if DEBUG
+            await test_afterMCPControlDetached?(session)
+        #endif
+        if let receipt = expectedContext.autoEditOverride {
+            await approvalStore.releaseAutoEditOverride(receipt)
+        }
+        await AgentRunSessionStore.removeCancellationHandler(registration: expectedContext.registration)
+        if cleanupRegistration { await AgentRunSessionStore.cleanup(registration: expectedContext.registration) }
+        return scope.sessions[session.tabID] === session
+            && session.mcpControlActivationGeneration == generation
+            && session.mcpControlContext == nil
+            && !session.runState.isActive
     }
 
     func mcpRemoveAgentRunOracleReviewContexts(sessionID: UUID) {

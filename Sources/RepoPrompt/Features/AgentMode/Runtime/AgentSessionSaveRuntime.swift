@@ -36,6 +36,9 @@ enum AgentSessionSaveRuntime {
     }
 
     struct Receipt {
+        /// Exact command/query incarnation that earned this durable acknowledgement.
+        /// Kept even after retirement so consumers cannot credit a successor writer.
+        let writerIdentity: AgentSessionRuntimeStore.WriterIdentity
         let payload: AgentSession
         let binding: AgentSessionRestorationBindingToken
         let acknowledgedCreation: Bool
@@ -137,6 +140,6 @@ enum AgentSessionSaveRuntime {
         session.lastUserMessageAt = payload.lastUserMessageAt
         // The caller can publish index/presentation effects before reporting the terminal
         // durable phase. The receipt is exact; a returned file URL by itself is insufficient.
-        return .committed(Receipt(payload: payload, binding: binding, acknowledgedCreation: acknowledgedCreation))
+        return .committed(Receipt(writerIdentity: writer.identity, payload: payload, binding: binding, acknowledgedCreation: acknowledgedCreation))
     }
 }

@@ -53,7 +53,7 @@ final class AgentRepromptSessionLinkIsolationTests: XCTestCase {
     func testManagedInboundTargetReplacementRestoresLocalReviewOriginal() async throws {
         let fixture = try await AgentRepromptTestFixture()
         defer { fixture.cleanUp() }
-        _ = fixture.viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: fixture.session)
+        try fixture.installPersistentWriter()
         fixture.session.hasLoadedPersistedState = true
         fixture.session.recordRestorationAuthoritative(.persistedPayloadApplied)
         fixture.session.installRunID(UUID())

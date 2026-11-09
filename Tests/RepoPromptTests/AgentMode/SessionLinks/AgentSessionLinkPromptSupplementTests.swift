@@ -3754,7 +3754,9 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         )
 
         // Same tab, same session UUID, new binding generation.
-        fixture.session.beginPersistentBindingTransition()
+        let generation = fixture.session.beginPersistentBindingTransition()
+        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        fixture.session.finishPersistentBindingTransition(generation: generation)
         let after = try AgentSessionLinkEndpointTestSupport.endpoint(
             fixture.viewModel,
             tabID: fixture.tabID
@@ -3846,7 +3848,9 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
             to: before
         )
 
-        fixture.session.beginPersistentBindingTransition()
+        let generation = fixture.session.beginPersistentBindingTransition()
+        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        fixture.session.finishPersistentBindingTransition(generation: generation)
         let after = try AgentSessionLinkEndpointTestSupport.endpoint(
             fixture.viewModel,
             tabID: fixture.tabID
@@ -3886,7 +3890,9 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
             before
         )
 
-        fixture.session.beginPersistentBindingTransition()
+        let generation = fixture.session.beginPersistentBindingTransition()
+        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        fixture.session.finishPersistentBindingTransition(generation: generation)
         let after = try AgentSessionLinkEndpointTestSupport.endpoint(
             fixture.viewModel,
             tabID: fixture.tabID
@@ -4526,7 +4532,9 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
             fixture.viewModel,
             tabID: fixture.tabID
         )
-        fixture.session.beginPersistentBindingTransition()
+        let generation = fixture.session.beginPersistentBindingTransition()
+        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        fixture.session.finishPersistentBindingTransition(generation: generation)
         let after = try AgentSessionLinkEndpointTestSupport.endpoint(
             fixture.viewModel,
             tabID: fixture.tabID
@@ -4560,7 +4568,9 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
             tabID: fixture.tabID
         )
 
-        fixture.session.beginPersistentBindingTransition()
+        let generation = fixture.session.beginPersistentBindingTransition()
+        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        fixture.session.finishPersistentBindingTransition(generation: generation)
         let currentEndpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
             fixture.viewModel,
             tabID: fixture.tabID

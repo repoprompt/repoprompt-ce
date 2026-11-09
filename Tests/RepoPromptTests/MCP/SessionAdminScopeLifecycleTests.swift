@@ -6060,7 +6060,11 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         // A genuinely loaded duplicate is still ambiguous, even when its session ID matches.
         let duplicate = AgentModeViewModel.TabSession(tabID: fixture.tab)
         second.agentModeViewModel.test_installLiveSession(duplicate)
-        _ = try XCTUnwrap(second.agentModeViewModel.test_installPersistentSessionBinding(sessionID: fixture.overseer, on: duplicate))
+        XCTAssertEqual(second.agentModeViewModel.test_bindingRejection(sessionID: fixture.overseer, on: duplicate), .conflictingWriter)
+        XCTAssertNil(second.agentModeViewModel.test_installPersistentSessionBinding(sessionID: fixture.overseer, on: duplicate))
+        XCTAssertNil(duplicate.persistentSessionBindingIdentity)
+        // Exercise legacy corruption only after proving ordinary writer admission refuses it.
+        duplicate.testInstallPersistentSessionBinding(sessionID: fixture.overseer)
         XCTAssertNil(AgentSessionAdministrationFrontDoor.liveExplicitBinding(forTab: fixture.tab))
         await fixture.approveAndApply(cardID)
         XCTAssertEqual(cardState(), .pending)
@@ -7339,6 +7343,10 @@ final class DelegationCommitFenceTests: XCTestCase {
         await second.workspaceManager.awaitInitialized()
         let requester = UUID()
         let catalogTab = ComposeTabState(name: "Catalog-only requester", activeAgentSessionID: requester)
+        var originalWorkspace = WorkspaceModel(name: "Original requester", repoPaths: [], isSavedWorkspace: false)
+        originalWorkspace.isEphemeral = true
+        originalWorkspace.composeTabs = [catalogTab]
+        first.workspaceManager.workspaces.append(originalWorkspace)
         let tab = catalogTab.id
         let session = AgentModeViewModel.TabSession(tabID: tab)
         first.agentModeViewModel.test_installLiveSession(session)
@@ -7380,17 +7388,29 @@ final class DelegationCommitFenceTests: XCTestCase {
         XCTAssertEqual(runtime.requests[request.id]?.state, .pending)
         XCTAssertFalse(runtime.hasLiveScope(grantedTo: requester))
 
+        let originalBinding = try XCTUnwrap(first.agentModeViewModel.test_installPersistentSessionBinding(sessionID: requester, on: session))
+        guard case let .unique(originalWriter) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: requester) else {
+            return XCTFail("The original presenter must have the exact writer")
+        }
         let otherSession = AgentModeViewModel.TabSession(tabID: tab)
         second.agentModeViewModel.test_installLiveSession(otherSession)
-        _ = try XCTUnwrap(second.agentModeViewModel.test_installPersistentSessionBinding(sessionID: requester, on: otherSession))
+        XCTAssertEqual(second.agentModeViewModel.test_bindingRejection(sessionID: requester, on: otherSession), .conflictingWriter)
+        XCTAssertNil(second.agentModeViewModel.test_installPersistentSessionBinding(sessionID: requester, on: otherSession))
+        XCTAssertNil(otherSession.persistentSessionBindingIdentity)
+        XCTAssertNil(otherSession.activeAgentSessionID)
+        XCTAssertEqual(session.persistentSessionBindingIdentity, originalBinding)
+        XCTAssertTrue(originalWriter.isCurrent, "refusal cannot replace or invalidate the originating writer")
+        guard case let .unique(currentWriter) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: requester) else {
+            return XCTFail("The refused presenter must leave no claim")
+        }
+        XCTAssertEqual(currentWriter.identity, originalWriter.identity)
+        XCTAssertTrue(currentWriter.session === session)
         windows = [second]
         XCTAssertFalse(approve(in: second), "matching IDs in a different physical window are not the presented request")
-        windows = [first]
-        _ = try XCTUnwrap(first.agentModeViewModel.test_installPersistentSessionBinding(sessionID: requester, on: session))
         windows = [first, second]
-        XCTAssertFalse(approve(in: first), "ambiguous cross-window tab ownership fails closed")
-        windows = [first]
-        XCTAssertTrue(approve(in: first), "the original physical window's current explicit binding can approve")
+        XCTAssertFalse(approve(in: second), "a refused second presenter cannot approve")
+        XCTAssertEqual(runtime.requests[request.id]?.state, .pending)
+        XCTAssertTrue(approve(in: first), "the original physical window's current explicit binding can approve despite a metadata replica")
         XCTAssertTrue(runtime.hasLiveScope(grantedTo: requester))
     }
 

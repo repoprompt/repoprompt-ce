@@ -94,13 +94,15 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
     }
 
     func testStartupRetainsExactScopeAndRefusesChangesAcrossPreparationWithoutPresentation() async throws {
-        for change in ["entryRefusal", "stop", "replacement", "binding", "retirement", "workspace"] {
+        for change in ["entryRefusal", "entryWorkspace", "stop", "replacement", "binding", "retirement", "reacquired", "workspace"] {
             var f: Fixture? = try fixture()
             let session = try XCTUnwrap(f).session
             let startup = try XCTUnwrap(f).scope.startup
             let links = try XCTUnwrap(f).runtime
+            try XCTUnwrap(f).scope.mcp.test_afterEpochBegan = { XCTFail("Changed preparation must not publish a new epoch") }
             weak let owner = try XCTUnwrap(f).scope
             var workspaceID = try XCTUnwrap(f).endpoint.workspaceID
+            if change == "entryWorkspace" { workspaceID = UUID() }
             let gate = AutoWakeCatalogAuthorityGate()
             let outcome = AgentRunStartOutcomeRecorder()
             let item = AgentChatItem.user("Retained original input", sequenceIndex: session.nextSequenceIndex)
@@ -119,16 +121,16 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 commitCreation: { _ in XCTFail("Changed preparation must not acknowledge creation")
                     return false
                 },
-                prepareEpoch: { _, _ in XCTFail("Changed preparation must not publish a new epoch") },
                 providerSwitchRefusal: { _ in "Provider switch pending" },
-                prepareProviderSwitch: { _, _, _ in XCTFail("Unexpected switch preparation")
+                input: AgentSessionProviderInputRuntime(skillCatalog: AgentSkillCatalog()),
+                workspacePaths: { XCTFail("Changed preparation must not augment input")
+                    return []
+                },
+                inputWorkspace: { _ in XCTFail("Changed preparation must not capture input resources")
                     return nil
                 },
-                augment: { text, _, _, _, _, _ in XCTFail("Changed preparation must not augment input")
-                    return text
-                },
-                initialMessage: { _, text in XCTFail("Changed preparation must not build initial context")
-                    return text
+                initialThreadInput: { _ in XCTFail("Changed preparation must not build initial context")
+                    return nil
                 },
                 composition: { preconditionFailure("Changed preparation must not construct execution") }
             )
@@ -140,8 +142,8 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                     claudeCoordinator: coordinator, links: links, environment: environment
                 )
             }
-            if change == "entryRefusal" {
-                owner?.beginRetirement()
+            if change == "entryRefusal" || change == "entryWorkspace" {
+                if change == "entryRefusal" { owner?.beginRetirement() }
                 _ = await task.value
                 f = nil
                 XCTAssertFalse(session.hasLocalComposerCandidate(itemID: item.id, fence: candidateFence))
@@ -159,7 +161,12 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                     tabID: session.tabID, sessionID: XCTUnwrap(session.activeAgentSessionID), workspaceID: workspaceID
                 ))
             case "retirement": owner?.beginRetirement()
-            default: workspaceID = UUID()
+            case "workspace": workspaceID = UUID()
+            default:
+                let binding = session.currentRestorationBindingToken
+                owner?.replaceSessions([:])
+                owner?.replaceSessions([session.tabID: session])
+                XCTAssertEqual(session.currentRestorationBindingToken, binding, "Claim reacquisition alone invalidates preparation")
             }
             f = nil
             XCTAssertNotNil(owner, "An in-flight preparation owns its scope, not a presentation")
@@ -172,50 +179,128 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         }
     }
 
-    func testStartupDoesNotAcknowledgeAReboundAttemptAfterInputSuspension() async throws {
+    func testBoundStartupKeepsWriterAcrossAuthoritativeRestoration() async throws {
         let f = try fixture()
         let session = f.session
-        let gate = AutoWakeCatalogAuthorityGate()
-        let outcome = AgentRunStartOutcomeRecorder()
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: f.endpoint.sessionID, workspaceID: f.endpoint.workspaceID))
+        XCTAssertFalse(session.permitsBoundOperationAndSave)
+        guard case let .unique(writer) = f.scope.resolveWriter(sessionID: f.endpoint.sessionID) else {
+            return XCTFail("A bound writer exists before hydration")
+        }
         var preparations = 0
-        var epochs = 0
-        let environment = AgentSessionRunStartRuntime.Environment(
+        var starts = 0
+        session.pendingHandoff = .init(payload: "<forked_session>Admitted continuity</forked_session>", createdAt: Date())
+        let outcome = AgentRunStartOutcomeRecorder()
+        var environment = AgentSessionRunStartRuntime.Environment(
             currentWorkspaceID: { f.endpoint.workspaceID },
-            prepareSession: { _ in preparations += 1 },
+            prepareSession: { exact in
+                preparations += 1
+                exact.recordRestorationAuthoritative(.persistedPayloadApplied)
+                XCTAssertTrue(writer.isCurrent, "Hydration keeps the admitted incarnation")
+            },
             availabilityFailure: { _ in nil },
             bindSession: { .init(sessionID: $0.activeAgentSessionID!, creation: nil) },
-            commitCreation: { _ in XCTFail("Already persisted identity must not claim new creation")
+            commitCreation: { _ in XCTFail("Existing writer is not a creation")
                 return false
             },
-            prepareEpoch: { _, _ in epochs += 1 },
-            providerSwitchRefusal: { _ in "Provider switch pending" },
-            prepareProviderSwitch: { _, _, _ in XCTFail("Unexpected switch preparation")
-                return nil
-            },
-            augment: { text, _, _, _, _, _ in _ = await gate.requirement()
-                return text
-            },
-            initialMessage: { _, text in text },
-            composition: { preconditionFailure("A rebound attempt must not construct execution") }
+            providerSwitchRefusal: { _ in "Unexpected switch" },
+            input: AgentSessionProviderInputRuntime(skillCatalog: AgentSkillCatalog()),
+            workspacePaths: { [] }, inputWorkspace: { _ in nil }, initialThreadInput: { _ in nil },
+            composition: { preconditionFailure("The test intercepts provider dispatch") }
         )
-        let coordinator = ClaudeAgentModeCoordinator(windowID: 401, workspacePathProvider: { _ in nil })
-        let task = Task {
-            await f.scope.startup.start(
-                session: session, initialMessage: "Stale augmented input", startOutcome: outcome,
-                claudeCoordinator: coordinator, links: f.runtime, environment: environment
-            )
+        environment.test_startOverride = { _, user, initial in
+            starts += 1
+            XCTAssertTrue(user.contains("<forked_session>Admitted continuity</forked_session>"))
+            XCTAssertEqual(initial, user)
+            return true
         }
-        await gate.waitUntilEntered()
+        _ = await f.scope.startup.start(
+            session: session, initialMessage: "Hydrated input", startOutcome: outcome,
+            claudeCoordinator: .init(windowID: 401, workspacePathProvider: { _ in nil }),
+            links: f.runtime, environment: environment
+        )
         XCTAssertEqual(preparations, 2)
-        XCTAssertEqual(epochs, 1)
-        try session.installPersistentSessionBinding(.init(
-            tabID: session.tabID, sessionID: XCTUnwrap(session.activeAgentSessionID), workspaceID: f.endpoint.workspaceID
-        ))
-        await gate.open()
-        _ = await task.value
-        XCTAssertFalse(outcome.outcome.didStart)
-        XCTAssertNil(session.activeRunOwnership)
-        XCTAssertTrue(session.items.isEmpty)
+        XCTAssertEqual(starts, 1)
+        XCTAssertTrue(outcome.outcome.didStart)
+        XCTAssertTrue(writer.isCurrent)
+        XCTAssertTrue(session.pendingHandoff.isStagedForSend)
+    }
+
+    func testStartupDoesNotAcknowledgeAReboundAttemptAfterInputSuspension() async throws {
+        for change in ["binding", "reacquired", "workspace", "retirement", "stop"] {
+            let f = try fixture()
+            let session = f.session
+            let gate = AutoWakeCatalogAuthorityGate()
+            let outcome = AgentRunStartOutcomeRecorder()
+            var preparations = 0
+            var workspaceID = f.endpoint.workspaceID
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("RuntimeStartInput-\(UUID().uuidString)")
+            let skill = root.appendingPathComponent(".agents/skills/writer-proof")
+            try FileManager.default.createDirectory(at: skill, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            try "Use the admitted writer".write(to: skill.appendingPathComponent("SKILL.md"), atomically: true, encoding: .utf8)
+            let catalog = AgentSkillCatalog(homeDirectoryURL: root.appendingPathComponent("home"))
+            catalog.test_beforePublish = { _ = await gate.requirement() }
+            session.pendingHandoff = .init(payload: "<forked_session>Retained continuity</forked_session>", createdAt: Date())
+            XCTAssertNil(session.mcpControlContext, "This ordinary start has no MCP epoch to prepare")
+            f.scope.mcp.test_afterEpochBegan = { XCTFail("An ordinary start must not create an MCP epoch") }
+            let environment = AgentSessionRunStartRuntime.Environment(
+                currentWorkspaceID: { workspaceID },
+                prepareSession: { _ in preparations += 1 },
+                availabilityFailure: { _ in nil },
+                bindSession: { .init(sessionID: $0.activeAgentSessionID!, creation: nil) },
+                commitCreation: { _ in XCTFail("Already persisted identity must not claim new creation")
+                    return false
+                },
+                providerSwitchRefusal: { _ in "Provider switch pending" },
+                input: AgentSessionProviderInputRuntime(skillCatalog: catalog),
+                workspacePaths: { [root.path] },
+                inputWorkspace: { _ in XCTFail("Stale discovery cannot capture successor workspace resources")
+                    return nil
+                },
+                initialThreadInput: { _ in XCTFail("Stale augmentation cannot proceed to initial-message preparation")
+                    return nil
+                },
+                composition: { preconditionFailure("A rebound attempt must not construct execution") }
+            )
+            let coordinator = ClaudeAgentModeCoordinator(windowID: 401, workspacePathProvider: { _ in nil })
+            let task = Task {
+                await f.scope.startup.start(
+                    session: session, initialMessage: "Stale augmented input", startOutcome: outcome,
+                    claudeCoordinator: coordinator, links: f.runtime, environment: environment
+                )
+            }
+            await gate.waitUntilEntered()
+            XCTAssertEqual(preparations, 2)
+            XCTAssertNil(session.mcpControlContext, "Passing epoch preparation must not create control for an ordinary start")
+            switch change {
+            case "reacquired":
+                let binding = session.currentRestorationBindingToken
+                f.scope.replaceSessions([:])
+                f.scope.replaceSessions([session.tabID: session])
+                XCTAssertEqual(session.currentRestorationBindingToken, binding)
+            case "workspace": workspaceID = UUID()
+            case "retirement": f.scope.beginRetirement()
+            case "stop": session.stopState.invalidateScheduledStarts()
+            default:
+                try session.installPersistentSessionBinding(.init(
+                    tabID: session.tabID, sessionID: XCTUnwrap(session.activeAgentSessionID), workspaceID: f.endpoint.workspaceID
+                ))
+            }
+            session.mcpFollowUpRunPending = true
+            await gate.open()
+            _ = await task.value
+            XCTAssertFalse(outcome.outcome.didStart)
+            XCTAssertNil(session.activeRunOwnership)
+            XCTAssertTrue(session.items.isEmpty)
+            XCTAssertEqual(session.mcpFollowUpRunPending, change == "binding" || change == "reacquired", "Only the originating writer may clear its pending marker")
+            XCTAssertFalse(session.pendingHandoff.isStagedForSend, "Suspended input cannot mutate handoff after \(change)")
+            XCTAssertTrue(session.pendingHandoff.hasPayload)
+            XCTAssertNil(catalog.resolve(name: "writer-proof"), "Stale discovery must not publish the catalog")
+            catalog.test_beforePublish = nil
+            await catalog.refresh(workspacePaths: [root.path], agentKind: session.selectedAgent)
+            XCTAssertNotNil(catalog.resolve(name: "writer-proof"), "The refused scan had a real discoverable skill")
+        }
     }
 
     func testFollowUpProducerRetainsScopeAndJoinsBeforeWriterReleaseWithoutPresentation() async throws {
@@ -391,18 +476,12 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             windowID: 401, workspaceID: workspaceID, tabID: session.tabID, sessionID: sessionID,
             persistentBindingGeneration: binding.generation, bindingTransitionGeneration: session.bindingTransitionGeneration
         )
-        let runtime = scope.makeLinkExecution(commands: .init(
+        let runtime = scope.makeLinkExecution(routeID: endpoint.windowID, commands: .init(
             isAvailable: isAvailable,
-            endpoint: { [weak scope, weak session] tabID in
-                onEndpointRead()
-                guard let session, scope?.sessions[tabID] === session,
-                      session.persistentSessionBindingIdentity == binding,
-                      session.bindingTransitionGeneration == endpoint.bindingTransitionGeneration else { return nil }
-                return endpoint
-            },
+            modelAvailability: { .init() },
             workspaceID: { _ in workspaceID },
-            augment: { _, input, _, _, _ in input },
-            initialMessage: { _, input in input },
+            input: scope.providerInput(skillCatalog: AgentSkillCatalog(), perfRecorder: NoopAgentModePerfRecorder()),
+            workspacePaths: { [] }, inputWorkspace: { _ in nil }, initialThreadInput: { _ in nil },
             modelDisplayName: { $0.selectedModelRaw },
             start: { session, text, _, outcome, _ in
                 if let start { await start(session, text, outcome) }
@@ -410,35 +489,9 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 return nil
             },
             settleSelfCompact: { session in XCTAssertNil(session.selfCompactState.active) },
-            selfCompactBlocksWake: { $0.selfCompactState.blocksAutomaticWake },
-            composerTarget: { [weak session] _, _ in
-                guard workspace != nil, let session else { return nil }
-                return AgentComposerSubmitTarget(
-                    tabID: session.tabID, route: .existingAgentSession,
-                    expectedSourceTabSessionIdentity: ObjectIdentifier(session),
-                    expectedSourceAgentSessionID: sessionID, expectedPersistentBindingIdentity: binding,
-                    expectedBindingTransitionGeneration: session.bindingTransitionGeneration,
-                    expectedRunState: session.runState, expectedRunID: session.runID,
-                    expectedRunAttemptID: session.activeRunAttemptID,
-                    expectedSubmissionToken: session.composerSubmissionToken, expectedInitialStartLocation: nil
-                )
-            },
-            claimComposer: { [weak session] attempt in
-                guard let session, session.activeComposerSubmitAttempt == nil else { return nil }
-                session.activeComposerSubmitAttempt = attempt
-                return AgentSessionComposerSubmitClaim(attempt: attempt, sourceSession: session, draftMutationGeneration: session.draftMutationGeneration)
-            },
-            composerIsCurrent: { [weak scope] claim in
-                scope?.sessions[claim.sourceSession.tabID] === claim.sourceSession
-                    && claim.sourceSession.persistentSessionBindingIdentity == claim.attempt.target.expectedPersistentBindingIdentity
-                    && claim.sourceSession.activeComposerSubmitAttempt?.id == claim.attempt.id
-            },
-            releaseComposer: { claim in
-                guard claim.sourceSession.activeComposerSubmitAttempt?.id == claim.attempt.id else { return false }
-                claim.sourceSession.activeComposerSubmitAttempt = nil
-                return true
-            }
+            selfCompactBlocksWake: { $0.selfCompactState.blocksAutomaticWake }
         ), diagnostics: NoopAgentSessionLinkCatalogEventSink())
+        runtime.test_endpointRead = onEndpointRead
         if let workspace {
             scope.persistence.composition = .init(
                 workspace: { workspace }, workspaceWithID: { $0 == workspace.id ? workspace : nil },
@@ -553,7 +606,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         try await f.scope.persistence.flushSaveRequired(for: f.session.tabID, workspaceID: workspace.id).get()
         let target = try XCTUnwrap(f.runtime.makeComposerSubmitTarget(tabID: f.session.tabID, session: f.session))
         let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "")
-        let claim = try XCTUnwrap(f.runtime.commands.claimComposer(attempt))
+        let claim = try XCTUnwrap(f.runtime.claimComposerSubmitAttempt(attempt))
         f.scope.beginRetirement()
         XCTAssertFalse(f.scope.releaseWriterClaimsAfterDrain(), "An admitted send claim is still owned work")
         XCTAssertTrue(f.runtime.releaseComposerSubmitClaim(claim))
@@ -1367,11 +1420,27 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             attempt.compactTurnSucceeded = true
             attempt.noteDispatchStarted = loss == "attemptedForeign"
             fixture.session.selfCompactState = AgentSelfCompactState(active: attempt)
+            let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
             let competingWriter = loss == "competingWriter" ? fixture.viewModel.session(for: UUID()) : nil
+            // Deliberately bypass normal binding admission to exercise corrupted competing claims.
             competingWriter?.testInstallPersistentSessionBinding(sessionID: fixture.sessionID)
             defer { competingWriter?.testInstallPersistentSessionBinding(sessionID: nil) }
             XCTAssertEqual(owner.matchesLocalBinding(fixture.session), loss != "localGeneration", loss)
             XCTAssertEqual(fixture.viewModel.agentSelfCompactBlocksNotificationWake(fixture.session), loss != "currentOwner", loss)
+            if loss == "competingWriter" {
+                XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+                fixture.viewModel.agentSessionLinkPublishPromptInventory(
+                    Self.inventory(observerSessionID: fixture.sessionID, revision: .max, targetCount: 1), to: endpoint
+                )
+                fixture.viewModel.agentSessionLinkReconcilePeriodicWake(for: endpoint)
+                XCTAssertEqual(fixture.session.selfCompactState.active, attempt, "No writer may mutate a conflicted session")
+                XCTAssertNil(fixture.session.selfCompactState.latest)
+                XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+                // Inventory is a retained authority projection, not writer admission. Even a newer
+                // cached publication cannot mutate the conflicted session or schedule provider input.
+                XCTAssertEqual(fixture.viewModel.agentSessionLinkPromptInventoryBySessionID[fixture.sessionID]?.inventory.linkSetRevision, .max)
+                continue
+            }
             try publishInventory(fixture, revision: 1)
             try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
             if loss == "currentOwner" || loss == "attemptedForeign" {

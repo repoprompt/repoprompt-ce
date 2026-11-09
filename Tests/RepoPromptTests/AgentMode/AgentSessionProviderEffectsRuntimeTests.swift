@@ -388,6 +388,7 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
             let session = AgentTabSession(tabID: UUID())
             let id = UUID(), activationID = UUID()
             session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: id, workspaceID: UUID()))
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
             scope.replaceSessions([session.tabID: session])
             let original = await store.register(sessionID: id)
             await store.cleanup(registration: original)
@@ -400,11 +401,11 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
                 }
                 XCTAssertNil(admitted)
             }
-            session.mcpControlContext = .init(
-                sessionID: id, activationID: activationID, registration: original,
+            session.mcpControlContext = try .init(
+                sessionID: id, activationID: activationID, writerIdentity: controlWriterIdentity(for: session, scope: scope), registration: original,
                 currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
                 originatingConnectionID: nil, interactionTransport: .mcp(sessionID: id, originatingConnectionID: nil),
-                suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: nil
+                suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: nil, autoEditOverride: nil
             )
             let foreignStore = makeCancellationStore()
             await scope.mcp.prepareRunEpoch(
@@ -465,14 +466,15 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
         let session = AgentTabSession(tabID: UUID())
         let id = UUID()
         session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: id, workspaceID: UUID()))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
         scope.replaceSessions([session.tabID: session])
         let original = await store.register(sessionID: id)
         await store.cleanup(registration: original)
-        session.mcpControlContext = .init(
-            sessionID: id, activationID: UUID(), registration: original,
+        session.mcpControlContext = try .init(
+            sessionID: id, activationID: UUID(), writerIdentity: controlWriterIdentity(for: session, scope: scope), registration: original,
             currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
             originatingConnectionID: nil, interactionTransport: .mcp(sessionID: id, originatingConnectionID: nil),
-            suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: nil
+            suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: nil, autoEditOverride: nil
         )
         await scope.mcp.prepareRunEpoch(
             session: session, stopFence: .init(session: session), transitionToken: nil, store: store,
@@ -490,19 +492,20 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
         _ = await store.shutdown()
     }
 
-    func testAcceptedOriginalEpochIsReconciledAfterScopeMembershipChanges() async {
+    func testAcceptedOriginalEpochIsReconciledAfterScopeMembershipChanges() async throws {
         let store = makeCancellationStore()
         let scope = AgentSessionRuntimeStore().makeScope()
         let session = AgentTabSession(tabID: UUID())
         let id = UUID()
         session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: id, workspaceID: UUID()))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
         scope.replaceSessions([session.tabID: session])
         let original = await store.register(sessionID: id)
-        session.mcpControlContext = .init(
-            sessionID: id, activationID: UUID(), registration: original,
+        session.mcpControlContext = try .init(
+            sessionID: id, activationID: UUID(), writerIdentity: controlWriterIdentity(for: session, scope: scope), registration: original,
             currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
             originatingConnectionID: nil, interactionTransport: .mcp(sessionID: id, originatingConnectionID: nil),
-            suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: nil
+            suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: nil, autoEditOverride: nil
         )
         await scope.mcp.prepareRunEpoch(
             session: session, stopFence: .init(session: session), transitionToken: nil, store: store,
@@ -518,6 +521,200 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
         _ = await store.shutdown()
     }
 
+    func testControlContextCannotAuthorizeAReacquiredClaimOrCopiedObject() async throws {
+        let f = try await makeFixture()
+        let original = try XCTUnwrap(f.scope.mcp.controlledWriter(sessionID: f.sessionID))
+        let context = try XCTUnwrap(f.session.mcpControlContext)
+        XCTAssertEqual(context.writerIdentity, original.identity)
+        XCTAssertEqual(context.replacingRegistration(f.registration).writerIdentity, original.identity)
+        XCTAssertNotNil(f.scope.mcp.registration(sessionID: f.sessionID))
+
+        let copy = AgentTabSession(tabID: UUID())
+        copy.mcpControlContext = context
+        f.scope.replaceSessions([f.session.tabID: f.session, copy.tabID: copy])
+        XCTAssertTrue(original.isCurrent, "An unbound copy is not a persistent writer")
+        XCTAssertNil(f.scope.mcp.controlledWriter(sessionID: f.sessionID), "Control ambiguity still vetoes routing")
+        XCTAssertEqual(
+            f.scope.mcp.registration(sessionID: f.sessionID),
+            context.registration,
+            "An unbound copy cannot hide the exact installed read receipt"
+        )
+        XCTAssertNotNil(f.scope.mcp.mcpReadSnapshot(for: f.session))
+        XCTAssertNil(f.scope.mcp.mcpReadSnapshot(for: copy))
+        f.scope.replaceSessions([f.session.tabID: f.session])
+        XCTAssertNotNil(f.scope.mcp.controlledWriter(sessionID: f.sessionID))
+
+        let binding = f.session.currentRestorationBindingToken
+        f.scope.replaceSessions([:])
+        XCTAssertNil(f.scope.mcp.registration(sessionID: f.sessionID), "A released claim really is expired")
+        XCTAssertNil(f.scope.mcp.waitCursor(sessionID: f.sessionID))
+        XCTAssertNil(f.scope.mcp.mcpReadSnapshot(for: f.session))
+        f.scope.replaceSessions([f.session.tabID: f.session])
+        guard case let .unique(successor) = f.scope.resolveWriter(sessionID: f.sessionID),
+              case let .success(command) = successor.admitCommand() else { return XCTFail("Expected the new writer") }
+        XCTAssertEqual(f.session.currentRestorationBindingToken, binding)
+        XCTAssertNotEqual(successor.identity, context.writerIdentity)
+        XCTAssertNil(f.scope.mcp.controlledWriter(sessionID: f.sessionID))
+        XCTAssertNil(f.scope.mcp.registration(sessionID: f.sessionID))
+        XCTAssertNil(f.scope.mcp.waitCursor(sessionID: f.sessionID))
+        XCTAssertNil(f.scope.mcp.mcpSnapshot(for: f.session))
+        XCTAssertNil(f.scope.mcp.mcpReadSnapshot(for: f.session), "Reads cannot adopt a superseded control incarnation")
+        XCTAssertFalse(f.scope.mcp.mcpControlContextMatches(tabID: f.session.tabID, sessionID: f.sessionID, activationID: context.activationID, registration: f.registration))
+        f.scope.mcp.setFollowUpRunPending(sessionID: f.sessionID, true)
+        XCTAssertFalse(f.session.mcpFollowUpRunPending)
+        XCTAssertNil(f.scope.mcp.stageEpochTransition(command: command, kind: .relatedFollowUp))
+        f.session.runState = .completed
+        await f.scope.mcp.prepareRunEpoch(
+            session: f.session, stopFence: .init(session: f.session), transitionToken: nil,
+            store: AgentRunSessionStore.shared,
+            cancelInstalledRun: { _ in XCTFail("The stale context cannot acquire new cancellation ownership") },
+            afterEpochBegan: { XCTFail("A fresh command does not adopt an old control context") }
+        )
+        XCTAssertEqual(f.session.mcpControlContext, context)
+        let epoch = await AgentRunSessionStore.currentEpoch(for: f.registration)
+        XCTAssertEqual(epoch, f.epoch)
+        let stale = try XCTUnwrap(f.scope.mcp.controlSessionForTeardown(sessionID: f.sessionID))
+        let removed = await f.scope.mcp.deactivateControlContext(
+            session: stale, expectedContext: context, approvalStore: ApplyEditsApprovalStore(),
+            cleanupRegistration: true, requireInactive: true
+        )
+        XCTAssertTrue(removed, "Teardown can release the obsolete receipt without admitting new work")
+        XCTAssertNil(f.session.mcpControlContext)
+        let registration = await AgentRunSessionStore.currentRegistration(for: f.sessionID)
+        XCTAssertNil(registration)
+        let ordinaryStart = await f.scope.mcp.prepareWaitTrackingForRunStart(session: f.session, stopFence: .init(session: f.session))
+        XCTAssertTrue(ordinaryStart, "A removed stale context must not permanently block ordinary starts")
+    }
+
+    func testOriginControlLookupSurvivesRetirementAndBindingPreparationButNotNewWork() async throws {
+        let f = try await makeFixture()
+        let writer = try XCTUnwrap(f.scope.mcp.controlledWriter(sessionID: f.sessionID))
+        f.scope.mcp.setFollowUpRunPending(sessionID: f.sessionID, true)
+        XCTAssertTrue(f.session.mcpFollowUpRunPending)
+        f.scope.beginRetirement()
+        f.scope.mcp.setFollowUpRunPending(sessionID: f.sessionID, false)
+        XCTAssertFalse(f.session.mcpFollowUpRunPending, "Originating cleanup drains retirement")
+        XCTAssertEqual(f.scope.mcp.controlledWriter(sessionID: f.sessionID)?.identity, writer.identity)
+        f.scope.mcp.setFollowUpRunPending(sessionID: f.sessionID, true)
+        XCTAssertFalse(f.session.mcpFollowUpRunPending)
+        _ = f.session.beginPersistentBindingTransition()
+        XCTAssertTrue(writer.ownsPersistentClaim)
+        f.session.mcpFollowUpRunPending = true
+        f.scope.mcp.setFollowUpRunPending(sessionID: f.sessionID, false)
+        XCTAssertFalse(f.session.mcpFollowUpRunPending, "Originating cleanup drains binding preparation")
+        XCTAssertEqual(f.scope.mcp.controlledWriter(sessionID: f.sessionID)?.identity, writer.identity)
+        XCTAssertEqual(
+            f.scope.mcp.registration(sessionID: f.sessionID),
+            f.registration,
+            "An originating control read survives binding preparation"
+        )
+        XCTAssertEqual(f.scope.mcp.waitCursor(sessionID: f.sessionID)?.registration, f.registration)
+        XCTAssertNotNil(f.scope.mcp.mcpReadSnapshot(for: f.session))
+        XCTAssertNil(f.scope.mcp.mcpSnapshot(for: f.session), "Publication still requires the current writer")
+    }
+
+    func testStagedEpochCleanupUsesOriginatingWriterAndTransitionReceipt() async throws {
+        for change in ["retiring", "detached", "reacquired", "rebound", "successor", "prepared"] {
+            let f = try await makeFixture()
+            guard case let .unique(writer) = f.scope.resolveWriter(sessionID: f.sessionID),
+                  case let .success(command) = writer.admitCommand() else { return XCTFail("Expected an admitted writer") }
+            let staged = try XCTUnwrap(f.scope.mcp.stageEpochTransition(command: command, kind: .steering))
+            XCTAssertEqual(f.session.mcpControlContext?.pendingEpochTransition?.token, staged.token)
+            var successorToken: UUID?
+            switch change {
+            case "retiring": f.scope.beginRetirement()
+            case "detached": f.scope.replaceSessions([:])
+            case "reacquired":
+                f.scope.replaceSessions([:])
+                f.scope.replaceSessions([f.session.tabID: f.session])
+            case "rebound":
+                f.session.installPersistentSessionBinding(.init(tabID: f.session.tabID, sessionID: f.sessionID, workspaceID: writer.identity.workspaceID))
+            case "successor":
+                successorToken = try XCTUnwrap(f.scope.mcp.stageEpochTransition(command: command, kind: .relatedFollowUp)).token
+            default: f.session.mcpControlContext?.preparedEpoch = f.epoch
+            }
+            f.scope.mcp.clearStagedEpochTransition(staged)
+            if change == "retiring" || change == "detached" {
+                XCTAssertNil(f.session.mcpControlContext?.pendingEpochTransition, "Admitted cleanup must drain: \(change)")
+            } else {
+                XCTAssertEqual(f.session.mcpControlContext?.pendingEpochTransition?.token, successorToken ?? staged.token, change)
+            }
+            if change != "successor", change != "prepared" {
+                XCTAssertNil(f.scope.mcp.stageEpochTransition(command: command, kind: .steering), "Stale commands cannot stage: \(change)")
+            }
+        }
+    }
+
+    func testEpochTransitionTaskLocalAndFailureCleanupAreRuntimeOwned() async throws {
+        enum Refusal: Error { case refused }
+        let f = try await makeFixture()
+        guard case let .unique(writer) = f.scope.resolveWriter(sessionID: f.sessionID),
+              case let .success(command) = writer.admitCommand() else { return XCTFail("Expected an admitted writer") }
+        XCTAssertNil(AgentSessionMCPRuntime.epochTransitionToken.get())
+        do {
+            try await f.scope.mcp.withEpochTransition(command: command, kind: .steering) {
+                let token = try XCTUnwrap(AgentSessionMCPRuntime.epochTransitionToken.get())
+                XCTAssertEqual(f.session.mcpControlContext?.pendingEpochTransition?.token, token)
+                f.scope.beginRetirement()
+                throw Refusal.refused
+            }
+            XCTFail("Expected the originating error")
+        } catch Refusal.refused {}
+        XCTAssertNil(f.session.mcpControlContext?.pendingEpochTransition)
+        XCTAssertNil(AgentSessionMCPRuntime.epochTransitionToken.get())
+        XCTAssertTrue(writer.isCurrent, "Retirement does not suppress originating cleanup")
+    }
+
+    func testEpochAdmissionAndAcknowledgementCannotCrossWriterIncarnations() async throws {
+        for refusal in ["unrestored", "retiring", "conflict", "reacquired"] {
+            let domain = makeCancellationStore()
+            let writers = AgentSessionRuntimeStore()
+            let scope = writers.makeScope()
+            let session = scope.makeSession(tabID: UUID())
+            let id = UUID(), workspaceID = UUID()
+            session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: id, workspaceID: workspaceID))
+            if refusal != "unrestored" { session.recordRestorationAuthoritative(.persistedPayloadApplied) }
+            scope.replaceSessions([session.tabID: session])
+            let registration = await domain.register(sessionID: id)
+            session.mcpControlContext = try .init(
+                sessionID: id, activationID: UUID(), writerIdentity: controlWriterIdentity(for: session, scope: scope), registration: registration,
+                currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
+                originatingConnectionID: nil, interactionTransport: .mcp(sessionID: id, originatingConnectionID: nil),
+                suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: nil, autoEditOverride: nil
+            )
+            let competitor = writers.makeScope()
+            if refusal == "retiring" { scope.beginRetirement() }
+            if refusal == "conflict" {
+                let replica = competitor.makeSession(tabID: UUID())
+                // Deliberately model a legacy competing claim; normal binding admission refuses it.
+                replica.installPersistentSessionBinding(.init(tabID: replica.tabID, sessionID: id, workspaceID: workspaceID))
+                competitor.replaceSessions([replica.tabID: replica])
+            }
+            var admitted = 0
+            await scope.mcp.prepareRunEpoch(
+                session: session, stopFence: .init(session: session), transitionToken: nil, store: domain,
+                cancelInstalledRun: { _ in XCTFail("An existing registration must not be recovered") },
+                afterEpochBegan: {
+                    admitted += 1
+                    XCTAssertEqual(refusal, "reacquired")
+                    let binding = session.currentRestorationBindingToken
+                    scope.replaceSessions([:])
+                    scope.replaceSessions([session.tabID: session])
+                    XCTAssertEqual(session.currentRestorationBindingToken, binding, "Only the runtime claim changed")
+                }
+            )
+            XCTAssertEqual(admitted, refusal == "reacquired" ? 1 : 0, refusal)
+            let durableEpoch = await domain.currentEpoch(for: registration)
+            XCTAssertEqual(durableEpoch != nil, refusal == "reacquired", refusal)
+            XCTAssertNil(session.mcpControlContext?.preparedEpoch, "Never publish into a successor claim: \(refusal)")
+            XCTAssertNil(session.mcpControlContext?.currentEpoch)
+            XCTAssertFalse(session.mcpFollowUpRunPending)
+            withExtendedLifetime(competitor) {}
+            await domain.cleanup(registration: registration)
+            _ = await domain.shutdown()
+        }
+    }
+
     func testRegistrationRetainsExactRuntimeCancellationUntilCleanupWithoutPresentation() async throws {
         let store = makeCancellationStore()
         var scope: AgentSessionRuntimeStore.Scope? = AgentSessionRuntimeStore().makeScope()
@@ -529,19 +726,27 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
         var cancellations = 0
         let registration: AgentRunSessionStore.Registration
         do {
-            let capability = try AgentSessionMCPRuntime.ControlActivationCancellation(
-                scope: XCTUnwrap(scope), session: session, activationID: activationID
+            guard case let .unique(writer) = try XCTUnwrap(scope).resolveWriter(sessionID: sessionID) else {
+                return XCTFail("Expected an exclusive cancellation writer")
+            }
+            let capability = AgentSessionMCPRuntime.ControlActivationCancellation(
+                writer: writer, activationID: activationID
             ) { exact in
                 XCTAssertIdentical(exact, session)
                 cancellations += 1
             }
+            session.hasLoadedPersistedState = true
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            session.isDirty = true
+            XCTAssertTrue(writer.isCurrent, "Hydration/readiness and dirty projections do not rotate the live claim")
+            XCTAssertTrue(capability.permitsPublication)
             registration = await store.register(sessionID: sessionID) { await capability.cancel(registration: $0) }
         }
-        session.mcpControlContext = .init(
-            sessionID: sessionID, activationID: activationID, registration: registration,
+        session.mcpControlContext = try .init(
+            sessionID: sessionID, activationID: activationID, writerIdentity: controlWriterIdentity(for: session, scope: scope), registration: registration,
             currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
             originatingConnectionID: nil, interactionTransport: .mcp(sessionID: sessionID, originatingConnectionID: nil),
-            suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: nil
+            suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: nil, autoEditOverride: nil
         )
         session.waitingPrompt = "Waiting for exact runtime cancellation"
         scope = nil
@@ -568,12 +773,51 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
         _ = await store.shutdown()
     }
 
+    func testControlCancellationRequiresTheOriginalExclusiveClaim() async throws {
+        for introduceConflict in [false, true] {
+            let f = try await makeFixture()
+            guard case let .unique(writer) = f.scope.resolveWriter(sessionID: f.registration.sessionID) else {
+                return XCTFail("Expected original writer")
+            }
+            var cancellations = 0
+            let capability = try AgentSessionMCPRuntime.ControlActivationCancellation(
+                writer: writer, activationID: XCTUnwrap(f.session.mcpControlContext).activationID
+            ) { _ in cancellations += 1 }
+            XCTAssertTrue(capability.permitsPublication)
+            let binding = f.session.currentRestorationBindingToken
+            let originalSessions = f.scope.sessions
+            if introduceConflict {
+                // Normal admission refuses this claim. Inject only to exercise legacy corruption.
+                let replica = f.scope.makeSession(tabID: UUID())
+                XCTAssertEqual(f.scope.bindingRejection(f.registration.sessionID, on: replica), .conflictingWriter)
+                replica.installPersistentSessionBinding(.init(
+                    tabID: replica.tabID, sessionID: f.registration.sessionID, workspaceID: writer.identity.workspaceID
+                ))
+                f.scope.replaceSessions(originalSessions.merging([replica.tabID: replica]) { original, _ in original })
+            } else {
+                let sessions = f.scope.sessions
+                f.scope.replaceSessions([:])
+                f.scope.replaceSessions(sessions)
+            }
+            XCTAssertEqual(f.session.currentRestorationBindingToken, binding)
+            XCTAssertFalse(capability.permitsPublication)
+            f.session.waitingPrompt = "Do not cancel successor work"
+            await capability.cancel(registration: f.registration)
+            XCTAssertEqual(cancellations, 0)
+            XCTAssertEqual(f.session.waitingPrompt, "Do not cancel successor work")
+            f.scope.replaceSessions(originalSessions)
+        }
+    }
+
     func testPendingActivationCancellationDoesNotCancelPreviouslyInstalledControl() async throws {
         let f = try await makeFixture()
         let previous = f.session.mcpControlContext
         var cancellations = 0
+        guard case let .unique(writer) = f.scope.resolveWriter(sessionID: f.registration.sessionID) else {
+            return XCTFail("Expected an exclusive cancellation writer")
+        }
         let pending = AgentSessionMCPRuntime.ControlActivationCancellation(
-            scope: f.scope, session: f.session, activationID: UUID()
+            writer: writer, activationID: UUID()
         ) { _ in cancellations += 1 }
         XCTAssertTrue(pending.permitsPublication)
         f.scope.beginRetirement()
@@ -840,7 +1084,7 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
             guard case let .accepted(epoch) = await AgentRunSessionStore.beginEpoch(registration: registration, activationID: activationID, expectedCurrentEpoch: nil, transitionKind: .initial) else {
                 throw NSError(domain: "MCP runtime fixture epoch", code: 1)
             }
-            session.mcpControlContext = .init(sessionID: sessionID, activationID: activationID, registration: registration, currentEpoch: epoch, preparedEpoch: nil, pendingEpochTransition: nil, originatingConnectionID: nil, interactionTransport: .mcp(sessionID: sessionID, originatingConnectionID: nil), suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: .pair)
+            session.mcpControlContext = try .init(sessionID: sessionID, activationID: activationID, writerIdentity: controlWriterIdentity(for: session, scope: scope), registration: registration, currentEpoch: epoch, preparedEpoch: nil, pendingEpochTransition: nil, originatingConnectionID: nil, interactionTransport: .mcp(sessionID: sessionID, originatingConnectionID: nil), suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: .pair, autoEditOverride: nil)
             return .init(scope: scope, session: session, sessionID: sessionID, registration: registration, epoch: epoch)
         }
 

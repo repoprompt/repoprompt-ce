@@ -38,7 +38,7 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         },
         fence: @MainActor () async -> AgentSessionLinkSendCommitOutcome = { .committed }
     ) async -> AgentSessionLinkModelOutcome {
-        await fixture.viewModel.agentSessionLinkPerformSetModel(
+        await fixture.viewModel.linkExecutionRuntime.agentSessionLinkPerformSetModel(
             to: fixture.candidate, modelID: modelID, liveness: liveness,
             availability: { .init() }, reauthorize: fence
         )
@@ -54,7 +54,7 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
                 defer { AgentModelCatalogRuntime.shared.invalidate(agent) }
                 let before = fixture.session.selectedModelRaw
                 let generation = fixture.session.saveRequestGeneration
-                let result = await fixture.viewModel.agentSessionLinkPerformSetModel(
+                let result = await fixture.viewModel.linkExecutionRuntime.agentSessionLinkPerformSetModel(
                     to: fixture.candidate, modelID: "explore",
                     liveness: { .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false) },
                     availability: { .init() },
@@ -198,7 +198,7 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         let originalEffort = fixture.session.selectedReasoningEffortRaw
         let saveGeneration = fixture.session.saveRequestGeneration
         var fenceCount = 0
-        let result = await fixture.viewModel.agentSessionLinkPerformSetModel(
+        let result = await fixture.viewModel.linkExecutionRuntime.agentSessionLinkPerformSetModel(
             to: fixture.candidate, modelID: "devin:default",
             liveness: { .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false) },
             availability: { .init(devinAvailable: true) },
@@ -219,19 +219,153 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
     }
 
-    func testSetModelRejectsIndexedBindingReplacementDuringFinalFence() async throws {
+    func testSetModelRejectsRuntimeBindingReplacementDuringFinalFence() async throws {
         let fixture = try makeFixture()
         let original = fixture.session.selectedModelRaw
         let modelID = advertiseModel()
         defer { AgentModelCatalogRuntime.shared.invalidate(.claudeCode) }
-        let result = await setModel(fixture, modelID: modelID) {
-            fixture.manager.workspaces[0].composeTabs[0].activeAgentSessionID = UUID()
+        let result = await setModel(fixture, modelID: modelID, fence: {
+            XCTAssertNotNil(fixture.viewModel.test_installPersistentSessionBinding(
+                sessionID: UUID(), on: fixture.session, updateWorkspaceMetadata: true
+            ))
             return .committed
-        }
+        })
         guard case .blocked(.endpointInvalidated) = result else { return XCTFail("Replaced binding must lose final fence") }
         XCTAssertEqual(fixture.session.selectedModelRaw, original)
         XCTAssertFalse(fixture.events.contains(.save))
         XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
+    }
+
+    func testSetModelUsesWriterWithoutPresentationAndDoesNotElectFromSidebar() async throws {
+        let fixture = try makeFixture()
+        defer {
+            fixture.session.saveDebounceTask?.cancel()
+            AgentModelCatalogRuntime.shared.invalidate(.claudeCode)
+        }
+        let runtime = fixture.viewModel.linkExecutionRuntime
+        let command = try XCTUnwrap(runtime.admit(fixture.candidate))
+        let presentation = command.writer.scope.presentation
+        let attachment = presentation.attach(fixture.session, sink: .init(
+            activityChanged: { _, _ in }, refresh: { _, _, _ in },
+            turnComplete: { _ in }, turnFailed: { _, _ in }
+        ))
+        presentation.detach(attachment)
+        let projectedModel = fixture.viewModel.selectedModelRaw
+        let modelID = advertiseModel()
+        let result = await setModel(fixture, modelID: modelID, fence: {
+            // The sidebar is only a projection; the supplied liveness proof and runtime binding
+            // remain current. It must not replace the exact writer's command admission.
+            fixture.manager.workspaces[0].composeTabs[0].activeAgentSessionID = UUID()
+            return .committed
+        })
+        guard case .accepted = result else { return XCTFail("Detached writer must commit configuration") }
+        XCTAssertTrue(command.isCurrent)
+        XCTAssertEqual(fixture.session.selectedModelRaw, "test-native:high")
+        XCTAssertEqual(fixture.viewModel.selectedModelRaw, projectedModel, "Detached presentation is not required for the commit")
+        XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
+    }
+
+    func testProgrammaticComposerClaimIgnoresLocalWorkspaceSwitchAndSidebarProjection() throws {
+        let fixture = try makeFixture()
+        defer {
+            fixture.viewModel.test_setWorkspaceSwitchInFlight(false)
+            fixture.session.saveDebounceTask?.cancel()
+        }
+        let runtime = fixture.viewModel.linkExecutionRuntime
+        let command = try XCTUnwrap(runtime.admit(fixture.candidate))
+        fixture.session.draftText = "untouched local draft"
+        let generation = fixture.session.draftMutationGeneration
+        fixture.viewModel.test_setWorkspaceSwitchInFlight(true)
+        fixture.manager.workspaces[0].composeTabs[0].activeAgentSessionID = UUID()
+        XCTAssertTrue(command.isCurrent)
+        XCTAssertNil(fixture.viewModel.makeComposerSubmitTarget(tabID: fixture.session.tabID, session: fixture.session))
+        let target = try XCTUnwrap(runtime.makeComposerSubmitTarget(tabID: fixture.session.tabID, session: fixture.session))
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "")
+        let claim = try XCTUnwrap(runtime.claimComposerSubmitAttempt(attempt))
+        XCTAssertTrue(runtime.composerSubmitClaimIsCurrent(claim))
+        XCTAssertEqual(fixture.session.draftText, "untouched local draft")
+        XCTAssertEqual(fixture.session.draftMutationGeneration, generation)
+        XCTAssertTrue(runtime.releaseComposerSubmitClaim(claim))
+        XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
+    }
+
+    func testTerminalMaterializationUsesWriterWhileSidebarMismatchStillRefusesPresentation() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.session.saveDebounceTask?.cancel() }
+        let command = try XCTUnwrap(fixture.viewModel.linkExecutionRuntime.admit(fixture.candidate))
+        XCTAssertTrue(fixture.viewModel.canBuildOrPublishActiveTranscriptBindings(for: fixture.session))
+        fixture.session.appendItem(.user("terminal request", sequenceIndex: fixture.session.nextSequenceIndex))
+        fixture.session.appendItem(.assistant("terminal answer", sequenceIndex: fixture.session.nextSequenceIndex))
+        let pending = fixture.session.derivedTranscriptRefreshTask
+        fixture.manager.workspaces[0].composeTabs[0].activeAgentSessionID = UUID()
+        XCTAssertTrue(command.isCurrent)
+        XCTAssertFalse(fixture.viewModel.canBuildOrPublishActiveTranscriptBindings(for: fixture.session))
+
+        command.writer.scope.observation.prepareTerminalPublication(for: fixture.session)
+        XCTAssertNil(fixture.session.derivedTranscriptRefreshTask)
+        let protection = AgentSessionTranscriptRefreshRuntime.transcriptProjectionProtection(for: fixture.session)
+        XCTAssertTrue(AgentSessionTranscriptRefreshRuntime.canReuseDerivedTranscriptForSave(
+            for: fixture.session, projectionProtection: protection
+        ))
+        XCTAssertFalse(fixture.viewModel.canBuildOrPublishActiveTranscriptBindings(for: fixture.session))
+        await pending?.value
+    }
+
+    func testSetModelRejectsRetirementDuringReauthorizationWithoutPartialCommit() async throws {
+        let fixture = try makeFixture()
+        let command = try XCTUnwrap(fixture.viewModel.linkExecutionRuntime.admit(fixture.candidate))
+        let beforeModel = fixture.session.selectedModelRaw
+        let beforeEffort = fixture.session.selectedReasoningEffortRaw
+        let beforeSave = fixture.session.saveRequestGeneration
+        let modelID = advertiseModel()
+        defer { AgentModelCatalogRuntime.shared.invalidate(.claudeCode) }
+        let result = await setModel(fixture, modelID: modelID, fence: {
+            command.writer.scope.beginRetirement()
+            return .committed
+        })
+        guard case .blocked(.endpointInvalidated) = result else { return XCTFail("Retirement must refuse new configuration") }
+        XCTAssertTrue(command.writer.isCurrent)
+        XCTAssertFalse(command.isCurrent)
+        XCTAssertEqual(fixture.session.selectedModelRaw, beforeModel)
+        XCTAssertEqual(fixture.session.selectedReasoningEffortRaw, beforeEffort)
+        XCTAssertEqual(fixture.session.saveRequestGeneration, beforeSave)
+        XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
+    }
+
+    func testDelegatedEffortRequiresLeaseAndExactWriterAtCommit() throws {
+        for boundary in ["current", "revoked", "rebound"] {
+            let fixture = try makeFixture()
+            defer { fixture.session.saveDebounceTask?.cancel() }
+            let runtime = fixture.viewModel.linkExecutionRuntime
+            let command = try XCTUnwrap(runtime.admit(fixture.candidate))
+            let beforeEffort = fixture.session.selectedReasoningEffortRaw
+            let beforeClaudeEffort = fixture.session.selectedClaudeEffortRaw
+            let beforeSave = fixture.session.saveRequestGeneration
+            let effort = try XCTUnwrap(AgentModelCatalog.supportedClaudeEfforts(
+                forSelectedModelRaw: fixture.session.selectedModelRaw, agentKind: fixture.session.selectedAgent
+            ).map(\.rawValue).first { $0 != beforeClaudeEffort })
+            let result = runtime.delegationSetReasoningEffort(command: command, effort: effort) {
+                if boundary == "rebound" {
+                    XCTAssertNotNil(fixture.viewModel.test_installPersistentSessionBinding(
+                        sessionID: UUID(), on: fixture.session, updateWorkspaceMetadata: true
+                    ))
+                }
+                return boundary != "revoked"
+            }
+            if boundary == "current" {
+                guard case .applied(changed: true, _) = result else { return XCTFail("Exact writer should accept effort") }
+                XCTAssertEqual(fixture.session.selectedClaudeEffortRaw, effort)
+                XCTAssertEqual(fixture.session.selectedReasoningEffortRaw, effort)
+                XCTAssertEqual(fixture.viewModel.selectedReasoningEffortRaw, effort)
+                XCTAssertEqual(fixture.session.saveRequestGeneration, beforeSave + 1)
+            } else {
+                guard case .blocked = result else { return XCTFail("\(boundary) must refuse effort") }
+                XCTAssertEqual(fixture.session.selectedClaudeEffortRaw, beforeClaudeEffort)
+                XCTAssertEqual(fixture.session.selectedReasoningEffortRaw, beforeEffort)
+                XCTAssertEqual(fixture.session.saveRequestGeneration, beforeSave)
+            }
+            XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
+        }
     }
 
     func testSetModelNoopStillRefusesBusyAndPostFenceReadinessLoss() async throws {
@@ -248,11 +382,11 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
                 fixture.session.selectedReasoningEffortRaw = "high"
                 if !duringFence { block(fixture.session) }
                 var fences = 0
-                let result = await setModel(fixture, modelID: modelID) {
+                let result = await setModel(fixture, modelID: modelID, fence: {
                     fences += 1
                     if duringFence { block(fixture.session) }
                     return .committed
-                }
+                })
                 guard case .blocked(.targetNotIdle) = result else { return XCTFail("\(label): expected idle refusal") }
                 XCTAssertEqual(fences, duringFence ? 1 : 0, label)
                 XCTAssertEqual(fixture.session.selectedModelRaw, "test-native:high")
@@ -311,13 +445,13 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         let before = fixture.session.selectedModelRaw
         let target = try XCTUnwrap(fixture.viewModel.makeComposerSubmitTarget(tabID: fixture.tabID, session: fixture.session))
         let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "local")
-        let result = await setModel(fixture, modelID: modelID) {
+        let result = await setModel(fixture, modelID: modelID, fence: {
             guard case .claimed = fixture.viewModel.claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: false) else {
                 XCTFail("Fixture must acquire real composer claim")
                 return .linkRevoked
             }
             return .committed
-        }
+        })
         guard case .blocked(.targetNotIdle) = result else { return XCTFail("A concurrent ordinary send must win") }
         XCTAssertEqual(fixture.session.selectedModelRaw, before)
         XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
@@ -893,16 +1027,13 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
     func testEndpointDriftAfterTheCommitFenceAbortsBeforeMutating() async throws {
         let fixture = try makeFixture()
 
-        let outcome = await send(fixture) { [manager = fixture.manager, fixture] in
-            // Rebind the tab to a different session while the authority commit is in flight.
-            _ = manager.compareAndSetActiveAgentSessionID(
-                expected: fixture.sessionID,
-                replacement: UUID(),
-                forTabID: fixture.tabID,
-                inWorkspaceID: fixture.workspaceID
-            )
+        let outcome = await send(fixture, commit: { [fixture] in
+            // Rebind the runtime writer, not merely its sidebar projection, while the fence waits.
+            XCTAssertNotNil(fixture.viewModel.test_installPersistentSessionBinding(
+                sessionID: UUID(), on: fixture.session, updateWorkspaceMetadata: true
+            ))
             return .committed
-        }
+        })
 
         XCTAssertEqual(outcome, .blocked(.endpointPostSession))
         XCTAssertTrue(fixture.session.items.isEmpty, "A drifted endpoint must never receive the row")
@@ -915,37 +1046,30 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
     ///
     /// `startAgentRun(tabID:)` acts on whatever occupies the tab *now*. An in-place rebind during the
     /// flush left the previously admitted facts unchecked, so the observer's turn could be dispatched
-    /// against a replacement binding the grant never covered. The row is already durably the
-    /// target's, so drift withholds only the provider start.
-    func testDriftDuringTheDeliveryFlushRetainsTheRowButStartsNoProvider() async throws {
+    /// against a replacement binding the grant never covered. Writer loss also prevents a qualified
+    /// save acknowledgement or compensating mutation of the successor: report uncertainty, retain
+    /// the staged row and withhold provider start.
+    func testWriterDriftDuringTheDeliveryFlushRetainsTheRowWithoutAcknowledgingOrStarting() async throws {
         let fixture = try makeFixture()
-        fixture.driftHook.duringDeliveryFlush = { [manager = fixture.manager, fixture] in
-            _ = manager.compareAndSetActiveAgentSessionID(
-                expected: fixture.sessionID,
-                replacement: UUID(),
-                forTabID: fixture.tabID,
-                inWorkspaceID: fixture.workspaceID
-            )
+        fixture.driftHook.duringDeliveryFlush = { [fixture] in
+            XCTAssertNotNil(fixture.viewModel.test_installPersistentSessionBinding(
+                sessionID: UUID(), on: fixture.session, updateWorkspaceMetadata: true
+            ))
         }
 
         let outcome = await send(fixture)
 
-        guard case let .delivered(delivery) = outcome else {
-            return XCTFail("Expected the durable delivery to be retained, got \(outcome)")
-        }
-        XCTAssertEqual(
-            delivery.deliveryState,
-            .persisted,
-            "A drifted endpoint must never be dispatched to, but the committed row is not rolled back"
-        )
+        XCTAssertEqual(outcome, .blocked(.persistenceIndeterminate))
+        let row = try XCTUnwrap(fixture.session.items.first(where: { $0.kind == .user }))
+        XCTAssertNotNil(row.crossSessionAttribution, "Writer loss must not compensate against the replacement binding")
         XCTAssertFalse(
             fixture.events.contains(.providerControllerCreated),
             "No provider turn may start against a binding that replaced the admitted one"
         )
         XCTAssertNil(fixture.session.activeComposerSubmitAttempt, "The composer claim must be released")
         XCTAssertNil(
-            fixture.session.items.first(where: { $0.id == delivery.targetItemID })?.dispatchedProviderText,
-            "A persisted-only row was never handed to the provider"
+            row.dispatchedProviderText,
+            "An unacknowledged row must never be handed to the provider"
         )
     }
 
@@ -1021,10 +1145,10 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
 
     func testClaimLostDuringCommitReportsClaimWithoutDelivering() async throws {
         let fixture = try makeFixture()
-        let outcome = await send(fixture) { [fixture] in
+        let outcome = await send(fixture, commit: { [fixture] in
             fixture.session.activeComposerSubmitAttempt = nil
             return .committed
-        }
+        })
         XCTAssertEqual(outcome, .blocked(.endpointClaim))
         XCTAssertEqual(AgentSessionLinkSendFailure.endpointClaim.wireResult, "endpoint_invalidated")
         XCTAssertEqual(AgentSessionLinkSendFailure.endpointClaim.subreason, "claim")
@@ -1138,7 +1262,7 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
     func testRevocationAtTheCommitFenceLeavesTheTargetUntouched() async throws {
         let fixture = try makeFixture()
 
-        let outcome = await send(fixture) { .linkRevoked }
+        let outcome = await send(fixture, commit: { .linkRevoked })
 
         XCTAssertEqual(outcome, .blocked(.linkRevoked))
         XCTAssertTrue(fixture.session.items.isEmpty)
@@ -1193,6 +1317,12 @@ final class LiveSendEventLog: @unchecked Sendable {
             }
         }
         return index
+    }
+
+    func count(_ event: Event) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return events.count(where: { $0 == event })
     }
 
     func contains(_ event: Event) -> Bool {

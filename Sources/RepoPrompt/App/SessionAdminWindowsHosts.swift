@@ -9,6 +9,25 @@ import RepoPromptWorkspaceCore
 /// session and to the existing owner of that state; nothing here authorizes.
 @MainActor
 enum SessionAdminWindows {
+    /// Carrier metadata can veto inconsistent identities, but cannot select or manufacture a writer.
+    static func command(for sessionID: UUID) throws -> AgentSessionRuntimeStore.Command? {
+        let carriers = AgentSessionCarrierResolver.capture(
+            windows: WindowStatesManager.shared.sessionRuntimeWindows, sessionIDs: [sessionID]
+        )
+        guard !carriers.ambiguousSessionIDs.contains(sessionID) else {
+            throw SessionAdminHostError.refused(code: "target_ambiguous", detail: "Conflicting target identities prevent mutation.", nextCall: nil)
+        }
+        switch AgentSessionRuntimeStore.shared.resolveWriter(sessionID: sessionID) {
+        case .unavailable(.absent): return nil
+        case .unavailable, .conflicting: throw SessionAdminHostError.sessionUnavailable
+        case let .unique(writer):
+            guard carriers.affectedWorkspaceIDs(for: sessionID).allSatisfy({ $0 == writer.identity.workspaceID }) else {
+                throw SessionAdminHostError.sessionUnavailable
+            }
+            return try writer.admitCommand().get()
+        }
+    }
+
     static func runtimeOwner(for sessionID: UUID) -> AgentSessionCarrierResolver.RuntimeOwner? {
         AgentSessionCarrierResolver.capture(
             windows: WindowStatesManager.shared.sessionRuntimeWindows, sessionIDs: [sessionID], includeRuntimeOwners: true
@@ -149,15 +168,35 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         }
     }
 
+    func prepareOrganizationalPlacement(
+        sessionID: UUID, isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async throws -> SessionAdminPlacementPreparation {
+        let manager = WindowStatesManager.shared
+        manager.beginPreparedOversightPreparation(sessionID)
+        var transferred = false
+        defer { if !transferred { manager.endPreparedOversightPreparation(sessionID) } }
+        guard isStillAuthorized(), !Task.isCancelled else { throw SessionAdminHostError.authorityEnded }
+        if try SessionAdminWindows.command(for: sessionID) == nil {
+            guard let preparation else { throw SessionAdminHostError.sessionUnavailable }
+            let result = await preparation(sessionID, isStillAuthorized)
+            guard isStillAuthorized(), !Task.isCancelled else { throw SessionAdminHostError.authorityEnded }
+            guard result == .ready else { throw Self.preparationRefusal(result) }
+        }
+        guard try SessionAdminWindows.command(for: sessionID) != nil else { throw SessionAdminHostError.sessionUnavailable }
+        transferred = true
+        return SessionAdminPlacementPreparation { manager.endPreparedOversightPreparation(sessionID) }
+    }
+
     func commitOrganizationalPlacement(
         sessionID: UUID,
         parentID: UUID,
         delegationScopeID: UUID?
     ) throws -> DelegationPlacementCommit? {
-        guard let viewModel = SessionAdminWindows.owningViewModel(for: sessionID) else { return nil }
-        let scopeID = delegationScopeID ?? viewModel.ownerValidatedSessionIndex[sessionID]?.delegationScopeID
-        return try viewModel.commitDelegationPlacement(
-            sessionID: sessionID, organizationalParentID: parentID, delegationScopeID: scopeID
+        guard let command = try SessionAdminWindows.command(for: sessionID) else { return nil }
+        return try command.commitDelegationPlacement(
+            organizationalParentID: parentID,
+            delegationScopeID: delegationScopeID ?? command.writer.session.delegationScopeID,
+            project: WindowStatesManager.shared.projectDelegationPlacement
         )
     }
 
@@ -202,7 +241,9 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         guard !owner.isClosing else { return .revoked }
         // Re-read after hydration: no captured endpoint, deletion state or ambiguity claim earns a link.
         let current = AgentSessionCarrierResolver.capture(windows: WindowStatesManager.shared.allWindows, sessionIDs: [target])
-        guard !current.ambiguousSessionIDs.contains(target), !current.replicatedSessionIDs.contains(target) else {
+        guard !current.ambiguousSessionIDs.contains(target),
+              (try? SessionAdminWindows.command(for: target)) != nil
+        else {
             return .failed("target_ambiguous: Target ownership changed during preparation. Use session_admin inventory; nothing was linked.")
         }
         let candidates = WindowStatesManager.shared.agentSessionLinkCandidates(
@@ -271,18 +312,17 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
     ) async -> SessionAdminLifecycleOutcome {
         if let refusal = await prepareIfUnloaded(sessionID, isStillAuthorized: isStillAuthorized) { return refusal }
         let windows = WindowStatesManager.shared
-        guard let owner = SessionAdminWindows.runtimeOwner(for: sessionID),
-              let candidate = windows.agentSessionLinkCandidates(forSessionIDs: [sessionID], includeLocation: false)[sessionID]?.only,
-              candidate.windowID == owner.location.window.windowID,
-              let modelCandidate = windows.agentSessionLinkModelCandidate(for: candidate.domainEndpoint)
+        guard let command = try? SessionAdminWindows.command(for: sessionID),
+              let runtime = command.writer.scope.linkExecution,
+              let endpoint = runtime.agentSessionLinkObserverEndpoint(tabID: command.writer.session.tabID),
+              let modelCandidate = runtime.agentSessionLinkModelCandidate(for: endpoint)
         else { return .blocked("The target session is not live.") }
-        let endpoint = candidate.domainEndpoint
         // Same commit seam as `agent_session_link set_model`; the scope lease is the final fence.
         let outcome = await windows.agentSessionLinkPerformSetModel(
             to: modelCandidate,
             modelID: modelID,
             liveness: {
-                let live = SessionAdminWindows.isCurrent(owner) && windows.agentSessionLinkModelCandidate(for: endpoint) != nil
+                let live = command.isCurrent && runtime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint
                 return AgentSessionLinkSendLiveness(
                     observerEndpointIsLive: isStillAuthorized(), targetEndpointIsLive: live, targetWindowIsClosing: false
                 )
@@ -309,12 +349,13 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         isStillAuthorized: @escaping @MainActor () -> Bool
     ) async -> SessionAdminLifecycleOutcome {
         if let refusal = await prepareIfUnloaded(sessionID, isStillAuthorized: isStillAuthorized) { return refusal }
-        guard let owner = SessionAdminWindows.runtimeOwner(for: sessionID) else {
+        guard let command = try? SessionAdminWindows.command(for: sessionID),
+              let runtime = command.writer.scope.linkExecution
+        else {
             return .blocked("The target session is not live.")
         }
-        return owner.location.window.agentModeViewModel.delegationSetReasoningEffort(
-            sessionID: sessionID, effort: effort,
-            isStillAuthorized: { isStillAuthorized() && SessionAdminWindows.isCurrent(owner) }
+        return runtime.delegationSetReasoningEffort(
+            command: command, effort: effort, isStillAuthorized: isStillAuthorized
         )
     }
 

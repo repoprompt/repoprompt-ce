@@ -176,7 +176,7 @@ extension AgentSessionLinkExecutionRuntime {
         let submission = AgentComposerSubmitAttempt(
             id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: ""
         )
-        guard let claim = commands.claimComposer(submission) else {
+        guard let claim = claimComposerSubmitAttempt(submission) else {
             cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
             return
         }

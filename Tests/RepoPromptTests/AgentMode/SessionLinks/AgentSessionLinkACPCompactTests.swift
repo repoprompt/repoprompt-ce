@@ -845,7 +845,7 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
             tabName: "ACP lane",
             isWindowClosing: false
         ))
-        return await fixture.viewModel.agentSessionLinkPerformCompact(
+        return await fixture.viewModel.linkExecutionRuntime.agentSessionLinkPerformCompact(
             to: candidate,
             request: request,
             liveness: { Self.liveLiveness },
@@ -867,13 +867,13 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
 
     func testSupportFollowsTheLiveAdvertisementForTheTargetsOwnProviderSession() async throws {
         let advertising = try makeFixture()
-        var support = await advertising.viewModel.agentSessionLinkCompactSupport(for: advertising.session)
+        var support = await advertising.viewModel.linkExecutionRuntime.agentSessionLinkCompactSupport(for: advertising.session)
         XCTAssertEqual(support, .noProviderSession)
         try await installLiveController(advertising)
-        support = await advertising.viewModel.agentSessionLinkCompactSupport(for: advertising.session)
+        support = await advertising.viewModel.linkExecutionRuntime.agentSessionLinkCompactSupport(for: advertising.session)
         XCTAssertEqual(support, .acpAdvertisedCommand)
         advertising.session.providerSessionID = "restored-older-session"
-        support = await advertising.viewModel.agentSessionLinkCompactSupport(for: advertising.session)
+        support = await advertising.viewModel.linkExecutionRuntime.agentSessionLinkCompactSupport(for: advertising.session)
         XCTAssertEqual(
             support,
             .notSupported,
@@ -882,12 +882,12 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
 
         let silent = try makeFixture(environment: ["ACP_ADVERTISE_COMMANDS": "review"])
         try await installLiveController(silent)
-        let silentSupport = await silent.viewModel.agentSessionLinkCompactSupport(for: silent.session)
+        let silentSupport = await silent.viewModel.linkExecutionRuntime.agentSessionLinkCompactSupport(for: silent.session)
         XCTAssertEqual(silentSupport, .notSupported)
 
         let relaunched = try makeFixture(agent: .devin, providerID: .devin)
         relaunched.session.providerSessionID = ACPCompactFixtures.sessionID
-        let relaunchedSupport = await relaunched.viewModel.agentSessionLinkCompactSupport(for: relaunched.session)
+        let relaunchedSupport = await relaunched.viewModel.linkExecutionRuntime.agentSessionLinkCompactSupport(for: relaunched.session)
         XCTAssertEqual(
             relaunchedSupport,
             .noProviderSession,
@@ -897,7 +897,7 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
 
         let openCode = try makeFixture(agent: .openCode, providerID: .openCode)
         try await installLiveController(openCode)
-        let openCodeSupport = await openCode.viewModel.agentSessionLinkCompactSupport(for: openCode.session)
+        let openCodeSupport = await openCode.viewModel.linkExecutionRuntime.agentSessionLinkCompactSupport(for: openCode.session)
         XCTAssertEqual(openCodeSupport, .notSupported)
     }
 
@@ -911,7 +911,7 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
             controller.advertisesCommand("compact", inProviderSession: ACPCompactFixtures.sessionID),
             "Bootstrap metadata precedes installed session identity; quiet ingress must not discard it"
         )
-        let support = await fixture.viewModel.agentSessionLinkCompactSupport(for: fixture.session)
+        let support = await fixture.viewModel.linkExecutionRuntime.agentSessionLinkCompactSupport(for: fixture.session)
         XCTAssertEqual(support, .acpAdvertisedCommand)
     }
 
@@ -923,7 +923,7 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
         let dead = try makeFixture(agent: .devin, providerID: .devin)
         let deadController = try await installLiveController(dead)
         await deadController.shutdown()
-        let deadSupport = await dead.viewModel.agentSessionLinkCompactSupport(for: dead.session)
+        let deadSupport = await dead.viewModel.linkExecutionRuntime.agentSessionLinkCompactSupport(for: dead.session)
         XCTAssertEqual(
             deadSupport,
             .noProviderSession,
@@ -932,7 +932,7 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
 
         let silent = try makeFixture(agent: .devin, providerID: .devin, environment: [:])
         try await installLiveController(silent, waitForAdvertisement: false)
-        let silentSupport = await silent.viewModel.agentSessionLinkCompactSupport(for: silent.session)
+        let silentSupport = await silent.viewModel.linkExecutionRuntime.agentSessionLinkCompactSupport(for: silent.session)
         XCTAssertEqual(
             silentSupport,
             .noProviderSession,

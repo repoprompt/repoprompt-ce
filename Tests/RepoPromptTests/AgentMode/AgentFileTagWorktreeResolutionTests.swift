@@ -45,6 +45,28 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
         XCTAssertTrue(initial.contains("<file_map>"), initial)
         XCTAssertTrue(initial.contains("<current_prompt_content>\nCaptured prompt\n</current_prompt_content>"), initial)
         XCTAssertTrue(initial.hasPrefix("Inspect\n\n"), initial)
+        let session = AgentTabSession(tabID: UUID())
+        let prepared = await input.buildInitialThreadMessageIfNeeded(
+            session: session, initialMessage: "Inspect", input: {
+                .init(workspace: source, selection: .init(selectedPaths: [fixture.logicalRoot.appendingPathComponent("Sources/App.swift").path]), promptText: "Captured prompt")
+            }, isCurrent: { true }
+        )
+        XCTAssertEqual(prepared, initial, "The runtime owns the same initial-thread construction")
+        let refused = await input.buildInitialThreadMessageIfNeeded(
+            session: session, initialMessage: "Inspect", input: {
+                XCTFail("A refused start must not capture prompt or selection")
+                return nil
+            }, isCurrent: { false }
+        )
+        XCTAssertEqual(refused, "Inspect")
+        session.providerSessionID = "resumed-provider-session"
+        let resumed = await input.buildInitialThreadMessageIfNeeded(
+            session: session, initialMessage: "Inspect", input: {
+                XCTFail("A resumed provider must not recapture initial-thread resources")
+                return nil
+            }, isCurrent: { true }
+        )
+        XCTAssertEqual(resumed, "Inspect")
     }
 
     @MainActor

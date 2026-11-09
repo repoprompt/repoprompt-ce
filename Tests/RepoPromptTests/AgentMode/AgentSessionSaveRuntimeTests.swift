@@ -25,9 +25,36 @@ final class AgentSessionSaveRuntimeTests: XCTestCase {
         XCTAssertNotNil(saved.lastUserMessageAt)
         XCTAssertTrue(receipt.acknowledgedCreation)
         XCTAssertEqual(receipt.binding, f.session.currentRestorationBindingToken)
+        XCTAssertEqual(receipt.writerIdentity, f.writer.identity)
+        XCTAssertEqual(receipt.writerIdentity.workspaceID, f.workspace.id)
+        XCTAssertEqual(receipt.writerIdentity.sessionID, saved.id)
+        XCTAssertEqual(receipt.writerIdentity.restoration, receipt.binding)
         XCTAssertTrue(f.session.qualifiedRestorationReadiness.isAuthoritative)
         XCTAssertFalse(f.session.isDirty)
         XCTAssertEqual(phases, [.writeMayHaveCommitted, .writeReturned], "Terminal owner, not storage, publishes the final durable phase")
+    }
+
+    func testCreationAdmissionBecomesOrdinaryAdmissionOnlyAfterDurableAcknowledgement() async throws {
+        let f = try Fixture()
+        defer { f.cleanUp() }
+        XCTAssertEqual(try XCTUnwrap(f.writer.query()).commandRejection, .restorationUnavailable)
+        let creationCommand = try f.writer.admitCommand(.creation(f.creation)).get()
+        XCTAssertTrue(creationCommand.isCurrent)
+        XCTAssertEqual(creationCommand.identity, f.writer.query()?.identity)
+        let prepared = try AgentSessionSaveRuntime.prepare(payload: f.payload, session: f.session, creation: .configured(f.creation))
+        let service = AgentSessionDataService()
+        let result = try await f.commit(prepared) { payload, workspace, count in
+            try await service.saveAgentSession(payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count)
+        }
+        guard case let .committed(receipt) = result else { return XCTFail("Expected durable acknowledgement") }
+        let command = try f.writer.admitCommand().get()
+        XCTAssertEqual(command.identity, receipt.writerIdentity)
+        XCTAssertTrue(command.isCurrent)
+        f.scope.beginRetirement()
+        XCTAssertFalse(command.isCurrent, "Retirement stops new commands, not originating persistence")
+        XCTAssertTrue(f.writer.isCurrent)
+        XCTAssertEqual(f.writer.query()?.commandRejection, .retiring)
+        XCTAssertEqual(receipt.writerIdentity, command.identity, "Retirement cannot erase a completed receipt")
     }
 
     func testHeldFirstSaveRejectsConfigurationAndIncarnationChangesAfterDiskWrite() async throws {

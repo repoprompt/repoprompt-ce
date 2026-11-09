@@ -3,12 +3,7 @@ import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import RepoPromptMCPServer
-
-struct AgentSessionComposerSubmitClaim {
-    let attempt: AgentComposerSubmitAttempt
-    let sourceSession: AgentTabSession
-    let draftMutationGeneration: UInt64
-}
+import RepoPromptSettingsCore
 
 /// Scope-owned provider-input composition and wake scheduling. Membership authority, passive
 /// delivery, claim accounting and wake reservations retain their existing, disjoint owners.
@@ -25,18 +20,16 @@ final class AgentSessionLinkExecutionRuntime {
         /// adapter phase this preserves the old all-or-nothing late-hook behavior after VM loss.
         /// A nonvisual host supplies its own lifetime independently of presentation.
         let isAvailable: @MainActor () -> Bool
-        let endpoint: @MainActor (UUID) -> DomainAgentSessionLinkEndpointIdentity?
+        let modelAvailability: @MainActor () -> AgentModelCatalog.AvailabilityContext?
         let workspaceID: @MainActor (AgentTabSession) -> UUID?
-        let augment: @MainActor (AgentTabSession, String, [AgentFileAttachment], [AgentTaggedFileAttachment], Bool) async -> String
-        let initialMessage: @MainActor (AgentTabSession, String) async -> String
+        let input: AgentSessionProviderInputRuntime
+        let workspacePaths: @MainActor () -> [String]
+        let inputWorkspace: @MainActor (AgentTabSession) -> AgentSessionProviderInputRuntime.WorkspaceSource?
+        let initialThreadInput: @MainActor (AgentTabSession) -> AgentSessionProviderInputRuntime.InitialThreadInput?
         let modelDisplayName: @MainActor (AgentTabSession) -> String
         let start: @MainActor (AgentTabSession, String, AgentDirectRunStartOptions, AgentRunStartOutcomeRecorder?, AgentProviderSwitchSendPreparation?) async -> CodexAgentModeCoordinator.NativeSendOutcome?
         let settleSelfCompact: @MainActor (AgentTabSession) -> Void
         let selfCompactBlocksWake: @MainActor (AgentTabSession) -> Bool
-        let composerTarget: @MainActor (UUID?, AgentTabSession?) -> AgentComposerSubmitTarget?
-        let claimComposer: @MainActor (AgentComposerSubmitAttempt) -> AgentComposerSubmitClaim?
-        let composerIsCurrent: @MainActor (AgentComposerSubmitClaim) -> Bool
-        let releaseComposer: @MainActor (AgentComposerSubmitClaim) -> Bool
     }
 
     private(set) weak var scope: AgentSessionRuntimeStore.Scope?
@@ -46,6 +39,8 @@ final class AgentSessionLinkExecutionRuntime {
     }
 
     var pendingSendEffects: [UUID: PendingSendEffect] = [:]
+    var pendingStopEffects: [UUID: PendingSendEffect] = [:]
+    let routeID: Int
     let commands: Commands
     let catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink
     var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
@@ -53,8 +48,9 @@ final class AgentSessionLinkExecutionRuntime {
     /// Display labels are optional and never participate in authority or receipt qualification.
     var displayProps: (@MainActor (DomainAgentSessionLinkEndpointIdentity) -> AgentMonitorPillProps?)?
 
-    init(scope: AgentSessionRuntimeStore.Scope, commands: Commands, diagnostics: any AgentSessionLinkCatalogEventSink) {
+    init(scope: AgentSessionRuntimeStore.Scope, routeID: Int, commands: Commands, diagnostics: any AgentSessionLinkCatalogEventSink) {
         self.scope = scope
+        self.routeID = routeID
         self.commands = commands
         catalogDiagnosticsSink = diagnostics
     }
@@ -74,6 +70,7 @@ final class AgentSessionLinkExecutionRuntime {
     }
 
     #if DEBUG
+        var test_endpointRead: (() -> Void)?
         var test_beforeRoutineIdleFollowUpStart: ((AgentTabSession, UUID) -> Bool)?
         var test_agentSessionLinkAfterProviderInputRouteReadiness: (() async -> Void)?
         var test_agentSessionLinkHasActiveOutboundLink: ((DomainAgentSessionLinkEndpointIdentity) async -> Bool)?
@@ -86,8 +83,29 @@ final class AgentSessionLinkExecutionRuntime {
     #endif
 
     func agentSessionLinkObserverEndpoint(tabID: UUID) -> DomainAgentSessionLinkEndpointIdentity? {
-        guard let scope, !scope.hasReleasedWriterClaims, scope.sessions[tabID] != nil else { return nil }
-        return commands.endpoint(tabID)
+        #if DEBUG
+            test_endpointRead?()
+        #endif
+        guard let scope, !scope.hasReleasedWriterClaims,
+              let session = scope.sessions[tabID], let sessionID = session.activeAgentSessionID,
+              case let .unique(writer) = scope.resolveWriter(sessionID: sessionID),
+              writer.scope === scope, writer.session === session else { return nil }
+        return DomainAgentSessionLinkEndpointIdentity(
+            windowID: routeID, workspaceID: writer.identity.workspaceID,
+            tabID: tabID, sessionID: sessionID,
+            persistentBindingGeneration: writer.binding.generation,
+            bindingTransitionGeneration: session.bindingTransitionGeneration
+        )
+    }
+
+    func admit(_ candidate: AgentSessionLinkEndpointCandidate) -> AgentSessionRuntimeStore.Command? {
+        guard let scope,
+              case let .unique(writer) = scope.resolveWriter(
+                  sessionID: candidate.sessionID, expectedWorkspaceID: candidate.workspaceID
+              ), writer.scope === scope, writer.session.tabID == candidate.tabID,
+              agentSessionLinkObserverEndpoint(tabID: candidate.tabID) == candidate.domainEndpoint
+        else { return nil }
+        return try? writer.admitCommand().get()
     }
 
     func hasCurrentRunCatalogRouteTokenInCurrentMCPServer(_ token: AgentSessionLinkRunCatalogRouteToken, tabID: UUID) -> Bool {
@@ -126,15 +144,27 @@ final class AgentSessionLinkExecutionRuntime {
     }
 
     func makeComposerSubmitTarget(tabID: UUID?, session: AgentTabSession?) -> AgentComposerSubmitTarget? {
-        commands.composerTarget(tabID, session)
+        guard let scope, let tabID, let session = session ?? scope.sessions[tabID],
+              session.tabID == tabID, let id = session.activeAgentSessionID,
+              case let .unique(writer) = scope.resolveWriter(sessionID: id),
+              writer.scope === scope, writer.session === session,
+              let command = try? writer.admitCommand().get() else { return nil }
+        return scope.submissions.programmaticTarget(command)
+    }
+
+    func claimComposerSubmitAttempt(_ attempt: AgentComposerSubmitAttempt) -> AgentComposerSubmitClaim? {
+        guard let scope, attempt.target.route == .existingAgentSession,
+              case let .claimed(claim) = scope.submissions.claim(attempt) else { return nil }
+        return claim
     }
 
     func composerSubmitClaimIsCurrent(_ claim: AgentComposerSubmitClaim) -> Bool {
-        commands.composerIsCurrent(claim)
+        scope === claim.scope && claim.scope.submissions.isCurrent(claim)
     }
 
     @discardableResult
     func releaseComposerSubmitClaim(_ claim: AgentComposerSubmitClaim) -> Bool {
-        commands.releaseComposer(claim)
+        guard scope === claim.scope else { return false }
+        return claim.scope.submissions.release(claim)
     }
 }

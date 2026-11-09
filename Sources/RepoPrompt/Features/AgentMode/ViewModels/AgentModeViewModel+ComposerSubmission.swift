@@ -40,7 +40,7 @@ extension AgentModeViewModel {
         guard let pending = ui.composer.pendingSubmissions[id],
               let session = sessions[pending.sourceTabID],
               let attempt = session.activeComposerSubmitAttempt, attempt.id == id else { return }
-        let claim = AgentComposerSubmitClaim(attempt: attempt, sourceSession: session, draftMutationGeneration: session.draftMutationGeneration)
+        guard let claim = composerSubmitRuntime.cleanupClaim(attempt: attempt, session: session) else { return }
         // Fence dispatch and restore immediately; backend cancellation may itself suspend.
         let workflowTask = autoWorkflowJudgments.removeValue(forKey: id)
         workflowTask?.cancel()

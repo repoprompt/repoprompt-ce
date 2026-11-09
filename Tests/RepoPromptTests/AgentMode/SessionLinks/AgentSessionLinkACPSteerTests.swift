@@ -201,7 +201,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
             requestID: UUID(), linkID: UUID(), linkGeneration: 1,
             observerEndpoint: Self.observer, observerDisplayName: "Overseer"
         )
-        let stop = await fixture.viewModel.agentSessionLinkPerformStop(
+        let stop = await fixture.viewModel.linkExecutionRuntime.agentSessionLinkPerformStop(
             to: fixture.candidate, request: stopRequest,
             liveness: { Self.liveness }, queueHasCommittedDrain: { false },
             withdrawInbound: { true }, commitAuthorization: { .committed }
@@ -448,7 +448,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
             requestID: UUID(), linkID: UUID(), linkGeneration: 1,
             observerEndpoint: Self.observer, observerDisplayName: "Overseer"
         )
-        let stop = await fixture.viewModel.agentSessionLinkPerformStop(
+        let stop = await fixture.viewModel.linkExecutionRuntime.agentSessionLinkPerformStop(
             to: fixture.candidate, request: stopRequest,
             liveness: { Self.liveness }, queueHasCommittedDrain: { false },
             withdrawInbound: { true }, commitAuthorization: { .committed }
@@ -663,7 +663,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
             requestID: UUID(), linkID: UUID(), linkGeneration: 1,
             observerEndpoint: Self.observer, observerDisplayName: "Overseer"
         )
-        let stop = await fixture.viewModel.agentSessionLinkPerformStop(
+        let stop = await fixture.viewModel.linkExecutionRuntime.agentSessionLinkPerformStop(
             to: fixture.candidate, request: stopRequest,
             liveness: { Self.liveness }, queueHasCommittedDrain: { false },
             withdrawInbound: { true }, commitAuthorization: { .committed }
@@ -738,7 +738,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
             requestID: UUID(), linkID: UUID(), linkGeneration: 1,
             observerEndpoint: Self.observer, observerDisplayName: "Overseer"
         )
-        let stop = await fixture.viewModel.agentSessionLinkPerformStop(
+        let stop = await fixture.viewModel.linkExecutionRuntime.agentSessionLinkPerformStop(
             to: fixture.candidate, request: stopRequest,
             liveness: { Self.liveness }, queueHasCommittedDrain: { false },
             withdrawInbound: { true }, commitAuthorization: { .committed }

@@ -399,7 +399,7 @@ enum AgentSessionCarrierResolver {
             let ownerIDs = requestedIDs ?? result.sessionIDs
             // One binding census per window serves both the runtime owners and liveness states.
             let censuses = owners.map { ($0, $0.agentModeViewModel.authoritativeLiveSessionCensus(for: ownerIDs)) }
-            let runtimeOwners = runtimeOwners(in: &result, censuses: censuses)
+            let runtimeOwners = runtimeOwners(in: &result, sessionIDs: ownerIDs)
             result.uniqueRuntimeOwners = runtimeOwners
             result.runtimeStatesByWindow = Dictionary(
                 censuses.map { (ObjectIdentifier($0.0), $0.1.states) }, uniquingKeysWith: { first, _ in first }
@@ -410,53 +410,35 @@ enum AgentSessionCarrierResolver {
 
     private static func runtimeOwners(
         in snapshot: inout Snapshot,
-        censuses: [(window: WindowState, census: AgentModeViewModel.AuthoritativeLiveSessionCensus)]
+        sessionIDs: Set<UUID>
     ) -> [UUID: RuntimeOwner] {
-        var candidates: [UUID: (Observation, AgentTabSession)] = [:]
-        var conflicts = snapshot.ambiguousSessionIDs
-        for (window, census) in censuses {
-            for (id, result) in census.sessions {
-                switch result {
-                case .failure:
-                    conflicts.insert(id)
-                case .success(nil):
-                    break
-                case let .success(session?):
-                    guard let row = snapshot.rows.first(where: {
-                        $0.sessionID == id && $0.window === window && $0.stashedTabID == nil
-                            && $0.tab.id == session.tabID && $0.hasCurrentMetadataOwner
-                            && $0.entry?.id == id && $0.entry?.tabID == session.tabID
-                            && window.workspaceManager.activeWorkspaceID == $0.workspaceID
-                    }) else {
-                        conflicts.insert(id)
-                        continue
-                    }
-                    if let existing = candidates[id], existing.1 !== session || existing.0.window !== window {
-                        conflicts.insert(id)
-                    } else {
-                        candidates[id] = (row, session)
-                    }
-                }
-            }
-        }
-        return candidates.reduce(into: [:]) { owners, candidate in
-            let (id, (row, session)) = candidate
+        var owners: [UUID: RuntimeOwner] = [:]
+        for id in sessionIDs {
             let writer: AgentSessionRuntimeStore.Writer
-            switch AgentSessionRuntimeStore.shared.resolveWriter(workspaceID: row.workspaceID, sessionID: id) {
-            case let .unique(resolved):
-                writer = resolved
-            case .conflicting:
-                snapshot.runtimeWriterRejections[id] = .conflicting
-                return
+            switch AgentSessionRuntimeStore.shared.resolveWriter(sessionID: id) {
+            case let .unique(resolved): writer = resolved
+            case .unavailable(.absent): continue
             case let .unavailable(reason):
                 snapshot.runtimeWriterRejections[id] = .unavailable(reason)
-                return
+                continue
+            case .conflicting:
+                snapshot.runtimeWriterRejections[id] = .conflicting
+                continue
             }
-            guard !conflicts.contains(id), session.permitsBoundOperationAndSave,
-                  let binding = session.currentRestorationBindingToken,
-                  binding.bindingIdentity.sessionID == id, binding.bindingIdentity.tabID == row.tab.id,
-                  writer.session === session, writer.restoration == binding else { return }
+            guard snapshot.affectedWorkspaceIDs(for: id).allSatisfy({ $0 == writer.identity.workspaceID }) else {
+                snapshot.runtimeWriterRejections[id] = .conflicting
+                continue
+            }
+            guard !snapshot.ambiguousSessionIDs.contains(id), writer.session.permitsBoundOperationAndSave,
+                  let row = snapshot.rows.first(where: {
+                      $0.sessionID == id && $0.workspaceID == writer.identity.workspaceID
+                          && $0.tab.id == writer.session.tabID && $0.stashedTabID == nil
+                          && $0.window.agentModeViewModel.sessions[$0.tab.id] === writer.session
+                          && $0.hasCurrentMetadataOwner && $0.entry?.id == id
+                  }) else { continue }
+            // Presentation is attached after runtime selection, never used to break a tie.
             owners[id] = RuntimeOwner(location: row, writer: writer)
         }
+        return owners
     }
 }

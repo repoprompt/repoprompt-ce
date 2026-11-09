@@ -200,8 +200,12 @@ extension AgentModeViewModel {
         let expectedSourceAgentSessionID = composerSourceAgentSessionID(tabID: tabID, session: resolvedSession)
         let hasLinkedSession = hasLinkedAgentSession(for: tabID)
         let route: AgentComposerSubmitTarget.Route
+        let writerIdentity: AgentSessionRuntimeStore.WriterIdentity?
         if hasLinkedSession {
-            guard expectedSourceAgentSessionID != nil else { return nil }
+            guard let sessionID = expectedSourceAgentSessionID,
+                  let command = try? runtimeCommand(sessionID: sessionID),
+                  command.writer.session === resolvedSession else { return nil }
+            writerIdentity = command.identity
             route = .existingAgentSession
         } else {
             guard expectedSourceAgentSessionID == nil else { return nil }
@@ -209,6 +213,7 @@ extension AgentModeViewModel {
                   resolvedSession.runID == nil,
                   resolvedSession.activeRunAttemptID == nil
             else { return nil }
+            writerIdentity = nil
             route = .createAgentSessionFromSourceTab
         }
 
@@ -227,7 +232,8 @@ extension AgentModeViewModel {
             expectedRunID: expectedRunID,
             expectedRunAttemptID: expectedRunAttemptID,
             expectedSubmissionToken: resolvedSession.composerSubmissionToken,
-            expectedInitialStartLocation: expectedInitialStartLocation
+            expectedInitialStartLocation: expectedInitialStartLocation,
+            expectedWriterIdentity: writerIdentity
         )
     }
 

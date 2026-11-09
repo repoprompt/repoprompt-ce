@@ -457,7 +457,7 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
                             && handle.session.currentRestorationBindingToken == handle.bindingToken
                     }
                 )
-                XCTAssertTrue(fixture.vm.withdrawPendingStartForSessionLink(session: handle.session, admission: admission))
+                XCTAssertTrue(fixture.vm.linkExecutionRuntime.withdrawPendingStartForSessionLink(session: handle.session, admission: admission))
                 XCTAssertFalse(handle.session.mcpFollowUpRunPending)
                 XCTAssertFalse(pendingFence.permitsStart(of: handle.session))
             } else {
@@ -567,7 +567,7 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
                     && handle.session.currentRestorationBindingToken == handle.bindingToken
             }
         )
-        XCTAssertTrue(fixture.vm.withdrawPendingStartForSessionLink(session: handle.session, admission: admission))
+        XCTAssertTrue(fixture.vm.linkExecutionRuntime.withdrawPendingStartForSessionLink(session: handle.session, admission: admission))
         XCTAssertFalse(pendingFence.permitsStart(of: handle.session))
         gate.release()
         let result = await starter.result

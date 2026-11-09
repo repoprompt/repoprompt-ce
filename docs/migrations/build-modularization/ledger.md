@@ -5340,7 +5340,48 @@ stash remain excluded and preserved. PR #1655 stays draft; no live-app lifecycle
   claim that the repository has no existing warnings; the clean hosted aggregate ratchet remains
   separate. Final Swift-tree lint: `e58f94fa-e23f-4c2b-beb6-fff6dfa2113e`, passed.
 
-#### M9.1 review follow-up: incremental Claude reasoning preview
+### M9.2 in progress: writer admission, placement, and Send/Stop routing
+
+This is a partial routing milestone, not completion of M9.2 or #1406.
+
+- `AgentSessionRuntimeStore.Writer` now carries an exact scope/incarnation/workspace/restoration
+  identity; command admission is distinct from originating-writer currency. Retirement refuses new
+  commands without invalidating already-claimed teardown or durable acknowledgement. Binding
+  admission refuses a second live writer before it can install a partial claim.
+- Delegation placement prepares a missing writer before the final synchronous scope-lease and
+  membership fence. The writer owns payload mutation and the existing serialized required save;
+  agreeing UI replicas receive projections, never writer claims. The cold file-rewrite fallback is
+  removed. Real-persistence tests cover the first mutation across cold replicas and late authority
+  loss during preparation.
+- The runtime scope now retains its single `AgentModeRunService`, shared by start and cancellation.
+  The stream runtime no longer depends on a weak view-model-owned execution back-pointer.
+  `WindowStatesManager` routes Send/Stop and their start-stop fence through the process writer;
+  route IDs remain exact endpoint fences, not window-election inputs.
+- The actual managed Stop transaction and cancellation helpers moved from the view model into
+  `AgentSessionLinkExecutionRuntime`. Claimed cleanup and audit effects retain their writer and
+  are tracked through drain. Stop effects are deliberately not joined by terminal publication,
+  which Stop itself awaits. Unsettled provisional target claims live in the existing MCP runtime.
+- Send rechecks its writer around authorization and persistence. Loss of the writer during a save
+  cannot acknowledge that write or compensate against the successor: the row remains, persistence
+  is reported indeterminate, and provider dispatch is withheld.
+- Retired here: the link `Commands.endpoint` callback, the VM managed Stop implementation and
+  cancellation helper bodies, and the VM's stored execution service. Remaining Steer/Compact/model,
+  MCP/admin/worktree, provider-input, self-compaction, terminal preparation and forwarding adapters
+  in the inventory above are still M9.2 work. Window-free resource composition remains M9.3;
+  close-preserves-run and presentation lifetime remain M9.4.
+
+Milestone validation: `1af66724-155a-4599-b74b-61510597f814` passed **580 focused tests**;
+`d1b9e6c1-9216-4f04-a909-703e918cdbf7` built both products. Fresh index check passed
+**1241/1360** wrong-way file edges and **53/66** largest-cycle components. Scoped pinned
+SwiftFormat lint and strict SwiftLint passed all 21 changed Swift files (the final wake fixture was
+rechecked separately). Normalized diagnostics in touched files matched the nine pre-existing
+warning signatures from the admission/placement builds; no new warning signature was introduced.
+The scope-lifetime witness joins its exact pending persistence task before asserting deallocation;
+it does not use a sleep or retry. Competing-writer wake coverage distinguishes cached authority
+projections from command admission: newer inventory can be cached, but no conflicted session
+mutation or provider wake is admitted. Hosted CI and live-app validation remain overseer-owned.
+
+### M9.1 review follow-up: incremental Claude reasoning preview
 
 Addressed review comment `4506135560` (review `5817795307`): the pre-existing assignment, preserved
 by the move, now appends reasoning chunks before the unchanged 4000-character suffix trim.
@@ -5361,7 +5402,503 @@ outside this narrow append repair; it must be considered before enabling the dor
 - No new compiler warnings in the three touched Swift files. The two emitted VM actor-isolation
   warnings are at unchanged lines 2839/3128, already matched to main in the prior audit.
 
-#### M9.1 post-merge CI follow-up: transcript fixture admission and cold Oracle awareness
+### M9.2 partial milestone: writer-owned model and effort configuration
+
+`AgentSessionLinkExecutionRuntime+Model` now owns the model admission, final authorization hop,
+exact-incarnation recheck, payload mutation and persistence scheduling. Its configuration-only
+candidate comes from the unique runtime writer, not a window or sidebar election. The link host
+and administrative model/effort hosts resolve that writer directly. Model availability remains a
+read-only host resource input; losing it refuses admission rather than inventing availability.
+
+The old VM mutation bodies are removed. Optional exact-object presentation sinks mirror accepted
+model/effort changes into composer UI; no runtime commit depends on their presence. Deferred MCP
+publication holds and rechecks the originating writer. Effort changes recheck both the scope lease
+and writer after the authorization callback, including synchronous rebinding during that callback.
+Model readiness, catalogue revalidation, same-provider restriction and no-provider-dispatch semantics
+remain intact. Configuration tests cover detached presentation, retirement and actual runtime rebind
+at the final fence, as well as revoked effort authority and no partial changes.
+
+This retires the model/effort mutation callbacks only. Other link commands, MCP routing, terminal
+preparation and the remaining M9.2 adapters above are still open; this is not M9.2 completion.
+
+Validation: `71aceefa-22f2-43f0-aac5-8bd00d0822f2` passed **529 focused tests**. The broader
+set also required updating legacy discovery/cancellation fixtures: ordinary duplicate installation
+is explicitly refused before raw corrupt state is injected for defensive census tests, and restored
+Stop fixtures use workspace-qualified bindings rather than unscoped test identities. No fail-closed
+assertions were removed. Both products passed `82732df7-5430-48e9-a954-fceed87ec97d`; full lint
+passed `2a4ede2a-600b-415f-95cb-74fd08d901a4`, followed by scoped checks covering all 12 changed
+Swift files and the final fixture correction. Nine existing touched-file warning signatures were
+matched to prior logs; no new warnings were introduced. Earlier compile/fixture failures are not
+counted as successful validation.
+
+### M9.2 partial milestone: writer-owned managed compaction
+
+The managed Compact transaction and shared native compaction leaves now live in
+`AgentSessionLinkExecutionRuntime+Compact`; the link host resolves the exact runtime writer instead
+of selecting a window. The transaction retains its command through authorization, support queries
+and required persistence. Workspace identity comes from that capability. Retirement before the
+request row refuses mutation; retirement after accepted persistence retains the request and withholds
+provider dispatch. A failed write after writer replacement reports indeterminate persistence without
+removing the originating row or issuing a compensating save against the successor.
+
+The VM Compact implementation is removed, and self-compaction calls the shared runtime native leaf.
+The self-compaction scheduler and the existing composer/start resource adapters remain explicitly
+open M9.2 work, alongside Steer and the other routing adapters above. This milestone does not change
+window close behavior or claim window-free provider composition.
+
+Regression coverage includes pre-commit retirement, retirement during save, and writer replacement
+inside a failed save with an exact one-save assertion. Legacy conflict fixtures now assert the
+canonical endpoint is unavailable while both claims remain, preserving all no-mutation assertions.
+The suspended Codex-resume fixture invalidates the runtime binding rather than merely clearing a
+sidebar projection.
+
+Validation: `191cba3e-7436-4db5-b185-e213564d5263` passed **171 focused tests**, including
+managed Claude/Codex/ACP compaction, autonomous delivery, shared self-compaction and Send regressions.
+Both products passed `cfbe482e-27ed-4795-aff4-866140959c65`; full lint passed
+`7ca65a07-a26a-4f77-9943-4871f280025d`, with scoped checks covering the new runtime file and final
+test edits. Fresh index check passed **1239/1360** wrong-way file edges and **53/66** largest-cycle
+components. A newly introduced test trailing-closure warning was fixed before the final passing run;
+remaining touched-source warning signatures match the prior baseline. No live-app or full-suite
+validation is claimed.
+
+### M9.2 partial milestone: writer-owned terminal transcript preparation
+
+The terminal publication hook now captures `AgentSessionObservationRuntime`, not a weak view model.
+That runtime owns derived-transcript catch-up and requires the exact unique persistent writer before
+terminal materialization. It retains and rechecks that writer across optional synchronous presentation
+cleanup, including rebinding from the cleanup callback. Accepted terminal work can finish during
+retirement; it does not acquire a new command or introduce another terminal settlement owner.
+
+`AgentSessionPresentationRuntime` owns UI-sync suppression and optional pending-UI cleanup. Sidebar
+identity still gates presentation, separately from runtime materialization: moving a sidebar projection
+does not elect a different writer, and it does not permit old rows to publish into that presentation.
+Unbound local drafts may build their ordinary derived projection but cannot pose as persistent terminal
+writers. No Stop drain is joined from terminal publication, because Stop already awaits terminal work.
+
+Coverage exercises detached presentation, retirement, replacement during optional cleanup, conflicting
+writers, unbound drafts, and a real VM whose sidebar mismatch refuses UI publication while the writer
+still materializes its transcript. Other event-boundary and routing adapters remain M9.2 work; this
+retires only the weak terminal-preparation callback and the VM's transcript catch-up implementation.
+
+Validation: `d5d8b993-4b7c-48d1-8da8-812e4a6bacb5` passed **266 focused tests**. Both products
+passed `ec61e564-fbc6-4b80-9cc3-dad8195e8bc4`; full lint passed
+`6462d785-fc13-4532-8d29-9ee6afec72cb`, followed by scoped checks on all five final Swift files,
+including the new runtime tests. Fresh index remained **1239/1360** wrong-way file edges and
+**53/66** largest-cycle components. Three emitted touched-file warning signatures matched the prior
+baseline; no new warnings were introduced. Live-app and full-suite validation were not run.
+
+### M9.2 partial milestone: runtime-owned composer submission claims
+
+`AgentSessionComposerSubmitRuntime` now owns the shared check-and-mutate, currency and release
+implementation for the existing session submission attempt and token. Its scope retains the sole
+fresh-task routing map; no parallel claim ledger was added. Existing-session targets carry the exact
+writer identity, and accepted claims retain their originating scope and command. A copied binding
+cannot revive a target after the scope releases and reacquires its writer claim. Cleanup can still
+release the originating attempt after retirement or replacement without clearing a successor.
+
+Programmatic link targets use only the admitted writer, not local focus, sidebar metadata, draft text
+or workspace-switch presentation state. The four composer target/claim/currency/release callbacks
+are removed from `AgentSessionLinkExecutionRuntime.Commands`. Local composer preparation retains
+its presentation checks and the unbound creation route; its first binding remains the existing
+creation owner's responsibility. Optional presentation notifications mirror the resulting claim.
+Local re-prompt preparation transfers to the new claim before its token change is published to UI;
+the broader re-prompt suites exposed and protect this ordering. Programmatic claims need no such
+local preparation. The other start, input, self-compaction and command-routing adapters remain open
+M9.2 work.
+
+Coverage includes claims without presentation, exact incarnation replacement, retirement cleanup,
+first binding of a local draft, and a real VM whose local workspace switch/sidebar mismatch cannot
+block a valid programmatic claim. Four isolated routing fixtures now install workspace-qualified
+restored writers; the delayed-handoff fixture carries the exact writer identity so it continues to
+prove the specific durable execution-location blocker rather than failing an unrelated identity check.
+
+Validation: `e4e842d1-2a5b-4dbf-99b3-86ef21f99e94` passed **458 focused tests**, including
+local draft, workflow and re-prompt integration as well as writer, link, compaction, restoration and
+handoff cases. Both products passed `d784a8d3-6c1c-4c02-9aaf-9c3572cb5d67`; full lint passed
+`a1435b83-511a-4c3d-a78e-244025cff613`, with an explicit scoped check for the new runtime file.
+Fresh index passed **1241/1360** wrong-way file edges and **53/66** largest-cycle components.
+Six emitted touched-file warning signatures matched the previous baseline; none were new.
+Earlier runs exposed the legacy unscoped fixtures and the local publication-order regression;
+those failures are not qualification receipts. No live-app or full-suite validation was run.
+
+### M9.2 partial milestone: runtime-owned MCP epoch preparation
+
+Run-start calls the scope's MCP runtime directly; `Environment.prepareEpoch` and the view-model
+preparation body are removed. The runtime owns the boxed transition-token carrier and composes
+cancellation from its already-installed execution service. Ordinary non-MCP starts do not create
+control or provider resources. Existing epoch-transition staging is still an open routing adapter.
+
+Epoch preparation admits the exact unique restored writer before calling the durable domain store.
+Missing-record recovery rechecks that same command around registration; conflicts, retirement and
+claim release/reacquisition cannot publish new control. A durable epoch accepted before Stop or
+retirement is still acknowledged on its originating object, but the runtime returns a separate start
+permission which run-start and Claude follow-up preparation must honor. Detached originating objects
+can reconcile their accepted epoch; a reinstalled object with an identical binding but a new writer
+incarnation cannot receive the old acknowledgement. The domain store remains the epoch authority.
+
+Coverage exercises rejected admission, same-binding claim reacquisition, recovered registration,
+Stop/retirement acknowledgements and the separate dispatch result. The native-Claude controlled-turn
+fixture now installs a workspace-qualified restored writer before creating MCP control; the public
+cancellation rebind fixture likewise preserves workspace identity while changing its session binding.
+Their original cancellation, adoption and lifecycle assertions remain intact. Other run-start, input,
+control-activation and command-routing adapters remain M9.2 work.
+
+Validation: `c9b1dbf7-67ee-48a1-bc62-392164e6f73b` passed **215 focused tests**, and
+`5ea27f48-3053-45b4-9a61-b7d2e7dcee96` passed **21 execution-runtime tests**, including the
+changed custom run-start environments. Both products passed
+`2902a377-fcf3-4b33-ad01-a2fbea63ed5a`; full lint passed
+`554a0ca3-3e26-47fe-97fa-66328fbc966f`, followed by scoped pinned formatter and strict SwiftLint
+checks on all seven final Swift files. Fresh index passed **1241/1360** wrong-way file edges and
+**53/66** largest-cycle components. Six emitted touched-file warning signatures matched the existing
+baseline; none were new. Earlier iterations exposed unbound test control fixtures; a periodic ACP
+response-gate timeout did not recur in either subsequent run, with its assertions and timeout unchanged.
+Those failed/cancelled runs are not qualification receipts. No live-app or full-suite validation was run.
+
+### M9.2 partial milestone: pinned run-start writers and epoch-transition receipts
+
+Run-start captures the exact writer before bound-session preparation and retains its incarnation
+across hydration, creation acknowledgement and input preparation. A local creation's writer is
+captured synchronously after binding and before awaiting the first save. Ordinary command admission
+follows authoritative restoration. The separate host-workspace resource fence remains until the
+mutable context/provider-path adapters are replaced: writer currency cannot authorize consuming
+another workspace's resources. Lane claims
+and subsequent epoch/input steps are fenced by that command. Same-binding claim reacquisition is
+not a continuation of the old start, and failed preparation cannot clear a successor's follow-up
+marker. The active Claude steering branch uses the scope's installed execution service.
+
+Epoch-transition staging, task-local execution and failure cleanup now belong to the MCP runtime.
+A staged receipt retains its originating writer and control activation. Cleanup can drain after
+retirement or detachment, but cannot clear a replacement writer, rebound session, newer transition
+or prepared epoch. The view-model compatibility entry resolves a runtime command, not a controlled
+tab through UI selection; its staging and cleanup implementations are removed.
+
+Coverage adds restoration under a stable writer, same-binding claim reacquisition during
+load/input preparation, preservation of the host-resource drift fence, and transition cleanup
+across retirement, detachment and replacement. The compact test fixture now installs the app model
+identity policy before persisting model pins; a combined run exposed its missing bootstrap. This
+changes no behavior assertion or production settings policy. Remaining input, binding, creation,
+provider-dispatch and broader routing callbacks are still M9.2 work, not deferred to M9.3.
+Native-Claude fixtures with an already-live provider conversation now install a workspace-qualified
+writer for local as well as MCP-controlled turns; the adoption, steering and lifecycle assertions remain
+unchanged. Unbound local creation continues to have separate composer/restoration coverage.
+
+Validation: `fdfe7678-1220-47ee-acfe-229320d65b4a` passed **509 focused tests**, including
+writer/epoch, link, native-Claude, restoration, composer/workflow and re-prompt paths. Both products
+passed `8d1ede22-ae29-4242-b104-68738c2d3874`; full lint passed
+`36fda4dd-65da-472c-a7c7-f2e8f72b8b56`. Fresh index passed **1241/1360** wrong-way edges
+and **53/66** largest-cycle components. Six emitted touched-file warning signatures matched the
+existing baseline; none were new. Earlier missing-import failures, the settings-bootstrap trap and
+the canceled unbound-provider-fixture run are not passing receipts. No live-app or full-suite
+validation was run.
+
+### M9.2 partial milestone: runtime input construction and provider-switch receipts
+
+Run-start and link provider-switch admission now call the scope's provider-input runtime directly.
+Their augmentation and initial-message command callbacks are removed; host composition supplies
+workspace paths, lookup resources and prompt/selection snapshots instead. Run-start also calls the
+existing link runtime's provider-switch preparation directly, removing that VM callback. Skill
+publication, workspace capture, initial-context construction and handoff staging honor the exact
+command and Stop/resource fences across suspension. An already-foreign host workspace is refused,
+not merely a workspace that changes during preparation. A host without an active workspace supplies
+no workspace paths, context store or initial-thread snapshot; global skill resources remain independent.
+The mutable resource fence stays until window-free resource composition is available.
+
+Provider-switch preparations retain their admitted command. Acceptance cannot install dispatch
+proof for a reacquired writer. Sending-save and ready-compensation use the originating writer and
+its workspace; a lost incarnation cannot authorize rollback or a compensating save. Review caught
+that simply returning after writer loss left the old transient dispatch armed. Cleanup now releases
+only the exact originating proof, whose value evidence includes writer incarnation, while retaining
+durable `.sending` uncertainty and the accepted row. The unused VM ready-compensation adapter is
+removed. Broader provider dispatch, creation/hydration, Steer and MCP/admin command routing remain
+M9.2 work; this milestone does not complete that segment.
+
+Coverage uses real skill discovery gates for writer rebind/reacquisition, retirement, Stop and
+workspace drift, with no stale handoff staging or catalog publication. It also covers successful
+unpresented construction, initial-thread resource capture/refusal, and exact save counts across
+provider-switch writer loss. The old composition race gate was moved from the deleted VM callback
+to actual runtime discovery without dropping its behavior assertions. A test-only saver fault is
+bounded to its transaction and removed before fixture teardown, preventing later checkpoint saves
+from executing stale test assertions.
+
+Validation: `b8a85da1-10f0-4362-974c-687dd74ece6a` passed **476 focused tests**. Both products
+passed `f2f8f5d5-d2d7-4e34-80b1-201edfb9d00f`; full lint passed
+`14792b3a-9690-4dc5-b34c-317e31b79564`, with scoped pinned formatter and strict SwiftLint
+passing again after the final test-only fixture cleanup. Fresh index passed **1241/1360** wrong-way
+file edges and **53/66** largest-cycle components. Four emitted touched-file warning signatures
+matched the baseline; none were new. The missing test-helper isolation, obsolete race hook and
+escaped test-fault runs are failed receipts, not qualification. A focused Oracle review was performed
+and its transient-proof cleanup finding addressed. No live-app or full-suite validation was run.
+
+### M9.2 partial milestone: originating-writer physical handover events
+
+Physical provider-switch acquisition now resolves the exact writer incarnation stored in its
+value proof and requires command admission at every release check. Binding a logical dispatch ID
+is not physical acceptance: Codex repeats the check after asynchronous Read proof, so retirement
+must still refuse that final release. A provider acceptance that already occurred instead uses
+the originating writer's drain currency and workspace. Its queued clear-save retains that writer,
+rechecks before selecting a save target, and cannot compensate a failed old write onto a reacquired
+claim. A retained in-memory acknowledgement remains dirty for the successor's own explicit save.
+
+Three obsolete VM physical-event forwarding methods are removed. Terminal handover-proof cleanup
+now captures the scope's link runtime directly rather than depending on a weak presentation callback.
+The terminal barrier and the link/notice/claim/wake owners are unchanged; inner runner admission,
+Steer, creation/hydration and the remaining MCP/admin routing are still M9.2 work.
+
+New causal cases retain identical binding tokens while reacquiring a claim before dispatch,
+acceptance, the scheduled save or a failing save. They verify exact save counts, unchanged state on
+refusal, retirement's late acceptance drain, and real persisted convergence through a successor's
+separate save. Review suggested relaxing repeated acquisition during retirement; inspection of
+Codex's pre/post-Read checks showed that would release new provider IO, so the guard is preserved
+and the scenario explicitly tested. The review found no blocking issue.
+
+Validation: `8ba00cb9-631e-466c-8e4d-72ed38c7ef3f` passed **400 focused tests**, including actual
+headless/ACP runner suites, handoff, Send, Stop, wake and native-Claude lifecycle coverage. Both
+products passed `84a63aba-8a26-4727-9147-15d72a346a94`; full lint passed
+`d5299cb4-9664-4e13-ae2d-84c8b9cd4f65`, followed by scoped pinned formatter/strict SwiftLint
+on the final test-only refinements. Fresh index passed **1241/1360** wrong-way file edges and
+**53/66** largest-cycle components. One emitted touched-file warning signature matched the baseline;
+none were new. No live-app or full-suite validation was run.
+
+### M9.2 partial milestone: replicated-creator accounting and production placement
+
+Creation accounting and spawn-stamping authorization no longer reject agreeing presentations
+when provenance proves one exact restored runtime writer. Preparation eligibility alone is still
+insufficient for a creator. Ancestry conflicts, scope capabilities, quota counting, reservations
+and the existing full-access policy remain unchanged. These are accounting/authorization proofs,
+not substitutes for the writer command required by the mutation host. The refusal guidance no
+longer tells users to close an otherwise valid duplicate presentation.
+
+The real-carrier regression distinguishes cold metadata, one writer, a refused second installation,
+and deliberately injected legacy competing claims. It verifies both presentation orders, one
+logical capacity count, scope stamping, in-flight quota exhaustion and reservation release. Existing
+census corruption fixtures now assert ordinary conflicting-writer refusal before raw injection,
+without dropping their conservative accounting or mutation-refusal assertions.
+
+The cold-replica placement journey now starts with the production MCP service, front door, structural
+handler registration, scope authorization and durable reparent transaction, rather than only calling
+the host. Preview creates no writer. A separate test inspection hold keeps the idle prepared adapter
+available for later witness checks; observed save-time hold counts prove the production transaction
+acquires its own hold through persistence and releases it afterward. Both UI indexes and prepared
+witnesses are checked before any subsequent lower-level mutation can overwrite the first result.
+The read-only replicas never acquire payload sessions. This is not completion of M9.2: execution,
+Steer, creation/hydration and the remaining MCP/admin adapters are still open.
+
+Validation: `e029a298-b667-46c1-ab03-9b4ab61f1229` passed **151 focused tests**. Both products
+passed `bd24097f-e05f-4344-abc3-8005fb74beed`; full lint passed
+`55ad14d2-98a0-4cf0-a634-fb010d8246cb`, followed by pinned formatter lint and strict SwiftLint
+on all five changed Swift files after the final test-only lifetime correction. Fresh index passed
+**1241/1360** wrong-way file edges and **53/66** largest-cycle components. Three emitted
+touched-file warning signatures matched the baseline; none were new. The earlier missing handler,
+spawn-stamp authorization and obsolete duplicate-install fixtures were failed receipts, not passes.
+Review prompted first-transaction projection assertions and a precise raw-writer refusal witness;
+the inspection hold avoids assuming that an idle prepared adapter survives an unrelated disk await.
+No live-app or full-suite validation was run.
+
+### M9.2 partial milestone: provider-initiated Claude adoption
+
+Claude provider-turn adoption now enters the canonical scope directly. The coordinator holds a
+weak scope resource reference rather than an `adoptProviderTurn` view-model callback. The scope
+selects/adopts the exact writer command, and the installed run service retains it through terminal
+publication and MCP epoch preparation. The actual provider-epoch body moved from the VM to
+`AgentSessionMCPRuntime`; copied control-context ambiguity remains a separate veto and no longer
+sets a pending-follow-up flag before refusal. Domain epoch acceptance is not dispatch permission.
+
+A refusal carries its originating writer back to the coordinator and rechecks that capability at
+the synchronous payload mutation. Retirement may refuse and drain that same writer; reacquisition
+must not receive its error row, run-state mutation, follow-up cleanup or save. A superseded operation
+retires only the captured unadopted listener/controller, disables its presentation callback, and
+never selects the replacement controller after suspension. Review caught the initially stranded
+provider-turn case; the correction cancels pending permissions without re-adopting on a retry.
+
+The regressions cover epoch suspension followed by retirement, identical-binding writer
+reacquisition, replacement controllers, entry admission refusal and control-context ambiguity.
+They assert pending work is resolved, successor state is untouched, and a still-current origin can
+acknowledge the accepted epoch without dispatch. Actual epoch preparation works without a
+presentation sink. Broader listener event/tool hooks and ordinary runner dispatch remain M9.2 work;
+this does not change presentation close or introduce a M9.4 handoff/drain policy.
+
+Validation: `dc86af3d-f7d7-4a76-9f29-e526ad69418c` passed **134 focused tests**. Both products
+passed `3b788eb2-9f07-4b97-9b20-09748b66136d`; full lint passed
+`e226517d-43d4-4be1-8a69-db2051b2d4c2`. Fresh index passed **1241/1360** wrong-way file
+edges and **53/66** largest-cycle components. Two emitted touched-file warning signatures matched
+the baseline; none were new. Earlier 123/124-test receipts preceded the review repair and final
+callback/receipt retirement and are not the final qualification. No live-app or full-suite
+validation was run.
+
+### M9.2 remaining inventory and completion checks
+
+Size is a rough implementation/test surface, not a time estimate: **S** = 1–2 files, **M** =
+3–5 files, **L** = 6+ files or a broad caller/fixture migration. These groups reconcile the M9.1
+adapter inventory with the partial milestones above; none is deferred merely because it is large.
+
+| Remaining M9.2 routing/retirement group | Size | Concrete boundary still to retire |
+| --- | --- | --- |
+| Binding, creation and hydration | L | VM binding/creation inputs, `prepareSessionForRunStart`, `performPersistedSessionLoad` and first-save admission callbacks; pin exact origin through inner IO, not only the outer startup fence |
+| Startup, continuation and provider execution | L | Remaining `makeRunStartEnvironment`/`makeFollowUpLaunch` command callbacks, composition → run service → runner resource/physical-dispatch boundaries; keep originating terminal cleanup distinct from new admission |
+| Link Steer, local/provider input and self-compaction | L | VM Steer/submission bodies, remaining `linkExecutionRuntime.Commands` start/self-compact callbacks, provider input release and link storage/forwarding adapters |
+| MCP control and routing | L | VM control-session/metadata lookup and mutation, activation/cancellation, `MCPRunRouteBindings` and tool service target selection; app/server resource composition remains separately identified |
+| Administration and worktree commands | L | `SessionAdminWindows.owningViewModel` command selection, delegation fork, worktree transition/merge bodies and their scope-authorized commit boundaries; placement/model/effort cutovers above are already active |
+| Interaction and provider approval commands | M | VM interaction forwarding and mutation callbacks in provider/approval composition, separate from user-facing consent presentation |
+| Provider event/tool-hook and terminal follow-up routing | L | Remaining weak service/coordinator hooks, Claude tool-hook installation, self-compaction/provider-switch-generation/worktree-relocation terminal callbacks; terminal transcript materialization is already runtime-owned |
+| Persistence and payload forwarding retirement | M–L | VM save/token/flush forwarding plus provider-input/resume-handoff, draft/usage/timing/transcript aliases and mutable session-proxy access; remove obsolete call paths, not just wrap them |
+
+Done means: (1) query/command/event boundaries carry exact session/workspace/incarnation and the
+appropriate writer/command capability and durable acknowledgement; absent, unique and conflicting
+writers remain distinct, with causal race and persistence coverage; (2) MCP, admin, scope and link
+mutation entries consume that writer rather than selecting a window or invoking a VM command body,
+while authorization and the four disjoint link owners remain unchanged; (3) caller/body searches
+show each M9.2-assigned adapter retired as its replacement activates, with only explicitly documented
+resource or presentation composition left; and (4) focused regression receipts, both products,
+full lint attempt, fresh index and zero new touched-file warnings qualify the final boundary.
+
+Boundary notes: the current private prepared owner and its inspection/transaction holds remain
+**M9.3** adapters; their idle retirement is not a promise of presentation lifetime. Window-free
+saved-target loading/composition and prepared-window removal are not M9.2 work. Closing a presenter
+still cancels its run: close-preserves-run and handoff/drain belong to **M9.4**. Do not remove the
+mutable host-workspace resource fence until resource identity is safely pinned; writer identity
+alone does not authorize use of a different window's context or launch path.
+
+### M9.2 partial milestone: MCP registration and cancellation claim receipts
+
+MCP activation now retains its admitted creation/restored command across setup instead of
+accepting a fresh lookup after each suspension. Registration, generation advancement and the
+registration cancellation receipt moved into `AgentSessionMCPRuntime`; the domain store remains
+registration authority and resident/consent revalidation remains separate from writer admission.
+The cancellation receipt retains the exact writer incarnation. Its originating teardown check
+allows retirement and binding preparation, but rejects conflicting claims, identical-binding
+reacquisition and reinstallation. Readiness/hydration and dirty-state changes do not rotate the
+claim; the live index was not weakened to make an obsolete cancellation receipt reusable.
+
+Review found that merely refusing post-installation reacquisition left half-installed control
+behind. Failure now removes an unchanged provisional activation receipt and its registration,
+without clearing a newer activation/context/generation or successor instruction. Permission,
+origin and auto-edit rollback only restores values that this attempt actually wrote and still
+owns. The regression covers reacquisition before visibility and after provisional installation,
+plus conflict cancellation and the existing no-presenter lifetime/retirement/transition drain.
+Broader parameter tests now explicitly install restored, workspace-qualified writers where they
+previously attempted MCP parameter mutations on unbound local drafts; their parameter, busy-state,
+rollback and rejection assertions are unchanged.
+
+This retires the VM registration transaction, not the remaining activation/permission setup,
+deactivation, control routing or inner execution cancellation adapters. Those remain M9.2;
+no saved-target host or presentation handoff/drain policy was changed.
+
+Validation: `609aa56d-5bdf-4bf7-88a6-6e5de2b5e371` passed **137 focused tests**. Both products
+passed `34ca534b-10ed-4175-b6af-b4e22033260a`; full lint passed
+`6ac666a6-fdf1-42b5-993a-11aaa3570b8c`, followed by a passing scoped check for the final
+fixture-only property correction. Fresh index passed **1241/1360** wrong-way file edges and
+**53/66** largest-cycle components. Three emitted touched-file warning signatures matched the
+baseline; none were new. The first run exposed abandoned-registration cleanup and unbound
+parameter fixtures; the second stopped on two incorrect test property names. Neither is a pass.
+No live-app or full-suite validation was run.
+
+### M9.2 partial milestone: runtime control installation and permission rollback
+
+`AgentSessionMCPRuntime.activateControlContext` now owns context installation, pending/origin
+state, provider permission policy, the real approval-store override, and exact provisional
+rollback. The VM installation body and DEBUG hook storage are removed. Composition supplies
+concrete approval/settings resources and a synchronous, read-only phase-specific resident
+consent fence; the admitted writer remains fixed through registration and permission awaits.
+The existing domain registration and cancellation owners are unchanged.
+
+Control UI membership and active bindings are an optional presentation projection after setup
+commits, or after rollback. Attached and detached cases exercise the same runtime transaction;
+consent revoked after the approval actor accepted its override restores the originating values
+and removes the exact provisional registration. Review caught an unintended post-installation
+inactive-run check: it was restricted to the resident phase to preserve the existing contract.
+Presentation is projected before observed MCP publication. The old VM permission and observed
+state helpers were checked: they forward to the same provider-policy and runtime owners.
+
+This retires the installation/permission mutation callback path, not the remaining host
+preflight/hydration/reset preparation, deactivation, control lookup/tool routing or inner
+provider execution. Those remain M9.2 items in the inventory above. Approval resources and UI
+projection are distinct from command authority; no M9.3 saved-host or M9.4 lifetime policy changed.
+
+Validation: `36066335-60d1-4edf-b644-183e4b61d4c2` passed **138 focused tests**. Both products
+passed `72f78cf7-ce4b-418f-9e6b-4686db31d673`; full lint passed
+`c14ae264-c79d-4060-a659-b3e963a26c3f`, with explicit scoped checks for the new runtime file
+and final test-only fixture correction. Fresh index passed **1242/1360** wrong-way file edges
+and **53/66** largest-cycle components. Two emitted touched-file warning signatures matched
+the baseline; none were new. The first compile caught two missing imports. The next run passed
+all 137 existing tests but exposed an unrelated approval actor in the new fixture; the final
+fixture uses the installed actor and observes subscription/state acknowledgement, preserving
+all rollback assertions. Neither earlier run qualifies this milestone. No live-app or full-suite
+validation was run.
+
+### M9.2 partial milestone: conditional approval receipts and runtime control detach
+
+The existing approval-store scope entry now carries a revision and at most one override owner.
+Activation prepares and conditionally applies an exact resource receipt; ordinary writes,
+including same-value manual writes and existing hydration synchronization, supersede it.
+Release-before-apply invalidates the request, cleanup/reuse cannot recreate its revision, and
+an old release cannot restore over a newer owner. There is no second claim ledger, tombstone
+set, successor reconciliation loop, or changed plain-write policy. A nil entry value still
+follows the global default. Registration replacement preserves the value-only resource receipt.
+
+The first causal successor test caught an important handover case: enabled state can still be
+the predecessor's override, not a user preference. Every activation now takes a resource receipt;
+the one existing entry carries its underlying restore value into a successor owner. A release
+between successor preparation and application fails closed rather than retrying. Review also
+caught stale local projection after a refused restore; release republishes the actor's actual
+value even when it does not mutate it. Tests cover manual writes before apply and during control.
+
+Generic and owned MCP deactivation share an actual runtime body. Local context, permissions and
+optional presentation detach before suspension; remaining effects name only the old approval
+receipt and exact domain registration. VM teardown likewise clears its old observer state before
+awaiting, rather than erasing a successor on return. The existing scope-local duplicate-control
+veto remains: passing an exact copied object must not expose another holder's resources. Tests
+exercise a copied context and a complete successor activation during paused old cleanup, including
+actor preference, domain registration, pending state and UI membership. Existing permission
+guidance uses the same optional presentation sink as before.
+
+This retires two VM deactivation mutation bodies, not all MCP routing. Context writer-identity
+qualification, cross-scope copied-registration protection, the remaining control selectors and
+reactivation/discard host adapters remain M9.2. The original M9.2 inventory and done criteria still
+apply. No window-free saved-host work, prepared-window retirement, close-preserves-run or new
+handoff/drain policy is included.
+
+Validation: `9020fb70-183d-4667-858f-86e16bd6f2ac` passed **153 focused tests**. Both products
+passed `be6c2ec8-2a31-4b8c-8fc7-20c638d6761a`; full lint passed
+`2a260152-c3b1-49fa-a627-d23ed76bba5b`. Fresh index passed **1242/1360** wrong-way file edges
+and **53/66** largest-cycle components. Two emitted touched-file warning signatures matched
+the baseline; none were new. The first run passed 151 tests but failed the new successor's
+approval-value assertion, exposing the skipped-ownership case described above; it is not a
+qualification pass. No live-app or full-suite validation was run.
+
+### M9.2 partial: control-context writer provenance and runtime routing
+
+Every control context now carries the value identity of its installing writer; registration
+replacement preserves it. The approval override receipt is immutable and explicit at every
+constructor. Runtime control lookup consumes the existing claim index, exact scope/object and
+incarnation rather than accepting a newly acquired writer with an old context. The independent
+scope-local duplicate-context veto remains, including an unbound copied context. Live registration,
+cursor, snapshot and observed-publication routes refuse obsolete contexts; epoch staging,
+preparation and cancellation compare the same stored identity. Follow-up mutation and control
+lookup bodies have moved out of the view model, while their compatibility callers remain open.
+
+Originating teardown is deliberately a separate route: the local single-holder lookup can still
+remove an obsolete exact context and registration after claim reacquisition. It grants no writer
+or new-command capability. Clearing an originating follow-up mask can drain retirement or binding
+preparation; setting it requires command admission. Review caught both cleanup distinctions, and
+tests cover refusal followed by actual teardown and an unblocked ordinary start. Cross-scope
+copied-registration resource protection and remaining MCP/tool callers are still M9.2 work.
+Canonical terminal snapshot construction remains with the original settlement path.
+
+Synthetic context fixtures now obtain a real indexed identity rather than fabricating authority.
+The broader presentation suites also retain the metadata-index assertions separately from writer
+identity: sidebar order/removal cannot re-elect the runtime workspace, and an in-flight binding
+transition has no command endpoint until it completes. No M9.3 host or M9.4 lifetime policy changed.
+
+Validation: `f466f8a9-95b8-428b-8f60-d2dd4b15f71a` passed **567 focused tests**, including
+control/epoch/cancellation, creation/restoration, Claude adoption, handoff, runtime-bridge and
+presentation/status-pill suites. Full lint passed `0af624b0-a7e2-4a66-8719-ec338849f961`;
+the final presentation-only fixture update also passed pinned format/lint checks. The initial
+run stopped at a fixture argument-order compile error; the next passed 556 tests but exposed
+four presentation tests still expecting pre-cutover window-derived endpoints. Neither failed
+run is a qualification pass. Product/index/warning evidence will accompany the priority M9.1/main
+integration before the next push. No live-app or full-suite validation was run.
+
+### M9.1 post-merge CI follow-up: transcript fixture admission and cold Oracle awareness
 
 Investigated the overseer's two repeated hosted failures on merge head `58c0355f9`, without reading
 CI logs. Neither a relaxed assertion nor a larger timing budget is included.
@@ -5401,3 +5938,120 @@ CI logs. Neither a relaxed assertion nor a larger timing budget is included.
   **53/66** largest-cycle components. No new compiler warnings in the four touched Swift files.
   One bounded independent review completed; its save/quiet-gate ordering recommendation was applied.
   Hosted full-suite status and live smoke remain overseer-owned; no visible app lifecycle action ran.
+
+### M9.2a cap and M9.2b handoff (PR #1659)
+
+The overseer explicitly split M9.2 at this checkpoint. **PR #1659 is M9.2a**, the canonical
+writer contract and first routing cutover; it does **not** complete the original M9.2 brief.
+A fresh session will take **M9.2b**, stacked on this branch. No new routing item was started
+after the cap decision. The control-context incarnation item was already committed as
+`f0ee70bc37e463359213685a48c3ccc9a0f6c3ee`; the remainder below is deliberately outstanding,
+not silently reassigned to M9.3 or M9.4.
+
+**Delivered in M9.2a.** The existing runtime store and live-claim index distinguish absent,
+unscoped/transitioning, unique and conflicting writers; capabilities carry exact session,
+workspace, scope and incarnation. Agreeing UI replicas neither elect a writer nor prevent
+preparing the first valid writer. Normal conflicting installation is refused, while explicit
+legacy-corruption fixtures prove fail-closed routing. Command admission is distinct from an
+originating writer's final persistence, cancellation, acknowledgement and terminal settlement.
+The existing authorization engine and four disjoint link owners remain authoritative.
+
+Actual runtime-owned cutovers include placement and its durable receipt, link Send/Stop,
+model/effort and Compact, composer claims, terminal transcript materialization, input construction,
+provider-switch preparation/physical receipts, MCP epoch/registration/control installation and
+conditional permission rollback/detach, control-context identity and metadata mutation, and
+Claude provider-turn adoption. Corresponding VM transaction bodies and command callbacks were
+removed where those replacements activated. The remaining compatibility entrypoints and inner
+provider/host boundaries below are **not** claimed as retired. Earlier milestone sections record
+individual causal tests, review corrections and failed iterations.
+
+**Main reconciliation.** M9.1 tip `2a4d8237bd0216483c594c9af4e7c929e9e16af5` was merged normally
+as `b6f66cbcf38e7a62b25d79933d5110137506e9bc`; only appended ledger sections conflicted, and
+both were retained. Before the explicitly authorized ancestry-only merge, `git diff 2a4d8237b
+origin/main` was verified empty against squash `48b0d82ad5ba56076ceff70e25abc087b00f4bd7`.
+Commit `85ec0bf7675f4bade29218a5fcec20074740909f` then used `-s ours` solely to record that
+already-integrated main ancestry. Its first-parent tree diff is empty. `git merge-tree
+--write-tree HEAD origin/main` is clean, and the triple-dot diff contains M9.2 changes rather
+than replaying M9.1. No rebase, force-push or history rewrite was used.
+
+#### Remaining for M9.2b — files, adapters and ownership boundaries
+
+Paths under **AM** below mean `Sources/RepoPrompt/Features/AgentMode/`. **M** = roughly 3–5
+files; **L** = 6+ files or a broad caller/fixture migration. These are surface estimates, not
+elapsed-time estimates. The original adapter inventory above remains the completion checklist;
+this table supersedes earlier entries that still listed now-delivered control identity/install
+or creator-replica/first-placement work as open.
+
+| Remaining group | Size | Starting files and actual adapters to retire |
+| --- | --- | --- |
+| Binding, creation and hydration | L | `AM/ViewModels/AgentModeViewModel.swift`: `prepareSessionForRunStart`, `performPersistedSessionLoad`, binding/creation and first-save callbacks; `AM/Runtime/AgentSessionRunStartRuntime.swift` environment preparation/bind/commit inputs; restoration/persistence runtimes. Preserve first-bind synchronous writer capture before save, and distinguish normal hydration from an intentional binding retry. |
+| Startup, continuation and inner provider execution | L | VM `makeRunStartEnvironment`/`makeFollowUpLaunch`; `AM/Services/AgentModeRunComposition.swift`; `AM/Runtime/AgentModeRunService.swift`, `AgentRunResourcePreparation.swift`, and Codex/Claude/ACP/headless runners/coordinators. Outer startup fences are implemented; inner factory, lease, installation and physical-release awaits still need the same capability. Separate new-command admission from originating terminal cleanup. |
+| Link Steer, local/provider input and self-compaction | L | `AM/Runtime/SessionLinks/AgentModeViewModel+SessionLinkSteer.swift`; VM `submitNoncomposerSteer`/`submitPreparedUserTurn`; `AgentSessionLinkExecutionRuntime.Commands` start/self-compact inputs and remaining link storage forwarders; provider input release/self-compaction callers. Send/Stop/Model/Compact and shared composer claims are already runtime-owned. Move actual bodies, not callback-shaped wrappers. |
+| MCP metadata/tool routing and copied-resource protection | L | `AM/Runtime/AgentSessionMCPRuntime.swift`, `AgentSessionMCPRuntime+ControlActivation.swift`, `AgentSessionRuntimeStore.swift`; VM control compatibility callers, host activation preparation and reactivation/discard wrappers; `Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentRunMCPToolService.swift` and `Infrastructure/MCP/AppShared/MCPRunRouteBindings.swift`. Context identity and actual registration/install/detach/epoch bodies are done. Remaining work includes cross-scope copied-registration/approval receipt protection and replacing VM/window target selection. |
+| Administration and worktree commands | L | `Sources/RepoPrompt/App/SessionAdminWindowsHosts.swift`; `AM/Runtime/Delegation/AgentModeViewModel+DelegationLifecycle.swift`; `AM/ViewModels/AgentModeViewModel+WorktreeMerge.swift`, `AgentModeViewModel+SelfWorktreeRelocation.swift`; `AM/Services/SessionAdminWorktreeHandler.swift`. Retire `owningViewModel` mutation selection, fork and worktree transition/merge bodies while retaining scope leases/authorization. Placement, model/effort, creator accounting and production cold-replica first reparent are already covered. |
+| Interaction and provider approval commands | M | `AM/Runtime/AgentSessionInteractionRuntime*.swift`, VM interaction forwarding, provider/approval composition. Runtime interaction storage exists; remaining mutation callbacks and command routing must consume the writer while consent UI remains optional presentation. |
+| Provider event/tool-hook and terminal follow-up routing | L | VM service/coordinator composition and terminal self-compaction/provider-switch-generation/worktree-relocation hooks; provider coordinators/runners and Claude tool-hook installation. Claude provider-turn adoption, physical handover receipts and terminal transcript materialization are already cut over; do not confuse them with the remaining event paths. Never join Stop-effect drain from terminal publication. |
+| Persistence and payload-forwarding retirement | M–L | VM save/token/`flushSaveRequired`, session proxy and mutable `_modify` aliases; runtime persistence, provider-input/resume-handoff, draft, usage, timing and transcript forwarding; remaining session-link VM extensions. Search actual call sites before deleting aliases, and preserve originating receipt semantics after retirement/loss rather than compensating against a successor. |
+
+**Suggested first investigation, not an implemented fix:** cross-scope copies can still name the
+same approval/domain registration receipt. Scope-local ambiguity veto and stale-context teardown
+are implemented; cross-scope protection is not. Identify the structural installation holder from
+the existing scope/tab/incarnation index, independently of global writer uniqueness: a raw
+conflict makes every `ownsPersistentClaim` false, so that predicate cannot elect a cleanup owner.
+A copied context must not release another holder's resources, while an abandoned exact provisional
+receipt must still unwind after claim loss. Add no parallel registration/lifecycle manager or
+strong writer stored in the context. Preserve the existing detached-target disposal ordering.
+
+**Fixture cautions for the next session:** `Scope.makeSession` only constructs; `replaceSessions`
+admits it. `Tests/RepoPromptTests/Helpers/AgentSessionLinkRunnerTestSupport.swift` contains real
+identity lookup, not a fabricated capability. Some lower-level runner fixtures use standalone
+unbound objects or a custom execution service not installed in the scope; migrate high-level
+command fixtures explicitly instead of adding an optional/default-true production bypass.
+Normal readiness/hydration/dirty changes do not mint new live-claim incarnations. Do not weaken
+index minting to make an old context reusable. Keep the mutable host-workspace resource fence:
+a current writer does not pin a window's mutable context or launch path.
+
+**M9.2b done criteria:** exact session/workspace/incarnation and appropriate command/event/durable
+acknowledgement at each remaining boundary; distinct zero/one/conflicting outcomes and valid
+agreeing-replica first mutation; all MCP/admin/scope/link mutation entries writer-routed with
+unchanged authorization; caller/body searches proving every M9.2-assigned adapter actually retired;
+causal race/real-persistence coverage, both products, full lint, fresh index and zero new warnings.
+Only explicitly documented resource/presentation adapters may remain. M9.3 owns window-free saved
+target composition and prepared-window retirement. M9.4 owns close-preserves-run, handoff/drain and
+presentation lifetime. Today's close-cancels-run stays unchanged; M10 target relocation is separate.
+
+**Cap validation fixture audit.** The merged-tree integration run passed 597 cases with two
+existing opt-in diagnostic skips. A broader run selecting every class in the PR's changed test
+files passed 1,568 cases, skipped those two diagnostics, and exposed one stale fixture in
+`SessionAdminOrganizingOperationTests.testOverThresholdRaisesOneCardAndApprovalAppliesOnlyTickedItems`
+(in `SessionAdminScopeLifecycleTests.swift`): it expected normal admission to install a second live writer. The overseer explicitly authorized
+this test-only repair pattern and a repository-wide scan for siblings. All 153 occurrences of
+the normal test binding entrypoint were inspected; the same pattern was also found in
+`AgentContextExportRenderSnapshotTests.testSameTurnBindingConflictIsVisibleToNextAuthoritativeResolution`
+and `SessionAdminWorktreeRecoveryTests.testCompetingBoundWritersCannotMutateConfigurationOrCreateWorktree`.
+Each now asserts typed `.conflictingWriter`, refused installation and unchanged nil binding before
+using the existing raw-corruption hook. All approval, card-count, no-effect, conflict-cache,
+configuration and worktree assertions remain. No production or formatter-policy change was made;
+pinned scoped formatting changed zero files. The failed broad run is not a qualification receipt.
+
+**Final M9.2a qualification on the integrated tree:**
+
+- `f5c0dd45-0c48-4e95-b13b-0f3a13feaf9c` passed **1,610 tests**, with **2 existing opt-in
+  diagnostic skips** and **0 failures**. It selects every test class in the changed test files,
+  the incoming Oracle/transcript regressions, and both additionally repaired fixture suites.
+- Both products passed `e3d159fd-f4e3-4a30-a37d-94df0f5654e4`.
+- Full `make dev-lint` through Conductor passed `fb9de748-b725-4652-9cbd-89a6b8dd94a5`.
+- Fresh index check passed **1242/1360** wrong-way file edges and **53/66** largest-cycle
+  components; no ratchet baseline was raised.
+- The final and earlier actual compile logs were audited for the PR's touched Swift files plus
+  incoming integration files. **22 emitted warning signatures matched the baseline; zero were
+  new.** Cached product success was not treated as evidence that earlier warnings did not exist.
+- The earlier merged-tree integration check passed **597 tests + 2 skips** under
+  `0b90d918-78fe-4df2-8cbd-e1e115289911`; products
+  `946a89c9-de11-4da2-8e99-d90713ab8aee` and full lint
+  `ed9707d6-cb97-474c-9fc4-611cdceac384` also passed. The broader final receipt above supersedes
+  the failed 1,568-pass fixture-discovery run, not merely a retry with unchanged source.
+
+No local full-suite, live-app, release or hosted-CI success is claimed. No CI logs were read.
+After the validated M9.2a push and PR update, this lane stops feature work; only CI failures
+reported by the overseer are assigned to it. M9.2b belongs to the fresh follow-on session.

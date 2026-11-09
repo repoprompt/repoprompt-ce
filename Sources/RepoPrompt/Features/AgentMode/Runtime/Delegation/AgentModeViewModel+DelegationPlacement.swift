@@ -1,8 +1,7 @@
 import Foundation
 
-/// Per-session serialization of placement-only disk rewrites, so two administrations of the same
-/// session can never interleave their load/rewrite of an unloaded session file. Only the durable
-/// write is queued; the in-memory placement is applied synchronously before it is scheduled.
+/// Per-session serialization of writer-owned placement flushes. Only the durable write is queued;
+/// the admitted writer applies in-memory placement synchronously before scheduling it.
 @MainActor
 enum DelegationPlacementWriteQueue {
     private static var tails: [UUID: (token: UUID, task: Task<Void, Never>)] = [:]
@@ -29,18 +28,14 @@ enum DelegationPlacementWriteQueue {
 }
 
 enum DelegationPlacementPersistenceError: LocalizedError {
-    case workspaceUnavailable
     case ownerChanged
     case superseded
-    case sessionFileMissing
     case saveFailed(String)
 
     var errorDescription: String? {
         switch self {
-        case .workspaceUnavailable: "The placement's owning workspace is unavailable."
         case .ownerChanged: "The session owner changed before placement persistence completed."
         case .superseded: "A newer placement superseded this change before persistence completed."
-        case .sessionFileMissing: "The session file is missing; the placement was not persisted."
         case let .saveFailed(message): message
         }
     }
@@ -113,71 +108,64 @@ enum DelegationSpawnTarget: Equatable {
     }
 }
 
+extension AgentSessionRuntimeStore.Command {
+    /// The caller's final authorization and this mutation are one synchronous region. Index
+    /// projections are published before returning, but only this writer changes the live payload.
+    func commitDelegationPlacement(
+        organizationalParentID: UUID?,
+        delegationScopeID: UUID?,
+        project: (AgentSessionRuntimeStore.Writer) -> Void
+    ) throws -> DelegationPlacementCommit {
+        guard isCurrent else { throw DelegationPlacementPersistenceError.ownerChanged }
+        let session = writer.session
+        if session.organizationalParentID != organizationalParentID || session.delegationScopeID != delegationScopeID {
+            session.organizationalParentID = organizationalParentID
+            session.delegationScopeID = delegationScopeID
+            session.isDirty = true
+            writer.scope.persistence.scheduleSave(for: session)
+        }
+        project(writer)
+        let writer = writer
+        let write = DelegationPlacementWriteQueue.schedule(identity.sessionID) {
+            let requireCurrentPlacement = {
+                // Retirement closes admission, not a committed writer's required flush.
+                guard writer.isCurrent else { throw DelegationPlacementPersistenceError.ownerChanged }
+                guard session.organizationalParentID == organizationalParentID,
+                      session.delegationScopeID == delegationScopeID
+                else { throw DelegationPlacementPersistenceError.superseded }
+            }
+            try requireCurrentPlacement()
+            if case let .failure(failure) = await writer.scope.persistence.flushSaveRequired(
+                for: session.tabID, workspaceID: writer.identity.workspaceID
+            ) {
+                throw DelegationPlacementPersistenceError.saveFailed(failure.message)
+            }
+            try requireCurrentPlacement()
+        }
+        return DelegationPlacementCommit(pendingWrite: write)
+    }
+}
+
 extension AgentModeViewModel {
-    /// Applies organizational placement synchronously, with no suspension: the owner-validated index
-    /// entry (which feeds `.tree` scope membership immediately) and the live tab when there is one —
-    /// even before the session has an index entry, as for a just-created `agent_run`/`agent_manage`
-    /// target. A caller that re-validates placement and then commits in one synchronous region can
-    /// therefore never race another placement change (two cross re-parents, two adopts at a limit).
-    ///
-    /// Persistence follows through the owning required-save path for a live tab, or a queued
-    /// placement-only rewrite for a session with no live tab. Spawn provenance is never written here.
-    ///
-    /// - Returns: `nil` when this window owns neither an index entry nor a live tab for the session.
+    /// Compatibility entry for local creation callers; saved admin targets prepare a writer before
+    /// entering their final synchronous decision region. There is no unloaded-file rewrite fallback.
     func commitDelegationPlacement(
         sessionID: UUID,
         organizationalParentID: UUID?,
         delegationScopeID: UUID?
     ) throws -> DelegationPlacementCommit? {
-        let live = try authoritativeLiveSession(for: sessionID)
-        let entry = ownerValidatedSessionIndex[sessionID]
-        guard live != nil || entry != nil else { return nil }
-        guard let workspace = workspaceManager?.activeWorkspace else {
-            throw DelegationPlacementPersistenceError.workspaceUnavailable
-        }
-        if var entry, entry.organizationalParentID != organizationalParentID || entry.delegationScopeID != delegationScopeID {
-            entry.organizationalParentID = organizationalParentID
-            entry.delegationScopeID = delegationScopeID
-            sessionIndexStore.applyLocalUpsert(entry)
-        }
-        if let session = live {
-            if session.organizationalParentID != organizationalParentID || session.delegationScopeID != delegationScopeID {
-                session.organizationalParentID = organizationalParentID
-                session.delegationScopeID = delegationScopeID
-                session.isDirty = true
-                scheduleSave(for: session.tabID)
+        guard let command = try runtimeCommand(sessionID: sessionID) else { return nil }
+        return try command.commitDelegationPlacement(
+            organizationalParentID: organizationalParentID, delegationScopeID: delegationScopeID
+        ) { writer in
+            WindowStatesManager.shared.projectDelegationPlacement(writer)
+            // An isolated composition may not be registered as a window yet.
+            if var entry = ownerValidatedSessionIndex[sessionID] {
+                entry.organizationalParentID = organizationalParentID
+                entry.delegationScopeID = delegationScopeID
+                sessionIndexStore.applyLocalUpsert(entry)
             }
-            let binding = session.persistentSessionBindingIdentity
-            let write = DelegationPlacementWriteQueue.schedule(sessionID) { [self, session] in
-                // The queue may start after another placement or a workspace switch. Flush only
-                // the exact owner that committed this change, never a successor on the same tab.
-                let requireCurrentPlacement = {
-                    guard self.workspaceManager?.activeWorkspaceID == workspace.id,
-                          self.sessions[session.tabID] === session,
-                          session.activeAgentSessionID == sessionID,
-                          session.persistentSessionBindingIdentity == binding
-                    else { throw DelegationPlacementPersistenceError.ownerChanged }
-                    guard session.organizationalParentID == organizationalParentID,
-                          session.delegationScopeID == delegationScopeID
-                    else { throw DelegationPlacementPersistenceError.superseded }
-                }
-                try requireCurrentPlacement()
-                if case let .failure(failure) = await flushSaveRequired(for: session.tabID, workspaceID: workspace.id) {
-                    throw DelegationPlacementPersistenceError.saveFailed(failure.message)
-                }
-                try requireCurrentPlacement()
-            }
-            return DelegationPlacementCommit(pendingWrite: write)
         }
-        let write = DelegationPlacementWriteQueue.schedule(sessionID) {
-            try await AgentSessionDataService.shared.updateDelegationPlacement(
-                id: sessionID,
-                organizationalParentID: organizationalParentID,
-                delegationScopeID: delegationScopeID,
-                for: workspace
-            )
-        }
-        return DelegationPlacementCommit(pendingWrite: write)
     }
 
     /// Placement facts of a session this window owns: the live tab when there is one, else the

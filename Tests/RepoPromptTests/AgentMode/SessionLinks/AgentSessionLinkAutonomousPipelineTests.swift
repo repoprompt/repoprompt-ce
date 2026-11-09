@@ -838,7 +838,7 @@ final class LiveWindowEndpointHost: AgentSessionLinkEndpointHost {
         guard let viewModel = viewModelsByWindowID[candidate.windowID] else {
             return .blocked(.endpointInvalidated)
         }
-        return await viewModel.agentSessionLinkPerformCompact(
+        return await viewModel.linkExecutionRuntime.agentSessionLinkPerformCompact(
             to: candidate,
             request: request,
             liveness: liveness,

@@ -31,6 +31,12 @@ extension AgentSessionLinkExecutionRuntime {
         }
         guard !Self.providerSwitchNeedsReview(session) else { return .failure(.providerHandoverNeedsReview) }
         guard !session.runState.isActive, session.activeRunOwnership == nil else { return .failure(.targetNotIdle) }
+        guard let sessionID = session.activeAgentSessionID,
+              case let .unique(writer) = owner.resolveWriter(sessionID: sessionID),
+              writer.scope === owner, writer.session === session,
+              case let .success(command) = writer.admitCommand() else { return .failure(.targetStopped) }
+        let resourceWorkspaceID = commands.workspaceID(session)
+        guard resourceWorkspaceID == nil || resourceWorkspaceID == writer.identity.workspaceID else { return .failure(.targetStopped) }
         let handoff = session.pendingHandoff
         let binding = session.currentRestorationBindingToken
         let agent = session.selectedAgent
@@ -41,9 +47,23 @@ extension AgentSessionLinkExecutionRuntime {
         let instructions = providerSwitchInstructionStrings(session, includeSupplement: !inputAlreadyIncludesSupplement)
         let composerAttemptID = session.activeComposerSubmitAttempt?.id
         let stopFence = AgentRunStartStopFence(session: session)
-        let augmented = skipsAugmentation ? input : await commands.augment(session, input, attachments, taggedFiles, skipsSlashExpansion)
-        let initial = await commands.initialMessage(session, augmented)
-        guard commands.isAvailable(), isCurrent(), !Task.isCancelled else { return .failure(.targetStopped) }
+        func inputIsCurrent() -> Bool {
+            command.isCurrent && commands.isAvailable() && isCurrent() && !Task.isCancelled
+                && commands.workspaceID(session) == resourceWorkspaceID && stopFence.permitsStart(of: session)
+        }
+        guard inputIsCurrent() else { return .failure(.targetStopped) }
+        let augmented = skipsAugmentation ? input : await commands.input.augmentUserMessage(
+            input, attachments: attachments, taggedFileAttachments: taggedFiles, agent: agent,
+            workspacePaths: commands.workspacePaths(), workspace: { commands.inputWorkspace(session) },
+            session: session, handoff: owner.handoff, ignoresPendingHandoff: true,
+            skipsSlashExpansion: skipsSlashExpansion, isCurrent: inputIsCurrent
+        )
+        guard inputIsCurrent() else { return .failure(.targetStopped) }
+        let initial = await commands.input.buildInitialThreadMessageIfNeeded(
+            session: session, initialMessage: augmented,
+            input: { commands.initialThreadInput(session) }, isCurrent: inputIsCurrent
+        )
+        guard inputIsCurrent() else { return .failure(.targetStopped) }
         guard !session.runState.isActive, session.activeRunOwnership == nil else { return .failure(.targetNotIdle) }
         guard sessions[session.tabID] === session,
               session.currentRestorationBindingToken == binding,
@@ -73,7 +93,7 @@ extension AgentSessionLinkExecutionRuntime {
               AgentProviderHandover.estimate(payload) <= budget.remainingCarrierTokens
         else { return .failure(.providerHandoverDoesNotFit) }
         return .success(ProviderSwitchSendPreparation(
-            binding: binding, handoff: handoff, agent: agent, model: model, rawInput: input,
+            command: command, binding: binding, handoff: handoff, agent: agent, model: model, rawInput: input,
             augmentedInput: augmented, initialThreadInput: initial, instructions: instructions,
             inputAlreadyIncludesSupplement: inputAlreadyIncludesSupplement,
             historyToolAllowed: historyAllowed, computerUseArmed: computerUseArmed,
@@ -123,9 +143,10 @@ extension AgentSessionLinkExecutionRuntime {
         guard let preparation else { return nil }
         guard providerSwitchPreparationIsCurrent(preparation, session: session),
               stopFence.permitsStart(of: session),
-              let payload = preparation.handoff.payload,
-              let workspaceID = commands.workspaceID(session)
+              let payload = preparation.handoff.payload
         else { return nil }
+        let writer = preparation.command.writer
+        let workspaceID = writer.identity.workspaceID
         session.pendingHandoff.providerSwitchDelivery = .sending
         session.pendingHandoff.isStagedForSend = true
         session.pendingHandoff.providerSwitchDispatch = preparation.physicalDispatch
@@ -136,14 +157,15 @@ extension AgentSessionLinkExecutionRuntime {
             if case .writeReturned = $0 { sendingSaverReturned = true }
         })
         guard case .success = sendingSave else {
-            if sendingSaverReturned, sessions[session.tabID] === session,
+            if sendingSaverReturned, writer.isCurrent, sessions[session.tabID] === session,
                session.currentRestorationBindingToken == preparation.binding, session.pendingHandoff == sending
             {
                 // This runtime has not released input to a runner. A known returned write may re-save
                 // ready, but never authorizes dispatch or replay of the accepted input.
-                await providerSwitchRestoreReadyBeforeDispatch(session: session, sending: sending, workspaceID: workspaceID)
+                await providerSwitchRestoreReadyBeforeDispatch(writer: writer, sending: sending)
             }
-            // Unknown writes or loss of the exact no-runner proof remain inert sending.
+            // Unknown writes or loss of writer currency remain inert sending. Equality includes
+            // the originating writer incarnation, so this only releases our transient proof.
             if sessions[session.tabID] === session, session.currentRestorationBindingToken == preparation.binding,
                session.pendingHandoff == sending
             {
@@ -152,9 +174,18 @@ extension AgentSessionLinkExecutionRuntime {
             }
             return nil
         }
-        guard sessions[session.tabID] === session, session.currentRestorationBindingToken == preparation.binding,
-              session.pendingHandoff == sending else { return nil }
-        guard !Task.isCancelled, stopFence.permitsStart(of: session),
+        guard writer.isCurrent, session.pendingHandoff == sending else {
+            // The transient proof belongs to this exact request, including its writer incarnation.
+            // Release only that proof, never a successor's proof or the durable sending uncertainty.
+            if sessions[session.tabID] === session, session.currentRestorationBindingToken == preparation.binding,
+               session.pendingHandoff == sending
+            {
+                session.pendingHandoff.isStagedForSend = false
+                session.pendingHandoff.providerSwitchDispatch = nil
+            }
+            return nil
+        }
+        guard preparation.command.isCurrent, !Task.isCancelled, stopFence.permitsStart(of: session),
               !session.runState.isActive, session.activeRunOwnership == nil,
               session.selectedAgent == preparation.agent, session.selectedModelRaw == preparation.model,
               session.isCodexComputerUseArmed == preparation.computerUseArmed,
@@ -164,14 +195,16 @@ extension AgentSessionLinkExecutionRuntime {
         else {
             // Only this runtime path proves the runner has not been invoked. An unacknowledged ready
             // re-save restores sending; controller-specific failures never enter this path.
-            await providerSwitchRestoreReadyBeforeDispatch(session: session, sending: sending, workspaceID: workspaceID)
+            await providerSwitchRestoreReadyBeforeDispatch(writer: writer, sending: sending)
             return nil
         }
         return (payload + "\n\n" + preparation.augmentedInput, payload + "\n\n" + preparation.initialThreadInput)
     }
 
     func providerSwitchPreparationIsCurrent(_ preparation: ProviderSwitchSendPreparation, session: TabSession) -> Bool {
-        commands.isAvailable() && sessions[session.tabID] === session && session.currentRestorationBindingToken == preparation.binding
+        preparation.command.isCurrent && preparation.command.writer.scope === scope
+            && preparation.command.writer.session === session
+            && commands.isAvailable() && sessions[session.tabID] === session && session.currentRestorationBindingToken == preparation.binding
             && session.selectedAgent == preparation.agent && session.selectedModelRaw == preparation.model
             && !session.runState.isActive && session.activeRunOwnership == nil
             && session.pendingHandoff == preparation.handoff
@@ -182,11 +215,12 @@ extension AgentSessionLinkExecutionRuntime {
             && providerSwitchInstructionStrings(session, includeSupplement: !preparation.inputAlreadyIncludesSupplement) == preparation.instructions
     }
 
-    func providerSwitchRestoreReadyBeforeDispatch(
-        session: TabSession, sending: PendingHandoffState, workspaceID: UUID
+    private func providerSwitchRestoreReadyBeforeDispatch(
+        writer: AgentSessionRuntimeStore.Writer, sending: PendingHandoffState
     ) async {
-        guard let owner = scope, !owner.hasReleasedWriterClaims else { return }
-        defer { withExtendedLifetime(owner) {} }
+        guard writer.scope === scope, writer.isCurrent else { return }
+        let session = writer.session
+        let workspaceID = writer.identity.workspaceID
         guard sessions[session.tabID] === session, session.pendingHandoff == sending,
               let proof = sending.providerSwitchDispatch, proof.binding == session.currentRestorationBindingToken,
               proof.runOwnership == nil, proof.runID == nil, proof.dispatchID == nil,
@@ -201,7 +235,7 @@ extension AgentSessionLinkExecutionRuntime {
         let readySave = await flushSaveRequired(for: session.tabID, workspaceID: workspaceID, observingSavePhase: {
             if case .writeReturned = $0 { readySaverReturned = true }
         })
-        if case .failure = readySave,
+        if case .failure = readySave, writer.isCurrent,
            !(readySaverReturned && !session.runState.isActive && session.activeRunOwnership == nil),
            sessions[session.tabID] === session, session.currentRestorationBindingToken == binding,
            session.pendingHandoff == ready
@@ -213,12 +247,28 @@ extension AgentSessionLinkExecutionRuntime {
         }
     }
 
+    /// The physical proof carries an incarnation, not just a binding token. Resolving it may
+    /// recover the originating writer during retirement, but may never adopt a replacement claim.
+    private func providerSwitchWriter(
+        for session: TabSession, proof: AgentProviderSwitchPhysicalDispatch
+    ) -> AgentSessionRuntimeStore.Writer? {
+        guard let scope, let sessionID = session.activeAgentSessionID,
+              case let .unique(writer) = scope.resolveWriter(
+                  sessionID: sessionID, expectedWorkspaceID: proof.admission.writerIdentity.workspaceID
+              ),
+              writer.scope === scope, writer.session === session,
+              writer.identity == proof.admission.writerIdentity, writer.isCurrent else { return nil }
+        return writer
+    }
+
     func providerSwitchAcquirePhysicalDispatch(session: TabSession, dispatchID: AgentSessionLinkPromptDispatchID) -> Bool {
         guard session.pendingHandoff.providerSwitchDelivery != nil else { return true }
         guard session.pendingHandoff.providerSwitchDelivery == .sending,
               session.pendingHandoff.isStagedForSend else { return false }
         let effectiveID = agentSessionLinkEffectiveDispatchID(for: session, dispatchID: dispatchID)
         guard let staged = session.pendingHandoff.providerSwitchDispatch,
+              let writer = providerSwitchWriter(for: session, proof: staged),
+              case .success = writer.admitCommand(),
               sessions[session.tabID] === session, staged.binding == session.currentRestorationBindingToken,
               staged.stopFence.permitsStart(of: session),
               let ownership = staged.runOwnership, let runID = session.runID,
@@ -252,7 +302,10 @@ extension AgentSessionLinkExecutionRuntime {
               session.pendingHandoff.isStagedForSend,
               let staged = session.pendingHandoff.providerSwitchDispatch,
               staged.dispatchID == context.dispatchID, staged.binding == session.currentRestorationBindingToken,
-              let workspaceID = commands.workspaceID(session) else { return }
+              let writer = providerSwitchWriter(for: session, proof: staged) else { return }
+        // Physical acceptance acknowledges an already-dispatched effect. Retirement blocks a new
+        // dispatch, not this originating acknowledgement or its final durable clear.
+        let workspaceID = writer.identity.workspaceID
         let sending = session.pendingHandoff
         let binding = session.currentRestorationBindingToken
         session.pendingHandoff.clearAfterSend()
@@ -264,17 +317,18 @@ extension AgentSessionLinkExecutionRuntime {
         )))
         session.isDirty = true
         let effectID = UUID()
-        let task = Task { @MainActor [self, session, owner] in
-            defer { pendingSendEffects.removeValue(forKey: effectID)
-                withExtendedLifetime(owner) {}
-            }
+        let task = Task { @MainActor [self, session, writer] in
+            defer { pendingSendEffects.removeValue(forKey: effectID) }
+            // Admission and the scheduled write are separate actor turns. Do not let a replaced
+            // claim persist this acknowledgement through the successor's tab slot.
+            guard writer.isCurrent else { return }
             // A returned frozen clear must survive later save-token drift. The ordinary fresh-save
             // owner carries it forward; only an unacknowledged write restores uncertainty.
             var saverReturned = false
             let result = await flushSaveRequired(for: session.tabID, workspaceID: workspaceID, observingSavePhase: {
                 if case .writeReturned = $0 { saverReturned = true }
             })
-            if case .failure = result, !saverReturned,
+            if case .failure = result, !saverReturned, writer.isCurrent,
                sessions[session.tabID] === session, session.currentRestorationBindingToken == binding,
                session.pendingHandoff == cleared
             {
@@ -349,6 +403,8 @@ extension AgentSessionLinkExecutionRuntime {
             return .blocked(failure == .endpointInvalidated ? .endpointReadiness : failure)
         }
 
+        guard let command = admit(candidate) else { return .blocked(.endpointSession) }
+        defer { withExtendedLifetime(command) {} }
         let envelope = AgentSessionLinkMessageEnvelope.render(
             sourceSessionID: request.observerSessionID, sourceName: request.observerDisplayName,
             linkID: request.linkID, linkGeneration: request.linkGeneration,
@@ -362,7 +418,7 @@ extension AgentSessionLinkExecutionRuntime {
         let dispatchedMessage = computerUseArmedAtAdmission
             ? CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: providerMessage) : providerMessage
         if case let .failure(failure) = await providerSwitchSendAdmission(session: session, input: dispatchedMessage, isCurrent: {
-            stopFence.permitsStart(of: session) && liveness().permitsDelivery
+            command.isCurrent && stopFence.permitsStart(of: session) && liveness().permitsDelivery
         }) { return .blocked(failure) }
 
         // 3. Local composer claim. Losing it means a local user Send won the race, which is exactly
@@ -382,7 +438,7 @@ extension AgentSessionLinkExecutionRuntime {
             // empty snapshot cannot match a real draft and therefore cannot clear the user's text.
             rawDraftSnapshot: ""
         )
-        guard let claim = commands.claimComposer(attempt) else {
+        guard let claim = claimComposerSubmitAttempt(attempt) else {
             return .blocked(.targetNotIdle)
         }
 
@@ -405,7 +461,7 @@ extension AgentSessionLinkExecutionRuntime {
         }
         let switchPreparation: ProviderSwitchSendPreparation?
         switch await providerSwitchSendAdmission(session: session, input: dispatchedMessage, isCurrent: {
-            stopFence.permitsStart(of: session) && liveness().permitsDelivery && self.composerSubmitClaimIsCurrent(claim)
+            command.isCurrent && stopFence.permitsStart(of: session) && liveness().permitsDelivery && self.composerSubmitClaimIsCurrent(claim)
         }) {
         case let .failure(failure):
             releaseComposerSubmitClaim(claim)
@@ -417,7 +473,7 @@ extension AgentSessionLinkExecutionRuntime {
         //    the observer incarnation and the target window's closing state, which an observer
         //    rebind/close or a window teardown during that await would otherwise slip past.
         let postCommitLiveness = liveness()
-        guard let liveSession = agentSessionLinkLiveSession(matching: candidate) else {
+        guard command.isCurrent, let liveSession = agentSessionLinkLiveSession(matching: candidate) else {
             releaseComposerSubmitClaim(claim)
             return .blocked(.endpointPostSession)
         }
@@ -444,14 +500,7 @@ extension AgentSessionLinkExecutionRuntime {
             releaseComposerSubmitClaim(claim)
             return .blocked(failure == .endpointInvalidated ? .endpointPostReadiness : failure)
         }
-        guard let workspaceID = commands.workspaceID(session) else {
-            releaseComposerSubmitClaim(claim)
-            return .blocked(.endpointMissingWorkspace)
-        }
-        guard workspaceID == candidate.workspaceID else {
-            releaseComposerSubmitClaim(claim)
-            return .blocked(.endpointWorkspace)
-        }
+        let workspaceID = command.identity.workspaceID
 
         return await persistAndStartNoncomposerTurn(
             session: liveSession,
@@ -515,6 +564,15 @@ extension AgentSessionLinkExecutionRuntime {
             let reason = AgentSessionLinkDeliveryReadiness.restorationBlockReason(liveSession.qualifiedRestorationReadiness)
             return .blocked(AgentSessionLinkSendFailure(reason ?? .targetLoading))
         }
+        guard let sessionID = liveSession.activeAgentSessionID,
+              case let .unique(writer) = owner.resolveWriter(sessionID: sessionID, expectedWorkspaceID: workspaceID),
+              writer.scope === owner, writer.session === liveSession,
+              case let .success(command) = writer.admitCommand()
+        else {
+            releaseComposerSubmitClaim(claim)
+            return .blocked(.endpointSession)
+        }
+        defer { withExtendedLifetime(command) {} }
         var switchPreparation = providerSwitchPreparation
         if liveSession.pendingHandoff.providerSwitchDelivery != nil, switchPreparation == nil {
             let input = liveSession.isCodexComputerUseArmed
@@ -531,6 +589,10 @@ extension AgentSessionLinkExecutionRuntime {
         if let switchPreparation, !providerSwitchPreparationIsCurrent(switchPreparation, session: liveSession) {
             releaseComposerSubmitClaim(claim)
             return .blocked(.providerHandoverNeedsReview)
+        }
+        guard command.isCurrent else {
+            releaseComposerSubmitClaim(claim)
+            return .blocked(.endpointPostSession)
         }
         liveSession.noteAcceptedTaskInput()
         // 6. Durable acceptance. The bubble keeps raw words; the exact provider payload is metadata.
@@ -551,6 +613,12 @@ extension AgentSessionLinkExecutionRuntime {
         requestUIRefresh(tabID: tabID, urgent: true)
 
         if case .failure = await flushSaveRequired(for: tabID, workspaceID: workspaceID) {
+            // The saver may have returned for the originating payload after this object was rebound.
+            // A stale writer may neither acknowledge that write nor compensate against its successor.
+            guard writer.isCurrent else {
+                releaseComposerSubmitClaim(claim)
+                return .blocked(.persistenceIndeterminate)
+            }
             rollbackNoncomposerStagedRow(
                 itemID: userItem.id,
                 tabID: tabID,
@@ -684,8 +752,10 @@ extension AgentSessionLinkExecutionRuntime {
     func agentSessionLinkLiveSession(
         matching candidate: AgentSessionLinkEndpointCandidate
     ) -> TabSession? {
-        guard let session = sessions[candidate.tabID],
-              session.activeAgentSessionID == candidate.sessionID,
+        guard let scope,
+              case let .unique(writer) = scope.resolveWriter(sessionID: candidate.sessionID, expectedWorkspaceID: candidate.workspaceID),
+              writer.scope === scope, writer.session.tabID == candidate.tabID,
+              let session = sessions[candidate.tabID], writer.session === session,
               let identity = agentSessionLinkObserverEndpoint(tabID: candidate.tabID),
               identity == candidate.domainEndpoint
         else {

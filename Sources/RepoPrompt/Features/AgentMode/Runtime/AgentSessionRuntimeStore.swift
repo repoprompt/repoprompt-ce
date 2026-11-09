@@ -14,10 +14,57 @@ final class AgentSessionRuntimeStore {
         case absent, unscopedBinding, bindingTransition
     }
 
+    enum BindingRejection: Equatable {
+        case conflictingWriter, retiring
+    }
+
     enum WriterResolution {
         case unavailable(Unavailable)
         case unique(Writer)
         case conflicting
+    }
+
+    /// Value identity carried by commands, queries and acknowledgements. The scope identifies
+    /// the owner; the claim incarnation also fences object replacement and claim reacquisition.
+    struct WriterIdentity: Equatable {
+        let scopeID: UUID
+        let incarnationID: UUID
+        let workspaceID: UUID
+        let restoration: AgentSessionRestorationBindingToken
+
+        var sessionID: UUID {
+            restoration.bindingIdentity.sessionID
+        }
+    }
+
+    struct Query {
+        let identity: WriterIdentity
+        let runState: AgentSessionRunState
+        let commandRejection: CommandRejection?
+    }
+
+    enum CommandRequirement {
+        case restored
+        case creation(AgentSessionCreationHandle)
+    }
+
+    enum CommandRejection: Error, Equatable {
+        case staleWriter, retiring, deleted, restorationUnavailable
+    }
+
+    /// Admission is not authorization. Callers retain their existing consent, operation and
+    /// cancellation fences and must revalidate this capability after every suspension.
+    @MainActor
+    struct Command {
+        let writer: Writer
+        let requirement: CommandRequirement
+        var identity: WriterIdentity {
+            writer.identity
+        }
+
+        var isCurrent: Bool {
+            writer.commandRejection(requirement) == nil
+        }
     }
 
     /// Exact-object capability. Holding one keeps its scope alive across suspension; it does
@@ -28,13 +75,50 @@ final class AgentSessionRuntimeStore {
         let session: AgentTabSession
         let binding: AgentPersistentSessionBindingIdentity
         let restoration: AgentSessionRestorationBindingToken
+        let identity: WriterIdentity
+
+        func query() -> Query? {
+            guard isCurrent else { return nil }
+            return Query(identity: identity, runState: session.runState, commandRejection: commandRejection(.restored))
+        }
+
+        func admitCommand(_ requirement: CommandRequirement = .restored) -> Result<Command, CommandRejection> {
+            if let rejection = commandRejection(requirement) { return .failure(rejection) }
+            return .success(Command(writer: self, requirement: requirement))
+        }
+
+        fileprivate func commandRejection(_ requirement: CommandRequirement) -> CommandRejection? {
+            guard isCurrent else { return .staleWriter }
+            guard !scope.isRetiring else { return .retiring }
+            guard !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: binding.sessionID),
+                  !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: binding.sessionID)
+            else { return .deleted }
+            switch requirement {
+            case .restored:
+                guard session.permitsBoundOperationAndSave else { return .restorationUnavailable }
+            case let .creation(handle):
+                guard session.creationHandleIsCurrent(handle) else { return .restorationUnavailable }
+            }
+            return nil
+        }
+
+        /// Originating teardown may run while binding preparation has suspended command
+        /// admission. It still belongs to this exact, exclusive claim, never a reacquisition.
+        /// This is not permission to publish control or start another operation.
+        var ownsPersistentClaim: Bool {
+            !scope.hasReleasedWriterClaims
+                && scope.sessions[session.tabID] === session
+                && session.persistentSessionBindingIdentity == binding
+                && scope.liveClaimByTabID[session.tabID]?.incarnationID == identity.incarnationID
+                && !scope.store.hasOtherClaim(sessionID: binding.sessionID, scope: scope, session: session)
+        }
 
         var isCurrent: Bool {
             guard let workspaceID = binding.workspaceID,
                   case let .unique(current) = scope.store.resolveWriter(workspaceID: workspaceID, sessionID: binding.sessionID)
             else { return false }
             return current.scope === scope && current.session === session
-                && current.binding == binding && current.restoration == restoration
+                && current.identity == identity
         }
     }
 
@@ -54,6 +138,10 @@ final class AgentSessionRuntimeStore {
     /// UI replicas never enter this store. Multiple live claims remain conflicts even when
     /// their metadata agrees; a selected tab/window is not a tie breaker.
     func resolveWriter(workspaceID: UUID, sessionID: UUID) -> WriterResolution {
+        resolveWriter(sessionID: sessionID, expectedWorkspaceID: workspaceID)
+    }
+
+    func resolveWriter(sessionID: UUID, expectedWorkspaceID: UUID? = nil) -> WriterResolution {
         var match: (Scope, AgentTabSession)?
         for reference in scopes.values {
             guard let scope = reference.value else { continue }
@@ -67,11 +155,24 @@ final class AgentSessionRuntimeStore {
             return .unavailable(.absent)
         }
         guard let boundWorkspaceID = binding.workspaceID else { return .unavailable(.unscopedBinding) }
-        guard boundWorkspaceID == workspaceID else { return .conflicting }
+        if let expectedWorkspaceID, boundWorkspaceID != expectedWorkspaceID { return .conflicting }
         guard !session.bindingTransitionInProgress, let restoration = session.currentRestorationBindingToken else {
             return .unavailable(.bindingTransition)
         }
-        return .unique(Writer(scope: scope, session: session, binding: binding, restoration: restoration))
+        guard let incarnationID = scope.liveClaimByTabID[session.tabID]?.incarnationID else { return .unavailable(.absent) }
+        return .unique(Writer(
+            scope: scope, session: session, binding: binding, restoration: restoration,
+            identity: WriterIdentity(scopeID: scope.id, incarnationID: incarnationID, workspaceID: boundWorkspaceID, restoration: restoration)
+        ))
+    }
+
+    private func hasOtherClaim(sessionID: UUID, scope: Scope, session: AgentTabSession) -> Bool {
+        scopes.values.contains { reference in
+            guard let owner = reference.value else { return false }
+            return owner.liveSessionTabIDs(for: sessionID).contains { tabID in
+                owner !== scope || owner.sessions[tabID] !== session
+            }
+        }
     }
 
     /// Admission is distinct from the originating writer capability: final IO must keep its
@@ -127,9 +228,40 @@ final class AgentSessionRuntimeStore {
     final class Scope {
         fileprivate let id = UUID()
         fileprivate let store: AgentSessionRuntimeStore
+
+        func resolveWriter(sessionID: UUID, expectedWorkspaceID: UUID? = nil) -> WriterResolution {
+            store.resolveWriter(sessionID: sessionID, expectedWorkspaceID: expectedWorkspaceID)
+        }
+
+        /// Reconstitute an originating receipt from its stored value identity, never from
+        /// today's occupant. Binding preparation may drain this claim; admission still uses
+        /// Writer.isCurrent and admitCommand. No claim is created by this lookup.
+        func originatingWriter(identity: WriterIdentity, session: AgentTabSession) -> Writer? {
+            guard identity.scopeID == id,
+                  identity.restoration.bindingIdentity == session.persistentSessionBindingIdentity else { return nil }
+            let writer = Writer(
+                scope: self, session: session, binding: identity.restoration.bindingIdentity,
+                restoration: identity.restoration, identity: identity
+            )
+            return writer.ownsPersistentClaim ? writer : nil
+        }
+
+        /// Read provenance is not command admission. The installed control receipt remains
+        /// readable while its exact claim is suspended or another claim makes writes ambiguous.
+        /// A real binding install or release/reacquire rotates the claim and invalidates it.
+        func matchesControlReadIdentity(_ identity: WriterIdentity, session: AgentTabSession) -> Bool {
+            identity.scopeID == id && !hasReleasedWriterClaims
+                && sessions[session.tabID] === session
+                && session.persistentSessionBindingIdentity == identity.restoration.bindingIdentity
+                && session.persistentSessionBindingIdentity?.workspaceID == identity.workspaceID
+                && liveClaimByTabID[session.tabID]?.sessionID == identity.sessionID
+                && liveClaimByTabID[session.tabID]?.incarnationID == identity.incarnationID
+        }
+
         let presentation = AgentSessionPresentationRuntime()
         let usage = AgentSessionUsageRuntime()
         lazy var turnTiming = AgentSessionTurnTimingRuntime(presentation: presentation)
+        lazy var submissions = AgentSessionComposerSubmitRuntime(scope: self)
         private var interactionRuntime: AgentSessionInteractionRuntime?
 
         func interactions(routeID: Int, approvalStore: ApplyEditsApprovalStore) -> AgentSessionInteractionRuntime {
@@ -142,16 +274,35 @@ final class AgentSessionRuntimeStore {
             return runtime
         }
 
+        private(set) var execution: AgentModeRunService?
+
+        func installExecution(_ execution: AgentModeRunService) {
+            precondition(self.execution == nil, "Execution is installed once by its runtime host.")
+            self.execution = execution
+        }
+
+        #if DEBUG
+            func test_replaceExecution(_ execution: AgentModeRunService) {
+                precondition(sessions.values.allSatisfy { $0.activeRunOwnership == nil })
+                self.execution = execution
+            }
+        #endif
+
+        var installedInteractions: AgentSessionInteractionRuntime? {
+            interactionRuntime
+        }
+
         private(set) var linkExecution: AgentSessionLinkExecutionRuntime?
 
         func makeLinkExecution(
+            routeID: Int,
             commands: AgentSessionLinkExecutionRuntime.Commands,
             diagnostics: any AgentSessionLinkCatalogEventSink
         ) -> AgentSessionLinkExecutionRuntime {
             // Host composition installs once. Presentation attachment must use `linkExecution`,
             // never replace its command authority or reset pending claims/tasks.
             precondition(linkExecution == nil, "Link execution is installed once by its runtime host.")
-            let runtime = AgentSessionLinkExecutionRuntime(scope: self, commands: commands, diagnostics: diagnostics)
+            let runtime = AgentSessionLinkExecutionRuntime(scope: self, routeID: routeID, commands: commands, diagnostics: diagnostics)
             linkExecution = runtime
             return runtime
         }
@@ -207,6 +358,7 @@ final class AgentSessionRuntimeStore {
             guard isRetiring, saveQueue.inFlightSessionIDs.isEmpty, !attachments.hasPendingRetention,
                   !continuation.hasPendingStarts,
                   linkExecution?.pendingSendEffects.isEmpty != false,
+                  linkExecution?.pendingStopEffects.isEmpty != false,
                   sessions.values.allSatisfy({ session in
                       !session.runState.isActive && session.activeComposerSubmitAttempt == nil
                           && !session.terminalCommitInProgress && (!session.isDirty || session.activeAgentSessionID.map {
@@ -219,7 +371,12 @@ final class AgentSessionRuntimeStore {
         }
 
         private(set) var sessions: [UUID: AgentTabSession] = [:]
-        private var liveClaimByTabID: [UUID: UUID] = [:]
+        fileprivate struct LiveClaim {
+            let sessionID: UUID
+            let incarnationID = UUID()
+        }
+
+        fileprivate var liveClaimByTabID: [UUID: LiveClaim] = [:]
         private var liveTabIDsBySessionID: [UUID: Set<UUID>] = [:]
 
         fileprivate init(store: AgentSessionRuntimeStore) {
@@ -240,11 +397,16 @@ final class AgentSessionRuntimeStore {
             }
         }
 
-        func permitsBinding(_ sessionID: UUID, on session: AgentTabSession) -> Bool {
+        func bindingRejection(_ sessionID: UUID, on session: AgentTabSession) -> BindingRejection? {
+            guard !store.hasOtherClaim(sessionID: sessionID, scope: self, session: session) else { return .conflictingWriter }
             if sessions[session.tabID] === session, session.activeAgentSessionID == sessionID {
-                return !hasReleasedWriterClaims
+                return hasReleasedWriterClaims ? .retiring : nil
             }
-            return !isRetiring && !store.hasRetiringWriter(sessionID: sessionID)
+            return isRetiring || store.hasRetiringWriter(sessionID: sessionID) ? .retiring : nil
+        }
+
+        func permitsBinding(_ sessionID: UUID, on session: AgentTabSession) -> Bool {
+            bindingRejection(sessionID, on: session) == nil
         }
 
         func resolveWriter(workspaceID: UUID, sessionID: UUID) -> WriterResolution {
@@ -257,13 +419,13 @@ final class AgentSessionRuntimeStore {
 
         fileprivate func updateLiveSessionBindingIndex(tabID: UUID) {
             if let previous = liveClaimByTabID.removeValue(forKey: tabID) {
-                liveTabIDsBySessionID[previous]?.remove(tabID)
-                if liveTabIDsBySessionID[previous]?.isEmpty == true {
-                    liveTabIDsBySessionID.removeValue(forKey: previous)
+                liveTabIDsBySessionID[previous.sessionID]?.remove(tabID)
+                if liveTabIDsBySessionID[previous.sessionID]?.isEmpty == true {
+                    liveTabIDsBySessionID.removeValue(forKey: previous.sessionID)
                 }
             }
             if let current = sessions[tabID]?.activeAgentSessionID {
-                liveClaimByTabID[tabID] = current
+                liveClaimByTabID[tabID] = LiveClaim(sessionID: current)
                 liveTabIDsBySessionID[current, default: []].insert(tabID)
             }
         }

@@ -80,28 +80,6 @@ extension AgentModeViewModel {
         linkExecutionRuntime.providerSwitchPreparationIsCurrent(preparation, session: session)
     }
 
-    func providerSwitchRestoreReadyBeforeDispatch(
-        session: TabSession, sending: PendingHandoffState, workspaceID: UUID
-    ) async {
-        await linkExecutionRuntime.providerSwitchRestoreReadyBeforeDispatch(session: session, sending: sending, workspaceID: workspaceID)
-    }
-
-    /// Called at the existing physical acquisition hook, not pipeline admission. Binding one exact
-    /// logical dispatch is transient evidence; losing it on restart leaves durable sending inert.
-    func providerSwitchAcquirePhysicalDispatch(session: TabSession, dispatchID: AgentSessionLinkPromptDispatchID) -> Bool {
-        linkExecutionRuntime.providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: dispatchID)
-    }
-
-    func providerSwitchRunSettled(_ session: TabSession, revision: AgentRunTerminalCommitRevision, publication: AgentRunTerminalPublicationResult) {
-        linkExecutionRuntime.providerSwitchRunSettled(session, revision: revision, publication: publication)
-    }
-
-    /// Existing physical acceptance context is stronger than the legacy handoff Boolean (ACP's
-    /// Boolean is earlier than its actual prompt return). Late/foreign contexts cannot clear M1.
-    func providerSwitchRecordPhysicalAcceptance(session: TabSession, context: AgentSessionLinkDispatchContext?) {
-        linkExecutionRuntime.providerSwitchRecordPhysicalAcceptance(session: session, context: context)
-    }
-
     func providerSwitchHistoryToolAllowed(_ session: TabSession, destination: AgentProviderKind? = nil) -> Bool {
         linkExecutionRuntime.providerSwitchHistoryToolAllowed(session, destination: destination)
     }
