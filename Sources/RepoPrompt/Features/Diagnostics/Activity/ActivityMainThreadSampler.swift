@@ -1,18 +1,45 @@
 import Darwin
 import Foundation
 
-/// Owns one send right captured on the main thread; never enumerates or suspends threads.
+/// Owns one captured main-thread send right and samples away from the UI actor.
 actor ActivityMainThreadSampler {
     private let mainThread: thread_act_t
     private var previous: Counters?
+    private var threadPrevious: [UInt64: ActivityThreadSampler.Counters] = [:]
+    private let captureThreads: @Sendable (thread_act_t, [UInt64: ActivityThreadSampler.Counters]) -> ActivityThreadSampler.Capture?
+
+    enum Threads {
+        case notSampled
+        case unavailable
+        case sampled(ActivityThreadSampler.Report)
+
+        var reportText: String {
+            let lines: [String] = switch self {
+            case .notSampled: ["Measuring…"]
+            case .unavailable: ["Unavailable"]
+            case let .sampled(report):
+                report.rows.map { "  \($0.label): \($0.cpuText)" } + [report.summary]
+            }
+            return "\nThreads\n" + ActivityThreadSampler.caveat + "\n" + lines.joined(separator: "\n") + "\n"
+        }
+    }
+
+    struct Sample {
+        let mainThreadCPU: String
+        let threads: Threads
+    }
 
     struct Counters {
         let cpuNs: UInt64
         let sampledAt: UInt64
     }
 
-    init(mainThread: thread_act_t) {
+    init(
+        mainThread: thread_act_t,
+        captureThreads: @escaping @Sendable (thread_act_t, [UInt64: ActivityThreadSampler.Counters]) -> ActivityThreadSampler.Capture? = ActivityThreadSampler.capture
+    ) {
         self.mainThread = mainThread
+        self.captureThreads = captureThreads
     }
 
     deinit {
@@ -38,6 +65,20 @@ actor ActivityMainThreadSampler {
         let text = Self.cpuText(previous: previous, current: current)
         previous = current
         return text
+    }
+
+    func read(includeThreads: Bool) -> Sample {
+        let cpu = read()
+        guard includeThreads else {
+            threadPrevious = [:]
+            return Sample(mainThreadCPU: cpu, threads: .notSampled)
+        }
+        guard let capture = captureThreads(mainThread, threadPrevious) else {
+            threadPrevious = [:]
+            return Sample(mainThreadCPU: cpu, threads: .unavailable)
+        }
+        threadPrevious = capture.counters
+        return Sample(mainThreadCPU: cpu, threads: .sampled(capture.report))
     }
 
     static func cpuText(previous: Counters?, current: Counters) -> String {

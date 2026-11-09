@@ -8,6 +8,14 @@ struct ActivitySettingsView: View {
     @State private var display = ActivityDisplay()
     @State private var copyStatus: String?
     @State private var sort: ActivityDisplay.Sort?
+    @State private var threadsExpanded = false
+    @State private var threads: ActivityMainThreadSampler.Threads = .notSampled
+    @State private var samplingGeneration = UUID()
+
+    private struct SamplingKey: Equatable {
+        let visible: Bool
+        let expanded: Bool
+    }
 
     var body: some View {
         SettingSection(title: "Activity", description: ActivityDisplay.caveat) {
@@ -64,23 +72,47 @@ struct ActivitySettingsView: View {
                 .font(.caption)
                 .monospacedDigit()
             }
+            DisclosureGroup("Threads", isExpanded: $threadsExpanded) {
+                Text(ActivityThreadSampler.caveat).foregroundStyle(.secondary)
+                switch threads {
+                case .notSampled:
+                    Text("Measuring…")
+                case .unavailable:
+                    Text("Unavailable")
+                case let .sampled(report):
+                    ForEach(report.rows) { row in
+                        HStack {
+                            Text(row.label).lineLimit(1).hoverTooltip(row.label)
+                            Spacer()
+                            Text(row.cpuText).monospacedDigit()
+                        }
+                    }
+                    Text(report.summary).foregroundStyle(.secondary)
+                }
+            }
             HStack {
                 Button("Copy report") {
                     NSPasteboard.general.clearContents()
-                    copyStatus = NSPasteboard.general.setString(display.report, forType: .string)
+                    copyStatus = NSPasteboard.general.setString(display.report + (threadsExpanded ? threads.reportText : ""), forType: .string)
                         ? "Copied" : "Could not copy report"
                 }
                 if let copyStatus { Text(copyStatus).foregroundStyle(.secondary) }
             }
         }
-        .task(id: isPresentationVisible) {
+        .task(id: SamplingKey(visible: isPresentationVisible, expanded: threadsExpanded)) {
+            let generation = UUID()
+            samplingGeneration = generation
+            threads = .notSampled
             guard isPresentationVisible else { return }
+            let includeThreads = threadsExpanded
             let mainThread = ActivityMainThreadSampler(mainThread: mach_thread_self())
             var previous: [Int: WindowActivityLedger.Snapshot] = [:]
             var process = ActivityProcessSampler()
             await ActivityRefreshLoop.run(visible: isPresentationVisible) {
-                let mainThreadCPU = await mainThread.read()
-                guard !Task.isCancelled else { return }
+                let sample = await mainThread.read(includeThreads: includeThreads)
+                // A cancelled or superseded capture must not publish into a new visible interval.
+                guard !Task.isCancelled, samplingGeneration == generation else { return }
+                threads = sample.threads
                 var snapshots = Dictionary(uniqueKeysWithValues: windows.activityLedger.snapshot().map { ($0.windowID, $0) })
                 let cpu = process.readCPU()
                 let memory = ActivityProcessSampler.residentMiB()
@@ -94,7 +126,7 @@ struct ActivitySettingsView: View {
                         agents: ActivityAgentCounts(window.agentModeViewModel.sessions.values.lazy.map(\.runState))
                     )
                 }
-                display = ActivityDisplay(cpu: cpu, memory: memory, rows: rows, sort: sort, mainThreadCPU: mainThreadCPU)
+                display = ActivityDisplay(cpu: cpu, memory: memory, rows: rows, sort: sort, mainThreadCPU: sample.mainThreadCPU)
                 previous = snapshots
             }
         }
