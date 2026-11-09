@@ -2868,7 +2868,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return FileManager.default.temporaryDirectory
         }
         let providerBindingService = AgentModeProviderBindingService()
-        let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePaths, permissionProfile, _, computerUseEnabled, capabilities in
+        let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePaths, permissionProfile, _, computerUseEnabled, capabilities, contextWindowSelection in
             let client = CodexAppServerClient(provisionsRepoPromptMCPOnStart: false)
             let options = CodexNativeSessionController.Options.agentModeDefault(
                 approvalPolicyProvider: { permissionProfile.codexApprovalPolicy },
@@ -2880,7 +2880,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 goalSupportEnabledProvider: { CodexGoalSupport.isEnabled },
                 reasoningSummariesEnabledProvider: { CodexReasoningSummaries.isEnabled },
                 memoriesEnabledProvider: { CodexMemories.isEnabled },
-                computerUseEnabledProvider: { computerUseEnabled }
+                computerUseEnabledProvider: { computerUseEnabled },
+                contextWindowSelection: contextWindowSelection
             )
             return CodexNativeSessionController(
                 client: client,
@@ -3152,7 +3153,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 )
             }
             let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = codexControllerFactoryWithComputerUse
-                ?? { runID, tabID, windowID, workspacePaths, permissionProfile, taskLabelKind, _, _ in
+                ?? { runID, tabID, windowID, workspacePaths, permissionProfile, taskLabelKind, _, _, _ in
                     codexControllerFactory(runID, tabID, windowID, workspacePaths, permissionProfile, taskLabelKind)
                 }
             self.headlessProviderFactory = headlessProviderFactory

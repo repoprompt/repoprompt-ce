@@ -1451,6 +1451,20 @@ final class AgentTabSession: ObservableObject {
     ///
     /// Never persisted: it describes a live process-local controller generation.
     var codexSessionLinkCatalogRepairCycle: AgentSessionLinkCodexCatalogRepair.Cycle?
+    /// Retained across controller replacements, but not persisted across cold restoration.
+    var codexContextWindowSelection: CodexContextWindowPreferences.Selection?
+
+    func clearCodexConversationIdentity() {
+        codexConversationID = nil
+        codexContextWindowSelection = nil
+    }
+
+    func codexContextWindowForBinding(current: CodexContextWindowPreferences.Selection) -> CodexContextWindowPreferences.Selection {
+        if let selection = codexContextWindowSelection { return selection }
+        codexContextWindowSelection = current
+        return current
+    }
+
     /// The permission profile the current Codex controller was created with.
     /// Used to detect when MCP control changes require controller recycling.
     var codexControllerPermissionProfile: AgentModeViewModel.AgentPermissionProfile?
