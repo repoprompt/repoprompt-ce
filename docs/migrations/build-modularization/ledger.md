@@ -6692,3 +6692,58 @@ ratchet baseline changed. After consolidation, focused
 scoped formatting/strict lint passed, and the consolidated test file compiled with zero warnings.
 The broad, isolated-handoff and product receipts above precede this test-only file consolidation;
 production source is unchanged.
+
+#### M9.2b checkpoint 10 — exact instruction-wait routing (validated locally; push frozen)
+
+Instruction wait installation, timeout and physical continuation consumption are routed
+through the existing link execution runtime. A single originating wait record replaces three
+mutable payload fields; legacy names are read-only projections. The VM captures the writer before
+hydration, admits the same writer afterwards, and passes the captured command to runtime ownership.
+Local send and auto-wake retain the command and wait ID across preparation awaits. User versus
+lane-update accounting and physical continuation acceptance remain distinct.
+
+The existing cancellation admission gains a precise instruction-timeout case, claimed inside the
+run service before cancellation preparation. It preserves legitimate waits with no run ownership
+without loosening ordinary active-run Stop. The timeout takes only its own record, does not cancel
+its own timer while joining terminal publication, and settles the captured continuation afterwards.
+A lost claim/run settles only the original wait; a terminal commit already in progress is not
+cancelled again. Existing execution services are composed before installing a timed wait, rather
+than requiring a live VM to construct them when the timer fires. No M9.3a surface is changed.
+
+One review identified three fixes: terminal-commit exclusion, exact-wake cancellation rather than
+endpoint-only successor cancellation, and preserving dequeued input across new command refusals.
+Those fixes are applied with additional causal coverage. The queued immediate augmentation/proof
+body remains in the VM: its new-command dispatch is fenced, while the original input's recovery
+continues to require the same object and binding. Caller-task cancellation behavior and the legacy
+non-waiting-state timeout no-op are unchanged, not claimed solved. Negative timeout values remain
+rejected at MCP ingress; the direct VM conversion is not redesigned here.
+
+Initial focused `7326495a-2abf-4703-93d3-edadd01b997c` failed compilation because the new fixture
+accessed private `runtimeSessionStore`; it now uses the captured command's scope. No test pass is
+claimed for that attempt. Retry `a083ad82-60d7-4601-83ee-57c4de7a43a4` also failed compilation:
+the synthetic successor-wake fixture used memberwise arguments instead of the existing initializer.
+After that correction, `4491ac16-85a0-49d3-a79f-bf3ebef168eb` executed **96** tests with three
+assertion failures in two cases. The notification fixture now supplies its newly installed session
+ID to the resolver. The terminal-owner fixture explicitly drains its independent approval-store
+subscription before testing instruction timeout, so asynchronous approval projection does not
+reconcile that fixture's state after the waiter returns. Neither assertion was weakened; broader
+approval-snapshot/terminal ownership is not claimed repaired by this instruction-wait slice.
+The method-qualified patterns in that first filter selected neither new auto-wake nor queued-input
+case; the final focused selection uses their complete suites instead.
+
+Final focused `9c4238e4-d6e6-4a40-b08c-fe8c63937850` passed **254 tests**, including every new
+instruction-wait, real timer, terminal join, successor-wake and queued-input recovery witness.
+Full lint `d5d376af-77d7-4b69-99a2-dc762667fdb8` passed; subsequent fixture-only corrections
+were scoped-formatted and strict-linted. All new suites are in existing test files; assertions and
+timeout budgets are preserved. Broad `049197c4-5806-4dab-bbcd-2aaf5b8126e3` passed **2,161
+executed, 22 skipped, zero failures** (2,150 app, seven domain, four provider), including all
+SessionLinks and admission/sidebar/lane-policy suites. Isolated handoff
+`4f1a0b50-93d9-4dd7-8a0e-ea3f143c4db5` passed **104**. Both products
+`dc96177a-6bdc-4535-8a88-5d85174704bc` passed. Fresh post-build index remains **1,245/1,360
+wrong-way edges, 53/66 largest-cycle components**, with no baseline change. Actual compilation
+across the 15 touched Swift files matches retained base warning occurrence counts: **four VM,
+11 auto-wake tests, six prompt-adapter tests, five steer-transaction tests, one MCP steer/resume
+test**, zero in the other ten files. No positive warning-count delta; this is not a claim of zero
+total warnings. No live-app, full-suite, release or hosted-CI qualification is claimed.
+The push freeze on `255d2650e` remains active; this checkpoint stays local until explicitly released.
+The remaining M9.2b inventory and the injected VM hydration-await race witness remain open.

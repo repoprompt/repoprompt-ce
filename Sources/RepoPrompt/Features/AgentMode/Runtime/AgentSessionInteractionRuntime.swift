@@ -285,13 +285,11 @@ final class AgentSessionInteractionRuntime {
     }
 
     static func cancelPendingInstruction(for session: AgentTabSession) {
-        session.instructionTimeoutTask?.cancel()
-        session.instructionTimeoutTask = nil
-        if let continuation = session.instructionContinuation {
-            continuation.resume(throwing: CancellationError())
-        }
-        session.instructionContinuation = nil
-        session.instructionWaitID = nil
+        let wait = session.instructionWait
+        session.instructionWait = nil
+        wait?.timeoutTask?.cancel()
+        wait?.timeoutTask = nil
         session.waitingPrompt = nil
+        wait?.continuation.resume(throwing: CancellationError())
     }
 }

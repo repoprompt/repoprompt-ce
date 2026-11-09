@@ -2340,10 +2340,10 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
 
     private func cancelWaitingInstructionForTest(_ session: AgentModeViewModel.TabSession) {
         session.instructionTimeoutTask?.cancel()
-        session.instructionTimeoutTask = nil
+        session.instructionWait?.timeoutTask = nil
         let continuation = session.instructionContinuation
-        session.instructionContinuation = nil
-        session.instructionWaitID = nil
+        session.instructionWait = nil
+
         session.waitingPrompt = nil
         continuation?.resume(throwing: CancellationError())
     }
@@ -3968,6 +3968,36 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         #else
             throw XCTSkip("Catalog observation diagnostics require DEBUG helpers.")
         #endif
+    }
+
+    func testDequeuedInstructionRestoresAfterWriterReacquisitionDuringAugmentation() async throws {
+        let fixture = try makeFixture(agent: .openCode)
+        let runtime = fixture.viewModel.linkExecutionRuntime
+        let original = try XCTUnwrap(runtime.instructionCommand(for: fixture.session))
+        let scope = original.writer.scope
+        let queued = AgentTabSession.PendingInstruction(providerText: "queued ordinary input", localDraftText: "original draft")
+        fixture.session.pendingInstructions = [queued]
+        let gate = TestReleaseFence(name: "queued augmentation before writer reacquisition")
+        fixture.viewModel.test_afterProviderInputAugmentation = { await gate.enterAndWait() }
+        let waiting = Task { try await fixture.viewModel.waitForNextUserInstruction(tabID: fixture.tabID) }
+        defer {
+            gate.release()
+            waiting.cancel()
+            fixture.viewModel.test_afterProviderInputAugmentation = nil
+        }
+        let entered = await gate.waitUntilEntered()
+        XCTAssertTrue(entered)
+        XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
+        scope.replaceSessions([:])
+        scope.replaceSessions([fixture.session.tabID: fixture.session])
+        XCTAssertFalse(original.isCurrent)
+        gate.release()
+        do { _ = try await waiting.value
+            XCTFail("A reacquired claim must not return old queued input")
+        } catch { XCTAssertTrue(error is MCPError) }
+        XCTAssertEqual(fixture.session.pendingInstructions, [queued], "The original dequeue still owns recovery of its input")
+        XCTAssertNil(fixture.session.instructionWait)
+        XCTAssertTrue(fixture.session.items.isEmpty)
     }
 
     func testLocalInputDequeuedInstructionDuringReadProofRecoversQueueOrStoppedDraftExactlyOnce() async throws {

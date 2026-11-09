@@ -1484,7 +1484,7 @@ final class AgentModeRunService {
     ) async {
         if let admission {
             // Pending starts are withdrawn synchronously by their producer owner, not terminalized.
-            guard admission.scope == .activeRun, admission.claim(for: session) else { return }
+            guard admission.scope != .pendingStart, admission.claim(for: session) else { return }
             outcomeRecorder?.recordCancellationInitiated()
         }
         let withdrawingProviderAdoption = dependencies.claudeCoordinator.hasPendingProviderAdoption(for: session)
