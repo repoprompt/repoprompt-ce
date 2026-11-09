@@ -471,7 +471,7 @@ final class RouterServiceSettingsPresentationTests: XCTestCase {
 }
 
 final class WindowActivityLedgerTests: XCTestCase {
-    private final class Clock: @unchecked Sendable {
+    fileprivate final class Clock: @unchecked Sendable {
         var now: UInt64 = 0
     }
 
@@ -564,6 +564,48 @@ final class WindowActivityLedgerTests: XCTestCase {
 }
 
 final class ActivitySettingsTests: XCTestCase {
+    func testRowsSortByFullTitleIgnoringCaseThenWindowID() {
+        let rows = [(3, "zebra"), (8, "Alpha"), (2, "alpha"), (1, "Beta")].map {
+            ActivityDisplay.Row(id: $0.0, title: $0.1, snapshot: nil, previous: nil)
+        }
+        XCTAssertEqual(ActivityDisplay(rows: rows).rows.map(\.id), [2, 8, 1, 3])
+        let title = String(repeating: "long title ", count: 20).trimmingCharacters(in: .whitespaces)
+        XCTAssertEqual(ActivityDisplay.Row(id: 1, title: title, snapshot: nil, previous: nil).window, "Window 1: \(title)")
+    }
+
+    func testTinyRecordedBatchRemainsVisibleWhileZeroMeansZero() throws {
+        let clock = WindowActivityLedgerTests.Clock()
+        let ledger = WindowActivityLedger(clock: { clock.now })
+        ledger.registerWindow(1)
+        let previous = try XCTUnwrap(ledger.snapshot().first)
+        ledger.record(windowID: 1, phase: .began, root: "_git_data (git data)")
+        clock.now += 2_000_000
+        ledger.record(windowID: 1, phase: .ended)
+        clock.now += 998_000_000
+        let snapshot = try XCTUnwrap(ledger.snapshot().first)
+        XCTAssertEqual(snapshot.busyTotal, 2_000_000)
+        // The old formatting concealed a real two-millisecond batch.
+        XCTAssertEqual(ActivityDisplay.number(Double(snapshot.busyTotal) / 1e9, decimals: 1), "0.0")
+        let row = ActivityDisplay.Row(id: 1, title: "repo", snapshot: snapshot, previous: previous)
+        XCTAssertEqual(row.total, "2.0 ms")
+        XCTAssertEqual(row.rate, "0.2%")
+        XCTAssertTrue(row.status.hasPrefix("Idle "))
+        XCTAssertEqual(row.root, "_git_data (git data)")
+        XCTAssertEqual(ActivityDisplay.duration(1), "<0.1 ms")
+        XCTAssertEqual(ActivityDisplay.duration(49_000_000), "49.0 ms")
+        XCTAssertEqual(ActivityDisplay.duration(999_000_000), "999.0 ms")
+        XCTAssertEqual(ActivityDisplay.duration(1_000_000_000), "1.0 s")
+        let tiny = WindowActivityLedger.Snapshot(
+            windowID: 1,
+            sampledAt: previous.sampledAt + 1_000_000_000,
+            busyTotal: 1,
+            busySince: nil,
+            lastEnded: previous.sampledAt,
+            root: nil
+        )
+        XCTAssertEqual(ActivityDisplay.Row(id: 1, title: "repo", snapshot: tiny, previous: previous).rate, "<0.1%")
+    }
+
     func testProcessCPUUsesTaskTotalsTimebaseAndResetsInvalidBaseline() {
         var sampler = ActivityProcessSampler(numer: 3, denom: 2)
         XCTAssertEqual(sampler.cpuText(.init(user: 0, system: 0, now: 0)), "Measuring…")
@@ -602,7 +644,7 @@ final class ActivitySettingsTests: XCTestCase {
         let idle = ActivityDisplay.Row(id: 2, title: "", snapshot: nil, previous: nil)
         XCTAssertEqual(idle.window, "Window 2")
         XCTAssertEqual(idle.status, "Not busy yet")
-        XCTAssertEqual(idle.total, "0.0 s")
+        XCTAssertEqual(idle.total, "0 ms")
     }
 
     func testShortLabelsRoundPercentagesClampAndKeepFolderSuffixes() {

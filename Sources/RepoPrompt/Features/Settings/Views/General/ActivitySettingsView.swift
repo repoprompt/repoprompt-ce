@@ -18,16 +18,33 @@ struct ActivitySettingsView: View {
             if display.rows.isEmpty {
                 Text("No open windows.").foregroundStyle(.secondary)
             }
-            ForEach(display.rows) { row in
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(row.window).fontWeight(.medium)
-                    Text("Watching files: \(row.rate)")
-                    Text("Folder: \(row.root)")
-                    Text(row.status)
-                    Text("Busy total: \(row.total)")
+            if !display.rows.isEmpty {
+                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 6) {
+                    GridRow {
+                        Text("Window")
+                        Text("Watching files")
+                        Text("Folder")
+                        Text("Status")
+                        Text("Busy total")
+                    }
+                    .fontWeight(.medium)
+                    ForEach(display.rows) { row in
+                        GridRow {
+                            Text(row.window)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .hoverTooltip(row.window)
+                            Text(row.rate)
+                            Text(row.root).lineLimit(1).hoverTooltip(row.root)
+                            Text(row.status)
+                            Text(row.total)
+                        }
+                        .accessibilityElement(children: .combine)
+                    }
                 }
+                .font(.caption)
                 .monospacedDigit()
-                .accessibilityElement(children: .combine)
             }
             HStack {
                 Button("Copy report") {
@@ -51,7 +68,7 @@ struct ActivitySettingsView: View {
                         id: window.windowID, title: window.displayedWindowTitle,
                         snapshot: snapshot, previous: previous[window.windowID]
                     )
-                }.sorted { $0.id < $1.id }
+                }
                 display = ActivityDisplay(cpu: cpu, memory: memory, rows: rows)
                 previous = Dictionary(uniqueKeysWithValues: snapshots.map { ($0.windowID, $0) })
                 do { try await Task.sleep(for: .seconds(1)) } catch { break }
@@ -71,11 +88,15 @@ struct ActivityDisplay {
         self.capturedAt = capturedAt
         self.cpu = cpu
         self.memory = memory
-        self.rows = rows
+        self.rows = rows.sorted {
+            let order = $0.title.compare($1.title, options: [.caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+            return order == .orderedSame ? $0.id < $1.id : order == .orderedAscending
+        }
     }
 
     struct Row: Identifiable {
         let id: Int
+        let title: String
         let window: String
         let rate: String
         let root: String
@@ -84,7 +105,8 @@ struct ActivityDisplay {
 
         init(id: Int, title: String, snapshot: WindowActivityLedger.Snapshot?, previous: WindowActivityLedger.Snapshot?) {
             self.id = id
-            let title = ActivityDisplay.label(title)
+            let title = title.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+            self.title = title
             window = title.isEmpty || title == WindowTitleFormatter.defaultTitle
                 ? "Window \(id)" : "Window \(id): \(title)"
             root = snapshot?.root.map { $0 == "Multiple roots" ? "Multiple folders" : ActivityDisplay.label($0) } ?? "—"
@@ -92,7 +114,9 @@ struct ActivityDisplay {
             if let snapshot, let previous, snapshot.sampledAt > previous.sampledAt, snapshot.busyTotal >= previous.busyTotal {
                 let fraction = Double(snapshot.busyTotal - previous.busyTotal) / Double(snapshot.sampledAt - previous.sampledAt)
                 // Union time cannot exceed the interval; clamp its displayed percentage to 0...100.
-                rate = ActivityDisplay.number(100 * min(1, max(0, fraction)), decimals: 0) + "%"
+                let percent = 100 * min(1, max(0, fraction))
+                rate = percent > 0 && percent < 0.1 ? "<0.1%"
+                    : ActivityDisplay.number(percent, decimals: percent > 0 && percent < 10 ? 1 : 0) + "%"
             } else {
                 rate = "Measuring…"
             }
@@ -138,6 +162,9 @@ struct ActivityDisplay {
 
     static func duration(_ nanoseconds: UInt64) -> String {
         let seconds = nanoseconds / 1_000_000_000
+        if nanoseconds == 0 { return "0 ms" }
+        if nanoseconds < 100_000 { return "<0.1 ms" }
+        if seconds == 0 { return number(Double(nanoseconds) / 1e6, decimals: 1) + " ms" }
         if seconds < 60 { return number(Double(nanoseconds) / 1e9, decimals: 1) + " s" }
         if seconds < 3600 { return "\(seconds / 60) m \(String(format: "%02d", Int(seconds % 60))) s" }
         if seconds < 86400 { return "\(seconds / 3600) h \(String(format: "%02d", Int(seconds / 60 % 60))) m" }

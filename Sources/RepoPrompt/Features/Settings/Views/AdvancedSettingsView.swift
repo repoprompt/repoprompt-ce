@@ -105,11 +105,6 @@ struct AdvancedSettingsView: View {
             VStack(alignment: .leading, spacing: 16) {
                 headerSection
 
-                ActivitySettingsView()
-
-                Divider()
-                    .padding(.horizontal, -16)
-
                 fileSystemSection
 
                 Divider()
@@ -136,6 +131,11 @@ struct AdvancedSettingsView: View {
                     .padding(.horizontal, -16)
 
                 savedPromptsSection
+
+                Divider()
+                    .padding(.horizontal, -16)
+
+                ActivitySettingsView()
 
                 Spacer()
             }
