@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import signal
 import socket
 import time
@@ -165,9 +166,9 @@ pid = os.fork()
 if pid == 0:
     os.setpgrp()
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    print('grandchild=' + str(os.getpid()), flush=True)
+    os.write(1, ('grandchild=' + str(os.getpid()) + '\\n').encode())
     while True: signal.pause()
-print('leader=' + str(os.getpid()), flush=True)
+os.write(1, ('leader=' + str(os.getpid()) + '\\n').encode())
 while True: signal.pause()
 '''
             wrapper = (
@@ -186,16 +187,19 @@ while True: signal.pause()
                     selector.register(process.stdout, selectors.EVENT_READ)
                     observed = ''
                     deadline = time.monotonic() + 5
-                    while 'grandchild=' not in observed or 'leader=' not in observed:
+                    pids = {}
+                    while pids.keys() != {'leader', 'grandchild'}:
                         self.assertGreater(deadline, time.monotonic(), observed)
                         for key, _ in selector.select(max(0, deadline - time.monotonic())):
                             observed += os.read(key.fd, 65536).decode()
+                        # Pipe reads may split records. Require the terminating newline so a
+                        # partial PID (or just its label) cannot satisfy the readiness barrier.
+                        pids = dict(re.findall(r'(leader|grandchild)=(\d+)\n', observed))
                 process.terminate()
                 output, _ = process.communicate(timeout=5)
                 self.assertEqual(process.returncode, 143, observed + output)
-                for line in observed.splitlines():
-                    if line.startswith(('leader=', 'grandchild=')):
-                        self.assert_process_stopped(line.split('=')[1])
+                for pid in pids.values():
+                    self.assert_process_stopped(int(pid))
             finally:
                 if process.poll() is None:
                     process.kill()
