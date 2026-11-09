@@ -6623,3 +6623,72 @@ edges, 53/66 largest-cycle components**; no baseline change. Actual compile warn
 counts across seven touched Swift files match retained base: **four VM, two link-runtime-bridge
 test warnings**, zero in the other five. No positive occurrence delta. No full-suite, live-app,
 release or hosted-CI qualification is claimed; M9.2b remains open.
+
+#### M9.2b checkpoint 9 — hook-review runtime ownership (validated locally; push frozen)
+
+The hook gate's actual discovery, waiting, response, refresh and completion bodies now live in
+`AgentSessionInteractionRuntime+HookReview`. The coordinator retains execution-CWD composition and
+an exact-command entry, not response mutations. UI and MCP responses use captured commands; the VM
+response adapter and its post-await MCP publication are retired. Composition installs the existing
+injected settings provider into the scope's interaction runtime without calling the recursive VM
+getter. Read-only coordinator policy queries remain for existing consumers. Unknown placement or
+missing policy stays strict. No M9.3a-owned composition surface changed.
+
+Gate entry requires the unique, restored command, including memo/coalesced paths. The original
+writer/run/attempt and gate generation fence discovery and review results. The continuation is
+installed before publication. A fresh claim on the same object cannot answer the old gate. A lost
+origin settles only its exact gate; no successor audit, memo, transcript, save or successful startup
+resume is produced. Clearing an old card on a still-live rebound/new-run payload uses only the
+existing exact-object interaction projection; derived run state remains fenced to the original run.
+Coalesced waiters remain held until the dispatch owner finishes, not merely until trust is approved.
+
+Only admitted provider list/trust effects enter the existing tracked-effect drain. Consent and
+phase consumption remain synchronous with caller authorization. Stop may therefore wait for an
+already-authorized trust operation's bounded settlement. Native trust remains a one-shot,
+cancellation-shielded write to the admitted candidate/fingerprint set, with postverification; the
+fingerprint check is not an atomic external-file CAS and this change does not claim a physical
+writer fence on that durable write. The pre-existing typed native cancellation/failure policy is
+unchanged. Larger startup/provider dispatch and provider-native cancellation paths remain open.
+
+One review identified live-object repaint and coalesced/successor coverage requirements. Source
+checks confirm VM presentation/MCP/persistence accessors use the same scope runtimes and the existing
+single observer was already Codex; its new reason still updates only the watchdog. Causal tests
+exercise strict consent, exact candidate/fingerprint dispatch, duplicate refusal, held trust versus
+claim loss/rebind/new run/raw conflict, a real successor gate, held initial/retry discovery, refreshed
+inventory, and Stop/drain versus coalesced dispatch. They add no timeout-budget changes or retries.
+Initial focused attempts `f058e6c2-1e15-4e2a-ae86-ce8ff47f6195`,
+`d6cabb13-dabc-49b2-a16c-b32a5a837c13`, and `db21f5c0-c07b-43e2-963d-d69bf7851161`
+failed compilation (DTO run IDs are identity inputs, not stored members; moved code needs the AI
+contracts import; the fixture must use the existing run-ID installer). No tests passed in those
+attempts. Focused `6055a2d7-f333-4e9b-87d7-1a7322521c95` executed **104**, with four
+assertions failing in three existing native-dispatch cases; all five new runtime tests passed.
+Those three fixtures now use the existing restored-binding helper before their ordinary dispatch,
+without changing their recovery or send assertions. `7851540d-e817-4bee-8155-8e7eb98ef9e9`
+executed **104**, with one cold-compaction fixture staging timeout. Its binding setup is limited to
+the later send phase, leaving the cold bootstrap/compaction setup unchanged; wait labels now identify
+the failing phase without changing the four-second budget. The isolated final selection
+`eee7ee5b-f5d5-4d3a-93ee-7dbacaea1c65` passed **six** (five new runtime tests and the cold
+compaction/send case). Full lint `7bd02d79-233d-4b87-881e-a3eb7bd8b719` passed; subsequent
+fixture edits were scoped-formatted and strict-linted. One new unused attachment-result warning was
+fixed; actual final compilation across ten touched Swift files matches retained base occurrence
+counts: **four VM, 17 resume-wedge tests**, zero in the other eight. No positive warning delta.
+Final broad `d0ad94cb-bdd1-4864-9f1f-c79b241e73b3` passed **2,156 executed, 22 skipped,
+zero failures** (2,145 app, seven domain, four provider), including the full affected focused
+families, all SessionLinks and admission/sidebar/lane-policy suites. Isolated handoff
+`0a08c05a-baa7-4e8b-830a-159e0bfb72fb` passed **104**. Both products
+`0eb5519b-6947-4ddb-90ff-e003f79b0a90` passed. Fresh post-build index is **1,245/1,360
+wrong-way edges, 53/66 largest-cycle components**, with no baseline change. The new app-local hook
+runtime retains the compiler-confirmed edge to `ViewModels/AgentTabSession`; this is ownership
+routing, not M10 target relocation. No live-app, full-suite, release or hosted-CI qualification is
+claimed. The overseer's push freeze on `255d2650e` remains in force; this validated checkpoint must
+stay local until explicitly released. The remaining M9.2b inventory is not complete.
+
+Commit preflight first encountered a sandbox-denied SwiftPM manifest evaluation; the unsandboxed
+retry reached the actual guards and rejected a new testable-app file (**340 > 339**). The five
+`CodexHookReviewRuntimeTests` methods and their fixtures were moved verbatim into the existing
+`CodexHookReviewCardStateTests.swift` file, retaining both suite names and every assertion. No
+ratchet baseline changed. After consolidation, focused
+`b22bfa36-4131-4bb3-93ff-509fed1d500f` passed **nine tests** (four card-state, five runtime),
+scoped formatting/strict lint passed, and the consolidated test file compiled with zero warnings.
+The broad, isolated-handoff and product receipts above precede this test-only file consolidation;
+production source is unchanged.

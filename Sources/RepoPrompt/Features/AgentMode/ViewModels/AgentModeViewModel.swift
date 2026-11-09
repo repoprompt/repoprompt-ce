@@ -3735,6 +3735,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     /// Composition installs concrete execution services independently of the optional UI attachment.
     func configureCodexRuntime(_ coordinator: CodexAgentModeCoordinator) {
+        let interactions = runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore)
+        coordinator.installInteractionRuntime(interactions)
+        interactions.observer = coordinator
         coordinator.installPersistenceRuntime(persistenceRuntime)
         coordinator.installAttachmentRuntime(attachmentRuntime)
         coordinator.installMCPRuntime(mcpRuntime)
@@ -12028,7 +12031,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 guard !payload.containsArgument("answers") else {
                     throw MCPError.invalidParams("continue_without_hooks requires the answers argument to be absent.")
                 }
-                guard !codexCoordinator.isCodexHookApprovalStrictModeEnabled(for: session) else {
+                guard !interactionRuntime.isCodexHookApprovalStrictModeEnabled(for: session) else {
                     throw MCPError.invalidParams(
                         AgentCodexHookReviewResolutionError.strictModeRequiresApproval.localizedDescription
                     )
@@ -12044,8 +12047,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 decision = .retryDiscovery
             }
             do {
-                try await codexCoordinator.resolveCodexHookReview(
-                    session: session,
+                try await interactionRuntime.submitCodexHookReviewDecision(
+                    command: command,
                     requestID: request.id,
                     decision: decision
                 )
@@ -12054,7 +12057,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             } catch {
                 throw MCPError.invalidParams("The hook approval operation could not be completed. Review the current interaction and retry.")
             }
-            handleObservedMCPStateChange(for: session)
             return nil
         }
     }
