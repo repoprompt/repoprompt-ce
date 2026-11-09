@@ -86,6 +86,31 @@ extension AgentSessionInteractionRuntime {
         scope?.sessions[session.tabID] === session && scope?.hasReleasedWriterClaims == false
     }
 
+    /// Admit from the rendered writer, then join the exact approval receipt's settlement.
+    /// The store acknowledgement is about that receipt, not today's tab occupant. No payload
+    /// or successor state is mutated after the actor hop.
+    @discardableResult
+    func submitApplyEditsReviewDecision(
+        command: AgentSessionRuntimeStore.Command,
+        reviewID: UUID,
+        decision: ApplyEditsReviewDecision
+    ) async -> Bool {
+        let session = command.writer.session
+        guard command.writer.scope === scope, command.isCurrent,
+              session.pendingApplyEditsReview?.id == reviewID else { return false }
+        let address = approvalScope(for: session)
+        var applied = false
+        let task = performEffect(for: session) { [self] in
+            #if DEBUG
+                await test_beforeApprovalDecision?()
+            #endif
+            guard command.isCurrent, session.pendingApplyEditsReview?.id == reviewID else { return }
+            applied = await approvalStore.resolveReview(scope: address, reviewID: reviewID, decision: decision)
+        }
+        await task.value
+        return applied
+    }
+
     private func requireCodexCoordinator() throws -> CodexAgentModeCoordinator {
         guard let codexCommands else { throw MCPError.invalidParams("The provider response route is unavailable. No response was applied.") }
         return codexCommands

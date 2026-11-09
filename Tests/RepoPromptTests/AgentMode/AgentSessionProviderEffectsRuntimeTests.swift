@@ -1454,6 +1454,91 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         XCTAssertNil(session.waitingPrompt)
     }
 
+    func testApplyEditsDecisionUsesCapturedWriterAndAcknowledgesExactReview() async throws {
+        for drift in ["none", "removed", "reacquired", "conflict", "retired", "successorReview"] {
+            let writers = AgentSessionRuntimeStore()
+            let scope = writers.makeScope()
+            let session = AgentTabSession(tabID: UUID())
+            let binding = AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: UUID(), workspaceID: UUID())
+            session.installPersistentSessionBinding(binding)
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            scope.replaceSessions([session.tabID: session])
+            guard case let .unique(writer) = scope.resolveWriter(sessionID: binding.sessionID) else {
+                return XCTFail("Expected the initial unique writer")
+            }
+            let command = try writer.admitCommand().get()
+            let approvals = ApplyEditsApprovalStore()
+            let runtime = scope.interactions(routeID: 42, approvalStore: approvals)
+            let address = runtime.approvalScope(for: session)
+            let (subscription, stream) = await approvals.subscribe(scope: address)
+            var snapshots = stream.makeAsyncIterator()
+            _ = await snapshots.next()
+            let original = Task { await approvals.requestReview(scope: address, path: "original", unifiedDiff: "diff", timeoutSeconds: 60) }
+            let firstSnapshot = await snapshots.next()
+            let first = try XCTUnwrap(firstSnapshot?.pendingReview)
+            session.pendingApplyEditsReview = first
+            let gate = TestReleaseFence(name: "writer-routed approval decision")
+            runtime.test_beforeApprovalDecision = { await gate.enterAndWait() }
+            addTeardownBlock {
+                gate.release()
+                await runtime.drainPendingEffects()
+                await approvals.cleanupScope(address)
+                await approvals.unsubscribe(scope: address, id: subscription)
+                _ = await original.value
+            }
+            let submission = Task { await runtime.submitApplyEditsReviewDecision(command: command, reviewID: first.id, decision: .accept) }
+            guard await gate.waitUntilEntered() else { return }
+            let other = writers.makeScope()
+            var successor: Task<ApplyEditsReviewDecision, Never>?
+            var expectedReviewID = first.id
+            switch drift {
+            case "removed":
+                scope.replaceSessions([:])
+            case "reacquired":
+                scope.replaceSessions([:])
+                scope.replaceSessions([session.tabID: session])
+            case "conflict":
+                let duplicate = AgentTabSession(tabID: UUID())
+                other.replaceSessions([duplicate.tabID: duplicate])
+                XCTAssertEqual(other.bindingRejection(binding.sessionID, on: duplicate), .conflictingWriter)
+                duplicate.installPersistentSessionBinding(.init(tabID: duplicate.tabID, sessionID: binding.sessionID, workspaceID: binding.workspaceID))
+                guard case .conflicting = writers.resolveWriter(sessionID: binding.sessionID) else {
+                    return XCTFail("Raw competing claim must remain conflicting")
+                }
+            case "retired":
+                scope.beginRetirement()
+            case "successorReview":
+                successor = Task { await approvals.requestReview(scope: address, path: "successor", unifiedDiff: "diff", timeoutSeconds: 60) }
+                _ = await snapshots.next() // original cancellation
+                let next = await snapshots.next()
+                expectedReviewID = try XCTUnwrap(next?.pendingReview?.id)
+            // Deliberately leave the local projection stale: the store receipt is authoritative.
+            default: break
+            }
+            gate.release()
+            let applied = await submission.value
+            XCTAssertEqual(applied, drift == "none", drift)
+            await runtime.drainPendingEffects(for: session)
+            let (checkID, currentStream) = await approvals.subscribe(scope: address)
+            var current = currentStream.makeAsyncIterator()
+            let snapshot = await current.next()
+            XCTAssertEqual(snapshot?.pendingReview?.id, drift == "none" ? nil : expectedReviewID, drift)
+            await approvals.unsubscribe(scope: address, id: checkID)
+            if drift != "none" {
+                let settled = await approvals.resolveReview(scope: address, reviewID: expectedReviewID, decision: .reject(reason: "test cleanup"))
+                XCTAssertTrue(settled, "The stale command must not consume the pending receipt")
+            }
+            let duplicateSettlement = await approvals.resolveReview(scope: address, reviewID: first.id, decision: .accept)
+            XCTAssertFalse(duplicateSettlement)
+            let originalResult = await original.value
+            if drift == "none" { XCTAssertEqual(originalResult, .accept) }
+            if let successor {
+                let result = await successor.value
+                XCTAssertEqual(result, .reject(reason: "test cleanup"))
+            }
+        }
+    }
+
     func testLateApprovalCancellationDrainsOriginalEffectWithoutCancellingSuccessorReview() async throws {
         var scope: AgentSessionRuntimeStore.Scope? = AgentSessionRuntimeStore().makeScope()
         let session = AgentTabSession(tabID: UUID())

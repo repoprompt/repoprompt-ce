@@ -67,19 +67,4 @@ extension AgentModeViewModel {
         }
         codexCoordinator.submitMCPElicitationResponse(session: session, request: request, response: response)
     }
-
-    func submitApplyEditsReviewDecision(
-        tabID: UUID,
-        reviewID: UUID,
-        decision: ApplyEditsReviewDecision
-    ) {
-        let scope = applyEditsScope(for: tabID)
-        Task { [applyEditsApprovalStore] in
-            await applyEditsApprovalStore.resolveReview(
-                scope: scope,
-                reviewID: reviewID,
-                decision: decision
-            )
-        }
-    }
 }

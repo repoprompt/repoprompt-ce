@@ -2413,23 +2413,17 @@ struct AgentModeChatDetailView: View {
             .id("pendingCodexHookReview")
             .transition(.opacity)
         } else if let review = runInteractionSnapshot.pendingApplyEditsReview {
+            let command = agentModeVM.activeSession?.activeAgentSessionID.flatMap { try? agentModeVM.runtimeCommand(sessionID: $0) }
+            let runtime = agentModeVM.interactionRuntime
             AgentApplyEditsReviewCard(
                 review: review,
                 onAccept: {
-                    guard let tabID = currentTabID else { return }
-                    agentModeVM.submitApplyEditsReviewDecision(
-                        tabID: tabID,
-                        reviewID: review.id,
-                        decision: .accept
-                    )
+                    guard let command else { return }
+                    Task { await runtime.submitApplyEditsReviewDecision(command: command, reviewID: review.id, decision: .accept) }
                 },
                 onReject: { reason in
-                    guard let tabID = currentTabID else { return }
-                    agentModeVM.submitApplyEditsReviewDecision(
-                        tabID: tabID,
-                        reviewID: review.id,
-                        decision: .reject(reason: reason)
-                    )
+                    guard let command else { return }
+                    Task { await runtime.submitApplyEditsReviewDecision(command: command, reviewID: review.id, decision: .reject(reason: reason)) }
                 }
             )
             .id("pendingApplyEditsReview")

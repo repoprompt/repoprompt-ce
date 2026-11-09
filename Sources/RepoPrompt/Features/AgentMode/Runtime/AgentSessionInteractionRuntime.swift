@@ -32,7 +32,8 @@ final class AgentSessionInteractionRuntime {
     }
 
     /// Admit an effect synchronously, retaining its exact owner until the effect has joined.
-    func performEffect(for session: AgentTabSession, operation: @escaping @MainActor () async -> Void) {
+    @discardableResult
+    func performEffect(for session: AgentTabSession, operation: @escaping @MainActor () async -> Void) -> Task<Void, Never> {
         let id = UUID()
         let owner = scope
         let task = Task { [self, owner] in
@@ -43,6 +44,7 @@ final class AgentSessionInteractionRuntime {
             await operation()
         }
         pendingEffects[id] = PendingEffect(sessionIdentity: ObjectIdentifier(session), task: task)
+        return task
     }
 
     let routeID: Int
@@ -67,6 +69,7 @@ final class AgentSessionInteractionRuntime {
 
     #if DEBUG
         var test_beforeApprovalCancellation: (@MainActor () async -> Void)?
+        var test_beforeApprovalDecision: (@MainActor () async -> Void)?
     #endif
 
     init(scope: AgentSessionRuntimeStore.Scope, routeID: Int, approvalStore: ApplyEditsApprovalStore) {

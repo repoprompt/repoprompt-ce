@@ -59,7 +59,7 @@ Everything lives on `AgentTabSession` (`Features/AgentMode/ViewModels/AgentTabSe
 | `pendingUserInputRequest` (+ queue; questions may be `isSecret`) | Codex ~8596 | `submitUserInputResponse(tabID:requestID:response:)` | `userInput` |
 | `pendingAskUser: AgentAskUserPendingState` | `AgentModeViewModel` ~19809+ (ask_user tool) | `submitAskUserResponse(tabID:interactionID:draftsByQuestionID:)`, `skipAskUser` | `question` |
 | `pendingCodexHookReview` | Codex ~739–1190 | `submitCodexHookReviewDecision` (id-checked, async) | `hookApproval` |
-| `pendingApplyEditsReview` | `AgentModeViewModel` ~4808 | `submitApplyEditsReviewDecision(tabID:reviewID:decision:)` | n/a |
+| `pendingApplyEditsReview` | `AgentSessionInteractionRuntime` approval-store subscription | `AgentSessionInteractionRuntime.submitApplyEditsReviewDecision(command:reviewID:decision:)` (captured writer, joined exact receipt) | n/a |
 | `pendingWorktreeMergeReview` | `AgentModeViewModel+WorktreeMerge.swift` ~715 | `submitWorktreeMergeReviewDecision` | `approval` |
 | `waitingPrompt` + `instructionContinuation` (`runState == .waitingForUser`) | `AgentModeViewModel` ~19605 | Composer submit → `resumeWaitingInstructionContinuation` (~19691) | `instruction` |
 

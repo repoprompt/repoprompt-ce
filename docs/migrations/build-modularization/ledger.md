@@ -6095,3 +6095,24 @@ progression concern: an epoch/registration can advance before permission setup f
 a partially configured control despite the failed activation response. Second-boundary progression
 is covered here; first-boundary completion/unwind remains in the control-routing inventory.
 M9.3 saved-target composition and M9.4 presentation/handoff/drain remain out of scope.
+
+### M9.2b checkpoint 2 — apply-edits review response routing (2026-11-09)
+
+The apply-edits review card captures the canonical writer command when rendered, rather than
+selecting a tab/window again when clicked. `AgentModeViewModel.submitApplyEditsReviewDecision`
+and its untracked approval-store task are removed. The interaction runtime validates the exact
+writer and review, tracks the admitted effect in its existing drain, revalidates before dispatch,
+and joins the store's exact-review Boolean acknowledgement. Actor-hop completion never writes
+back to a successor session. The approval store still owns review settlement; ordinary originating
+Stop/cancellation cleanup retains its separate exact-receipt path.
+
+The causal matrix covers successful settlement, removal, claim reacquisition, raw conflicting
+writers (after typed admission refusal), retirement and an undisplayed successor review. A stale
+command must leave the receipt pending, and duplicate/stale review settlement returns false.
+`AgentSessionInteractionRuntimeTests` passed **13 tests, 0 failures**, Conductor
+`4417a5d7-24ac-4def-8f77-8207620922c2`; pinned scoped formatting and strict lint passed.
+The actual compile emitted zero warnings in the six touched Swift files. The filter also named
+`ApplyEditsApprovalStoreTests`, which does not exist; no separate store-suite coverage is claimed.
+Caller/body search leaves only the runtime method and its two card calls; the notification
+architecture inventory now names this runtime path. This checkpoint does not complete other
+interaction/provider-approval routing or any other outstanding M9.2b group.
