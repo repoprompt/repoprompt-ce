@@ -211,38 +211,6 @@ final class AgentSessionInteractionRuntime {
         }
     }
 
-    func finishPendingWorktreeMergeReview(session: AgentTabSession) {
-        session.worktreeMergeReviewTimeoutTask?.cancel()
-        session.worktreeMergeReviewTimeoutTask = nil
-        session.worktreeMergeReviewContinuation = nil
-        session.pendingWorktreeMergeReview = nil
-        Self.reconcileInteractiveRunState(session)
-        scope?.presentation.makeRunHooks().requestUIRefresh(session, true)
-    }
-
-    func cancelPendingWorktreeMergeReview(for session: AgentTabSession, reason: String) {
-        let operationID = session.pendingWorktreeMergeReview?.operationID
-        let continuation = session.worktreeMergeReviewContinuation
-        finishPendingWorktreeMergeReview(session: session)
-        if let operationID {
-            do {
-                try AgentWorktreeMergeCoordinator.update(operationID: operationID, in: &session.worktreeMergeOperations) {
-                    $0.status = .cancelled
-                    $0.completedAt = Date()
-                    $0.lastError = reason
-                }
-                session.isDirty = true
-                scope?.presentation.worktreeOperationsChanged(session)
-                scope?.mcp.handleObservedMCPStateChange(for: session)
-                scope?.presentation.bindingChanged(session)
-                scope?.persistence.scheduleSave(for: session)
-            } catch {
-                // Preserve the existing best-effort cancellation when the operation was removed.
-            }
-        }
-        continuation?.resume(returning: .cancelled(reason: reason))
-    }
-
     static func reconcileInteractiveRunState(_ session: AgentTabSession) {
         let nextState: AgentSessionRunState? = if session.pendingApplyEditsReview != nil || session.pendingWorktreeMergeReview != nil || session.pendingApproval != nil || session.hasPendingCodexHookReviewRequest || session.pendingPermissionsRequest != nil || session.pendingMCPElicitationRequest != nil {
             .waitingForApproval

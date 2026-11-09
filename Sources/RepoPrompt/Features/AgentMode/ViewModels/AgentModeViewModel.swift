@@ -7719,7 +7719,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.pendingPermissionsRequest = nil
         session.pendingMCPElicitationRequest = nil
         session.pendingApplyEditsReview = nil
-        cancelPendingWorktreeMergeReview(for: session, reason: "Session reset")
+        interactionRuntime.cancelPendingWorktreeMergeReview(for: session, reason: "Session reset")
         session.queuedUserInputRequests.removeAll()
         session.queuedMCPElicitationRequests.removeAll()
         session.pendingInstructions.removeAll()
@@ -19038,7 +19038,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         cancelPendingQuestion(for: session)
         cancelPendingApproval(for: session)
         cancelPendingApplyEditsReview(for: session, reason: "Provider switch")
-        cancelPendingWorktreeMergeReview(for: session, reason: "Provider switch")
+        interactionRuntime.cancelPendingWorktreeMergeReview(for: session, reason: "Provider switch")
     }
 
     private func cancelPendingQuestion(for session: TabSession) {

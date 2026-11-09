@@ -540,8 +540,7 @@ final class AgentTabSession: ObservableObject {
 
     var applyEditsApprovalSubscriptionID: UUID?
     var applyEditsApprovalSubscriptionTask: Task<Void, Never>?
-    var worktreeMergeReviewContinuation: CheckedContinuation<WorktreeMergeReviewDecision, Never>?
-    var worktreeMergeReviewTimeoutTask: Task<Void, Never>?
+    var worktreeMergeReviewWait: AgentWorktreeMergeReviewWait?
     /// External MCP control attachment. Its presence and effective task label determine whether this
     /// exact session may act as an oversight observer.
     var mcpControlContext: AgentMCPControlContext? {

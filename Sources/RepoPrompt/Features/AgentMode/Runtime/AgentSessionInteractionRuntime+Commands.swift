@@ -150,13 +150,6 @@ extension AgentSessionInteractionRuntime {
         return true
     }
 
-    func submitWorktreeMergeReviewDecision(session: AgentTabSession, reviewID: UUID, decision: WorktreeMergeReviewDecision) {
-        guard owns(session), session.pendingWorktreeMergeReview?.id == reviewID,
-              let continuation = session.worktreeMergeReviewContinuation else { return }
-        finishPendingWorktreeMergeReview(session: session)
-        continuation.resume(returning: decision)
-    }
-
     static func canonicalApprovalResponse(from payload: AgentMCPInteractionResponsePayload) throws -> String {
         if payload.containsArgument("decision") {
             throw MCPError.invalidParams(
@@ -415,7 +408,9 @@ extension AgentSessionInteractionRuntime {
                 throw MCPError.invalidParams("The provider response route is unavailable or the user-input request is no longer current. No response was applied.")
             }
         case let .worktreeMerge(reviewID, decision):
-            submitWorktreeMergeReviewDecision(session: session, reviewID: reviewID, decision: decision)
+            guard submitWorktreeMergeReviewDecision(command: command, reviewID: reviewID, decision: decision) else {
+                throw MCPError.invalidParams("The worktree merge review is no longer current. No response was applied.")
+            }
         case let .permissions(request, decision):
             guard submitPermissionsDecision(command: command, requestID: request.id, decision: decision) else {
                 throw MCPError.invalidParams("The provider response route is unavailable or the permissions request is no longer current. No response was applied.")

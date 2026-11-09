@@ -2429,20 +2429,22 @@ struct AgentModeChatDetailView: View {
             .id("pendingApplyEditsReview")
             .transition(.opacity)
         } else if let mergeReview = runInteractionSnapshot.pendingWorktreeMergeReview {
+            let command = agentModeVM.activeSession?.activeAgentSessionID.flatMap { try? agentModeVM.runtimeCommand(sessionID: $0) }
+            let runtime = agentModeVM.interactionRuntime
             AgentWorktreeMergeReviewCard(
                 review: mergeReview,
                 onAccept: {
-                    guard let tabID = currentTabID else { return }
-                    agentModeVM.submitWorktreeMergeReviewDecision(
-                        tabID: tabID,
+                    guard let command else { return }
+                    runtime.submitWorktreeMergeReviewDecision(
+                        command: command,
                         reviewID: mergeReview.id,
                         decision: .accept
                     )
                 },
                 onCancel: { reason in
-                    guard let tabID = currentTabID else { return }
-                    agentModeVM.submitWorktreeMergeReviewDecision(
-                        tabID: tabID,
+                    guard let command else { return }
+                    runtime.submitWorktreeMergeReviewDecision(
+                        command: command,
                         reviewID: mergeReview.id,
                         decision: .reject(reason: reason)
                     )

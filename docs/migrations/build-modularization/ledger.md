@@ -6481,3 +6481,96 @@ Latest merged-tree validation:
 
 The prior exact-squash-only gates also passed, but do not substitute for these newer-main gates.
 M9.2b remains open; no full-suite, live-app, release or hosted-CI qualification is claimed.
+
+#### M9.2b checkpoint 7 — worktree review lifecycle, not the VCS apply pipeline
+
+Moved the actual review installation, timeout, response and settlement bodies into the existing
+interaction runtime. One non-persisted wait record owns the continuation, timer and originating
+writer identity. New admission and UI/MCP responses require the canonical command; a reacquired
+claim cannot consume an older wait. MCP now reports refusal instead of silently acknowledging an
+unconsumed review. The card captures its command at render time. Removed the VM's review-install
+body, response/cancel/finish forwarding and duplicate cancellation-operation update.
+
+The timer and run teardown settle the exact originating wait without a tab lookup, even after
+presentation detach or writer loss. Operation mutation, explicit publication and save are gated
+by the originating persistent claim. Removing the original run's blocker reconciles its derived
+state only while the binding and run/attempt still match; a rebound binding or successor attempt
+is not reconciled. Acceptance alone does not schedule an unchanged-operation save. The VM captures
+its command before preview authorization/revalidation, checks it afterward, and checks it again
+before acting on an accepted result. Non-accept outcomes never return through a stale tab-keyed
+cancellation save. If admission is suspended before an accepted waiter resumes, no apply starts;
+claim-owned cleanup can record that abandoned decision instead.
+
+One review was completed. Its enum-label compile issue and original-run derived-state issue were
+addressed. Removed-symbol scans found no remaining callers; the existing presentation handler
+still invokes the index/sidebar/current-tab interaction projection. Causal tests cover synchronous
+publication ordering, refusal and duplicate settlement, raw conflicts, same-object reacquisition
+and rebound, detached expiry, a newer same-tab waiter, actual timer execution and exact save-request
+counts. Three tests were added to the existing worktree-review suite, with no relaxed assertions
+or budgets. VM authorization-await/accepted-resumption ordering is source-checked, not covered by
+a new injected VCS test seam. The existing load reconciler already cancels persisted
+`awaitingApproval` operations whose continuations cannot survive relaunch; no new recovery owner
+or schema was added.
+
+Still open: ask-user creation and its MCP external cancellation callback need an exact per-wait
+cutover; hook review and the administrative VCS apply/preview/continue/abort pipeline remain open.
+In particular, later VCS awaits/result persistence are not claimed writer-complete by this slice.
+
+Checkpoint 7 validation (in progress): focused `3ac6ba2f-8c61-4dbf-b76b-6c1512a415cf`
+passed **30 tests** (12 worktree review, 14 interaction runtime, four MCP response diagnostics).
+Full lint `db47ec13-1167-46bc-9730-a5cf4edaa14f` passed. Actual compile occurrence counts across
+eight touched Swift files match retained base: **four VM warnings**, zero in the other seven;
+no positive deltas. Isolated handoff `ca3933c9-925e-4fd1-bf40-293f7da6689f` passed **104**;
+both products `79696295-0c5d-496a-9d39-a24deadeb420` passed. Broad
+`da19f3fe-d82c-4aa4-b788-1098b30b4340` is **failed/incomplete**, not a pass: XCTest exited
+with signal 11 during LiveDiscovery's queued-observation Stop case. The local crash report places
+`EXC_BAD_ACCESS` in `CodexNativeSessionController.shutdown` clearing
+`completedCanonicalItemScopes`, via coordinator retirement; it has no Swift overlapping-access
+or exclusivity diagnostic. Isolated head `744fd8ac-fc82-4f83-9f29-3c6ef2cd091d` executed **36**,
+with four skips and zero failures. Exact base `7bd6f8188`, tested after preserving checkpoint 7
+in stash, executed **36**, with four skips and three timeout failures
+(`testW3RegisteredRingClaudeFirstDoesNotEchoQuietClosures`,
+`testW3RepromptRequiresAcceptedDeclarationBeforeFrameAndNoLaterTool`,
+`testW3SilentUndeclaredCloseRemainsOrdinary`) on ticket
+`1608955d-c234-4b0f-99d7-c8b7d85bea88`; no crash reproduced there. Checkpoint 7 was restored.
+These isolated results do not classify the signal-11 cause. Source shows direct fixture shutdown
+of the same decoder that Stop retires through the coordinator, with no controller-level joining
+or event-mutex acquisition in shutdown. Production lifecycle repair and a passing broad gate are
+required before this checkpoint can be pushed. No full-suite, live-app, release or hosted-CI
+qualification; M9.2b remains open.
+
+Shutdown blocker repair (validation in progress): the controller now owns one locked, joinable
+shutdown task, including direct retirement callers outside the coordinator's existing deduplication.
+Cancelled callers join the same task. It closes event delivery, serializes stream retirement with
+installation, and then drains the existing event mutex before clearing event-derived state; the
+async mutexes are never nested. PID/client cleanup remains owned by that task, and deinit's fallback
+is reserved for controllers never explicitly retired. Recovery refuses a retired controller rather
+than acknowledging skipped installation. No coordinator or LiveDiscovery test cleanup was changed.
+
+The state-writer audit found production collection mutation in the existing event-mutex paths;
+the transport-exit path also checks its stream ownership token before acquiring that mutex.
+`CodexAppServerClient.request` has explicit task-cancellation settlement, rather than relying on
+its request timeout. Current production auth-refresh callbacks are nil. These source facts and the
+new join/drain tests establish the repaired contract, not proof of the observed SIGSEGV's exact
+interleaving. The first focused repair run `6207eabb-fc08-410e-9532-5b2f9e07e9dd` passed **32**.
+A separate review of this blocker fix prompted the early delivery cutoff and explicit recovery
+refusal. Tests additionally cover cancelled concurrent callers, handler-before-clear ordering,
+stream cutoff before drain, terminal-state cleanup, physical client stop and controller release.
+Final validation: `e12119cf-f382-4662-917f-a51357da39c7` passed **70 executed, four skipped,
+zero failures**, including all 36 LiveDiscovery cases. Broad
+`c79a0de3-86cc-4068-9ad3-621bbe9fafec` passed **2,145 executed, 22 skipped, zero failures**
+(2,134 app, seven domain, four provider), including all SessionLinks and the admission/sidebar/
+lane-policy families. Isolated handoff `3f728727-9045-40ec-8c56-1d33e557d5e7` passed **104**;
+both products `86e50746-bb5b-45e5-ac4d-fa0b8c6351a6` passed. Full lint
+`0e44824c-5641-4034-8d72-108bc84f6973` passed; the subsequent nonthrowing-lock-helper compile
+repair was scoped-formatted and strict-linted before the final passing runs. The intermediate
+`05441d1c-9771-4835-8940-47d180123082` was a compile failure, not a test pass.
+
+Fresh post-build index: **1,244/1,360 wrong-way edges, 53/66 largest-cycle components**; baseline
+unchanged. The new review runtime retains app-local edges to the existing review DTO/operation
+helpers in `AgentModeViewModel+WorktreeMerge` and to `AgentTabSession`; no target-move closure is
+claimed. Actual final compilation across 11 touched Swift files matches retained base warning
+occurrences: **four VM, three native-controller, two native-interrupt-test**, zero in the other
+eight files. No positive occurrence deltas. No permanent trace, sanitizer run, live-app smoke,
+full-suite or hosted-CI qualification is claimed. The repaired join/drain contract and passing
+broad rerun release this checkpoint's local push hold; M9.2b's remaining inventory stays open.
