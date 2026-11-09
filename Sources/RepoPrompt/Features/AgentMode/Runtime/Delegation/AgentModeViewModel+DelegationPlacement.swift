@@ -136,7 +136,7 @@ extension AgentSessionRuntimeStore.Command {
             }
             try requireCurrentPlacement()
             if case let .failure(failure) = await writer.scope.persistence.flushSaveRequired(
-                for: session.tabID, workspaceID: writer.identity.workspaceID
+                writer: writer
             ) {
                 throw DelegationPlacementPersistenceError.saveFailed(failure.message)
             }
