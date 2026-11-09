@@ -2,6 +2,16 @@ import Foundation
 import RepoPromptDomainRuntime
 import XCTest
 
+extension CodexServerRequestReceipt {
+    static func fixture(_ requestID: CodexAppServerRequestID, generation: UInt64 = 1, clientID: UUID? = nil) -> Self {
+        .init(
+            clientInstanceID: clientID ?? UUID(uuidString: "F05339D5-F0BA-4C36-943C-028A4FBE89BA")!,
+            transportGeneration: generation,
+            requestID: requestID
+        )
+    }
+}
+
 final class CodexControllerValueCompatibilityTests: XCTestCase {
     func testLegacyUsageDecodesWithoutPendingCompactionKey() throws {
         let usage = try JSONDecoder().decode(
@@ -37,20 +47,35 @@ final class CodexControllerValueCompatibilityTests: XCTestCase {
             options: [AgentRequestUserInputOption(label: "Allow", description: "Once")]
         )
         let input = AgentRequestUserInputRequest(
-            requestID: .int(42), method: "item/tool/requestUserInput", threadID: "thread", turnID: "turn", itemID: "item",
+            receipt: .fixture(.int(42)), method: "item/tool/requestUserInput", threadID: "thread", turnID: "turn", itemID: "item",
             askedAt: askedAt, questions: [question]
         )
         let elicitation = AgentMCPElicitationRequest(
-            requestID: .int(42), method: "mcpServer/elicitation/request", threadID: "thread", turnID: "turn", itemID: "item",
+            receipt: .fixture(.int(42)), method: "mcpServer/elicitation/request", threadID: "thread", turnID: "turn", itemID: "item",
             rawParamsJSON: #"{"message":"Choose"}"#
         )
         let permissions = AgentPermissionsRequest(
-            requestID: .int(42), method: "item/permissions/requestApproval", threadID: "thread", turnID: "turn", itemID: "item",
+            receipt: .fixture(.int(42)), method: "item/permissions/requestApproval", threadID: "thread", turnID: "turn", itemID: "item",
             cwd: "/workspace", permissionsJSON: #"{"network":true}"#
         )
-        XCTAssertEqual(input.id.uuidString, "C18761C1-C079-F23C-0041-0F7A2834DB52")
-        XCTAssertEqual(elicitation.id.uuidString, "39BB7521-9C1B-5AB2-87C5-FCBDA6FD9D6A")
-        XCTAssertEqual(permissions.id.uuidString, "EAFECB52-BC76-8DC7-6631-BA4D6501EC86")
+        XCTAssertEqual(input.id.uuidString, "7240C9EE-1EF9-4C1C-76F7-FFF7176BC033")
+        XCTAssertEqual(elicitation.id.uuidString, "E4ECB518-A550-31FA-3E93-95E1D200AFE1")
+        XCTAssertEqual(permissions.id.uuidString, "4DF0079C-44ED-1BB8-622E-13C32F8188A2")
+        let original = CodexServerRequestReceipt.fixture(.int(42))
+        func identities(_ receipt: CodexServerRequestReceipt) -> [UUID] {
+            [
+                AgentRequestUserInputRequest.stableID(receipt: receipt, method: input.method, threadID: "thread", turnID: "turn", itemID: "item"),
+                AgentMCPElicitationRequest.stableID(receipt: receipt, method: elicitation.method, threadID: "thread", turnID: "turn", itemID: "item"),
+                AgentPermissionsRequest.stableID(receipt: receipt, method: permissions.method, threadID: "thread", turnID: "turn", itemID: "item"),
+                AgentApprovalRequest.stableID(requestID: .codex(receipt), method: "approve", kind: .commandExecution, threadID: "thread", turnID: "turn", itemID: "item")
+            ]
+        }
+        XCTAssertEqual(identities(original), identities(.fixture(.int(42))), "Duplicate ingress retains identity")
+        for changed in [CodexServerRequestReceipt.fixture(.int(42), generation: 2), .fixture(.int(42), clientID: UUID()), .fixture(.string("42"))] {
+            for (before, after) in zip(identities(original), identities(changed)) {
+                XCTAssertNotEqual(before, after, "Raw request reuse cannot preserve UI identity across origins or ID kinds")
+            }
+        }
         XCTAssertEqual(input.askedAt, askedAt)
         XCTAssertEqual(input.questions, [question])
         XCTAssertFalse(input.repoPromptAutoApprovalVerified)
@@ -60,16 +85,16 @@ final class CodexControllerValueCompatibilityTests: XCTestCase {
 
         let explicitID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000001"))
         XCTAssertEqual(AgentRequestUserInputRequest(
-            id: explicitID, requestID: .string("42"), method: input.method,
+            id: explicitID, receipt: .fixture(.string("42")), method: input.method,
             threadID: "thread", turnID: "turn", itemID: "item", questions: [],
             repoPromptAutoApprovalVerified: true, computerUseCompanionVerified: true
         ).id, explicitID)
         XCTAssertEqual(AgentMCPElicitationRequest(
-            id: explicitID, requestID: .string("42"), method: elicitation.method,
+            id: explicitID, receipt: .fixture(.string("42")), method: elicitation.method,
             threadID: "thread", turnID: "turn", itemID: "item", rawParamsJSON: "{}"
         ).id, explicitID)
         XCTAssertEqual(AgentPermissionsRequest(
-            id: explicitID, requestID: .string("42"), method: permissions.method,
+            id: explicitID, receipt: .fixture(.string("42")), method: permissions.method,
             threadID: "thread", turnID: "turn", itemID: "item", cwd: "/workspace", permissionsJSON: "{}"
         ).id, explicitID)
     }

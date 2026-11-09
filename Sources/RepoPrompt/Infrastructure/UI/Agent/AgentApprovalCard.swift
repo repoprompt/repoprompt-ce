@@ -135,7 +135,7 @@ struct AgentPermissionsApprovalCard: View {
         AgentApprovalCard(
             request: AgentApprovalRequest(
                 id: request.id,
-                requestID: .codex(request.requestID),
+                requestID: .codex(request.receipt),
                 method: request.method,
                 kind: .fileChange,
                 threadID: request.threadID,
@@ -250,7 +250,7 @@ struct AgentMCPElicitationCard: View {
         static var previews: some View {
             AgentApprovalCard(
                 request: AgentApprovalRequest(
-                    requestID: .codex(.int(1)),
+                    requestID: .codex(.init(clientInstanceID: UUID(), transportGeneration: 0, requestID: .int(1))),
                     method: "item/commandExecution/requestApproval",
                     kind: .commandExecution,
                     threadID: "thread-1",

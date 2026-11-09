@@ -78,7 +78,7 @@ struct AgentRunInteractionUISnapshot: Equatable {
             expectedRunID: activeRunID,
             expectedActiveAgentSessionID: activeAgentSessionID,
             expectedRunAttemptID: activeRunAttemptID,
-            expectedPendingUserInputRequestID: pendingUserInputRequest.requestID
+            expectedPendingUserInputReceipt: pendingUserInputRequest.receipt
         )
     }
 

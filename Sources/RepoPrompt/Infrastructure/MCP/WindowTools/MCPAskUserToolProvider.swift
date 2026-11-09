@@ -233,19 +233,8 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
                     surface: .agentQuestion
                 )
             }
-            let requestID = DomainInteractionPresentationContext.requestID
-            let requireTargetWindow = dependencies.requireTargetWindow
-            response = try await withPresentationRegistration(
-                requestID: requestID,
-                cancellation: {
-                    await MainActor.run {
-                        guard let window = try? requireTargetWindow() else { return }
-                        window.agentModeViewModel.cancelAskUserInteraction(
-                            tabID: tabID,
-                            interactionID: parsed.interaction.id
-                        )
-                    }
-                }
+            response = try await withAgentQuestionPresentation(
+                requestID: DomainInteractionPresentationContext.requestID
             ) {
                 try await targetWindow.agentModeViewModel.askUserInteraction(
                     target: target,
@@ -285,6 +274,48 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
             return targetWindow.contextBuilderAgentViewModel.questionTimeoutSeconds
         case .unknown:
             throw MCPError.invalidParams("ask_user is only available during Context Builder or agent mode runs")
+        }
+    }
+
+    /// Own the exact Agent question invocation, including its preparation awaits. Cancellation
+    /// joins that invocation; it never resolves today's window/tab or a reused interaction ID.
+    /// The start gate prevents publication before the external coordinator accepts registration.
+    static func withAgentQuestionPresentation(
+        requestID: UUID?,
+        coordinator: MCPAskUserPresentationCoordinator = .shared,
+        operation: @escaping @MainActor () async throws -> AgentAskUserResponse
+    ) async throws -> AgentAskUserResponse {
+        guard let requestID else { return try await operation() }
+        let gate = AsyncStream<Void>.makeStream()
+        let question = Task { @MainActor in
+            for await _ in gate.stream {
+                break
+            }
+            try Task.checkCancellation()
+            return try await operation()
+        }
+        defer { gate.continuation.finish() }
+        return try await withTaskCancellationHandler {
+            guard await coordinator.register(requestID: requestID, cancellation: {
+                question.cancel()
+                _ = await question.result
+            }) else {
+                question.cancel()
+                _ = await question.result
+                throw CancellationError()
+            }
+            gate.continuation.yield(())
+            do {
+                let response = try await question.value
+                await coordinator.unregister(requestID: requestID)
+                return response
+            } catch {
+                await coordinator.unregister(requestID: requestID)
+                throw error
+            }
+        } onCancel: {
+            question.cancel()
+            Task { await coordinator.cancel(requestID: requestID) }
         }
     }
 

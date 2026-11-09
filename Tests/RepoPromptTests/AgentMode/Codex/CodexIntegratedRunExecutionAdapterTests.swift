@@ -1,4 +1,5 @@
 import Foundation
+import os
 @testable import RepoPromptApp
 import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
@@ -9,6 +10,73 @@ import XCTest
 
 @MainActor
 final class CodexIntegratedRunExecutionAdapterTests: XCTestCase {
+    func testDeferredAuthRefreshAndErrorRepliesKeepIngressTransport() async throws {
+        let frames = OSAllocatedUnfairLock(initialState: [Data]())
+        let client = CodexAppServerClient(writeFrameHandler: { _, frame in frames.withLock { $0.append(frame) } })
+        await client.debugInstallTestTransport()
+        let generation = await client.debugTransportGeneration()
+        var requests = await client.subscribeServerRequests().makeAsyncIterator()
+        let incoming = Data("{\"id\":99,\"method\":\"account/chatgptAuthTokens/refresh\",\"params\":{}}\n".utf8)
+        await client.debugIngestStdoutChunk(incoming, generation: generation)
+        let originValue = await requests.next()
+        let origin = try XCTUnwrap(originValue).receipt
+        let entered = expectation(description: "refresh suspended")
+        let release = AsyncStream<Void>.makeStream()
+        var options = CodexNativeSessionController.Options.agentModeDefault()
+        options.authTokensRefreshHandler = { _ in
+            entered.fulfill()
+            for await _ in release.stream {
+                break
+            }
+            return .init(accessToken: "fixture-refreshed-token", chatgptAccountID: "fixture-account", chatgptPlanType: "fixture-plan")
+        }
+        let controller = CodexNativeSessionController(client: client, runID: UUID(), tabID: UUID(), windowID: -1, workspacePaths: .uniform(nil), options: options)
+        let reply = Task {
+            await controller.test_handleServerRequest(receipt: origin, method: "account/chatgptAuthTokens/refresh", params: ["reason": .string("unauthorized")])
+        }
+        await fulfillment(of: [entered], timeout: 3)
+        await client.stop()
+        await client.debugInstallTestTransport()
+        let successorGeneration = await client.debugTransportGeneration()
+        XCTAssertNotEqual(generation, successorGeneration)
+        release.continuation.yield(())
+        await reply.value
+        release.continuation.finish()
+        XCTAssertEqual(frames.withLock { $0.count }, 0, "Suspended auth may not send credentials to a replacement transport")
+        await controller.test_handleServerRequest(receipt: origin, method: "unknown-fixture-method", params: [:])
+        XCTAssertEqual(frames.withLock { $0.count }, 0, "Error replies use the same physical origin fence")
+
+        var successors = await client.subscribeServerRequests().makeAsyncIterator()
+        await client.debugIngestStdoutChunk(incoming, generation: successorGeneration)
+        let successorValue = await successors.next()
+        let successor = try XCTUnwrap(successorValue).receipt
+        await controller.test_handleServerRequest(receipt: successor, method: "unknown-fixture-method", params: [:])
+        XCTAssertEqual(frames.withLock { $0.count }, 1)
+        controller.test_installThreadState(threadID: "replacement-thread", authoritativeTurnID: "reused-turn", routingTurnID: "reused-turn")
+        do {
+            _ = try await controller.interruptUserTurn(expectedThreadID: "original-thread", expectedTurnID: "reused-turn", answering: successor)
+            XCTFail("A matching turn ID cannot redirect a reply's follow-up to another thread")
+        } catch let error as CodexAppServerClient.ClientError {
+            guard case .invalidResponse = error else { return XCTFail("Unexpected thread refusal: \(error)") }
+        } catch { XCTFail("Unexpected thread refusal: \(error)") }
+        XCTAssertEqual(frames.withLock { $0.count }, 1)
+        await controller.shutdown()
+        var liveness = 0
+        var failures = 0
+        var issues = 0
+        for await event in controller.events {
+            switch event {
+            case .livenessActivity: liveness += 1
+            case .error: failures += 1
+            case .serverRequestIssue: issues += 1
+            default: break
+            }
+        }
+        XCTAssertEqual(liveness, 1, "Preserve the existing auth interaction liveness position")
+        XCTAssertEqual(failures, 0, "Stale-origin refusals must not terminalize the successor run")
+        XCTAssertEqual(issues, 1, "Only the current error reply emits its settled issue")
+    }
+
     func testAcceptedDispatchOutcomesPreserveNativeResultAndClassifyAsTransientCompletion() async {
         let queueID = UUID()
         let outcomes: [CodexAgentModeCoordinator.NativeSendOutcome] = [
@@ -287,14 +355,14 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
             _ = try await controller.test_computerUseApprovalPolicy()
             armed = false
             var events = controller.events.makeAsyncIterator()
-            await controller.test_handleServerRequest(method: "mcpServer/elicitation/request", params: ["serverName": .string(server), "threadId": .string("thread"), "turnId": .string("turn"), "message": .string("Allow computer interaction?"), "requestedSchema": .object(["type": .string("object"), "properties": .object([:])])])
+            await controller.test_handleServerRequest(receipt: .fixture(.int(42)), method: "mcpServer/elicitation/request", params: ["serverName": .string(server), "threadId": .string("thread"), "turnId": .string("turn"), "message": .string("Allow computer interaction?"), "requestedSchema": .object(["type": .string("object"), "properties": .object([:])])])
             guard case let .mcpElicitationRequest(request) = await events.next() else {
                 XCTFail("Expected a surfaced elicitation, not an automatic response")
                 await controller.shutdown()
                 continue
             }
             XCTAssertEqual(request.serverName, server)
-            XCTAssertEqual(request.requestID, .int(42))
+            XCTAssertEqual(request.receipt.requestID, .int(42))
             await controller.shutdown()
         }
     }
@@ -359,12 +427,12 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
             if revoked { controller.revokeComputerUseAutoApproval() }
             var params: [String: CodexJSONValue] = ["toolName": .string(tool), "threadId": .string("thread"), "turnId": .string("turn"), "message": .string("Approve app tool call?"), "requestedSchema": .object(["type": .string("object"), "properties": .object([:])])]
             if let server { params["serverName"] = .string(server) }
-            await controller.test_handleServerRequest(method: "mcpServer/elicitation/request", params: params)
+            await controller.test_handleServerRequest(receipt: .fixture(.int(42), generation: client.debugTransportGeneration(), clientID: client.instanceID), method: "mcpServer/elicitation/request", params: params)
             var permissionParams = params
             permissionParams["itemId"] = .string("permission")
             permissionParams["cwd"] = .string(root.path)
             permissionParams["permissions"] = .object(["network": .object(["enabled": .bool(true)])])
-            await controller.test_handleServerRequest(method: "item/permissions/requestApproval", params: permissionParams)
+            await controller.test_handleServerRequest(receipt: .fixture(.int(43), generation: client.debugTransportGeneration(), clientID: client.instanceID), method: "item/permissions/requestApproval", params: permissionParams)
             let hostTypedAutoApproved = server == "RepoPromptCE" && autoApproved
             XCTAssertEqual(recorder.permissionScopes, autoApproved && !hostTypedAutoApproved ? ["turn"] : [], "Typed companion grants must follow the same policy without remembered consent")
             await controller.shutdown()
@@ -542,7 +610,7 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
         _ = try await controller.test_computerUseApprovalPolicy()
         armed = false
         var events = controller.events.makeAsyncIterator()
-        await controller.test_handleServerRequest(method: "item/permissions/requestApproval", params: ["threadId": .string("thread"), "turnId": .string("turn"), "itemId": .string("permission-item"), "cwd": .string("/tmp"), "reason": .string("Allow computer interaction?"), "permissions": .object(["network": .object(["enabled": .bool(true)])])])
+        await controller.test_handleServerRequest(receipt: .fixture(.int(42)), method: "item/permissions/requestApproval", params: ["threadId": .string("thread"), "turnId": .string("turn"), "itemId": .string("permission-item"), "cwd": .string("/tmp"), "reason": .string("Allow computer interaction?"), "permissions": .object(["network": .object(["enabled": .bool(true)])])])
         guard case let .permissionsRequest(request) = await events.next() else {
             XCTFail("Permission requests must reach the one-shot user UI")
             await controller.shutdown()
@@ -554,7 +622,18 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
         session.codexControllerFeatureState = .init(computerUseEnabled: true, goalSupportEnabled: false, reasoningSummariesEnabled: false, memoriesEnabled: false, capabilities: .disabled)
         session.pendingPermissionsRequest = request
         let coordinator = makeCoordinator()
-        coordinator.submitPermissionsDecision(session: session, request: request, decision: .acceptForSession)
+        let writers = AgentSessionRuntimeStore()
+        let scope = writers.makeScope()
+        let sessionID = UUID()
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: UUID()))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        scope.replaceSessions([session.tabID: session])
+        guard case let .unique(writer) = scope.resolveWriter(sessionID: sessionID) else {
+            return XCTFail("Expected exact permissions writer")
+        }
+        let command = try writer.admitCommand().get()
+        let interactions = scope.interactions(routeID: 1, approvalStore: ApplyEditsApprovalStore())
+        XCTAssertFalse(interactions.submitPermissionsDecision(command: command, requestID: request.id, decision: .acceptForSession))
         XCTAssertEqual(session.pendingPermissionsRequest?.id, request.id, "Remembered approval must not be submitted")
         await coordinator.revokeCodexComputerUse(session: session, reason: "user-off")
         XCTAssertNil(session.pendingPermissionsRequest)
@@ -831,7 +910,8 @@ private final class MCPApprovalWireRecorder: @unchecked Sendable {
 
     func record(_ frame: Data) {
         guard let packet = try? JSONSerialization.jsonObject(with: frame) as? [String: Any],
-              packet["id"] as? Int == 42,
+              let requestID = packet["id"] as? Int,
+              [42, 43].contains(requestID),
               let result = packet["result"] as? [String: Any] else { return }
         lock.withLock {
             if let action = result["action"] as? String { recordedActions.append(action) }

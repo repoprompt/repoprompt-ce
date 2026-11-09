@@ -127,36 +127,34 @@ extension AgentSessionMCPRuntime {
         // Publication transfers ownership from the app-owned admission to this exact control context.
         activationOwnership = .installed(context: activatedContext, generation: activationGeneration)
         func releaseFailedInstalledActivation() async {
-            // An unchanged activation ID/generation/context is this attempt's provisional
-            // write even if its writer claim was lost. Remove that receipt, not successor work.
-            guard writer.scope.sessions[tabID] === session,
-                  session.currentRestorationBindingToken == activationBindingToken,
-                  session.mcpControlActivationGeneration == activationGeneration,
-                  session.mcpControlContext == activatedContext
-            else {
-                let current = writer.scope.sessions[tabID]
-                if let current, current.mcpControlContext?.registration == registration,
-                   current !== session || current.mcpControlActivationGeneration != activationGeneration
-                   || current.mcpControlContext != activatedContext
-                {
-                    // A successor still owns this registration, including a new epoch on the same activation.
-                    return
+            // The exact provisional write belongs to this object even after removal or
+            // claim loss. A copied context in its former tab slot is not a successor.
+            if session.mcpControlActivationGeneration == activationGeneration,
+               session.mcpControlContext == activatedContext
+            {
+                session.mcpControlActivationGeneration &+= 1
+                session.mcpControlContext = nil
+                if session.mcpFollowUpRunPending == startPending { session.mcpFollowUpRunPending = false }
+                // Rebinding may have hydrated new payload values. Unwind the old receipt,
+                // but never restore the predecessor's settings over that new binding.
+                if session.currentRestorationBindingToken == activationBindingToken {
+                    if didMarkMCPOriginated, session.isMCPOriginated { session.isMCPOriginated = priorMCPOriginated }
+                    if let installedPermissionProfile, session.permissionProfile == installedPermissionProfile {
+                        session.permissionProfile = priorPermissionProfile
+                    }
+                    if didOverrideAutoEdit, session.autoEditEnabled { session.autoEditEnabled = priorAutoEditEnabled }
                 }
-                // A removed or rebound original without a successor must not leak its registration.
-                await resources.approvalStore.releaseAutoEditOverride(autoEditOverride)
-                await AgentRunSessionStore.cleanup(registration: registration)
+                if writer.scope.sessions[tabID] === session {
+                    writer.scope.presentation.mcpControlChanged(session, controlled: false)
+                }
+            } else if session.mcpControlActivationGeneration == activationGeneration,
+                      session.mcpControlContext?.activationID == activatedContext.activationID
+            {
+                // This installation progressed (possibly recovering a new registration).
+                // Its live context, not the failed setup, still owns the shared override.
                 return
             }
-            session.mcpControlActivationGeneration &+= 1
-            session.mcpControlContext = nil
-            if session.mcpFollowUpRunPending == startPending { session.mcpFollowUpRunPending = false }
-            if didMarkMCPOriginated, session.isMCPOriginated { session.isMCPOriginated = priorMCPOriginated }
-            if let installedPermissionProfile, session.permissionProfile == installedPermissionProfile {
-                session.permissionProfile = priorPermissionProfile
-            }
-            let restoreAutoEdit = didOverrideAutoEdit && session.autoEditEnabled
-            if restoreAutoEdit { session.autoEditEnabled = priorAutoEditEnabled }
-            writer.scope.presentation.mcpControlChanged(session, controlled: false)
+            guard !writer.scope.hasOtherControlResourceHolder(activatedContext, excluding: session) else { return }
             await resources.approvalStore.releaseAutoEditOverride(autoEditOverride)
             await AgentRunSessionStore.cleanup(registration: registration)
         }

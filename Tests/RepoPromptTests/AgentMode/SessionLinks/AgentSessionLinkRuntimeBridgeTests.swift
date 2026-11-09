@@ -885,8 +885,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
         func shutdown() async {}
 
-        func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async {
-            recorder.record("\(id.displayValue):\(result["decision"] as? String ?? "unknown")")
+        func respondToServerRequest(receipt: CodexServerRequestReceipt, result: [String: Any]) async -> CodexServerResponseDelivery {
+            recorder.record("\(receipt.requestID.displayValue):\(result["decision"] as? String ?? "unknown")")
+            return .written
         }
     }
 
@@ -1136,7 +1137,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let reference = DomainAgentSessionLinkReference(linkID: item.linkID, generation: item.generation)
         let targetEndpoint = target.domainEndpoint
         let permission = AgentApprovalRequest(
-            requestID: .codex(.int(102)),
+            requestID: .codex(.fixture(.int(102))),
             method: "item/commandExecution/requestApproval",
             kind: .commandExecution,
             threadID: "thread",
@@ -1324,7 +1325,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
         // A new managed link may address a prompt that was already waiting.
         let approval = AgentApprovalRequest(
-            requestID: .codex(.int(201)),
+            requestID: .codex(.fixture(.int(201))),
             method: "item/commandExecution/requestApproval",
             kind: .commandExecution,
             threadID: "thread",
@@ -1386,7 +1387,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
         // Revocation at the final fence leaves this later prompt for the target's user.
         let later = AgentApprovalRequest(
-            requestID: .codex(.int(202)),
+            requestID: .codex(.fixture(.int(202))),
             method: "item/commandExecution/requestApproval",
             kind: .commandExecution,
             threadID: "thread",
@@ -1567,11 +1568,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
                 allowsCustom: false
             )]
         )
+        let command = try XCTUnwrap(viewModel.runtimeCommand(sessionID: sessionID))
         let answered = Task { @MainActor in
-            try await withCheckedThrowingContinuation { continuation in
-                session.askUserContinuation = continuation
-                session.pendingAskUser = AgentAskUserPendingState(interaction: interaction)
-            }
+            try await viewModel.interactionRuntime.askUser(command: command, interaction: interaction)
         }
         try await AsyncTestWait.waitUntil("the question to be pending") {
             await MainActor.run { session.askUserContinuation != nil }

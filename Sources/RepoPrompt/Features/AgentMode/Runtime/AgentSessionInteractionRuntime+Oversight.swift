@@ -31,13 +31,17 @@ extension AgentSessionInteractionRuntime {
         request: AgentSessionLinkInteractionResponseRequest,
         authorize: @escaping @MainActor @Sendable () async -> Bool
     ) async -> AgentSessionLinkInteractionResponseOutcome {
-        guard let owner = scope, owns(session), endpointIsCurrent() else { return .unavailable }
+        guard let owner = scope, owns(session), endpointIsCurrent(),
+              let sessionID = session.activeAgentSessionID,
+              case let .unique(writer) = owner.resolveWriter(sessionID: sessionID),
+              writer.scope === owner, writer.session === session,
+              case let .success(command) = writer.admitCommand() else { return .unavailable }
         defer { withExtendedLifetime(owner) {} }
         let binding = session.persistentSessionBindingIdentity
         let transition = session.bindingTransitionGeneration
         let isCurrent: @MainActor () -> Bool = { [weak self, weak session] in
             guard let self, let session else { return false }
-            return owns(session) && session.persistentSessionBindingIdentity == binding
+            return command.isCurrent && owns(session) && session.persistentSessionBindingIdentity == binding
                 && session.bindingTransitionGeneration == transition && endpointIsCurrent()
         }
         guard let interaction = scope?.mcp.mcpPendingInteraction(for: session) else { return .noPendingInteraction }
@@ -118,7 +122,7 @@ extension AgentSessionInteractionRuntime {
                   AgentSessionLinkReadOnlyApprovalPolicy.allows(approval) else { return .unavailable }
         }
         do {
-            try applyPendingInteractionResolution(resolution, to: session)
+            try applyPendingInteractionResolution(resolution, command: command)
         } catch let error as MCPError {
             return .invalid(Self.overseerMessage(for: error))
         } catch {

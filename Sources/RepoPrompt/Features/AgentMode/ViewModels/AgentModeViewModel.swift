@@ -2176,6 +2176,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     guard let self, sessions[session.tabID] === session else { return }
                     updateBindingsFromSession(session)
                 },
+                interaction: { [weak self] session in
+                    guard let self, sessions[session.tabID] === session, currentTabID == session.tabID else { return }
+                    syncRunInteractionUIState()
+                },
                 elapsedTime: { [weak self] session in
                     guard let self, sessions[session.tabID] === session else { return }
                     publishActiveAgentRunStartedAt(for: session.tabID, session: session)
@@ -3339,7 +3343,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     var interactionRuntime: AgentSessionInteractionRuntime {
         let runtime = runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore)
         runtime.observer = codexCoordinator
-        runtime.installProviderCommands(codex: codexCoordinator, claude: claudeCoordinator)
+        runtime.installClaudeCancellationCommands(claudeCoordinator)
         _ = persistenceRuntime
         return runtime
     }
@@ -7716,7 +7720,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.pendingPermissionsRequest = nil
         session.pendingMCPElicitationRequest = nil
         session.pendingApplyEditsReview = nil
-        cancelPendingWorktreeMergeReview(for: session, reason: "Session reset")
+        interactionRuntime.cancelPendingWorktreeMergeReview(for: session, reason: "Session reset")
         session.queuedUserInputRequests.removeAll()
         session.queuedMCPElicitationRequests.removeAll()
         session.pendingInstructions.removeAll()
@@ -11920,7 +11924,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         payload: MCPInteractionResponsePayload,
         workflow: AgentWorkflowDefinition? = nil
     ) async throws -> MCPInstructionDispatch? {
-        guard let session = mcpControlledSession(sessionID: sessionID) else {
+        guard let session = mcpControlledSession(sessionID: sessionID),
+              let command = try runtimeCommand(sessionID: sessionID), command.writer.session === session
+        else {
             throw MCPError.invalidParams("The requested agent run is no longer active.")
         }
 
@@ -11957,7 +11963,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 interactionID: interactionID,
                 payload: payload
             )
-            try applyPendingInteractionResolution(resolution, to: session)
+            try interactionRuntime.applyPendingInteractionResolution(resolution, command: command)
             handleObservedMCPStateChange(for: session)
             return nil
         case .hookApproval:
@@ -12061,10 +12067,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         interactionID: UUID, payload: MCPInteractionResponsePayload
     ) throws -> PendingInteractionResolution {
         try interactionRuntime.mcpPendingInteractionResolution(for: session, kind: kind, interactionID: interactionID, payload: payload)
-    }
-
-    func applyPendingInteractionResolution(_ resolution: PendingInteractionResolution, to session: TabSession) throws {
-        try interactionRuntime.applyPendingInteractionResolution(resolution, to: session)
     }
 
     // MARK: - End MCP Control Plane
@@ -18317,14 +18319,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     func makeRunCancelTarget(
         tabID: UUID,
         session: TabSession,
-        expectedPendingUserInputRequestID: CodexAppServerRequestID? = nil
+        expectedPendingUserInputReceipt: CodexServerRequestReceipt? = nil
     ) -> AgentRunCancelTarget {
         AgentRunCancelTarget(
             tabID: tabID,
             expectedRunID: session.runID,
             expectedActiveAgentSessionID: session.activeAgentSessionID,
             expectedRunAttemptID: session.activeRunAttemptID,
-            expectedPendingUserInputRequestID: expectedPendingUserInputRequestID
+            expectedPendingUserInputReceipt: expectedPendingUserInputReceipt
         )
     }
 
@@ -18414,8 +18416,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if session.activeRunAttemptID != target.expectedRunAttemptID {
             return "run_attempt_id_mismatch"
         }
-        if let expectedPendingUserInputRequestID = target.expectedPendingUserInputRequestID,
-           session.pendingUserInputRequest?.requestID != expectedPendingUserInputRequestID
+        if let expectedPendingUserInputReceipt = target.expectedPendingUserInputReceipt,
+           session.pendingUserInputRequest?.receipt != expectedPendingUserInputReceipt
         {
             return "pending_user_input_request_mismatch"
         }
@@ -18438,8 +18440,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     "liveAgentSessionID": perfRecorder.shortID(session?.activeAgentSessionID),
                     "expectedRunAttemptID": perfRecorder.shortID(target.expectedRunAttemptID),
                     "liveRunAttemptID": perfRecorder.shortID(session?.activeRunAttemptID),
-                    "expectedPendingInputRequestID": target.expectedPendingUserInputRequestID?.displayValue ?? "nil",
-                    "livePendingInputRequestID": session?.pendingUserInputRequest?.requestID.displayValue ?? "nil",
+                    "expectedPendingInputRequestID": target.expectedPendingUserInputReceipt?.requestID.displayValue ?? "nil",
+                    "livePendingInputRequestID": session?.pendingUserInputRequest?.receipt.requestID.displayValue ?? "nil",
                     "liveRunState": session?.runState.rawValue ?? "missing"
                 ]
             )
@@ -18975,7 +18977,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func canPresentAskUserInteraction(tabID: UUID) -> Bool {
-        sessions[tabID] != nil
+        guard let session = sessions[tabID], let sessionID = session.activeAgentSessionID,
+              let writer = try? runtimeWriter(sessionID: sessionID) else { return false }
+        // Loading may still be needed; availability requires a stable owner, not completed hydration.
+        return writer.scope === runtimeSessionStore && writer.session === session && !runtimeSessionStore.isRetiring
     }
 
     func askUserInteraction(
@@ -19001,9 +19006,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         interaction: AgentAskUserInteraction,
         lifecycleTarget: AgentSessionLifecycleAuthority.MutationTarget? = nil
     ) async throws -> AgentAskUserResponse {
+        try Task.checkCancellation()
         let original = session(for: tabID)
+        guard let sessionID = original.activeAgentSessionID,
+              let writer = try? runtimeWriter(sessionID: sessionID),
+              writer.scope === runtimeSessionStore, writer.session === original
+        else {
+            throw MCPError.invalidParams("The Agent session is unavailable for its question.")
+        }
         let bindingToken = original.currentRestorationBindingToken
         let session = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true)
+        try Task.checkCancellation()
         guard sessions[tabID] === original, session === original,
               session.currentRestorationBindingToken == bindingToken
         else {
@@ -19015,82 +19028,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if let lifecycleTarget {
             _ = try requireCurrentAgentSessionLifecycleTarget(lifecycleTarget, intent: .askUser)
         }
-        return try await interactionRuntime.askUser(session: session, interaction: interaction)
-    }
-
-    func updateAskUserDraft(tabID: UUID, interactionID: UUID, questionID: String, draft: AgentAskUserDraft) {
-        guard let session = sessions[tabID] else { return }
-        interactionRuntime.updateAskUserDraft(session: session, interactionID: interactionID, questionID: questionID, draft: draft)
-    }
-
-    func updateAskUserQuestionIndex(tabID: UUID, interactionID: UUID, index: Int) {
-        guard let session = sessions[tabID] else { return }
-        interactionRuntime.updateAskUserQuestionIndex(session: session, interactionID: interactionID, index: index)
-    }
-
-    /// Card activity changes the existing runtime timeout, not presentation ownership.
-    func noteAskUserCardActivity(tabID: UUID, interactionID: UUID) {
-        guard let session = sessions[tabID],
-              interactionRuntime.noteAskUserCardActivity(session: session, interactionID: interactionID) else { return }
-        if tabID == currentTabID { syncRunInteractionUIState() }
-    }
-
-    @discardableResult
-    func cancelAskUserInteraction(tabID: UUID, interactionID: UUID) -> Bool {
-        guard let session = sessions[tabID] else { return false }
-        return interactionRuntime.cancelAskUserInteraction(session: session, interactionID: interactionID)
-    }
-
-    func submitAskUserResponse(tabID: UUID, interactionID: UUID) {
-        guard let session = sessions[tabID], session.pendingAskUser?.interaction.id == interactionID else { return }
-        do {
-            try resolveAskUserResponse(for: session, interactionID: interactionID, skipAll: false)
-        } catch {
-            return
+        guard case let .success(command) = writer.admitCommand() else {
+            throw MCPError.invalidParams("The Agent session changed while preparing its question.")
         }
-    }
-
-    func submitAskUserResponse(tabID: UUID, interactionID: UUID, draftsByQuestionID: [String: AgentAskUserDraft]) throws {
-        guard let session = sessions[tabID] else { return }
-        try interactionRuntime.submitAskUserResponse(session: session, interactionID: interactionID, draftsByQuestionID: draftsByQuestionID)
-    }
-
-    func skipAskUser(tabID: UUID, interactionID: UUID) {
-        guard let session = sessions[tabID], session.pendingAskUser?.interaction.id == interactionID else { return }
-        try? resolveAskUserResponse(for: session, interactionID: interactionID, skipAll: true)
-    }
-
-    private func resolveAskUserResponse(for session: TabSession, interactionID: UUID, skipAll: Bool) throws {
-        try interactionRuntime.resolveAskUserResponse(for: session, interactionID: interactionID, skipAll: skipAll)
-    }
-
-    /// Legacy single-question UI shim retained for tests and old call sites during migration.
-    func noteQuestionCardActivity(tabID: UUID, questionID: UUID) {
-        noteAskUserCardActivity(tabID: tabID, interactionID: questionID)
-    }
-
-    /// Legacy single-question UI shim retained for tests and old call sites during migration.
-    func submitQuestionResponse(tabID: UUID, interactionID: UUID, response: String) {
-        guard let session = sessions[tabID],
-              let pending = session.pendingAskUser,
-              pending.interaction.id == interactionID,
-              let question = pending.interaction.questions.first
-        else { return }
-        var draft = AgentAskUserDraft(customResponse: response)
-        if let matchedOption = question.optionLabels.first(where: { $0 == response }) {
-            draft = AgentAskUserDraft(selectedOptionLabels: [matchedOption])
-        }
-        try? submitAskUserResponse(tabID: tabID, interactionID: interactionID, draftsByQuestionID: [question.id: draft])
-    }
-
-    /// Legacy single-question UI shim retained for tests and old call sites during migration.
-    func skipQuestion(tabID: UUID, interactionID: UUID) {
-        skipAskUser(tabID: tabID, interactionID: interactionID)
-    }
-
-    func submitUserInputResponse(tabID: UUID, requestID: CodexAppServerRequestID, response: AgentRequestUserInputResponse) {
-        guard let session = sessions[tabID] else { return }
-        interactionRuntime.submitUserInputResponse(session: session, requestID: requestID, response: response)
+        return try await interactionRuntime.askUser(command: command, interaction: interaction)
     }
 
     /// Forced provider switch declines every pending interaction exactly once through the same
@@ -19106,7 +19047,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         cancelPendingQuestion(for: session)
         cancelPendingApproval(for: session)
         cancelPendingApplyEditsReview(for: session, reason: "Provider switch")
-        cancelPendingWorktreeMergeReview(for: session, reason: "Provider switch")
+        interactionRuntime.cancelPendingWorktreeMergeReview(for: session, reason: "Provider switch")
     }
 
     private func cancelPendingQuestion(for session: TabSession) {

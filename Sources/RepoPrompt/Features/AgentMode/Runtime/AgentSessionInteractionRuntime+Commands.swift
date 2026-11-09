@@ -82,33 +82,61 @@ enum AgentPendingInteractionResolution {
 
 @MainActor
 extension AgentSessionInteractionRuntime {
+    /// Membership for observations and composite managed-response checks, not command admission.
     func owns(_ session: AgentTabSession) -> Bool {
         scope?.sessions[session.tabID] === session && scope?.hasReleasedWriterClaims == false
     }
 
-    private func requireCodexCoordinator() throws -> CodexAgentModeCoordinator {
-        guard let codexCommands else { throw MCPError.invalidParams("The provider response route is unavailable. No response was applied.") }
-        return codexCommands
+    /// Admit from the rendered writer, then join the exact approval receipt's settlement.
+    /// The store acknowledgement is about that receipt, not today's tab occupant. No payload
+    /// or successor state is mutated after the actor hop.
+    @discardableResult
+    func submitApplyEditsReviewDecision(
+        command: AgentSessionRuntimeStore.Command,
+        reviewID: UUID,
+        decision: ApplyEditsReviewDecision
+    ) async -> Bool {
+        let session = command.writer.session
+        guard command.writer.scope === scope, command.isCurrent,
+              session.pendingApplyEditsReview?.id == reviewID else { return false }
+        let address = approvalScope(for: session)
+        var applied = false
+        let task = performEffect(for: session) { [self] in
+            #if DEBUG
+                await test_beforeApprovalDecision?()
+            #endif
+            guard command.isCurrent, session.pendingApplyEditsReview?.id == reviewID else { return }
+            applied = await approvalStore.resolveReview(scope: address, reviewID: reviewID, decision: decision)
+        }
+        await task.value
+        return applied
     }
 
     private func mcpApprovalDecisionLabels(for approval: AgentApprovalRequest, session: AgentTabSession, includeAliases: Bool) -> [String] {
         scope?.mcp.mcpApprovalDecisionLabels(for: approval, session: session, includeAliases: includeAliases) ?? []
     }
 
-    func submitAskUserResponse(session: AgentTabSession, interactionID: UUID, draftsByQuestionID: [String: AgentAskUserDraft]) throws {
-        guard owns(session), var pending = session.pendingAskUser, pending.interaction.id == interactionID else { return }
+    @discardableResult
+    func submitAskUserResponse(command: AgentSessionRuntimeStore.Command, interactionID: UUID, draftsByQuestionID: [String: AgentAskUserDraft]) throws -> Bool {
+        let session = command.writer.session
+        guard ownsQuestion(command: command, interactionID: interactionID),
+              var pending = session.pendingAskUser else { return false }
         pending.draftsByQuestionID = draftsByQuestionID
         session.pendingAskUser = pending
-        try resolveAskUserResponse(for: session, interactionID: interactionID, skipAll: false)
+        return try resolveAskUserResponse(command: command, interactionID: interactionID, skipAll: false)
     }
 
-    func skipAskUser(session: AgentTabSession, interactionID: UUID) {
-        try? resolveAskUserResponse(for: session, interactionID: interactionID, skipAll: true)
+    @discardableResult
+    func skipAskUser(command: AgentSessionRuntimeStore.Command, interactionID: UUID) -> Bool {
+        (try? resolveAskUserResponse(command: command, interactionID: interactionID, skipAll: true)) ?? false
     }
 
-    func resolveAskUserResponse(for session: AgentTabSession, interactionID: UUID, skipAll: Bool) throws {
-        guard owns(session), let pending = session.pendingAskUser,
-              pending.interaction.id == interactionID, let continuation = session.askUserContinuation else { return }
+    @discardableResult
+    func resolveAskUserResponse(command: AgentSessionRuntimeStore.Command, interactionID: UUID, skipAll: Bool) throws -> Bool {
+        let session = command.writer.session
+        guard ownsQuestion(command: command, interactionID: interactionID),
+              let wait = questionWaits[ObjectIdentifier(session)], let pending = session.pendingAskUser,
+              let continuation = session.askUserContinuation else { return false }
         let elapsedSeconds = max(0, Int(Date().timeIntervalSince(pending.interaction.askedAt)))
         let response = if skipAll {
             pending.interaction.buildSkippedResponse(elapsedSeconds: elapsedSeconds)
@@ -118,52 +146,10 @@ extension AgentSessionInteractionRuntime {
         Self.invalidatePendingAskUserTimeout(for: session)
         session.pendingAskUser = nil
         session.askUserContinuation = nil
-        Self.reconcileInteractiveRunState(session)
-        scope?.presentation.bindingChanged(session)
+        questionWaits.removeValue(forKey: ObjectIdentifier(session))
+        finishQuestionState(session: session, wait: wait)
         continuation.resume(returning: response)
-    }
-
-    func submitWorktreeMergeReviewDecision(session: AgentTabSession, reviewID: UUID, decision: WorktreeMergeReviewDecision) {
-        guard owns(session), session.pendingWorktreeMergeReview?.id == reviewID,
-              let continuation = session.worktreeMergeReviewContinuation else { return }
-        finishPendingWorktreeMergeReview(session: session)
-        continuation.resume(returning: decision)
-    }
-
-    @discardableResult
-    func submitUserInputResponse(session: AgentTabSession, requestID: CodexAppServerRequestID, response: AgentRequestUserInputResponse) -> Bool {
-        guard owns(session), let request = session.pendingUserInputRequest, request.requestID == requestID,
-              codexCommands?.submitUserInputResponse(session: session, requestID: requestID, response: response) == true else { return false }
-        session.pendingUserInputRequest = nil
-        if !session.queuedUserInputRequests.isEmpty { session.pendingUserInputRequest = session.queuedUserInputRequests.removeFirst() }
-        Self.reconcileInteractiveRunState(session)
-        publishRunInteractionStateChange(for: session, reason: .userInputResponseSubmitted)
-        scope?.presentation.bindingChanged(session)
-        scope?.presentation.makeRunHooks().requestUIRefresh(session, true)
         return true
-    }
-
-    @discardableResult
-    func submitApprovalDecision(session: AgentTabSession, requestID: UUID, decision: AgentApprovalDecision) -> Bool {
-        guard owns(session), let request = session.pendingApproval, request.id == requestID,
-              decision != .accept || request.supportsPlainApprove else { return false }
-        switch request.requestID {
-        case .codex:
-            guard let codexCommands else { return false }
-            codexCommands.submitApprovalDecision(session: session, decision: decision)
-        case .claudeControl:
-            guard let claudeCommands else { return false }
-            claudeCommands.submitApprovalDecision(session: session, decision: decision)
-        case let .acp(providerRequestID):
-            let controller = session.acpController
-            session.pendingApproval = nil
-            if session.runState == .waitingForApproval { session.runState = .running }
-            scope?.presentation.makeRunHooks().requestUIRefresh(session, true)
-            performEffect(for: session) {
-                await controller?.respondToPermissionRequest(id: providerRequestID, decision: decision)
-            }
-        }
-        return session.pendingApproval?.id != requestID
     }
 
     static func canonicalApprovalResponse(from payload: AgentMCPInteractionResponsePayload) throws -> String {
@@ -394,32 +380,45 @@ extension AgentSessionInteractionRuntime {
     /// Submits a resolution produced by `mcpPendingInteractionResolution` without suspending.
     func applyPendingInteractionResolution(
         _ resolution: AgentPendingInteractionResolution,
-        to session: AgentTabSession
+        command: AgentSessionRuntimeStore.Command
     ) throws {
-        guard owns(session) else { throw MCPError.invalidParams("The interaction owner is no longer current. No response was applied.") }
+        let session = command.writer.session
+        guard command.writer.scope === scope, command.isCurrent else { throw MCPError.invalidParams("The interaction owner is no longer current. No response was applied.") }
         switch resolution {
         case let .askUserSkip(interactionID):
-            skipAskUser(session: session, interactionID: interactionID)
+            guard skipAskUser(command: command, interactionID: interactionID) else {
+                throw MCPError.invalidParams("The pending question is no longer current. No response was applied.")
+            }
         case let .askUser(interactionID, drafts):
             do {
-                try submitAskUserResponse(session: session, interactionID: interactionID, draftsByQuestionID: drafts)
+                guard try submitAskUserResponse(command: command, interactionID: interactionID, draftsByQuestionID: drafts) else {
+                    throw MCPError.invalidParams("The pending question is no longer current. No response was applied.")
+                }
             } catch let error as MCPError {
                 throw error
             } catch {
                 throw MCPError.invalidParams(error.localizedDescription)
             }
         case let .mcpElicitation(request, response):
-            try requireCodexCoordinator().submitMCPElicitationResponse(session: session, request: request, response: response)
+            guard submitMCPElicitationResponse(command: command, requestID: request.id, response: response) else {
+                throw MCPError.invalidParams("The provider response route is unavailable or the MCP elicitation request is no longer current. No response was applied.")
+            }
         case let .userInput(request, response):
-            guard submitUserInputResponse(session: session, requestID: request.requestID, response: response) else {
+            guard session.codexController != nil,
+                  submitUserInputResponse(command: command, requestID: request.id, response: response)
+            else {
                 throw MCPError.invalidParams("The provider response route is unavailable or the user-input request is no longer current. No response was applied.")
             }
         case let .worktreeMerge(reviewID, decision):
-            submitWorktreeMergeReviewDecision(session: session, reviewID: reviewID, decision: decision)
+            guard submitWorktreeMergeReviewDecision(command: command, reviewID: reviewID, decision: decision) else {
+                throw MCPError.invalidParams("The worktree merge review is no longer current. No response was applied.")
+            }
         case let .permissions(request, decision):
-            try requireCodexCoordinator().submitPermissionsDecision(session: session, request: request, decision: decision)
+            guard submitPermissionsDecision(command: command, requestID: request.id, decision: decision) else {
+                throw MCPError.invalidParams("The provider response route is unavailable or the permissions request is no longer current. No response was applied.")
+            }
         case let .approval(request, decision):
-            guard submitApprovalDecision(session: session, requestID: request.id, decision: decision) else {
+            guard submitApprovalDecision(command: command, requestID: request.id, decision: decision) else {
                 let current = session.pendingApproval ?? request
                 throw MCPError.invalidParams(
                     "The approval is unavailable, unsupported, or no longer matches interaction_id. response must be one of: \(mcpApprovalDecisionLabels(for: current, session: session, includeAliases: false).joined(separator: ", ")). No response was applied."

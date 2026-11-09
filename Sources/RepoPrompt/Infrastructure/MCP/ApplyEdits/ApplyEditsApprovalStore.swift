@@ -220,11 +220,12 @@ actor ApplyEditsApprovalStore: Sendable {
         return decision
     }
 
+    @discardableResult
     func resolveReview(
         scope: ApplyEditsApprovalScope,
         reviewID: UUID,
         decision: ApplyEditsReviewDecision
-    ) {
+    ) -> Bool {
         resolvePendingReviewIfMatching(scope: scope, reviewID: reviewID, decision: decision)
     }
 
@@ -290,13 +291,15 @@ actor ApplyEditsApprovalStore: Sendable {
         }
     #endif
 
+    @discardableResult
     private func resolvePendingReviewIfMatching(
         scope: ApplyEditsApprovalScope,
         reviewID: UUID,
         decision: ApplyEditsReviewDecision
-    ) {
-        guard let record = pendingByScope[scope], record.review.id == reviewID else { return }
+    ) -> Bool {
+        guard let record = pendingByScope[scope], record.review.id == reviewID else { return false }
         finishPendingReview(scope: scope, record: record, decision: decision)
+        return true
     }
 
     private func finishPendingReview(
