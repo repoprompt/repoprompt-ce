@@ -1558,6 +1558,28 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertFalse(session.isCodexComputerUseArmed)
     }
 
+    func testRestoringDifferentCodexConversationClearsOnlyItsWindowSnapshot() {
+        let fixture = makeFixture([])
+        fixture.session.codexContextWindowSelection = .tokens500K
+        var persisted = AgentSession(id: UUID(), name: "Hydration")
+        persisted.codexConversationID = Self.oldThreadID
+        persisted.codexRolloutPath = Self.oldRolloutPath
+        fixture.coordinator.restoreCodexMetadata(from: persisted, session: fixture.session)
+        XCTAssertEqual(fixture.session.codexContextWindowSelection, .tokens500K)
+        persisted.codexConversationID = "another-thread"
+        persisted.codexRolloutPath = "/tmp/another-rollout.jsonl"
+        fixture.coordinator.restoreCodexMetadata(from: persisted, session: fixture.session)
+        XCTAssertEqual(fixture.session.codexConversationID, "another-thread")
+        XCTAssertNil(fixture.session.codexContextWindowSelection)
+        XCTAssertEqual(fixture.session.codexContextWindowForBinding(current: .tokens1M), .tokens1M)
+        persisted.codexConversationID = nil
+        persisted.codexRolloutPath = nil
+        fixture.session.codexConversationID = nil
+        fixture.session.codexRolloutPath = nil
+        fixture.coordinator.restoreCodexMetadata(from: persisted, session: fixture.session)
+        XCTAssertNil(fixture.session.codexContextWindowSelection)
+    }
+
     func testComputerUseSessionShutdownAndPersistedRestoreDoNotRearm() async throws {
         CodexComputerUseWorkflow.setEnabledForTesting(true)
         defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
