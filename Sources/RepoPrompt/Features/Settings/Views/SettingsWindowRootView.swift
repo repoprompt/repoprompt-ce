@@ -17,6 +17,7 @@ struct SettingsWindowRootView: View {
                 }
             },
             selectedTab: $model.selectedTab,
+            isPresentationVisible: model.isPresentationVisible,
             closeAction: nil
         )
         .safeAreaInset(edge: .top) { GlobalSettingsPersistenceBlockBanner(allowsSessionDismissal: false) }

@@ -132,11 +132,6 @@ struct AdvancedSettingsView: View {
 
                 savedPromptsSection
 
-                Divider()
-                    .padding(.horizontal, -16)
-
-                ActivitySettingsView()
-
                 Spacer()
             }
             .padding()

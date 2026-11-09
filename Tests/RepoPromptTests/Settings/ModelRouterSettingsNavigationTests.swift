@@ -564,11 +564,112 @@ final class WindowActivityLedgerTests: XCTestCase {
 }
 
 final class ActivitySettingsTests: XCTestCase {
+    @MainActor
+    func testHiddenRefreshDoesNotSampleSleepOrCreateSubscriptionsAndRevealResets() async {
+        var ticks = 0
+        var sleeps = 0
+        enum Stop: Error { case done }
+        let model = SettingsWindowModel(selectedTab: .activity)
+        for _ in 0 ..< 3 {
+            model.updatePresentationVisibility(false)
+            await ActivityRefreshLoop.run(visible: model.isPresentationVisible, tick: { ticks += 1 }, sleep: { sleeps += 1
+                throw Stop.done
+            })
+        }
+        XCTAssertEqual(ticks, 0)
+        XCTAssertEqual(sleeps, 0)
+        // Visibility comes from the existing window delegate, not a subscription or hidden poll.
+        for _ in 0 ..< 2 {
+            model.updatePresentationVisibility(true)
+            var baseline: ActivityMainThreadSampler.Counters?
+            await ActivityRefreshLoop.run(visible: model.isPresentationVisible, tick: {
+                XCTAssertEqual(ActivityMainThreadSampler.cpuText(previous: baseline, current: .init(cpuNs: 100, sampledAt: 200)), "Measuring…")
+                baseline = .init(cpuNs: 100, sampledAt: 200)
+                ticks += 1
+            }, sleep: { sleeps += 1
+                throw Stop.done
+            })
+            model.updatePresentationVisibility(false)
+        }
+        XCTAssertEqual(ticks, 2)
+        XCTAssertEqual(sleeps, 2)
+        XCTAssertFalse(WindowPresentationVisibility.isVisible(windowIsVisible: true, isMiniaturized: false, occlusionIsVisible: true, appIsHidden: true))
+    }
+
+    @MainActor
+    func testMainThreadSamplerBalancesItsRightAndHasBoundedVisibleTickCost() async {
+        let port = mach_thread_self()
+        defer { mach_port_deallocate(mach_task_self_, port) }
+        var before: mach_port_urefs_t = 0
+        XCTAssertEqual(mach_port_get_refs(mach_task_self_, port, mach_port_right_t(MACH_PORT_RIGHT_SEND), &before), KERN_SUCCESS)
+        XCTAssertEqual(mach_port_mod_refs(mach_task_self_, port, mach_port_right_t(MACH_PORT_RIGHT_SEND), 1), KERN_SUCCESS)
+        var sampler: ActivityMainThreadSampler? = ActivityMainThreadSampler(mainThread: port)
+        weak var released = sampler
+        var samples: [UInt64] = []
+        for index in 0 ..< 100 {
+            let start = DispatchTime.now().uptimeNanoseconds
+            guard let activeSampler = sampler else { XCTFail("Sampler released before tick")
+                return
+            }
+            let text = await activeSampler.read()
+            samples.append(DispatchTime.now().uptimeNanoseconds - start)
+            if index == 0 { XCTAssertEqual(text, "Measuring…") }
+            else { XCTAssertTrue(text.hasSuffix("%")) }
+        }
+        sampler = nil
+        XCTAssertNil(released)
+        var after: mach_port_urefs_t = 0
+        XCTAssertEqual(mach_port_get_refs(mach_task_self_, port, mach_port_right_t(MACH_PORT_RIGHT_SEND), &after), KERN_SUCCESS)
+        XCTAssertEqual(after, before)
+        let p95 = samples.sorted()[94]
+        print("Activity main-thread sample round-trip p95: \(p95) ns; budget: 2000000 ns")
+        XCTAssertLessThan(p95, 2_000_000)
+    }
+
+    func testMainThreadCPUUsesActualIntervalsAndRejectsInvalidCounters() {
+        let previous = ActivityMainThreadSampler.Counters(cpuNs: 1_000_000_000, sampledAt: 5_000_000_000)
+        XCTAssertEqual(ActivityMainThreadSampler.cpuText(previous: nil, current: previous), "Measuring…")
+        XCTAssertEqual(ActivityMainThreadSampler.cpuText(previous: previous, current: .init(cpuNs: 2_000_000_000, sampledAt: 7_000_000_000)), "50.0%")
+        XCTAssertEqual(ActivityMainThreadSampler.cpuText(previous: previous, current: .init(cpuNs: 0, sampledAt: 7_000_000_000)), "Unavailable")
+        XCTAssertEqual(ActivityMainThreadSampler.cpuText(previous: previous, current: previous), "Unavailable")
+    }
+
+    @MainActor
+    func testResidentAgentCountsAt35WindowScaleAndBudget() {
+        let inactive: [AgentSessionRunState] = [.idle, .completed, .cancelled, .failed]
+        let states: [AgentSessionRunState] = [.running, .running, .waitingForUser, .waitingForQuestion, .waitingForApproval] + inactive
+        let counts = ActivityAgentCounts(states)
+        XCTAssertEqual(counts.text, "2 running, 3 waiting")
+        var durations: [UInt64] = []
+        for _ in 0 ..< 100 {
+            let start = DispatchTime.now().uptimeNanoseconds
+            let rows = (1 ... 35).map { id in
+                ActivityDisplay.Row(
+                    id: id,
+                    title: "Window \(id)",
+                    snapshot: nil,
+                    previous: nil,
+                    agents: ActivityAgentCounts(id == 25 ? states : id == 26 ? [.waitingForApproval] : inactive)
+                )
+            }
+            let display = ActivityDisplay(rows: rows, sort: .init(column: .agents, ascending: false))
+            durations.append(DispatchTime.now().uptimeNanoseconds - start)
+            XCTAssertEqual(display.rows.first?.id, 25)
+            XCTAssertEqual(display.rows[1].id, 26)
+            XCTAssertEqual(display.rows.first?.status, "No measured work")
+            XCTAssertEqual(display.rows.first?.total, "0 ms")
+            XCTAssertEqual(display.rows.first?.agents.text, "2 running, 3 waiting")
+        }
+        let p95 = durations.sorted()[94]
+        print("Activity 35-window fake census/display p95: \(p95) ns; budget: 20000000 ns")
+        XCTAssertLessThan(p95, 20_000_000)
+    }
+
     func testWatcherColumnLabelsAndRawNumericSortsStayStableAcrossRefresh() {
         XCTAssertEqual(ActivityDisplay.Column.allCases.map(\.rawValue), [
-            "Window", "Watcher busy", "Last busy folder", "File watcher", "Watcher busy total"
+            "Window", "Agents", "Watcher busy", "Last busy folder", "File watcher", "Watcher busy total"
         ])
-        XCTAssertEqual(ActivityDisplay.caveat, "Window figures cover file watching only; agent runs are not counted. Times include waiting, not drawing. CPU: 100% = one core.")
+        XCTAssertEqual(ActivityDisplay.caveat, "Agents show resident session states, not CPU. Window times currently cover file watching, including waits; drawing and other work are not measured. CPU: 100% = one core.")
         func row(_ id: Int, title: String, root: String, total: UInt64, busy: Bool, age: UInt64 = 100_000_000) -> ActivityDisplay.Row {
             let previous = WindowActivityLedger.Snapshot(windowID: id, sampledAt: 0, busyTotal: 0, busySince: nil, lastEnded: nil, root: nil)
             let current = WindowActivityLedger.Snapshot(
@@ -596,7 +697,7 @@ final class ActivitySettingsTests: XCTestCase {
                 let refreshed = ActivityDisplay(rows: rows.reversed(), sort: sort)
                 XCTAssertEqual(display.rows.map(\.id), refreshed.rows.map(\.id))
                 XCTAssertEqual(display.sorted(by: sort).rows.map(\.id), display.rows.map(\.id))
-                let expected = column == .window ? (ascending ? [1, 2, 3] : [3, 1, 2])
+                let expected = column == .agents ? [1, 2, 3] : column == .window ? (ascending ? [1, 2, 3] : [3, 1, 2])
                     : (ascending ? [3, 1, 2] : [1, 2, 3])
                 XCTAssertEqual(display.rows.map(\.id), expected, "\(column) ascending=\(ascending)")
             }
@@ -635,7 +736,7 @@ final class ActivitySettingsTests: XCTestCase {
         let row = ActivityDisplay.Row(id: 1, title: "repo", snapshot: snapshot, previous: previous)
         XCTAssertEqual(row.total, "2.0 ms")
         XCTAssertEqual(row.rate, "0.2%")
-        XCTAssertTrue(row.status.hasPrefix("Idle "))
+        XCTAssertTrue(row.status.hasPrefix("No measured work"))
         XCTAssertEqual(row.root, "_git_data (git data)")
         XCTAssertEqual(ActivityDisplay.duration(1), "<0.1 ms")
         XCTAssertEqual(ActivityDisplay.duration(49_000_000), "49.0 ms")
@@ -689,7 +790,7 @@ final class ActivitySettingsTests: XCTestCase {
         XCTAssertEqual(ActivityDisplay.Row(id: 1, title: "repo", snapshot: now, previous: nil).rate, "Measuring…")
         let idle = ActivityDisplay.Row(id: 2, title: "", snapshot: nil, previous: nil)
         XCTAssertEqual(idle.window, "Window 2")
-        XCTAssertEqual(idle.status, "Not busy yet")
+        XCTAssertEqual(idle.status, "No measured work")
         XCTAssertEqual(idle.total, "0 ms")
     }
 
@@ -712,7 +813,7 @@ final class ActivitySettingsTests: XCTestCase {
             XCTAssertEqual(row.window, "Window 1: repo")
             XCTAssertEqual(row.rate, expectedRate)
             XCTAssertEqual(row.root, expectedFolder)
-            XCTAssertEqual(row.status, "Idle 1.0 s")
+            XCTAssertEqual(row.status, "No measured work (last busy 1.0 s ago)")
         }
     }
 
@@ -733,8 +834,11 @@ final class ActivitySettingsTests: XCTestCase {
         Captured: 1970-01-01T00:00:00Z
         CPU: 150.0%
         Memory: 2400 MiB
-        Window figures cover file watching only; agent runs are not counted. Times include waiting, not drawing. CPU: 100% = one core.
+        Main thread CPU: Measuring…
+        CPU not attributed to windows: not measured
+        Agents show resident session states, not CPU. Window times currently cover file watching, including waits; drawing and other work are not measured. CPU: 100% = one core.
         Window 1: repo window
+          Agents: 0 running, 0 waiting
           Watcher busy: Measuring…
           Last busy folder: repo root
           File watcher: Busy 1 m 04 s
@@ -743,6 +847,9 @@ final class ActivitySettingsTests: XCTestCase {
         XCTAssertEqual(ActivityDisplay.label(String(repeating: "a", count: 100)).count, 80)
         XCTAssertEqual(ActivityDisplay.duration(3_840_000_000_000), "1 h 04 m")
         XCTAssertEqual(ActivityDisplay.duration(100_800_000_000_000), "1 d 04 h")
-        XCTAssertTrue(SettingsTab.advanced.searchTags.contains("activity"))
+        XCTAssertTrue(SettingsTab.activity.searchTags.contains("activity"))
+        XCTAssertEqual(SettingsTab.activity.title, "Activity")
+        XCTAssertEqual(SettingsTab.activity.section, .general)
+        XCTAssertFalse(SettingsTab.advanced.searchTags.contains("activity"))
     }
 }

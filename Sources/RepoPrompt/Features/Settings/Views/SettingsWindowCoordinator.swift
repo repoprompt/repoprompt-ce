@@ -5,6 +5,11 @@ import SwiftUI
 @MainActor
 final class SettingsWindowModel: ObservableObject {
     @Published var selectedTab: SettingsTab
+    @Published private(set) var isPresentationVisible = false
+
+    func updatePresentationVisibility(_ visible: Bool) {
+        if isPresentationVisible != visible { isPresentationVisible = visible }
+    }
 
     init(selectedTab: SettingsTab = .appearance) {
         self.selectedTab = selectedTab
@@ -177,6 +182,23 @@ final class SettingsWindowCoordinator: NSObject, ObservableObject, NSWindowDeleg
         clearWindowReferences()
     }
 
+    func windowDidChangeOcclusionState(_ notification: Notification) {
+        refreshPresentationVisibility(notification)
+    }
+
+    func windowDidMiniaturize(_ notification: Notification) {
+        refreshPresentationVisibility(notification)
+    }
+
+    func windowDidDeminiaturize(_ notification: Notification) {
+        refreshPresentationVisibility(notification)
+    }
+
+    private func refreshPresentationVisibility(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, window === windowController?.window else { return }
+        model?.updatePresentationVisibility(WindowPresentationVisibility.sample(window))
+    }
+
     func windowWillClose(_ notification: Notification) {
         guard (notification.object as? NSWindow) === windowController?.window else { return }
         clearWindowReferences()
@@ -202,6 +224,9 @@ final class SettingsWindowCoordinator: NSObject, ObservableObject, NSWindowDeleg
         NSApp.activate(ignoringOtherApps: true)
         windowController.showWindow(nil)
         windowController.window?.makeKeyAndOrderFront(nil)
+        if let window = windowController.window {
+            model?.updatePresentationVisibility(WindowPresentationVisibility.sample(window))
+        }
     }
 
     static func makeHostingController<Content: View>(rootView: Content) -> NSHostingController<Content> {
@@ -255,6 +280,7 @@ final class SettingsWindowCoordinator: NSObject, ObservableObject, NSWindowDeleg
     }
 
     private func clearWindowReferences() {
+        model?.updatePresentationVisibility(false)
         windowController?.window?.delegate = nil
         windowController = nil
         hostingController = nil

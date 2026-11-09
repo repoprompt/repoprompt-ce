@@ -3,6 +3,7 @@ import Darwin
 import SwiftUI
 
 struct ActivitySettingsView: View {
+    let isPresentationVisible: Bool
     @EnvironmentObject private var windows: WindowStatesManager
     @State private var display = ActivityDisplay()
     @State private var copyStatus: String?
@@ -16,6 +17,8 @@ struct ActivitySettingsView: View {
                 Text("Memory: \(display.memory)")
             }
             .monospacedDigit()
+            Text("Main thread CPU: \(display.mainThreadCPU)").monospacedDigit()
+            Text(ActivityDisplay.unattributed).foregroundStyle(.secondary)
             if display.rows.isEmpty {
                 Text("No open windows.").foregroundStyle(.secondary)
             }
@@ -47,6 +50,7 @@ struct ActivitySettingsView: View {
                                 .truncationMode(.tail)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .hoverTooltip(row.window)
+                            Text(row.agents.text)
                             Text(row.rate)
                             Text(row.root).lineLimit(1).hoverTooltip(row.root)
                             Text(row.status)
@@ -67,10 +71,14 @@ struct ActivitySettingsView: View {
                 if let copyStatus { Text(copyStatus).foregroundStyle(.secondary) }
             }
         }
-        .task {
+        .task(id: isPresentationVisible) {
+            guard isPresentationVisible else { return }
+            let mainThread = ActivityMainThreadSampler(mainThread: mach_thread_self())
             var previous: [Int: WindowActivityLedger.Snapshot] = [:]
             var process = ActivityProcessSampler()
-            while !Task.isCancelled {
+            await ActivityRefreshLoop.run(visible: isPresentationVisible) {
+                let mainThreadCPU = await mainThread.read()
+                guard !Task.isCancelled else { return }
                 let snapshots = windows.activityLedger.snapshot()
                 let cpu = process.readCPU()
                 let memory = ActivityProcessSampler.residentMiB()
@@ -78,21 +86,42 @@ struct ActivitySettingsView: View {
                     let snapshot = snapshots.first { $0.windowID == window.windowID }
                     return ActivityDisplay.Row(
                         id: window.windowID, title: window.displayedWindowTitle,
-                        snapshot: snapshot, previous: previous[window.windowID]
+                        snapshot: snapshot, previous: previous[window.windowID],
+                        agents: ActivityAgentCounts(window.agentModeViewModel.sessions.values.lazy.map(\.runState))
                     )
                 }
-                display = ActivityDisplay(cpu: cpu, memory: memory, rows: rows, sort: sort)
+                display = ActivityDisplay(cpu: cpu, memory: memory, rows: rows, sort: sort, mainThreadCPU: mainThreadCPU)
                 previous = Dictionary(uniqueKeysWithValues: snapshots.map { ($0.windowID, $0) })
-                do { try await Task.sleep(for: .seconds(1)) } catch { break }
             }
         }
     }
 }
 
+struct ActivityAgentCounts {
+    private(set) var running = 0
+    private(set) var waiting = 0
+
+    init(_ states: some Sequence<AgentSessionRunState>) {
+        for state in states {
+            switch state {
+            case .running: running += 1
+            case .waitingForUser, .waitingForQuestion, .waitingForApproval: waiting += 1
+            case .idle, .completed, .cancelled, .failed: break
+            }
+        }
+    }
+
+    var text: String {
+        "\(running) running, \(waiting) waiting"
+    }
+}
+
 struct ActivityDisplay {
-    static let caveat = "Window figures cover file watching only; agent runs are not counted. Times include waiting, not drawing. CPU: 100% = one core."
+    static let caveat = "Agents show resident session states, not CPU. Window times currently cover file watching, including waits; drawing and other work are not measured. CPU: 100% = one core."
+    static let unattributed = "CPU not attributed to windows: not measured"
     enum Column: String, CaseIterable {
         case window = "Window"
+        case agents = "Agents"
         case rate = "Watcher busy"
         case root = "Last busy folder"
         case status = "File watcher"
@@ -107,16 +136,21 @@ struct ActivityDisplay {
     let capturedAt: Date
     let cpu: String
     let memory: String
+    let mainThreadCPU: String
     let rows: [Row]
 
-    init(cpu: String = "Measuring…", memory: String = "Measuring…", rows: [Row] = [], capturedAt: Date = Date(), sort: Sort? = nil) {
+    init(cpu: String = "Measuring…", memory: String = "Measuring…", rows: [Row] = [], capturedAt: Date = Date(), sort: Sort? = nil, mainThreadCPU: String = "Measuring…") {
         self.capturedAt = capturedAt
         self.cpu = cpu
         self.memory = memory
+        self.mainThreadCPU = mainThreadCPU
         self.rows = rows.sorted { lhs, rhs in
             let order: ComparisonResult
             switch sort?.column ?? .window {
             case .window: order = Self.compareText(lhs.title, rhs.title)
+            case .agents:
+                let running = Self.compare(lhs.agents.running, rhs.agents.running)
+                order = running == .orderedSame ? Self.compare(lhs.agents.waiting, rhs.agents.waiting) : running
             case .root: order = Self.compareText(lhs.fullRoot, rhs.fullRoot)
             case .rate: order = Self.compare(lhs.rawRate ?? -1, rhs.rawRate ?? -1)
             case .total: order = Self.compare(lhs.snapshot?.busyTotal ?? 0, rhs.snapshot?.busyTotal ?? 0)
@@ -131,7 +165,7 @@ struct ActivityDisplay {
     }
 
     func sorted(by sort: Sort?) -> Self {
-        Self(cpu: cpu, memory: memory, rows: rows, capturedAt: capturedAt, sort: sort)
+        Self(cpu: cpu, memory: memory, rows: rows, capturedAt: capturedAt, sort: sort, mainThreadCPU: mainThreadCPU)
     }
 
     private static func compare<T: Comparable>(_ lhs: T, _ rhs: T) -> ComparisonResult {
@@ -155,6 +189,7 @@ struct ActivityDisplay {
         let snapshot: WindowActivityLedger.Snapshot?
         let rawRate: Double?
         let fullRoot: String
+        let agents: ActivityAgentCounts
 
         // Ascending: never recorded, idle, busy. Descending puts busy episodes first.
         var watcherPhase: Int {
@@ -166,9 +201,10 @@ struct ActivityDisplay {
             return snapshot.sampledAt >= start ? snapshot.sampledAt - start : 0
         }
 
-        init(id: Int, title: String, snapshot: WindowActivityLedger.Snapshot?, previous: WindowActivityLedger.Snapshot?) {
+        init(id: Int, title: String, snapshot: WindowActivityLedger.Snapshot?, previous: WindowActivityLedger.Snapshot?, agents: ActivityAgentCounts = .init([])) {
             self.id = id
             self.snapshot = snapshot
+            self.agents = agents
             let title = title.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
             self.title = title
             window = title.isEmpty || title == WindowTitleFormatter.defaultTitle
@@ -190,9 +226,9 @@ struct ActivityDisplay {
             if let snapshot, let start = snapshot.busySince {
                 status = "Busy \(ActivityDisplay.duration(snapshot.sampledAt >= start ? snapshot.sampledAt - start : 0))"
             } else if let snapshot, let end = snapshot.lastEnded {
-                status = "Idle \(ActivityDisplay.duration(snapshot.sampledAt >= end ? snapshot.sampledAt - end : 0))"
+                status = "No measured work (last busy \(ActivityDisplay.duration(snapshot.sampledAt >= end ? snapshot.sampledAt - end : 0)) ago)"
             } else {
-                status = "Not busy yet"
+                status = "No measured work"
             }
         }
     }
@@ -202,6 +238,7 @@ struct ActivityDisplay {
         let body = rows.map { row in
             """
             \(row.window)
+              Agents: \(row.agents.text)
               Watcher busy: \(row.rate)
               Last busy folder: \(row.root)
               File watcher: \(row.status)
@@ -213,6 +250,8 @@ struct ActivityDisplay {
         Captured: \(timestamp)
         CPU: \(cpu)
         Memory: \(memory)
+        Main thread CPU: \(mainThreadCPU)
+        \(Self.unattributed)
         \(Self.caveat)
         \(rows.isEmpty ? "No open windows." : body)
         """
