@@ -6,6 +6,7 @@ struct ActivitySettingsView: View {
     @EnvironmentObject private var windows: WindowStatesManager
     @State private var display = ActivityDisplay()
     @State private var copyStatus: String?
+    @State private var sort: ActivityDisplay.Sort?
 
     var body: some View {
         SettingSection(title: "Activity", description: ActivityDisplay.caveat) {
@@ -21,11 +22,22 @@ struct ActivitySettingsView: View {
             if !display.rows.isEmpty {
                 Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 6) {
                     GridRow {
-                        Text("Window")
-                        Text("Watching files")
-                        Text("Last busy folder")
-                        Text("Status")
-                        Text("Busy total")
+                        ForEach(ActivityDisplay.Column.allCases, id: \.self) { column in
+                            Button {
+                                sort = ActivityDisplay.Sort(column: column, ascending: sort?.column == column ? !(sort?.ascending ?? true) : true)
+                                display = display.sorted(by: sort)
+                            } label: {
+                                HStack(spacing: 3) {
+                                    Text(column.rawValue)
+                                    if sort?.column == column {
+                                        Image(systemName: sort?.ascending == true ? "chevron.up" : "chevron.down")
+                                            .imageScale(.small)
+                                            .accessibilityHidden(true)
+                                    }
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        }
                     }
                     .fontWeight(.medium)
                     ForEach(display.rows) { row in
@@ -69,7 +81,7 @@ struct ActivitySettingsView: View {
                         snapshot: snapshot, previous: previous[window.windowID]
                     )
                 }
-                display = ActivityDisplay(cpu: cpu, memory: memory, rows: rows)
+                display = ActivityDisplay(cpu: cpu, memory: memory, rows: rows, sort: sort)
                 previous = Dictionary(uniqueKeysWithValues: snapshots.map { ($0.windowID, $0) })
                 do { try await Task.sleep(for: .seconds(1)) } catch { break }
             }
@@ -78,20 +90,58 @@ struct ActivitySettingsView: View {
 }
 
 struct ActivityDisplay {
-    static let caveat = "100% = one core. Window times include waiting; drawing not counted."
+    static let caveat = "Window figures cover file watching only; agent runs are not counted. Times include waiting, not drawing. CPU: 100% = one core."
+    enum Column: String, CaseIterable {
+        case window = "Window"
+        case rate = "Watcher busy"
+        case root = "Last busy folder"
+        case status = "File watcher"
+        case total = "Watcher busy total"
+    }
+
+    struct Sort {
+        let column: Column
+        let ascending: Bool
+    }
+
     let capturedAt: Date
     let cpu: String
     let memory: String
     let rows: [Row]
 
-    init(cpu: String = "Measuring…", memory: String = "Measuring…", rows: [Row] = [], capturedAt: Date = Date()) {
+    init(cpu: String = "Measuring…", memory: String = "Measuring…", rows: [Row] = [], capturedAt: Date = Date(), sort: Sort? = nil) {
         self.capturedAt = capturedAt
         self.cpu = cpu
         self.memory = memory
-        self.rows = rows.sorted {
-            let order = $0.title.compare($1.title, options: [.caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
-            return order == .orderedSame ? $0.id < $1.id : order == .orderedAscending
+        self.rows = rows.sorted { lhs, rhs in
+            let order: ComparisonResult
+            switch sort?.column ?? .window {
+            case .window: order = Self.compareText(lhs.title, rhs.title)
+            case .root: order = Self.compareText(lhs.fullRoot, rhs.fullRoot)
+            case .rate: order = Self.compare(lhs.rawRate ?? -1, rhs.rawRate ?? -1)
+            case .total: order = Self.compare(lhs.snapshot?.busyTotal ?? 0, rhs.snapshot?.busyTotal ?? 0)
+            case .status:
+                let phase = Self.compare(lhs.watcherPhase, rhs.watcherPhase)
+                order = phase == .orderedSame ? Self.compare(lhs.statusDuration, rhs.statusDuration) : phase
+            }
+            // A fixed ID tie-breaker prevents equal keys from jumping on refresh or reversal.
+            return order == .orderedSame ? lhs.id < rhs.id
+                : order == (sort?.ascending == false ? .orderedDescending : .orderedAscending)
         }
+    }
+
+    func sorted(by sort: Sort?) -> Self {
+        Self(cpu: cpu, memory: memory, rows: rows, capturedAt: capturedAt, sort: sort)
+    }
+
+    private static func compare<T: Comparable>(_ lhs: T, _ rhs: T) -> ComparisonResult {
+        lhs == rhs ? .orderedSame : lhs < rhs ? .orderedAscending : .orderedDescending
+    }
+
+    private static func compareText(_ lhs: String, _ rhs: String) -> ComparisonResult {
+        let locale = Locale(identifier: "en_US_POSIX")
+        return lhs.folding(options: .caseInsensitive, locale: locale)
+            .compare(rhs.folding(options: .caseInsensitive, locale: locale), options: .literal)
     }
 
     struct Row: Identifiable {
@@ -102,22 +152,39 @@ struct ActivityDisplay {
         let root: String
         let status: String
         let total: String
+        let snapshot: WindowActivityLedger.Snapshot?
+        let rawRate: Double?
+        let fullRoot: String
+
+        // Ascending: never recorded, idle, busy. Descending puts busy episodes first.
+        var watcherPhase: Int {
+            snapshot?.busySince != nil ? 2 : snapshot?.lastEnded != nil ? 1 : 0
+        }
+
+        var statusDuration: UInt64 {
+            guard let snapshot, let start = snapshot.busySince ?? snapshot.lastEnded else { return 0 }
+            return snapshot.sampledAt >= start ? snapshot.sampledAt - start : 0
+        }
 
         init(id: Int, title: String, snapshot: WindowActivityLedger.Snapshot?, previous: WindowActivityLedger.Snapshot?) {
             self.id = id
+            self.snapshot = snapshot
             let title = title.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
             self.title = title
             window = title.isEmpty || title == WindowTitleFormatter.defaultTitle
                 ? "Window \(id)" : "Window \(id): \(title)"
-            root = snapshot?.root.map { $0 == "Multiple roots" ? "Multiple folders" : ActivityDisplay.label($0) } ?? "—"
+            fullRoot = snapshot?.root.map { $0 == "Multiple roots" ? "Multiple folders" : $0 } ?? "—"
+            root = ActivityDisplay.label(fullRoot)
             total = ActivityDisplay.duration(snapshot?.busyTotal ?? 0)
             if let snapshot, let previous, snapshot.sampledAt > previous.sampledAt, snapshot.busyTotal >= previous.busyTotal {
                 let fraction = Double(snapshot.busyTotal - previous.busyTotal) / Double(snapshot.sampledAt - previous.sampledAt)
+                rawRate = fraction
                 // Union time cannot exceed the interval; clamp its displayed percentage to 0...100.
                 let percent = 100 * min(1, max(0, fraction))
                 rate = percent > 0 && percent < 0.1 ? "<0.1%"
                     : ActivityDisplay.number(percent, decimals: percent > 0 && percent < 10 ? 1 : 0) + "%"
             } else {
+                rawRate = nil
                 rate = "Measuring…"
             }
             if let snapshot, let start = snapshot.busySince {
@@ -135,10 +202,10 @@ struct ActivityDisplay {
         let body = rows.map { row in
             """
             \(row.window)
-              Watching files: \(row.rate)
+              Watcher busy: \(row.rate)
               Last busy folder: \(row.root)
-              \(row.status)
-              Busy total: \(row.total)
+              File watcher: \(row.status)
+              Watcher busy total: \(row.total)
             """
         }.joined(separator: "\n")
         return """

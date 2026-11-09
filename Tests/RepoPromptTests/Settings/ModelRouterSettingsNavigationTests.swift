@@ -564,6 +564,52 @@ final class WindowActivityLedgerTests: XCTestCase {
 }
 
 final class ActivitySettingsTests: XCTestCase {
+    func testWatcherColumnLabelsAndRawNumericSortsStayStableAcrossRefresh() {
+        XCTAssertEqual(ActivityDisplay.Column.allCases.map(\.rawValue), [
+            "Window", "Watcher busy", "Last busy folder", "File watcher", "Watcher busy total"
+        ])
+        XCTAssertEqual(ActivityDisplay.caveat, "Window figures cover file watching only; agent runs are not counted. Times include waiting, not drawing. CPU: 100% = one core.")
+        func row(_ id: Int, title: String, root: String, total: UInt64, busy: Bool, age: UInt64 = 100_000_000) -> ActivityDisplay.Row {
+            let previous = WindowActivityLedger.Snapshot(windowID: id, sampledAt: 0, busyTotal: 0, busySince: nil, lastEnded: nil, root: nil)
+            let current = WindowActivityLedger.Snapshot(
+                windowID: id,
+                sampledAt: 1_000_000_000,
+                busyTotal: total,
+                busySince: busy ? 1_000_000_000 - age : nil,
+                lastEnded: busy ? nil : 1_000_000_000 - age,
+                root: root
+            )
+            return .init(id: id, title: title, snapshot: current, previous: previous)
+        }
+        let rows = [
+            row(3, title: "Zulu", root: "Alpha", total: 100, busy: false),
+            row(2, title: "alpha", root: "zulu", total: 200, busy: true),
+            row(1, title: "Alpha", root: "Zulu", total: 200, busy: true)
+        ]
+        // All rates and totals round to the same visible strings; sorting must use raw values.
+        XCTAssertEqual(Set(rows.map(\.rate)), ["<0.1%"])
+        XCTAssertEqual(Set(rows.map(\.total)), ["<0.1 ms"])
+        for column in ActivityDisplay.Column.allCases {
+            for ascending in [true, false] {
+                let sort = ActivityDisplay.Sort(column: column, ascending: ascending)
+                let display = ActivityDisplay(rows: rows, sort: sort)
+                let refreshed = ActivityDisplay(rows: rows.reversed(), sort: sort)
+                XCTAssertEqual(display.rows.map(\.id), refreshed.rows.map(\.id))
+                XCTAssertEqual(display.sorted(by: sort).rows.map(\.id), display.rows.map(\.id))
+                let expected = column == .window ? (ascending ? [1, 2, 3] : [3, 1, 2])
+                    : (ascending ? [3, 1, 2] : [1, 2, 3])
+                XCTAssertEqual(display.rows.map(\.id), expected, "\(column) ascending=\(ascending)")
+            }
+        }
+        XCTAssertEqual(ActivityDisplay(rows: rows).rows.map(\.id), [1, 2, 3])
+        let never = ActivityDisplay.Row(id: 4, title: "never", snapshot: nil, previous: nil)
+        let statusSort = ActivityDisplay.Sort(column: .status, ascending: false)
+        XCTAssertEqual(ActivityDisplay(rows: [never] + rows, sort: statusSort).rows.map(\.id), [1, 2, 3, 4])
+        let longerBusy = row(9, title: "long", root: "root", total: 1, busy: true, age: 900_000_000)
+        let longerIdle = row(8, title: "idle", root: "root", total: 1, busy: false, age: 900_000_000)
+        XCTAssertEqual(ActivityDisplay(rows: rows + [longerBusy, longerIdle], sort: statusSort).rows.map(\.id), [9, 1, 2, 8, 3])
+    }
+
     func testRowsSortByFullTitleIgnoringCaseThenWindowID() {
         let rows = [(3, "zebra"), (8, "Alpha"), (2, "alpha"), (1, "Beta")].map {
             ActivityDisplay.Row(id: $0.0, title: $0.1, snapshot: nil, previous: nil)
@@ -687,12 +733,12 @@ final class ActivitySettingsTests: XCTestCase {
         Captured: 1970-01-01T00:00:00Z
         CPU: 150.0%
         Memory: 2400 MiB
-        100% = one core. Window times include waiting; drawing not counted.
+        Window figures cover file watching only; agent runs are not counted. Times include waiting, not drawing. CPU: 100% = one core.
         Window 1: repo window
-          Watching files: Measuring…
+          Watcher busy: Measuring…
           Last busy folder: repo root
-          Busy 1 m 04 s
-          Busy total: 1 m 04 s
+          File watcher: Busy 1 m 04 s
+          Watcher busy total: 1 m 04 s
         """)
         XCTAssertEqual(ActivityDisplay.label(String(repeating: "a", count: 100)).count, 80)
         XCTAssertEqual(ActivityDisplay.duration(3_840_000_000_000), "1 h 04 m")
