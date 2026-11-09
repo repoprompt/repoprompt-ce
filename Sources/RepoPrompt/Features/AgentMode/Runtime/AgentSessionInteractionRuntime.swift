@@ -48,9 +48,16 @@ final class AgentSessionInteractionRuntime {
     let approvalStore: ApplyEditsApprovalStore
     weak var observer: (any AgentRunInteractionStateObserving)?
     private var subscriptions: [ObjectIdentifier: UUID] = [:]
-    // Request-lifetime identities fence delayed caller cancellation from a subsequent question,
-    // even when a caller reuses its public interaction ID on the same session object.
-    var questionWaitIDs: [ObjectIdentifier: UUID] = [:]
+    /// Request-lifetime identities fence delayed caller cancellation from a subsequent question,
+    /// even when a caller reuses its public interaction ID on the same session object.
+    struct QuestionWait {
+        let id: UUID
+        let writer: AgentSessionRuntimeStore.WriterIdentity
+        let runID: UUID?
+        let runAttemptID: UUID?
+    }
+
+    var questionWaits: [ObjectIdentifier: QuestionWait] = [:]
     private struct CancellationCutoff {
         weak var session: AgentTabSession?
         let instant: ContinuousClock.Instant
@@ -247,6 +254,7 @@ final class AgentSessionInteractionRuntime {
     }
 
     func cancelPendingQuestion(for session: AgentTabSession) {
+        questionWaits.removeValue(forKey: ObjectIdentifier(session))
         Self.invalidatePendingAskUserTimeout(for: session)
         let continuation = session.askUserContinuation
         session.askUserContinuation = nil

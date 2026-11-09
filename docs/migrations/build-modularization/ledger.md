@@ -6574,3 +6574,52 @@ occurrences: **four VM, three native-controller, two native-interrupt-test**, ze
 eight files. No positive occurrence deltas. No permanent trace, sanitizer run, live-app smoke,
 full-suite or hosted-CI qualification is claimed. The repaired join/drain contract and passing
 broad rerun release this checkpoint's local push hold; M9.2b's remaining inventory stays open.
+
+#### M9.2b checkpoint 8 — question admission and exact MCP cancellation
+
+Question creation now requires the canonical command. The VM captures the writer before hydration,
+retains the existing object/restoration and MutationTarget checks, and admits that same writer after
+readiness; refusal remains a typed MCP error. Availability requires the same local writer but does
+not require hydration to have completed. There is no absent/unbound or conflicting-writer fallback.
+The existing question wait-ID map now records originating writer, run and attempt identities.
+Responses, drafts, page changes and activity must match the original writer, not a fresh claim on
+the same payload. Timer/caller cancellation additionally carries the exact wait ID, so a reused
+public interaction ID cannot identify a successor wait. Timeout zero keeps its immediate-expiry
+meaning. Cleanup releases the original continuation after detachment; it reconciles only the same
+binding/run/attempt and performs writer publication only with the originating claim. A live,
+reacquired/rebound payload receives only the existing exact-object interaction projection to hide
+its cleared card, never stale binding/save publication or reconciliation of a successor run.
+
+The Agent Mode MCP path now owns the exact question invocation behind a registration start gate.
+External cancellation cancels and joins that task, including preparation, instead of re-resolving a
+window/tab and cancelling by public interaction ID. The VM cancel adapter is retired. Early or
+refused registration cannot begin presentation. Context Builder retains its separate run-scoped
+path. Membership `owns` remains for observation and composite managed-response checks; it is no
+longer question-creation admission. No M9.3a-owned composition file changed.
+
+One review prompted typed refusal mapping, exact-object interaction-only repaint after claim loss,
+and external-cancellation/preparation coverage. Two existing managed-response fixtures and the
+multiple-choice link fixture now install a real runtime wait instead of fabricating continuation
+state; no production bypass was added. New causal coverage includes early registration cancellation,
+caller and coordinator cancellation joining a held preparation, a same-tab/public-ID successor,
+reacquired-claim response refusal, and original timeout versus rebound/successor-attempt state.
+The VM hydration-await mutation itself remains source-reviewed rather than injected by a new test
+seam. The broad provider-native cancellation hook and hook-review workflow remain open, as do the
+other M9.2b inventory groups; this is not interaction or milestone closeout.
+
+Initial focused `56dd16b6-0b54-4c53-afc2-fa35c6d45208` failed compilation because observation/
+managed-response callers still require `owns`; those uses were retained, not silently tightened.
+Focused `ca6d1dd8-a3c4-45c6-a6a5-18dc7b8b5a3b` executed **276**, with one failing new fixture:
+its supposedly held preparation used the cancellation-aware `TestReleaseFence`. Replacing that
+fixture with an explicitly held continuation preserves the join assertion. Final focused
+`c9a4c042-df87-4d8c-8aa8-489febac55bd` passed **276**, zero failures. Full lint
+`e819afd7-e90b-4f91-9e9f-669fd478b204` passed; the subsequent fixture-only correction was
+scoped-formatted and strict-linted. Broad `2e823a28-4d7d-48c9-9fa7-88863af32adc` passed
+**2,147 executed, 22 skipped, zero failures** (2,136 app, seven domain, four provider), including
+all SessionLinks and admission/sidebar/lane-policy suites. Isolated handoff
+`6f31a359-349c-4a55-be80-2bf7b3bf7d23` passed **104**. Both products
+`f161b52e-9736-462e-a3b5-fd03bcd8e940` passed. Fresh index remains **1,244/1,360 wrong-way
+edges, 53/66 largest-cycle components**; no baseline change. Actual compile warning occurrence
+counts across seven touched Swift files match retained base: **four VM, two link-runtime-bridge
+test warnings**, zero in the other five. No positive occurrence delta. No full-suite, live-app,
+release or hosted-CI qualification is claimed; M9.2b remains open.

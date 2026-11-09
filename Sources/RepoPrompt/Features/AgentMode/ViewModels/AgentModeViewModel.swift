@@ -18976,7 +18976,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func canPresentAskUserInteraction(tabID: UUID) -> Bool {
-        sessions[tabID] != nil
+        guard let session = sessions[tabID], let sessionID = session.activeAgentSessionID,
+              let writer = try? runtimeWriter(sessionID: sessionID) else { return false }
+        // Loading may still be needed; availability requires a stable owner, not completed hydration.
+        return writer.scope === runtimeSessionStore && writer.session === session && !runtimeSessionStore.isRetiring
     }
 
     func askUserInteraction(
@@ -19002,9 +19005,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         interaction: AgentAskUserInteraction,
         lifecycleTarget: AgentSessionLifecycleAuthority.MutationTarget? = nil
     ) async throws -> AgentAskUserResponse {
+        try Task.checkCancellation()
         let original = session(for: tabID)
+        guard let sessionID = original.activeAgentSessionID,
+              let writer = try? runtimeWriter(sessionID: sessionID),
+              writer.scope === runtimeSessionStore, writer.session === original
+        else {
+            throw MCPError.invalidParams("The Agent session is unavailable for its question.")
+        }
         let bindingToken = original.currentRestorationBindingToken
         let session = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true)
+        try Task.checkCancellation()
         guard sessions[tabID] === original, session === original,
               session.currentRestorationBindingToken == bindingToken
         else {
@@ -19016,13 +19027,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if let lifecycleTarget {
             _ = try requireCurrentAgentSessionLifecycleTarget(lifecycleTarget, intent: .askUser)
         }
-        return try await interactionRuntime.askUser(session: session, interaction: interaction)
-    }
-
-    @discardableResult
-    func cancelAskUserInteraction(tabID: UUID, interactionID: UUID) -> Bool {
-        guard let session = sessions[tabID] else { return false }
-        return interactionRuntime.cancelAskUserInteraction(session: session, interactionID: interactionID)
+        guard case let .success(command) = writer.admitCommand() else {
+            throw MCPError.invalidParams("The Agent session changed while preparing its question.")
+        }
+        return try await interactionRuntime.askUser(command: command, interaction: interaction)
     }
 
     /// Forced provider switch declines every pending interaction exactly once through the same

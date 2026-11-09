@@ -1568,11 +1568,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
                 allowsCustom: false
             )]
         )
+        let command = try XCTUnwrap(viewModel.runtimeCommand(sessionID: sessionID))
         let answered = Task { @MainActor in
-            try await withCheckedThrowingContinuation { continuation in
-                session.askUserContinuation = continuation
-                session.pendingAskUser = AgentAskUserPendingState(interaction: interaction)
-            }
+            try await viewModel.interactionRuntime.askUser(command: command, interaction: interaction)
         }
         try await AsyncTestWait.waitUntil("the question to be pending") {
             await MainActor.run { session.askUserContinuation != nil }

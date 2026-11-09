@@ -82,6 +82,7 @@ enum AgentPendingInteractionResolution {
 
 @MainActor
 extension AgentSessionInteractionRuntime {
+    /// Membership for observations and composite managed-response checks, not command admission.
     func owns(_ session: AgentTabSession) -> Bool {
         scope?.sessions[session.tabID] === session && scope?.hasReleasedWriterClaims == false
     }
@@ -118,8 +119,8 @@ extension AgentSessionInteractionRuntime {
     @discardableResult
     func submitAskUserResponse(command: AgentSessionRuntimeStore.Command, interactionID: UUID, draftsByQuestionID: [String: AgentAskUserDraft]) throws -> Bool {
         let session = command.writer.session
-        guard command.writer.scope === scope, command.isCurrent, session.askUserContinuation != nil,
-              var pending = session.pendingAskUser, pending.interaction.id == interactionID else { return false }
+        guard ownsQuestion(command: command, interactionID: interactionID),
+              var pending = session.pendingAskUser else { return false }
         pending.draftsByQuestionID = draftsByQuestionID
         session.pendingAskUser = pending
         return try resolveAskUserResponse(command: command, interactionID: interactionID, skipAll: false)
@@ -133,8 +134,9 @@ extension AgentSessionInteractionRuntime {
     @discardableResult
     func resolveAskUserResponse(command: AgentSessionRuntimeStore.Command, interactionID: UUID, skipAll: Bool) throws -> Bool {
         let session = command.writer.session
-        guard command.writer.scope === scope, command.isCurrent, let pending = session.pendingAskUser,
-              pending.interaction.id == interactionID, let continuation = session.askUserContinuation else { return false }
+        guard ownsQuestion(command: command, interactionID: interactionID),
+              let wait = questionWaits[ObjectIdentifier(session)], let pending = session.pendingAskUser,
+              let continuation = session.askUserContinuation else { return false }
         let elapsedSeconds = max(0, Int(Date().timeIntervalSince(pending.interaction.askedAt)))
         let response = if skipAll {
             pending.interaction.buildSkippedResponse(elapsedSeconds: elapsedSeconds)
@@ -144,8 +146,8 @@ extension AgentSessionInteractionRuntime {
         Self.invalidatePendingAskUserTimeout(for: session)
         session.pendingAskUser = nil
         session.askUserContinuation = nil
-        Self.reconcileInteractiveRunState(session)
-        scope?.presentation.bindingChanged(session)
+        questionWaits.removeValue(forKey: ObjectIdentifier(session))
+        finishQuestionState(session: session, wait: wait)
         continuation.resume(returning: response)
         return true
     }
