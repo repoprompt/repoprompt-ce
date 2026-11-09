@@ -2142,6 +2142,65 @@ final class AgentRunStartBudgetTests: XCTestCase {
         }
     }
 
+    func testControlReadsDuringBindingPreparationDoNotExpireTheLiveHandle() async throws {
+        for conflict in [false, true] {
+            let fixture = try await makeFixture()
+            addTeardownBlock { @MainActor in await fixture.cleanup() }
+            let vm = fixture.window.agentModeViewModel
+            let session = fixture.session
+            let command = try XCTUnwrap(vm.runtimeCommand(sessionID: fixture.sessionID))
+            let prepared = await vm.mcpRuntime.prepareWaitTrackingForRunStart(session: session, stopFence: .init(session: session))
+            XCTAssertTrue(prepared)
+            let context = try XCTUnwrap(session.mcpControlContext)
+            session.runState = .completed
+            session.mcpFollowUpRunPending = true
+            session.mcpFollowUpRunPendingUpdatedAt = Date().addingTimeInterval(-60)
+            let conflictScope = AgentSessionRuntimeStore.shared.makeScope()
+            var generation: UInt64?
+            if conflict {
+                let replica = conflictScope.makeSession(tabID: UUID())
+                XCTAssertEqual(conflictScope.bindingRejection(fixture.sessionID, on: replica), .conflictingWriter)
+                // Legacy corruption only; normal admission above refuses the competing writer.
+                replica.installPersistentSessionBinding(.init(
+                    tabID: replica.tabID, sessionID: fixture.sessionID, workspaceID: command.identity.workspaceID
+                ))
+                replica.mcpControlContext = context
+                conflictScope.replaceSessions([replica.tabID: replica])
+            } else {
+                generation = session.beginPersistentBindingTransition()
+            }
+            defer {
+                if let generation { session.finishPersistentBindingTransition(generation: generation) }
+                conflictScope.replaceSessions([:])
+            }
+            XCTAssertFalse(command.isCurrent, "Unavailable or conflicting writers still refuse mutations")
+            XCTAssertEqual(vm.mcpRegistration(sessionID: fixture.sessionID), context.registration)
+            XCTAssertEqual(vm.mcpWaitCursor(sessionID: fixture.sessionID)?.registration, context.registration)
+            XCTAssertEqual(vm.mcpSnapshot(sessionID: fixture.sessionID)?.status, .running)
+            XCTAssertNil(vm.mcpSnapshot(for: session), "Publication still needs the current exclusive writer")
+            XCTAssertNil(vm.mcpWaitPublication(sessionID: fixture.sessionID), "Waiter wakes must not publish a read-only snapshot")
+            for op in ["poll", "wait"] {
+                let result = try await fixture.service.execute(args: [
+                    "op": .string(op), "session_id": .string(fixture.sessionID.uuidString), "timeout": .double(0.01)
+                ])
+                XCTAssertEqual(result.objectValue?["status"], .string("running"), op)
+                XCTAssertFalse(result.objectValue?["status_text"]?.stringValue?.contains("expired") == true, op)
+            }
+            XCTAssertEqual(session.mcpControlContext, context)
+            XCTAssertTrue(session.mcpFollowUpRunPending, "A read must not clear stale masks without mutation currency")
+            XCTAssertNil(vm.mcpRuntime.stageEpochTransition(command: command, kind: .steering))
+            if let generation {
+                session.finishPersistentBindingTransition(generation: generation)
+                XCTAssertFalse(command.isCurrent, "A preparation generation never revives an old mutation capability")
+                XCTAssertEqual(
+                    vm.mcpRegistration(sessionID: fixture.sessionID),
+                    context.registration,
+                    "Finishing preparation without installing a replacement does not expire the original claim"
+                )
+            }
+        }
+    }
+
     func testPostActivationExpiryKeepsAgedPreEpochSessionPollableWaitableAndCancellable() async throws {
         let fixture = try await makeFixture()
         addTeardownBlock { @MainActor in await fixture.cleanup() }

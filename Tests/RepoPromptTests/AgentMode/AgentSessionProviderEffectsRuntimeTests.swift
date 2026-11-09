@@ -534,11 +534,21 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
         f.scope.replaceSessions([f.session.tabID: f.session, copy.tabID: copy])
         XCTAssertTrue(original.isCurrent, "An unbound copy is not a persistent writer")
         XCTAssertNil(f.scope.mcp.controlledWriter(sessionID: f.sessionID), "Control ambiguity still vetoes routing")
+        XCTAssertEqual(
+            f.scope.mcp.registration(sessionID: f.sessionID),
+            context.registration,
+            "An unbound copy cannot hide the exact installed read receipt"
+        )
+        XCTAssertNotNil(f.scope.mcp.mcpReadSnapshot(for: f.session))
+        XCTAssertNil(f.scope.mcp.mcpReadSnapshot(for: copy))
         f.scope.replaceSessions([f.session.tabID: f.session])
         XCTAssertNotNil(f.scope.mcp.controlledWriter(sessionID: f.sessionID))
 
         let binding = f.session.currentRestorationBindingToken
         f.scope.replaceSessions([:])
+        XCTAssertNil(f.scope.mcp.registration(sessionID: f.sessionID), "A released claim really is expired")
+        XCTAssertNil(f.scope.mcp.waitCursor(sessionID: f.sessionID))
+        XCTAssertNil(f.scope.mcp.mcpReadSnapshot(for: f.session))
         f.scope.replaceSessions([f.session.tabID: f.session])
         guard case let .unique(successor) = f.scope.resolveWriter(sessionID: f.sessionID),
               case let .success(command) = successor.admitCommand() else { return XCTFail("Expected the new writer") }
@@ -548,6 +558,7 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
         XCTAssertNil(f.scope.mcp.registration(sessionID: f.sessionID))
         XCTAssertNil(f.scope.mcp.waitCursor(sessionID: f.sessionID))
         XCTAssertNil(f.scope.mcp.mcpSnapshot(for: f.session))
+        XCTAssertNil(f.scope.mcp.mcpReadSnapshot(for: f.session), "Reads cannot adopt a superseded control incarnation")
         XCTAssertFalse(f.scope.mcp.mcpControlContextMatches(tabID: f.session.tabID, sessionID: f.sessionID, activationID: context.activationID, registration: f.registration))
         f.scope.mcp.setFollowUpRunPending(sessionID: f.sessionID, true)
         XCTAssertFalse(f.session.mcpFollowUpRunPending)
@@ -646,8 +657,14 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
         f.scope.mcp.setFollowUpRunPending(sessionID: f.sessionID, false)
         XCTAssertFalse(f.session.mcpFollowUpRunPending, "Originating cleanup drains binding preparation")
         XCTAssertEqual(f.scope.mcp.controlledWriter(sessionID: f.sessionID)?.identity, writer.identity)
-        XCTAssertNil(f.scope.mcp.registration(sessionID: f.sessionID), "Queries cannot publish while binding preparation is in flight")
-        XCTAssertNil(f.scope.mcp.waitCursor(sessionID: f.sessionID))
+        XCTAssertEqual(
+            f.scope.mcp.registration(sessionID: f.sessionID),
+            f.registration,
+            "An originating control read survives binding preparation"
+        )
+        XCTAssertEqual(f.scope.mcp.waitCursor(sessionID: f.sessionID)?.registration, f.registration)
+        XCTAssertNotNil(f.scope.mcp.mcpReadSnapshot(for: f.session))
+        XCTAssertNil(f.scope.mcp.mcpSnapshot(for: f.session), "Publication still requires the current writer")
     }
 
     func testStagedEpochCleanupUsesOriginatingWriterAndTransitionReceipt() async throws {

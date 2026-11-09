@@ -6283,7 +6283,7 @@ No full-suite or hosted-CI success is claimed for M9.2b. The overseer reports #1
 base; this lane did not read CI logs. The previously frozen endpoint/incarnation and run-ownership
 paths may be worked on after this validated integration, as authorized. M9.2b remains incomplete.
 
-#### M9.2b checkpoint 5 — provider-response body cutover (validation in progress)
+#### M9.2b checkpoint 5 — provider-response body cutover
 
 The interaction runtime now owns the actual Codex/Claude/ACP approval, Codex permissions,
 MCP elicitation and user-input response bodies. Each explicit response synchronously checks its
@@ -6342,3 +6342,38 @@ Checkpoint validation before integrating the next M9.2a base:
 - The broader SessionLinks/isolated-handoff, product and fresh-index push gates are still required
   after the requested normal integration of the updated M9.2a branch. This is not a push or a
   complete M9.2b validation receipt.
+
+#### M9.2b checkpoint 5 integration — M9.2a `8d3b3d1ac`
+
+Normally merged `8d3b3d1ac52cd4d6b804b3393b81ed8b56f8101a` onto checkpoint 5
+`424d76bb6`. The only textual conflict placed two helpers at the same runtime-store insertion
+point; both the structural copied-control holder check and incoming control-read identity check
+are retained. Incoming control reads remain available across writer transitions, while mutations
+still require exact command admission. The non-terminal unavailable wait result and main's #1664
+flake-test fixes are preserved. No rebase, history rewrite or assertion/budget relaxation.
+
+Merged-tree push gates:
+- Broad 105-suite selection `41fb6f2b-26d3-4d2d-9761-9878f60b83c6`: **2086 executed,
+  8 skipped, zero failures**. Includes every SessionLinks suite, admission/sidebar/lane-policy,
+  all provider-effects classes, MCP steer/resume, and the affected response/coordinator suites.
+  This reruns the former six M9.2a failure families and the prior LateQualification intermittent.
+- Isolated HandoffInheritance `702b763c-1d82-4b09-8d45-9ccc94200ff2`: **104 passed**;
+  scale **4.47s** (broad run **5.13s**). Historical render/scale failures were inherited baseline
+  (reproduced on `e42006ff8` under broad load; isolated 3×104 passed on base and head), tracked
+  separately; this integration includes the subsequently merged flake fixes.
+- Both products `1020e342-b65a-4418-8304-129d81154958` and full lint
+  `1da826d5-83b6-43ca-a387-fe1f61fb4b80` passed. Fresh compiler index: **1243/1360** wrong-way
+  file edges and **53/66** largest cycle components. The new response-body file introduces its
+  payload dependency on `ViewModels/AgentTabSession.swift`; the count increased by one from the
+  prior checkpoint. No ratchet baseline was changed; payload ownership retirement remains open.
+- Warning occurrence audit across **18 Swift files**, using actual merged compilation and the
+  retained exact `ddf34184a` baseline compilation: **4** VM, **3** MCP tool-service, **17** Codex
+  resume/wedge, **1** MCP steer/resume diagnostic occurrences, zero in the other audited paths.
+  Counts match the baseline; **no positive deltas**. This is not a zero-total-warning claim.
+- Local `make ci-app-test-runner-selftest`: the sandboxed attempt could not execute `ps` and
+  failed process-supervision assertions. The approved unsandboxed rerun passed **200 tests**
+  across eight groups. No harness source or assertions were changed to obtain the pass.
+
+These are local selected-suite/product receipts, not full-suite, live-app, release or hosted-CI
+qualification. The provider transport receipt fence and remaining ledger routing groups are open;
+M9.2b is not complete.
