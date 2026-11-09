@@ -7955,8 +7955,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func mcpSnapshot(sessionID: UUID) -> AgentRunMCPSnapshot? {
-        guard let session = mcpControlledSession(sessionID: sessionID) else { return nil }
-        return mcpSnapshot(for: session)
+        guard let session = mcpRuntime.controlRead(sessionID: sessionID).session else { return nil }
+        return mcpRuntime.mcpReadSnapshot(for: session)
     }
 
     func mcpSnapshot(registration: AgentRunSessionStore.Registration) -> AgentRunMCPSnapshot? {
@@ -7969,21 +7969,24 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func mcpSnapshot(cursor: AgentRunSessionStore.WaitCursor) -> AgentRunMCPSnapshot? {
-        guard let session = mcpControlledSession(sessionID: cursor.registration.sessionID),
+        guard let session = mcpRuntime.controlRead(sessionID: cursor.registration.sessionID, registration: cursor.registration).session,
               let context = session.mcpControlContext,
               context.registration == cursor.registration,
               context.currentEpoch == cursor.epoch
         else {
             return nil
         }
-        return mcpSnapshot(for: session)
+        return mcpRuntime.mcpReadSnapshot(for: session)
     }
 
     func mcpWaitPublication(
         sessionID: UUID
     ) -> (snapshot: AgentRunMCPSnapshot, cursor: AgentRunSessionStore.WaitCursor)? {
         guard let cursor = mcpWaitCursor(sessionID: sessionID),
-              let snapshot = mcpSnapshot(cursor: cursor)
+              let session = mcpControlledSession(sessionID: sessionID),
+              session.mcpControlContext?.registration == cursor.registration,
+              session.mcpControlContext?.currentEpoch == cursor.epoch,
+              let snapshot = mcpSnapshot(for: session)
         else {
             return nil
         }

@@ -99,14 +99,38 @@ final class AgentSessionMCPRuntime {
         return scope.originatingWriter(identity: context.writerIdentity, session: session)
     }
 
+    enum ControlReadResolution {
+        case available(AgentTabSession)
+        case unavailable
+        case expired
+
+        var session: AgentTabSession? {
+            if case let .available(session) = self { return session }
+            return nil
+        }
+    }
+
+    /// Select only the context installed on this exact claim, not an unbound copy or a
+    /// replacement incarnation. Conflicting write claims do not expire an existing read receipt.
+    func controlRead(sessionID: UUID, registration: AgentRunSessionStore.Registration? = nil) -> ControlReadResolution {
+        guard let scope else { return .expired }
+        let matches = scope.sessions.values.filter { session in
+            guard let context = session.mcpControlContext,
+                  context.sessionID == sessionID, context.writerIdentity.sessionID == sessionID,
+                  context.registration.sessionID == sessionID,
+                  registration == nil || context.registration == registration else { return false }
+            return scope.matchesControlReadIdentity(context.writerIdentity, session: session)
+        }
+        guard matches.count <= 1 else { return .unavailable }
+        return matches.first.map(ControlReadResolution.available) ?? .expired
+    }
+
     func registration(sessionID: UUID) -> AgentRunSessionStore.Registration? {
-        guard let writer = controlledWriter(sessionID: sessionID), writer.isCurrent else { return nil }
-        return writer.session.mcpControlContext?.registration
+        controlRead(sessionID: sessionID).session?.mcpControlContext?.registration
     }
 
     func waitCursor(sessionID: UUID) -> AgentRunSessionStore.WaitCursor? {
-        guard let writer = controlledWriter(sessionID: sessionID), writer.isCurrent,
-              let context = writer.session.mcpControlContext else { return nil }
+        guard let context = controlRead(sessionID: sessionID).session?.mcpControlContext else { return nil }
         return .init(registration: context.registration, epoch: context.currentEpoch)
     }
 
@@ -602,6 +626,29 @@ final class AgentSessionMCPRuntime {
             guard let writer = controlledWriter(sessionID: context.sessionID),
                   writer.session === session, writer.isCurrent else { return nil }
         }
+        return buildSnapshot(
+            for: session, context: context, canonicalTerminalState: canonicalTerminalState,
+            canonicalProviderRunID: canonicalProviderRunID, canonicalFailureReason: canonicalFailureReason,
+            mayClearStaleMasks: true
+        )
+    }
+
+    func mcpReadSnapshot(for session: AgentTabSession) -> AgentRunMCPSnapshot? {
+        guard let context = session.mcpControlContext,
+              controlRead(sessionID: context.sessionID, registration: context.registration).session === session else { return nil }
+        let writer = controlledWriter(sessionID: context.sessionID)
+        return buildSnapshot(
+            for: session, context: context, canonicalTerminalState: nil,
+            canonicalProviderRunID: nil, canonicalFailureReason: nil,
+            mayClearStaleMasks: writer?.session === session && writer?.isCurrent == true
+        )
+    }
+
+    private func buildSnapshot(
+        for session: AgentTabSession, context: AgentMCPControlContext,
+        canonicalTerminalState: AgentSessionRunState?, canonicalProviderRunID: UUID?,
+        canonicalFailureReason: AgentRunMCPSnapshot.FailureReason?, mayClearStaleMasks: Bool
+    ) -> AgentRunMCPSnapshot {
         let interaction = canonicalTerminalState == nil ? mcpPendingInteraction(for: session) : nil
         let status: AgentRunMCPSnapshot.Status = {
             if let canonicalTerminalState {
@@ -651,7 +698,7 @@ final class AgentSessionMCPRuntime {
             let supersedingMaskIsStale = session.pendingSupersedingTurnCompletions > 0
                 && session.pendingSupersedingTurnCompletionsUpdatedAt.map { now.timeIntervalSince($0) > 15 } == true
             if let terminalStatus,
-               context.currentEpoch != nil,
+               mayClearStaleMasks, context.currentEpoch != nil,
                followUpMaskIsStale || supersedingMaskIsStale,
                session.agentTask == nil,
                session.pendingInstructions.isEmpty,

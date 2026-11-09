@@ -246,6 +246,18 @@ final class AgentSessionRuntimeStore {
             return writer.ownsPersistentClaim ? writer : nil
         }
 
+        /// Read provenance is not command admission. The installed control receipt remains
+        /// readable while its exact claim is suspended or another claim makes writes ambiguous.
+        /// A real binding install or release/reacquire rotates the claim and invalidates it.
+        func matchesControlReadIdentity(_ identity: WriterIdentity, session: AgentTabSession) -> Bool {
+            identity.scopeID == id && !hasReleasedWriterClaims
+                && sessions[session.tabID] === session
+                && session.persistentSessionBindingIdentity == identity.restoration.bindingIdentity
+                && session.persistentSessionBindingIdentity?.workspaceID == identity.workspaceID
+                && liveClaimByTabID[session.tabID]?.sessionID == identity.sessionID
+                && liveClaimByTabID[session.tabID]?.incarnationID == identity.incarnationID
+        }
+
         let presentation = AgentSessionPresentationRuntime()
         let usage = AgentSessionUsageRuntime()
         lazy var turnTiming = AgentSessionTurnTimingRuntime(presentation: presentation)
