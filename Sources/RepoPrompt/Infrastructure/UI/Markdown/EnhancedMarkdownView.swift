@@ -437,6 +437,7 @@ enum AttributedTextMeasurementWidthResolver {
 }
 
 struct AttributedTextView: NSViewRepresentable {
+    @Environment(\.activityMainWork) private var activityMainWork
     let attributedString: NSAttributedString
     let isEditable: Bool
     let allowsTextSelection: Bool
@@ -476,6 +477,9 @@ struct AttributedTextView: NSViewRepresentable {
     }
 
     func updateNSView(_ textView: CodeBlockTextView, context: Context) {
+        let activity = activityMainWork
+        activity?.begin(.markdown)
+        defer { activity?.end(.markdown) }
         context.coordinator.opener = linkOpener
         // Detect attribute changes (not just the raw string).
         let current = textView.attributedString()

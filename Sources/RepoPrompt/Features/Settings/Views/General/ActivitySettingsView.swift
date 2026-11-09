@@ -51,6 +51,8 @@ struct ActivitySettingsView: View {
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .hoverTooltip(row.window)
                             Text(row.agents.text)
+                            Text(row.mainWork)
+                            Text(row.dominantKind)
                             Text(row.rate)
                             Text(row.root).lineLimit(1).hoverTooltip(row.root)
                             Text(row.status)
@@ -79,11 +81,13 @@ struct ActivitySettingsView: View {
             await ActivityRefreshLoop.run(visible: isPresentationVisible) {
                 let mainThreadCPU = await mainThread.read()
                 guard !Task.isCancelled else { return }
-                let snapshots = windows.activityLedger.snapshot()
+                var snapshots = Dictionary(uniqueKeysWithValues: windows.activityLedger.snapshot().map { ($0.windowID, $0) })
                 let cpu = process.readCPU()
                 let memory = ActivityProcessSampler.residentMiB()
                 let rows = windows.allWindows.filter { !$0.isClosing && !$0.isPreparedSessionOwner }.map { window in
-                    let snapshot = snapshots.first { $0.windowID == window.windowID }
+                    var snapshot = snapshots[window.windowID]
+                    snapshot?.mainWork = window.workspaceManager.activityMainWork?.snapshot ?? .init()
+                    snapshots[window.windowID] = snapshot
                     return ActivityDisplay.Row(
                         id: window.windowID, title: window.displayedWindowTitle,
                         snapshot: snapshot, previous: previous[window.windowID],
@@ -91,7 +95,7 @@ struct ActivitySettingsView: View {
                     )
                 }
                 display = ActivityDisplay(cpu: cpu, memory: memory, rows: rows, sort: sort, mainThreadCPU: mainThreadCPU)
-                previous = Dictionary(uniqueKeysWithValues: snapshots.map { ($0.windowID, $0) })
+                previous = snapshots
             }
         }
     }
@@ -117,11 +121,13 @@ struct ActivityAgentCounts {
 }
 
 struct ActivityDisplay {
-    static let caveat = "Agents show resident session states, not CPU. Window times currently cover file watching, including waits; drawing and other work are not measured. CPU: 100% = one core."
+    static let caveat = "Agents show resident session states, not CPU. Main-thread work covers stored selection, markdown presentation and session routing; dominant kind uses their inclusive times. Watcher time is separate. Times include waiting; drawing and other work are not measured. CPU: 100% = one core."
     static let unattributed = "CPU not attributed to windows: not measured"
     enum Column: String, CaseIterable {
         case window = "Window"
         case agents = "Agents"
+        case mainWork = "Main-thread work"
+        case dominantKind = "Dominant kind"
         case rate = "Watcher busy"
         case root = "Last busy folder"
         case status = "File watcher"
@@ -151,6 +157,8 @@ struct ActivityDisplay {
             case .agents:
                 let running = Self.compare(lhs.agents.running, rhs.agents.running)
                 order = running == .orderedSame ? Self.compare(lhs.agents.waiting, rhs.agents.waiting) : running
+            case .mainWork: order = Self.compare(lhs.rawMainWork ?? -1, rhs.rawMainWork ?? -1)
+            case .dominantKind: order = Self.compareText(lhs.dominantKind, rhs.dominantKind)
             case .root: order = Self.compareText(lhs.fullRoot, rhs.fullRoot)
             case .rate: order = Self.compare(lhs.rawRate ?? -1, rhs.rawRate ?? -1)
             case .total: order = Self.compare(lhs.snapshot?.busyTotal ?? 0, rhs.snapshot?.busyTotal ?? 0)
@@ -190,6 +198,9 @@ struct ActivityDisplay {
         let rawRate: Double?
         let fullRoot: String
         let agents: ActivityAgentCounts
+        let mainWork: String
+        let rawMainWork: Double?
+        let dominantKind: String
 
         // Ascending: never recorded, idle, busy. Descending puts busy episodes first.
         var watcherPhase: Int {
@@ -212,6 +223,31 @@ struct ActivityDisplay {
             fullRoot = snapshot?.root.map { $0 == "Multiple roots" ? "Multiple folders" : $0 } ?? "—"
             root = ActivityDisplay.label(fullRoot)
             total = ActivityDisplay.duration(snapshot?.busyTotal ?? 0)
+            if let snapshot, let previous, snapshot.sampledAt > previous.sampledAt,
+               snapshot.mainWork.union >= previous.mainWork.union
+            {
+                let elapsed = Double(snapshot.sampledAt - previous.sampledAt)
+                let millisecondsPerSecond = Double(snapshot.mainWork.union - previous.mainWork.union) / elapsed * 1000
+                rawMainWork = millisecondsPerSecond
+                mainWork = millisecondsPerSecond > 0 && millisecondsPerSecond < 0.1 ? "<0.1 ms/s"
+                    : ActivityDisplay.number(millisecondsPerSecond, decimals: 1) + " ms/s"
+                // These are inclusive synchronous category times, never compared or added to watcher waits.
+                var largest: UInt64 = 0
+                var dominant: ActivityMainWorkCounters.Kind?
+                for kind in ActivityMainWorkCounters.Kind.allCases {
+                    let current = snapshot.mainWork.total(for: kind)
+                    let before = previous.mainWork.total(for: kind)
+                    let delta = current >= before ? current - before : 0
+                    if delta > largest { largest = delta
+                        dominant = kind
+                    }
+                }
+                dominantKind = dominant?.rawValue ?? "—"
+            } else {
+                rawMainWork = nil
+                mainWork = "Measuring…"
+                dominantKind = "—"
+            }
             if let snapshot, let previous, snapshot.sampledAt > previous.sampledAt, snapshot.busyTotal >= previous.busyTotal {
                 let fraction = Double(snapshot.busyTotal - previous.busyTotal) / Double(snapshot.sampledAt - previous.sampledAt)
                 rawRate = fraction
@@ -239,6 +275,8 @@ struct ActivityDisplay {
             """
             \(row.window)
               Agents: \(row.agents.text)
+              Main-thread work: \(row.mainWork)
+              Dominant kind: \(row.dominantKind)
               Watcher busy: \(row.rate)
               Last busy folder: \(row.root)
               File watcher: \(row.status)

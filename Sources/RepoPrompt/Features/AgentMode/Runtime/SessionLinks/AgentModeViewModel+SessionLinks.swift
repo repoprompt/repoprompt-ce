@@ -59,6 +59,9 @@ extension AgentModeViewModel {
     /// - Parameter isWindowClosing: the owning window's `isClosing` flag. A closing window's tabs are
     ///   never offered as endpoints.
     func agentSessionLinkCandidates(isWindowClosing: Bool, includeLocation: Bool = true) -> [AgentSessionLinkEndpointCandidate] {
+        let activity = workspaceManager?.activityMainWork
+        activity?.begin(.routing)
+        defer { activity?.end(.routing) }
         guard let workspaceManager else { return [] }
         return workspaceManager.workspaces.filter { $0.id == workspaceManager.activeWorkspaceID }.flatMap { workspace in
             workspace.composeTabs.compactMap { tab in
@@ -88,6 +91,9 @@ extension AgentModeViewModel {
     func agentSessionLinkCandidates(
         forSessionIDs sessionIDs: Set<UUID>, includeLocation: Bool
     ) -> [UUID: [AgentSessionLinkEndpointCandidate]] {
+        let activity = workspaceManager?.activityMainWork
+        activity?.begin(.routing)
+        defer { activity?.end(.routing) }
         var result = Dictionary(uniqueKeysWithValues: sessionIDs.map { ($0, [AgentSessionLinkEndpointCandidate]()) })
         guard let workspaceManager, let workspaceID = workspaceManager.activeWorkspaceID else { return result }
         for sessionID in sessionIDs {

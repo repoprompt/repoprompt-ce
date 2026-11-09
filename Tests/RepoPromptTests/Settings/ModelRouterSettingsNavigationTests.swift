@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 @testable import RepoPromptApp
 @testable import RepoPromptFileSystem
@@ -667,9 +668,9 @@ final class ActivitySettingsTests: XCTestCase {
 
     func testWatcherColumnLabelsAndRawNumericSortsStayStableAcrossRefresh() {
         XCTAssertEqual(ActivityDisplay.Column.allCases.map(\.rawValue), [
-            "Window", "Agents", "Watcher busy", "Last busy folder", "File watcher", "Watcher busy total"
+            "Window", "Agents", "Main-thread work", "Dominant kind", "Watcher busy", "Last busy folder", "File watcher", "Watcher busy total"
         ])
-        XCTAssertEqual(ActivityDisplay.caveat, "Agents show resident session states, not CPU. Window times currently cover file watching, including waits; drawing and other work are not measured. CPU: 100% = one core.")
+        XCTAssertEqual(ActivityDisplay.caveat, "Agents show resident session states, not CPU. Main-thread work covers stored selection, markdown presentation and session routing; dominant kind uses their inclusive times. Watcher time is separate. Times include waiting; drawing and other work are not measured. CPU: 100% = one core.")
         func row(_ id: Int, title: String, root: String, total: UInt64, busy: Bool, age: UInt64 = 100_000_000) -> ActivityDisplay.Row {
             let previous = WindowActivityLedger.Snapshot(windowID: id, sampledAt: 0, busyTotal: 0, busySince: nil, lastEnded: nil, root: nil)
             let current = WindowActivityLedger.Snapshot(
@@ -697,7 +698,7 @@ final class ActivitySettingsTests: XCTestCase {
                 let refreshed = ActivityDisplay(rows: rows.reversed(), sort: sort)
                 XCTAssertEqual(display.rows.map(\.id), refreshed.rows.map(\.id))
                 XCTAssertEqual(display.sorted(by: sort).rows.map(\.id), display.rows.map(\.id))
-                let expected = column == .agents ? [1, 2, 3] : column == .window ? (ascending ? [1, 2, 3] : [3, 1, 2])
+                let expected = [.agents, .mainWork, .dominantKind].contains(column) ? [1, 2, 3] : column == .window ? (ascending ? [1, 2, 3] : [3, 1, 2])
                     : (ascending ? [3, 1, 2] : [1, 2, 3])
                 XCTAssertEqual(display.rows.map(\.id), expected, "\(column) ascending=\(ascending)")
             }
@@ -836,9 +837,11 @@ final class ActivitySettingsTests: XCTestCase {
         Memory: 2400 MiB
         Main thread CPU: Measuring…
         CPU not attributed to windows: not measured
-        Agents show resident session states, not CPU. Window times currently cover file watching, including waits; drawing and other work are not measured. CPU: 100% = one core.
+        Agents show resident session states, not CPU. Main-thread work covers stored selection, markdown presentation and session routing; dominant kind uses their inclusive times. Watcher time is separate. Times include waiting; drawing and other work are not measured. CPU: 100% = one core.
         Window 1: repo window
           Agents: 0 running, 0 waiting
+          Main-thread work: Measuring…
+          Dominant kind: —
           Watcher busy: Measuring…
           Last busy folder: repo root
           File watcher: Busy 1 m 04 s
@@ -851,5 +854,195 @@ final class ActivitySettingsTests: XCTestCase {
         XCTAssertEqual(SettingsTab.activity.title, "Activity")
         XCTAssertEqual(SettingsTab.activity.section, .general)
         XCTAssertFalse(SettingsTab.advanced.searchTags.contains("activity"))
+    }
+}
+
+// Test-process-only libmalloc probe; never installed by the app. Count on the main thread only.
+private typealias ActivityMallocLogger = @convention(c) (UInt32, UInt, UInt, UInt, UInt, UInt32) -> Void
+private nonisolated(unsafe) var activityAllocations = 0
+private nonisolated(unsafe) var activityCounting = false
+private let activityMallocLogger: ActivityMallocLogger = { type, _, _, _, _, _ in
+    if pthread_main_np() != 0, activityCounting, type & 2 != 0 { activityAllocations += 1 }
+}
+
+@MainActor
+final class ActivityMainWorkTests: XCTestCase {
+    func testNestedKindsCountUnionAndDestinationIndependently() {
+        let first = ActivityMainWorkCounters()
+        let second = ActivityMainWorkCounters()
+        first.begin(.selection, at: 10)
+        first.begin(.selection, at: 20)
+        first.begin(.markdown, at: 30)
+        second.begin(.routing, at: 35)
+        first.end(.selection, at: 40)
+        first.end(.markdown, at: 50)
+        first.end(.selection, at: 60)
+        second.end(.routing, at: 75)
+        XCTAssertEqual(first.selection.total, 50)
+        XCTAssertEqual(first.markdown.total, 20)
+        XCTAssertEqual(first.union.total, 50)
+        XCTAssertEqual(second.routing.total, 40)
+        XCTAssertEqual(second.selection.total, 0)
+    }
+
+    func testVisible35WindowSnapshotBudgetAndHiddenCountersOnly() async {
+        let counters = (1 ... 35).map { _ in ActivityMainWorkCounters() }
+        final class Clock: @unchecked Sendable { var now: UInt64 = 1_000_000_000 }
+        let clock = Clock()
+        let ledger = WindowActivityLedger(clock: { clock.now })
+        for id in 1 ... 35 {
+            ledger.registerWindow(id)
+        }
+        let baseline = Dictionary(uniqueKeysWithValues: ledger.snapshot().map { ($0.windowID, $0) })
+        var ticks = 0
+        var sleeps = 0
+        await ActivityRefreshLoop.run(visible: false, tick: { ticks += 1 }, sleep: { sleeps += 1 })
+        // Ordinary work still records while hidden, without scheduling any diagnostic work.
+        counters[24].begin(.selection, at: 10_000_000)
+        counters[24].begin(.markdown, at: 20_000_000)
+        counters[24].end(.markdown, at: 30_000_000)
+        counters[24].end(.selection, at: 40_000_000)
+        counters[25].begin(.routing, at: 20_000_000)
+        counters[25].end(.routing, at: 40_000_000)
+        ledger.record(windowID: 1, phase: .began, root: "repo")
+        clock.now += 500_000_000
+        ledger.record(windowID: 1, phase: .ended)
+        clock.now += 1_500_000_000
+        XCTAssertEqual(ticks, 0)
+        XCTAssertEqual(sleeps, 0)
+        XCTAssertNil(EnvironmentValues().activityMainWork, "Reusable markdown without a window has no owner")
+        var timings: [UInt64] = []
+        for _ in 0 ..< 100 {
+            let start = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)
+            let rows = ledger.snapshot().map { value in
+                var current = value
+                current.mainWork = counters[value.windowID - 1].snapshot
+                return ActivityDisplay.Row(id: value.windowID, title: "Window \(value.windowID)", snapshot: current, previous: baseline[value.windowID])
+            }
+            let display = ActivityDisplay(rows: rows, sort: .init(column: .mainWork, ascending: false))
+            timings.append(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - start)
+            XCTAssertEqual(display.rows.prefix(2).map(\.id), [25, 26])
+            XCTAssertEqual(display.rows.first?.mainWork, "15.0 ms/s", "Use the actual two-second interval and union, not sum, of nested categories")
+            XCTAssertEqual(display.rows.first?.dominantKind, "Stored selection")
+            XCTAssertEqual(display.rows.first?.rate, "0%", "Watcher waits remain separate from synchronous work")
+            XCTAssertEqual(display.rows.first(where: { $0.id == 1 })?.rate, "25%")
+            XCTAssertEqual(display.rows.first(where: { $0.id == 26 })?.dominantKind, "Session routing")
+            XCTAssertTrue(display.report.contains("Main-thread work: 15.0 ms/s\n  Dominant kind: Stored selection"))
+            XCTAssertFalse(display.report.contains("Window CPU"))
+        }
+        let p95 = timings.sorted()[95]
+        print("ACTIVITY_PHASE2_35_WINDOWS p95_ns=\(p95) budget_ns=20000000")
+        XCTAssertLessThan(p95, 20_000_000)
+        // A new owner cannot inherit a former window's counters, even if the displayed ID is reused.
+        let replacement = ActivityMainWorkCounters()
+        XCTAssertEqual(replacement.snapshot, .init())
+        ledger.removeWindow(25)
+        ledger.registerWindow(25)
+        XCTAssertEqual(ledger.snapshot().first(where: { $0.windowID == 25 })?.mainWork, .init())
+    }
+
+    func testAdmissionOverheadAllocationAndInputDelay() async throws {
+        let counters = ActivityMainWorkCounters()
+        // Warm runtime metadata and accessors before observing calls.
+        for _ in 0 ..< 1000 {
+            counters.begin(.selection)
+            counters.end(.selection)
+        }
+        guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "malloc_logger") else {
+            throw XCTSkip("libmalloc allocation probe is unavailable; overhead admission remains unproven")
+        }
+        let logger = symbol.assumingMemoryBound(to: ActivityMallocLogger?.self)
+        guard logger.pointee == nil else { throw XCTSkip("Do not replace an existing allocation profiler") }
+        logger.pointee = activityMallocLogger
+        defer { activityCounting = false
+            logger.pointee = nil
+        }
+        activityAllocations = 0
+        activityCounting = true
+        var iteration = 0
+        while iteration < 10000 {
+            counters.begin(.selection)
+            counters.end(.selection)
+            iteration += 1
+        }
+        activityCounting = false
+        let allocations = activityAllocations
+        XCTAssertEqual(allocations, 0, "FAIL admission: allocations in empty begin/end pairs")
+
+        var sink: UInt64 = 1
+        let paths = Array(0 ..< 500).map(UInt64.init)
+        let tabs = Array(0 ..< 1000).map(UInt64.init)
+        func representative() {
+            for path in paths {
+                sink = (sink &* 31) &+ path
+            }
+            sink ^= tabs[Int(sink % 1000)]
+        }
+        // Debug payload iteration can itself allocate. Compare identical warmed work, not its absolute count.
+        representative()
+        activityAllocations = 0
+        activityCounting = true
+        iteration = 0
+        while iteration < 100 {
+            representative()
+            iteration += 1
+        }
+        activityCounting = false
+        let payloadAllocations = activityAllocations
+        activityAllocations = 0
+        activityCounting = true
+        iteration = 0
+        while iteration < 100 {
+            counters.begin(.selection)
+            representative()
+            counters.end(.selection)
+            iteration += 1
+        }
+        activityCounting = false
+        let wrappedPayloadAllocations = activityAllocations
+        XCTAssertEqual(wrappedPayloadAllocations, payloadAllocations, "FAIL admission: wrapper added representative allocations")
+
+        var emptyOff: [UInt64] = [], emptyOn: [UInt64] = []
+        var representativeOff: [UInt64] = [], representativeOn: [UInt64] = []
+        var delayOff: [UInt64] = [], delayOn: [UInt64] = []
+        func sample(enabled: Bool, work: Bool) -> UInt64 {
+            let start = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)
+            for _ in 0 ..< 100 {
+                if enabled { counters.begin(.selection) }
+                if work { representative() } else { sink &+= 1 }
+                if enabled { counters.end(.selection) }
+            }
+            return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - start
+        }
+        for index in 0 ..< 100 {
+            // Alternate order to avoid systematically giving the warm/faster half to one mode.
+            for enabled in index.isMultiple(of: 2) ? [false, true] : [true, false] {
+                let empty = sample(enabled: enabled, work: false) / 100
+                let work = sample(enabled: enabled, work: true) / 100
+                if enabled { emptyOn.append(empty)
+                    representativeOn.append(work)
+                } else { emptyOff.append(empty)
+                    representativeOff.append(work)
+                }
+                // Queue an input sentinel behind one 500-path handler (no app/provider launch).
+                let start = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)
+                if enabled { counters.begin(.selection) }
+                representative()
+                if enabled { counters.end(.selection) }
+                let delay: UInt64 = await withCheckedContinuation { continuation in
+                    DispatchQueue.main.async {
+                        continuation.resume(returning: clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - start)
+                    }
+                }
+                if enabled { delayOn.append(delay) } else { delayOff.append(delay) }
+            }
+        }
+        func p95(_ values: [UInt64]) -> UInt64 {
+            values.sorted()[values.count * 95 / 100]
+        }
+        print("ACTIVITY_ADMISSION allocations=\(allocations) payload_allocations_off=\(payloadAllocations) payload_allocations_on=\(wrappedPayloadAllocations) empty_off_p95_ns=\(p95(emptyOff)) empty_on_p95_ns=\(p95(emptyOn)) representative_off_p95_ns=\(p95(representativeOff)) representative_on_p95_ns=\(p95(representativeOn)) input_off_p95_ns=\(p95(delayOff)) input_on_p95_ns=\(p95(delayOn)) sink=\(sink)")
+        XCTAssertLessThan(p95(emptyOn), 1000, "FAIL admission: empty wrapper p95 exceeds 1 us")
+        // A 20 us noise allowance is below a single frame's input budget; no latency claim beyond this fake workload.
+        XCTAssertLessThanOrEqual(p95(delayOn), p95(delayOff) + 20000, "FAIL admission: added input delay exceeds 20 us")
     }
 }

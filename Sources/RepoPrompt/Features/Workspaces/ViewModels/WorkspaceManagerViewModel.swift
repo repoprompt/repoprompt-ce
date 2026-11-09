@@ -1191,6 +1191,8 @@ enum DomainCatalogApplicationResult: Equatable {
 /// in its own folder + workspace.json, and maintain an index file for all known workspaces.
 @MainActor
 class WorkspaceManagerViewModel: ObservableObject {
+    // Installed once by window composition; nonvisual owners have no window work to charge.
+    var activityMainWork: ActivityMainWorkCounters?
     let restorePerfRecorder: any WorkspaceRestorePerfRecording
     private let workspaceSaveTracer: WorkspaceSaveTracer
 
@@ -11105,6 +11107,9 @@ class WorkspaceManagerViewModel: ObservableObject {
     @MainActor
     @discardableResult
     func updateComposeTabStoredOnly(_ tab: ComposeTabState, inWorkspaceID workspaceID: UUID) -> Bool {
+        let activity = activityMainWork
+        activity?.begin(.selection)
+        defer { activity?.end(.selection) }
         guard let workspaceIndex = workspaces.firstIndex(where: { $0.id == workspaceID }),
               let tabIndex = workspaces[workspaceIndex].composeTabs.firstIndex(where: { $0.id == tab.id })
         else { return false }

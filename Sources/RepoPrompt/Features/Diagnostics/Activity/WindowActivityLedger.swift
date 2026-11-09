@@ -1,6 +1,6 @@
 import Foundation
 
-/// Settings > Advanced reads this ledger without waiting on a busy filesystem actor.
+/// Settings > Activity reads this ledger without waiting on a busy filesystem actor.
 final class WindowActivityLedger: @unchecked Sendable {
     enum Kind { case fileWatching }
     enum Phase { case began, ended }
@@ -11,6 +11,7 @@ final class WindowActivityLedger: @unchecked Sendable {
         let busySince: UInt64?
         let lastEnded: UInt64?
         let root: String?
+        var mainWork = ActivityMainWorkCounters.Snapshot()
     }
 
     private struct State {

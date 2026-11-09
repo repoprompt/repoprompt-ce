@@ -32,6 +32,7 @@ struct WindowContentView: View {
             .debugBuildWindowEdge()
             .environmentObject(windowState) // If your subviews need it
             .environment(\.windowIsPresentationVisible, windowState.isPresentationVisible)
+            .environment(\.activityMainWork, windowState.workspaceManager.activityMainWork)
             .environment(\.agentModePerfRecorder, windowState.agentModeViewModel.perfRecorder)
             .environmentObject(sparkleManager)
             .environmentObject(versionManager) // Pass versionManager to ContentView
