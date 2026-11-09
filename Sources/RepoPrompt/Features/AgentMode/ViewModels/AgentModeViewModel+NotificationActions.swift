@@ -44,16 +44,18 @@ extension AgentModeViewModel: AgentNotificationActionTarget {
         guard let session = sessions[tabID], session.pendingAskUser?.interaction.id == interactionID else {
             return false
         }
-        try submitAskUserResponse(tabID: tabID, interactionID: interactionID, draftsByQuestionID: draftsByQuestionID)
-        return session.pendingAskUser?.interaction.id != interactionID
+        guard let sessionID = session.activeAgentSessionID,
+              let command = try runtimeCommand(sessionID: sessionID), command.writer.session === session else { return false }
+        return try interactionRuntime.submitAskUserResponse(command: command, interactionID: interactionID, draftsByQuestionID: draftsByQuestionID)
     }
 
     func notificationSkipAskUser(tabID: UUID, interactionID: UUID) -> Bool {
         guard let session = sessions[tabID], session.pendingAskUser?.interaction.id == interactionID else {
             return false
         }
-        skipAskUser(tabID: tabID, interactionID: interactionID)
-        return session.pendingAskUser?.interaction.id != interactionID
+        guard let sessionID = session.activeAgentSessionID,
+              let command = try? runtimeCommand(sessionID: sessionID), command.writer.session === session else { return false }
+        return interactionRuntime.skipAskUser(command: command, interactionID: interactionID)
     }
 
     func notificationSubmitUserInput(tabID: UUID, requestID: UUID, answers: [String: [String]]) -> Bool {

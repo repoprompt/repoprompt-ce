@@ -57,7 +57,7 @@ Everything lives on `AgentTabSession` (`Features/AgentMode/ViewModels/AgentTabSe
 | `pendingPermissionsRequest` (Codex) | Codex ~8560 | `codexCoordinator.submitPermissionsDecision` (id-checked) | `approval` |
 | `pendingMCPElicitationRequest` (+ queue) | Codex ~8572 | `submitMCPElicitationResponse(tabID:requestID:response:)` | `mcpElicitation` |
 | `pendingUserInputRequest` (+ queue; questions may be `isSecret`) | Codex ~8596 | `submitUserInputResponse(tabID:requestID:response:)` | `userInput` |
-| `pendingAskUser: AgentAskUserPendingState` | `AgentModeViewModel` ~19809+ (ask_user tool) | `submitAskUserResponse(tabID:interactionID:draftsByQuestionID:)`, `skipAskUser` | `question` |
+| `pendingAskUser: AgentAskUserPendingState` | `AgentSessionInteractionRuntime` (ask_user tool) | `submitAskUserResponse(command:interactionID:draftsByQuestionID:)`, `skipAskUser` | `question` |
 | `pendingCodexHookReview` | Codex ~739–1190 | `submitCodexHookReviewDecision` (id-checked, async) | `hookApproval` |
 | `pendingApplyEditsReview` | `AgentSessionInteractionRuntime` approval-store subscription | `AgentSessionInteractionRuntime.submitApplyEditsReviewDecision(command:reviewID:decision:)` (captured writer, joined exact receipt) | n/a |
 | `pendingWorktreeMergeReview` | `AgentModeViewModel+WorktreeMerge.swift` ~715 | `submitWorktreeMergeReviewDecision` | `approval` |

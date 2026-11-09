@@ -2499,6 +2499,8 @@ struct AgentModeChatDetailView: View {
             .id("pendingUserInputRequest")
             .transition(.opacity)
         } else if let pendingAskUser = runInteractionSnapshot.pendingAskUser {
+            let command = agentModeVM.activeSession?.activeAgentSessionID.flatMap { try? agentModeVM.runtimeCommand(sessionID: $0) }
+            let runtime = agentModeVM.interactionRuntime
             AgentAskUserWizardCard(
                 pending: pendingAskUser,
                 onDraftChange: { questionID, draft in
@@ -2519,12 +2521,12 @@ struct AgentModeChatDetailView: View {
                     )
                 },
                 onSubmit: {
-                    guard let tabID = currentTabID else { return }
-                    agentModeVM.submitAskUserResponse(tabID: tabID, interactionID: pendingAskUser.interaction.id)
+                    guard let command else { return }
+                    try? runtime.resolveAskUserResponse(command: command, interactionID: pendingAskUser.interaction.id, skipAll: false)
                 },
                 onSkipAll: {
-                    guard let tabID = currentTabID else { return }
-                    agentModeVM.skipAskUser(tabID: tabID, interactionID: pendingAskUser.interaction.id)
+                    guard let command else { return }
+                    runtime.skipAskUser(command: command, interactionID: pendingAskUser.interaction.id)
                 },
                 onUserActivity: {
                     guard let tabID = currentTabID else { return }

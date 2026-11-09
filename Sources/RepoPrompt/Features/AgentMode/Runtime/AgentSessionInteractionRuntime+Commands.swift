@@ -120,20 +120,26 @@ extension AgentSessionInteractionRuntime {
         scope?.mcp.mcpApprovalDecisionLabels(for: approval, session: session, includeAliases: includeAliases) ?? []
     }
 
-    func submitAskUserResponse(session: AgentTabSession, interactionID: UUID, draftsByQuestionID: [String: AgentAskUserDraft]) throws {
-        guard owns(session), var pending = session.pendingAskUser, pending.interaction.id == interactionID else { return }
+    @discardableResult
+    func submitAskUserResponse(command: AgentSessionRuntimeStore.Command, interactionID: UUID, draftsByQuestionID: [String: AgentAskUserDraft]) throws -> Bool {
+        let session = command.writer.session
+        guard command.writer.scope === scope, command.isCurrent, session.askUserContinuation != nil,
+              var pending = session.pendingAskUser, pending.interaction.id == interactionID else { return false }
         pending.draftsByQuestionID = draftsByQuestionID
         session.pendingAskUser = pending
-        try resolveAskUserResponse(for: session, interactionID: interactionID, skipAll: false)
+        return try resolveAskUserResponse(command: command, interactionID: interactionID, skipAll: false)
     }
 
-    func skipAskUser(session: AgentTabSession, interactionID: UUID) {
-        try? resolveAskUserResponse(for: session, interactionID: interactionID, skipAll: true)
+    @discardableResult
+    func skipAskUser(command: AgentSessionRuntimeStore.Command, interactionID: UUID) -> Bool {
+        (try? resolveAskUserResponse(command: command, interactionID: interactionID, skipAll: true)) ?? false
     }
 
-    func resolveAskUserResponse(for session: AgentTabSession, interactionID: UUID, skipAll: Bool) throws {
-        guard owns(session), let pending = session.pendingAskUser,
-              pending.interaction.id == interactionID, let continuation = session.askUserContinuation else { return }
+    @discardableResult
+    func resolveAskUserResponse(command: AgentSessionRuntimeStore.Command, interactionID: UUID, skipAll: Bool) throws -> Bool {
+        let session = command.writer.session
+        guard command.writer.scope === scope, command.isCurrent, let pending = session.pendingAskUser,
+              pending.interaction.id == interactionID, let continuation = session.askUserContinuation else { return false }
         let elapsedSeconds = max(0, Int(Date().timeIntervalSince(pending.interaction.askedAt)))
         let response = if skipAll {
             pending.interaction.buildSkippedResponse(elapsedSeconds: elapsedSeconds)
@@ -146,6 +152,7 @@ extension AgentSessionInteractionRuntime {
         Self.reconcileInteractiveRunState(session)
         scope?.presentation.bindingChanged(session)
         continuation.resume(returning: response)
+        return true
     }
 
     func submitWorktreeMergeReviewDecision(session: AgentTabSession, reviewID: UUID, decision: WorktreeMergeReviewDecision) {
@@ -419,15 +426,20 @@ extension AgentSessionInteractionRuntime {
     /// Submits a resolution produced by `mcpPendingInteractionResolution` without suspending.
     func applyPendingInteractionResolution(
         _ resolution: AgentPendingInteractionResolution,
-        to session: AgentTabSession
+        command: AgentSessionRuntimeStore.Command
     ) throws {
-        guard owns(session) else { throw MCPError.invalidParams("The interaction owner is no longer current. No response was applied.") }
+        let session = command.writer.session
+        guard command.writer.scope === scope, command.isCurrent else { throw MCPError.invalidParams("The interaction owner is no longer current. No response was applied.") }
         switch resolution {
         case let .askUserSkip(interactionID):
-            skipAskUser(session: session, interactionID: interactionID)
+            guard skipAskUser(command: command, interactionID: interactionID) else {
+                throw MCPError.invalidParams("The pending question is no longer current. No response was applied.")
+            }
         case let .askUser(interactionID, drafts):
             do {
-                try submitAskUserResponse(session: session, interactionID: interactionID, draftsByQuestionID: drafts)
+                guard try submitAskUserResponse(command: command, interactionID: interactionID, draftsByQuestionID: drafts) else {
+                    throw MCPError.invalidParams("The pending question is no longer current. No response was applied.")
+                }
             } catch let error as MCPError {
                 throw error
             } catch {

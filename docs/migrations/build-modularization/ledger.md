@@ -6116,3 +6116,44 @@ The actual compile emitted zero warnings in the six touched Swift files. The fil
 Caller/body search leaves only the runtime method and its two card calls; the notification
 architecture inventory now names this runtime path. This checkpoint does not complete other
 interaction/provider-approval routing or any other outstanding M9.2b group.
+
+### M9.2b checkpoint 3 — question responses and managed admission (2026-11-09)
+
+Ask-user submit/skip/resolve now require the captured canonical writer command and acknowledge
+whether the pending continuation was actually consumed. A stale command cannot change drafts or
+consume a continuation. The card captures the rendered writer; notification replies perform exact
+writer admission; MCP response parsing now passes the command directly to the interaction runtime.
+Managed responses capture the same capability before authorization and recheck it after the await,
+including same-object claim reacquisition rather than only binding/object equality. The existing
+endpoint/grant checks, one-time approval policy and provider decision checks remain in place.
+
+Actual Agent Mode VM methods retired: both `submitAskUserResponse` overloads, `skipAskUser`,
+private `resolveAskUserResponse`, the `applyPendingInteractionResolution` forwarding body, and
+unused `noteQuestionCardActivity`/`submitQuestionResponse`/`skipQuestion` legacy shims. Searches
+confirm only the runtime response implementation remains in Agent Mode. Context Builder's
+separate question implementation is unchanged. Draft/index/activity forwarding and other provider
+response bodies remain open; this is not completion of the interaction group.
+
+Validation for checkpoints 2–3:
+- Final focused run: **280 passed, 0 failures**, Conductor
+  `c6f8c97b-36f6-471a-a8d4-4b6f6a5db571`, covering interaction runtime, notification actions,
+  Codex approval choices, MCP response diagnostics and session-link runtime bridge suites.
+  The preceding 277-pass/3-failure run exposed three unbound/unrestored response fixtures;
+  these now install restored writers while retaining their outcome/continuation assertions.
+  Added reacquisition and raw-conflict response refusal plus authorization-await reacquisition.
+- Final both-product build: `a2570571-0b36-4e96-96fe-5f303c5d7115`, completed successfully.
+  Its waiter briefly timed out contacting the daemon; the same ticket's terminal status, not
+  the waiter exit, establishes completion. Earlier products `bb87508f-3c25-43fc-849b-656be1dcd6af`
+  also passed before the final guard/test changes.
+- Full lint: `46a045a9-3846-4ef3-9e8f-6ff2726f16f7` passed, **0/2144** files needing formatting.
+  The first attempt overlapped scoped formatting and failed on the VM file; a stable-source,
+  cache-independent formatter check passed before the full retry. Final guard/fixture changes
+  additionally passed scoped pinned formatting and strict lint.
+- Fresh index: **1242/1360**, **53/66**; baseline unchanged.
+- Cold and final incremental logs were audited by per-file compiler-warning occurrence count:
+  **zero occurrences in all 14 Swift files touched by M9.2b so far**. Two existing runtime
+  SwiftUI diagnostics in untouched `AgentSessionRows.swift` during bridge tests are not hidden
+  or claimed to be compiler warnings in touched files.
+- No full-suite, live-app, release or hosted-CI success is claimed; no CI logs were read.
+
+All remaining M9.2b inventory and the first-control-setup progression concern remain open.

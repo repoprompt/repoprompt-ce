@@ -1145,6 +1145,15 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         return session
     }
 
+    private func questionCommand(in scope: AgentSessionRuntimeStore.Scope?, for session: AgentTabSession) throws -> AgentSessionRuntimeStore.Command {
+        let scope = try XCTUnwrap(scope)
+        let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+        guard case let .unique(writer) = scope.resolveWriter(sessionID: sessionID), writer.session === session else {
+            throw NSError(domain: "Expected exact question writer", code: 1)
+        }
+        return try writer.admitCommand().get()
+    }
+
     private func runtimeQuestion() -> AgentAskUserInteraction {
         AgentAskUserInteraction(title: "Runtime question", timeoutSeconds: 600, questions: [
             AgentAskUserQuestion(id: "answer", question: "Which files?", options: [], allowsMultiple: false, allowsCustom: true)
@@ -1182,7 +1191,7 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         XCTAssertEqual(session.pendingAskUser?.interaction.id, question.id)
         scope = nil
         XCTAssertNotNil(owner, "An admitted question owns its runtime, not its presentation")
-        runtime.skipAskUser(session: session, interactionID: question.id)
+        XCTAssertTrue(try runtime.skipAskUser(command: questionCommand(in: runtime.scope, for: session), interactionID: question.id))
         let response = try await task.value
         XCTAssertTrue(response.skipped)
         XCTAssertNil(session.pendingAskUser)
@@ -1215,10 +1224,52 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         XCTAssertNil(original.askUserContinuation)
         XCTAssertEqual(replacement.pendingAskUser?.interaction.id, question.id)
         XCTAssertNotNil(replacement.askUserContinuation)
-        runtime.skipAskUser(session: replacement, interactionID: question.id)
+        XCTAssertTrue(try runtime.skipAskUser(command: questionCommand(in: scope, for: replacement), interactionID: question.id))
         let response = try await second.value
         XCTAssertTrue(response.skipped)
         XCTAssertTrue(runtime.questionWaitIDs.isEmpty)
+    }
+
+    func testQuestionResponseRejectsReacquiredAndConflictingWriterCommands() async throws {
+        for conflict in [false, true] {
+            let writers = AgentSessionRuntimeStore()
+            let scope = writers.makeScope()
+            let session = questionSession(in: scope)
+            let command = try questionCommand(in: scope, for: session)
+            let runtime = scope.interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
+            let question = runtimeQuestion()
+            let installed = expectation(description: "question ready for writer refusal")
+            let attachment = observeQuestionInstallation(scope: scope, session: session, installed: installed)
+            let task = Task { try await runtime.askUser(session: session, interaction: question) }
+            addTeardownBlock { task.cancel()
+                _ = try? await task.value
+            }
+            await fulfillment(of: [installed], timeout: 3)
+            scope.presentation.detach(attachment)
+            let other = writers.makeScope()
+            if conflict {
+                let copy = AgentTabSession(tabID: UUID())
+                other.replaceSessions([copy.tabID: copy])
+                XCTAssertEqual(other.bindingRejection(command.identity.sessionID, on: copy), .conflictingWriter)
+                copy.installPersistentSessionBinding(.init(tabID: copy.tabID, sessionID: command.identity.sessionID, workspaceID: command.identity.workspaceID))
+                guard case .conflicting = scope.resolveWriter(sessionID: command.identity.sessionID) else {
+                    return XCTFail("Expected raw conflicting writer claims")
+                }
+            } else {
+                scope.replaceSessions([:])
+                scope.replaceSessions([session.tabID: session])
+            }
+            XCTAssertFalse(runtime.skipAskUser(command: command, interactionID: question.id))
+            let submitted = try runtime.submitAskUserResponse(command: command, interactionID: question.id, draftsByQuestionID: [:])
+            XCTAssertFalse(submitted)
+            XCTAssertEqual(session.pendingAskUser?.interaction.id, question.id)
+            XCTAssertNotNil(session.askUserContinuation)
+            other.replaceSessions([:])
+            XCTAssertTrue(try runtime.skipAskUser(command: questionCommand(in: scope, for: session), interactionID: question.id))
+            let response = try await task.value
+            XCTAssertTrue(response.skipped)
+            XCTAssertNil(session.askUserContinuation)
+        }
     }
 
     func testQuestionTimeoutRearmRejectsOldGenerationAndReturnsDraftAfterDetach() async throws {
@@ -1297,8 +1348,7 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
 
     func testManagedQuestionResponseOwnsExactScopeAcrossAuthorizationWithoutPresentation() async throws {
         var scope: AgentSessionRuntimeStore.Scope? = AgentSessionRuntimeStore().makeScope()
-        let session = AgentTabSession(tabID: UUID())
-        scope?.replaceSessions([session.tabID: session])
+        let session = try questionSession(in: XCTUnwrap(scope))
         let runtime = try XCTUnwrap(scope).interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
         weak let retainedScope = scope
         let question = AgentAskUserInteraction(title: "Scope", questions: [
@@ -1344,12 +1394,13 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
     }
 
     func testManagedResponseRechecksGrantObjectAndBindingAfterAuthorization() async throws {
-        for mutation in ["revoke", "rebind", "replace"] {
+        for mutation in ["revoke", "rebind", "replace", "reacquire"] {
             let scope = AgentSessionRuntimeStore().makeScope()
             let session = AgentTabSession(tabID: UUID())
             let sessionID = UUID()
             let workspaceID = UUID()
             session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: workspaceID))
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
             scope.replaceSessions([session.tabID: session])
             let runtime = scope.interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
             let question = AgentAskUserInteraction(title: "Scope", questions: [
@@ -1384,6 +1435,9 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
                 session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: workspaceID))
             } else if mutation == "replace" {
                 scope.replaceSessions([session.tabID: AgentTabSession(tabID: session.tabID)])
+            } else if mutation == "reacquire" {
+                scope.replaceSessions([:])
+                scope.replaceSessions([session.tabID: session])
             }
             gate.release()
             let outcome = await submitted.value
@@ -1399,8 +1453,7 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
 
     func testManagedUserInputDoesNotAcknowledgeMissingProviderRoute() async throws {
         let scope = AgentSessionRuntimeStore().makeScope()
-        let session = AgentTabSession(tabID: UUID())
-        scope.replaceSessions([session.tabID: session])
+        let session = questionSession(in: scope)
         let runtime = scope.interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
         let pending = AgentRequestUserInputRequest(
             requestID: .string("input"), method: "item/tool/requestUserInput", threadID: "thread", turnID: "turn", itemID: "item",

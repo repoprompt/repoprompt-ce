@@ -11910,7 +11910,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         payload: MCPInteractionResponsePayload,
         workflow: AgentWorkflowDefinition? = nil
     ) async throws -> MCPInstructionDispatch? {
-        guard let session = mcpControlledSession(sessionID: sessionID) else {
+        guard let session = mcpControlledSession(sessionID: sessionID),
+              let command = try runtimeCommand(sessionID: sessionID), command.writer.session === session
+        else {
             throw MCPError.invalidParams("The requested agent run is no longer active.")
         }
 
@@ -11947,7 +11949,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 interactionID: interactionID,
                 payload: payload
             )
-            try applyPendingInteractionResolution(resolution, to: session)
+            try interactionRuntime.applyPendingInteractionResolution(resolution, command: command)
             handleObservedMCPStateChange(for: session)
             return nil
         case .hookApproval:
@@ -12051,10 +12053,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         interactionID: UUID, payload: MCPInteractionResponsePayload
     ) throws -> PendingInteractionResolution {
         try interactionRuntime.mcpPendingInteractionResolution(for: session, kind: kind, interactionID: interactionID, payload: payload)
-    }
-
-    func applyPendingInteractionResolution(_ resolution: PendingInteractionResolution, to session: TabSession) throws {
-        try interactionRuntime.applyPendingInteractionResolution(resolution, to: session)
     }
 
     // MARK: - End MCP Control Plane
@@ -19029,53 +19027,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     func cancelAskUserInteraction(tabID: UUID, interactionID: UUID) -> Bool {
         guard let session = sessions[tabID] else { return false }
         return interactionRuntime.cancelAskUserInteraction(session: session, interactionID: interactionID)
-    }
-
-    func submitAskUserResponse(tabID: UUID, interactionID: UUID) {
-        guard let session = sessions[tabID], session.pendingAskUser?.interaction.id == interactionID else { return }
-        do {
-            try resolveAskUserResponse(for: session, interactionID: interactionID, skipAll: false)
-        } catch {
-            return
-        }
-    }
-
-    func submitAskUserResponse(tabID: UUID, interactionID: UUID, draftsByQuestionID: [String: AgentAskUserDraft]) throws {
-        guard let session = sessions[tabID] else { return }
-        try interactionRuntime.submitAskUserResponse(session: session, interactionID: interactionID, draftsByQuestionID: draftsByQuestionID)
-    }
-
-    func skipAskUser(tabID: UUID, interactionID: UUID) {
-        guard let session = sessions[tabID], session.pendingAskUser?.interaction.id == interactionID else { return }
-        try? resolveAskUserResponse(for: session, interactionID: interactionID, skipAll: true)
-    }
-
-    private func resolveAskUserResponse(for session: TabSession, interactionID: UUID, skipAll: Bool) throws {
-        try interactionRuntime.resolveAskUserResponse(for: session, interactionID: interactionID, skipAll: skipAll)
-    }
-
-    /// Legacy single-question UI shim retained for tests and old call sites during migration.
-    func noteQuestionCardActivity(tabID: UUID, questionID: UUID) {
-        noteAskUserCardActivity(tabID: tabID, interactionID: questionID)
-    }
-
-    /// Legacy single-question UI shim retained for tests and old call sites during migration.
-    func submitQuestionResponse(tabID: UUID, interactionID: UUID, response: String) {
-        guard let session = sessions[tabID],
-              let pending = session.pendingAskUser,
-              pending.interaction.id == interactionID,
-              let question = pending.interaction.questions.first
-        else { return }
-        var draft = AgentAskUserDraft(customResponse: response)
-        if let matchedOption = question.optionLabels.first(where: { $0 == response }) {
-            draft = AgentAskUserDraft(selectedOptionLabels: [matchedOption])
-        }
-        try? submitAskUserResponse(tabID: tabID, interactionID: interactionID, draftsByQuestionID: [question.id: draft])
-    }
-
-    /// Legacy single-question UI shim retained for tests and old call sites during migration.
-    func skipQuestion(tabID: UUID, interactionID: UUID) {
-        skipAskUser(tabID: tabID, interactionID: interactionID)
     }
 
     func submitUserInputResponse(tabID: UUID, requestID: CodexAppServerRequestID, response: AgentRequestUserInputResponse) {
