@@ -4925,9 +4925,11 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
     private static func capturedSendIsCurrent(
         session: AgentTabSession,
         sendRunID: UUID,
+        sendRunAttemptID: UUID?,
         controller: any CodexSessionControlling
     ) -> Bool {
         session.runID == sendRunID
+            && session.activeRunAttemptID == sendRunAttemptID
             && session.codexController.map { sameCodexControllerInstance($0, controller) } == true
     }
 
@@ -7828,6 +7830,9 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         let auditTurnID = fallbackContext?.optimisticUserItemID
             ?? session.pendingTurnRuntimeAnchors.first?.userItemID
         let wasRunAlreadyActive = session.runState.isActive
+        var attemptedPhysicalSend = false
+        let priorAuthRetryTurn = session.codexPendingAuthRetryTurn
+        var preparedSteerAuthRetryTurn: AgentTabSession.CodexPendingAuthRetryTurn?
         let sendRunAttemptIDAtEntry = session.activeRunAttemptID
         let activeSendRunID = wasRunAlreadyActive ? session.runID : nil
         let activeSendRunAttemptID = wasRunAlreadyActive ? session.activeRunAttemptID : nil
@@ -8420,6 +8425,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                             let baseText = released?.text(text) ?? monitoring?.text ?? text
                             let dispatchText = parkedNote.map { $0.frame + "\n\n" + baseText } ?? baseText
                             oracleAwareness = isSelfNote ? nil : session.oracleBackgroundAwareness.reserve(session: session, providerID: ObjectIdentifier(controller))
+                            attemptedPhysicalSend = true
                             receipt = try await controller.startUserTurn(
                                 text: oracleAwareness?.decorating(dispatchText) ?? dispatchText,
                                 attachments: attachments,
@@ -8478,6 +8484,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                     persistenceRuntime?.scheduleSave(for: session)
                 }
                 do {
+                    preparedSteerAuthRetryTurn = session.codexPendingAuthRetryTurn
                     let proof = await linkExecutionRuntime?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
                     guard !Task.isCancelled, effectiveStopFence.permitsStart(of: session),
                           session.runID == sendRunID, session.activeRunAttemptID == sendRunAttemptIDAtEntry,
@@ -8511,6 +8518,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                     let baseText = released?.text(text) ?? monitoring?.text ?? text
                     let dispatchText = parkedNote.map { $0.frame + "\n\n" + baseText } ?? baseText
                     oracleAwareness = session.oracleBackgroundAwareness.reserve(session: session, providerID: ObjectIdentifier(controller))
+                    attemptedPhysicalSend = true
                     let receipt = try await controller.steerUserTurn(
                         text: oracleAwareness?.decorating(dispatchText) ?? dispatchText,
                         attachments: attachments,
@@ -8697,14 +8705,15 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                     dispatchID: promptDispatchID
                 )
             }
-            session.codexPendingTurnKind = nil
             guard Self.capturedSendIsCurrent(
                 session: session,
                 sendRunID: sendRunID,
+                sendRunAttemptID: sendRunAttemptIDAtEntry,
                 controller: controller
             ) else {
                 return .stale(reason: "Codex ignored a late steer rejection because the active run/controller changed.")
             }
+            session.codexPendingTurnKind = nil
             let decision: CodexTurnFallbackDecision = switch steerError {
             case let .noActiveTurn(failure):
                 .noActiveTurn(failure: failure)
@@ -8744,6 +8753,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 guard Self.capturedSendIsCurrent(
                     session: session,
                     sendRunID: sendRunID,
+                    sendRunAttemptID: sendRunAttemptIDAtEntry,
                     controller: controller
                 ) else {
                     attachmentRuntime?.finalizeAttachmentsForTurn(
@@ -8752,6 +8762,17 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                         disposition: .restoreToPending
                     )
                     return .stale(reason: "Codex ignored a late send cancellation because the active run/controller changed.")
+                }
+                if case .steer = dispatchPlan, !attemptedPhysicalSend {
+                    if session.codexPendingAuthRetryTurn == preparedSteerAuthRetryTurn {
+                        session.codexPendingAuthRetryTurn = priorAuthRetryTurn
+                    }
+                    // Cancelling optional input preparation is not a terminal event for the
+                    // provider turn already running. Keep it available for a later steer.
+                    attachmentRuntime?.finalizeAttachmentsForTurn(
+                        for: session, reservationID: attachmentReservationID, disposition: .restoreToPending
+                    )
+                    return .cancelled
                 }
                 session.codexPendingTurnKind = nil
                 clearCodexPendingAuthRetryTurn(session)
@@ -8773,15 +8794,16 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 }
                 return .cancelled
             }
-            session.codexPendingTurnKind = nil
             guard Self.capturedSendIsCurrent(
                 session: session,
                 sendRunID: sendRunID,
+                sendRunAttemptID: sendRunAttemptIDAtEntry,
                 controller: controller
             ) else {
                 logCodex("[AgentModeVM] sendCodexNativeMessage: ignoring late send error for stale controller - \(error.localizedDescription)")
                 return .stale(reason: "Codex ignored a late send failure because the active run/controller changed.")
             }
+            session.codexPendingTurnKind = nil
             logCodex("[AgentModeVM] sendCodexNativeMessage: error - \(error)")
             if await attemptManagedCodexAuthRecovery(
                 for: session,

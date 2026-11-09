@@ -9347,6 +9347,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     workspaceID: reservationWorkspaceID
                 )
                 reservedSessionID = intendedSessionID
+                // A published replica is not another payload owner. Preserve the provisional
+                // reservation refusal above, then reject before local hydration can create a copy.
+                try requireLocalMCPRuntimeWriter(sessionID: intendedSessionID, expectedWorkspaceID: reservationWorkspaceID)
             }
             triggerPendingMCPSessionTargetDiscardRetries()
             try revalidateNormalizedMCPSessionSelector(
@@ -9884,11 +9887,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
         let admittedWindow = WindowStatesManager.shared.window(withID: windowID)
         let residentActivationTarget = try await mcpPreflightResidentActivation(sessionID: sessionID, admittedWindow: admittedWindow)
+        try requireLocalMCPRuntimeWriter(sessionID: sessionID, expectedWorkspaceID: expectedWorkspaceID)
         let hydrated = await ensureSessionReady(tabID: tabID)
         #if DEBUG
             await test_afterExplicitTabSessionReady?()
         #endif
         try Task.checkCancellation()
+        try requireLocalMCPRuntimeWriter(sessionID: sessionID, expectedWorkspaceID: expectedWorkspaceID)
         try requireFrozenMCPSessionBinding(
             tabID: tabID,
             sessionID: sessionID,
@@ -11116,7 +11121,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     /// Stop is a control read, so it must not mutate a session whose recovery owner has not settled.
     func mcpSettledLiveSessionForStop(sessionID: UUID) throws -> TabSession? {
-        guard let command = try runtimeCommand(sessionID: sessionID) else { return nil }
+        guard let writer = try runtimeWriter(sessionID: sessionID), writer.scope === runtimeSessionStore else { return nil }
+        let command = try writer.admitCommand().get()
         return mcpRuntime.settledSession(for: command.writer)
     }
 
@@ -19914,14 +19920,24 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     func runtimeCommand(
         sessionID: UUID, requirement: AgentSessionRuntimeStore.CommandRequirement = .restored
     ) throws -> AgentSessionRuntimeStore.Command? {
-        switch AgentSessionRuntimeStore.shared.resolveWriter(sessionID: sessionID) {
-        case .unavailable(.absent):
-            return nil
-        case .unavailable, .conflicting:
-            throw PersistentBindingMutationError.staleTransition
-        case let .unique(writer):
-            guard writer.scope === runtimeSessionStore else { throw PersistentBindingMutationError.staleTransition }
-            return try writer.admitCommand(requirement).get()
+        guard let writer = try runtimeWriter(sessionID: sessionID) else { return nil }
+        guard writer.scope === runtimeSessionStore else { throw PersistentBindingMutationError.staleTransition }
+        return try writer.admitCommand(requirement).get()
+    }
+
+    private func runtimeWriter(sessionID: UUID, expectedWorkspaceID: UUID? = nil) throws -> AgentSessionRuntimeStore.Writer? {
+        switch AgentSessionRuntimeStore.shared.resolveWriter(sessionID: sessionID, expectedWorkspaceID: expectedWorkspaceID) {
+        case .unavailable(.absent): return nil
+        case .unavailable, .conflicting: throw PersistentBindingMutationError.staleTransition
+        case let .unique(writer): return writer
+        }
+    }
+
+    private func requireLocalMCPRuntimeWriter(sessionID: UUID, expectedWorkspaceID: UUID?) throws {
+        if case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+            sessionID: sessionID, expectedWorkspaceID: expectedWorkspaceID
+        ), writer.scope !== runtimeSessionStore {
+            throw MCPError.invalidParams("The Agent session is owned by another window's runtime; target it from that window.")
         }
     }
 

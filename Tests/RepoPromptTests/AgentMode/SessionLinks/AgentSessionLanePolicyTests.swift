@@ -248,6 +248,15 @@ final class AgentSessionLanePolicyTests: XCTestCase {
         let tabID = try XCTUnwrap(activeWorkspace.activeComposeTabID)
         let viewModel = window.agentModeViewModel
         let session = await viewModel.ensureSessionReady(tabID: tabID)
+        // MCP configuration now requires an admitted writer, not an unbound composer draft.
+        let sessionID = UUID()
+        XCTAssertNil(viewModel.test_bindingRejection(sessionID: sessionID, on: session))
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, compareAndSetInWorkspaceID: activeWorkspace.id
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(viewModel.runtimeCommand(sessionID: sessionID))
+        viewModel.test_setSuppressesAgentSessionPersistence(true)
         session.isMCPOriginated = true
         for agent in AgentProviderKind.allCases where agent.usesClaudeNativeRuntime && agent != .claudeCode {
             try await viewModel.mcpConfigureSession(
