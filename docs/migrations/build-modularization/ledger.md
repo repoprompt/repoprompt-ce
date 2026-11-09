@@ -6747,3 +6747,123 @@ test**, zero in the other ten files. No positive warning-count delta; this is no
 total warnings. No live-app, full-suite, release or hosted-CI qualification is claimed.
 The push freeze on `255d2650e` remains active; this checkpoint stays local until explicitly released.
 The remaining M9.2b inventory and the injected VM hydration-await race witness remain open.
+
+#### M9.2b checkpoint 11 — self-compaction admission and exact required-save writer (in progress)
+
+The actual reservation, admission and duplicate-response bodies move from the VM into the existing
+link execution runtime. The MCP scheduling callback calls that runtime directly. Read-only context
+projection and the terminal/native completion pipeline remain separate. New admission captures a
+command before provider support; an existing durable duplicate can still be read during retirement.
+Required persistence now accepts an explicit exact-writer expectation through its existing queue,
+preparation and physical-write chain. The legacy current-owner mode is unchanged. An exact flush
+cannot select a reacquired writer after its queue wait or credit that writer on return.
+
+The physical payload writer already fenced its captured writer before and after storage; this
+checkpoint fixes which writer reaches that boundary, not a missing physical-write fence. Failed
+admission disarms only its own still-scheduled attempt on the original record, preserving recovery
+notes. Only the originating claim may schedule the admission's cleanup save. A rebound record is
+untouched: assigning even a cleared `selfCompactState` would mark its new payload dirty. Existing
+owner/binding checks and decoded-state reconciliation keep that old request non-executable.
+Independently requested generic saves may still drain for a reacquired owner; no global single-write
+claim is made for that case. The exact operation itself cannot dirty or request a fresh save through
+a replacement after losing its claim. The native completion owner's post-ack incarnation gap remains open.
+
+Scoped formatting and strict lint passed. First focused compaction/persistence run
+`f12dff1a-4092-48ae-865d-c514eae0102f` executed **50 tests with one failure**: the stale exact
+save's generic retry path marked the replacement object dirty. The production retry request is now
+conditional on the original exact-writer expectation still holding; independently queued requests
+are not discarded. The successor assertion is unchanged. Focused retry
+`2e773157-8f55-4c8b-9aa4-b33b65994a95` passed **50** tests. Broad
+`59610fcb-d525-4f10-858d-72c84a64051d` passed **2,178 executed, 22 skipped, zero failures**
+(2,167 app, seven domain, four provider), including all SessionLinks and admission/sidebar/lane-policy
+suites. Isolated handoff `3a49f61d-2d50-4114-92cf-dd8a0e9516b8` passed **104**. Both products
+`881bf395-093b-4554-bd58-3252c6b84cc8` and full lint
+`d9295ec3-63b7-4a81-b538-6fbc0e968d66` passed. Fresh post-build index is **1,247/1,360
+wrong-way edges, 53/66 largest-cycle components**, with no baseline change. The two added file edges
+are the new self-compaction runtime file's existing VM read projections and `AgentTabSession` types;
+this is disclosed file-placement debt, not an M10 relocation. Actual compile warning occurrence
+counts across the six touched Swift files show four MCPServerViewModel warnings versus eleven in
+the retained base, and zero in the other five files: no positive delta, not zero total warnings.
+
+The checkpoint review request (snapshot `2026-11-10/0235`) and its refreshed retry (`0259`) both
+failed before any response because Oracle reported expired OAuth credentials that could not
+refresh. Neither was a review verdict. The local execution gates passed while the checkpoint was
+held uncommitted pending review. The later M9.2c review and integration entry below supersedes that
+hold. No live-app, full-suite or release qualification is claimed.
+
+**Updated remaining M9.2b inventory for the next push handoff.** Sizes mean affected surfaces,
+not elapsed estimates: **M** roughly 3–5 files, **L** 6+ or broad caller/fixture migration, **XL**
+multiple provider-specific pipelines. These checkpoints do not put M9.2b near closeout.
+
+| Remaining group | Rough size | Still-open boundary |
+| --- | --- | --- |
+| Binding, creation and hydration | L | Run-start preparation, persisted-load and first-save callbacks; exact creation/restoration authority across awaits. |
+| Startup and inner provider execution | XL | Factory/lease/controller install and physical provider release; continuation/start environment callbacks across Codex, Claude, ACP and headless. |
+| Managed Steer, local/provider input and self-compaction | L–XL | Managed-Steer and prepared-turn bodies, queued immediate-input body, native compaction scheduler/completion and its wake callbacks; checkpoint 11 covers admission only. |
+| MCP metadata and tool routing | L | Remaining VM compatibility/reactivation/host-preparation callers and target routing; copied-resource protection is delivered, first-setup activation progression remains open. |
+| Administration and worktree commands | L | Fork/owning-VM mutation selection, worktree transition and VCS preview/apply/continue/abort await boundaries; review waits are delivered. |
+| Provider event/tool hooks and terminal follow-ups | L–XL | Remaining coordinator event installation, Claude tool-hook callbacks, terminal self-compact/provider-switch/relocation follow-ups. |
+| Persistence and payload forwarding | L | Remaining save/proxy/mutable aliases and draft/usage/timing/transcript forwarders; exact-save expectation is not yet a cutover of every caller. |
+| Residual interaction cleanup | M | Provider-native cancellation and shared approval projection/terminal boundaries, plus direct VM readiness-wrapper race witnesses. |
+
+M9.3a's prepared host/census/persistence-composition/attachment configuration files, M9.4
+close/handoff/drain and M10 target relocation are still excluded.
+
+#### M9.2b checkpoint 12 — remaining captured-writer required-save callers (in progress)
+
+The link send/provider-switch transaction's tab-ID required-save adapter now requires the captured
+writer, derives its workspace/tab from that capability and calls exact persistence. Its staged-row,
+compensating-removal, pre-dispatch handoff and physical-acceptance saves cannot reacquire authority
+while queued. Cross-session compaction's request/removal saves, Stop's audit flush and committed
+delegation-placement writes now pass their already-captured writers too. Retirement still permits
+an originating writer's final save; it does not admit a new dispatch. This does not cut over the
+remaining VM provider-switch, execution-location, native self-compaction or close-drain callers.
+
+A new live-send witness holds the existing persistence queue after the attributed row is staged,
+then reacquires the same object, replaces it, or retires the original writer. Lost claims must not
+write or start a provider; the original retiring writer must persist the row without dispatching.
+Successor payload and dirty state remain untouched. Existing rollback/acknowledgement assertions
+are unchanged. Focused `4e636727-4e02-4adc-a8cb-ad7cfa862010` passed **222** tests. Broad
+`66517d43-a30c-4e58-a0b2-cb7fa79e99b8` passed **2,179 executed, 22 skipped, zero failures**
+(2,168 app, seven domain, four provider). Isolated handoff
+`330b9b72-248c-4c98-928d-e7527a5373eb` passed **104**. Both products
+`8ae86779-417f-492b-9041-726f36dab663` and full lint
+`3e5fafe0-ae42-40e2-917e-1212b4eb40fd` passed. Scoped pinned formatting and strict lint passed;
+actual focused compilation emitted zero warning occurrences in these five touched Swift files,
+matching the retained base. Fresh post-build index remains **1,247/1,360 wrong-way edges,
+53/66 largest-cycle components**, with no baseline changes. Whitespace checks pass.
+
+At this checkpoint, 11 and 12 were held uncommitted because Oracle authentication failed before a
+response. The later M9.2c review/integration entry below supersedes that hold. No hosted-CI,
+full-suite, live-app or release result is claimed for this tree.
+
+#### M9.2c — checkpoints 9–12 follow-up after the M9.2b squash
+
+M9.2b merged at checkpoint 8 (`255d2650e`, squash `5505a0a63`). Checkpoints 9–10 were local
+commits and 11–12 were held changes; none of those four checkpoints is credited to that squash.
+The publication freeze was explicitly lifted for a new draft M9.2c PR, not another push to #1662.
+
+Oracle review `untitled-chat-C269F8`, snapshot `2026-11-10/0816`, reviewed checkpoints 11–12
+successfully after authentication recovery. It found one P1: an exact flush could cancel an owner's
+pending debounce and then drop that independent request when the same object reacquired its claim.
+The fix delays exact-mode cancellation until after queue admission, records actual pending timer
+identity separately from save revisions, and restores only a previously pending same-object,
+same-record request when the exact writer is lost. It neither dirties a replacement nor credits the
+stale operation. Completed/cancelled timers cannot masquerade as pending requests. Existing tests
+now assert preservation during the queue wait and successful ordinary-owner persistence after
+an in-flight exact write is superseded. The default current-owner path is unchanged.
+
+The review's writer-only persistence overload suggestion was also applied to production exact-save
+callers. Post-return/current-writer checks remain deliberately conservative: presentation and phase
+callbacks can re-enter synchronously, and a returned storage URL alone is not an acknowledgment.
+The generalized `session_not_exclusive` refusal for failed self-compact command admission stays
+fail-closed; it does not widen authority. Dedicated queued-reacquisition tests for Stop audit and
+placement remain a coverage limitation; the shared queue fence, their existing suites and the
+live-send call-site witness are exercised. No assertion or timeout budget was weakened.
+
+Review-fix focused `b3490cf4-b39c-40da-832f-22864a7f1405` passed **132 tests**, including both
+pending-save preservation witnesses, live-send queue drift, Stop and placement suites. Scoped
+pinned formatting and strict lint passed for all 12 touched Swift files. Main integration and
+merged-tree broad/product validation are next. M9.3a's incoming host/persistence/attachment changes
+must be retained by normal merge; squash ancestry is not an excuse to drop later main changes.
+M9.4 and M10 remain outside this follow-up.

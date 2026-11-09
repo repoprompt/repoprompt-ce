@@ -1084,7 +1084,7 @@ final class MCPServerViewModel: ObservableObject {
                 window.agentModeViewModel.agentSelfContextSnapshot(endpoint: endpoint, origin: origin)
             },
             scheduleCompact: { window, endpoint, origin, note, key in
-                await window.agentModeViewModel.agentSelfCompactMCPAdmission(
+                await window.agentModeViewModel.linkExecutionRuntime.agentSelfCompactMCPAdmission(
                     endpoint: endpoint, origin: origin, note: note, idempotencyKey: key
                 )
             }

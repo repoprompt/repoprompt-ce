@@ -1670,6 +1670,8 @@ final class AgentTabSession: ObservableObject {
     var lastUserMessageAt: Date?
     var lastCommandOutputSaveAt: Date?
     var saveDebounceTask: Task<Void, Never>?
+    /// Identifies a pending timer independently of the payload/save revision.
+    var saveDebounceRequestID: UUID?
     var isDirty: Bool = false {
         didSet {
             if isDirty {
