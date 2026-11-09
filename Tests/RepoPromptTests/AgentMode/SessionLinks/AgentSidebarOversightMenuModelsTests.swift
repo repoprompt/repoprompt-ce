@@ -2864,7 +2864,8 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         }
         let host = NSHostingView(rootView: sidebar(for: state, tabID: tabs[0].id))
         window.contentView = host
-        window.makeKeyAndOrderFront(nil)
+        // Data/provider tests use this hosted fixture without displaying a window.
+        // Only the explicitly opted-in native opening helper may order it front.
         host.layoutSubtreeIfNeeded()
         await Task.yield()
         return Fixture(state: state, tabs: tabs, host: host, window: window, providerAttempts: providerAttempts, hydrationAttempts: hydrationAttempts)
@@ -2902,6 +2903,12 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         cancelAfterOpening: Bool = true, timeout: TimeInterval = 3,
         whileTracking: ((NSMenu) -> Void)? = nil
     ) async throws -> NSMenu {
+        // Real AppKit tracking displays menus and consumes desktop input. Never do
+        // this in routine suite runs; keep offscreen data/provider coverage active.
+        guard ProcessInfo.processInfo.environment["REPOPROMPT_RUN_INTERACTIVE_MENU_TESTS"] == "1" else {
+            throw XCTSkip("Interactive menu tests steal desktop focus; opt in with REPOPROMPT_RUN_INTERACTIVE_MENU_TESTS=1")
+        }
+        fixture.window.makeKeyAndOrderFront(nil)
         let region = try mountedRegion(in: fixture)
         let finished = expectation(description: "Native tracking observed and intentionally ended")
         var tracked: NSMenu?
