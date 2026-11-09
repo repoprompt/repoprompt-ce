@@ -28,6 +28,15 @@ final class AgentSessionAttachmentRuntime {
     struct Configuration {
         let location: (AgentTabSession) -> AgentSessionAttachmentLocation?
         let locationIsCurrent: (AgentSessionAttachmentLocation, AgentTabSession) -> Bool
+
+        static func canonical(
+            location: @escaping (AgentTabSession) -> AgentSessionAttachmentLocation?
+        ) -> Self {
+            .init(location: location, locationIsCurrent: { captured, session in
+                guard let current = location(session) else { return false }
+                return current.retainedRoot == captured.retainedRoot
+            })
+        }
     }
 
     private weak var scope: AgentSessionRuntimeStore.Scope?
