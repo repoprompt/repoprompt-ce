@@ -1241,10 +1241,11 @@ final class DelegationMembershipCensusTests: XCTestCase {
             mcpServerEnabler: { true }
         )
         let idleID = UUID(), runningID = UUID(), ambiguousID = UUID(), missingID = UUID()
-        for (id, active) in [(idleID, false), (runningID, true), (ambiguousID, false), (ambiguousID, false)] {
+        for (index, state) in [(idleID, false), (runningID, true), (ambiguousID, false), (ambiguousID, false)].enumerated() {
+            let (id, active) = state
             let session = AgentModeViewModel.TabSession(tabID: UUID())
             viewModel.test_installLiveSession(session)
-            _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(sessionID: id, on: session))
+            try installCensusBinding(id, on: session, in: viewModel, conflicting: index == 3)
             if active { session.runState = .running }
         }
         let ids: Set = [idleID, runningID, ambiguousID, missingID]
@@ -1263,7 +1264,7 @@ final class DelegationMembershipCensusTests: XCTestCase {
         XCTAssertEqual(viewModel.test_persistentBindingResolutionBuildCount, 1)
         let secondIdle = AgentModeViewModel.TabSession(tabID: UUID())
         viewModel.test_installLiveSession(secondIdle)
-        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(sessionID: idleID, on: secondIdle))
+        try installCensusBinding(idleID, on: secondIdle, in: viewModel, conflicting: true)
         XCTAssertEqual(viewModel.authoritativeLiveSessionStates(for: ids)[idleID], .ambiguous)
         XCTAssertEqual(viewModel.test_persistentBindingResolutionBuildCount, 2)
         XCTAssertTrue(viewModel.authoritativeLiveSessionStates(for: []).isEmpty)
@@ -1294,15 +1295,15 @@ final class DelegationMembershipCensusTests: XCTestCase {
             owner: owner, latestOwner: owner, activeWorkspace: ownerWorkspace
         )
         for id in [ambiguousID, runningID] {
-            for _ in 0 ..< 2 {
+            for index in 0 ..< 2 {
                 let session = AgentModeViewModel.TabSession(tabID: UUID())
                 first.agentModeViewModel.test_installLiveSession(session)
-                _ = try XCTUnwrap(first.agentModeViewModel.test_installPersistentSessionBinding(sessionID: id, on: session))
+                try installCensusBinding(id, on: session, in: first.agentModeViewModel, conflicting: index == 1)
             }
         }
         let running = AgentModeViewModel.TabSession(tabID: UUID())
         second.agentModeViewModel.test_installLiveSession(running)
-        _ = try XCTUnwrap(second.agentModeViewModel.test_installPersistentSessionBinding(sessionID: runningID, on: running))
+        try installCensusBinding(runningID, on: running, in: second.agentModeViewModel, conflicting: true)
         running.runState = .running
         let idle = AgentModeViewModel.TabSession(tabID: UUID())
         second.agentModeViewModel.test_installLiveSession(idle)
@@ -1435,10 +1436,10 @@ final class DelegationMembershipCensusTests: XCTestCase {
         XCTAssertEqual(window.agentModeViewModel.test_persistentBindingResolutionBuildCount, 1)
         // Two idle runtime claims are not a proven idle endpoint. Ambiguity must count as live
         // on the very next synchronous authorization, without awaiting a publication or cache reset.
-        for _ in 0 ..< 2 {
+        for index in 0 ..< 2 {
             let session = AgentModeViewModel.TabSession(tabID: UUID())
             window.agentModeViewModel.test_installLiveSession(session)
-            _ = try XCTUnwrap(window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: conflictID, on: session))
+            try installCensusBinding(conflictID, on: session, in: window.agentModeViewModel, conflicting: index == 1)
         }
         window.agentModeViewModel.test_resetPersistentBindingResolutionSnapshotBuildCount()
         guard case let .denied(denial, _) = core.authorize(fork) else { return XCTFail("Ambiguous live membership must consume the last slot") }
@@ -1488,7 +1489,7 @@ final class DelegationMembershipCensusTests: XCTestCase {
                 installIdleCarrier(target, tabID: firstTab.id, on: first)
             }
             let liveTab = try XCTUnwrap(secondWorkspace.composeTabs.first)
-            installIdleCarrier(target, tabID: liveTab.id, on: second)
+            installIdleCarrier(target, tabID: liveTab.id, on: second, injectConflictingWriter: !firstWorkspace.composeTabs.isEmpty)
             for windows in [[first, second], [second, first]] {
                 try await assertAmbiguousAdministrationRefused(
                     target, workspaceID: firstWorkspace.id, windows: windows, context: conflict
@@ -1523,7 +1524,7 @@ final class DelegationMembershipCensusTests: XCTestCase {
         }
     }
 
-    func testCoherentCanonicalReplicasRemainReadableButRefuseWritesAndPreserveAncestry() async throws {
+    func testCoherentReplicasRemainReadableAndConflictingWritersRefuseWrites() async throws {
         let root = UUID(), middle = UUID(), target = UUID()
         let tab = ComposeTabState(name: "Original", activeAgentSessionID: target)
         let workspace = WorkspaceModel(
@@ -1584,7 +1585,7 @@ final class DelegationMembershipCensusTests: XCTestCase {
         XCTAssertTrue(projector.authorityConflictInAncestry(of: target))
 
         installCarrierIndex(first.agentModeViewModel.sessionIndex, workspace: workspace, on: second)
-        installIdleCarrier(target, tabID: tab.id, on: first)
+        installIdleCarrier(target, tabID: tab.id, on: first, injectConflictingWriter: true)
         var undoTokens = 0
         let fixture = try carrierAdministration(windows: [first, second], workspaceID: workspace.id, makeToken: {
             undoTokens += 1
@@ -1970,6 +1971,85 @@ final class DelegationMembershipCensusTests: XCTestCase {
         }
     }
 
+    func testReplicatedCreatorRequiresOneWriterAndStillReservesDelegatedCapacity() async throws {
+        let originalFullAccess = OverseerGlobalAutoApprove.isEnabled
+        OverseerGlobalAutoApprove.isEnabled = { false }
+        defer { OverseerGlobalAutoApprove.isEnabled = originalFullAccess }
+        let creator = UUID()
+        let tab = ComposeTabState(name: "Creator", activeAgentSessionID: creator)
+        let workspace = WorkspaceModel(
+            name: "Replicated creator", repoPaths: [], ephemeralFlag: true,
+            composeTabs: [tab], activeComposeTabID: tab.id
+        )
+        let entry = carrierEntry(creator, tabID: tab.id)
+        let owner = await carrierWindow(workspace: workspace, entries: [entry])
+        let replica = await carrierWindow(workspace: workspace, entries: [entry])
+        var windows = [replica, owner]
+        let source = OpenWindowsDelegationProvenanceSource(windows: { windows })
+        let projector = SpawnProvenanceDelegationMembershipProjector(source: source)
+        let scopes = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        let requested = try scopes.requestScope(
+            requesterSessionID: creator, requesterTabID: tab.id, kind: .tree(rootSessionID: creator),
+            capabilities: [.observe, .spawn], guardrails: .init(maxLiveSessions: 2), reason: nil, idempotencyKey: nil
+        ).get()
+        let scope = try scopes.approve(requestID: requested.id).get()
+        let core = AgentSessionAdministrationCore(scopes: scopes, projector: projector)
+        func admit() -> DelegationSpawnAdmission.Outcome {
+            DelegationSpawnAdmission.admit(
+                creatorSessionID: creator, target: .newSession, scopes: scopes, administration: core, projector: projector
+            )
+        }
+        XCTAssertEqual(projector.pointResolutionState(for: creator), .replicated)
+        XCTAssertEqual(projector.knownProvenance(for: creator)?.canPrepareRuntimeWriter, true)
+        XCTAssertEqual(admit(), .creatorPlacementUnresolved("creator_replicated"), "Cold target preparation is not an existing creator writer")
+
+        installIdleCarrier(creator, tabID: tab.id, on: owner)
+        let command = try XCTUnwrap(owner.agentModeViewModel.runtimeCommand(sessionID: creator))
+        XCTAssertEqual(projector.knownProvenance(for: creator)?.hasUniqueRuntimeOwner, true)
+        let usage = try XCTUnwrap(projector.usageEvidence(of: scope.grant, spawnParentSessionID: creator))
+        XCTAssertEqual(usage.liveSessionCount, 1, "Agreeing UI replicas count the logical creator only once")
+        for ordered in [[replica, owner], [owner, replica]] {
+            windows = ordered
+            guard case let .admitted(admission) = admit() else { return XCTFail("The unique writer must authorize accounting in either presentation order") }
+            XCTAssertEqual(admission.stampScopeID, scope.id)
+            XCTAssertNotNil(admission.stampLease)
+            XCTAssertEqual(scopes.usageIncludingReservations(usage).liveSessionCount, 2)
+            XCTAssertEqual(admit(), .denied(.guardrailExceeded(guardrail: .maxLiveSessions, limit: 2, current: 2)))
+            DelegationSpawnAdmission.finish(admission, scopes: scopes)
+            XCTAssertEqual(scopes.usageIncludingReservations(usage), usage)
+        }
+        // Normal installation refuses a second writer without changing the valid creator.
+        let contender = AgentModeViewModel.TabSession(tabID: tab.id)
+        XCTAssertEqual(replica.agentModeViewModel.test_bindingRejection(sessionID: creator, on: contender), .conflictingWriter)
+        XCTAssertNil(replica.agentModeViewModel.test_installPersistentSessionBinding(sessionID: creator, on: contender))
+        XCTAssertNil(contender.persistentSessionBindingIdentity)
+        XCTAssertNil(replica.agentModeViewModel.sessions[tab.id])
+        XCTAssertTrue(command.isCurrent)
+        XCTAssertEqual(projector.knownProvenance(for: creator)?.hasUniqueRuntimeOwner, true)
+
+        // A unique payload writer does not repair conflicting organizational provenance.
+        var conflicting = entry
+        conflicting.organizationalParentID = UUID()
+        installCarrierIndex([creator: conflicting], workspace: workspace, on: replica)
+        XCTAssertEqual(admit(), .creatorPlacementUnresolved("creator_ancestry_conflict"))
+        XCTAssertEqual(scopes.usageIncludingReservations(usage), usage)
+        installCarrierIndex([creator: entry], workspace: workspace, on: replica)
+
+        // Inject legacy corruption only after proving that ordinary admission refused it.
+        contender.testInstallPersistentSessionBinding(sessionID: creator)
+        contender.hasLoadedPersistedState = true
+        replica.agentModeViewModel.test_installLiveSession(contender)
+        guard case .conflicting = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: creator) else {
+            return XCTFail("The raw competing claim must be visible to canonical writer resolution")
+        }
+        XCTAssertFalse(command.isCurrent)
+        XCTAssertNotEqual(projector.knownProvenance(for: creator)?.hasUniqueRuntimeOwner, true)
+        // The physical address and metadata still agree; only the runtime writer conflicts.
+        XCTAssertEqual(projector.pointResolutionState(for: creator), .replicated)
+        XCTAssertEqual(admit(), .creatorPlacementUnresolved("creator_replicated"))
+        XCTAssertEqual(scopes.usageIncludingReservations(usage), usage, "A refused creator never reserves capacity")
+    }
+
     func testConflictingPlacementRetainsAccountingButDeniesUsageAndNewSessionAdmission() async throws {
         let creator = UUID(), caller = UUID()
         let tab = ComposeTabState(name: "Creator", activeAgentSessionID: creator)
@@ -2142,9 +2222,33 @@ final class DelegationMembershipCensusTests: XCTestCase {
         window.agentModeViewModel.test_installSessionIndexSnapshot(entries, owner: owner, latestOwner: owner, activeWorkspace: workspace)
     }
 
-    private func installIdleCarrier(_ sessionID: UUID, tabID: UUID, on window: WindowState) {
+    private func installCensusBinding(
+        _ sessionID: UUID, on session: AgentTabSession, in viewModel: AgentModeViewModel, conflicting: Bool
+    ) throws {
+        if conflicting {
+            XCTAssertEqual(viewModel.test_bindingRejection(sessionID: sessionID, on: session), .conflictingWriter)
+            XCTAssertNil(viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session))
+            XCTAssertNil(session.persistentSessionBindingIdentity)
+            // These read-only census cases deliberately retain evidence of legacy corruption.
+            session.testInstallPersistentSessionBinding(sessionID: sessionID)
+        } else {
+            _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session))
+        }
+    }
+
+    private func installIdleCarrier(_ sessionID: UUID, tabID: UUID, on window: WindowState, injectConflictingWriter: Bool = false) {
         let live = AgentModeViewModel.TabSession(tabID: tabID)
-        live.testInstallPersistentSessionBinding(sessionID: sessionID)
+        if injectConflictingWriter {
+            XCTAssertEqual(window.agentModeViewModel.test_bindingRejection(sessionID: sessionID, on: live), .conflictingWriter)
+            XCTAssertNil(window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: live))
+            XCTAssertNil(live.persistentSessionBindingIdentity)
+            live.testInstallPersistentSessionBinding(sessionID: sessionID)
+        } else {
+            // Archive requires a real workspace-qualified payload writer, not a raw test claim.
+            let binding = window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: live)
+            XCTAssertEqual(binding?.sessionID, sessionID)
+            XCTAssertEqual(binding?.workspaceID, window.workspaceManager.activeWorkspace?.id)
+        }
         live.hasLoadedPersistedState = true
         live.recordRestorationAuthoritative(.persistedPayloadApplied)
         XCTAssertNil(live.operationAdmissionFailureMessage)

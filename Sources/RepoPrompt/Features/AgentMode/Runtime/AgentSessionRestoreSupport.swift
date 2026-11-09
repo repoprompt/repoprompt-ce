@@ -320,8 +320,8 @@ enum AgentSessionRestoreSupport {
         projectionProtection: AgentTranscriptProjectionProtection,
         isCompressedHistoryRevealed: Bool,
         isColdLoad: Bool
-    ) -> AgentModeViewModel.BuiltTranscriptPresentation {
-        AgentModeViewModel.buildTranscriptPresentation(
+    ) -> AgentBuiltTranscriptPresentation {
+        AgentSessionTranscriptBuilder.buildTranscriptPresentation(
             from: transcript,
             sourceItems: sourceItems,
             selectedAgent: selectedAgent,

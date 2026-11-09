@@ -7,6 +7,39 @@ private struct AgentSessionLaneBindingLocation: Hashable {
     let tabID: UUID
 }
 
+private struct AgentSessionLaneBindingCensus {
+    #if DEBUG
+        @MainActor static var observer: ((Set<UUID>, Int) -> Void)?
+    #endif
+    var locations: Set<AgentSessionLaneBindingLocation> = []
+    var projectionOwners: [AgentSessionLaneBindingLocation: Set<Int>] = [:]
+    var activeOwners: [AgentSessionLaneBindingLocation: Set<Int>] = [:]
+    var ephemeralLocations: Set<AgentSessionLaneBindingLocation> = []
+    var duplicateWithinWindow = false
+
+    mutating func record(
+        location: AgentSessionLaneBindingLocation, windowID: Int, duplicate: Bool, ephemeral: Bool, active: Bool
+    ) {
+        duplicateWithinWindow = duplicateWithinWindow || duplicate
+        locations.insert(location)
+        projectionOwners[location, default: []].insert(windowID)
+        if ephemeral { ephemeralLocations.insert(location) }
+        if active { activeOwners[location, default: []].insert(windowID) }
+    }
+
+    var count: Int {
+        // Inactive durable projections reload from disk; ephemeral projections cannot.
+        // Distinct locations, multiple active owners and duplicate rows fail closed.
+        let total = locations.reduce(0) { count, location in
+            let owners = ephemeralLocations.contains(location)
+                ? projectionOwners[location]?.count ?? 0
+                : activeOwners[location]?.count ?? 0
+            return count + max(owners, 1)
+        }
+        return duplicateWithinWindow ? max(total, 2) : total
+    }
+}
+
 extension WindowStatesManager {
     func agentSessionLinkWasCreatedBy(sessionID: UUID, creatorSessionID: UUID) -> Bool {
         guard !isTerminating else { return false }
@@ -80,39 +113,42 @@ extension WindowStatesManager {
     }
 
     func agentSessionLinkBindingCount(sessionID: UUID) -> Int {
-        guard !isTerminating else { return 0 }
-        var locations: Set<AgentSessionLaneBindingLocation> = []
-        var projectionOwners: [AgentSessionLaneBindingLocation: Set<Int>] = [:]
-        var activeOwners: [AgentSessionLaneBindingLocation: Set<Int>] = [:]
-        var ephemeralLocations: Set<AgentSessionLaneBindingLocation> = []
-        var duplicateWithinWindow = false
+        agentSessionLinkBindingCounts(sessionIDs: [sessionID]).counts[sessionID, default: 0]
+    }
+
+    /// Counts every requested session in one physical-window walk. The visit count supports
+    /// deterministic scaling tests; it does not include closed windows.
+    func agentSessionLinkBindingCounts(sessionIDs: Set<UUID>) -> (counts: [UUID: Int], tabVisits: Int) {
+        guard !isTerminating, !sessionIDs.isEmpty else { return ([:], 0) }
+        var bindings: [UUID: AgentSessionLaneBindingCensus] = [:]
+        var tabVisits = 0
         for window in allWindows where !window.isClosing {
-            var seenInWindow: Set<AgentSessionLaneBindingLocation> = []
+            var seenInWindow: [UUID: Set<AgentSessionLaneBindingLocation>] = [:]
             for workspace in window.workspaceManager.workspaces {
-                for tab in workspace.composeTabs where tab.activeAgentSessionID == sessionID {
+                for tab in workspace.composeTabs {
+                    tabVisits += 1
+                    guard let sessionID = tab.activeAgentSessionID, sessionIDs.contains(sessionID) else { continue }
                     let location = AgentSessionLaneBindingLocation(workspaceID: workspace.id, tabID: tab.id)
-                    if !seenInWindow.insert(location).inserted { duplicateWithinWindow = true }
-                    locations.insert(location)
-                    projectionOwners[location, default: []].insert(window.windowID)
-                    if workspace.isEphemeral { ephemeralLocations.insert(location) }
-                    if window.workspaceManager.activeWorkspaceID == workspace.id {
-                        activeOwners[location, default: []].insert(window.windowID)
-                    }
+                    let duplicate = !seenInWindow[sessionID, default: []].insert(location).inserted
+                    bindings[sessionID, default: AgentSessionLaneBindingCensus()].record(
+                        location: location, windowID: window.windowID, duplicate: duplicate,
+                        ephemeral: workspace.isEphemeral,
+                        active: window.workspaceManager.activeWorkspaceID == workspace.id
+                    )
                 }
             }
         }
-        // A durable workspace is reloaded on activation, so its inactive catalog copies are not
-        // separate bindings. Ephemeral workspaces have no canonical disk copy: every other window
-        // can reopen its stale tab, and must still block retirement. A distinct location, second
-        // active owner, or duplicate entry within one window also fails closed.
-        let count = locations.reduce(0) { count, location in
-            let owners = ephemeralLocations.contains(location)
-                ? projectionOwners[location]?.count ?? 0
-                : activeOwners[location]?.count ?? 0
-            return count + max(owners, 1)
-        }
-        return duplicateWithinWindow ? max(count, 2) : count
+        #if DEBUG
+            AgentSessionLaneBindingCensus.observer?(sessionIDs, tabVisits)
+        #endif
+        return (bindings.mapValues(\.count), tabVisits)
     }
+
+    #if DEBUG
+        func test_setBindingCensusObserver(_ observer: ((Set<UUID>, Int) -> Void)?) {
+            AgentSessionLaneBindingCensus.observer = observer
+        }
+    #endif
 
     func agentSessionLinkClaimLaneRetirement(endpoint: DomainAgentSessionLinkEndpointIdentity) -> UUID? {
         guard !isTerminating,
@@ -183,12 +219,13 @@ extension WindowStatesManager {
                   AgentSessionLaneChildRetirementRecord.descendantIDs(of: endpoint.sessionID, in: records) == descendants
             else { return false }
             // Cascade removal owns only this window's bindings. Other active owners must keep their tabs.
+            let bindingCounts = agentSessionLinkBindingCounts(sessionIDs: descendants).counts
             for peer in allWindows where !peer.isClosing {
                 for workspace in peer.workspaceManager.workspaces {
                     for tab in workspace.composeTabs {
                         guard let sessionID = tab.activeAgentSessionID, descendants.contains(sessionID) else { continue }
                         guard workspace.id == endpoint.workspaceID,
-                              self.agentSessionLinkBindingCount(sessionID: sessionID) == 1,
+                              bindingCounts[sessionID, default: 0] == 1,
                               peer === window || (!workspace.isEphemeral && peer.workspaceManager.activeWorkspaceID != workspace.id)
                         else { return false }
                     }

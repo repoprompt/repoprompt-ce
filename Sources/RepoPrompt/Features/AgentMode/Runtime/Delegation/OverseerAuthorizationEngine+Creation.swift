@@ -236,7 +236,11 @@ extension OverseerAuthorizationEngine {
     }
 
     private func creatorPlacementFailure(_ creator: UUID, projector: any DelegationMembershipProjector) -> String? {
-        if projector.pointResolutionState(for: creator) == .replicated { return "creator_replicated" }
+        // Agreeing presentations do not create another mutation owner. Creation accounting
+        // requires the creator's existing writer, not merely permission to prepare a cold target.
+        if projector.pointResolutionState(for: creator) == .replicated,
+           projector.knownProvenance(for: creator)?.hasUniqueRuntimeOwner != true
+        { return "creator_replicated" }
         if projector.authorityConflictInAncestry(of: creator) { return "creator_ancestry_conflict" }
         return nil
     }

@@ -752,22 +752,36 @@ class WindowState: ObservableObject {
     let isPreparedSessionOwner: Bool
     private let compositionDomainRuntime: MCPDomainRuntime?
     private var didReleaseManagedSettings = false
+    private var preparedSessionTeardownTask: Task<Bool, Never>?
+    var isPreparedSessionTeardownInFlight: Bool {
+        preparedSessionTeardownTask != nil
+    }
 
     /// Retire the private route and its provider/session work, not the app-wide MCP listener or
     /// borrowed API settings. This owner has no window settings or placement document to persist.
     @discardableResult
     func tearDownPreparedSessionOwner() async -> Bool {
         guard isPreparedSessionOwner else { return false }
+        if let preparedSessionTeardownTask { return await preparedSessionTeardownTask.value }
+        if didReleaseManagedSettings { return true }
+        agentModeViewModel.beginPreparedOversightRetirement()
         beginClose()
-        let saved = await agentModeViewModel.finishPreparedOversightRuntime()
-        await mcpServer.unregisterDomainRoutingWindow()
-        mcpServer.stopServiceObservation()
-        await promptManager.gitViewModel.shutdownForWindowClose()
-        aiQueriesService.cancelQuery()
-        if !didReleaseManagedSettings {
-            didReleaseManagedSettings = true
-            apiSettingsViewModel.releaseManagedRuntime()
+        let task = Task { @MainActor in
+            guard await self.agentModeViewModel.finishPreparedOversightRuntime() else { return false }
+            await self.mcpServer.unregisterDomainRoutingWindow()
+            self.mcpServer.stopServiceObservation()
+            await self.promptManager.gitViewModel.shutdownForWindowClose()
+            self.aiQueriesService.cancelQuery()
+            guard self.agentModeViewModel.releasePreparedOversightWriterAfterDrain() else { return false }
+            if !self.didReleaseManagedSettings {
+                self.didReleaseManagedSettings = true
+                self.apiSettingsViewModel.releaseManagedRuntime()
+            }
+            return true
         }
+        preparedSessionTeardownTask = task
+        let saved = await task.value
+        preparedSessionTeardownTask = nil
         return saved
     }
 

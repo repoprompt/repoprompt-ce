@@ -2,12 +2,12 @@ import Foundation
 
 @MainActor
 final class CodexIntegratedAgentModeRunner {
-    private let mcpServerEnabler: AgentModeViewModel.MCPServerEnabler
+    private let mcpServerEnabler: AgentRunExecutionContracts.MCPServerEnabler
     private let codexCoordinator: CodexAgentModeCoordinator
     private let hooks: AgentModeRunService.Hooks
 
     init(
-        mcpServerEnabler: @escaping AgentModeViewModel.MCPServerEnabler,
+        mcpServerEnabler: @escaping AgentRunExecutionContracts.MCPServerEnabler,
         codexCoordinator: CodexAgentModeCoordinator,
         hooks: AgentModeRunService.Hooks
     ) {

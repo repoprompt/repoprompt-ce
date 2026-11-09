@@ -84,7 +84,7 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
             windowID: 2, workspaceID: UUID(), tabID: UUID(), sessionID: UUID(),
             persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1
         )
-        return await fixture.viewModel.agentSessionLinkPerformStop(
+        return await fixture.viewModel.linkExecutionRuntime.agentSessionLinkPerformStop(
             to: fixture.candidate,
             request: AgentSessionLinkStopRequest(
                 requestID: UUID(), linkID: UUID(), linkGeneration: 1,
@@ -104,6 +104,63 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
             },
             beforeCleanupTask: beforeCleanupTask
         )
+    }
+
+    func testRetainedScopeOwnsExecutionWithoutRetainingItsPresenter() async throws {
+        var retainedScope: AgentSessionRuntimeStore.Scope?
+        weak var presenter: AgentModeViewModel?
+        weak var scope: AgentSessionRuntimeStore.Scope?
+        weak var execution: AgentModeRunService?
+        func prepareRetainedScope() async throws {
+            let fixture = try makeFixture()
+            guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: fixture.candidate.sessionID) else {
+                throw AgentSessionRuntimeStore.CommandRejection.staleWriter
+            }
+            scope = writer.scope
+            execution = writer.scope.execution
+            presenter = fixture.viewModel
+            await fixture.viewModel.prepareForWindowClose()
+            // Close cancels presentation, but its final persistence timer can still retain the
+            // originating scope. Join that exact task; cancellation alone is not a drain receipt.
+            let pendingSave = fixture.session.saveDebounceTask
+            pendingSave?.cancel()
+            await pendingSave?.value
+            fixture.session.saveDebounceTask = nil
+            retainedFixtures.removeAll()
+            retainedScope = writer.scope
+        }
+        try await prepareRetainedScope()
+        XCTAssertNil(presenter, "runtime execution must not retain its presentation adapter")
+        XCTAssertNotNil(execution)
+        XCTAssertTrue(retainedScope?.execution === execution)
+        retainedScope = nil
+        XCTAssertNil(scope)
+        XCTAssertNil(execution)
+    }
+
+    func testClaimedStopKeepsExactExecutionAndWriterThroughRetirement() async throws {
+        let fixture = try makeFixture()
+        guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: fixture.candidate.sessionID) else {
+            return XCTFail("Expected the exact runtime writer")
+        }
+        XCTAssertTrue(writer.scope.execution === fixture.viewModel.test_initializeRunService())
+        fixture.session.runState = .running
+        fixture.session.installRunID(UUID())
+        _ = fixture.session.beginRunAttempt(source: "retiring-stop-writer")
+        let outcome = await stop(fixture, beforeCleanupTask: {
+            writer.scope.beginRetirement()
+            XCTAssertTrue(writer.isCurrent)
+            XCTAssertEqual(writer.query()?.commandRejection, .retiring)
+            XCTAssertFalse(writer.scope.releaseWriterClaimsAfterDrain(), "claimed Stop still owns teardown and its audit")
+        })
+        guard case let .settled(receipt) = outcome else { return XCTFail("Expected a Stop receipt") }
+        XCTAssertEqual(receipt.result, .stopped)
+        XCTAssertEqual(receipt.auditStatus, .persisted)
+        XCTAssertEqual(fixture.session.runState, .cancelled)
+        XCTAssertTrue(fixture.viewModel.linkExecutionRuntime.pendingStopEffects.isEmpty)
+        XCTAssertTrue(writer.isCurrent)
+        XCTAssertTrue(writer.scope.releaseWriterClaimsAfterDrain())
+        XCTAssertFalse(writer.isCurrent)
     }
 
     func testIdleTargetRetainsNoopWithoutRowOrMutation() async throws {
@@ -318,7 +375,10 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         fixture.session.stopState.markCleanupStarted(id: oldStopID, binding: oldBinding)
         fixture.session.stopState.test_ageManagedStopClaim(by: 31)
         fixture.session.installPersistentSessionBinding(
-            AgentPersistentSessionBindingIdentity(tabID: fixture.tabID, sessionID: fixture.candidate.sessionID)
+            AgentPersistentSessionBindingIdentity(
+                tabID: fixture.tabID, sessionID: fixture.candidate.sessionID,
+                workspaceID: fixture.candidate.workspaceID
+            )
         )
         XCTAssertFalse(fixture.session.permitsBoundOperationAndSave, "The old binding's hydration must not transfer to its successor")
         fixture.session.recordRestorationAuthoritative(.persistedPayloadApplied)
@@ -571,13 +631,11 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         fixture.session.runState = .running
         fixture.session.installRunID(UUID())
         _ = fixture.session.beginRunAttempt(source: "stop-audit-rebind")
-        let manager = try XCTUnwrap(fixture.viewModel.workspaceManager)
         fixture.viewModel.test_setAgentSessionSaver { agentSession, _, _ in
             if agentSession.toLiveItems().contains(where: { $0.text == AgentChatItem.overseerRunStoppedText }) {
-                _ = manager.compareAndSetActiveAgentSessionID(
-                    expected: fixture.candidate.sessionID, replacement: UUID(),
-                    forTabID: fixture.tabID, inWorkspaceID: fixture.candidate.workspaceID
-                )
+                XCTAssertNotNil(fixture.viewModel.test_installPersistentSessionBinding(
+                    sessionID: UUID(), on: fixture.session, updateWorkspaceMetadata: true
+                ))
             }
             return URL(fileURLWithPath: NSTemporaryDirectory())
                 .appendingPathComponent("\(UUID().uuidString).json")

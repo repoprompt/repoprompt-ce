@@ -586,6 +586,59 @@ import XCTest
             }
         }
 
+        /// A cancelled connection lookup belongs to its registration, not a reused run ID.
+        func testCancelledConnectionWaiterCannotUnregisterSameRunSuccessorObserver() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease, domainRuntime: AppDomainRuntimeComposition.shared.runtime)
+                let endpoint = try fixture.endpointA()
+                let manager = fixture.networkManager
+                let tracker = AgentToolTracker()
+                let gate = TestReleaseFence(name: "predecessor connection lookup")
+                let runID = UUID()
+                var calls: [UUID] = []
+                var completions: [UUID] = []
+                var waiter: Task<Void, Never>?
+                @MainActor
+                func cleanup() async throws {
+                    gate.release()
+                    waiter?.cancel()
+                    await waiter?.value
+                    await tracker.stop()
+                    await manager.debugSetDomainPeerIdentityForTesting(connectionID: endpoint.connectionID, identity: nil)
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                }
+                do {
+                    try await Self.prepareCanonicalReadFixture(fixture, endpoint: endpoint, context: fixture.contextA)
+                    await manager.debugSeedConnectionRunRouting(connectionID: endpoint.connectionID, runID: runID, windowID: fixture.contextA.window.windowID)
+                    let predecessorToken = await tracker.registerEnhancedObserver(runID: runID, onCalled: { _, _, _ in }, onCompleted: { _, _, _, _, _ in })
+                    await tracker.setBeforeConnectionLookupForTesting { await gate.enterAndWait() }
+                    let predecessor = Task { await tracker.waitForConnectionAfterRegistration(runID: runID, observerToken: predecessorToken, clientNameHint: nil) }
+                    waiter = predecessor
+                    guard await gate.waitUntilEntered() else { throw CancellationError() }
+                    await tracker.stop(ifTracking: runID)
+                    await tracker.registerEnhancedObserver(runID: runID, onCalled: { invocation, _, _ in
+                        await MainActor.run { calls.append(invocation) }
+                    }, onCompleted: { invocation, _, _, _, _ in
+                        await MainActor.run { completions.append(invocation) }
+                    })
+                    // Reproduce the controller's same-run attempt replacement: the old cancelled
+                    // lookup settles only after the new observer has been registered.
+                    predecessor.cancel()
+                    await predecessor.value
+                    waiter = nil
+                    let response = try await endpoint.callTool(name: "read_file", arguments: ["path": fixture.contextA.fileURL.path])
+                    XCTAssertTrue(try Self.toolResultText(response).contains(fixture.contextA.sentinel))
+                    XCTAssertEqual(calls.count, 1, "Predecessor cancellation must not remove the successor observer")
+                    XCTAssertEqual(completions, calls)
+                    try await cleanup()
+                } catch {
+                    try? await cleanup()
+                    throw error
+                }
+            }
+        }
+
         /// W0(a): exercises the real network handler, wrapper active set, context UUID, observer
         /// delivery and tracker FIFO. No self_noop registration or provider process is involved.
         func testW0WrapperCleanupAndMailboxIdleDoNotFenceFutureObserverAndResponseDoesNotDrainMailbox() async throws {

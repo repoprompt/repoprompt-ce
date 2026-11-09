@@ -1,5 +1,23 @@
 # Testing RepoPrompt CE
 
+## Interactive native-menu tests (explicit opt-in)
+
+Ordinary test runs must not display context menus or take desktop focus. The hosted
+`AgentSidebarHostedContextMenuTests` fixtures create a frontmost key window, send
+synthetic input, and enter real AppKit menu tracking (including submenu navigation
+and retries). Native opening skips before displaying a window or posting input
+unless explicitly enabled. Hosted data/provider tests use offscreen windows and
+continue running, as do headless menu-model and stable-menu tests.
+
+Only on a desktop reserved for interactive validation, run:
+
+```bash
+REPOPROMPT_RUN_INTERACTIVE_MENU_TESTS=1 make dev-test FILTER=RepoPromptTests.AgentSidebarHostedContextMenuTests
+```
+
+This opt-in intentionally displays windows/menus and may steal focus. Do not set it
+in routine suite or CI environments. No production menu behavior is disabled.
+
 Use this guide for contributor-facing XCTest changes. Follow `AGENTS.md` for coordinated daemon use, style checks, and lifecycle approvals. Use `$rpce-test-quality` when deciding whether coverage is worth adding, retaining, consolidating, or removing.
 
 ## Fast local feedback and CI escalation

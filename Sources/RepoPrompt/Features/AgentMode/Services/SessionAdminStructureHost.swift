@@ -7,8 +7,8 @@ import RepoPromptDomainRuntime
 // only perform the already-authorized effect through the existing owner of that state:
 // - links go through `AgentSessionLinkRuntimeBridge.addMonitorLink` / `stopMonitorLink` (link
 //   authority stays the sole owner);
-// - placement through the owning window's `commitDelegationPlacement` (in memory synchronously,
-//   durable write queued);
+// - placement through the exact runtime writer's `commitDelegationPlacement` (in memory
+//   synchronously, durable write queued);
 // - model/effort through the target's existing model-commit seam;
 // - worktree bindings through `transitionWorktreeBindings(.externalManagement)`;
 // - merge apply through the existing user merge-review prompt.
@@ -44,12 +44,22 @@ enum SessionAdminLifecycleOutcome: Equatable {
     case invalid(String)
 }
 
+/// Keeps a prepared runtime alive through the final authorization region and durable receipt.
+/// It is a lifetime hold only, never permission to mutate the session.
+@MainActor
+struct SessionAdminPlacementPreparation {
+    let release: () -> Void
+}
+
 @MainActor
 protocol SessionAdminStructureHost: AnyObject {
+    func prepareOrganizationalPlacement(
+        sessionID: UUID, isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async throws -> SessionAdminPlacementPreparation
     /// Applies organizational placement synchronously, with no suspension, so the handler's final
     /// re-validation and this write form one critical section; the returned commit carries the queued
     /// durable write. `delegationScopeID == nil` keeps the existing value. Spawn provenance is never
-    /// written. Returns `nil` when no loaded window owns the session.
+    /// written. Returns `nil` when no exact runtime writer owns the session.
     func commitOrganizationalPlacement(sessionID: UUID, parentID: UUID, delegationScopeID: UUID?) throws -> DelegationPlacementCommit?
     /// Capabilities of the active link from `observer` to `target`, or `nil` when none.
     func activeLinkCapabilities(observer: UUID, target: UUID) async -> Set<DomainAgentSessionLinkCapability>?
@@ -93,6 +103,13 @@ protocol SessionAdminStructureHost: AnyObject {
 }
 
 extension SessionAdminStructureHost {
+    func prepareOrganizationalPlacement(
+        sessionID _: UUID, isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async throws -> SessionAdminPlacementPreparation {
+        guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
+        return SessionAdminPlacementPreparation(release: {})
+    }
+
     func addLink(
         observer: UUID, target: UUID, sourceScopeID: UUID?,
         isStillAuthorized: @escaping @MainActor () -> Bool

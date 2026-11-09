@@ -94,20 +94,20 @@ extension AgentModeViewModel {
             return answer
         }
 
-        guard !agentSelfCompactHasCompetingWriter(session, sessionID: endpoint.sessionID) else {
+        guard agentSelfCompactHasExclusiveWriter(session, endpoint: endpoint) else {
             return .blocked(reason: "session_not_exclusive")
         }
         guard !session.selfCompactPersistenceWarning,
               endpoint.persistentBindingGeneration != nil
         else { return .blocked(reason: "session_not_exclusive") }
 
-        let support = await agentSessionLinkCompactSupport(for: session)
+        let support = await linkExecutionRuntime.agentSessionLinkCompactSupport(for: session)
         guard sessions[endpoint.tabID] === session,
               agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
               session.runID == origin.runID,
               session.activeRunOwnership?.attemptID == origin.runAttemptID
         else { return .unavailable }
-        guard !agentSelfCompactHasCompetingWriter(session, sessionID: endpoint.sessionID) else {
+        guard agentSelfCompactHasExclusiveWriter(session, endpoint: endpoint) else {
             return .blocked(reason: "session_not_exclusive")
         }
         switch support {
@@ -126,7 +126,7 @@ extension AgentModeViewModel {
             || readiness.hasPendingApplyEditsReview || readiness.hasPendingWorktreeMergeReview
         if hasInteraction { return .blocked(reason: "pending_interaction") }
         guard AgentSessionLinkDeliveryReadiness.evaluate(snapshot: readiness) == .ready,
-              !Self.agentSessionLinkCompactHasQueuedProviderWork(session)
+              !AgentSessionLinkExecutionRuntime.agentSessionLinkCompactHasQueuedProviderWork(session)
         else { return .blocked(reason: "busy") }
 
         guard let accepted = agentSelfCompactSchedule(
@@ -159,7 +159,7 @@ extension AgentModeViewModel {
               agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
               session.selfCompactState.active?.id == attempt.id
         else { return .blocked(reason: "busy") }
-        guard !agentSelfCompactHasCompetingWriter(session, sessionID: endpoint.sessionID) else {
+        guard agentSelfCompactHasExclusiveWriter(session, endpoint: endpoint) else {
             var state = session.selfCompactState
             state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
             session.selfCompactState = state
@@ -182,7 +182,7 @@ extension AgentModeViewModel {
                 return .blocked(reason: "persistence_pending")
             }
             if session.selfCompactState.active?.id == requestID,
-               agentSelfCompactHasCompetingWriter(session, sessionID: endpoint.sessionID)
+               !agentSelfCompactHasExclusiveWriter(session, endpoint: endpoint, allowRetiringWriter: true)
             {
                 return .blocked(reason: "session_not_exclusive")
             }
@@ -230,15 +230,15 @@ extension AgentModeViewModel {
         return snapshot
     }
 
-    private func agentSelfCompactHasCompetingWriter(_ session: TabSession, sessionID: UUID) -> Bool {
-        let sameWindowWriter = sessions.values.contains { other in
-            other !== session && other.activeAgentSessionID == sessionID
-        }
-        return sameWindowWriter || WindowStatesManager.shared.allWindows.contains { window in
-            window.agentModeViewModel.sessions.values.contains { other in
-                other !== session && other.activeAgentSessionID == sessionID
-            }
-        }
+    private func agentSelfCompactHasExclusiveWriter(_ session: TabSession, endpoint: DomainAgentSessionLinkEndpointIdentity, allowRetiringWriter: Bool = false) -> Bool {
+        // A window census misses independent runtime scopes. Use the same exact writer
+        // authority as persistence, before reserving a request or spending its key.
+        guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+            workspaceID: endpoint.workspaceID, sessionID: endpoint.sessionID
+        ) else { return false }
+        return writer.session === session && writer.binding.tabID == endpoint.tabID
+            && writer.binding.generation == endpoint.persistentBindingGeneration
+            && (allowRetiringWriter || !writer.scope.isRetiring)
     }
 
     func agentSelfCompactTerminalSettled(
@@ -305,7 +305,7 @@ extension AgentModeViewModel {
                 self?.agentSelfCompactHasActiveMCPTools(runID: runID) ?? false
             },
             support: { [weak self] in
-                await self?.agentSessionLinkCompactSupport(for: session) ?? .notSupported
+                await self?.linkExecutionRuntime.agentSessionLinkCompactSupport(for: session) ?? .notSupported
             },
             dispatch: { [weak self] requestID, support, stillAdmissible in
                 guard let self else { return false }
@@ -332,7 +332,7 @@ extension AgentModeViewModel {
             && endpoint.sessionID == owner.sessionID
             && endpoint.persistentBindingGeneration == owner.persistentBindingGeneration
             && endpoint.bindingTransitionGeneration == owner.bindingTransitionGeneration
-            && !agentSelfCompactHasCompetingWriter(session, sessionID: owner.sessionID)
+            && agentSelfCompactHasExclusiveWriter(session, endpoint: endpoint)
     }
 
     /// Evaluation can release a stale parked note without requiring a send that the note itself
@@ -384,7 +384,7 @@ extension AgentModeViewModel {
 
         let ready: @MainActor () -> Bool = { [weak self] in
             guard let self, stillAdmissible(), composerSubmitClaimIsCurrent(claim),
-                  !Self.agentSessionLinkCompactHasQueuedProviderWork(session),
+                  !AgentSessionLinkExecutionRuntime.agentSessionLinkCompactHasQueuedProviderWork(session),
                   workspaceManager?.activeWorkspace?.id == owner.workspaceID
             else { return false }
             return AgentSessionLinkDeliveryReadiness.evaluate(
@@ -419,7 +419,7 @@ extension AgentModeViewModel {
         state.active?.usedTokensBeforeCompact = session.vouchedContextCount?.tokens
         session.selfCompactState = state
         session.selfCompactNativeCompletion = agentSelfCompactNativeCompletion(for: session)
-        let result = await agentSessionLinkDispatchNativeCompact(
+        let result = await linkExecutionRuntime.agentSessionLinkDispatchNativeCompact(
             session: session,
             tabID: owner.tabID,
             support: support,
@@ -491,7 +491,7 @@ extension AgentModeViewModel {
         defer { releaseComposerSubmitClaim(claim) }
         let ready: @MainActor () -> Bool = { [weak self] in
             guard let self, stillAdmissible(), composerSubmitClaimIsCurrent(claim),
-                  !Self.agentSessionLinkCompactHasQueuedProviderWork(session),
+                  !AgentSessionLinkExecutionRuntime.agentSessionLinkCompactHasQueuedProviderWork(session),
                   agentSelfCompactOwnerIsCurrent(owner, session: session),
                   workspaceManager?.activeWorkspace?.id == owner.workspaceID
             else { return false }

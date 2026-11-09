@@ -760,7 +760,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             stopLivenessReadings.append(admissionLiveness)
             guard admissionLiveness.permitsDelivery else { return .blocked(.endpointInvalidated) }
             if routeStopToInteractionViewModel, let interactionViewModel {
-                return await interactionViewModel.agentSessionLinkPerformStop(
+                return await interactionViewModel.linkExecutionRuntime.agentSessionLinkPerformStop(
                     to: candidate, request: request, liveness: liveness,
                     queueHasCommittedDrain: queueHasCommittedDrain,
                     withdrawInbound: withdrawInbound, commitAuthorization: commitAuthorization
@@ -1223,7 +1223,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             fields: [],
             details: [.init(label: "api_key=private-label", value: "secret=private-value", isCode: false)]
         )
-        let projected = AgentModeViewModel.overseerProjection(of: interaction)
+        let projected = AgentSessionInteractionRuntime.overseerProjection(of: interaction)
         XCTAssertEqual(projected.options.map(\.label), ["continue"])
         XCTAssertFalse(projected.title?.contains("private-title") ?? false)
         XCTAssertFalse(projected.options.first?.description?.contains("private-description") ?? false)
@@ -1259,7 +1259,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             options: [], fields: [], details: []
         )
         let start = ProcessInfo.processInfo.systemUptime
-        let projected = AgentModeViewModel.overseerProjection(of: interaction)
+        let projected = AgentSessionInteractionRuntime.overseerProjection(of: interaction)
         XCTAssertEqual(projected.prompt, whitespace)
         XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 3)
         XCTAssertFalse(AgentSessionLinkPendingInteractionInspection.rawPromptExceedsWorkLimit(interaction))
@@ -1613,7 +1613,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             fields: [.init(id: "token", prompt: "Token?", isSecret: true, allowsOther: false, options: [])],
             details: []
         )
-        XCTAssertEqual(viewModel.overseerManualOnlyReason(for: secret, session: session), .secretInput)
+        XCTAssertEqual(viewModel.interactionRuntime.overseerManualOnlyReason(for: secret, session: session), .secretInput)
         let hook = AgentRunMCPSnapshot.Interaction(
             id: UUID(),
             kind: .hookApproval,
@@ -1626,7 +1626,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             fields: [],
             details: []
         )
-        XCTAssertEqual(viewModel.overseerManualOnlyReason(for: hook, session: session), .hookApproval)
+        XCTAssertEqual(viewModel.interactionRuntime.overseerManualOnlyReason(for: hook, session: session), .hookApproval)
     }
 
     private func pollState(
@@ -2837,11 +2837,13 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(viewModel.agentSidebarLaneCreator(tabID: tabID, expectedSessionID: sessionID)?.sessionID, freshCreator)
         let secondTabID = UUID()
         let second = viewModel.session(for: secondTabID)
-        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: second, updateWorkspaceMetadata: false)
+        XCTAssertEqual(viewModel.test_bindingRejection(sessionID: sessionID, on: second), .conflictingWriter)
+        XCTAssertNil(viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: second, updateWorkspaceMetadata: false))
         second.createdByOverseerSessionID = indexedCreator
-        // Both same-UUID live rows must read their own tab, not whichever dictionary value is first.
+        // A refused second writer cannot impersonate the first row's provenance.
+        XCTAssertNil(second.persistentSessionBindingIdentity)
         XCTAssertEqual(viewModel.agentSidebarLaneCreator(tabID: tabID, expectedSessionID: sessionID)?.sessionID, freshCreator)
-        XCTAssertEqual(viewModel.agentSidebarLaneCreator(tabID: secondTabID, expectedSessionID: sessionID)?.sessionID, indexedCreator)
+        XCTAssertNil(viewModel.agentSidebarLaneCreator(tabID: secondTabID, expectedSessionID: sessionID))
         first.hasLoadedPersistedState = true
         first.createdByOverseerSessionID = nil
         XCTAssertNil(viewModel.agentSidebarLaneCreator(tabID: tabID, expectedSessionID: sessionID))
@@ -3434,19 +3436,22 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             let observer = fixture.observer
             let session = AgentModeViewModel.TabSession(tabID: observer.tabID)
             session.beginPersistentBindingTransition()
-            try session.installPersistentSessionBinding(.init(tabID: observer.tabID, sessionID: observer.sessionID, generation: XCTUnwrap(observer.persistentBindingGeneration)))
+            try session.installPersistentSessionBinding(.init(tabID: observer.tabID, sessionID: observer.sessionID, generation: XCTUnwrap(observer.persistentBindingGeneration), workspaceID: observer.workspaceID))
+            let scope = AgentSessionRuntimeStore().makeScope()
+            scope.replaceSessions([session.tabID: session])
+            let controlIdentity = try controlWriterIdentity(for: session, scope: scope)
             session.hasLoadedPersistedState = true
             session.recordRestorationAuthoritative(.persistedPayloadApplied)
             let registration = await AgentRunSessionStore.register(sessionID: observer.sessionID)
             addTeardownBlock { await AgentRunSessionStore.cleanup(registration: registration) }
             func context(_ kind: AgentModelCatalog.TaskLabelKind) -> AgentModeViewModel.AgentMCPControlContext {
                 .init(
-                    sessionID: observer.sessionID, activationID: UUID(), registration: registration,
+                    sessionID: observer.sessionID, activationID: UUID(), writerIdentity: controlIdentity, registration: registration,
                     currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
                     originatingConnectionID: nil,
                     interactionTransport: .mcp(sessionID: observer.sessionID, originatingConnectionID: nil),
                     suppressUserNotifications: true, forceAutoEditEnabled: false,
-                    autoEditEnabledBeforeOverride: session.autoEditEnabled, taskLabelKind: kind
+                    autoEditEnabledBeforeOverride: session.autoEditEnabled, taskLabelKind: kind, autoEditOverride: nil
                 )
             }
             if input == "role-policy" { session.mcpControlContext = context(.pair) }

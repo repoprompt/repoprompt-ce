@@ -480,7 +480,7 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
             node.session.selectedAgent = .claudeCode
             let workspaceID = try XCTUnwrap(node.manager.activeWorkspaceID)
             XCTAssertTrue(node.manager.compareAndSetActiveAgentSessionID(
-                expected: nil, replacement: node.sessionID, forTabID: node.session.tabID, inWorkspaceID: workspaceID
+                expected: node.sessionID, replacement: node.sessionID, forTabID: node.session.tabID, inWorkspaceID: workspaceID
             ))
         }
         let host = LiveWindowEndpointHost()
@@ -1140,12 +1140,18 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         let (viewModel, session, sessionID) = fixture(workspacePath: logical.path, windowID: windowID)
         let workspace = WorkspaceModel(
             name: "Worktree switch", repoPaths: [logical.path], ephemeralFlag: true,
-            composeTabs: [ComposeTabState(id: session.tabID)], activeComposeTabID: session.tabID
+            composeTabs: [ComposeTabState(id: session.tabID, activeAgentSessionID: sessionID)], activeComposeTabID: session.tabID
         )
         manager.workspaces = [workspace]
         manager.activeWorkspace = workspace
         viewModel.workspaceManager = manager
         viewModel.promptManager = prompt
+        // The durable fixture owns an exact workspace carrier, not an unscoped test-only binding.
+        // Exercise the production qualification CAS before granting restored-payload readiness.
+        XCTAssertNotNil(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, compareAndSetInWorkspaceID: workspace.id
+        ))
+        XCTAssertEqual(session.persistentSessionBindingIdentity?.workspaceID, workspace.id)
         session.hasLoadedPersistedState = true
         XCTAssertNotNil(session.restorationAdmissionFailureMessage)
         session.recordRestorationAuthoritative(.persistedPayloadApplied)

@@ -442,7 +442,7 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
                 }
                 let attempt = session.activeRunAttemptID
                 if schedule == "managedStop" {
-                    window.agentModeViewModel.withdrawQueuedWorkForManagedStop(session: session)
+                    window.agentModeViewModel.linkExecutionRuntime.withdrawQueuedWorkForManagedStop(session: session)
                     let joined = await window.agentModeViewModel.awaitOracleBackgroundDrain(for: session)
                     XCTAssertTrue(joined, "Claim-time Stop survives subsequent run admission refusal")
                 } else { await window.agentModeViewModel.cancelAgentRun(tabID: session.tabID) }
@@ -1129,6 +1129,7 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
                 await fulfillment(of: [dispatchObserved], timeout: 2)
                 let live = try XCTUnwrap(registry.snapshot(for: owner).invocations.first)
                 XCTAssertEqual(live.phase, .running)
+                XCTAssertEqual(registry.liveInvocations(for: owner).map(\.reference), [reference])
                 XCTAssertEqual(live.reference.provenance.agentRunID, creatingRun)
                 XCTAssertEqual(live.laneOutcomes[0], .completed, "Progress must not regress a finalized lane")
                 let generation = registry.awarenessVersion(for: owner).generation
@@ -1138,11 +1139,13 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
                 XCTAssertEqual(registry.snapshot(for: owner).invocations.first?.phase, .settled)
                 XCTAssertTrue(registry.snapshot(for: owner).invocations.first?.queries.isEmpty == true)
                 XCTAssertEqual(providerCalls, 1)
+                XCTAssertTrue(registry.liveInvocations(for: owner).isEmpty)
             } else {
                 if case let .failure(error) = outcome { XCTAssertTrue(error is CancellationError) }
                 else { XCTFail("Uncommitted work must not return a receipt") }
                 XCTAssertEqual(providerCalls, 0)
                 XCTAssertTrue(registry.snapshot(for: owner).invocations.isEmpty)
+                XCTAssertTrue(registry.liveInvocations(for: owner).isEmpty)
             }
             completion.release()
             await registry.close(owner).value
@@ -1205,6 +1208,7 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
         await fulfillment(of: [cleaning], timeout: 2)
         XCTAssertEqual(cleanupCalls, 2, "Repeated Stop/cancel and repeated query registration must share cleanup")
         XCTAssertEqual(registry.snapshot(for: owner).invocations.first?.phase, .cancelling)
+        XCTAssertEqual(registry.liveInvocations(for: owner).first?.phase, .cancelling)
         let timedOut = await Registry.awaitDrain(drain, timeout: 0)
         XCTAssertFalse(timedOut, "A deadline releases the waiter, not retained cleanup ownership")
         XCTAssertTrue(registry.hasLiveOwner(owner))
@@ -1212,6 +1216,7 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
         let foreign = registryOwner()
         let sameSessionRebound = Registry.Owner(workspaceID: owner.workspaceID, binding: .init(tabID: owner.binding.tabID, sessionID: owner.binding.sessionID))
         XCTAssertTrue(registry.snapshot(for: sameSessionRebound).invocations.isEmpty, "A new binding cannot take live execution rights")
+        XCTAssertTrue(registry.liveInvocations(for: sameSessionRebound).isEmpty)
         XCTAssertThrowsError(try registry.cancel(owner: sameSessionRebound, reference: reference))
         XCTAssertTrue(registry.snapshot(for: foreign).invocations.isEmpty)
         XCTAssertThrowsError(try registry.cancel(owner: foreign, reference: reference))
@@ -1226,6 +1231,7 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
         XCTAssertFalse(cancelled.contains(successor))
         let terminal = try XCTUnwrap(registry.snapshot(for: owner).invocations.first)
         XCTAssertEqual(terminal.phase, .settled)
+        XCTAssertTrue(registry.liveInvocations(for: owner).isEmpty)
         XCTAssertEqual(terminal.laneOutcomes[0], .completed)
         XCTAssertEqual(terminal.laneOutcomes[1], .cancelled)
         XCTAssertFalse(try registry.cancel(owner: owner, reference: reference))
@@ -1234,6 +1240,7 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
         let priorEpoch = registry.snapshot(for: owner).epoch
         try registry.reopen(owner, admissionIsCurrent: { true })
         XCTAssertNotEqual(registry.snapshot(for: owner).epoch, priorEpoch)
+        XCTAssertTrue(registry.liveInvocations(for: owner).isEmpty)
         let stale = Registry.QueryIdentity(sessionID: reference.members[0].memberID.rawValue, queryID: successor)
         XCTAssertThrowsError(try retainedJob?.registerQuery(laneIndex: 0, identity: stale, isCurrent: { _ in true }, cancel: { _ in XCTFail("Stale job must not cancel a successor") }))
         await registry.close(sameSessionRebound).value
@@ -1329,12 +1336,12 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
             recipient.runState = .idle
             var physicalProviderID: ObjectIdentifier?
             var physicalRunID: UUID?
-            await runner.startRun(tabID: recipient.tabID, session: recipient, initialUserMessage: "ordinary input", initialMessageForRun: "ordinary input", attachments: [], makeLease: { runID in
+            await harness.resources.fulfill(runner.prepareRun(tabID: recipient.tabID, session: recipient, initialUserMessage: "ordinary input", initialMessageForRun: "ordinary input", attachments: [], makeLease: { runID in
                 let lease = harness.makeLease(runID: runID, tabID: recipient.tabID)
                 physicalProviderID = ObjectIdentifier(lease)
                 physicalRunID = runID
                 return lease
-            })
+            }))
             await recipient.agentTask?.value
             // Failed terminal cleanup clears runID. Inspect the exact dispatched context, not
             // the empty recipient or a newly minted context that would re-owe either outcome.
@@ -1499,6 +1506,9 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
             XCTAssertTrue(snapshots.allSatisfy { $0.invocations.count(where: { $0.phase.isLive }) == Registry.activeLimit })
             XCTAssertEqual(snapshots.flatMap(\.invocations).count(where: { !$0.phase.isLive }), min(Registry.inactiveProcessLimit, ownerCount * Registry.inactiveSessionLimit))
             XCTAssertTrue(snapshots.allSatisfy { $0.invocations.count(where: { !$0.phase.isLive }) <= Registry.inactiveSessionLimit })
+            for owner in owners {
+                XCTAssertEqual(registry.liveInvocations(for: owner).map(\.reference), registry.snapshot(for: owner, includeFinished: false).invocations.map(\.reference))
+            }
             let targetSnapshot = registry.snapshot(for: target)
             XCTAssertEqual(targetSnapshot.invocations.count(where: { !$0.phase.isLive }), Registry.inactiveSessionLimit)
             XCTAssertTrue(targetSnapshot.historyTruncated)

@@ -1303,6 +1303,10 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
     ) async throws {
         XCTAssertNil(viewModel.makeComposerSubmitTarget(tabID: session.tabID, session: session), file: file, line: line)
         let sessionID = try XCTUnwrap(session.activeAgentSessionID, file: file, line: line)
+        guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: sessionID) else {
+            return XCTFail("The blocked payload must still have its exact runtime writer.", file: file, line: line)
+        }
+        XCTAssertTrue(writer.session === session, file: file, line: line)
         // The UI cannot mint a target while blocked. Model an already-captured, otherwise-current
         // target to prove the claim boundary independently rejects a delayed submission callback.
         let target = AgentComposerSubmitTarget(
@@ -1316,7 +1320,8 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
             expectedRunID: session.runID,
             expectedRunAttemptID: session.activeRunAttemptID,
             expectedSubmissionToken: session.composerSubmissionToken,
-            expectedInitialStartLocation: viewModel.initialStartLocationProps(tabID: session.tabID)?.selection
+            expectedInitialStartLocation: viewModel.initialStartLocationProps(tabID: session.tabID)?.selection,
+            expectedWriterIdentity: writer.identity
         )
         let attempt = AgentComposerSubmitAttempt(
             id: UUID(), target: target, inputRevision: 0, noticeRevision: 0,

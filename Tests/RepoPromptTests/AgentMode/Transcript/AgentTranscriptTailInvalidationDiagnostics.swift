@@ -266,6 +266,20 @@
             try await wait(fixture, seconds: 5, gate: "settled error and bash bodies") {
                 recorder.latestBody[ordinaryID] == "Ordinary settled error" && recorder.latestBody[loginID] == CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage && recorder.bodies[bashID, default: 0] > 0
             }
+            // A properly bound delayed save must not allocate another identity or replace
+            // settled presentation rows. Exercise the same debounce path that exposed the
+            // old duplicate-identity fixture, rather than relying on its scheduling timing.
+            let vm = fixture.state.agentModeViewModel
+            let session = vm.session(for: fixture.tabID)
+            let binding = try XCTUnwrap(session.currentRestorationBindingToken)
+            let beforeSave = fixture.store.snapshot
+            session.isDirty = true
+            vm.scheduleSave(for: session)
+            let save = try XCTUnwrap(session.saveDebounceTask)
+            await save.value
+            XCTAssertFalse(session.isDirty, "The scheduled save must actually complete")
+            XCTAssertEqual(session.currentRestorationBindingToken, binding)
+            XCTAssertEqual(fixture.store.snapshot, beforeSave, "Saving an existing binding must not republish settled rows")
             var serial = recorder.serial
             var quietSince = ProcessInfo.processInfo.systemUptime
             try await wait(fixture, seconds: 5, gate: "error fixture quiet window") {
@@ -303,8 +317,6 @@
             XCTAssertEqual(recorder.counts[userID]?["update", default: 0] ?? 0, 0)
 
             // Exercise the normal source mutation, coalescer and VM publication path too.
-            let vm = fixture.state.agentModeViewModel
-            let session = vm.session(for: fixture.tabID)
             vm.enqueueAssistantDelta(" NORMAL_VM_DELTA", session: session)
             vm.flushPendingAssistantDelta(session)
             try await wait(fixture, seconds: 5, gate: "normal VM delta reaches attached native storage") {
@@ -662,7 +674,10 @@
             )
             ownedStates.append(state)
             await state.workspaceManager.awaitInitialized()
-            let tab = ComposeTabState(name: "Synthetic transcript baseline", activeAgentSessionID: Self.id(90000))
+            // Windows from an earlier fixture may still own a retiring writer during drain.
+            // Transcript item IDs stay deterministic, but every fixture needs its own session.
+            let sessionID = UUID()
+            let tab = ComposeTabState(name: "Synthetic transcript baseline", activeAgentSessionID: sessionID)
             let workspace = WorkspaceModel(name: "Transcript baseline", repoPaths: [], ephemeralFlag: true, composeTabs: [tab], activeComposeTabID: tab.id)
             state.workspaceManager.workspaces = [workspace]
             let switched = await state.workspaceManager.switchWorkspace(to: workspace, saveState: false, reason: "transcriptTailDiagnostic")
@@ -673,7 +688,9 @@
             vm.test_setCurrentTabIDOverride(tab.id)
             _ = await vm.ensureSessionReady(tabID: tab.id)
             let session = vm.session(for: tab.id)
-            _ = vm.test_installPersistentSessionBinding(sessionID: tab.activeAgentSessionID, on: session, updateWorkspaceMetadata: true)
+            let installed = try XCTUnwrap(vm.test_installPersistentSessionBinding(sessionID: sessionID, on: session, updateWorkspaceMetadata: true))
+            XCTAssertEqual(installed.sessionID, sessionID)
+            XCTAssertEqual(session.activeAgentSessionID, sessionID)
             session.hasLoadedPersistedState = true
             session.recordRestorationAuthoritative(.persistedPayloadApplied)
             session.markCurrentBindingHydrated()

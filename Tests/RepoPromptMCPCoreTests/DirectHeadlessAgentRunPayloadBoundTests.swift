@@ -5,6 +5,35 @@ import RepoPromptDomainRuntime
 import RepoPromptShared
 import XCTest
 
+private actor HeadlessStartupGate {
+    private var registration: DomainAgentSessionRegistration?
+    private var observers: [CheckedContinuation<DomainAgentSessionRegistration, Never>] = []
+    private var releaseWaiter: CheckedContinuation<Void, Never>?
+    private var released = false
+
+    func hold(_ registration: DomainAgentSessionRegistration) async {
+        self.registration = registration
+        let observers = observers
+        self.observers.removeAll()
+        for observer in observers {
+            observer.resume(returning: registration)
+        }
+        guard !released else { return }
+        await withCheckedContinuation { releaseWaiter = $0 }
+    }
+
+    func waitUntilHeld() async -> DomainAgentSessionRegistration {
+        if let registration { return registration }
+        return await withCheckedContinuation { observers.append($0) }
+    }
+
+    func release() {
+        released = true
+        releaseWaiter?.resume()
+        releaseWaiter = nil
+    }
+}
+
 /// Follow-up to #1598 (#399): the headless agent_run start/poll/wait responses must stay
 /// bounded on the wire even when the child's final reply is huge. Drives the real direct
 /// provider coordinator against a fake `codex exec` that prints one oversized message, then
@@ -32,6 +61,205 @@ final class DirectHeadlessAgentRunPayloadBoundTests: XCTestCase {
         let sessionID = try XCTUnwrap((startedObject["session_id"] as? String).flatMap(UUID.init(uuidString:)))
         try await assertBounded(coordinator.pollAgent(sessionID: sessionID, timeout: 0).toValue(), label: "poll")
         try await assertBounded(coordinator.waitAgent(sessionID: sessionID, timeout: 5).toValue(), label: "wait")
+    }
+
+    func testCancellationIsInstalledBeforeEpochPublicationAndJoinsPendingStartupRollback() async throws {
+        let prepared = try await makePreparedRuntime(replyCharacters: 1)
+        let gate = HeadlessStartupGate()
+        let coordinator = makeHeldCoordinator(prepared, gate: gate)
+        let cancelled = expectation(description: "Exact registered handler reached pending startup")
+        await coordinator.test_observePendingStartCancellation { cancelled.fulfill() }
+        let request = try await Self.request(prepared, arguments: [:])
+        let start = Task {
+            try await coordinator.startAgent(args: ["message": .string("Never launch"), "detach": .bool(true)], request: request)
+        }
+        let registration = await gate.waitUntilHeld()
+        let owned = await prepared.runtime.agentSessionStore.test_shutdownOwnedState()
+        XCTAssertEqual(owned.cancellationHandlerCount, 1, "Registration is already cancellable while epoch setup is held")
+        let cancellation = Task {
+            await prepared.runtime.agentSessionStore.test_invokeCancellationHandler(registration: registration)
+        }
+        await fulfillment(of: [cancelled], timeout: 3)
+        await gate.release()
+        do {
+            _ = try await start.value
+            XCTFail("Cancelled pending start must not publish running or launch a provider")
+        } catch is CancellationError {} catch {
+            XCTFail("Unexpected startup error: \(error)")
+        }
+        let invoked = await cancellation.value
+        XCTAssertTrue(invoked)
+        let remaining = await prepared.runtime.agentSessionStore.test_shutdownOwnedState()
+        XCTAssertEqual(remaining.recordCount, 0)
+        XCTAssertEqual(remaining.cancellationHandlerCount, 0)
+        let agents = await coordinator.listAgents()
+        XCTAssertEqual(agents.count, 1)
+        XCTAssertEqual(agents.first?.objectValue?["status"], .string("dormant"))
+        XCTAssertEqual(agents.first?.objectValue?["resumable"], .bool(true), "Preserve the domain store's existing durable cleanup policy")
+        await coordinator.shutdown()
+    }
+
+    func testStoreShutdownDrainsHeldHeadlessStartupBeforeReturning() async throws {
+        let prepared = try await makePreparedRuntime(replyCharacters: 1)
+        let gate = HeadlessStartupGate()
+        let coordinator = makeHeldCoordinator(prepared, gate: gate)
+        let cancelled = expectation(description: "Store shutdown cancelled registered pending startup")
+        await coordinator.test_observePendingStartCancellation { cancelled.fulfill() }
+        let request = try await Self.request(prepared, arguments: [:])
+        let start = Task {
+            try await coordinator.startAgent(args: ["message": .string("Never launch"), "detach": .bool(true)], request: request)
+        }
+        let registration = await gate.waitUntilHeld()
+        let shutdown = Task { await prepared.runtime.agentSessionStore.shutdown() }
+        await fulfillment(of: [cancelled], timeout: 3)
+        await gate.release()
+        do {
+            _ = try await start.value
+            XCTFail("Shutdown must refuse the pending start")
+        } catch is CancellationError {} catch {
+            XCTFail("Unexpected startup error: \(error)")
+        }
+        let shutdownResult = await shutdown.value
+        XCTAssertEqual(shutdownResult.cooperativeSessionIDs, [registration.sessionID])
+        XCTAssertTrue(shutdownResult.interruptedSessionIDs.isEmpty)
+        let remaining = await prepared.runtime.agentSessionStore.test_shutdownOwnedState()
+        XCTAssertEqual(remaining.recordCount, 0)
+        XCTAssertEqual(remaining.cancellationHandlerCount, 0)
+        let agents = await coordinator.listAgents()
+        XCTAssertEqual(agents.count, 1)
+        XCTAssertEqual(agents.first?.objectValue?["status"], .string("dormant"))
+        XCTAssertEqual(agents.first?.objectValue?["resumable"], .bool(true), "Preserve the domain store's existing durable cleanup policy")
+        await coordinator.shutdown()
+    }
+
+    func testCallerCancellationAfterEpochAdmissionCleansRegistrationWithoutPublishingRunning() async throws {
+        let prepared = try await makePreparedRuntime(replyCharacters: 1)
+        let gate = HeadlessStartupGate()
+        let coordinator = makeHeldCoordinator(prepared, gate: gate)
+        let request = try await Self.request(prepared, arguments: [:])
+        let start = Task {
+            try await coordinator.startAgent(args: ["message": .string("Never launch"), "detach": .bool(true)], request: request)
+        }
+        _ = await gate.waitUntilHeld()
+        start.cancel()
+        await gate.release()
+        do {
+            _ = try await start.value
+            XCTFail("Caller cancellation must roll back the admitted epoch")
+        } catch is CancellationError {} catch {
+            XCTFail("Unexpected startup error: \(error)")
+        }
+        let remaining = await prepared.runtime.agentSessionStore.test_shutdownOwnedState()
+        XCTAssertEqual(remaining.recordCount, 0)
+        XCTAssertEqual(remaining.cancellationHandlerCount, 0)
+        let agents = await coordinator.listAgents()
+        XCTAssertEqual(agents.count, 1)
+        XCTAssertEqual(agents.first?.objectValue?["status"], .string("dormant"))
+        XCTAssertEqual(agents.first?.objectValue?["resumable"], .bool(true), "Preserve the domain store's existing durable cleanup policy")
+        await coordinator.shutdown()
+    }
+
+    func testPublishedRunningStartAlreadyOwnsCancellationBeforeProviderLaunch() async throws {
+        let prepared = try await makePreparedRuntime(replyCharacters: 1)
+        let coordinator = prepared.providerCoordinator
+        let gate = HeadlessStartupGate()
+        await coordinator.test_observeRunningPublication { await gate.hold($0) }
+        let cancelled = expectation(description: "Published start is cancellable before task attachment")
+        await coordinator.test_observePendingStartCancellation { cancelled.fulfill() }
+        let request = try await Self.request(prepared, arguments: [:])
+        let start = Task {
+            try await coordinator.startAgent(args: ["message": .string("Never launch"), "detach": .bool(true)], request: request)
+        }
+        let registration = await gate.waitUntilHeld()
+        let snapshot = await prepared.runtime.agentSessionStore.snapshot(for: registration)
+        XCTAssertEqual(snapshot?.status, .running)
+        let cancellation = Task {
+            await prepared.runtime.agentSessionStore.test_invokeCancellationHandler(registration: registration)
+        }
+        await fulfillment(of: [cancelled], timeout: 3)
+        await gate.release()
+        do {
+            _ = try await start.value
+            XCTFail("Cancelled visible start must not launch its provider")
+        } catch is CancellationError {} catch {
+            XCTFail("Unexpected startup error: \(error)")
+        }
+        let invoked = await cancellation.value
+        XCTAssertTrue(invoked)
+        let context = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        let root = try XCTUnwrap(context.activeRoot)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("provider-launched").path))
+        let remaining = await prepared.runtime.agentSessionStore.test_shutdownOwnedState()
+        XCTAssertEqual(remaining.recordCount, 0)
+        XCTAssertEqual(remaining.cancellationHandlerCount, 0)
+    }
+
+    func testCoordinatorShutdownJoinsPendingStartRollback() async throws {
+        let prepared = try await makePreparedRuntime(replyCharacters: 1)
+        let gate = HeadlessStartupGate()
+        let coordinator = makeHeldCoordinator(prepared, gate: gate)
+        let cancelled = expectation(description: "Coordinator shutdown retracts pending start")
+        await coordinator.test_observePendingStartCancellation { cancelled.fulfill() }
+        let request = try await Self.request(prepared, arguments: [:])
+        let start = Task {
+            try await coordinator.startAgent(args: ["message": .string("Never launch"), "detach": .bool(true)], request: request)
+        }
+        _ = await gate.waitUntilHeld()
+        let shutdown = Task { await coordinator.shutdown() }
+        await fulfillment(of: [cancelled], timeout: 3)
+        await gate.release()
+        await shutdown.value
+        // Inspect immediately after shutdown, before joining the caller: rollback is part of drain.
+        let remaining = await prepared.runtime.agentSessionStore.test_shutdownOwnedState()
+        XCTAssertEqual(remaining.recordCount, 0)
+        XCTAssertEqual(remaining.cancellationHandlerCount, 0)
+        do {
+            _ = try await start.value
+            XCTFail("Coordinator shutdown must retract the pending start")
+        } catch is CancellationError {} catch {
+            XCTFail("Unexpected startup error: \(error)")
+        }
+    }
+
+    func testAlreadyShutDownStoreRefusesHeadlessStartAsCancellation() async throws {
+        let prepared = try await makePreparedRuntime(replyCharacters: 1)
+        _ = await prepared.runtime.agentSessionStore.shutdown()
+        let request = try await Self.request(prepared, arguments: [:])
+        do {
+            _ = try await prepared.providerCoordinator.startAgent(
+                args: ["message": .string("Never launch"), "detach": .bool(true)], request: request
+            )
+            XCTFail("A generation-zero registration must not become an epoch or running agent")
+        } catch is CancellationError {} catch {
+            XCTFail("Shutdown is cancellation, not an internal epoch error: \(error)")
+        }
+        let remaining = await prepared.runtime.agentSessionStore.test_shutdownOwnedState()
+        XCTAssertEqual(remaining.recordCount, 0)
+        XCTAssertEqual(remaining.cancellationHandlerCount, 0)
+        let agents = await prepared.providerCoordinator.listAgents()
+        XCTAssertTrue(agents.isEmpty)
+    }
+
+    private func makeHeldCoordinator(
+        _ prepared: DirectHeadlessMCPService.PreparedRuntime,
+        gate: HeadlessStartupGate
+    ) -> DirectHeadlessProviderCoordinator {
+        DirectHeadlessProviderCoordinator(
+            runtime: prepared.runtime,
+            context: prepared.context,
+            settingsStore: prepared.settingsStore,
+            environment: ["REPOPROMPT_CODEX_COMMAND": "/usr/bin/false", "PATH": "/usr/bin:/bin"],
+            beginEpoch: { registration, activationID in
+                let result = await prepared.runtime.agentSessionStore.beginEpoch(
+                    registration: registration,
+                    activationID: activationID,
+                    expectedCurrentEpoch: nil,
+                    transitionKind: .initial
+                )
+                await gate.hold(registration)
+                return result
+            }
+        )
     }
 
     func testTerminalStatusTextIsAConciseLabelNotTheReply() {
@@ -73,6 +301,7 @@ final class DirectHeadlessAgentRunPayloadBoundTests: XCTestCase {
         let fakeCodex = directory.appendingPathComponent("fake-codex")
         let script = """
         #!/bin/sh
+        touch '\(root.appendingPathComponent("provider-launched").path)'
         cat >/dev/null
         printf '{"type":"item.completed","item":{"type":"agent_message","text":"'
         head -c \(replyCharacters) /dev/zero | tr '\\0' 'x'

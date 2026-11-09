@@ -709,6 +709,7 @@ extension AgentSessionDataService {
                 try await runAfterHydrationPrepareHookForTesting(sessionID: request.sessionID)
             #endif
             return AgentSessionHydrationPayload(
+                sourceWorkspaceID: request.workspace.id,
                 sessionID: request.sessionID,
                 persistedSession: agentSession,
                 canonicalLiveItems: canonicalLiveItems,

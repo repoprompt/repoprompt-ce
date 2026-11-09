@@ -17,7 +17,7 @@ enum AgentModeMCPPolicyInstaller {
         runID: UUID,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
         allowsAgentExternalControlTools: Bool = false,
-        connectionPolicyInstaller: AgentModeViewModel.ConnectionPolicyInstaller
+        connectionPolicyInstaller: AgentRunExecutionContracts.ConnectionPolicyInstaller
     ) async {
         guard let clientName = agent.mcpClientNameHint else { return }
         await connectionPolicyInstaller(

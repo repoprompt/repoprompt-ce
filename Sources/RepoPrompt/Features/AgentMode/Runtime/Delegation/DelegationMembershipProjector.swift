@@ -27,6 +27,9 @@ struct DelegationSessionProvenance: Hashable {
     let runState: DomainDelegationScopeTargetState
     /// Request-local evidence for payload operations, independent of replicated UI placement.
     let hasUniqueRuntimeOwner: Bool
+    /// Agreeing saved identity with no runtime claim. This permits preparation, never mutation;
+    /// the command host must admit the newly restored writer at the actual write fence.
+    let canPrepareRuntimeWriter: Bool
 
     init(
         sessionID: UUID,
@@ -39,7 +42,8 @@ struct DelegationSessionProvenance: Hashable {
         worktreeCount: Int = 0,
         boundWorktreeIDs: Set<String> = [],
         runState: DomainDelegationScopeTargetState = .unknown,
-        hasUniqueRuntimeOwner: Bool = false
+        hasUniqueRuntimeOwner: Bool = false,
+        canPrepareRuntimeWriter: Bool = false
     ) {
         self.sessionID = sessionID
         self.workspaceID = workspaceID
@@ -52,6 +56,7 @@ struct DelegationSessionProvenance: Hashable {
         self.boundWorktreeIDs = boundWorktreeIDs
         self.runState = runState
         self.hasUniqueRuntimeOwner = hasUniqueRuntimeOwner
+        self.canPrepareRuntimeWriter = canPrepareRuntimeWriter
     }
 
     /// Tree placement: organizational parent, else spawn parent, else lane creator.
@@ -394,7 +399,7 @@ struct SpawnProvenanceDelegationMembershipProjector: DelegationMembershipProject
         case let .session(managedTarget):
             guard targetSessionID == managedTarget || targetSessionID == scope.granteeSessionID,
                   pointResolutionState(for: targetSessionID) != .replicated
-                  || source.provenance(for: targetSessionID)?.hasUniqueRuntimeOwner == true else { return nil }
+                  || source.provenance(for: targetSessionID).map({ $0.hasUniqueRuntimeOwner || $0.canPrepareRuntimeWriter }) == true else { return nil }
             return DomainDelegationScopeMembershipProof(scopeID: scope.id, targetSessionID: targetSessionID, basis: .exactSession)
         case let .tree(rootSessionID):
             let rootState = pointResolutionState(for: rootSessionID)

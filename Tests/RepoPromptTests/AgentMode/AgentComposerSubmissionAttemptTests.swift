@@ -11,6 +11,103 @@ import RepoPromptSettingsCore
 import XCTest
 
 @MainActor
+final class AgentSessionComposerSubmitRuntimeTests: XCTestCase {
+    private func boundFixture() -> (AgentSessionRuntimeStore.Scope, AgentTabSession, AgentSessionRuntimeStore.Command) {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        scope.replaceSessions([session.tabID: session])
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: UUID()))
+        session.hasLoadedPersistedState = true
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        guard case let .unique(writer) = scope.resolveWriter(sessionID: session.activeAgentSessionID!),
+              case let .success(command) = writer.admitCommand() else { fatalError("Invalid test writer") }
+        return (scope, session, command)
+    }
+
+    private func attempt(_ target: AgentComposerSubmitTarget) -> AgentComposerSubmitAttempt {
+        .init(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "")
+    }
+
+    func testProgrammaticClaimWithoutPresentationRotatesTokenAndNeverTouchesDraft() throws {
+        let (scope, session, command) = boundFixture()
+        session.draftText = "local draft"
+        let generation = session.draftMutationGeneration
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        XCTAssertNil(target.expectedInitialStartLocation)
+        XCTAssertEqual(target.expectedWriterIdentity, command.identity)
+        let submission = attempt(target)
+        guard case let .claimed(claim) = scope.submissions.claim(submission, command: command) else { return XCTFail("Expected claim") }
+        XCTAssertTrue(scope.submissions.isCurrent(claim))
+        XCTAssertNotEqual(session.composerSubmissionToken, target.expectedSubmissionToken)
+        XCTAssertEqual(session.draftText, "local draft")
+        XCTAssertEqual(session.draftMutationGeneration, generation)
+        XCTAssertTrue(scope.submissions.release(claim))
+        guard case let .rejected(reason) = scope.submissions.claim(submission, command: command) else { return XCTFail("Stale token accepted") }
+        XCTAssertEqual(reason, .targetRejected(reason: "submission_token_mismatch"))
+    }
+
+    func testClaimPinsWriterButCleanupSurvivesRetirementAndCannotClearSuccessor() throws {
+        let (scope, session, command) = boundFixture()
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command) else { return XCTFail("Expected claim") }
+        scope.beginRetirement()
+        XCTAssertFalse(scope.submissions.isCurrent(claim))
+        XCTAssertNil(scope.submissions.programmaticTarget(command))
+        XCTAssertTrue(command.writer.isCurrent)
+        XCTAssertTrue(scope.submissions.release(claim))
+        let successor = attempt(target)
+        session.activeComposerSubmitAttempt = successor
+        XCTAssertFalse(scope.submissions.release(claim))
+        XCTAssertEqual(session.activeComposerSubmitAttempt?.id, successor.id)
+        session.activeComposerSubmitAttempt = nil
+    }
+
+    func testReacquiredBindingRejectsOldTargetAndOldClaimCannotClearReplacementObject() throws {
+        let (scope, session, command) = boundFixture()
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        scope.replaceSessions([:])
+        scope.replaceSessions([session.tabID: session])
+        XCTAssertFalse(command.isCurrent)
+        guard case let .rejected(reason) = scope.submissions.claim(attempt(target)) else { return XCTFail("Old incarnation accepted") }
+        XCTAssertEqual(reason, .targetRejected(reason: "writer_unavailable"))
+        XCTAssertNil(session.activeComposerSubmitAttempt)
+        guard case let .unique(writer) = scope.resolveWriter(sessionID: command.identity.sessionID),
+              case let .success(current) = writer.admitCommand(),
+              let newTarget = scope.submissions.programmaticTarget(current),
+              case let .claimed(claim) = scope.submissions.claim(attempt(newTarget), command: current)
+        else { return XCTFail("Expected reacquired writer") }
+        let replacement = AgentTabSession(tabID: session.tabID)
+        let replacementAttempt = attempt(newTarget)
+        replacement.activeComposerSubmitAttempt = replacementAttempt
+        scope.replaceSessions([replacement.tabID: replacement])
+        XCTAssertFalse(scope.submissions.isCurrent(claim))
+        XCTAssertTrue(scope.submissions.release(claim))
+        XCTAssertNil(session.activeComposerSubmitAttempt)
+        XCTAssertEqual(replacement.activeComposerSubmitAttempt?.id, replacementAttempt.id)
+        replacement.activeComposerSubmitAttempt = nil
+    }
+
+    func testLocalUnboundClaimSurvivesItsFirstBindingWithoutMintingRemoteAuthority() {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        scope.replaceSessions([session.tabID: session])
+        session.hasLoadedPersistedState = true
+        let target = AgentComposerSubmitTarget(
+            tabID: session.tabID, route: .createAgentSessionFromSourceTab,
+            expectedSourceTabSessionIdentity: ObjectIdentifier(session), expectedSourceAgentSessionID: nil,
+            expectedPersistentBindingIdentity: nil, expectedBindingTransitionGeneration: session.bindingTransitionGeneration,
+            expectedRunState: .idle, expectedRunID: nil, expectedRunAttemptID: nil,
+            expectedSubmissionToken: session.composerSubmissionToken, expectedInitialStartLocation: .local
+        )
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(target)) else { return XCTFail("Expected local claim") }
+        XCTAssertNil(claim.command)
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: UUID()))
+        XCTAssertTrue(scope.submissions.isCurrent(claim))
+        XCTAssertTrue(scope.submissions.release(claim))
+    }
+}
+
+@MainActor
 final class AgentComposerSubmissionAttemptTests: XCTestCase {
     func testComposerProductionEqualityRejectsLiveTabChangeBeforePropsCatchUp() {
         let sourceTabID = UUID()
@@ -189,10 +286,7 @@ extension AgentComposerSubmissionAttemptTests {
         session.selectedAgent = .codexExec
         session.selectedModelRaw = "gpt-6.1-sol-high"
         let text = "Implement parser and tests"
-        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: session))
-        session.hasLoadedPersistedState = true
-        // An installed binding admits operations only after restoration is authoritative (#1363).
-        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        try installRestoredRoutingWriter(viewModel: viewModel, session: session)
         let claim = try routingClaim(viewModel: viewModel, session: session, text: text)
 
         let result = await viewModel.submitUserTurnAfterFreshTaskRouting(
@@ -849,10 +943,7 @@ extension AgentComposerSubmissionAttemptTests {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .codexExec
         session.selectedModelRaw = "gpt-6.1-sol-high"
-        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: session))
-        session.hasLoadedPersistedState = true
-        // An installed binding admits operations only after restoration is authoritative (#1363).
-        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        try installRestoredRoutingWriter(viewModel: viewModel, session: session)
         let baseline = viewModel.executableTarget(for: session)
         XCTAssertNil(viewModel.localUsageDecision(basedOn: baseline, scope: .primarySession, surface: .general))
         let child = try await viewModel.routeSubagentTargetIfEnabled(task: "Implement parser", surface: .headless, baseline: baseline)
@@ -912,9 +1003,7 @@ extension AgentComposerSubmissionAttemptTests {
         let tabID = UUID()
         viewModel.test_setCurrentTabIDOverride(tabID)
         let session = viewModel.session(for: tabID)
-        _ = viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: session)
-        session.hasLoadedPersistedState = true
-        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        try installRestoredRoutingWriter(viewModel: viewModel, session: session)
         session.installLocalInputSeed(.init())
         session.selectedAgent = .claudeCode
         session.installRunID(UUID())
@@ -944,9 +1033,7 @@ extension AgentComposerSubmissionAttemptTests {
         let tabID = UUID()
         viewModel.test_setCurrentTabIDOverride(tabID)
         let session = viewModel.session(for: tabID)
-        _ = viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: session)
-        session.hasLoadedPersistedState = true
-        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        try installRestoredRoutingWriter(viewModel: viewModel, session: session)
         session.installLocalInputSeed(.init())
         session.selectedAgent = .claudeCode
         session.installRunID(UUID())
@@ -1249,6 +1336,22 @@ extension AgentComposerSubmissionAttemptTests {
             runtime.backendReadiness(backend.id) != nil
         }
         return (viewModel, store)
+    }
+
+    /// These isolated routing fixtures have no workspace manager. Give their restored payload
+    /// a real workspace-qualified runtime binding rather than admitting an unscoped presenter.
+    private func installRestoredRoutingWriter(
+        viewModel: AgentModeViewModel,
+        session: AgentModeViewModel.TabSession
+    ) throws {
+        let sessionID = UUID()
+        XCTAssertNil(viewModel.test_bindingRejection(sessionID: sessionID, on: session))
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: UUID()))
+        session.hasLoadedPersistedState = true
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        let command = try XCTUnwrap(viewModel.runtimeCommand(sessionID: sessionID))
+        XCTAssertTrue(command.writer.session === session)
+        XCTAssertTrue(command.isCurrent)
     }
 
     private func routingClaim(

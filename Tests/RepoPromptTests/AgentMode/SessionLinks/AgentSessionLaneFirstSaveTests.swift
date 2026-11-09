@@ -118,14 +118,17 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
     /// refuses to capture an app-owned linked overseer. These races test proof revocation and
     /// rollback, not capture admission; the production didSet and release path still run.
     private func installDeniedRoleControlFixture(on session: AgentTabSession, sessionID: UUID) async {
+        guard let identity = try? controlWriterIdentity(for: session) else {
+            return XCTFail("The denied-role fixture requires its real persistent writer")
+        }
         let registration = await AgentRunSessionStore.register(sessionID: sessionID)
         session.mcpControlContext = AgentModeViewModel.AgentMCPControlContext(
-            sessionID: sessionID, activationID: UUID(), registration: registration,
+            sessionID: sessionID, activationID: UUID(), writerIdentity: identity, registration: registration,
             currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
             originatingConnectionID: nil,
             interactionTransport: .mcp(sessionID: sessionID, originatingConnectionID: nil),
             suppressUserNotifications: true, forceAutoEditEnabled: false,
-            autoEditEnabledBeforeOverride: session.autoEditEnabled, taskLabelKind: .explore
+            autoEditEnabledBeforeOverride: session.autoEditEnabled, taskLabelKind: .explore, autoEditOverride: nil
         )
     }
 
@@ -2041,6 +2044,69 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 selection: fixture.selection, expectedWorkspaceID: fixture.workspaceID
             )
             XCTAssertEqual(capturedLabel, AgentMonitorSessionIDFormatter.short(creatorID))
+        }
+    }
+
+    func testRetireBindingCensusVisitsTabsOnceForManyDescendants() async throws {
+        try await withFixture { fixture in
+            try await withSecondRegisteredWindow { second in
+                try await withSecondRegisteredWindow { third in
+                    let host = WindowStatesManager.shared
+                    let viewModel = fixture.window.agentModeViewModel
+                    let parent = try await viewModel.mcpCreateOversightLane(
+                        creatorSessionID: UUID(), sessionName: "Census parent",
+                        selection: fixture.selection, expectedWorkspaceID: fixture.workspaceID
+                    )
+                    guard case let .created(parentID, parentTabID, _) = parent else {
+                        return XCTFail("parent binding was not created")
+                    }
+                    let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: parentTabID))
+                    var sessions: Set<UUID> = []
+                    for index in 0 ..< 20 {
+                        let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+                            tabID: nil, sessionID: nil, createIfNeeded: true,
+                            sessionName: "Census child \(index)", parentSessionID: parentID,
+                            expectedWorkspaceID: fixture.workspaceID
+                        )
+                        let committed = await viewModel.commitConfiguredSessionCreation(target: target)
+                        XCTAssertTrue(committed)
+                        let child = try XCTUnwrap(viewModel.sessions[target.tabID])
+                        child.runState = .completed
+                        try sessions.insert(XCTUnwrap(child.activeAgentSessionID))
+                    }
+                    for window in [fixture.window, second, third] {
+                        let activeID = try XCTUnwrap(window.workspaceManager.activeWorkspaceID)
+                        let index = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == activeID })
+                        let tabs = (0 ..< 100).map { _ in
+                            ComposeTabState(id: UUID(), name: "Census tab", activeAgentSessionID: UUID())
+                        }
+                        window.workspaceManager.workspaces[index].composeTabs.append(contentsOf: tabs)
+                    }
+                    let expectedVisits = host.allWindows.filter { !$0.isClosing }.reduce(0) { count, window in
+                        count + window.workspaceManager.workspaces.reduce(0) { $0 + $1.composeTabs.count }
+                    }
+                    var observations: [(Set<UUID>, Int)] = []
+                    var validationCount = 0
+                    host.test_setBindingCensusObserver { observations.append(($0, $1)) }
+                    defer { host.test_setBindingCensusObserver(nil) }
+                    let start = Date()
+                    let retired = await host.agentSessionLinkRetireLane(
+                        endpoint: endpoint, commit: false, isStillRetirable: {
+                            validationCount += 1
+                            return true
+                        }
+                    )
+                    let elapsed = Date().timeIntervalSince(start)
+                    XCTAssertTrue(retired)
+                    XCTAssertGreaterThan(validationCount, 0)
+                    XCTAssertEqual(observations.count, validationCount, "one census per synchronous validation")
+                    for (requested, visits) in observations {
+                        XCTAssertEqual(requested, sessions, "each validation must batch the complete descendant set")
+                        XCTAssertEqual(visits, expectedVisits, "one physical tab walk per validation")
+                    }
+                    print("Retirement census per validation: before=\(expectedVisits * sessions.count), after=\(expectedVisits), seconds=\(elapsed)")
+                }
+            }
         }
     }
 

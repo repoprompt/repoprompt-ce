@@ -288,7 +288,7 @@ final class AgentMonitorAutoWakeSnoozeProjectionTests: XCTestCase {
     /// pruning.
     func testEverySnoozeWriteRepaintsThroughTheSingleMapCommit() throws {
         let coordinator = try source(
-            "Sources/RepoPrompt/Features/AgentMode/Runtime/SessionLinks/AgentModeViewModel+SessionLinkAutoWake.swift"
+            "Sources/RepoPrompt/Features/AgentMode/Runtime/SessionLinks/AgentSessionLinkExecutionRuntime+Wake.swift"
         )
         XCTAssertEqual(
             coordinator.components(separatedBy: "session.oversight.autoWakeSnoozes = ").count - 1,

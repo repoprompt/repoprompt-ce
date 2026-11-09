@@ -1,10 +1,132 @@
 @testable import RepoPromptApp
 import RepoPromptFileSystem
 import RepoPromptFoundation
+import RepoPromptInstrumentation
 @testable import RepoPromptWorkspaceContext
 import XCTest
 
 final class AgentFileTagWorktreeResolutionTests: XCTestCase {
+    @MainActor
+    func testRuntimeProviderInputUsesCapturedWorktreeContentWithoutPresentation() async throws {
+        let fixture = try await makeBoundFixture(includeBranchOnly: false)
+        let source = AgentSessionProviderInputRuntime.WorkspaceSource(
+            store: fixture.store,
+            lookupSource: .init(activeAgentSessionID: fixture.sessionID, worktreeBindings: [fixture.binding])
+        )
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let catalog = AgentSkillCatalog(homeDirectoryURL: fixture.logicalRoot.appendingPathComponent("home"))
+        let input = scope.providerInput(skillCatalog: catalog, perfRecorder: NoopAgentModePerfRecorder())
+        XCTAssertTrue(input === scope.providerInput(skillCatalog: catalog, perfRecorder: NoopAgentModePerfRecorder()))
+        let text = await input.augmentUserMessage(
+            "Inspect @Sources/App.swift", attachments: [], taggedFileAttachments: [], agent: .claudeCode,
+            workspacePaths: [fixture.logicalRoot.path], workspace: { source }, session: nil,
+            handoff: scope.handoff, ignoresPendingHandoff: true, skipsSlashExpansion: false, isCurrent: { true }
+        )
+        XCTAssertTrue(text.contains("let origin = \"worktree\""), text)
+        XCTAssertFalse(text.contains("let origin = \"base\""), text)
+        XCTAssertFalse(text.contains(fixture.worktreeRoot.path), text)
+        XCTAssertEqual(text.components(separatedBy: "<file_contents>").count - 1, 1)
+        let repeated = await input.augmentUserMessage(
+            text, attachments: [], taggedFileAttachments: [], agent: .claudeCode,
+            workspacePaths: [fixture.logicalRoot.path], workspace: { source }, session: nil,
+            handoff: scope.handoff, ignoresPendingHandoff: true, skipsSlashExpansion: true, isCurrent: { true }
+        )
+        XCTAssertEqual(repeated, text)
+        let context = await input.initialThreadContext(.init(
+            workspace: source,
+            selection: .init(selectedPaths: [fixture.logicalRoot.appendingPathComponent("Sources/App.swift").path]),
+            promptText: "Captured prompt"
+        ))
+        XCTAssertTrue(context.fileTree.contains("App.swift"), context.fileTree)
+        XCTAssertFalse(context.fileTree.contains(fixture.worktreeRoot.path), context.fileTree)
+        let initial = AgentSessionProviderInputRuntime.composeInitialThreadMessage(
+            initialMessage: "Inspect", fileTree: context.fileTree, promptText: context.promptText
+        )
+        XCTAssertTrue(initial.contains("<file_map>"), initial)
+        XCTAssertTrue(initial.contains("<current_prompt_content>\nCaptured prompt\n</current_prompt_content>"), initial)
+        XCTAssertTrue(initial.hasPrefix("Inspect\n\n"), initial)
+        let session = AgentTabSession(tabID: UUID())
+        let prepared = await input.buildInitialThreadMessageIfNeeded(
+            session: session, initialMessage: "Inspect", input: {
+                .init(workspace: source, selection: .init(selectedPaths: [fixture.logicalRoot.appendingPathComponent("Sources/App.swift").path]), promptText: "Captured prompt")
+            }, isCurrent: { true }
+        )
+        XCTAssertEqual(prepared, initial, "The runtime owns the same initial-thread construction")
+        let refused = await input.buildInitialThreadMessageIfNeeded(
+            session: session, initialMessage: "Inspect", input: {
+                XCTFail("A refused start must not capture prompt or selection")
+                return nil
+            }, isCurrent: { false }
+        )
+        XCTAssertEqual(refused, "Inspect")
+        session.providerSessionID = "resumed-provider-session"
+        let resumed = await input.buildInitialThreadMessageIfNeeded(
+            session: session, initialMessage: "Inspect", input: {
+                XCTFail("A resumed provider must not recapture initial-thread resources")
+                return nil
+            }, isCurrent: { true }
+        )
+        XCTAssertEqual(resumed, "Inspect")
+    }
+
+    @MainActor
+    func testRuntimeInputResolvesPresentationSourceAfterSkillsAndHonorsRefusal() async throws {
+        let fixture = try await makeBoundFixture(includeBranchOnly: true)
+        _ = await makeLookupContext(fixture: fixture)
+        let commands = fixture.logicalRoot.appendingPathComponent(".claude/commands")
+        try FileManager.default.createDirectory(at: commands, withIntermediateDirectories: true)
+        try "Inspect $ARGUMENTS".write(to: commands.appendingPathComponent("inspect.md"), atomically: true, encoding: .utf8)
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let catalog = AgentSkillCatalog(homeDirectoryURL: fixture.logicalRoot.appendingPathComponent("home"))
+        let input = scope.providerInput(skillCatalog: catalog, perfRecorder: NoopAgentModePerfRecorder())
+        var sourceReads = 0
+        let result = await input.augmentUserMessage(
+            "/skill:inspect @Sources/App.swift", attachments: [], taggedFileAttachments: [], agent: .claudeCode,
+            workspacePaths: [fixture.logicalRoot.path], workspace: {
+                sourceReads += 1
+                XCTAssertNotNil(catalog.resolve(name: "inspect"), "Binding inputs must be captured after skill discovery")
+                // The same branch used while a binding transition is in progress. Hidden
+                // worktree roots remain loaded, but must not become the visible fallback.
+                return .init(store: fixture.store, lookupSource: nil)
+            }, session: nil, handoff: scope.handoff, ignoresPendingHandoff: true,
+            skipsSlashExpansion: false, isCurrent: { true }
+        )
+        XCTAssertEqual(sourceReads, 1)
+        XCTAssertTrue(result.contains("<selected_skill_context name=\"inspect\""), result)
+        XCTAssertTrue(result.contains("let origin = \"base\""), result)
+        XCTAssertFalse(result.contains("let origin = \"worktree\""), result)
+        let refused = await input.augmentUserMessage(
+            "@Sources/App.swift", attachments: [], taggedFileAttachments: [], agent: .claudeCode,
+            workspacePaths: [fixture.logicalRoot.path], workspace: {
+                XCTFail("Refused input must not read workspace source")
+                return .init(store: fixture.store, lookupSource: nil)
+            }, session: nil, handoff: scope.handoff, ignoresPendingHandoff: true,
+            skipsSlashExpansion: true, isCurrent: { false }
+        )
+        XCTAssertEqual(refused, "@Sources/App.swift")
+    }
+
+    @MainActor
+    func testRuntimeSkillExpansionUsesExplicitRootsAndPreservesNativeCompactNamespace() async throws {
+        let root = try makeTemporaryRoot(name: "RuntimeProviderSkills")
+        let commands = root.appendingPathComponent(".claude/commands")
+        try FileManager.default.createDirectory(at: commands, withIntermediateDirectories: true)
+        try "---\ndescription: Runtime skill\n---\nInspect $ARGUMENTS".write(to: commands.appendingPathComponent("compact.md"), atomically: true, encoding: .utf8)
+        let catalog = AgentSkillCatalog(homeDirectoryURL: root.appendingPathComponent("home"))
+        let input = AgentSessionProviderInputRuntime(skillCatalog: catalog)
+        let native = await input.expandSlashSkillInvocationIfNeeded("/compact retain this", agentKind: .claudeCode, workspacePaths: [root.path])
+        XCTAssertEqual(native, "/compact retain this")
+        let expanded = await input.expandSlashSkillInvocationIfNeeded("/skill:compact retain this", agentKind: .claudeCode, workspacePaths: [root.path])
+        XCTAssertTrue(expanded.contains("<selected_skill_context name=\"compact\""), expanded)
+        XCTAssertTrue(expanded.contains("<user_instructions>\nretain this\n</user_instructions>"), expanded)
+        XCTAssertFalse(expanded.contains("$ARGUMENTS"), expanded)
+        let freshCatalog = AgentSkillCatalog(homeDirectoryURL: root.appendingPathComponent("home"))
+        let unpublished = AgentSessionProviderInputRuntime(skillCatalog: freshCatalog)
+        let refused = await unpublished.expandSlashSkillInvocationIfNeeded("/skill:compact do not publish", agentKind: .claudeCode, workspacePaths: [root.path], shouldPublishCatalog: { false })
+        XCTAssertEqual(refused, "/skill:compact do not publish")
+        XCTAssertNil(freshCatalog.resolve(name: "compact"), "A refused discovery must not publish a skill catalog")
+    }
+
     @MainActor
     func testExpandedBoundWorktreeSuggestionUsesLogicalPathAndSubtitle() async throws {
         let fixture = try await makeBoundFixture(includeBranchOnly: true)
