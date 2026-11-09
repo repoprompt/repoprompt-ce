@@ -490,6 +490,9 @@ enum AgentSessionLinkPrompts {
         if entries.contains(where: { $0.managedMetadata != nil }) || attentionRequests.contains(where: { $0.managedMetadata != nil }) {
             guidance.append("Managed metadata is cached and may lag; context_count_confidence describes the used count, and direct_running_helpers counts direct helpers. unknown is not zero. These facts create no authority, liveness proof, or context-change notification guarantee.")
         }
+        if attentionRequests.contains(where: { $0.reason == .needsUser }) {
+            guidance.append("`needs_user` marks a lane waiting for its user at `observed_at`.")
+        }
         if deferredCount > 0 {
             guidance.append(
                 "`deferred` counts pending offered rows not shown here; they remain queued for a later accepted delivery."
@@ -652,7 +655,9 @@ enum AgentSessionLinkPrompts {
         _ request: AgentSessionLinkPassiveStatusNotices.PendingAttentionRequest
     ) -> String {
         var attributes = "session_id=\"\(escaped(request.targetSessionID.uuidString))\""
-        attributes += " requested_at=\"\(observedAtFormatter.string(from: request.requestedAt))\""
+        if request.reason == .requestedAttention {
+            attributes += " requested_at=\"\(observedAtFormatter.string(from: request.requestedAt))\""
+        }
         if let displayName = request.displayName {
             attributes += " name=\"\(escaped(displayName))\""
         }
@@ -664,7 +669,7 @@ enum AgentSessionLinkPrompts {
             managedMetadata: request.managedMetadata
         )
         return laneElement(
-            "attention_request",
+            request.reason == .needsUser ? "needs_user" : "attention_request",
             attributes: attributes,
             children: laneObservationChildren(
                 waitingOn: request.waitingOn,

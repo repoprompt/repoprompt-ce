@@ -9606,7 +9606,12 @@ extension AgentSessionLinkRuntimeBridgeTests {
         guard case let .reserved(reservation, _) = await fixture.authority.reserveLink(
             observer: fixture.observer.domainEndpoint, target: fixture.target.domainEndpoint, capabilities: [.poll]
         ), case .activated = await fixture.authority.activateLink(
-            reservation: reservation, initialSnapshot: quietSnapshot(fixture, status: .idle), sourcePublicationSequence: 1
+            reservation: reservation, initialSnapshot: .init(
+                sessionID: fixture.target.sessionID, displayName: "Worker", providerDisplayName: nil,
+                status: .awaitingUser, board: .empty, idleForSend: false,
+                pendingInteractionKind: .approval, latestVisibleAssistantPreview: nil,
+                visibleRowCount: 0, lastActivityAt: .distantPast
+            ), sourcePublicationSequence: 1
         ) else { return XCTFail("watch-only activation failed") }
         var samples: [AgentSessionLinkPassiveStatusNotices.Sample] = []
         fixture.bridge.test_onPassiveSample = { samples.append($0) }
@@ -9614,6 +9619,94 @@ extension AgentSessionLinkRuntimeBridgeTests {
         fixture.bridge.test_onPassiveSample = nil
         let sample = try XCTUnwrap(samples.last)
         XCTAssertNil(sample.managedMetadata)
+        XCTAssertTrue(sample.hasPendingInteraction)
+        XCTAssertNil(sample.runFacts)
+    }
+
+    func testSupplementalWaitSeedPublishesInitialProofLossWithoutPublicChange() async throws {
+        for pending in [false, true] {
+            for lossIsFirstReplay in [false, true] {
+                let fixture = makeFixture()
+                fixture.host.runFacts[fixture.target.sessionID] = .init(
+                    settledThrough: 8, ordinaryThrough: 8, supplementalNeedsUser: pending
+                )
+                guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
+                await fixture.bridge.test_settleProjections()
+                let initial = await pollState(fixture)
+                let sequence = try XCTUnwrap(fixture.bridge.test_sourcePublicationSequence(for: fixture.target.sessionID))
+                if !lossIsFirstReplay {
+                    fixture.host.fireObservation(for: fixture.target.sessionID)
+                    await fixture.bridge.test_settleTargetPublications()
+                    XCTAssertEqual(fixture.bridge.test_sourcePublicationSequence(for: fixture.target.sessionID), sequence)
+                }
+                fixture.host.runFacts.removeValue(forKey: fixture.target.sessionID)
+                fixture.host.fireObservation(for: fixture.target.sessionID)
+                await fixture.bridge.test_settleTargetPublications()
+                let envelope = await fixture.authority.observationSnapshot(forTargetEndpoint: fixture.target.domainEndpoint)
+                XCTAssertNil(try XCTUnwrap(envelope).runFacts)
+                XCTAssertEqual(fixture.bridge.test_sourcePublicationSequence(for: fixture.target.sessionID), sequence + 1)
+                let final = await pollState(fixture)
+                XCTAssertEqual(final?.changeSequence, initial?.changeSequence)
+            }
+        }
+    }
+
+    func testNeedsUserPublicationReachesManagedAndWatchObserversWithIndependentReceipts() async throws {
+        for supplementary in [false, true] {
+            let fixture = makeFixture()
+            let other = makeCandidate(windowID: 3, displayName: "Watch observer")
+            fixture.host.candidates.append(other)
+            func observation(_ pending: Bool) -> DomainAgentSessionObservationSnapshot {
+                .init(
+                    sessionID: fixture.target.sessionID,
+                    displayName: "Worker",
+                    providerDisplayName: nil,
+                    status: .awaitingUser,
+                    board: .empty,
+                    idleForSend: false,
+                    pendingInteractionKind: pending ? .approval : nil,
+                    latestVisibleAssistantPreview: nil,
+                    visibleRowCount: 0,
+                    lastActivityAt: .distantPast
+                )
+            }
+            fixture.host.snapshotOverrides[fixture.target.sessionID] = observation(false)
+            if supplementary {
+                fixture.host.runFacts[fixture.target.sessionID] = .init(settledThrough: 0, ordinaryThrough: 0, supplementalNeedsUser: false)
+            }
+            guard case .added = await addLink(fixture),
+                  case let .reserved(reservation, _) = await fixture.authority.reserveLink(observer: other.domainEndpoint, target: fixture.target.domainEndpoint, capabilities: [.poll]),
+                  case .activated = await fixture.authority.activateLink(reservation: reservation, initialSnapshot: observation(false), sourcePublicationSequence: 1)
+            else { return XCTFail("observer setup failed") }
+            await fixture.bridge.test_refreshStatus(sessionIDs: [fixture.observer.sessionID, other.sessionID])
+            let initial = await pollState(fixture)
+            if supplementary {
+                fixture.host.runFacts[fixture.target.sessionID] = .init(settledThrough: 0, ordinaryThrough: 0, supplementalNeedsUser: true)
+            } else {
+                fixture.host.snapshotOverrides[fixture.target.sessionID] = observation(true)
+            }
+            fixture.host.fireObservation(for: fixture.target.sessionID)
+            await fixture.bridge.test_settleTargetPublications()
+            if !supplementary {
+                // No change feed runs in this fixture; public changes need its scoped refresh.
+                // Supplemental-only publications must refresh both observers automatically.
+                await fixture.bridge.test_refreshStatus(sessionIDs: [fixture.observer.sessionID, other.sessionID])
+            }
+            let managed = try XCTUnwrap(fixture.host.publishedPassiveNoticesByEndpoint[fixture.observer.domainEndpoint])
+            let watch = try XCTUnwrap(fixture.host.publishedPassiveNoticesByEndpoint[other.domainEndpoint])
+            XCTAssertEqual(managed.attentionRequests.map(\.reason), [.needsUser])
+            XCTAssertEqual(watch.attentionRequests.map(\.reason), [.needsUser])
+            XCTAssertNil(watch.attentionRequests.first?.managedMetadata)
+            XCTAssertTrue(managed.entries.isEmpty)
+            XCTAssertTrue(watch.entries.isEmpty)
+            if supplementary {
+                let final = await pollState(fixture)
+                XCTAssertEqual(final?.changeSequence, initial?.changeSequence)
+            }
+            fixture.bridge.applyPassiveMonitorNoticeReceipt(.init(snapshot: managed), observerEndpoint: fixture.observer.domainEndpoint)
+            XCTAssertTrue(try XCTUnwrap(fixture.host.publishedPassiveNoticesByEndpoint[fixture.observer.domainEndpoint]).attentionRequests.isEmpty)
+            XCTAssertEqual(fixture.host.publishedPassiveNoticesByEndpoint[other.domainEndpoint]?.attentionRequests, watch.attentionRequests)
+        }
     }
 
     func testManagedPassiveSampleUsesAcceptedCachedObservationWithoutExtraTargetReads() async throws {
