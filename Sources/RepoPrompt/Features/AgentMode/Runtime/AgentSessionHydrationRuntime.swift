@@ -78,6 +78,9 @@ enum AgentSessionHydrationRuntime {
     }
 
     static func restoreCodexMetadata(from persisted: AgentSession, to session: AgentTabSession) {
+        if persisted.codexConversationID == nil || session.codexConversationID != persisted.codexConversationID || session.codexRolloutPath != persisted.codexRolloutPath {
+            session.clearCodexConversationIdentity()
+        }
         session.codexConversationID = persisted.codexConversationID
         session.codexRolloutPath = persisted.codexRolloutPath
         session.providerCleanupHandle = persisted.resolvedProviderCleanupHandle

@@ -64,7 +64,7 @@
             session.providerTokenUsageByTurn = []
             session.pendingNonCodexUserInputTokenQueue = []
             session.activeNonCodexTurnTokenAccumulator = nil
-            session.codexConversationID = nil
+            session.clearCodexConversationIdentity()
             session.codexRolloutPath = nil
             session.codexModel = nil
             session.codexReasoningEffort = nil

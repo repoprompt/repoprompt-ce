@@ -780,7 +780,8 @@ final class CodexNativeSessionController {
             memoriesEnabledProvider: @escaping @MainActor () -> Bool = { false },
             computerUseEnabledProvider: @escaping @MainActor () -> Bool = { false },
             computerUseClientPathProvider: @escaping () -> String? = { CodexNativeSessionController.computerUseClientPath() },
-            mcpServerEntriesProvider: @escaping () -> [MCPIntegrationHelper.CodexServerEntry] = { MCPIntegrationHelper.codexMCPServerEntries() }
+            mcpServerEntriesProvider: @escaping () -> [MCPIntegrationHelper.CodexServerEntry] = { MCPIntegrationHelper.codexMCPServerEntries() },
+            contextWindowSelection: CodexContextWindowPreferences.Selection = .codexDefault
         ) -> Options {
             Options(
                 requestTimeout: 120,
@@ -803,7 +804,8 @@ final class CodexNativeSessionController {
                         memoriesEnabled: featurePolicy.memoriesEnabled,
                         computerUseEnabled: featurePolicy.computerUseEnabled,
                         computerUseClientPath: computerUseClientPathProvider(),
-                        serverEntries: mcpServerEntriesProvider()
+                        serverEntries: mcpServerEntriesProvider(),
+                        contextWindowSelection: contextWindowSelection
                     )
                 },
                 approvalPolicyProvider: approvalPolicyProvider,
@@ -9616,7 +9618,8 @@ final class CodexNativeSessionController {
         memoriesEnabled: Bool = false,
         computerUseEnabled: Bool = false,
         computerUseClientPath: String? = computerUseClientPath(),
-        serverEntries: [MCPIntegrationHelper.CodexServerEntry] = MCPIntegrationHelper.codexMCPServerEntries()
+        serverEntries: [MCPIntegrationHelper.CodexServerEntry] = MCPIntegrationHelper.codexMCPServerEntries(),
+        contextWindowSelection: CodexContextWindowPreferences.Selection = .codexDefault
     ) -> [String: Any] {
         let readyComputerUse = computerUseEnabled && computerUseClientPath != nil && !hasReservedComputerUseEntry(serverEntries)
         let preferences = CodexAgentToolPreferences.snapshot(for: serverEntries)
@@ -9637,6 +9640,9 @@ final class CodexNativeSessionController {
                 capabilities: computerUseEnabled ? .computerUse : capabilities
             )
         )
+        for (key, value) in CodexContextWindowPreferences.overrides(contextWindowSelection) {
+            overrides[key] = value
+        }
         let mcpOverrides = appServerMCPServerOverrides(
             serverEntries: serverEntries,
             enabledMCPServerNames: preferences.enabledMCPServerNames,

@@ -43,7 +43,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             testWorkspacePath: FileManager.default.temporaryDirectory.path,
             shouldManageCodexTooling: shouldManageCodexTooling,
             codexControllerFactory: { runID, _, _, _, _, _ in factory.make(runID: runID) },
-            codexControllerFactoryWithComputerUse: { runID, _, _, _, _, _, enabled, _ in
+            codexControllerFactoryWithComputerUse: { runID, _, _, _, _, _, enabled, _, _ in
                 factory.make(runID: runID, computerUseEnabled: enabled)
             },
             mcpServerEnabler: mcpServerEnabler,
@@ -88,6 +88,73 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         )
     }
 
+    func testContextWindowSnapshotSurvivesReconnectAndResetsWithConversation() async throws {
+        let suite = "codex-window-reconnect-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        CodexContextWindowPreferences.setSelection(.tokens500K, defaults: defaults)
+        let fixture = makeFixture([], shouldManageCodexTooling: false)
+        let factory = WedgeControllerFactory(plans: [[.timeout], [.success(Self.oldThreadID)], [.success("new-thread")]])
+        var received: [CodexContextWindowPreferences.Selection] = []
+        let coordinator = CodexAgentModeCoordinator(
+            windowID: 1,
+            runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
+            codexControllerFactory: { runID, _, _, _, _, _, enabled, _, selection in
+                received.append(selection)
+                return factory.make(runID: runID, computerUseEnabled: enabled)
+            },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            routeOwnerValidator: { _, _, _, _ in true },
+            shouldManageCodexTooling: false,
+            codexHookApprovalSettings: GlobalSettingsStore.shared,
+            preferenceDefaults: defaults
+        )
+        fixture.viewModel.configureCodexRuntime(coordinator)
+        await coordinator.ensureCodexNativeSession(session: fixture.session)
+        XCTAssertEqual(received, [.tokens500K])
+        CodexContextWindowPreferences.setSelection(.tokens1M, defaults: defaults)
+        await coordinator.ensureCodexNativeSession(session: fixture.session)
+        XCTAssertEqual(received, [.tokens500K, .tokens500K])
+        coordinator.clearCodexSessionState(fixture.session)
+        await coordinator.ensureCodexNativeSession(session: fixture.session)
+        XCTAssertEqual(received, [.tokens500K, .tokens500K, .tokens1M])
+        await coordinator.shutdownCodexSession(fixture.session)
+    }
+
+    func testProviderSwitchClearsContextWindowSnapshotForNewConversation() async throws {
+        let suite = "codex-window-provider-switch-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        CodexContextWindowPreferences.setSelection(.tokens500K, defaults: defaults)
+        let fixture = makeFixture([], freshSession: true, shouldManageCodexTooling: false)
+        let factory = WedgeControllerFactory(plans: [[.success("first-thread")], [.success("new-thread")]])
+        var received: [CodexContextWindowPreferences.Selection] = []
+        let coordinator = CodexAgentModeCoordinator(
+            windowID: 1,
+            runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
+            codexControllerFactory: { runID, _, _, _, _, _, enabled, _, selection in
+                received.append(selection)
+                return factory.make(runID: runID, computerUseEnabled: enabled)
+            },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            routeOwnerValidator: { _, _, _, _ in true },
+            shouldManageCodexTooling: false,
+            codexHookApprovalSettings: GlobalSettingsStore.shared,
+            preferenceDefaults: defaults
+        )
+        fixture.viewModel.configureCodexRuntime(coordinator)
+        await coordinator.ensureCodexNativeSession(session: fixture.session)
+        XCTAssertEqual(received, [.tokens500K])
+        CodexContextWindowPreferences.setSelection(.tokens1M, defaults: defaults)
+        coordinator.handleProviderSwitch(from: .codexExec, to: .claudeCode, session: fixture.session)
+        fixture.session.selectedAgent = .claudeCode
+        coordinator.handleProviderSwitch(from: .claudeCode, to: .codexExec, session: fixture.session)
+        fixture.session.selectedAgent = .codexExec
+        await coordinator.ensureCodexNativeSession(session: fixture.session)
+        XCTAssertEqual(received, [.tokens500K, .tokens1M])
+        await coordinator.shutdownCodexSession(fixture.session)
+    }
+
     private final class RuntimeHookSettings: CodexHookApprovalSettingsProviding {
         let strictWorkspaceID = UUID()
         var lastWorkspaceID: UUID?
@@ -107,7 +174,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         let factory = WedgeControllerFactory(plans: [[]])
         let coordinator = CodexAgentModeCoordinator(
             windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
-            codexControllerFactory: { runID, _, _, _, _, _, _, _ in factory.make(runID: runID) },
+            codexControllerFactory: { runID, _, _, _, _, _, _, _, _ in factory.make(runID: runID) },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
             shouldManageCodexTooling: false, codexHookApprovalSettings: settings
         )
@@ -1514,6 +1581,28 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertFalse(session.isCodexComputerUseArmed)
     }
 
+    func testRestoringDifferentCodexConversationClearsOnlyItsWindowSnapshot() {
+        let fixture = makeFixture([])
+        fixture.session.codexContextWindowSelection = .tokens500K
+        var persisted = AgentSession(id: UUID(), name: "Hydration")
+        persisted.codexConversationID = Self.oldThreadID
+        persisted.codexRolloutPath = Self.oldRolloutPath
+        fixture.coordinator.restoreCodexMetadata(from: persisted, session: fixture.session)
+        XCTAssertEqual(fixture.session.codexContextWindowSelection, .tokens500K)
+        persisted.codexConversationID = "another-thread"
+        persisted.codexRolloutPath = "/tmp/another-rollout.jsonl"
+        fixture.coordinator.restoreCodexMetadata(from: persisted, session: fixture.session)
+        XCTAssertEqual(fixture.session.codexConversationID, "another-thread")
+        XCTAssertNil(fixture.session.codexContextWindowSelection)
+        XCTAssertEqual(fixture.session.codexContextWindowForBinding(current: .tokens1M), .tokens1M)
+        persisted.codexConversationID = nil
+        persisted.codexRolloutPath = nil
+        fixture.session.codexConversationID = nil
+        fixture.session.codexRolloutPath = nil
+        fixture.coordinator.restoreCodexMetadata(from: persisted, session: fixture.session)
+        XCTAssertNil(fixture.session.codexContextWindowSelection)
+    }
+
     func testComputerUseSessionShutdownAndPersistedRestoreDoNotRearm() async throws {
         CodexComputerUseWorkflow.setEnabledForTesting(true)
         defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
@@ -1570,7 +1659,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
     ) -> CodexAgentModeCoordinator {
         let coordinator = CodexAgentModeCoordinator(
             windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
-            codexControllerFactory: { runID, _, _, _, _, _, enabled, _ in factory(runID, enabled) },
+            codexControllerFactory: { runID, _, _, _, _, _, enabled, _, _ in factory(runID, enabled) },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
             shouldManageCodexTooling: false, computerUseRuntimeUnavailableMessage: { nil }, computerUseCompanionReady: { true },
             computerUseReservedEntryExists: { false },
@@ -1589,7 +1678,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         var routeChecks = 0
         let coordinator = CodexAgentModeCoordinator(
             windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
-            codexControllerFactory: { runID, _, _, _, _, _, _, _ in
+            codexControllerFactory: { runID, _, _, _, _, _, _, _, _ in
                 WedgeFakeCodexController(runID: runID, responses: [.success("uncommitted-computer-use")])
             },
             connectionPolicyInstaller: { clientName, windowID, tools, oneShot, reason, ttl, tabID, runID, additional, purpose, label, externalControl, requiresPID in

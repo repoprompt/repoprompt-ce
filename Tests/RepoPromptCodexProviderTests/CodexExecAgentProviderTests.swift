@@ -7,6 +7,17 @@ import RepoPromptProcess
 import XCTest
 
 final class CodexExecAgentProviderTests: XCTestCase {
+    func testContextArgumentsArePassedToExec() {
+        let host = ExecHost()
+        let pair = ["-c", "model_context_window=1000000", "-c", "model_auto_compact_token_limit=900000"]
+        let entries = host.serverEntries()
+        let defaults = CodexExecAgentProvider.buildCodexExecArguments(selectedModelString: nil, serverEntries: entries, brokenServers: [], host: host).args
+        XCTAssertFalse(defaults.contains("model_context_window=1000000"))
+        let selected = CodexExecAgentProvider.buildCodexExecArguments(selectedModelString: nil, serverEntries: entries, brokenServers: [], contextWindowArguments: pair, host: host).args
+        XCTAssertEqual(selected.count(where: { $0 == "model_context_window=1000000" }), 1)
+        XCTAssertEqual(selected.count(where: { $0 == "model_auto_compact_token_limit=900000" }), 1)
+    }
+
     func testServerEntryEqualityIncludesEveryExistingIdentityField() {
         let entry = CodexExecServerEntry(rawName: "Raw", normalizedName: "normalized", cliPathComponent: "path")
         XCTAssertEqual(entry, .init(rawName: "Raw", normalizedName: "normalized", cliPathComponent: "path"))
@@ -325,6 +336,10 @@ final class CodexExecAgentProviderTests: XCTestCase {
 }
 
 private final class ExecHost: CodexExecAgentHost, CodexExecToolTracking {
+    func contextWindowOverrideArguments() -> [String] {
+        []
+    }
+
     private let lock = NSLock()
     private var recorded: [String] = []
     private var broken: Set<String> = []

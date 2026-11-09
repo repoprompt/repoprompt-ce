@@ -2189,11 +2189,19 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     }
 
     func testRenderedAttentionThatFailedIsSuppressedAndRemainsOwedForNaturalTurn() throws {
+        for reason in [AttentionReason.requestedAttention, .needsUser] {
+            try assertFailedAttentionRemainsOwed(reason)
+        }
+    }
+
+    private typealias AttentionReason = AgentSessionLinkPassiveStatusNotices.PendingAttentionRequest.Reason
+
+    private func assertFailedAttentionRemainsOwed(_ reason: AttentionReason) throws {
         let fixture = try makeFixture()
         try publishInventory(fixture, revision: 1)
         fixture.session.oversight.autoWakeOnUpdates = true
         fixture.session.runState = .running
-        let attention = Self.attentionRequest(0)
+        let attention = Self.attentionRequest(0, reason: reason)
         try publishLane(
             fixture,
             linkSetRevision: 1,
@@ -2421,6 +2429,12 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     }
 
     func testPurposefulAttentionBypassesOnlyItsExactLaneSnooze() throws {
+        for reason in [AttentionReason.requestedAttention, .needsUser] {
+            try assertAttentionBypassesOnlyExactSnooze(reason)
+        }
+    }
+
+    private func assertAttentionBypassesOnlyExactSnooze(_ reason: AttentionReason) throws {
         let bypass = try makeFixture()
         installSnoozeClock(bypass)
         try publishInventory(bypass, revision: 1)
@@ -2447,7 +2461,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             ))
         }
 
-        let attention = Self.attentionRequest(0)
+        let attention = Self.attentionRequest(0, reason: reason)
         try publishLane(
             bypass,
             linkSetRevision: 1,
@@ -2484,6 +2498,12 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     }
 
     func testPurposefulAttentionIgnoresRoutineSelectionThroughPhysicalAcquisition() throws {
+        for reason in [AttentionReason.requestedAttention, .needsUser] {
+            try assertAttentionSelectionBypassThroughAcquisition(reason)
+        }
+    }
+
+    private func assertAttentionSelectionBypassThroughAcquisition(_ reason: AttentionReason) throws {
         let fixture = try makeFixture()
         try publishInventory(fixture, revision: 1)
         fixture.session.oversight.autoWakeOnUpdates = true
@@ -2492,7 +2512,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             fixture.viewModel,
             tabID: fixture.tabID
         )
-        let attention = Self.attentionRequest(0)
+        let attention = Self.attentionRequest(0, reason: reason)
         try publishLane(
             fixture,
             linkSetRevision: 1,
@@ -2538,12 +2558,44 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
     }
 
+    func testNeedsUserAcquisitionRejectsPublishedRetirementButNotUnpublishedResolution() throws {
+        for retired in [false, true] {
+            let fixture = try makeFixture()
+            try publishInventory(fixture, revision: 1)
+            fixture.session.oversight.autoWakeOnUpdates = false
+            fixture.session.runState = .running
+            let attention = Self.attentionRequest(0, reason: .needsUser)
+            try publishLane(fixture, linkSetRevision: 1, queueRevision: 1, targetIndices: [], laneIndices: [0], selectedTargetIndices: [], attentionRequests: [attention])
+            let reserved = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+            reserved.task?.cancel()
+            let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(for: fixture.session, dispatchID: .autoWake(wakeID: reserved.wakeID)))
+            XCTAssertEqual(claim.passive?.receipt.deliveredAttentionOccurrences, [attention.occurrence])
+            var preparing = reserved
+            preparing.phase = .preparingDispatch
+            preparing.task = nil
+            fixture.session.oversight.pendingAutoWake = preparing
+            if retired {
+                try publishLane(fixture, linkSetRevision: 1, queueRevision: 2, targetIndices: [], laneIndices: [0], selectedTargetIndices: [], attentionRequests: [])
+            }
+            // Without a new publication, acquisition deliberately uses the frozen observed-at notice.
+            let acquired = fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: claim.dispatchID)
+            XCTAssertEqual(acquired, !retired)
+            if acquired { fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: claim.dispatchID) }
+        }
+    }
+
     func testPurposefulAttentionSelectionBypassStillRequiresExactLaneGeneration() throws {
+        for reason in [AttentionReason.requestedAttention, .needsUser] {
+            try assertAttentionRequiresExactGeneration(reason)
+        }
+    }
+
+    private func assertAttentionRequiresExactGeneration(_ reason: AttentionReason) throws {
         let fixture = try makeFixture()
         try publishInventory(fixture, revision: 1)
         fixture.session.oversight.autoWakeOnUpdates = false
         fixture.session.runState = .running
-        let staleAttention = Self.attentionRequest(0)
+        let staleAttention = Self.attentionRequest(0, reason: reason)
 
         try publishLane(
             fixture,
@@ -2637,6 +2689,12 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     }
 
     func testBudgetOmissionOfRequiredAttentionBasisIsADefiniteNoCall() throws {
+        for reason in [AttentionReason.requestedAttention, .needsUser] {
+            try assertRequiredAttentionBudgetOmission(reason)
+        }
+    }
+
+    private func assertRequiredAttentionBudgetOmission(_ reason: AttentionReason) throws {
         let fixture = try makeFixture()
         installSnoozeClock(fixture)
         try publishInventory(fixture, revision: 1)
@@ -2665,7 +2723,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         XCTAssertFalse(fixture.session.oversight.autoWakeOnUpdates)
         XCTAssertTrue(fixture.session.oversight.autoWakeTargetSessionIDs.isEmpty)
 
-        let attention = Self.attentionRequest(0)
+        let attention = Self.attentionRequest(0, reason: reason)
         try publishLane(
             fixture,
             linkSetRevision: 1,
@@ -5338,12 +5396,18 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     /// Purposeful attention admits inside the window without changing the preference, and its own
     /// dispatch restarts the interval like any other oversight wake.
     func testPurposefulAttentionBypassesTheRoutineIntervalAndRestartsIt() throws {
+        for reason in [AttentionReason.requestedAttention, .needsUser] {
+            try assertAttentionBypassesRoutineInterval(reason)
+        }
+    }
+
+    private func assertAttentionBypassesRoutineInterval(_ reason: AttentionReason) throws {
         let fixture = try makeFixture()
         let clock = installSnoozeClock(fixture)
         try publishInventory(fixture, revision: 1)
         fixture.session.oversight.autoWakeOnUpdates = true
         try enableRoutineInterval(fixture, clock: clock, seconds: 300)
-        let attention = Self.attentionRequest(0)
+        let attention = Self.attentionRequest(0, reason: reason)
 
         try publishLane(
             fixture,
@@ -6614,7 +6678,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     private static func attentionRequest(
         _ index: Int,
         sequence: UInt64 = 1,
-        queueEpoch: UUID = laneQueueEpoch
+        queueEpoch: UUID = laneQueueEpoch,
+        reason: AgentSessionLinkPassiveStatusNotices.PendingAttentionRequest.Reason = .requestedAttention
     ) -> AgentSessionLinkPassiveStatusNotices.PendingAttentionRequest {
         AgentSessionLinkPassiveStatusNotices.PendingAttentionRequest(
             occurrence: .init(
@@ -6625,7 +6690,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             targetEndpoint: laneTargetEndpoint(index),
             targetSessionID: targetID(index),
             requestedAt: Date(timeIntervalSince1970: TimeInterval(sequence)),
-            status: .idle
+            status: .idle,
+            reason: reason
         )
     }
 
@@ -7491,8 +7557,8 @@ extension AgentSessionLinkAutoWakeTests {
                 }
             ))
             XCTAssertNotNil(revision)
-            XCTAssertEqual(preparingFacts, opening, "real host accessor uses the captured active status after seal")
-            XCTAssertEqual(inlineIdleFacts, target.session.quietLedger.facts)
+            XCTAssertEqual(preparingFacts, opening.flatMap { .init(settledThrough: $0.settledThrough, ordinaryThrough: $0.ordinaryThrough, supplementalNeedsUser: false) }, "real host accessor preserves the captured active counters after seal")
+            XCTAssertEqual(inlineIdleFacts, target.session.quietLedger.facts.flatMap { .init(settledThrough: $0.settledThrough, ordinaryThrough: $0.ordinaryThrough, supplementalNeedsUser: false) })
             XCTAssertTrue(idleStillOwned, "first captured idle facts do not wait for ownership release")
             // Source publishers coalesce on the main queue. Wait for their existing signal, then
             // drain the owning serial publication and ordinary authoritative observer projection.
@@ -7984,7 +8050,7 @@ extension AgentSessionLinkAutoWakeTests {
                     try await AsyncTestWait.waitUntil("failing ring exact new paired ordinary closure accepted") {
                         let status = await bridge.test_pairedRunStatus(for: endpoint)
                         let facts = await bridge.test_pairedRunFacts(for: endpoint)
-                        return status == .idle && facts == after
+                        return status == .idle && facts == AgentRunQuietFacts(settledThrough: after.settledThrough, ordinaryThrough: after.ordinaryThrough, supplementalNeedsUser: false)
                     }
                     await bridge.test_settleTargetPublications()
                     await bridge.test_refreshStatus(sessionIDs: [a.sessionID, b.sessionID])

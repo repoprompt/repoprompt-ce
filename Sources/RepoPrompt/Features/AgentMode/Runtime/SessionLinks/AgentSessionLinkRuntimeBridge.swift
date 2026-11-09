@@ -3927,7 +3927,10 @@ final class AgentSessionLinkRuntimeBridge {
             // replay burst reproduces it and is correctly dropped instead of advancing
             // `change_sequence`.
             lastPublishedSnapshotBySession[targetEndpoint.sessionID] = seed
-            installObservation(for: liveTarget, initialActivity: seed.lastActivityAt)
+            let initialFrame = seedFacts?.supplementalNeedsUser == nil ? nil : TargetPublicationFrame(
+                endpoint: targetEndpoint, sourceSequence: seedSequence, snapshot: seed, runFacts: seedFacts
+            )
+            installObservation(for: liveTarget, initialActivity: seed.lastActivityAt, initialFrame: initialFrame)
         } else if chains[targetEndpoint.sessionID] == nil {
             // The authority already has a target record but this process lost its chain (for example
             // the previous installer's window closed between activations). Reinstalling keeps status
@@ -4606,7 +4609,8 @@ final class AgentSessionLinkRuntimeBridge {
 
     private func installObservation(
         for candidate: AgentSessionLinkEndpointCandidate,
-        initialActivity: Date?
+        initialActivity: Date?,
+        initialFrame: TargetPublicationFrame? = nil
     ) {
         guard let host else { return }
         let endpoint = candidate.domainEndpoint
@@ -4614,6 +4618,8 @@ final class AgentSessionLinkRuntimeBridge {
             removeChain(forTargetSession: endpoint.sessionID, matching: existing)
         }
         let chain = TargetPublicationChain(endpoint: endpoint, activityHighWater: initialActivity)
+        // The installing seed owns this frame; ignored joining seeds must remain unseeded.
+        chain.scheduledFrame = initialFrame
         chains[endpoint.sessionID] = chain
         chain.token = host.agentSessionLinkInstallObservation(for: candidate) { [weak self, weak chain] in
             guard let chain else { return }
@@ -5211,7 +5217,8 @@ final class AgentSessionLinkRuntimeBridge {
                     waitingOn: observation.waitingOn,
                     latestVisibleAssistantPreview: observation.latestVisibleAssistantPreview,
                     runFacts: envelope.runFacts,
-                    managedMetadata: item.capabilities.contains(.manage) ? .init(observation) : nil
+                    managedMetadata: item.capabilities.contains(.manage) ? .init(observation) : nil,
+                    hasPendingInteraction: observation.hasPendingInteraction
                 ))
             }
             outbound.append(AgentMonitorPillProps.Outbound(

@@ -21,7 +21,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         _ permissionProfile: AgentModeViewModel.AgentPermissionProfile,
         _ taskLabelKind: AgentModelCatalog.TaskLabelKind?,
         _ computerUseEnabled: Bool,
-        _ capabilities: CodexCapabilitySettings
+        _ capabilities: CodexCapabilitySettings,
+        _ contextWindowSelection: CodexContextWindowPreferences.Selection
     ) -> any CodexSessionControlling
 
     typealias ConnectionPolicyInstaller = (
@@ -3934,7 +3935,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             resetCodexWatchdogState(session)
             resetCodexResumeTimeoutState(for: session)
             session.codexOversizedResumeTarget = nil
-            session.codexConversationID = nil
+            session.clearCodexConversationIdentity()
             session.codexRolloutPath = nil
             session.providerCleanupHandle = nil
             session.codexContextUsage = nil
@@ -6511,6 +6512,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             desiredFeatureState = refreshedFeatureState
 
             if session.codexController == nil {
+                let contextWindowSelection = session.codexContextWindowForBinding(current: CodexContextWindowPreferences.selection(defaults: preferenceDefaults))
                 let controller = codexControllerFactory(
                     runID,
                     session.tabID,
@@ -6519,7 +6521,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                     controllerPermissionProfile,
                     currentTaskLabelKind,
                     wantsComputerUse,
-                    desiredFeatureState.capabilities
+                    desiredFeatureState.capabilities,
+                    contextWindowSelection
                 )
                 guard managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken) else {
                     logCodex("[AgentModeVM][CodexLogout] retiring controller created after managed sign-out invalidated its session token tab=\(session.tabID)")
@@ -11861,7 +11864,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         clearCodexRecoveryAttempt(for: session.runID)
         resetCodexResumeTimeoutState(for: session)
         session.codexOversizedResumeTarget = nil
-        session.codexConversationID = nil
+        session.clearCodexConversationIdentity()
         session.codexRolloutPath = nil
         session.providerCleanupHandle = nil
         session.codexContextUsage = nil

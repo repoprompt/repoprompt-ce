@@ -1996,7 +1996,7 @@ final class AgentSessionCodexRuntimeEffectsTests: XCTestCase {
     private func makeCoordinator(scope: AgentSessionRuntimeStore.Scope) -> CodexAgentModeCoordinator {
         let coordinator = CodexAgentModeCoordinator(
             windowID: -901, runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
-            codexControllerFactory: { _, _, _, _, _, _, _, _ in fatalError("Event handling must not launch a controller") },
+            codexControllerFactory: { _, _, _, _, _, _, _, _, _ in fatalError("Event handling must not launch a controller") },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
             shouldManageCodexTooling: false, codexHookApprovalSettings: GlobalSettingsStore.shared
         )

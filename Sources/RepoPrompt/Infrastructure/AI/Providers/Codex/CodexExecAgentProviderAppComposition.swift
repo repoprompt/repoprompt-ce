@@ -85,6 +85,10 @@ private final class CodexExecAppHost: CodexExecAgentHost {
         await CodexBrokenServersCache.shared.add(name)
     }
 
+    func contextWindowOverrideArguments() -> [String] {
+        CodexContextWindowPreferences.cliArguments(CodexContextWindowPreferences.selection())
+    }
+
     func toolOverrideArguments() -> [String] {
         let toolPolicy = CodexOverrides.ToolPolicy(
             toolOutputTokenLimit: MCPIntegrationHelper.desiredCodexToolOutputTokenLimit,

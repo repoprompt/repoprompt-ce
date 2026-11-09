@@ -403,7 +403,14 @@ extension AgentModeViewModel {
         case .running: .running
         case .awaitingUser: .waitingForUser
         }
-        return session.quietRunFacts(capturedState: state)
+        guard let facts = session.quietRunFacts(capturedState: state) else { return nil }
+        let instructionWait = session.runState == .waitingForUser
+            && session.instructionContinuation != nil && session.instructionWaitID != nil
+        return AgentRunQuietFacts(
+            settledThrough: facts.settledThrough,
+            ordinaryThrough: facts.ordinaryThrough,
+            supplementalNeedsUser: session.pendingCodexHookReview != nil || instructionWait
+        )
     }
 
     /// Sanitized status projection for one live endpoint.

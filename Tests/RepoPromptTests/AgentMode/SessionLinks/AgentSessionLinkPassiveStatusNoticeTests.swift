@@ -7,6 +7,157 @@ final class AgentSessionLinkPassiveStatusNoticeTests: XCTestCase {
     private typealias Reducer = AgentSessionLinkPassiveStatusNotices
     private typealias Status = Reducer.Status
 
+    func testWaitEvidenceDoesNotBecomeQuietProofOrObservationIdentity() {
+        let plain = sample(0, status: .waiting, runFacts: .init(settledThrough: 8, ordinaryThrough: 7))
+        var decorated = sample(0, status: .waiting, runFacts: .init(settledThrough: 8, ordinaryThrough: 7, supplementalNeedsUser: true))
+        decorated.hasPendingInteraction = true
+        XCTAssertEqual(decorated.supplementalNeedsUser, true)
+        XCTAssertEqual(decorated.runFacts, plain.runFacts)
+        XCTAssertNil(decorated.runFacts?.supplementalNeedsUser)
+        XCTAssertEqual(decorated, plain)
+        XCTAssertEqual(Set([decorated, plain]).count, 1)
+        XCTAssertNil(AgentRunQuietFacts(settledThrough: 0, ordinaryThrough: 1, supplementalNeedsUser: true))
+    }
+
+    func testNeedsUserEpisodesBaselineRetireAndRearmWithoutStatusDebt() throws {
+        for supplementary in [false, true] {
+            func observed(_ active: Bool, name: String? = nil) -> Reducer.Sample {
+                var value = sample(0, name: name, status: .waiting, runFacts: supplementary ? .init(settledThrough: 0, ordinaryThrough: 0, supplementalNeedsUser: active) : nil)
+                value.hasPendingInteraction = !supplementary && active
+                return value
+            }
+            var reducer = makeReducer()
+            reducer.enable(samples: [observed(true)], linkSetRevision: 1)
+            XCTAssertTrue(reducer.snapshot.attentionRequests.isEmpty)
+            reducer.reconcile(samples: [observed(false)], linkSetRevision: 1, deliverable: true)
+            let at = Date(timeIntervalSince1970: 50)
+            reducer.reconcile(samples: [observed(true)], linkSetRevision: 1, deliverable: true, observedAt: at)
+            let first = reducer.snapshot
+            let request = try XCTUnwrap(first.attentionRequests.first)
+            XCTAssertEqual(request.reason, .needsUser)
+            XCTAssertEqual(request.requestedAt, at)
+            reducer.reconcile(samples: [observed(true, name: "Refreshed")], linkSetRevision: 1, deliverable: true, observedAt: at.addingTimeInterval(10))
+            let refreshed = try XCTUnwrap(reducer.snapshot.attentionRequests.first)
+            XCTAssertEqual(refreshed.reason, .needsUser)
+            XCTAssertEqual(refreshed.occurrence, request.occurrence)
+            XCTAssertEqual(refreshed.requestedAt, at)
+            XCTAssertEqual(refreshed.observedAt, at.addingTimeInterval(10))
+            XCTAssertEqual(first.wakeEligibilityFingerprint, reducer.snapshot.wakeEligibilityFingerprint)
+            reducer.apply(.init(snapshot: first))
+            reducer.reconcile(samples: [observed(true)], linkSetRevision: 1, deliverable: true)
+            XCTAssertTrue(reducer.snapshot.attentionRequests.isEmpty, "acceptance cannot recreate the same episode")
+            reducer.reconcile(samples: [observed(false)], linkSetRevision: 1, deliverable: true)
+            reducer.reconcile(samples: [observed(true)], linkSetRevision: 1, deliverable: true)
+            let successor = try XCTUnwrap(reducer.snapshot.attentionRequests.first)
+            XCTAssertNotEqual(successor.occurrence, request.occurrence)
+            reducer.apply(.init(snapshot: first))
+            XCTAssertEqual(reducer.snapshot.attentionRequests.map(\.occurrence), [successor.occurrence])
+            reducer.reconcile(samples: [observed(false)], linkSetRevision: 1, deliverable: true)
+            XCTAssertTrue(reducer.snapshot.attentionRequests.isEmpty, "wait exit retires the derived occurrence")
+            XCTAssertTrue(reducer.snapshot.entries.isEmpty, "same-status evidence must never create ordinary debt")
+            XCTAssertEqual(reducer.snapshot.unacknowledgedOverflowCount, 0)
+        }
+    }
+
+    func testNeedsUserUnionAndUnknownRecoveryDoNotInventEpisodes() {
+        func observed(_ pending: Bool, _ supplementary: Bool?) -> Reducer.Sample {
+            var value = sample(0, status: .waiting, runFacts: supplementary.flatMap { .init(settledThrough: 0, ordinaryThrough: 0, supplementalNeedsUser: $0) })
+            value.hasPendingInteraction = pending
+            return value
+        }
+        var reducer = makeReducer()
+        reducer.enable(samples: [observed(false, nil)], linkSetRevision: 1)
+        reducer.reconcile(samples: [observed(false, true)], linkSetRevision: 1, deliverable: true)
+        XCTAssertTrue(reducer.snapshot.attentionRequests.isEmpty, "unknown-to-true supplementary evidence baselines")
+        reducer.reconcile(samples: [observed(false, false)], linkSetRevision: 1, deliverable: true)
+        reducer.reconcile(samples: [observed(false, true)], linkSetRevision: 1, deliverable: true)
+        let occurrence = reducer.snapshot.attentionRequests.first?.occurrence
+        reducer.reconcile(samples: [observed(true, false)], linkSetRevision: 1, deliverable: true)
+        XCTAssertEqual(reducer.snapshot.attentionRequests.first?.occurrence, occurrence, "switching wait source without a gap is one episode")
+        reducer.reconcile(samples: [observed(false, nil)], linkSetRevision: 1, deliverable: true)
+        XCTAssertTrue(reducer.snapshot.attentionRequests.isEmpty)
+        reducer.reconcile(samples: [observed(true, nil)], linkSetRevision: 1, deliverable: true)
+        XCTAssertEqual(reducer.snapshot.attentionRequests.count, 1, "public pending presence works without private facts")
+        var unavailable = sample(0, status: .unavailable, runFacts: .init(settledThrough: 0, ordinaryThrough: 0, supplementalNeedsUser: true))
+        unavailable.hasPendingInteraction = true
+        reducer.reconcile(samples: [unavailable], linkSetRevision: 1, deliverable: true)
+        reducer.reconcile(samples: [observed(true, true)], linkSetRevision: 1, deliverable: true)
+        XCTAssertTrue(reducer.snapshot.attentionRequests.isEmpty, "unavailable recovery baselines even positive public evidence")
+    }
+
+    func testNeedsUserFirstWinsCollisionsAndReceiptsStayIndependentFromStatus() {
+        var active = sample(0, status: .waiting)
+        active.hasPendingInteraction = true
+        for explicitFirst in [false, true] {
+            var reducer = makeReducer()
+            reducer.enable(samples: [sample(0, status: .running)], linkSetRevision: 1)
+            if explicitFirst { XCTAssertEqual(requestAttention(0, reducer: &reducer), .accepted) }
+            reducer.reconcile(samples: [active], linkSetRevision: 1, deliverable: true)
+            let original = reducer.snapshot
+            XCTAssertEqual(original.attentionRequests.first?.reason, explicitFirst ? .requestedAttention : .needsUser)
+            XCTAssertEqual(requestAttention(0, reducer: &reducer), .accepted)
+            XCTAssertEqual(reducer.snapshot.attentionRequests, original.attentionRequests)
+            reducer.apply(.init(snapshot: original, deliveredAttentionRequests: []))
+            XCTAssertTrue(reducer.snapshot.entries.isEmpty)
+            XCTAssertEqual(reducer.snapshot.attentionRequests, original.attentionRequests, "a status receipt cannot pay attention")
+            reducer.reconcile(samples: [sample(0, status: .waiting)], linkSetRevision: 1, deliverable: true)
+            XCTAssertEqual(reducer.snapshot.attentionRequests.count, explicitFirst ? 1 : 0)
+        }
+        var reducer = makeReducer()
+        reducer.enable(samples: [sample(0, status: .running)], linkSetRevision: 1)
+        reducer.reconcile(samples: [active], linkSetRevision: 1, deliverable: true)
+        let both = reducer.snapshot
+        reducer.apply(.init(snapshot: both, deliveredEntries: []))
+        XCTAssertTrue(reducer.snapshot.attentionRequests.isEmpty)
+        XCTAssertEqual(reducer.snapshot.entries, both.entries, "an attention receipt cannot pay status")
+    }
+
+    func testNeedsUserCapacityMissDoesNotReplayAndRetirementFreesSlotsBeforeEntry() {
+        func observed(_ active: Set<Int>) -> [Reducer.Sample] {
+            (0 ... 16).map { index in
+                var value = sample(index, status: .waiting)
+                value.hasPendingInteraction = active.contains(index)
+                return value
+            }
+        }
+        var reducer = makeReducer()
+        reducer.enable(samples: observed([]), linkSetRevision: 1)
+        for index in 0 ..< 16 {
+            XCTAssertEqual(requestAttention(index, reducer: &reducer), .accepted)
+        }
+        reducer.reconcile(samples: observed([16]), linkSetRevision: 1, deliverable: true)
+        let full = reducer.snapshot
+        XCTAssertEqual(full.attentionRequests.count, 16)
+        reducer.apply(.init(snapshot: full, deliveredEntries: [], deliveredAttentionRequests: [full.attentionRequests[0]]))
+        reducer.reconcile(samples: observed([16]), linkSetRevision: 1, deliverable: true)
+        XCTAssertEqual(reducer.snapshot.attentionRequests.count, 15, "free space does not retry a missed episode")
+        reducer.reconcile(samples: observed([]), linkSetRevision: 1, deliverable: true)
+        reducer.reconcile(samples: observed([16]), linkSetRevision: 1, deliverable: true)
+        XCTAssertEqual(reducer.snapshot.attentionRequests.count, 16)
+        var derived = makeReducer()
+        derived.enable(samples: observed([]), linkSetRevision: 1)
+        derived.reconcile(samples: observed(Set(1 ... 16)), linkSetRevision: 1, deliverable: true)
+        derived.reconcile(samples: observed(Set(0 ... 15)), linkSetRevision: 1, deliverable: true)
+        XCTAssertEqual(derived.snapshot.attentionRequests.count, 16)
+        XCTAssertTrue(derived.snapshot.attentionRequests.contains { $0.reference == sample(0, status: .waiting).reference })
+        XCTAssertEqual(derived.snapshot.unacknowledgedOverflowCount, 0)
+        for entering in [0, 16] {
+            let exiting = 16 - entering
+            var lifecycle = makeReducer()
+            lifecycle.enable(samples: observed([]), linkSetRevision: 1)
+            for index in 0 ... 16 where index != entering {
+                XCTAssertEqual(requestAttention(index, reducer: &lifecycle), .accepted)
+            }
+            let samples = observed([entering]).map { value in
+                value.reference == sample(exiting, status: .waiting).reference ? sample(exiting, status: .unavailable) : value
+            }
+            lifecycle.reconcile(samples: samples, linkSetRevision: 1, deliverable: true)
+            XCTAssertEqual(lifecycle.snapshot.attentionRequests.count, 16)
+            XCTAssertEqual(lifecycle.snapshot.attentionRequests.first { $0.reference == sample(entering, status: .waiting).reference }?.reason, .needsUser)
+            XCTAssertFalse(lifecycle.snapshot.attentionRequests.contains { $0.reference == sample(exiting, status: .waiting).reference })
+        }
+    }
+
     func testEveryLiveStatusEdgeHasTheSpecifiedDeterministicEffect() {
         struct Case {
             let from: Status
@@ -727,6 +878,8 @@ final class AgentSessionLinkPassiveStatusNoticeTests: XCTestCase {
         let refreshedSnapshot = reducer.snapshot
         let refreshed = try XCTUnwrap(refreshedSnapshot.attentionRequests.first)
         XCTAssertEqual(refreshed.occurrence, original.occurrence)
+        XCTAssertEqual(original.reason, .requestedAttention)
+        XCTAssertEqual(refreshed.reason, original.reason)
         XCTAssertEqual(refreshed.requestedAt, requestedAt)
         XCTAssertEqual(refreshed.displayName, "Current target")
         XCTAssertEqual(refreshed.status, .idle)

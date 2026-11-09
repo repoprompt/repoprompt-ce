@@ -395,16 +395,17 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let tabID = UUID()
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         session.selectedAgent = .codexExec
+        session.codexContextWindowSelection = .tokens1M
         let candidate = makeCandidate(tabID: tabID)
 
         viewModel.applyCodexNativeContextUsage(
-            AgentContextUsage(modelContextWindow: 1_000_000, lastTotalTokens: 400_000, totalTotalTokens: 900_000),
+            AgentContextUsage(modelContextWindow: 500_000, lastTotalTokens: 400_000, totalTotalTokens: 900_000),
             session: session
         )
         let context = try XCTUnwrap(AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context)
         XCTAssertEqual(context.usedTokens, 400_000, "The last request's context, never the cumulative total")
-        XCTAssertEqual(context.windowTokens, 1_000_000)
-        XCTAssertEqual(context.usedPercent, 40.0)
+        XCTAssertEqual(context.windowTokens, 500_000, "The reported window, not the requested preset")
+        XCTAssertEqual(context.usedPercent, 80.0)
         XCTAssertEqual(context.confidence, .exact)
 
         // What `markCodexContextCompacted` does: stamp the compaction, then re-derive the snapshot
@@ -413,7 +414,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         viewModel.refreshCodexContextUsageSnapshot(for: session)
         let compacted = AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0)).context
         XCTAssertNil(compacted?.usedTokens)
-        XCTAssertEqual(compacted?.windowTokens, 1_000_000)
+        XCTAssertEqual(compacted?.windowTokens, 500_000)
     }
 
     /// A stored ACP figure is reported only while the current provider's own live report vouches
