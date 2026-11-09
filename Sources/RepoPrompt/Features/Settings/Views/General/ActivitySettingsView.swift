@@ -10,9 +10,9 @@ struct ActivitySettingsView: View {
     var body: some View {
         SettingSection(title: "Activity", description: ActivityDisplay.caveat) {
             HStack {
-                Text("Process CPU: \(display.cpu)")
+                Text("CPU: \(display.cpu)")
                 Spacer()
-                Text("Memory (resident): \(display.memory)")
+                Text("Memory: \(display.memory)")
             }
             .monospacedDigit()
             if display.rows.isEmpty {
@@ -21,10 +21,10 @@ struct ActivitySettingsView: View {
             ForEach(display.rows) { row in
                 VStack(alignment: .leading, spacing: 3) {
                     Text(row.window).fontWeight(.medium)
-                    Text("File watching: \(row.rate) (s/s, last interval)")
-                    Text("Root: \(row.root)")
-                    Text("Status: \(row.status)")
-                    Text("Busy total since window opened: \(row.total)")
+                    Text("Watching files: \(row.rate)")
+                    Text("Folder: \(row.root)")
+                    Text(row.status)
+                    Text("Busy total: \(row.total)")
                 }
                 .monospacedDigit()
                 .accessibilityElement(children: .combine)
@@ -61,7 +61,7 @@ struct ActivitySettingsView: View {
 }
 
 struct ActivityDisplay {
-    static let caveat = "100% CPU = one core. Window job time includes waits, not CPU; drawing and other work are unattributed."
+    static let caveat = "100% = one core. Window times include waiting; drawing not counted."
     let capturedAt: Date
     let cpu: String
     let memory: String
@@ -86,21 +86,22 @@ struct ActivityDisplay {
             self.id = id
             let title = ActivityDisplay.label(title)
             window = title.isEmpty || title == WindowTitleFormatter.defaultTitle
-                ? "Window \(id)" : "Window \(id) — \(title)"
-            root = snapshot?.root.map(ActivityDisplay.label) ?? "—"
+                ? "Window \(id)" : "Window \(id): \(title)"
+            root = snapshot?.root.map { $0 == "Multiple roots" ? "Multiple folders" : ActivityDisplay.label($0) } ?? "—"
             total = ActivityDisplay.duration(snapshot?.busyTotal ?? 0)
             if let snapshot, let previous, snapshot.sampledAt > previous.sampledAt, snapshot.busyTotal >= previous.busyTotal {
                 let fraction = Double(snapshot.busyTotal - previous.busyTotal) / Double(snapshot.sampledAt - previous.sampledAt)
-                rate = ActivityDisplay.number(min(1, max(0, fraction)), decimals: 2)
+                // Union time cannot exceed the interval; clamp its displayed percentage to 0...100.
+                rate = ActivityDisplay.number(100 * min(1, max(0, fraction)), decimals: 0) + "%"
             } else {
                 rate = "Measuring…"
             }
             if let snapshot, let start = snapshot.busySince {
-                status = "running for \(ActivityDisplay.duration(snapshot.sampledAt >= start ? snapshot.sampledAt - start : 0))"
+                status = "Busy \(ActivityDisplay.duration(snapshot.sampledAt >= start ? snapshot.sampledAt - start : 0))"
             } else if let snapshot, let end = snapshot.lastEnded {
-                status = "idle, last active \(ActivityDisplay.duration(snapshot.sampledAt >= end ? snapshot.sampledAt - end : 0)) ago"
+                status = "Idle \(ActivityDisplay.duration(snapshot.sampledAt >= end ? snapshot.sampledAt - end : 0))"
             } else {
-                status = "No activity recorded"
+                status = "Not busy yet"
             }
         }
     }
@@ -110,17 +111,17 @@ struct ActivityDisplay {
         let body = rows.map { row in
             """
             \(row.window)
-              File watching: \(row.rate) (s/s, last interval)
-              Root: \(row.root)
-              Status: \(row.status)
-              Busy total since window opened: \(row.total)
+              Watching files: \(row.rate)
+              Folder: \(row.root)
+              \(row.status)
+              Busy total: \(row.total)
             """
         }.joined(separator: "\n")
         return """
-        RepoPrompt CE — Activity
+        RepoPrompt CE: Activity
         Captured: \(timestamp)
-        Process CPU: \(cpu)
-        Memory (resident): \(memory)
+        CPU: \(cpu)
+        Memory: \(memory)
         \(Self.caveat)
         \(rows.isEmpty ? "No open windows." : body)
         """

@@ -594,15 +594,38 @@ final class ActivitySettingsTests: XCTestCase {
             root: "repo (session worktree)"
         )
         let row = ActivityDisplay.Row(id: 1, title: "repo", snapshot: now, previous: previous)
-        XCTAssertEqual(row.rate, "1.00")
+        XCTAssertEqual(row.rate, "100%")
         XCTAssertEqual(row.total, "3.0 s")
-        XCTAssertEqual(row.status, "running for 3.0 s")
+        XCTAssertEqual(row.status, "Busy 3.0 s")
         XCTAssertEqual(row.root, "repo (session worktree)")
         XCTAssertEqual(ActivityDisplay.Row(id: 1, title: "repo", snapshot: now, previous: nil).rate, "Measuring…")
         let idle = ActivityDisplay.Row(id: 2, title: "", snapshot: nil, previous: nil)
         XCTAssertEqual(idle.window, "Window 2")
-        XCTAssertEqual(idle.status, "No activity recorded")
+        XCTAssertEqual(idle.status, "Not busy yet")
         XCTAssertEqual(idle.total, "0.0 s")
+    }
+
+    func testShortLabelsRoundPercentagesClampAndKeepFolderSuffixes() {
+        let previous = WindowActivityLedger.Snapshot(
+            windowID: 1, sampledAt: 1_000_000_000, busyTotal: 0, busySince: nil, lastEnded: nil, root: nil
+        )
+        let cases: [(UInt64, String, String, String)] = [
+            (516_000_000, "repo (session worktree)", "52%", "repo (session worktree)"),
+            (0, "repo (git data)", "0%", "repo (git data)"),
+            (1_000_000_000, "repo (system)", "100%", "repo (system)"),
+            (2_000_000_000, "Multiple roots", "100%", "Multiple folders")
+        ]
+        for (total, root, expectedRate, expectedFolder) in cases {
+            let snapshot = WindowActivityLedger.Snapshot(
+                windowID: 1, sampledAt: 2_000_000_000, busyTotal: total,
+                busySince: nil, lastEnded: 1_000_000_000, root: root
+            )
+            let row = ActivityDisplay.Row(id: 1, title: "repo", snapshot: snapshot, previous: previous)
+            XCTAssertEqual(row.window, "Window 1: repo")
+            XCTAssertEqual(row.rate, expectedRate)
+            XCTAssertEqual(row.root, expectedFolder)
+            XCTAssertEqual(row.status, "Idle 1.0 s")
+        }
     }
 
     func testReportUsesDisplayedValuesAndSanitizedLabels() {
@@ -618,16 +641,16 @@ final class ActivitySettingsTests: XCTestCase {
             .init(id: 1, title: "repo\twindow", snapshot: snapshot, previous: nil)
         ], capturedAt: Date(timeIntervalSince1970: 0))
         XCTAssertEqual(display.report, """
-        RepoPrompt CE — Activity
+        RepoPrompt CE: Activity
         Captured: 1970-01-01T00:00:00Z
-        Process CPU: 150.0%
-        Memory (resident): 2400 MiB
-        100% CPU = one core. Window job time includes waits, not CPU; drawing and other work are unattributed.
-        Window 1 — repo window
-          File watching: Measuring… (s/s, last interval)
-          Root: repo root
-          Status: running for 1 m 04 s
-          Busy total since window opened: 1 m 04 s
+        CPU: 150.0%
+        Memory: 2400 MiB
+        100% = one core. Window times include waiting; drawing not counted.
+        Window 1: repo window
+          Watching files: Measuring…
+          Folder: repo root
+          Busy 1 m 04 s
+          Busy total: 1 m 04 s
         """)
         XCTAssertEqual(ActivityDisplay.label(String(repeating: "a", count: 100)).count, 80)
         XCTAssertEqual(ActivityDisplay.duration(3_840_000_000_000), "1 h 04 m")
