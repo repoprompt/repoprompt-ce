@@ -3,6 +3,7 @@ import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptFoundation
 import RepoPromptHTTPProviders
+import RepoPromptSecureStorage
 import XCTest
 
 final class ZAIProviderEndpointTests: XCTestCase {
@@ -171,5 +172,50 @@ final class ProviderEndpointConsentTests: XCTestCase {
         store.saveConfig(config)
         store.saveConfig(staleApprovedConfig)
         XCTAssertNil(store.config(for: .custom).httpCredentialConsentEndpoint)
+    }
+}
+
+@MainActor
+final class ErrorExtensionsKeychainTests: XCTestCase {
+    func testOwnerMismatchDisplaysActionableSanitizedRecoveryInsteadOfNSErrorWrapper() throws {
+        let error = KeychainService.KeychainError.invalidOwnerEdit
+        let message = error.asFriendlyString()
+
+        XCTAssertTrue(message.contains("-25244"))
+        XCTAssertTrue(message.contains("Keychain Access"))
+        XCTAssertTrue(message.contains("Account and Where"))
+        XCTAssertTrue(message.contains("Do not delete migration journal or manifest"))
+        XCTAssertFalse(message.contains("Unknown error"))
+        XCTAssertFalse(message.contains("code 0"))
+        XCTAssertTrue(try message.contains(XCTUnwrap(error.errorDescription)))
+    }
+
+    func testUnconfirmedDeletionAndCancelledAccessHaveDistinctMessages() {
+        XCTAssertTrue(
+            KeychainService.KeychainError.deletionNotConfirmed.asFriendlyString()
+                .contains("a matching Keychain item still exists")
+        )
+        XCTAssertEqual(
+            KeychainService.KeychainError.userInteractionCancelled.asFriendlyString(),
+            "Keychain interaction was cancelled"
+        )
+    }
+
+    func testZAIKeyManagerPropagatesDeleteFailureToSettingsMessageWithoutClearingStoredValue() async {
+        let backend = TestSecureStorageBackend(values: [.zAIAPI: "fixture-value"])
+        backend.deleteErrors[.zAIAPI] = .invalidOwnerEdit
+        let manager = KeyManager(secureService: SecureKeysService(secureStorage: backend))
+
+        do {
+            try await manager.deleteAPIKey(for: .zAI)
+            XCTFail("Expected the storage error to reach the settings caller")
+        } catch {
+            XCTAssertEqual(error as? KeychainService.KeychainError, .invalidOwnerEdit)
+            let message = error.asFriendlyString()
+            XCTAssertTrue(message.contains("Keychain Access"))
+            XCTAssertFalse(message.contains("Unknown error"))
+        }
+        XCTAssertEqual(backend.value(for: .zAIAPI), "fixture-value")
+        XCTAssertEqual(backend.calls, [.init(operation: .delete, account: .zAIAPI, accessMode: .interactive)])
     }
 }
