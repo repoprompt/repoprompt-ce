@@ -1238,7 +1238,12 @@ extension FileSystemService {
             watcherBatchProcessingDidFinish(token: token)
             return
         }
-        _ = await handleBatchedEvents(batch)
+        let observer = watcherActivityObserver
+        let accepted = observer?(.began) ?? false
+        do {
+            defer { if accepted { _ = observer?(.ended) } }
+            _ = await handleBatchedEvents(batch)
+        }
         watcherBatchProcessingDidFinish(token: token)
     }
 

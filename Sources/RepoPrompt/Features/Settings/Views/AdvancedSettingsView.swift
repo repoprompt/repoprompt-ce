@@ -105,6 +105,8 @@ struct AdvancedSettingsView: View {
             VStack(alignment: .leading, spacing: 16) {
                 headerSection
 
+                ActivitySettingsView()
+
                 Divider()
                     .padding(.horizontal, -16)
 

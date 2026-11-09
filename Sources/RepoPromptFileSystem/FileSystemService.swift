@@ -291,6 +291,10 @@ package final class FileSystemServiceFSEventTeardownHandle: @unchecked Sendable 
 package actor FileSystemService {
     // Internal for FileSystemService same-target extensions only.
     // These are not public API; preserve actor isolation when accessing them.
+    package enum WatcherActivityPhase { case began, ended }
+    package typealias WatcherActivityObserver = @Sendable (WatcherActivityPhase) -> Bool
+    package let watcherActivityObserver: WatcherActivityObserver?
+
     package let fileManager = FileManager.default
     package nonisolated let diagnosticRootToken = UUID()
     package nonisolated let watcherIngressMailbox: FileSystemWatcherIngressMailbox
@@ -663,8 +667,10 @@ package actor FileSystemService {
         respectCursorignore: Bool = true,
         skipSymlinks: Bool = true,
         enableHierarchicalIgnores: Bool = true,
-        ignoreRulesManager: IgnoreRulesManager
+        ignoreRulesManager: IgnoreRulesManager,
+        watcherActivityObserver: WatcherActivityObserver? = nil
     ) async throws {
+        self.watcherActivityObserver = watcherActivityObserver
         self.path = path
         let resolvedRootURL = URL(fileURLWithPath: path).standardizedFileURL
         rootURL = resolvedRootURL
@@ -816,8 +822,10 @@ package actor FileSystemService {
             recoveryScanSleep: @escaping @Sendable (UInt64) async -> Void = { nanoseconds in
                 try? await Task.sleep(nanoseconds: nanoseconds)
             },
-            ignoreRulesManager: IgnoreRulesManager
+            ignoreRulesManager: IgnoreRulesManager,
+            watcherActivityObserver: WatcherActivityObserver? = nil
         ) async throws {
+            self.watcherActivityObserver = watcherActivityObserver
             self.path = path
             let resolvedRootURL = URL(fileURLWithPath: path).standardizedFileURL
             rootURL = resolvedRootURL

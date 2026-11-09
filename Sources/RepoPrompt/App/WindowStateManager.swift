@@ -546,6 +546,7 @@ class WindowStatesManager: ObservableObject {
 
     /// 🚀 Single, shared instance for the entire app
     static let shared = WindowStatesManager()
+    let activityLedger = WindowActivityLedger()
 
     /// App-global bundled router registry plus shared backend credential/readiness authorities.
     let modelRouterRuntime = AgentTaskRouterRuntime()
@@ -1097,6 +1098,7 @@ class WindowStatesManager: ObservableObject {
             let registerStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
         allWindows.append(state)
+        activityLedger.registerWindow(state.windowID)
         #if DEBUG
             WorkspaceRestorePerfLog.log(
                 "restore.window registered windowID=\(state.windowID) registeredWindows=\(allWindows.count) pendingRestoreEntries=\(restoreQueue.count)"
@@ -1204,6 +1206,7 @@ class WindowStatesManager: ObservableObject {
         invalidateAgentSessionLinks(forClosedWindowID: state.windowID)
         // Retract every attention notification this window owned; its sessions are gone.
         NotificationService.shared.agentNotifications.removeWindow(state.windowID)
+        activityLedger.removeWindow(state.windowID)
         explicitlyClosingWindowIDs.remove(state.windowID)
         // A window that closes mid-restore must not leave the persistence gate held.
         restorePersistenceGate.finishRestoringWindow(state.windowID)

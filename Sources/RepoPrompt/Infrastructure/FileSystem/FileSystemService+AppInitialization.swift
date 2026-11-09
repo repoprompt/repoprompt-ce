@@ -7,7 +7,8 @@ extension FileSystemService {
         respectRepoIgnore: Bool = true,
         respectCursorignore: Bool = true,
         skipSymlinks: Bool = true,
-        enableHierarchicalIgnores: Bool = true
+        enableHierarchicalIgnores: Bool = true,
+        watcherActivityObserver: WatcherActivityObserver? = nil
     ) async throws {
         FileSystemAppIntegration.installHooks()
         try await self.init(
@@ -16,7 +17,8 @@ extension FileSystemService {
             respectCursorignore: respectCursorignore,
             skipSymlinks: skipSymlinks,
             enableHierarchicalIgnores: enableHierarchicalIgnores,
-            ignoreRulesManager: IgnoreRulesManager.shared
+            ignoreRulesManager: IgnoreRulesManager.shared,
+            watcherActivityObserver: watcherActivityObserver
         )
     }
 
@@ -39,7 +41,8 @@ extension FileSystemService {
             recoveryScanRetryBaseNanosecondsOverride: UInt64? = nil,
             recoveryScanSleep: @escaping @Sendable (UInt64) async -> Void = { nanoseconds in
                 try? await Task.sleep(nanoseconds: nanoseconds)
-            }
+            },
+            watcherActivityObserver: WatcherActivityObserver? = nil
         ) async throws {
             FileSystemAppIntegration.installHooks()
             try await self.init(
@@ -59,7 +62,8 @@ extension FileSystemService {
                 maxRecoveryScanAttemptsOverride: maxRecoveryScanAttemptsOverride,
                 recoveryScanRetryBaseNanosecondsOverride: recoveryScanRetryBaseNanosecondsOverride,
                 recoveryScanSleep: recoveryScanSleep,
-                ignoreRulesManager: IgnoreRulesManager.shared
+                ignoreRulesManager: IgnoreRulesManager.shared,
+                watcherActivityObserver: watcherActivityObserver
             )
         }
     #endif
