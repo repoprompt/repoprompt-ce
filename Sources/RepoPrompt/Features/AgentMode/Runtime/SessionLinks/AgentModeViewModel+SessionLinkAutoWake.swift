@@ -827,6 +827,20 @@ extension AgentModeViewModel {
             return false
         }
         if attempt.phase != .dispatching {
+            // Keep the producer's identity fenced until its no-call finalizer runs. Automatic
+            // queue content remains owed; a manual Wake now is a one-shot and is not requeued.
+            if agentSelfCompactHoldsWakeAcquisition(session) {
+                if let claim = agentSessionLinkPromptClaimStore.pendingClaim(
+                    dispatchID: effectiveID,
+                    observerSessionID: attempt.observerEndpoint.sessionID
+                ) {
+                    agentSessionLinkPromptClaimStore.abandon(claim)
+                }
+                if !attempt.isManual { session.oversight.autoWakeReevaluationOwed = true }
+                attempt.phase = .cancelledBeforeDispatch
+                session.oversight.pendingAutoWake = attempt
+                return false
+            }
             // The acceptance fence, evaluated exactly once and only on this side of the transport
             // boundary. A re-entrant acquire for an attempt that is already `dispatching` must not
             // consult it: the physical call may already have happened, so retracting the identity
