@@ -6243,3 +6243,42 @@ Final checkpoint-4 receipts after restoring the candidate source:
   no baseline changes.
 - Broad-suite baseline failures are disclosed above; no full-suite, live-app, release or hosted-CI
   success is claimed. This is a validated checkpoint, not completion of M9.2b.
+
+#### M9.2a integration into M9.2b — `ddf34184a`
+
+Normal merge of `ddf34184a177b47e41ab61f6a198556d3bd65df9` into checkpoint-4
+`d2e1af2415845769e06a54ad4e0186e85a866f21`; no rebase or force-push. The automatic merge was
+conflict-free. Both the M9.2a peer-admission/Stop changes and Codex parked-input/attempt fences
+remain intact, alongside M9.2b's captured interaction commands. The incoming fixture and warning
+repairs are preserved, not replaced with looser assertions.
+
+Merged-tree validation:
+- All SessionLinks suites, admission/sidebar/lane-policy, interaction runtime and Codex resume/wedge:
+  `c5ed5a92-6890-44d5-b634-11e96782da84`, **1956 executed, 8 skipped, one failing case / three
+  diagnostics**. All six previously failing suite families now pass: concurrent workspace admission,
+  lane policy, sidebar tab filtering, monitor pill props, link prompt view-model and Codex prompt
+  adapter. The handoff suite passed **104/104**, with scale **6.82s**, in this broad run.
+- The separate handoff run `b0dc9055-853e-4456-8a47-fb3420b3e07b` had one scale failure,
+  **11.30s vs 10s**; render assertions passed. The overseer explicitly classifies this as the
+  inherited baseline owned by the separate flake lane and permits this integration push.
+- **Additional intermittent:** `AgentSessionLinkLateQualificationTests.testReconnectionCannotInheritPredecessorOffer`
+  was the broad run's sole failing case: a 3-second retention-edge timeout, cancellation, and MCP
+  `tools[23].inputSchema.properties.sort.enum[2]` decoding error. It then passed in isolation on
+  both the merged candidate (`4bbacb04-271a-4011-bf4a-f0503f140edc`) and exact `ddf34184a` in a
+  temporary detached worktree (`924b06e8-c805-42c2-9918-1122dc58e415`): each executed **12 tests,
+  1 skipped, 0 failures**. Per the overseer's explicit rule this broad-only result is recorded as
+  intermittent and does not block pushing. Its cause is **not** established, and the schema error
+  is not dismissed as a load symptom. No MCP tool-schema/argument-definition or decoding source
+  differs from `ddf34184a`; no schema, assertion or timeout was changed. The temporary worktree was
+  removed after validation; Conductor retains its logs.
+- Both products `0de5d882-3782-40e3-9b25-7d947f0e34a9` and full lint
+  `5b3c641b-7efa-4eea-9ec9-ce3d55653642` passed. Fresh index: **1242/1360**, **53/66**; no ratchet
+  baseline changes.
+- ANSI-stripped warning occurrence audit over **24 Swift files** (M9.2b diff plus incoming merge
+  paths): exact-base and merged compile logs each contain **4** VM diagnostics, **6** in
+  `AgentSessionLinkPromptAdapterTests.swift`, **1** in `AgentRunMCPToolServiceSteerResumeTests.swift`,
+  and **0** in the other audited files. **No positive occurrence deltas.**
+
+No full-suite or hosted-CI success is claimed for M9.2b. The overseer reports #1659 green at this
+base; this lane did not read CI logs. The previously frozen endpoint/incarnation and run-ownership
+paths may be worked on after this validated integration, as authorized. M9.2b remains incomplete.

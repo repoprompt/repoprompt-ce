@@ -978,6 +978,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             let parked = try XCTUnwrap(state.parkedNote)
             let startsBefore = fixture.startedTurns.count
             let steersBefore = fixture.controller.steeredTurns.count
+            let priorAuthRetryTurn = fixture.session.codexPendingAuthRetryTurn
+            let priorOwnership = fixture.session.activeRunOwnership
             let gate = TestReleaseFence(name: "parked Codex optional Read cancellation")
             fixture.viewModel.test_agentSessionLinkLocalInputReadProof = { decoration in
                 await gate.enterAndWait()
@@ -997,6 +999,10 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             XCTAssertEqual(fixture.startedTurns.count, startsBefore)
             XCTAssertEqual(fixture.controller.steeredTurns.count, steersBefore)
             XCTAssertEqual(fixture.session.selfCompactState.parkedNote?.dispatchID, parked.dispatchID)
+            if steer {
+                XCTAssertEqual(fixture.session.activeRunOwnership, priorOwnership)
+                XCTAssertEqual(fixture.session.codexPendingAuthRetryTurn, priorAuthRetryTurn)
+            }
             XCTAssertEqual(fixture.session.selfCompactState.active?.noteDispatchStarted, false)
             XCTAssertNil(fixture.session.selfCompactState.latest)
             let inventory = try XCTUnwrap(input.host.publishedPromptInventories[input.observer.sessionID])
