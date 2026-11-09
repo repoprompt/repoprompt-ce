@@ -23,7 +23,7 @@ struct ActivitySettingsView: View {
                     GridRow {
                         Text("Window")
                         Text("Watching files")
-                        Text("Folder")
+                        Text("Last busy folder")
                         Text("Status")
                         Text("Busy total")
                     }
@@ -136,7 +136,7 @@ struct ActivityDisplay {
             """
             \(row.window)
               Watching files: \(row.rate)
-              Folder: \(row.root)
+              Last busy folder: \(row.root)
               \(row.status)
               Busy total: \(row.total)
             """

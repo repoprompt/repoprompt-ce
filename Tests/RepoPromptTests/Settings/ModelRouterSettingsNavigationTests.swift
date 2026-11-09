@@ -690,7 +690,7 @@ final class ActivitySettingsTests: XCTestCase {
         100% = one core. Window times include waiting; drawing not counted.
         Window 1: repo window
           Watching files: Measuring…
-          Folder: repo root
+          Last busy folder: repo root
           Busy 1 m 04 s
           Busy total: 1 m 04 s
         """)
