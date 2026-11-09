@@ -4,7 +4,10 @@ enum CodexContextWindowPreferences {
     enum Selection: String, CaseIterable {
         case codexDefault = "default"
         case tokens500K = "500000"
-        case tokens750K = "750000"
+        case tokens600K = "600000"
+        case tokens700K = "700000"
+        case tokens800K = "800000"
+        case tokens900K = "900000"
         case tokens1M = "1000000"
 
         var tokens: Int? {
@@ -15,7 +18,10 @@ enum CodexContextWindowPreferences {
             switch self {
             case .codexDefault: "Codex default"
             case .tokens500K: "500K tokens"
-            case .tokens750K: "750K tokens"
+            case .tokens600K: "600K tokens"
+            case .tokens700K: "700K tokens"
+            case .tokens800K: "800K tokens"
+            case .tokens900K: "900K tokens"
             case .tokens1M: "1M tokens"
             }
         }
@@ -24,7 +30,9 @@ enum CodexContextWindowPreferences {
     private static let key = "codexContextWindowSelection"
 
     static func selection(defaults: UserDefaults = .standard) -> Selection {
-        defaults.string(forKey: key).flatMap(Selection.init(rawValue:)) ?? .codexDefault
+        let raw = defaults.string(forKey: key)
+        if raw == "750000" { return .tokens800K }
+        return raw.flatMap(Selection.init(rawValue:)) ?? .codexDefault
     }
 
     static func setSelection(_ selection: Selection, defaults: UserDefaults = .standard) {
