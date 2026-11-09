@@ -6150,10 +6150,96 @@ Validation for checkpoints 2–3:
   cache-independent formatter check passed before the full retry. Final guard/fixture changes
   additionally passed scoped pinned formatting and strict lint.
 - Fresh index: **1242/1360**, **53/66**; baseline unchanged.
-- Cold and final incremental logs were audited by per-file compiler-warning occurrence count:
-  **zero occurrences in all 14 Swift files touched by M9.2b so far**. Two existing runtime
-  SwiftUI diagnostics in untouched `AgentSessionRows.swift` during bridge tests are not hidden
-  or claimed to be compiler warnings in touched files.
+- **Corrected during checkpoint 4:** the earlier zero-occurrence warning audit missed ANSI-coded
+  diagnostics. The exact-base compile has four occurrences in `AgentModeViewModel.swift` and one
+  in `AgentRunMCPToolServiceSteerResumeTests.swift`; earlier M9.2b compilation logs also contain
+  these baseline diagnostics. An additional unused-`try?` result in `AgentModeView.swift` introduced
+  by checkpoint 3 is fixed in checkpoint 4. Incremental logs that did not compile a file are not
+  evidence of zero warnings. Final validation compares ANSI-stripped occurrence counts per file.
+  Existing runtime SwiftUI diagnostics in untouched `AgentSessionRows.swift` remain distinct from
+  compiler warnings.
 - No full-suite, live-app, release or hosted-CI success is claimed; no CI logs were read.
 
 All remaining M9.2b inventory and the first-control-setup progression concern remain open.
+
+#### M9.2b checkpoint 4 — question draft and activity commands
+
+Question draft edits, page selection and timeout rearming now consume the same exact writer
+command captured when the card is rendered. They acknowledge only a changed, current pending
+question with a live continuation. Cross-scope commands, reacquired claims and raw writer
+conflicts cannot alter drafts, page index or timeout generation. The existing response-refusal
+witness now covers these mutations, valid detached-presentation editing and invalid question/page
+inputs without changing its budgets or response assertions. Originating timeout/cancellation
+cleanup remains independent of fresh writer admission.
+
+Removed Agent Mode VM `updateAskUserDraft`, `updateAskUserQuestionIndex` and
+`noteAskUserCardActivity` methods; source/caller searches leave only runtime commands and direct
+card calls. Context Builder's separate implementation is untouched. An optional exact-object
+presentation notification preserves activity's narrow interaction refresh instead of refreshing
+all bindings on every user activity. This callback projects state only; it cannot admit writes.
+Question creation/loading and provider response bodies remain open. No endpoint/incarnation
+lookup or run-ownership publication implementation was changed.
+
+Validation history (including the superseded provisional attribution and its resolution):
+Scoped pinned formatting/strict lint and full lint `21294799-7c5f-406a-be01-1c43c035172e`
+passed. The newly required all-SessionLinks/admission/sidebar/lane-policy baseline at `cc4a92e`
+(`45c434ff-4704-4037-a241-6cba394225e8`) ran **1867 tests**, with **8 skipped** and **19 failing
+cases / 43 failure diagnostics**. The six suites reported by M9.2a account for 17 failing cases.
+Two additional `AgentSessionLinkHandoffInheritanceTests` cases failed: the cold-Claude picker
+composer-body equality assertion (60 vs 50) and the provider-switch scale budget (12.05s vs 10s).
+These were escalated before another push. Checkpoint-4 test `7a21c8a9-54c9-4a76-b487-363db21a14de`
+and product `3de0c87a-da48-464c-9142-6f87cf92a503` were cancelled for the exact-base comparison;
+neither is a passing validation receipt.
+
+**Known intermittent, overseer-classified:** the handoff suite is load-correlated, not yet
+root-caused. Exact base `e42006ff8` passed **104/104** (`62638293-1672-43c2-a1bc-51ad5efdf872`,
+scale 5.36s), and intermediate `a29638caf` passed **104/104**
+(`b7f54fd6-682b-420b-97fd-732ee299fae6`, scale 7.63s). The first focused `cc4a92e` run
+(`39fadef7-7bc7-438a-8085-104ab3375f5b`) failed composer counts (65/55 and 93/83), scale
+(32.85s), and a controlled-MCP refusal case. Subsequent head runs passed: the three isolated
+cases with temporary render logging (`0f81cab3-f271-4329-a9d4-9d72bf49c55c`, scale 6.29s),
+the full **104/104** with logging (`0c0aad6e-6787-4e66-b20f-cf90d94abfed`, scale 5.10s),
+and unmodified **104/104** (`c3d0c54a-8deb-49e9-a415-cabba6e805db`, scale **4.93s**).
+All temporary diagnostics were removed; no causal production fix is claimed. The failing runs
+overlapped other agent-lane work. The overseer permits pushing with this explicit classification,
+requires the suite at every push gate, and requires stopping to root-cause any recurrence using
+repeated head/base comparisons. **No assertions or budgets changed.** The complete selection plus
+the interaction-runtime suite then ran on checkpoint 4:
+`179f4f7a-a5d1-43a5-8436-92a9f9c8b9be` executed **1881 tests**, **8 skipped**, **17 failing
+cases / 37 diagnostics**. The focused interaction-runtime suite passed; handoff scale passed
+at **6.47s**, but the composer assertion recurred (**33 vs 23**). Per the overseer's condition,
+the push is stopped and repeated exact-head/base investigation is required. Products
+`c4c7d1b7-7dee-44c1-9305-6b1297ba0af0` and full lint
+`35cb539e-8e56-4f2a-828e-539ae76cd98e` passed.
+
+**Inherited-baseline classification (supersedes the provisional attribution above):** exact base
+`e42006ff8` reproduced both failures under the same broad 90-suite selection
+(`905e68ed-7ce6-4c29-9820-3aa89a77dc5b`): composer **30 vs 26**, scale **10.76s**;
+**1867 tests**, **8 skipped**, **18 failing cases / 38 diagnostics**. Unchanged head and base each
+passed three consecutive isolated **104-test** runs. Head tickets:
+`6a2cc95b-22e8-4ed5-a3ff-d5e48d54417b`, `ed8ff23c-48a0-4a8e-88ef-afb1a543a505`,
+`916662a7-1cc9-4d77-bb79-2f9425704baa`; base tickets:
+`dc3947a3-5340-494f-af41-5af3d0b5305b`, `62d5d409-9ae3-4f8f-99ce-791d806e1ebb`,
+`e00e9c76-2780-44b5-a0bc-ce7fcd73e947`.
+The overseer assigns root-cause work to a separate flake lane and releases this checkpoint to push:
+**HandoffInheritance render/scale: inherited baseline (reproduces on base `e42006ff8` under broad
+load; isolated 3×104 pass on base and head); tracked separately.** Later push gates continue to
+require an isolated handoff-suite pass. No assertion, budget or production composer path changed.
+
+The corrected compiler-warning audit compares complete ANSI-stripped diagnostic occurrence counts
+for all **16 touched Swift files**: base `62638293…` and checkpoint-4 `179f4f7a…` each report
+**four** in `AgentModeViewModel.swift`, **one** in `AgentRunMCPToolServiceSteerResumeTests.swift`,
+and **zero** in the other touched files. The new unused-`try?` result warning is absent after the
+explicit discard fix. The both-product incremental log adds no warnings; it is not treated as an
+independent full recompilation of every touched file.
+
+Final checkpoint-4 receipts after restoring the candidate source:
+- **118 passed, 0 failures** (104 handoff + 14 interaction runtime),
+  `6f4ef934-09d1-4929-8a6e-e0578400415b`; scale **6.46s**. The complete warning occurrence
+  audit again matches the base's four VM and one steer/resume-test diagnostics, with no additions.
+- Both products passed: `b5d86978-223c-426d-a770-e151be08df76`.
+- Full lint `35cb539e-8e56-4f2a-828e-539ae76cd98e` passed on the same Swift source.
+- Fresh index after final products: **1242/1360** wrong-way edges, **53/66** cycle components;
+  no baseline changes.
+- Broad-suite baseline failures are disclosed above; no full-suite, live-app, release or hosted-CI
+  success is claimed. This is a validated checkpoint, not completion of M9.2b.

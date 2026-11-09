@@ -1237,7 +1237,10 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
             let session = questionSession(in: scope)
             let command = try questionCommand(in: scope, for: session)
             let runtime = scope.interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
-            let question = runtimeQuestion()
+            let question = AgentAskUserInteraction(title: "Writer-fenced question", timeoutSeconds: 600, questions: [
+                AgentAskUserQuestion(id: "answer", question: "Which files?", options: [], allowsMultiple: false, allowsCustom: true),
+                AgentAskUserQuestion(id: "reason", question: "Why?", options: [], allowsMultiple: false, allowsCustom: true)
+            ])
             let installed = expectation(description: "question ready for writer refusal")
             let attachment = observeQuestionInstallation(scope: scope, session: session, installed: installed)
             let task = Task { try await runtime.askUser(session: session, interaction: question) }
@@ -1246,7 +1249,20 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
             }
             await fulfillment(of: [installed], timeout: 3)
             scope.presentation.detach(attachment)
+            let draft = AgentAskUserDraft(customResponse: "Sources only")
+            XCTAssertTrue(runtime.updateAskUserDraft(command: command, interactionID: question.id, questionID: "answer", draft: draft))
+            XCTAssertTrue(runtime.updateAskUserQuestionIndex(command: command, interactionID: question.id, index: 1))
+            XCTAssertTrue(runtime.noteAskUserCardActivity(command: command, interactionID: question.id))
+            let timeoutGeneration = session.pendingAskUserTimeoutGeneration
+            let timeoutStart = session.pendingAskUser?.timeoutStartedAt
+            XCTAssertFalse(runtime.updateAskUserDraft(command: command, interactionID: question.id, questionID: "missing", draft: draft))
+            XCTAssertFalse(runtime.updateAskUserQuestionIndex(command: command, interactionID: question.id, index: 2))
+            XCTAssertFalse(runtime.noteAskUserCardActivity(command: command, interactionID: UUID()))
             let other = writers.makeScope()
+            let foreignRuntime = other.interactions(routeID: 43, approvalStore: ApplyEditsApprovalStore())
+            XCTAssertFalse(foreignRuntime.updateAskUserDraft(command: command, interactionID: question.id, questionID: "answer", draft: .init(customResponse: "Foreign scope")))
+            XCTAssertFalse(foreignRuntime.updateAskUserQuestionIndex(command: command, interactionID: question.id, index: 0))
+            XCTAssertFalse(foreignRuntime.noteAskUserCardActivity(command: command, interactionID: question.id))
             if conflict {
                 let copy = AgentTabSession(tabID: UUID())
                 other.replaceSessions([copy.tabID: copy])
@@ -1259,6 +1275,13 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
                 scope.replaceSessions([:])
                 scope.replaceSessions([session.tabID: session])
             }
+            XCTAssertFalse(runtime.updateAskUserDraft(command: command, interactionID: question.id, questionID: "answer", draft: .init(customResponse: "Stale card")))
+            XCTAssertFalse(runtime.updateAskUserQuestionIndex(command: command, interactionID: question.id, index: 0))
+            XCTAssertFalse(runtime.noteAskUserCardActivity(command: command, interactionID: question.id))
+            XCTAssertEqual(session.pendingAskUser?.draftsByQuestionID["answer"], draft)
+            XCTAssertEqual(session.pendingAskUser?.currentQuestionIndex, 1)
+            XCTAssertEqual(session.pendingAskUserTimeoutGeneration, timeoutGeneration)
+            XCTAssertEqual(session.pendingAskUser?.timeoutStartedAt, timeoutStart)
             XCTAssertFalse(runtime.skipAskUser(command: command, interactionID: question.id))
             let submitted = try runtime.submitAskUserResponse(command: command, interactionID: question.id, draftsByQuestionID: [:])
             XCTAssertFalse(submitted)
@@ -1282,9 +1305,10 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         let task = Task { try await runtime.askUser(session: session, interaction: question) }
         await fulfillment(of: [installed], timeout: 3)
         scope.presentation.detach(attachment)
-        runtime.updateAskUserDraft(session: session, interactionID: question.id, questionID: "answer", draft: .init(customResponse: "Sources only"))
+        let command = try questionCommand(in: scope, for: session)
+        XCTAssertTrue(runtime.updateAskUserDraft(command: command, interactionID: question.id, questionID: "answer", draft: .init(customResponse: "Sources only")))
         let oldGeneration = session.pendingAskUserTimeoutGeneration
-        runtime.noteAskUserCardActivity(session: session, interactionID: question.id)
+        XCTAssertTrue(runtime.noteAskUserCardActivity(command: command, interactionID: question.id))
         let currentGeneration = session.pendingAskUserTimeoutGeneration
         XCTAssertNotEqual(oldGeneration, currentGeneration)
         runtime.expireAskUserTimeout(for: session, interactionID: question.id, generation: oldGeneration)

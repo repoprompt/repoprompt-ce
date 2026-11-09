@@ -2176,6 +2176,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     guard let self, sessions[session.tabID] === session else { return }
                     updateBindingsFromSession(session)
                 },
+                interaction: { [weak self] session in
+                    guard let self, sessions[session.tabID] === session, currentTabID == session.tabID else { return }
+                    syncRunInteractionUIState()
+                },
                 elapsedTime: { [weak self] session in
                     guard let self, sessions[session.tabID] === session else { return }
                     publishActiveAgentRunStartedAt(for: session.tabID, session: session)
@@ -19004,23 +19008,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             _ = try requireCurrentAgentSessionLifecycleTarget(lifecycleTarget, intent: .askUser)
         }
         return try await interactionRuntime.askUser(session: session, interaction: interaction)
-    }
-
-    func updateAskUserDraft(tabID: UUID, interactionID: UUID, questionID: String, draft: AgentAskUserDraft) {
-        guard let session = sessions[tabID] else { return }
-        interactionRuntime.updateAskUserDraft(session: session, interactionID: interactionID, questionID: questionID, draft: draft)
-    }
-
-    func updateAskUserQuestionIndex(tabID: UUID, interactionID: UUID, index: Int) {
-        guard let session = sessions[tabID] else { return }
-        interactionRuntime.updateAskUserQuestionIndex(session: session, interactionID: interactionID, index: index)
-    }
-
-    /// Card activity changes the existing runtime timeout, not presentation ownership.
-    func noteAskUserCardActivity(tabID: UUID, interactionID: UUID) {
-        guard let session = sessions[tabID],
-              interactionRuntime.noteAskUserCardActivity(session: session, interactionID: interactionID) else { return }
-        if tabID == currentTabID { syncRunInteractionUIState() }
     }
 
     @discardableResult

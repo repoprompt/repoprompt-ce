@@ -62,33 +62,43 @@ extension AgentSessionInteractionRuntime {
         }
     }
 
-    func updateAskUserDraft(session: AgentTabSession, interactionID: UUID, questionID: String, draft: AgentAskUserDraft) {
-        guard owns(session), var pending = session.pendingAskUser,
+    @discardableResult
+    func updateAskUserDraft(command: AgentSessionRuntimeStore.Command, interactionID: UUID, questionID: String, draft: AgentAskUserDraft) -> Bool {
+        let session = command.writer.session
+        guard command.writer.scope === scope, command.isCurrent, session.askUserContinuation != nil,
+              var pending = session.pendingAskUser,
               pending.interaction.id == interactionID,
               pending.interaction.questions.contains(where: { $0.id == questionID }),
-              pending.draftsByQuestionID[questionID] != draft else { return }
+              pending.draftsByQuestionID[questionID] != draft else { return false }
         pending.draftsByQuestionID[questionID] = draft
         session.pendingAskUser = pending
         scope?.presentation.bindingChanged(session)
-    }
-
-    func updateAskUserQuestionIndex(session: AgentTabSession, interactionID: UUID, index: Int) {
-        guard owns(session), var pending = session.pendingAskUser,
-              pending.interaction.id == interactionID,
-              pending.interaction.questions.indices.contains(index), pending.currentQuestionIndex != index else { return }
-        pending.currentQuestionIndex = index
-        session.pendingAskUser = pending
-        scope?.presentation.bindingChanged(session)
+        return true
     }
 
     @discardableResult
-    func noteAskUserCardActivity(session: AgentTabSession, interactionID: UUID) -> Bool {
-        guard owns(session), let pending = session.pendingAskUser,
+    func updateAskUserQuestionIndex(command: AgentSessionRuntimeStore.Command, interactionID: UUID, index: Int) -> Bool {
+        let session = command.writer.session
+        guard command.writer.scope === scope, command.isCurrent, session.askUserContinuation != nil,
+              var pending = session.pendingAskUser,
+              pending.interaction.id == interactionID,
+              pending.interaction.questions.indices.contains(index), pending.currentQuestionIndex != index else { return false }
+        pending.currentQuestionIndex = index
+        session.pendingAskUser = pending
+        scope?.presentation.bindingChanged(session)
+        return true
+    }
+
+    @discardableResult
+    func noteAskUserCardActivity(command: AgentSessionRuntimeStore.Command, interactionID: UUID) -> Bool {
+        let session = command.writer.session
+        guard command.writer.scope === scope, command.isCurrent, let pending = session.pendingAskUser,
               pending.interaction.id == interactionID, session.askUserContinuation != nil else { return false }
         schedulePendingAskUserTimeout(
             for: session, interactionID: interactionID,
             timeoutSeconds: pending.interaction.timeoutSeconds, startedAt: Date()
         )
+        scope?.presentation.interactionChanged(session)
         return true
     }
 

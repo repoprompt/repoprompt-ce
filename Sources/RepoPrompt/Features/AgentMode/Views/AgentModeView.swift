@@ -2504,33 +2504,33 @@ struct AgentModeChatDetailView: View {
             AgentAskUserWizardCard(
                 pending: pendingAskUser,
                 onDraftChange: { questionID, draft in
-                    guard let tabID = currentTabID else { return }
-                    agentModeVM.updateAskUserDraft(
-                        tabID: tabID,
+                    guard let command else { return }
+                    runtime.updateAskUserDraft(
+                        command: command,
                         interactionID: pendingAskUser.interaction.id,
                         questionID: questionID,
                         draft: draft
                     )
                 },
                 onQuestionIndexChange: { index in
-                    guard let tabID = currentTabID else { return }
-                    agentModeVM.updateAskUserQuestionIndex(
-                        tabID: tabID,
+                    guard let command else { return }
+                    runtime.updateAskUserQuestionIndex(
+                        command: command,
                         interactionID: pendingAskUser.interaction.id,
                         index: index
                     )
                 },
                 onSubmit: {
                     guard let command else { return }
-                    try? runtime.resolveAskUserResponse(command: command, interactionID: pendingAskUser.interaction.id, skipAll: false)
+                    _ = try? runtime.resolveAskUserResponse(command: command, interactionID: pendingAskUser.interaction.id, skipAll: false)
                 },
                 onSkipAll: {
                     guard let command else { return }
                     runtime.skipAskUser(command: command, interactionID: pendingAskUser.interaction.id)
                 },
                 onUserActivity: {
-                    guard let tabID = currentTabID else { return }
-                    agentModeVM.noteAskUserCardActivity(tabID: tabID, interactionID: pendingAskUser.interaction.id)
+                    guard let command else { return }
+                    runtime.noteAskUserCardActivity(command: command, interactionID: pendingAskUser.interaction.id)
                 },
                 pendingFocusStore: runInteractionUI,
                 pendingFocusTabID: currentTabID
