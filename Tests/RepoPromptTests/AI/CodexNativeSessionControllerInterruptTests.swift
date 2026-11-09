@@ -235,7 +235,7 @@ final class CodexAppServerFramingTests: XCTestCase {
             )
             await controller.test_installThreadState(threadID: "thread", authoritativeTurnID: "turn", routingTurnID: "turn")
             let events = controller.events
-            await controller.test_ensureInboundStreamsStarted()
+            try await controller.test_ensureInboundStreamsStarted()
             let generation = await client.debugTransportGeneration()
             // Fake-server contract, not a real Codex run: honor the advertised exact-method opt-out
             // before writing notifications, retaining canonical text, exact usage and terminal state.

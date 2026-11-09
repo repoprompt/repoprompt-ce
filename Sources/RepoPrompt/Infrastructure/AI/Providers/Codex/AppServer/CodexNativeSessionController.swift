@@ -991,6 +991,20 @@ final class CodexNativeSessionController {
     private let eventsStream: AsyncStream<Event>
     /// Protected by `eventsContinuationLock`.
     private var lifecycleState: LifecycleState = .fresh
+    /// Protected by `eventsContinuationLock`. All retirement callers join this one teardown.
+    private var shutdownTask: Task<Void, Never>?
+
+    #if DEBUG
+        enum ShutdownPhase: Equatable {
+            case joined(isOwner: Bool)
+            case waitingForEventDrain
+            case eventStateCleared
+            case finished
+        }
+
+        /// Configure before starting controller work; observations never run under the state lock.
+        var test_shutdownObserver: (@Sendable (ShutdownPhase) -> Void)?
+    #endif
     /// One-shot flag preventing double-emission of transport-closed events when both
     /// notification and serverRequest streams end. Protected by `eventsContinuationLock`.
     /// Never reset — this controller is single-use (coordinator creates a fresh instance on reconnect).
@@ -1581,7 +1595,9 @@ final class CodexNativeSessionController {
         let client = client
         let shouldClearExpectedPID = expectedMCPClientName != nil
         let shouldStopClient = clientShutdownBehavior == .stopOnShutdown
-        if shouldClearExpectedPID || shouldStopClient {
+        // An explicit shutdown keeps self alive until its client cleanup has completed.
+        // Only controllers never handed to that owner need the deinit fallback.
+        if shutdownTask == nil, shouldClearExpectedPID || shouldStopClient {
             Task.detached {
                 if shouldClearExpectedPID {
                     await client.clearExpectedAgentPIDRegistration()
@@ -2856,28 +2872,54 @@ final class CodexNativeSessionController {
     }
 
     func shutdown() async {
-        revokeComputerUseAutoApproval()
-        withEventsStateLock {
+        let claim = withEventsStateLock { () -> (task: Task<Void, Never>, isOwner: Bool) in
+            if let shutdownTask { return (shutdownTask, false) }
+            computerUseAutoApprovalRevoked = true
             if lifecycleState != .terminated {
                 lifecycleState = .shuttingDown
             }
+            let task = Task { [self] in await performShutdown() }
+            shutdownTask = task
+            return (task, true)
         }
-        retireAllInboundStreamTasks()
-        assistantEmittedTextByTurnID.removeAll(keepingCapacity: false)
-        completedCanonicalItemScopes.removeAll(keepingCapacity: false)
-        completedCanonicalItemScopeOrder.removeAll(keepingCapacity: false)
-        canonicalAssistantCompletionTurnIDs.removeAll(keepingCapacity: false)
-        canonicalAssistantCompletionTurnOrder.removeAll(keepingCapacity: false)
-        canonicalContextCompactionTurnIDs.removeAll(keepingCapacity: false)
-        canonicalContextCompactionTurnOrder.removeAll(keepingCapacity: false)
-        deprecatedContextCompactionTurnIDs.removeAll(keepingCapacity: false)
-        deprecatedContextCompactionTurnOrder.removeAll(keepingCapacity: false)
-        pendingTurnFailuresByScope.removeAll(keepingCapacity: false)
-        pendingTurnFailureScopeOrder.removeAll(keepingCapacity: false)
-        fileChangeStateByItemID.removeAll(keepingCapacity: false)
-        terminalFileChangeItemIDs.removeAll(keepingCapacity: false)
-        commandExecutionMirrorStateByItemID.removeAll(keepingCapacity: false)
+        #if DEBUG
+            test_shutdownObserver?(.joined(isOwner: claim.isOwner))
+        #endif
+        // A cancelled retirement caller must still join the original cleanup, not start another.
+        await claim.task.value
+    }
+
+    private func performShutdown() async {
+        // Close delivery before waiting for in-flight handlers; they may still attempt to emit.
         finishEventsStreamIfNeeded()
+        // Do not nest these mutexes: recovery can acquire installation from an event handler.
+        // Closing lifecycle admission above prevents a later installation after this drain.
+        try? await inboundStreamInstallationMutex.withLockIgnoringCancellation {
+            retireAllInboundStreamTasks()
+        }
+        #if DEBUG
+            test_shutdownObserver?(.waitingForEventDrain)
+        #endif
+        // Cancelling a stream task alone does not stop its in-flight handler.
+        try? await eventHandlingMutex.withLockIgnoringCancellation {
+            assistantEmittedTextByTurnID.removeAll(keepingCapacity: false)
+            completedCanonicalItemScopes.removeAll(keepingCapacity: false)
+            completedCanonicalItemScopeOrder.removeAll(keepingCapacity: false)
+            canonicalAssistantCompletionTurnIDs.removeAll(keepingCapacity: false)
+            canonicalAssistantCompletionTurnOrder.removeAll(keepingCapacity: false)
+            canonicalContextCompactionTurnIDs.removeAll(keepingCapacity: false)
+            canonicalContextCompactionTurnOrder.removeAll(keepingCapacity: false)
+            deprecatedContextCompactionTurnIDs.removeAll(keepingCapacity: false)
+            deprecatedContextCompactionTurnOrder.removeAll(keepingCapacity: false)
+            pendingTurnFailuresByScope.removeAll(keepingCapacity: false)
+            pendingTurnFailureScopeOrder.removeAll(keepingCapacity: false)
+            fileChangeStateByItemID.removeAll(keepingCapacity: false)
+            terminalFileChangeItemIDs.removeAll(keepingCapacity: false)
+            commandExecutionMirrorStateByItemID.removeAll(keepingCapacity: false)
+        }
+        #if DEBUG
+            test_shutdownObserver?(.eventStateCleared)
+        #endif
         if expectedMCPClientName != nil {
             await client.clearExpectedAgentPIDRegistration()
         }
@@ -2895,6 +2937,9 @@ final class CodexNativeSessionController {
                 )
             #endif
         }
+        #if DEBUG
+            test_shutdownObserver?(.finished)
+        #endif
     }
 
     private func restoreThreadSnapshot(_ snapshot: ThreadSnapshot) {
@@ -3303,14 +3348,15 @@ final class CodexNativeSessionController {
         }
     }
 
-    private func shouldInstallInboundStreamTask() -> Bool {
-        withEventsStateLock {
-            switch lifecycleState {
-            case .binding, .active:
-                true
-            case .fresh, .shuttingDown, .terminated:
-                false
-            }
+    private func shouldInstallInboundStreamTask() throws -> Bool {
+        switch withEventsStateLock({ lifecycleState }) {
+        case .binding, .active:
+            return true
+        case .fresh:
+            return false
+        case .shuttingDown, .terminated:
+            // Recovery must not interpret a retired controller's refusal as successful setup.
+            throw CodexSessionControllerError.invalidLifecycleState("shutting down or terminated")
         }
     }
 
@@ -3345,6 +3391,7 @@ final class CodexNativeSessionController {
         acquireSubscription: () async throws -> (stream: AsyncStream<Element>, transportGeneration: UInt64),
         handleElement: @escaping (CodexNativeSessionController, Element) async -> Void
     ) async throws {
+        guard try shouldInstallInboundStreamTask() else { return }
         guard let healthyGeneration = await client.healthyTransportGeneration() else {
             retireInboundStreamTask(kind: kind)
             throw CodexAppServerClient.ClientError.processNotRunning
@@ -3358,7 +3405,7 @@ final class CodexNativeSessionController {
         guard await client.healthyTransportGeneration() == subscription.transportGeneration else {
             throw CodexAppServerClient.ClientError.processNotRunning
         }
-        guard shouldInstallInboundStreamTask() else { return }
+        guard try shouldInstallInboundStreamTask() else { return }
         let token = UUID()
         let startGate = CodexInboundStreamTaskStartGate()
         let task = Task { [weak self] in
@@ -4999,6 +5046,10 @@ final class CodexNativeSessionController {
     }
 
     #if DEBUG
+        func test_withEventHandlingLock(_ body: () async -> Void) async {
+            try? await eventHandlingMutex.withLockIgnoringCancellation { await body() }
+        }
+
         func test_markHookTrustTransportRetiring(generation: UInt64) {
             markHookTrustTransportRetiring(generation: generation)
         }
@@ -5007,8 +5058,8 @@ final class CodexNativeSessionController {
             shouldSuppressHookTrustStreamEnd(transportGeneration: transportGeneration)
         }
 
-        func test_ensureInboundStreamsStarted() async {
-            await ensureInboundStreamsStarted()
+        func test_ensureInboundStreamsStarted() async throws {
+            try await ensureInboundStreamsStartedForRecovery()
         }
 
         func test_inboundStreamTransportGenerations() -> (notifications: UInt64?, serverRequests: UInt64?) {
