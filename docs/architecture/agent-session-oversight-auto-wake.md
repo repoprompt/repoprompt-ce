@@ -1090,6 +1090,32 @@ stale or out-of-order receipt cannot clear a successor occurrence, an unaccepted
 occurrence pending, and a target may request attention again after the previous occurrence is
 receipted.
 
+### Observed user waits use the same attention owner
+
+The reducer also offers an attention occurrence when an established lane enters a deterministic user
+wait. Its immutable reason is `needsUser`; explicit requests retain `requestedAttention`. Public
+`pendingInteractionKind` supplies pending approval, permission, review, question and input evidence,
+including on links without Manage. Hook review and a live instruction wait require one supplementary
+bit in the existing private `runFacts` publication. The instruction predicate requires the waiting run
+state, continuation and wait ID together. A waiting status or prompt string alone is insufficient.
+The reducer extracts that bit before processing counters-only quiet proof, so ordinary status
+coalescing, fingerprints and receipts keep their existing behavior. Unknown proof stays unknown.
+
+First observations, restored lanes and recovery of unknown supplementary evidence baseline silently.
+A public pending edge works even without private facts. Replacing one wait with another without a
+sampled gap does not create another occurrence. Each observer has its own occurrence under its exact
+link, admission gates and receipt. Each reason uses the existing exception to routine selection,
+exact-lane snooze and interval admission. These settings retain their saved values. Inspection and
+prompt responses require their existing capabilities and user instructions.
+
+The same first-wins slot and sixteen-occurrence capacity apply. A later explicit request coalesced
+behind `needsUser` does not convert its reason. Acceptance or an observed wait exit removes that item;
+a pending explicit request survives wait exit. Capacity misses are not retried when space opens, and
+unobserved exit/re-entry is not reconstructed. The renderer uses `<needs_user>` without `requested_at`
+and explains the wait at `observed_at`, rather than claiming the lane requested attention. A frozen
+claim may lag resolution until retirement is published. Physical acquisition checks the exact
+rendered occurrence against the published queue. Provider acceptance uses the existing receipt rules.
+
 `set_waiting_on` is related context, not part of the attention transaction. It is optional,
 self-scoped and session-global, shared with every linked observer, mutable, and published non-atomically
 through a separate state path. It is never a prerequisite for `request_attention`, is never auto-set or

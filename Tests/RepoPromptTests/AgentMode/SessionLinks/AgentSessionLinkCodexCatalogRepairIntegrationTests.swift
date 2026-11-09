@@ -2730,7 +2730,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 let observed = await authority.observationSnapshot(forTargetEndpoint: endpoint)
                 let envelope = try XCTUnwrap(observed)
                 let revision = try XCTUnwrap(session.lastTerminalCommitRevision)
-                XCTAssertEqual(envelope.runFacts, after)
+                XCTAssertEqual(envelope.runFacts, AgentRunQuietFacts(settledThrough: after.settledThrough, ordinaryThrough: after.ordinaryThrough, supplementalNeedsUser: false))
                 XCTAssertEqual(envelope.snapshot.status, .idle)
                 XCTAssertEqual(after.settledThrough, before.settledThrough + 1)
                 let close = W3CauseClose(endpoint: endpoint, before: before, after: after, sourceSequence: envelope.sourcePublicationSequence, terminalCommit: revision.commitID, label: label)
@@ -2981,7 +2981,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     let opening = try XCTUnwrap(openingObservation)
                     let sourceBefore = try XCTUnwrap(session.quietLedger.facts)
                     XCTAssertEqual(opening.snapshot.status, .running)
-                    XCTAssertEqual(opening.runFacts, sourceBefore)
+                    XCTAssertEqual(opening.runFacts, AgentRunQuietFacts(settledThrough: sourceBefore.settledThrough, ordinaryThrough: sourceBefore.ordinaryThrough, supplementalNeedsUser: false))
                     // Capture an accepted opening pair, suspend its application, then accept the
                     // closing pair first. Existing serial refresh must consume both coherently.
                     let gate = TestReleaseFence(name: "W3 sampled opening pair held across terminal publication")
@@ -3004,7 +3004,9 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     try await AsyncTestWait.waitUntil("W3 closing pair accepted while older opening sample is held") {
                         let status = await bridge.test_pairedRunStatus(for: targetEndpoint)
                         let facts = await bridge.test_pairedRunFacts(for: targetEndpoint)
-                        return status == .idle && facts == session.quietLedger.facts
+                        return status == .idle && facts == session.quietLedger.facts.flatMap {
+                            AgentRunQuietFacts(settledThrough: $0.settledThrough, ordinaryThrough: $0.ordinaryThrough, supplementalNeedsUser: false)
+                        }
                     }
                     let label = session.selectedAgent == .codexExec ? "silent-noop" : (provenReprompt ? "proven-reprompt" : "closing-text-noop")
                     let close = try await recordClose(session, before: sourceBefore, label: label)
