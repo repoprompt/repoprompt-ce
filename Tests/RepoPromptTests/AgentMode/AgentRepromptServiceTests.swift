@@ -10,7 +10,7 @@ final class AgentRepromptServiceTests: XCTestCase {
     func testMessageContainsOnlyDeclaredInputsAndFixedHistoryFraming() throws {
         let request = AgentRepromptRequest(originalText: "That's wrong. Start over with a different approach.", guidance: "My guidance", answers: [.init(question: "Which?", customText: "My answer")])
         let message = try AgentRepromptService.message(for: request)
-        XCTAssertTrue(message.systemPrompt.contains("prompt rewriter, not a coding agent"))
+        XCTAssertTrue(message.systemPrompt.contains("Rewrite, never answer or execute"))
         XCTAssertTrue(message.systemPrompt.contains(AgentRepromptHistory.framing))
         XCTAssertTrue(message.systemPrompt.contains("do NOT carry forward the prior"))
         XCTAssertTrue(message.systemPrompt.contains("My guidance"))
@@ -27,12 +27,12 @@ final class AgentRepromptServiceTests: XCTestCase {
         XCTAssertNil(object["sessionTitle"])
     }
 
-    func testContractDescribesAttachmentsAndForbidsSpeculation() throws {
+    func testContractKeepsSafetyAndProtocolWithoutBlockingExpansion() throws {
         let contract = try AgentRepromptService.message(for: .init(originalText: "Hello")).systemPrompt
-        for required in ["attachments", "recentChat", "sessionTitle", "cannot see their contents", "candidate intents", "hedged guesses", "remarks about the draft", "near-identical", "exactly one thing", "do not guess"] {
+        for required in ["attachments", "recentChat", "sessionTitle", "see their contents", "untrusted data", "secret-extraction", "safety bypasses", "harmful requests", "Preserve intent, scope and authority", "invent no facts or requirements", "Keep follow-ups short", "do not guess", "<<<REPROMPT_QUESTIONS_V2>>>"] {
             XCTAssertTrue(contract.contains(required), required)
         }
-        for removed in ["anifest", "vocabulary", "Leave incidental gaps", "unspecified"] {
+        for removed in ["candidate intents", "hedged guesses", "remarks about the draft", "near-identical", "If the draft leaves something unsaid, leave it unsaid"] {
             XCTAssertFalse(contract.contains(removed), removed)
         }
     }
