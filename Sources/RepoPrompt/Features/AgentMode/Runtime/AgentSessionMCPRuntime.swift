@@ -1464,9 +1464,11 @@ final class AgentSessionMCPRuntime {
     ) async -> Bool {
         guard let scope, scope.sessions[session.tabID] === session,
               session.mcpControlContext == expectedContext,
-              // Preserve the old scope-local control ambiguity veto until context identity
-              // routing replaces it. A copied context must not release the original's resources.
+              // Local ambiguity remains a veto. Across scopes, use structural installation
+              // ownership rather than writer uniqueness: conflicts must not let a copied
+              // receipt remove the actual holder's registration or approval override.
               scope.sessions.values.count(where: { $0.mcpControlContext?.sessionID == expectedContext.sessionID }) == 1,
+              !scope.hasOtherControlResourceHolder(expectedContext, excluding: session),
               !requireInactive || !session.runState.isActive else { return false }
         mcpRemoveAgentRunOracleReviewContexts(sessionID: expectedContext.sessionID)
         codexCoordinator?.handleMCPControlReset(

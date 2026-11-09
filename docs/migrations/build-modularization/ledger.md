@@ -6055,3 +6055,43 @@ pinned scoped formatting changed zero files. The failed broad run is not a quali
 No local full-suite, live-app, release or hosted-CI success is claimed. No CI logs were read.
 After the validated M9.2a push and PR update, this lane stops feature work; only CI failures
 reported by the overseer are assigned to it. M9.2b belongs to the fresh follow-on session.
+
+### M9.2b checkpoint 1 — copied control resources and provisional unwind (2026-11-09)
+
+The copied-resource portion of the MCP inventory is implemented. Cleanup recognizes the
+structural installation holder in the existing scope/tab/incarnation index, independently of
+unique-writer admission. A copied registration or approval receipt in another scope cannot
+release the holder's resources, including under a deliberately corrupted conflicting claim.
+No parallel registry or lifecycle manager was added; the scope-local ambiguity veto remains.
+
+Failed activation now unwinds its exact provisional context on the original object after
+removal, replacement or rebinding. Payload restoration is limited to the original restoration
+token. The former same-tab-occupant-as-successor heuristic is retired: a copied occupant does
+not own the abandoned registration. A progressed installation or freshly registered successor
+keeps its resources. Causal coverage exercises registration and approval-only copies, raw
+conflicts, removal, real binding transition, copied replacement, registration recovery and an
+actual nested successor activation, including resource release and payload-setting assertions.
+
+Validation for this checkpoint:
+- Focused `AgentSessionMCPRuntimeTests`, `AgentSessionRuntimeStoreTests` and
+  `AgentRunMCPToolServiceSteerResumeTests`: **62 passed, 0 failures**, Conductor
+  `66c4764a-ce7b-46aa-89be-db81ed27eacc`. The earlier 61-pass/1-failure run exposed a new
+  fixture that reinstalled the same binding without advancing its restoration generation;
+  it now performs a real binding transition and retains the preservation assertion.
+- Both products passed `539c31b8-ce1f-42d6-af65-e743c32efb3d`.
+- Full lint passed `e0ea1090-c1cd-4a1f-8a49-c2617055c510`; final test-only edits also passed
+  pinned SwiftFormat 0.61.1 and scoped strict SwiftLint.
+- Fresh index: **1242/1360** wrong-way file edges, **53/66** largest-cycle components;
+  no baseline changes. An index query during the running test correctly refused freshness;
+  the post-completion check above passed.
+- Actual cold compile and final incremental logs contain **zero warning occurrences in each
+  touched Swift file** (not merely zero new warning signatures). Product logs were checked too.
+- One Oracle review completed; settings and successor assertions were strengthened afterward.
+  No full-suite, live-app, release or hosted-CI success is claimed; no CI logs were read.
+
+**Still open:** every other M9.2b inventory group above, including remaining MCP metadata/tool
+selection and VM adapter retirement. The review also identified a pre-existing first-setup-await
+progression concern: an epoch/registration can advance before permission setup finishes, retaining
+a partially configured control despite the failed activation response. Second-boundary progression
+is covered here; first-boundary completion/unwind remains in the control-routing inventory.
+M9.3 saved-target composition and M9.4 presentation/handoff/drain remain out of scope.

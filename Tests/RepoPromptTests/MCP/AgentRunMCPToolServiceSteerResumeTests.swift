@@ -1157,6 +1157,117 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         }
     }
 
+    func testFailedActivationUnwindsExactReceiptButPreservesProgressedInstallation() async throws {
+        for drift in ["removed", "rebound", "copiedSlot", "recoveredRegistration", "successorActivation"] {
+            let window = try await makeWindow()
+            let viewModel = window.agentModeViewModel
+            let sessionID = UUID()
+            let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+            let command = try XCTUnwrap(viewModel.runtimeCommand(sessionID: sessionID))
+            let scope = command.writer.scope
+            let runtime = scope.mcp
+            try await AsyncTestWait.waitUntil("approval subscription initialized before rollback witness") {
+                await MainActor.run { session.applyEditsApprovalSubscriptionID != nil }
+            }
+            // An isolated approval namespace lets this test witness the actual resource receipt
+            // without an unrelated UI subscription projecting its own store over the local object.
+            let approvals = ApplyEditsApprovalStore()
+            let address = viewModel.applyEditsScope(for: session.tabID)
+            await approvals.setAutoEditEnabled(false, for: address, updateGlobalDefault: false)
+            session.autoEditEnabled = false
+            let priorOrigin = session.isMCPOriginated
+            let priorProfile = session.permissionProfile
+            let resources = AgentSessionMCPRuntime.ControlActivationResources(
+                approvalStore: approvals, approvalScope: address,
+                providerBindings: viewModel.providerBindingService, perfRecorder: viewModel.perfRecorder
+            )
+            var setupCount = 0
+            var provisional: AgentMCPControlContext?
+            var replacement: AgentTabSession?
+            runtime.test_afterMCPControlSetupAwait = { current in
+                setupCount += 1
+                guard setupCount == 2, let context = current.mcpControlContext else { return }
+                provisional = context
+                let applied = await approvals.autoEditEnabled(for: address)
+                XCTAssertTrue(applied)
+                switch drift {
+                case "removed":
+                    scope.replaceSessions(scope.sessions.filter { $0.key != session.tabID })
+                case "rebound":
+                    current.beginPersistentBindingTransition()
+                    current.installPersistentSessionBinding(context.writerIdentity.restoration.bindingIdentity)
+                    XCTAssertNotEqual(current.currentRestorationBindingToken, context.writerIdentity.restoration)
+                    current.autoEditEnabled = true
+                    current.waitingPrompt = "Rebound payload"
+                case "copiedSlot":
+                    let copy = AgentTabSession(tabID: current.tabID)
+                    copy.installPersistentSessionBinding(context.writerIdentity.restoration.bindingIdentity)
+                    copy.mcpControlContext = context
+                    var sessions = scope.sessions
+                    sessions[current.tabID] = copy
+                    scope.replaceSessions(sessions)
+                    replacement = copy
+                case "recoveredRegistration":
+                    let recovered = await AgentRunSessionStore.register(sessionID: sessionID)
+                    current.mcpControlContext = context.replacingRegistration(recovered)
+                default:
+                    do {
+                        _ = try await runtime.activateControlContext(
+                            command: command, activationID: UUID(), originatingConnectionID: nil,
+                            taskLabelKind: nil, startPending: true, markSessionAsMCPOriginated: true,
+                            requireInactiveRunState: true, resources: resources, revalidateAdmission: { _ in }
+                        )
+                    } catch { XCTFail("Successor activation failed: \(error)") }
+                }
+            }
+            defer { runtime.test_afterMCPControlSetupAwait = nil }
+            do {
+                _ = try await runtime.activateControlContext(
+                    command: command, activationID: UUID(), originatingConnectionID: nil,
+                    taskLabelKind: nil, startPending: true, markSessionAsMCPOriginated: true,
+                    requireInactiveRunState: true, resources: resources, revalidateAdmission: { _ in }
+                )
+                XCTFail("Changed installation must refuse publication: \(drift)")
+            } catch { XCTAssertTrue(error is MCPError) }
+            runtime.test_afterMCPControlSetupAwait = nil
+            XCTAssertEqual(setupCount, drift == "successorActivation" ? 4 : 2)
+            let original = try XCTUnwrap(provisional)
+            let retainedOverride = await approvals.autoEditEnabled(for: address)
+            let registration = await AgentRunSessionStore.currentRegistration(for: sessionID)
+            if drift == "recoveredRegistration" || drift == "successorActivation" {
+                let progressed = try XCTUnwrap(session.mcpControlContext)
+                XCTAssertNotEqual(progressed.registration, original.registration)
+                XCTAssertEqual(registration, progressed.registration)
+                XCTAssertTrue(retainedOverride, "Failed setup cannot release a progressed installation's override")
+                await runtime.deactivateControlContext(
+                    session: session, expectedContext: progressed, approvalStore: approvals, cleanupRegistration: true
+                )
+                let restored = await approvals.autoEditEnabled(for: address)
+                XCTAssertFalse(restored)
+                let released = await AgentRunSessionStore.currentRegistration(for: sessionID)
+                XCTAssertNil(released)
+            } else {
+                XCTAssertNil(session.mcpControlContext, "The original object must not retain its failed provisional receipt")
+                XCTAssertFalse(session.mcpFollowUpRunPending)
+                XCTAssertNil(registration, "A copied tab occupant is not a registration holder")
+                XCTAssertFalse(retainedOverride)
+                if drift == "copiedSlot" {
+                    XCTAssertEqual(replacement?.mcpControlContext, original)
+                    XCTAssertFalse(try XCTUnwrap(replacement).isMCPOriginated)
+                    XCTAssertEqual(replacement?.permissionProfile, .userConfigured)
+                }
+                if drift == "rebound" {
+                    XCTAssertTrue(session.autoEditEnabled, "Rollback does not directly restore predecessor payload settings; approval projection is separate")
+                    XCTAssertEqual(session.waitingPrompt, "Rebound payload")
+                } else {
+                    XCTAssertEqual(session.isMCPOriginated, priorOrigin)
+                    XCTAssertEqual(session.permissionProfile, priorProfile)
+                    XCTAssertFalse(session.autoEditEnabled)
+                }
+            }
+        }
+    }
+
     func testLateRealGrantRefusesInstallationAndSurvivesEligibilityAudit() async throws {
         let window = try await makeWindow()
         let viewModel = window.agentModeViewModel

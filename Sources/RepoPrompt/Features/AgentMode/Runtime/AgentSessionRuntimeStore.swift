@@ -246,6 +246,25 @@ final class AgentSessionRuntimeStore {
             return writer.ownsPersistentClaim ? writer : nil
         }
 
+        /// Resource cleanup must recognize the structural installation holder even when raw
+        /// conflicting claims make every writer unavailable. This is not command admission.
+        /// Copies of a context do not become holders merely by naming the same receipts.
+        func hasOtherControlResourceHolder(_ context: AgentMCPControlContext, excluding session: AgentTabSession) -> Bool {
+            store.scopes.values.contains { reference in
+                guard let owner = reference.value else { return false }
+                return owner.sessions.values.contains { candidate in
+                    guard owner !== self || candidate !== session,
+                          let installed = candidate.mcpControlContext,
+                          installed.writerIdentity.scopeID == owner.id,
+                          installed.writerIdentity.restoration.bindingIdentity.tabID == candidate.tabID,
+                          owner.liveClaimByTabID[candidate.tabID]?.incarnationID == installed.writerIdentity.incarnationID
+                    else { return false }
+                    return installed.registration == context.registration
+                        || (context.autoEditOverride != nil && installed.autoEditOverride == context.autoEditOverride)
+                }
+            }
+        }
+
         let presentation = AgentSessionPresentationRuntime()
         let usage = AgentSessionUsageRuntime()
         lazy var turnTiming = AgentSessionTurnTimingRuntime(presentation: presentation)

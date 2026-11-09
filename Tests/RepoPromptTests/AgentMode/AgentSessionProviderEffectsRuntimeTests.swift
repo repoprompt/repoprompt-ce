@@ -575,6 +575,60 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
         XCTAssertTrue(ordinaryStart, "A removed stale context must not permanently block ordinary starts")
     }
 
+    func testCrossScopeCopiedControlCannotReleaseStructuralHolderDuringConflict() async throws {
+        for (conflictingClaim, sharesRegistration) in [(false, true), (true, true), (false, false), (true, false)] {
+            let store = AgentSessionRuntimeStore()
+            let approvals = ApplyEditsApprovalStore()
+            let address = ApplyEditsApprovalScope(windowID: 42, tabID: UUID())
+            await approvals.setAutoEditEnabled(false, for: address, updateGlobalDefault: false)
+            let override = await approvals.prepareAutoEditOverride(for: address)
+            let applied = await approvals.applyAutoEditOverride(override)
+            XCTAssertTrue(applied)
+            let f = try await makeFixture(store: store, autoEditOverride: override)
+            let context = try XCTUnwrap(f.session.mcpControlContext)
+            let otherRegistration = await AgentRunSessionStore.register(sessionID: UUID())
+            addTeardownBlock { await AgentRunSessionStore.cleanup(registration: otherRegistration) }
+            let copiedContext = sharesRegistration ? context : context.replacingRegistration(otherRegistration)
+            let original = try XCTUnwrap(f.scope.mcp.controlledWriter(sessionID: f.sessionID))
+            let other = store.makeScope()
+            let copy = AgentTabSession(tabID: UUID())
+            copy.mcpControlContext = copiedContext
+            other.replaceSessions([copy.tabID: copy])
+            if conflictingClaim {
+                XCTAssertEqual(other.bindingRejection(f.sessionID, on: copy), .conflictingWriter)
+                // Bypass admission only to model corrupt competing claims. Production must refuse this.
+                copy.installPersistentSessionBinding(.init(
+                    tabID: copy.tabID, sessionID: f.sessionID, workspaceID: original.identity.workspaceID
+                ))
+                guard case .conflicting = store.resolveWriter(sessionID: f.sessionID) else {
+                    return XCTFail("Expected raw conflict")
+                }
+                XCTAssertFalse(original.ownsPersistentClaim)
+            }
+            let removedCopy = await other.mcp.deactivateControlContext(
+                session: copy, expectedContext: copiedContext, approvalStore: approvals, cleanupRegistration: true
+            )
+            XCTAssertFalse(removedCopy, "A copied context cannot release the structural holder's resources")
+            XCTAssertEqual(copy.mcpControlContext, copiedContext)
+            let protectedOverride = await approvals.autoEditEnabled(for: address)
+            XCTAssertTrue(protectedOverride, "Protection must cover approval receipts independently of registration equality")
+            let current = await AgentRunSessionStore.currentRegistration(for: f.sessionID)
+            XCTAssertEqual(current, f.registration)
+            XCTAssertEqual(f.session.mcpControlContext, context)
+
+            f.session.runState = .completed
+            let removedOwner = await f.scope.mcp.deactivateControlContext(
+                session: f.session, expectedContext: context, approvalStore: approvals, cleanupRegistration: true
+            )
+            XCTAssertTrue(removedOwner, "A raw conflict must not turn the copied receipt into a cleanup owner")
+            let released = await AgentRunSessionStore.currentRegistration(for: f.sessionID)
+            XCTAssertNil(released)
+            let restored = await approvals.autoEditEnabled(for: address)
+            XCTAssertFalse(restored)
+            XCTAssertEqual(copy.mcpControlContext, copiedContext)
+        }
+    }
+
     func testOriginControlLookupSurvivesRetirementAndBindingPreparationButNotNewWork() async throws {
         let f = try await makeFixture()
         let writer = try XCTUnwrap(f.scope.mcp.controlledWriter(sessionID: f.sessionID))
@@ -1038,8 +1092,10 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
         }
     }
 
-    private func makeFixture() async throws -> Fixture {
-        let fixture = try await Fixture.make()
+    private func makeFixture(
+        store: AgentSessionRuntimeStore? = nil, autoEditOverride: ApplyEditsApprovalStore.AutoEditOverride? = nil
+    ) async throws -> Fixture {
+        let fixture = try await Fixture.make(store: store ?? AgentSessionRuntimeStore(), autoEditOverride: autoEditOverride)
         let registration = fixture.registration
         addTeardownBlock { await AgentRunSessionStore.cleanup(registration: registration) }
         return fixture
@@ -1053,8 +1109,8 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
         let registration: AgentRunSessionStore.Registration
         let epoch: AgentRunTurnEpoch
 
-        static func make() async throws -> Fixture {
-            let scope = AgentSessionRuntimeStore().makeScope()
+        static func make(store: AgentSessionRuntimeStore, autoEditOverride: ApplyEditsApprovalStore.AutoEditOverride?) async throws -> Fixture {
+            let scope = store.makeScope()
             let session = AgentTabSession(tabID: UUID())
             let sessionID = UUID(), activationID = UUID()
             session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: UUID()))
@@ -1067,7 +1123,7 @@ final class AgentSessionMCPRuntimeTests: XCTestCase {
             guard case let .accepted(epoch) = await AgentRunSessionStore.beginEpoch(registration: registration, activationID: activationID, expectedCurrentEpoch: nil, transitionKind: .initial) else {
                 throw NSError(domain: "MCP runtime fixture epoch", code: 1)
             }
-            session.mcpControlContext = try .init(sessionID: sessionID, activationID: activationID, writerIdentity: controlWriterIdentity(for: session, scope: scope), registration: registration, currentEpoch: epoch, preparedEpoch: nil, pendingEpochTransition: nil, originatingConnectionID: nil, interactionTransport: .mcp(sessionID: sessionID, originatingConnectionID: nil), suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: .pair, autoEditOverride: nil)
+            session.mcpControlContext = try .init(sessionID: sessionID, activationID: activationID, writerIdentity: controlWriterIdentity(for: session, scope: scope), registration: registration, currentEpoch: epoch, preparedEpoch: nil, pendingEpochTransition: nil, originatingConnectionID: nil, interactionTransport: .mcp(sessionID: sessionID, originatingConnectionID: nil), suppressUserNotifications: true, forceAutoEditEnabled: autoEditOverride != nil, autoEditEnabledBeforeOverride: false, taskLabelKind: .pair, autoEditOverride: autoEditOverride)
             return .init(scope: scope, session: session, sessionID: sessionID, registration: registration, epoch: epoch)
         }
 
