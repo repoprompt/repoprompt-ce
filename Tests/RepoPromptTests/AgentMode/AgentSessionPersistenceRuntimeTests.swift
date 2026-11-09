@@ -188,6 +188,9 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
         let f = try Fixture(fresh: true)
         defer { f.cleanUp() }
         let handle = try XCTUnwrap(f.creation)
+        let prematureFlush = await f.scope.persistence.flushSaveRequired(for: f.session.tabID, workspaceID: f.placement.workspace.id)
+        guard case .failure = prematureFlush else { return XCTFail("Required flush cannot qualify an unconfigured creation") }
+        XCTAssertFalse(f.session.qualifiedRestorationReadiness.isAuthoritative)
         var phases: [AgentSessionRequiredSavePhase] = []
         let result = await f.scope.persistence.saveSessionCore(for: f.session.tabID, creationSave: .configured(handle), observingPhase: { phases.append($0) })
         guard case let .durablySaved(binding) = result else { return XCTFail("Configured first save must acknowledge its exact incarnation") }
@@ -288,15 +291,13 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
             session.isDirty = true
             scope.replaceSessions([session.tabID: session])
             let placement = placement
-            scope.persistence.composition = .init(
-                workspace: { placement.workspace },
+            let storage = AgentSessionStorageInputs(
+                workspaceID: workspace.id,
                 workspaceWithID: { $0 == placement.workspace.id ? placement.workspace : nil },
-                displayName: { _ in "Headless persistence" },
-                isSuppressed: { false }, bypassesSuppression: { false }, isPreparedSavedHost: { true },
-                saveAdmission: { _ in placement.refusal },
-                creationIsCurrent: { $0.session.creationHandleIsCurrent($0) },
-                admitBinding: { session in session.activeAgentSessionID.map { .init(sessionID: $0, creation: nil) } }
+                displayName: { _ in "Headless persistence" }, isSuppressed: { false },
+                attachmentWorkspaceDirectory: { FileManager.default.temporaryDirectory }
             )
+            scope.persistence.composition = storage.persistenceComposition(scope: scope, saveAdmission: { _ in placement.refusal })
         }
 
         func cleanUp() {

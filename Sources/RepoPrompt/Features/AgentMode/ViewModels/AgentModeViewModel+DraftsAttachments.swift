@@ -553,13 +553,10 @@ extension AgentModeViewModel {
         if let sessionAttachmentsRootOverride {
             return sessionAttachmentsRootOverride()?.standardizedFileURL
         }
-        guard !attachmentPersistenceIsSuppressed(),
-              let workspace = workspace ?? workspaceManager?.activeWorkspace
-        else { return nil }
-        let agentSessionsFolder = WorkspaceSessionSidecarMigration
-            .workspaceDirectory(for: workspace, root: AgentSessionDataService.defaultWorkspaceRootURL())
-            .appendingPathComponent("AgentSessions", isDirectory: true)
-        return AgentSessionAttachmentStore.rootURL(forAgentSessionsFolder: agentSessionsFolder)
+        return AgentSessionStorageInputs.retainedAttachmentsRoot(
+            workspace: workspace ?? workspaceManager?.activeWorkspace,
+            isSuppressed: attachmentPersistenceIsSuppressed()
+        )
     }
 
     func repairRetainedAttachmentPathsAfterHydration(_ session: TabSession, sessionID: UUID) {

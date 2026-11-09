@@ -193,3 +193,274 @@ final class AgentSavedSessionTargetLoaderTests: XCTestCase {
         XCTAssertEqual(actual, expected, file: file, line: line)
     }
 }
+
+@MainActor
+final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
+    func testSavedHistoricalPayloadLoadsIntoCanonicalWriterWithoutWindowComposition() async throws {
+        let f = Fixture()
+        defer { f.cleanUp() }
+        try await f.save()
+        let carrier = f.placement.workspace.composeTabs
+        let result = try await f.load().get()
+        XCTAssertEqual(result.source, .savedPayload)
+        XCTAssertTrue(result.writer.scope === f.scope)
+        XCTAssertTrue(result.writer.session.permitsBoundOperationAndSave)
+        XCTAssertEqual(result.writer.session.items.map(\.text), ["Saved request", "Saved response"])
+        XCTAssertEqual(f.placement.workspace.composeTabs, carrier, "Historical lookup must not select or rebind the visible carrier")
+        XCTAssertNil(f.scope.execution, "Loading does not install a fake execution service")
+        XCTAssertNil(f.scope.linkExecution)
+        XCTAssertNil(f.scope.persistence.presentation)
+        XCTAssertNil(f.scope.attachments.invalidatePreviews)
+        XCTAssertNil(result.writer.session.activeRunOwnership)
+        let second = try await f.load().get()
+        XCTAssertEqual(second.source, .existingWriter)
+        XCTAssertTrue(second.writer.session === result.writer.session)
+        XCTAssertEqual(f.payloadReads, 1)
+    }
+
+    func testExistingForeignScopeIsReturnedWithoutComposingOrPopulatingColdScope() async throws {
+        let f = Fixture()
+        defer { f.cleanUp() }
+        try await f.save()
+        let original = try await f.load().get()
+        let cold = f.store.makeScope()
+        let reused = try await f.load(into: cold).get()
+        XCTAssertEqual(reused.source, .existingWriter)
+        XCTAssertTrue(reused.writer.scope === original.writer.scope)
+        XCTAssertTrue(cold.sessions.isEmpty)
+        XCTAssertNil(cold.persistence.composition)
+        XCTAssertEqual(f.payloadReads, 1)
+    }
+
+    func testConflictingAndUnreadyWritersDoNotFallBackToSavedPayload() async {
+        let f = Fixture()
+        defer { f.cleanUp() }
+        let first = f.scope.makeSession(tabID: f.tab.id)
+        first.installPersistentSessionBinding(.init(tabID: first.tabID, sessionID: f.sessionID, workspaceID: f.placement.workspace.id))
+        f.scope.replaceSessions([first.tabID: first])
+        await assertFailure(f.load(), reason: .commandRejected(.restorationUnavailable), effects: .none)
+        let otherScope = f.store.makeScope()
+        let other = otherScope.makeSession(tabID: UUID())
+        XCTAssertEqual(otherScope.bindingRejection(f.sessionID, on: other), .conflictingWriter)
+        // Deliberate legacy corruption after proving normal binding admission refuses it.
+        other.installPersistentSessionBinding(.init(tabID: other.tabID, sessionID: f.sessionID, workspaceID: f.placement.workspace.id))
+        otherScope.replaceSessions([other.tabID: other])
+        await assertFailure(f.load(), reason: .lookup(.ambiguous), effects: .none)
+        XCTAssertEqual(f.payloadReads, 0)
+        XCTAssertTrue(f.scope.sessions[first.tabID] === first)
+        otherScope.replaceSessions([:])
+    }
+
+    func testPayloadFailureReleasesOnlyItsLoadingClaimAndExplicitRetryCanRestore() async throws {
+        let f = Fixture()
+        defer { f.cleanUp() }
+        try await f.save()
+        f.beforePayload = { _ in throw CocoaError(.fileReadCorruptFile) }
+        await assertFailure(f.load(), reason: .lookup(.unreadable), effects: .loadingClaimReleased)
+        XCTAssertTrue(f.scope.sessions.isEmpty)
+        guard case .unavailable(.absent) = f.store.resolveWriter(sessionID: f.sessionID) else { return XCTFail("Failed clean load must not strand a writer") }
+        f.beforePayload = nil
+        let retried = try await f.load().get()
+        XCTAssertTrue(retried.writer.session.permitsBoundOperationAndSave)
+    }
+
+    func testRevocationAndStorageMoveAfterReadCannotPublishReadiness() async throws {
+        for moveStorage in [false, true] {
+            let f = Fixture()
+            defer { f.cleanUp() }
+            try await f.save()
+            f.afterPayload = {
+                if moveStorage { f.placement.workspace.customStoragePath = f.root.appendingPathComponent("moved") }
+                else { f.authorized = false }
+            }
+            await assertFailure(f.load(), reason: .lookup(.changed), effects: .loadingClaimReleased)
+            XCTAssertTrue(f.scope.sessions.isEmpty)
+        }
+    }
+
+    func testLocalMutationDuringPayloadReadIsRetainedWithHonestFailureEffect() async throws {
+        let f = Fixture()
+        defer { f.cleanUp() }
+        try await f.save()
+        f.afterPayload = {
+            guard let session = f.scope.sessions[f.tab.id] else { return XCTFail("Loading claim missing") }
+            session.setItemsSilently([.init(kind: .user, text: "New local input", sequenceIndex: 0)], reason: .persistedSessionHydration)
+            session.isDirty = true
+        }
+        await assertFailure(f.load(), reason: .lookup(.changed), effects: .loadingClaimRetained)
+        let retained = try XCTUnwrap(f.scope.sessions[f.tab.id])
+        XCTAssertEqual(retained.items.map(\.text), ["New local input"])
+        XCTAssertFalse(retained.permitsBoundOperationAndSave)
+        XCTAssertTrue(retained.isDirty)
+    }
+
+    func testSuppressionAndOccupiedTabHaveNoLoadingSideEffects() async throws {
+        let f = Fixture()
+        defer { f.cleanUp() }
+        try await f.save()
+        f.placement.suppressed = true
+        await assertFailure(f.load(), reason: .suppressed, effects: .none)
+        f.placement.suppressed = false
+        let draft = f.scope.makeSession(tabID: f.tab.id)
+        f.scope.replaceSessions([draft.tabID: draft])
+        await assertFailure(f.load(), reason: .occupiedTab, effects: .none)
+        XCTAssertEqual(f.payloadReads, 0)
+        XCTAssertTrue(f.scope.sessions[draft.tabID] === draft)
+    }
+
+    func testRetirementAndReplacementDuringReadCannotPublishOrEvictSuccessor() async throws {
+        for replace in [false, true] {
+            let f = Fixture()
+            defer { f.cleanUp() }
+            try await f.save()
+            let successor = f.scope.makeSession(tabID: f.tab.id)
+            f.afterPayload = {
+                if replace { f.scope.replaceSessions([successor.tabID: successor]) }
+                else { f.scope.beginRetirement() }
+            }
+            await assertFailure(f.load(), reason: .lookup(.changed), effects: replace ? .loadingClaimDisplaced : .loadingClaimReleased)
+            if replace { XCTAssertTrue(f.scope.sessions[f.tab.id] === successor) }
+            else { XCTAssertTrue(f.scope.sessions.isEmpty) }
+        }
+    }
+
+    func testOldMetadataCannotOverwriteNewPayloadPlacement() async throws {
+        let f = Fixture()
+        defer { f.cleanUp() }
+        try await f.save()
+        let parent = UUID()
+        f.beforePayload = { _ in
+            let saved = try await f.service.loadAgentSession(id: f.sessionID, for: f.placement.workspace)
+            var payload = try XCTUnwrap(saved)
+            payload.organizationalParentID = parent
+            _ = try await f.service.saveAgentSession(payload, for: f.placement.workspace)
+        }
+        let loaded = try await f.load().get()
+        XCTAssertEqual(loaded.writer.session.organizationalParentID, parent)
+    }
+
+    func testMissingStorageCompositionRefusesBeforePublishingClaim() async throws {
+        let f = Fixture()
+        defer { f.cleanUp() }
+        try await f.save()
+        f.scope.persistence.composition = nil
+        await assertFailure(f.load(), reason: .compositionUnavailable, effects: .none)
+        XCTAssertTrue(f.scope.sessions.isEmpty)
+        XCTAssertEqual(f.payloadReads, 0)
+    }
+
+    func testAttachmentStorageFollowsBoundCatalogRootWithoutPresentation() async throws {
+        let f = Fixture()
+        defer { f.cleanUp() }
+        try await f.save()
+        let configuration = try XCTUnwrap(f.scope.attachments.configuration)
+        let draft = f.scope.makeSession(tabID: UUID())
+        XCTAssertNotNil(configuration.location(draft), "An unbound first turn retains its canonical temporary location")
+        let session = try await f.load().get().writer.session
+        let captured = try XCTUnwrap(configuration.location(session))
+        XCTAssertNotNil(captured.retainedRoot)
+        XCTAssertTrue(configuration.locationIsCurrent(captured, session))
+        f.placement.workspace.customStoragePath = f.root.appendingPathComponent("moved")
+        XCTAssertFalse(configuration.locationIsCurrent(captured, session))
+        f.placement.suppressed = true
+        XCTAssertNil(configuration.location(session)?.retainedRoot)
+    }
+
+    private func assertFailure(
+        _ result: Result<AgentSavedSessionTargetLoader.RuntimeLoad, AgentSavedSessionTargetLoader.RuntimeLoadFailure>,
+        reason: AgentSavedSessionTargetLoader.RuntimeLoadFailure.Reason,
+        effects: AgentSavedSessionTargetLoader.RuntimeLoadFailure.Effects,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        guard case let .failure(failure) = result else { return XCTFail("Expected refusal", file: file, line: line) }
+        XCTAssertEqual(failure.reason, reason, file: file, line: line)
+        XCTAssertEqual(failure.effects, effects, file: file, line: line)
+    }
+
+    @MainActor
+    private final class Placement {
+        var workspace: WorkspaceModel
+        var suppressed = false
+        init(_ workspace: WorkspaceModel) {
+            self.workspace = workspace
+        }
+    }
+
+    @MainActor
+    private final class Fixture {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("M93Loading-\(UUID())")
+        let sessionID = UUID()
+        let tab = ComposeTabState(activeAgentSessionID: UUID())
+        let service = AgentSessionDataService()
+        let store = AgentSessionRuntimeStore()
+        let scope: AgentSessionRuntimeStore.Scope
+        let placement: Placement
+        let storage: AgentSessionStorageInputs
+        var authorized = true
+        var payloadReads = 0
+        var beforePayload: ((AgentSessionHydrationRequest) async throws -> Void)?
+        var afterPayload: (() -> Void)?
+
+        init() {
+            var workspace = WorkspaceModel(name: "Canonical catalog", repoPaths: [], customStoragePath: root)
+            workspace.composeTabs = [tab]
+            workspace.stashedTabs = []
+            placement = Placement(workspace)
+            scope = store.makeScope()
+            let placement = placement
+            storage = .init(
+                workspaceID: workspace.id,
+                workspaceWithID: { $0 == placement.workspace.id ? placement.workspace : nil },
+                displayName: { _ in "Saved target" }, isSuppressed: { placement.suppressed },
+                attachmentWorkspaceDirectory: { FileManager.default.temporaryDirectory }
+            )
+            scope.persistence.composition = storage.persistenceComposition(scope: scope)
+            scope.attachments.configuration = storage.attachmentConfiguration()
+        }
+
+        func save() async throws {
+            _ = try await service.saveAgentSession(.init(
+                id: sessionID, workspaceID: placement.workspace.id, composeTabID: tab.id, name: "Saved target",
+                items: [
+                    AgentChatItem(kind: .user, text: "Saved request", sequenceIndex: 0),
+                    AgentChatItem(kind: .assistant, text: "Saved response", sequenceIndex: 1)
+                ].map { AgentChatItemPersist(from: $0) },
+                lastRunState: "completed"
+            ), for: placement.workspace)
+        }
+
+        func load(into destination: AgentSessionRuntimeStore.Scope? = nil) async -> Result<AgentSavedSessionTargetLoader.RuntimeLoad, AgentSavedSessionTargetLoader.RuntimeLoadFailure> {
+            await AgentSavedSessionTargetLoader.loadRuntime(
+                sessionID: sessionID, scope: destination ?? scope,
+                catalog: .init(
+                    workspaces: { [self] in [placement.workspace] }, currentWorkspace: storage.workspaceWithID,
+                    currentMetadata: { _, _ in nil }, isCurrent: { [self] target in
+                        target.workspace.id == placement.workspace.id && target.tab == placement.workspace.composeTabs.first
+                    }
+                ), storage: storage,
+                selection: { .init(agent: $0.normalizedSelection.agent, modelRaw: $0.normalizedSelection.modelRaw, explicitReasoningEffortRaw: nil) },
+                codexPolicy: { _ in .init(options: [], defaultEffort: nil, lastUsed: nil) },
+                isStillAuthorized: { [self] in authorized },
+                readRecord: { [service] in try await service.metadataRecordForSessionID($0, for: $1) },
+                readPayload: { [self] request in
+                    payloadReads += 1
+                    try await beforePayload?(request)
+                    let payload = try await service.preparePersistedHydration(request)
+                    afterPayload?()
+                    return payload
+                }
+            )
+        }
+
+        func cleanUp() {
+            beforePayload = nil
+            afterPayload = nil
+            for session in scope.sessions.values {
+                session.saveDebounceTask?.cancel()
+                session.derivedTranscriptRefreshTask?.cancel()
+            }
+            scope.replaceSessions([:])
+            try? FileManager.default.removeItem(at: root)
+        }
+    }
+}
