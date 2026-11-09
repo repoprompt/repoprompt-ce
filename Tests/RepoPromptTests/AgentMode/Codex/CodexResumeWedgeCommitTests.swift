@@ -565,19 +565,20 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         session.codexControllerFeatureState = .init(computerUseEnabled: true, goalSupportEnabled: false, reasoningSummariesEnabled: false, memoriesEnabled: false, capabilities: .disabled)
         let request = makeLegacyApprovalRequest()
         let questionID = try XCTUnwrap(request.questions.first?.id)
+        let command = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: installRestoredBinding(fixture)))
         await fixture.coordinator.test_handleCodexNativeEvent(.requestUserInput(request), session: session, sourceController: controller)
         XCTAssertEqual(session.pendingUserInputRequest?.id, request.id, "Frozen armed scope must surface approval even with the global setting OFF")
         XCTAssertEqual(session.pendingUserInputRequest?.questions.first?.options.map(\.label), ["Allow", "Deny"], "Remembered and unknown approval options must not be offered")
         // Continue probing submission even on the known-bad autoanswer path.
         if session.pendingUserInputRequest == nil { session.pendingUserInputRequest = request }
         for remembered in ["Allow for this session", "AlwaysAllow", "Allow forever", "user_note: Allow for this session"] {
-            fixture.viewModel.submitUserInputResponse(tabID: session.tabID, requestID: request.requestID, response: .init(answersByQuestionID: [questionID: [remembered]]))
+            fixture.viewModel.interactionRuntime.submitUserInputResponse(command: command, requestID: request.id, response: .init(answersByQuestionID: [questionID: [remembered]]))
             XCTAssertEqual(session.pendingUserInputRequest?.id, request.id, "Rejected answers must preserve the pending review: \(remembered)")
             if session.pendingUserInputRequest == nil { session.pendingUserInputRequest = request }
         }
-        fixture.viewModel.submitUserInputResponse(tabID: session.tabID, requestID: .int(999), response: .init(answersByQuestionID: [questionID: ["Allow"]]))
+        fixture.viewModel.interactionRuntime.submitUserInputResponse(command: command, requestID: UUID(), response: .init(answersByQuestionID: [questionID: ["Allow"]]))
         XCTAssertEqual(session.pendingUserInputRequest?.id, request.id, "A stale request ID must not consume the prompt")
-        fixture.viewModel.submitUserInputResponse(tabID: session.tabID, requestID: request.requestID, response: .init(answersByQuestionID: [questionID: ["Allow"]]))
+        fixture.viewModel.interactionRuntime.submitUserInputResponse(command: command, requestID: request.id, response: .init(answersByQuestionID: [questionID: ["Allow"]]))
         try await AsyncTestWait.waitUntil("explicit one-shot legacy answer", timeout: 4) { controller.qaUserInputAnswers[questionID] == ["Allow"] }
         XCTAssertEqual(controller.qaResponseCount, 1, "Only the explicit one-shot response may reach the controller")
         XCTAssertNil(session.pendingUserInputRequest)
@@ -781,6 +782,19 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertFalse(source.isCodexComputerUseArmed)
         XCTAssertTrue(source.items.isEmpty, "The source must not receive the destination's turn")
         try await assertComputerUseProviderStart(fixture, session: destination)
+        let controller = try XCTUnwrap(fixture.factory.controllers.first)
+        let approval = AgentApprovalRequest(requestID: .codex(.int(91)), method: "item/commandExecution/requestApproval", kind: .commandExecution, threadID: "submission-thread", turnID: "first-turn", itemID: "first-approval")
+        await fixture.coordinator.test_handleCodexNativeEvent(.approvalRequest(approval), session: destination, sourceController: controller)
+        XCTAssertEqual(destination.pendingApproval?.id, approval.id)
+        // This is the card's capture expression, without test-only restoration or binding repair:
+        // first-save admission must complete before the first provider prompt is answerable.
+        let responseCommand = try XCTUnwrap(vm.activeSession?.activeAgentSessionID.flatMap { try? vm.runtimeCommand(sessionID: $0) })
+        XCTAssertTrue(responseCommand.writer.session === destination)
+        XCTAssertTrue(vm.interactionRuntime.submitApprovalDecision(command: responseCommand, requestID: approval.id, decision: .accept))
+        XCTAssertFalse(vm.interactionRuntime.submitApprovalDecision(command: responseCommand, requestID: approval.id, decision: .accept))
+        await vm.interactionRuntime.drainPendingEffects(for: destination)
+        XCTAssertEqual(controller.qaResponseCount, 1)
+        XCTAssertNil(destination.pendingApproval)
     }
 
     func testLocalComputerUseComposerExistingSessionArmsAndStartsProvider() async throws {
@@ -1082,6 +1096,11 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         CodexComputerUseWorkflow.setEnabledForTesting(true)
         defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
         let fixture = makeFixture([])
+        let responseSessionID = try installRestoredBinding(fixture)
+        // This coordinator-level fixture starts its synthetic attempt before binding. Reopen it
+        // against the restored binding now required by the real interaction command boundary.
+        let restoredOwnership = fixture.session.beginRunAttempt(source: "computer-use.restored-response-fixture")
+        XCTAssertTrue(fixture.session.isCurrentRunAttemptForCurrentBinding(restoredOwnership, expectedRunID: fixture.session.runID))
         var flags: [Bool] = []
         var controllers: [WedgeFakeCodexController] = []
         let coordinator = makeComputerUseCoordinator(fixture: fixture) { runID, enabled in
@@ -1146,9 +1165,10 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         await coordinator.test_handleCodexNativeEvent(.approvalRequest(permission), session: session, sourceController: controller)
         XCTAssertEqual(session.pendingApproval?.id, permission.id)
         XCTAssertEqual(controller.qaResponseCount, 0)
-        coordinator.submitApprovalDecision(session: session, decision: .acceptForSession)
+        let command = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: responseSessionID))
+        fixture.viewModel.interactionRuntime.submitApprovalDecision(command: command, requestID: permission.id, decision: .acceptForSession)
         XCTAssertEqual(session.pendingApproval?.id, permission.id, "Remembered permission must remain rejected")
-        coordinator.submitApprovalDecision(session: session, decision: .accept)
+        fixture.viewModel.interactionRuntime.submitApprovalDecision(command: command, requestID: permission.id, decision: .accept)
         try await AsyncTestWait.waitUntil("one explicit permission response", timeout: 4) { controller.qaResponseCount == 1 }
         XCTAssertNil(session.pendingApproval)
         let followUp = await coordinator.sendCodexNativeMessage(session: session, text: "continue locally", attachments: [], fallbackContext: context(true))

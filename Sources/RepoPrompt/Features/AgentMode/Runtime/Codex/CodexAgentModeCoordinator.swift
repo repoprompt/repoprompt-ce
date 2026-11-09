@@ -10063,7 +10063,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             let computerUseArmed = session.codexControllerFeatureState?.computerUseEnabled == true
             if !computerUseArmed, Self.shouldAutoApproveCodexMCPToolRequest(request) {
                 let response = Self.buildAutoApprovalResponse(for: request)
-                submitUserInputResponse(session: session, requestID: request.requestID, response: response)
+                await session.codexController?.respondToServerRequest(id: request.requestID, result: response.jsonObject)
                 return
             }
             let autoApproveCompanion = CodexComputerUseWorkflow.automaticallyApprovesCompanion(
@@ -12355,102 +12355,6 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         return computerUseAllowsDecision(decision, session: session)
     }
 
-    func submitApprovalDecision(
-        session: AgentTabSession,
-        decision: AgentApprovalDecision
-    ) {
-        guard let request = session.pendingApproval,
-              case let .codex(requestID) = request.requestID,
-              let controller = session.codexController,
-              Self.allowsApprovalDecision(decision, request: request, session: session),
-              let result = Self.buildApprovalResult(decision: decision, request: request)
-        else {
-            return
-        }
-        session.pendingApproval = nil
-        AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
-        handleRunInteractionStateChange(for: session, reason: .approvalResponseSubmitted)
-        presentationRuntime.requestUIRefresh(for: session, urgent: true)
-        Task { [controller] in
-            await controller.respondToServerRequest(id: requestID, result: result)
-        }
-    }
-
-    func submitPermissionsDecision(
-        session: AgentTabSession,
-        request: AgentPermissionsRequest,
-        decision: AgentApprovalDecision
-    ) {
-        guard let controller = session.codexController,
-              session.pendingPermissionsRequest?.id == request.id
-        else {
-            return
-        }
-        guard Self.computerUseAllowsDecision(decision, session: session) else { return }
-        let result = Self.buildPermissionsResult(decision: decision, request: request)
-        session.pendingPermissionsRequest = nil
-        AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
-        handleRunInteractionStateChange(for: session, reason: .permissionsResponseSubmitted)
-        presentationRuntime.requestUIRefresh(for: session, urgent: true)
-        let authoritativeTurnID = session.codexAuthoritativeActiveTurn?.turnID
-        Task { [controller] in
-            await controller.respondToServerRequest(id: request.requestID, result: result)
-            if case .cancel = decision, let authoritativeTurnID {
-                _ = try? await controller.interruptUserTurn(expectedTurnID: authoritativeTurnID)
-            } else if case .cancel = decision {
-                _ = try? await controller.reconcileAndInterruptCurrentTurn()
-            }
-        }
-    }
-
-    func submitMCPElicitationResponse(
-        session: AgentTabSession,
-        request: AgentMCPElicitationRequest,
-        response: AgentMCPElicitationResponse
-    ) {
-        guard let controller = session.codexController,
-              session.pendingMCPElicitationRequest?.id == request.id
-        else {
-            return
-        }
-        session.pendingMCPElicitationRequest = nil
-        if !session.queuedMCPElicitationRequests.isEmpty {
-            session.pendingMCPElicitationRequest = session.queuedMCPElicitationRequests.removeFirst()
-        }
-        AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
-        handleRunInteractionStateChange(for: session, reason: .mcpElicitationResponseSubmitted)
-        presentationRuntime.requestUIRefresh(for: session, urgent: true)
-        mcpRuntime?.handleObservedMCPStateChange(for: session)
-        let authoritativeTurnID = session.codexAuthoritativeActiveTurn?.turnID
-        Task { [controller] in
-            await controller.respondToServerRequest(id: request.requestID, result: response.jsonObject)
-            if response.action == .cancel, let authoritativeTurnID {
-                _ = try? await controller.interruptUserTurn(expectedTurnID: authoritativeTurnID)
-            } else if response.action == .cancel {
-                _ = try? await controller.reconcileAndInterruptCurrentTurn()
-            }
-        }
-    }
-
-    @discardableResult
-    func submitUserInputResponse(
-        session: AgentTabSession,
-        requestID: CodexAppServerRequestID,
-        response: AgentRequestUserInputResponse
-    ) -> Bool {
-        if session.codexControllerFeatureState?.computerUseEnabled == true {
-            guard let request = session.pendingUserInputRequest,
-                  request.requestID == requestID,
-                  request.allowsComputerUseResponse(response) else { return false }
-        }
-        // Preserve ordinary callers' existing pending-state settlement even without a controller.
-        guard let controller = session.codexController else { return true }
-        Task { [controller] in
-            await controller.respondToServerRequest(id: requestID, result: response.jsonObject)
-        }
-        return true
-    }
-
     // MARK: - MCP Tool Auto-Approval
 
     /// Returns true when all questions in a `requestUserInput` event are MCP tool-call approval
@@ -12473,7 +12377,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         return AgentRequestUserInputResponse(answersByQuestionID: answers)
     }
 
-    private static func buildPermissionsResult(decision: AgentApprovalDecision, request: AgentPermissionsRequest) -> [String: Any] {
+    static func buildPermissionsResult(decision: AgentApprovalDecision, request: AgentPermissionsRequest) -> [String: Any] {
         let permissions: [String: Any]
         let scope: String
         switch decision {

@@ -2451,34 +2451,42 @@ struct AgentModeChatDetailView: View {
             .id("pendingWorktreeMergeReview")
             .transition(.opacity)
         } else if let approval = runInteractionSnapshot.pendingApproval {
+            let command = agentModeVM.activeSession?.activeAgentSessionID.flatMap { try? agentModeVM.runtimeCommand(sessionID: $0) }
+            let runtime = agentModeVM.interactionRuntime
             AgentApprovalCard(
                 request: approval,
                 allowsRememberedDecision: agentModeVM.codexRememberedApprovalAllowed(for: currentTabID),
                 onDecision: { decision in
-                    guard let tabID = currentTabID else { return }
-                    agentModeVM.submitApprovalDecision(tabID: tabID, requestID: approval.id, decision: decision)
+                    guard let command else { return }
+                    runtime.submitApprovalDecision(command: command, requestID: approval.id, decision: decision)
                 }
             )
             .id("pendingApproval")
             .transition(.opacity)
         } else if let request = runInteractionSnapshot.pendingPermissionsRequest {
+            let command = agentModeVM.activeSession?.activeAgentSessionID.flatMap { try? agentModeVM.runtimeCommand(sessionID: $0) }
+            let runtime = agentModeVM.interactionRuntime
             AgentPermissionsApprovalCard(request: request, onDecision: { decision in
-                guard let tabID = currentTabID else { return }
-                agentModeVM.submitPermissionsDecision(tabID: tabID, requestID: request.id, decision: decision)
+                guard let command else { return }
+                runtime.submitPermissionsDecision(command: command, requestID: request.id, decision: decision)
             })
             .id("pendingPermissions")
             .transition(.opacity)
         } else if let request = runInteractionSnapshot.pendingMCPElicitationRequest {
+            let command = agentModeVM.activeSession?.activeAgentSessionID.flatMap { try? agentModeVM.runtimeCommand(sessionID: $0) }
+            let runtime = agentModeVM.interactionRuntime
             AgentMCPElicitationCard(
                 request: request,
                 onResponse: { response in
-                    guard let tabID = currentTabID else { return }
-                    agentModeVM.submitMCPElicitationResponse(tabID: tabID, requestID: request.id, response: response)
+                    guard let command else { return }
+                    runtime.submitMCPElicitationResponse(command: command, requestID: request.id, response: response)
                 }
             )
             .id("pendingMCPElicitation")
             .transition(.opacity)
         } else if let request = runInteractionSnapshot.pendingUserInputRequest {
+            let command = agentModeVM.activeSession?.activeAgentSessionID.flatMap { try? agentModeVM.runtimeCommand(sessionID: $0) }
+            let runtime = agentModeVM.interactionRuntime
             let cancelTarget = runInteractionSnapshot.pendingUserInputCancelTarget
             AgentRequestUserInputCard(
                 request: request,
@@ -2486,8 +2494,8 @@ struct AgentModeChatDetailView: View {
                 pendingFocusStore: runInteractionUI,
                 pendingFocusTabID: currentTabID,
                 onSubmit: { response in
-                    guard let tabID = currentTabID else { return }
-                    agentModeVM.submitUserInputResponse(tabID: tabID, requestID: request.requestID, response: response)
+                    guard let command else { return }
+                    runtime.submitUserInputResponse(command: command, requestID: request.id, response: response)
                 },
                 onStop: {
                     guard let cancelTarget else { return }

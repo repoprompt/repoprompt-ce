@@ -3342,7 +3342,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     var interactionRuntime: AgentSessionInteractionRuntime {
         let runtime = runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore)
         runtime.observer = codexCoordinator
-        runtime.installProviderCommands(codex: codexCoordinator, claude: claudeCoordinator)
+        runtime.installClaudeCancellationCommands(claudeCoordinator)
         _ = persistenceRuntime
         return runtime
     }
@@ -19020,11 +19020,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     func cancelAskUserInteraction(tabID: UUID, interactionID: UUID) -> Bool {
         guard let session = sessions[tabID] else { return false }
         return interactionRuntime.cancelAskUserInteraction(session: session, interactionID: interactionID)
-    }
-
-    func submitUserInputResponse(tabID: UUID, requestID: CodexAppServerRequestID, response: AgentRequestUserInputResponse) {
-        guard let session = sessions[tabID] else { return }
-        interactionRuntime.submitUserInputResponse(session: session, requestID: requestID, response: response)
     }
 
     /// Forced provider switch declines every pending interaction exactly once through the same

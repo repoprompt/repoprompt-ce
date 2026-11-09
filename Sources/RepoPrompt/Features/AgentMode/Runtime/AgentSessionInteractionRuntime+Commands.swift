@@ -111,11 +111,6 @@ extension AgentSessionInteractionRuntime {
         return applied
     }
 
-    private func requireCodexCoordinator() throws -> CodexAgentModeCoordinator {
-        guard let codexCommands else { throw MCPError.invalidParams("The provider response route is unavailable. No response was applied.") }
-        return codexCommands
-    }
-
     private func mcpApprovalDecisionLabels(for approval: AgentApprovalRequest, session: AgentTabSession, includeAliases: Bool) -> [String] {
         scope?.mcp.mcpApprovalDecisionLabels(for: approval, session: session, includeAliases: includeAliases) ?? []
     }
@@ -160,42 +155,6 @@ extension AgentSessionInteractionRuntime {
               let continuation = session.worktreeMergeReviewContinuation else { return }
         finishPendingWorktreeMergeReview(session: session)
         continuation.resume(returning: decision)
-    }
-
-    @discardableResult
-    func submitUserInputResponse(session: AgentTabSession, requestID: CodexAppServerRequestID, response: AgentRequestUserInputResponse) -> Bool {
-        guard owns(session), let request = session.pendingUserInputRequest, request.requestID == requestID,
-              codexCommands?.submitUserInputResponse(session: session, requestID: requestID, response: response) == true else { return false }
-        session.pendingUserInputRequest = nil
-        if !session.queuedUserInputRequests.isEmpty { session.pendingUserInputRequest = session.queuedUserInputRequests.removeFirst() }
-        Self.reconcileInteractiveRunState(session)
-        publishRunInteractionStateChange(for: session, reason: .userInputResponseSubmitted)
-        scope?.presentation.bindingChanged(session)
-        scope?.presentation.makeRunHooks().requestUIRefresh(session, true)
-        return true
-    }
-
-    @discardableResult
-    func submitApprovalDecision(session: AgentTabSession, requestID: UUID, decision: AgentApprovalDecision) -> Bool {
-        guard owns(session), let request = session.pendingApproval, request.id == requestID,
-              decision != .accept || request.supportsPlainApprove else { return false }
-        switch request.requestID {
-        case .codex:
-            guard let codexCommands else { return false }
-            codexCommands.submitApprovalDecision(session: session, decision: decision)
-        case .claudeControl:
-            guard let claudeCommands else { return false }
-            claudeCommands.submitApprovalDecision(session: session, decision: decision)
-        case let .acp(providerRequestID):
-            let controller = session.acpController
-            session.pendingApproval = nil
-            if session.runState == .waitingForApproval { session.runState = .running }
-            scope?.presentation.makeRunHooks().requestUIRefresh(session, true)
-            performEffect(for: session) {
-                await controller?.respondToPermissionRequest(id: providerRequestID, decision: decision)
-            }
-        }
-        return session.pendingApproval?.id != requestID
     }
 
     static func canonicalApprovalResponse(from payload: AgentMCPInteractionResponsePayload) throws -> String {
@@ -446,17 +405,23 @@ extension AgentSessionInteractionRuntime {
                 throw MCPError.invalidParams(error.localizedDescription)
             }
         case let .mcpElicitation(request, response):
-            try requireCodexCoordinator().submitMCPElicitationResponse(session: session, request: request, response: response)
+            guard submitMCPElicitationResponse(command: command, requestID: request.id, response: response) else {
+                throw MCPError.invalidParams("The provider response route is unavailable or the MCP elicitation request is no longer current. No response was applied.")
+            }
         case let .userInput(request, response):
-            guard submitUserInputResponse(session: session, requestID: request.requestID, response: response) else {
+            guard session.codexController != nil,
+                  submitUserInputResponse(command: command, requestID: request.id, response: response)
+            else {
                 throw MCPError.invalidParams("The provider response route is unavailable or the user-input request is no longer current. No response was applied.")
             }
         case let .worktreeMerge(reviewID, decision):
             submitWorktreeMergeReviewDecision(session: session, reviewID: reviewID, decision: decision)
         case let .permissions(request, decision):
-            try requireCodexCoordinator().submitPermissionsDecision(session: session, request: request, decision: decision)
+            guard submitPermissionsDecision(command: command, requestID: request.id, decision: decision) else {
+                throw MCPError.invalidParams("The provider response route is unavailable or the permissions request is no longer current. No response was applied.")
+            }
         case let .approval(request, decision):
-            guard submitApprovalDecision(session: session, requestID: request.id, decision: decision) else {
+            guard submitApprovalDecision(command: command, requestID: request.id, decision: decision) else {
                 let current = session.pendingApproval ?? request
                 throw MCPError.invalidParams(
                     "The approval is unavailable, unsupported, or no longer matches interaction_id. response must be one of: \(mcpApprovalDecisionLabels(for: current, session: session, includeAliases: false).joined(separator: ", ")). No response was applied."

@@ -3,21 +3,6 @@ import RepoPromptDomainRuntime
 
 @MainActor
 extension AgentModeViewModel {
-    /// Id-checked approval submission: applies `decision` only while `requestID` is still the pending
-    /// approval for `tabID`. Returns whether that approval was consumed.
-    @discardableResult
-    func submitApprovalDecision(tabID: UUID, requestID: UUID, decision: AgentApprovalDecision) -> Bool {
-        guard let session = sessions[tabID] else { return false }
-        return interactionRuntime.submitApprovalDecision(session: session, requestID: requestID, decision: decision)
-    }
-
-    /// Unchecked variant resolving whatever approval is currently pending. Prefer the id-checked
-    /// overload for any caller that captured the request earlier (cards, notifications).
-    func submitApprovalDecision(tabID: UUID, decision: AgentApprovalDecision) {
-        guard let session = sessions[tabID], let requestID = session.pendingApproval?.id else { return }
-        interactionRuntime.submitApprovalDecision(session: session, requestID: requestID, decision: decision)
-    }
-
     func submitCodexHookReviewDecision(
         tabID: UUID,
         requestID: UUID,
@@ -46,25 +31,5 @@ extension AgentModeViewModel {
     func codexRememberedApprovalAllowed(for tabID: UUID?) -> Bool {
         guard let tabID else { return true }
         return sessions[tabID]?.codexControllerFeatureState?.computerUseEnabled != true
-    }
-
-    func submitPermissionsDecision(tabID: UUID, requestID: UUID, decision: AgentApprovalDecision) {
-        guard let session = sessions[tabID], let request = session.pendingPermissionsRequest,
-              request.id == requestID else { return }
-        codexCoordinator.submitPermissionsDecision(session: session, request: request, decision: decision)
-    }
-
-    func submitMCPElicitationResponse(
-        tabID: UUID,
-        requestID: UUID,
-        response: AgentMCPElicitationResponse
-    ) {
-        guard let session = sessions[tabID],
-              let request = session.pendingMCPElicitationRequest,
-              request.id == requestID
-        else {
-            return
-        }
-        codexCoordinator.submitMCPElicitationResponse(session: session, request: request, response: response)
     }
 }

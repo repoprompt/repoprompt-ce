@@ -2205,26 +2205,6 @@ final class ClaudeAgentModeCoordinator {
         }
     }
 
-    func submitApprovalDecision(
-        session: AgentTabSession,
-        decision: AgentApprovalDecision
-    ) {
-        guard let request = session.pendingApproval,
-              let controller = session.claudeController,
-              case let .claudeControl(requestID) = request.requestID
-        else {
-            return
-        }
-        session.pendingApproval = nil
-        session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
-        session.setRunningStatus("Thinking…", source: .transport)
-        session.runState = .running
-        hostCapabilities.requestUIRefresh(session, true)
-        Task { [controller] in
-            await controller.respondToPermissionRequest(id: requestID, decision: decision)
-        }
-    }
-
     /// Detaches the current Claude controller and its tool tracker synchronously
     /// so a replacement run cannot be affected by the old controller's async cleanup.
     func prepareClaudeCancelSync(_ session: AgentTabSession) -> DetachedClaudeController? {

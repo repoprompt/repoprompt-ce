@@ -554,7 +554,18 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
         session.codexControllerFeatureState = .init(computerUseEnabled: true, goalSupportEnabled: false, reasoningSummariesEnabled: false, memoriesEnabled: false, capabilities: .disabled)
         session.pendingPermissionsRequest = request
         let coordinator = makeCoordinator()
-        coordinator.submitPermissionsDecision(session: session, request: request, decision: .acceptForSession)
+        let writers = AgentSessionRuntimeStore()
+        let scope = writers.makeScope()
+        let sessionID = UUID()
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: UUID()))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        scope.replaceSessions([session.tabID: session])
+        guard case let .unique(writer) = scope.resolveWriter(sessionID: sessionID) else {
+            return XCTFail("Expected exact permissions writer")
+        }
+        let command = try writer.admitCommand().get()
+        let interactions = scope.interactions(routeID: 1, approvalStore: ApplyEditsApprovalStore())
+        XCTAssertFalse(interactions.submitPermissionsDecision(command: command, requestID: request.id, decision: .acceptForSession))
         XCTAssertEqual(session.pendingPermissionsRequest?.id, request.id, "Remembered approval must not be submitted")
         await coordinator.revokeCodexComputerUse(session: session, reason: "user-off")
         XCTAssertNil(session.pendingPermissionsRequest)

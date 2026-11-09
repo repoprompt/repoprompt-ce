@@ -1358,7 +1358,7 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         )
         viewModel?.ensureRunServiceMaterializedForRunStart()
         let runtime = try XCTUnwrap(viewModel?.interactionRuntime)
-        weak let codex = runtime.codexCommands
+        weak let codex = viewModel?.codexCoordinator
         weak let claude = runtime.claudeCommands
         XCTAssertNotNil(codex)
         XCTAssertNotNil(claude)
@@ -1366,7 +1366,7 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         viewModel = nil
         XCTAssertNil(codex, "The terminal binder retains interaction hooks, not their provider command owners")
         XCTAssertNil(claude)
-        XCTAssertNil(runtime.codexCommands)
+        XCTAssertNil(runtime.observer, "The remaining provider-state observer must also be weak")
         XCTAssertNil(runtime.claudeCommands)
     }
 
@@ -2017,5 +2017,229 @@ final class AgentSessionHandoffRuntimeTests: XCTestCase {
         XCTAssertEqual(session.pendingHandoff.payload, "old")
         XCTAssertEqual(replacement.pendingHandoff.payload, "new")
         XCTAssertEqual(runtime.prependPendingHandoffIfNeeded("input", session: session), "input")
+    }
+}
+
+@MainActor
+final class AgentProviderResponseCommandTests: XCTestCase {
+    private enum Kind: CaseIterable {
+        case approval, permissions, elicitation, userInput
+
+        @MainActor
+        func install(on session: AgentTabSession) -> UUID {
+            let id = UUID()
+            switch self {
+            case .approval:
+                session.pendingApproval = .init(id: id, requestID: .codex(.int(1)), method: "item/commandExecution/requestApproval", kind: .commandExecution, threadID: "thread", turnID: "turn", itemID: "item")
+            case .permissions:
+                session.pendingPermissionsRequest = .init(id: id, requestID: .int(1), method: "item/permissions/requestApproval", threadID: "thread", turnID: "turn", itemID: "item", cwd: "/tmp", permissionsJSON: "{}")
+            case .elicitation:
+                session.pendingMCPElicitationRequest = .init(id: id, requestID: .int(1), method: "mcpServer/elicitation/request", threadID: "thread", turnID: "turn", itemID: "item", rawParamsJSON: "{}")
+            case .userInput:
+                session.pendingUserInputRequest = .init(id: id, requestID: .int(1), method: "item/tool/requestUserInput", threadID: "thread", turnID: "turn", itemID: "item", questions: [])
+            }
+            return id
+        }
+
+        @MainActor
+        func pendingID(on session: AgentTabSession) -> UUID? {
+            switch self {
+            case .approval: session.pendingApproval?.id
+            case .permissions: session.pendingPermissionsRequest?.id
+            case .elicitation: session.pendingMCPElicitationRequest?.id
+            case .userInput: session.pendingUserInputRequest?.id
+            }
+        }
+
+        @MainActor
+        func submit(_ runtime: AgentSessionInteractionRuntime, command: AgentSessionRuntimeStore.Command, id: UUID) -> Bool {
+            switch self {
+            case .approval: runtime.submitApprovalDecision(command: command, requestID: id, decision: .cancel)
+            case .permissions: runtime.submitPermissionsDecision(command: command, requestID: id, decision: .cancel)
+            case .elicitation: runtime.submitMCPElicitationResponse(command: command, requestID: id, response: .init(action: .cancel))
+            case .userInput: runtime.submitUserInputResponse(command: command, requestID: id, response: .init(answersByQuestionID: [:]))
+            }
+        }
+    }
+
+    private func install(in scope: AgentSessionRuntimeStore.Scope) -> AgentTabSession {
+        let session = AgentTabSession(tabID: UUID())
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: UUID()))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        scope.replaceSessions([session.tabID: session])
+        return session
+    }
+
+    private func command(_ scope: AgentSessionRuntimeStore.Scope, _ session: AgentTabSession) throws -> AgentSessionRuntimeStore.Command {
+        guard case let .unique(writer) = try scope.resolveWriter(sessionID: XCTUnwrap(session.activeAgentSessionID)), writer.session === session else {
+            throw NSError(domain: "Expected exact response writer", code: 1)
+        }
+        return try writer.admitCommand().get()
+    }
+
+    func testResponseCommandsRejectWriterDriftAndDuplicateConsumption() async throws {
+        for kind in Kind.allCases {
+            for conflict in [false, true] {
+                let store = AgentSessionRuntimeStore()
+                let scope = store.makeScope()
+                let other = store.makeScope()
+                let session = install(in: scope)
+                let runtime = scope.interactions(routeID: 1, approvalStore: ApplyEditsApprovalStore())
+                let captured = try command(scope, session)
+                let controller = ResponseController()
+                session.codexController = controller
+                let id = kind.install(on: session)
+                if conflict {
+                    let duplicate = AgentTabSession(tabID: UUID())
+                    other.replaceSessions([duplicate.tabID: duplicate])
+                    XCTAssertEqual(other.bindingRejection(captured.identity.sessionID, on: duplicate), .conflictingWriter)
+                    duplicate.installPersistentSessionBinding(.init(tabID: duplicate.tabID, sessionID: captured.identity.sessionID, workspaceID: captured.identity.workspaceID))
+                    duplicate.recordRestorationAuthoritative(.persistedPayloadApplied)
+                    guard case .conflicting = scope.resolveWriter(sessionID: captured.identity.sessionID) else {
+                        return XCTFail("Expected raw conflicting writer claims")
+                    }
+                } else {
+                    scope.replaceSessions([:])
+                    scope.replaceSessions([session.tabID: session])
+                }
+                XCTAssertFalse(kind.submit(runtime, command: captured, id: id), "\(kind), conflict=\(conflict)")
+                XCTAssertEqual(kind.pendingID(on: session), id)
+                await runtime.drainPendingEffects()
+                let rejectedCount = await controller.receipts.count
+                XCTAssertEqual(rejectedCount, 0)
+                other.replaceSessions([:])
+                let current = try command(scope, session)
+                XCTAssertTrue(kind.submit(runtime, command: current, id: id))
+                XCTAssertFalse(kind.submit(runtime, command: current, id: id))
+                await runtime.drainPendingEffects()
+                let sentCount = await controller.receipts.count
+                XCTAssertEqual(sentCount, 1)
+            }
+        }
+    }
+
+    func testConsumedResponseDrainsOriginalControllerWithoutInterruptingLaterTurn() async throws {
+        for kind in Kind.allCases {
+            for turn in ["unknown", "current", "foreignController"] {
+                let store = AgentSessionRuntimeStore()
+                let scope = store.makeScope()
+                let session = install(in: scope)
+                let runtime = scope.interactions(routeID: 1, approvalStore: ApplyEditsApprovalStore())
+                let entered = expectation(description: "original response entered")
+                let controller = ResponseController(entered: entered)
+                session.codexController = controller
+                session.codexConversationID = "thread"
+                session.beginRunAttempt(source: "response command test")
+                let foreignController = ResponseController()
+                if turn != "unknown" {
+                    session.codexAuthoritativeActiveTurn = try .init(threadID: "thread", turnID: "original-turn", turnKind: .user, controllerInstanceID: ObjectIdentifier(turn == "foreignController" ? foreignController : controller), controllerGeneration: session.codexControllerGeneration, runID: session.runID, runAttemptID: XCTUnwrap(session.activeRunAttemptID))
+                }
+                let id = kind.install(on: session)
+                XCTAssertTrue(try kind.submit(runtime, command: command(scope, session), id: id))
+                await fulfillment(of: [entered], timeout: 3)
+                let successor = kind.install(on: session)
+                // A later turn on the same controller must not be discovered by a cancel follow-up.
+                session.codexAuthoritativeActiveTurn = try .init(threadID: "thread", turnID: "later-turn", turnKind: .user, controllerInstanceID: ObjectIdentifier(controller), controllerGeneration: session.codexControllerGeneration, runID: session.runID, runAttemptID: XCTUnwrap(session.activeRunAttemptID))
+                let replacement = ResponseController()
+                session.codexController = replacement
+                scope.replaceSessions([:])
+                var drained = false
+                let drainStarted = expectation(description: "response drain entered")
+                let drain = Task {
+                    drainStarted.fulfill()
+                    await runtime.drainPendingEffects(for: session)
+                    drained = true
+                }
+                await fulfillment(of: [drainStarted], timeout: 3)
+                XCTAssertFalse(drained, "Drain must still own the suspended provider send")
+                await controller.receipts.release()
+                await drain.value
+                XCTAssertTrue(drained)
+                let completed = await controller.receipts.completed
+                XCTAssertEqual(completed, 1, "Drain acknowledges the completed send, not just its admission")
+                let count = await controller.receipts.count
+                let interrupts = await controller.receipts.interrupts
+                let reconciliations = await controller.receipts.reconciliations
+                let replacementCount = await replacement.receipts.count
+                XCTAssertEqual(count, 1)
+                XCTAssertEqual(replacementCount, 0)
+                XCTAssertEqual(kind.pendingID(on: session), successor)
+                XCTAssertEqual(reconciliations, 0, "Cancellation may not discover a later turn")
+                XCTAssertEqual(interrupts, turn == "current" && (kind == .permissions || kind == .elicitation) ? ["original-turn"] : [])
+            }
+        }
+    }
+
+    func testMissingProviderDoesNotAcknowledgePermissionsOrElicitation() throws {
+        let store = AgentSessionRuntimeStore()
+        let scope = store.makeScope()
+        let session = install(in: scope)
+        let runtime = scope.interactions(routeID: 1, approvalStore: ApplyEditsApprovalStore())
+        let captured = try command(scope, session)
+        for kind in [Kind.permissions, .elicitation] {
+            let id = kind.install(on: session)
+            let resolution: AgentPendingInteractionResolution = switch kind {
+            case .permissions: try .permissions(request: XCTUnwrap(session.pendingPermissionsRequest), decision: .decline)
+            default: try .mcpElicitation(request: XCTUnwrap(session.pendingMCPElicitationRequest), response: .init(action: .decline))
+            }
+            XCTAssertThrowsError(try runtime.applyPendingInteractionResolution(resolution, command: captured))
+            XCTAssertEqual(kind.pendingID(on: session), id)
+        }
+    }
+
+    private actor Receipts {
+        var count = 0
+        var completed = 0
+        var interrupts: [String] = []
+        var reconciliations = 0
+        private var waiter: CheckedContinuation<Void, Never>?
+        func respond(entered: XCTestExpectation?) async {
+            count += 1
+            defer { completed += 1 }
+            guard let entered else { return }
+            await withCheckedContinuation { waiter = $0
+                entered.fulfill()
+            }
+        }
+
+        func release() {
+            waiter?.resume()
+            waiter = nil
+        }
+
+        func interrupt(_ id: String) {
+            interrupts.append(id)
+        }
+
+        func reconcile() {
+            reconciliations += 1
+        }
+    }
+
+    private final class ResponseController: CodexSessionControllerPassiveStubDefaults {
+        let receipts = Receipts()
+        let entered: XCTestExpectation?
+        init(entered: XCTestExpectation? = nil) {
+            self.entered = entered
+        }
+
+        var events: AsyncStream<CodexNativeSessionController.Event> {
+            AsyncStream { $0.finish() }
+        }
+
+        func shutdown() async {}
+        func respondToServerRequest(id _: CodexAppServerRequestID, result _: [String: Any]) async {
+            await receipts.respond(entered: entered)
+        }
+
+        func interruptUserTurn(expectedTurnID: String) async throws -> CodexTurnInterruptReceipt {
+            await receipts.interrupt(expectedTurnID)
+            return .init(interruptedTurnID: expectedTurnID)
+        }
+
+        func reconcileAndInterruptCurrentTurn() async throws -> CodexTurnInterruptReceipt {
+            await receipts.reconcile()
+            return .init(interruptedTurnID: "later-turn")
+        }
     }
 }

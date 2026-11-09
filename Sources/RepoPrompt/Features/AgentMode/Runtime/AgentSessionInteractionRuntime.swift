@@ -21,13 +21,10 @@ enum AgentRunInteractionStateChangeReason: String, Equatable {
 @MainActor
 final class AgentSessionInteractionRuntime {
     private(set) weak var scope: AgentSessionRuntimeStore.Scope?
-    private(set) weak var codexCommands: CodexAgentModeCoordinator?
     private(set) weak var claudeCommands: ClaudeAgentModeCoordinator?
 
-    func installProviderCommands(codex: CodexAgentModeCoordinator, claude: ClaudeAgentModeCoordinator) {
-        precondition(codexCommands == nil || codexCommands === codex)
+    func installClaudeCancellationCommands(_ claude: ClaudeAgentModeCoordinator) {
         precondition(claudeCommands == nil || claudeCommands === claude)
-        codexCommands = codex
         claudeCommands = claude
     }
 

@@ -778,6 +778,7 @@ final class ACPApprovalAvailabilityTests: XCTestCase {
         )
         addTeardownBlock { @MainActor in await context.cleanup() }
         let viewModel = context.window.agentModeViewModel
+        let command = try XCTUnwrap(viewModel.runtimeCommand(sessionID: XCTUnwrap(context.session.activeAgentSessionID)))
         for available in [false, true] {
             let request = approval(available: available)
             context.session.pendingApproval = request
@@ -806,17 +807,17 @@ final class ACPApprovalAvailabilityTests: XCTestCase {
                     XCTAssertEqual(context.session.pendingApproval, request)
                 }
             }
-            let submitted = viewModel.submitApprovalDecision(tabID: context.session.tabID, requestID: request.id, decision: .accept)
+            let submitted = viewModel.interactionRuntime.submitApprovalDecision(command: command, requestID: request.id, decision: .accept)
             XCTAssertEqual(submitted, available)
             if !available {
                 XCTAssertEqual(context.session.pendingApproval, request)
                 XCTAssertEqual(context.session.runState, .waitingForApproval)
-                viewModel.submitApprovalDecision(tabID: context.session.tabID, decision: .accept)
-                XCTAssertEqual(context.session.pendingApproval, request, "Unchecked/batch callers must not consume the prompt")
+                XCTAssertFalse(viewModel.interactionRuntime.submitApprovalDecision(command: command, requestID: request.id, decision: .accept))
+                XCTAssertEqual(context.session.pendingApproval, request, "Repeated rejected responses must not consume the prompt")
             }
             for decision: AgentApprovalDecision in [.acceptForSession, .acceptWithExecpolicyAmendment("remember"), .decline] {
                 context.session.pendingApproval = request
-                XCTAssertTrue(viewModel.submitApprovalDecision(tabID: context.session.tabID, requestID: request.id, decision: decision))
+                XCTAssertTrue(viewModel.interactionRuntime.submitApprovalDecision(command: command, requestID: request.id, decision: decision))
             }
         }
     }
@@ -1179,7 +1180,7 @@ final class CodexApprovalChoiceTests: XCTestCase {
             XCTAssertEqual(session.runState, .waitingForApproval)
         }
         for decision: AgentApprovalDecision in [.acceptForSession, .decline, .acceptWithExecpolicyAmendment(#"["git"]"#)] {
-            XCTAssertFalse(viewModel.submitApprovalDecision(tabID: session.tabID, requestID: plain.id, decision: decision))
+            XCTAssertFalse(try viewModel.interactionRuntime.submitApprovalDecision(command: runtimeCommand(in: context), requestID: plain.id, decision: decision))
             XCTAssertThrowsError(try viewModel.interactionRuntime.applyPendingInteractionResolution(.approval(request: plain, decision: decision), command: runtimeCommand(in: context)))
             XCTAssertEqual(session.pendingApproval, plain)
             XCTAssertEqual(session.runState, .waitingForApproval)
@@ -1189,7 +1190,7 @@ final class CodexApprovalChoiceTests: XCTestCase {
         )
         install(amendment, in: context)
         XCTAssertThrowsError(try viewModel.interactionRuntime.applyPendingInteractionResolution(stale, command: runtimeCommand(in: context)))
-        XCTAssertFalse(viewModel.submitApprovalDecision(tabID: session.tabID, requestID: plain.id, decision: .accept))
+        XCTAssertFalse(try viewModel.interactionRuntime.submitApprovalDecision(command: runtimeCommand(in: context), requestID: plain.id, decision: .accept))
         XCTAssertEqual(session.pendingApproval, amendment)
         XCTAssertEqual(session.runState, .waitingForApproval)
 
@@ -1237,7 +1238,7 @@ final class CodexApprovalChoiceTests: XCTestCase {
             try viewModel.interactionRuntime.applyPendingInteractionResolution(resolution, command: runtimeCommand(in: context))
             XCTAssertNil(session.pendingApproval)
             XCTAssertNotEqual(session.runState, .waitingForApproval)
-            XCTAssertFalse(viewModel.submitApprovalDecision(tabID: session.tabID, requestID: request.id, decision: .cancel))
+            XCTAssertFalse(try viewModel.interactionRuntime.submitApprovalDecision(command: runtimeCommand(in: context), requestID: request.id, decision: .cancel))
             XCTAssertThrowsError(try viewModel.interactionRuntime.applyPendingInteractionResolution(resolution, command: runtimeCommand(in: context)))
         }
         await fulfillment(of: [sent], timeout: 3)

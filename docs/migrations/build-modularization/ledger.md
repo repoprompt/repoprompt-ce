@@ -6282,3 +6282,63 @@ Merged-tree validation:
 No full-suite or hosted-CI success is claimed for M9.2b. The overseer reports #1659 green at this
 base; this lane did not read CI logs. The previously frozen endpoint/incarnation and run-ownership
 paths may be worked on after this validated integration, as authorized. M9.2b remains incomplete.
+
+#### M9.2b checkpoint 5 — provider-response body cutover (validation in progress)
+
+The interaction runtime now owns the actual Codex/Claude/ACP approval, Codex permissions,
+MCP elicitation and user-input response bodies. Each explicit response synchronously checks its
+captured writer command and pending interaction UUID, consumes once, and admits a tracked effect.
+Cards capture the command at render; notifications admit the exact addressed session. MCP and
+managed responses retain their synchronous authorization-to-consumption boundary. Permissions and
+elicitation can no longer report success when the controller route is absent or the request was
+not consumed. The coordinator response bodies, VM mutation forwarders and runtime's Codex command
+callback are deleted, rather than retained as forwarding adapters. Claude cancellation composition
+remains because provider-adoption cancellation is a separate outstanding path.
+
+A response's Boolean acknowledges **local consumption and dispatch admission**, not provider delivery.
+Controller response methods still return Void and report transport failures separately. Ordinary
+UI user-input and ACP nil-controller local settlement are pre-existing behavior preserved here.
+MCP/managed user-input requires a controller before consuming, preserving the existing missing-route
+refusal contract instead of acknowledging a response that has no provider route. Codex responses still target the captured
+controller's current transport: the client can reconnect and requests do not carry its existing
+transport generation. Ingress-stamped transport receipt validation at the client's actual write is
+**required remaining M9.2b work**, not solved by a pre-send main-actor writer check. Event-side
+auto-approvals still need their own physical receipt fence; the existing MCP-input auto-answer now
+joins its existing event handler rather than launching an untracked response task.
+
+Cancel follow-ups use only an authoritative turn tuple matching the consumed request's controller,
+thread, generation and run attempt. The old fallback that asynchronously discovered and interrupted
+a later current turn is removed. With no matching authoritative turn, cancellation settles the
+request without guessing an interrupt target. The controller's expected-turn API is the final fence.
+
+Causal coverage checks duplicate consumption, same-object claim reacquisition and raw writer
+conflicts, original-controller dispatch after replacement, successor prompt preservation, tracked
+drain completion, foreign-controller/unknown turn cancellation, missing-controller MCP refusal and
+fresh composer first-turn approval through the card's command expression. Existing computer-use,
+ACP and approval-choice assertions remain. The unchecked VM approval overload is retired; its
+rejection assertion now exercises a repeated captured-command denial instead. Production run-start
+already commits fresh creation and admits a restored command before dispatch; no creation bypass
+was introduced. Review was performed once for this slice; its drain-witness and turn-tuple hardening
+recommendations were incorporated. No transport exactness or full M9.2b completion is claimed.
+
+Initial focused validation caught and repaired obsolete test references to retired APIs, three
+nonisolated test-table helpers accessing main-actor session state, a missing-provider managed-input
+acknowledgement regression, and a coordinator fixture's attempt still tied to its pre-binding
+identity. The fixture now explicitly opens and asserts an attempt for its restored binding; terminal
+publication/turn-count assertions are unchanged. No timing budgets were adjusted.
+
+Checkpoint validation before integrating the next M9.2a base:
+- Focused `c3b13943-6d01-4223-aa59-65c6fb763449`: **129 passed, zero failures**, including the
+  three new response-command tests and the fresh-composer first-provider-approval witness.
+- Scoped pinned formatting and strict lint passed; the three response-command tests were then
+  consolidated unchanged into the existing provider-effects test file to preserve the testable-app
+  import-file ratchet (**339**, not **340**). The resulting **13 Swift files** were scoped-checked
+  again; executable test names and behavioral assertions are unchanged. Full lint
+  `164ca997-3f5d-4c18-82bb-a49ea80efcaf` passed; subsequent test-fixture/route fixes were scoped
+  formatted and linted again.
+- Actual compile logs show at most **4** VM warning occurrences and **17** in
+  `CodexResumeWedgeCommitTests.swift`, with zero in the other touched files. The exact `ddf34184a`
+  baseline compile (`924b06e8…`) has the same **4/17** counts; no positive occurrence deltas.
+- The broader SessionLinks/isolated-handoff, product and fresh-index push gates are still required
+  after the requested normal integration of the updated M9.2a branch. This is not a push or a
+  complete M9.2b validation receipt.
