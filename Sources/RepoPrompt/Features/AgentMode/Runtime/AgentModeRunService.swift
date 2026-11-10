@@ -268,6 +268,7 @@ final class AgentModeRunService {
     func prepareRun(
         tabID: UUID,
         session: AgentTabSession,
+        origin: AgentSessionRuntimeStore.Command,
         workspace: AgentRunWorkspaceInput,
         initialUserMessage: String,
         initialMessageForRun: String,
@@ -291,9 +292,13 @@ final class AgentModeRunService {
         }
         var candidateTransferred = false
         defer {
-            if !candidateTransferred {
+            if !candidateTransferred, origin.writer.session === session, origin.writer.ownsPersistentClaim {
                 session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
             }
+        }
+        guard case .restored = origin.requirement, origin.writer.session === session, origin.isCurrent else {
+            startOutcome?.recordStartFailure(message: nil)
+            return .completed(nil)
         }
         guard stopFence?.permitsStart(of: session) ?? true else {
             startOutcome?.recordStartFailure(message: "This scheduled run was cancelled by Stop.")
@@ -417,6 +422,7 @@ final class AgentModeRunService {
             let resources = await acpRunner.prepareRun(
                 tabID: tabID,
                 session: session,
+                origin: origin,
                 workspace: workspace,
                 initialUserMessage: initialUserMessage,
                 initialMessageForRun: initialMessageForRun,
@@ -430,6 +436,10 @@ final class AgentModeRunService {
             )
             if let resources {
                 return .resources(resources)
+            }
+            guard origin.writer.ownsPersistentClaim else {
+                startOutcome?.recordStartFailure(message: nil)
+                return .completed(nil)
             }
             recordNonCodexStartOutcome(startOutcome, session: session)
             return .completed(nil)

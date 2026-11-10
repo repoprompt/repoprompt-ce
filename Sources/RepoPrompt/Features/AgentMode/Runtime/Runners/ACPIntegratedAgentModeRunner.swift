@@ -179,6 +179,7 @@ final class ACPIntegratedAgentModeRunner {
     func prepareRun(
         tabID: UUID,
         session: AgentTabSession,
+        origin: AgentSessionRuntimeStore.Command,
         workspace: AgentRunWorkspaceInput,
         initialUserMessage: String,
         initialMessageForRun: String,
@@ -191,7 +192,8 @@ final class ACPIntegratedAgentModeRunner {
         localComposerCandidate: UUID? = nil
     ) async -> AgentRunResourceRequest? {
         var candidateTransferred = false
-        defer { if !candidateTransferred { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) } }
+        defer { if !candidateTransferred, origin.writer.session === session, origin.writer.ownsPersistentClaim { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) } }
+        guard case .restored = origin.requirement, origin.writer.session === session, origin.isCurrent else { return nil }
         guard session.operationAdmissionFailureMessage == nil else { return nil }
         guard stopFence?.permitsStart(of: session) ?? true else { return nil }
         let attachmentReservationID = hooks.attachments.reserveAttachmentsForTurn(attachments, session)
@@ -221,7 +223,7 @@ final class ACPIntegratedAgentModeRunner {
         )
         var handedToRunTask = false
         defer {
-            if let dedicatedNoteID, !handedToRunTask {
+            if let dedicatedNoteID, !handedToRunTask, origin.writer.ownsPersistentClaim {
                 AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(
                     dedicatedNoteID, session: session
                 ) { hooks.persistence.scheduleSave(session) }
@@ -297,27 +299,40 @@ final class ACPIntegratedAgentModeRunner {
             await existingController.shutdown()
             guard isStartupStillCurrent(session: session, runAttemptID: runAttemptID) else { return nil }
         }
+        guard origin.writer.ownsPersistentClaim else {
+            startOutcome?.recordStartFailure(message: nil)
+            return nil
+        }
         let runID = AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
         let lease = makeLease(runID)
         guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else { return nil }
 
         let stillCurrent = { [self] in
-            session.currentRestorationBindingToken == binding
+            origin.isCurrent && session.currentRestorationBindingToken == binding
                 && isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID)
                 && (stopFence?.permitsStart(of: session) ?? true)
         }
-        let refuse: () async -> Void = { [self] in
-            session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
-            if session.currentRestorationBindingToken == binding {
-                await cancelBeforeProviderSend(
-                    session: session,
-                    runID: runID,
-                    runAttemptID: runAttemptID,
-                    attachmentReservationID: attachmentReservationID
-                )
+        // Construction owns this not-yet-acquired lease and any uninstalled controller. Losing
+        // the writer does not authorize terminal publication or attachment mutation on a new claim.
+        let abandon: (String?) async -> Void = { [self] errorText in
+            if origin.writer.ownsPersistentClaim, session.currentRestorationBindingToken == binding {
+                session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
+                if let errorText {
+                    await failBeforeProviderSend(
+                        tabID: tabID, session: session, runID: runID, runAttemptID: runAttemptID,
+                        attachmentReservationID: attachmentReservationID, errorText: errorText
+                    )
+                } else {
+                    await cancelBeforeProviderSend(
+                        session: session, runID: runID, runAttemptID: runAttemptID,
+                        attachmentReservationID: attachmentReservationID
+                    )
+                }
             }
+            startOutcome?.recordStartFailure(message: nil)
             await lease.cancelAndCleanup()
         }
+        let refuse: () async -> Void = { await abandon(nil) }
         candidateTransferred = true
         return .acpProvider(
             agent: runRequest.agentKind,
@@ -327,7 +342,7 @@ final class ACPIntegratedAgentModeRunner {
                 refused: refuse,
                 receive: { [self, session] result in
                     var candidateTransferred = false
-                    defer { if !candidateTransferred { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) } }
+                    defer { if !candidateTransferred, origin.writer.session === session, origin.writer.ownsPersistentClaim { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) } }
                     guard stillCurrent() else {
                         await refuse()
                         return nil
@@ -335,52 +350,22 @@ final class ACPIntegratedAgentModeRunner {
                     let provider: any ACPAgentProvider
                     do {
                         guard let created = try result.get() else {
-                            await failBeforeProviderSend(
-                                tabID: tabID,
-                                session: session,
-                                runID: runID,
-                                runAttemptID: runAttemptID,
-                                attachmentReservationID: attachmentReservationID,
-                                errorText: "No ACP provider is registered for \(runRequest.agentKind.displayName)."
-                            )
-                            await lease.cancelAndCleanup()
+                            await abandon("No ACP provider is registered for \(runRequest.agentKind.displayName).")
                             return nil
                         }
                         provider = created
                     } catch {
-                        await failBeforeProviderSend(
-                            tabID: tabID,
-                            session: session,
-                            runID: runID,
-                            runAttemptID: runAttemptID,
-                            attachmentReservationID: attachmentReservationID,
-                            errorText: "ACP provider construction failed: \(error.localizedDescription)"
-                        )
-                        await lease.cancelAndCleanup()
+                        await abandon("ACP provider construction failed: \(error.localizedDescription)")
                         return nil
                     }
                     let support: ACPSupportResult
                     do {
                         support = try await provider.support(for: freshRunRequest)
                     } catch is CancellationError {
-                        await cancelBeforeProviderSend(
-                            session: session,
-                            runID: runID,
-                            runAttemptID: runAttemptID,
-                            attachmentReservationID: attachmentReservationID
-                        )
-                        await lease.cancelAndCleanup()
+                        await abandon(nil)
                         return nil
                     } catch {
-                        await failBeforeProviderSend(
-                            tabID: tabID,
-                            session: session,
-                            runID: runID,
-                            runAttemptID: runAttemptID,
-                            attachmentReservationID: attachmentReservationID,
-                            errorText: "ACP support preflight failed: \(error.localizedDescription)"
-                        )
-                        await lease.cancelAndCleanup()
+                        await abandon("ACP support preflight failed: \(error.localizedDescription)")
                         return nil
                     }
                     guard stillCurrent() else {
@@ -388,15 +373,7 @@ final class ACPIntegratedAgentModeRunner {
                         return nil
                     }
                     guard support == .supported else {
-                        await failBeforeProviderSend(
-                            tabID: tabID,
-                            session: session,
-                            runID: runID,
-                            runAttemptID: runAttemptID,
-                            attachmentReservationID: attachmentReservationID,
-                            errorText: support.reason ?? "\(runRequest.agentKind.displayName) ACP is not available."
-                        )
-                        await lease.cancelAndCleanup()
+                        await abandon(support.reason ?? "\(runRequest.agentKind.displayName) ACP is not available.")
                         return nil
                     }
                     candidateTransferred = true
@@ -408,23 +385,20 @@ final class ACPIntegratedAgentModeRunner {
                             refused: refuse,
                             receive: { [self, session] result in
                                 var candidateTransferred = false
-                                defer { if !candidateTransferred { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) } }
+                                defer { if !candidateTransferred, origin.writer.session === session, origin.writer.ownsPersistentClaim { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) } }
                                 let controller: ACPAgentSessionController
                                 do {
                                     controller = try result.get()
                                 } catch {
-                                    await failBeforeProviderSend(
-                                        tabID: tabID,
-                                        session: session,
-                                        runID: runID,
-                                        runAttemptID: runAttemptID,
-                                        attachmentReservationID: attachmentReservationID,
-                                        errorText: "ACP controller init failed: \(error.localizedDescription)"
-                                    )
-                                    await lease.cancelAndCleanup()
+                                    await abandon("ACP controller init failed: \(error.localizedDescription)")
                                     return nil
                                 }
 
+                                guard stillCurrent() else {
+                                    await controller.shutdown()
+                                    await refuse()
+                                    return nil
+                                }
                                 await controller.setExpectedMCPRunID(runID)
                                 guard stillCurrent() else {
                                     await controller.shutdown()

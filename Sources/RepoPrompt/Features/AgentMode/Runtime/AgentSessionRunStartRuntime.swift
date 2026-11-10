@@ -342,6 +342,7 @@ final class AgentSessionRunStartRuntime {
         return await environment.composition().startRun(
             tabID: tabID,
             session: session,
+            origin: command,
             initialUserMessage: augmentedInitialMessage,
             initialMessageForRun: initialMessageForRun,
             attachments: attachments,

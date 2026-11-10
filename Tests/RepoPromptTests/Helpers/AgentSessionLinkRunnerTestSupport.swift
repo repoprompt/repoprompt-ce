@@ -390,6 +390,13 @@ final class AgentSessionLinkRunnerHarness {
         )
     }
 
+    func startCommand(for session: AgentTabSession) throws -> AgentSessionRuntimeStore.Command {
+        let id = try XCTUnwrap(session.activeAgentSessionID)
+        let command = try XCTUnwrap(host.runtimeCommand(sessionID: id))
+        XCTAssertTrue(command.writer.session === session)
+        return command
+    }
+
     func makeBoundSession(agent: AgentProviderKind) throws -> AgentModeViewModel.TabSession {
         let tabID = UUID()
         workspaces.append(AgentSessionLinkEndpointTestSupport.installWorkspace(on: host, tabID: tabID, name: "Positive runner authority"))
@@ -458,12 +465,14 @@ final class AgentSessionLinkCapturingACPProvider: ACPAgentProvider, @unchecked S
     private let lock = NSLock()
     private var captured: [AgentMessage] = []
     private var supportChecks = 0
+    private let supportOperation: (@Sendable () async throws -> ACPSupportResult)?
 
     var supportCallCount: Int {
         lock.withLock { supportChecks }
     }
 
-    init(providerID: ACPProviderID, commandPath: String, environment: [String: String] = [:]) {
+    init(providerID: ACPProviderID, commandPath: String, environment: [String: String] = [:], supportOperation: (@Sendable () async throws -> ACPSupportResult)? = nil) {
+        self.supportOperation = supportOperation
         self.providerID = providerID
         self.commandPath = commandPath
         self.environment = environment
@@ -485,6 +494,7 @@ final class AgentSessionLinkCapturingACPProvider: ACPAgentProvider, @unchecked S
 
     func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
         lock.withLock { supportChecks += 1 }
+        if let supportOperation { return try await supportOperation() }
         return .supported
     }
 

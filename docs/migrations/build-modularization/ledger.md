@@ -7315,3 +7315,55 @@ in both changed Swift files, matching their baseline. The fresh post-test index 
 receipts, not a new full publication gate. #1679 remains at `c10f85830`; the overseer requires no
 further push until its CI result is reported. #1677's merge `7717cb6bf` is noted but not integrated
 in this local checkpoint.
+
+#### M9.2e — restored startup admission and fresh ACP construction (local follow-up)
+
+The existing restored `Command` now crosses run composition and run-service admission instead of
+being discarded at that boundary. Common entry and direct ACP preparation require the exact session
+object and restored command; creating/runtime-only fixtures are not a provider-start authority.
+Fresh ACP resource preparation rechecks that command across provider construction, support lookup,
+controller construction and the expected-run-ID actor hop. An uninstalled controller is shut down;
+the captured, not-yet-acquired lease is cancelled. After claim loss, the old operation does not settle
+composer state, publish terminal state, finalize attachments or schedule a save through the new claim.
+An exclusive original claim suspended for retirement may still settle its own startup via the existing
+terminal barrier. No new manager or ownership registry is introduced, and the strong command remains
+operation-local rather than being captured by `session.agentTask` or terminal-resource closures.
+
+Claim loss does not automatically terminate or adopt the shared run attempt: its payload and reserved
+attachments remain the current claimant's responsibility. The existing Stop path can settle it even
+without an installed task/controller; the new causal witness checks that explicitly. Automatic
+claim-loss lifecycle transfer, existing-controller reuse, physical prompt admission and terminal-barrier
+revalidation after its own awaits remain OPEN. This slice does not claim full ACP/startup closure.
+The common recorder now refuses a lost claim rather than inferring acceptance from shared `.running`
+state when a runner returns without resources.
+
+Oracle review `2026-11-10/2208` requested that outcome correction, immutable actor-owned test snapshots,
+real lease run IDs and a pre-fulfillment loss witness; these are applied. One new test method covers
+queued/provider/support/controller loss and original-claim retirement, including throwing factories/
+support, no successor save/publication, release of captured resources and current-claim Stop.
+Existing runner fixtures now install real scoped/restored bindings; input-only runtime workspace tests
+and all existing assertions/budgets remain. The expected-run-ID hop is source-fenced but no additional
+controller test seam was added for a suspension inside that hop.
+
+Initial ticket `a866f913-db03-49d5-8cb9-f9977fd6816d` failed compilation on 13 missed test-only
+Claude composition calls. They now pass their already restored fixture writer. Ticket
+`c99a8934-8c28-4b65-a026-4ba0539ae0a9` compiled and executed 368 tests with one fixture assertion
+failure: the migrated ACP fixture was already restored, so its conditional nil-binding setup no longer
+invalidated readiness. The test now explicitly reinstalls the same scoped binding before the unchanged
+pre-restoration assertion. Final ticket `88f8819e-d764-4c10-938a-66b95ab0843b` passed **368 tests,
+zero failures or skips**, including the seven-variant resource-loss witness (0.262s), real ACP/Claude
+runner paths, self-compaction, waiting ownership, Auto-wake and restoration admission.
+
+Full lint's first attempt `5a4146df-ae38-44c7-80a1-1184ed974a86` timed out in an unchanged formatter
+rule/file; retry `0b5e26b3-da28-4af8-9cc2-c6e87c3114a8` passed without settings changes. The final
+fixture correction also passed scoped pinned formatting and strict lint. Actual compile logs across
+12 touched Swift files have no positive warning-occurrence deltas versus retained M9.2c/integrated
+baseline compilations: ACP runner 1→1, Claude lifecycle tests 1→1, ACP compact tests 1→1, AutoWake
+11→10, ACP prompt-adapter tests 1→1, other seven 0→0. The fresh post-test index check passed at
+**1,254/1,360 wrong-way edges, 53/66 largest cycle**, baseline unchanged. This is a local checkpoint,
+not a new full SessionLinks/product/live-app publication gate.
+
+The overseer subsequently confirmed fully green CI on #1679's `c10f85830`, including all three under-watch
+cases; its PR note was updated without pushing code. #1679 must stay scoped to the published binding/
+hydration work. This startup follow-up remains local for M9.2g, pending #1679's merge and separately
+instructed squash integration/publication.

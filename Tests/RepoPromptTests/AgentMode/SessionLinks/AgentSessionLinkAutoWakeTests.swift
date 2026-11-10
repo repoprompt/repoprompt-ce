@@ -6384,9 +6384,10 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         }
         fixture.session.oversight.pendingAutoWake?.phase = .preparingDispatch
         fixture.session.oversight.pendingAutoWake?.periodicComposerAttemptID = submission.id
+        let origin = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: XCTUnwrap(fixture.session.activeAgentSessionID)))
         return Task { @MainActor in
             _ = await harness.composition.startRun(
-                tabID: fixture.tabID, session: fixture.session,
+                tabID: fixture.tabID, session: fixture.session, origin: origin,
                 initialUserMessage: AgentModeViewModel.periodicWakeMessage,
                 initialMessageForRun: AgentModeViewModel.periodicWakeMessage, attachments: []
             )

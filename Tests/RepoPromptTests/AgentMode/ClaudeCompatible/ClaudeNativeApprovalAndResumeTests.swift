@@ -1695,8 +1695,8 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
         session.appendItem(row)
         let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
-        await h.host.test_composeRunService(service).startRun(
-            tabID: session.tabID, session: session, initialUserMessage: row.text,
+        try await h.host.test_composeRunService(service).startRun(
+            tabID: session.tabID, session: session, origin: h.startCommand(for: session), initialUserMessage: row.text,
             initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
         )
         await until("host input is registered") { !session.claudeExpectedTurnIDs.isEmpty }
@@ -1733,8 +1733,8 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
         session.appendItem(row)
         let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
-        await h.host.test_composeRunService(service).startRun(
-            tabID: session.tabID, session: session, initialUserMessage: row.text,
+        try await h.host.test_composeRunService(service).startRun(
+            tabID: session.tabID, session: session, origin: h.startCommand(for: session), initialUserMessage: row.text,
             initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
         )
         await until("host input is registered") { !session.claudeExpectedTurnIDs.isEmpty }
@@ -1764,8 +1764,8 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
             let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
             session.appendItem(row)
             let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
-            await h.host.test_composeRunService(service).startRun(
-                tabID: session.tabID, session: session, initialUserMessage: row.text,
+            try await h.host.test_composeRunService(service).startRun(
+                tabID: session.tabID, session: session, origin: h.startCommand(for: session), initialUserMessage: row.text,
                 initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
             )
             await until("host input is registered") { !session.claudeExpectedTurnIDs.isEmpty }
@@ -1807,8 +1807,8 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
         session.appendItem(row)
         let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
-        await h.host.test_composeRunService(service).startRun(
-            tabID: session.tabID, session: session, initialUserMessage: row.text,
+        try await h.host.test_composeRunService(service).startRun(
+            tabID: session.tabID, session: session, origin: h.startCommand(for: session), initialUserMessage: row.text,
             initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
         )
         await until("A registers") { !session.claudeExpectedTurnIDs.isEmpty }
@@ -1862,8 +1862,8 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
         session.appendItem(row)
         let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
-        await h.host.test_composeRunService(service).startRun(
-            tabID: session.tabID, session: session, initialUserMessage: row.text,
+        try await h.host.test_composeRunService(service).startRun(
+            tabID: session.tabID, session: session, origin: h.startCommand(for: session), initialUserMessage: row.text,
             initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
         )
         await until("A registers") { !session.claudeExpectedTurnIDs.isEmpty }
@@ -1922,8 +1922,8 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
         session.appendItem(row)
         let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
-        await h.host.test_composeRunService(service).startRun(
-            tabID: session.tabID, session: session, initialUserMessage: row.text,
+        try await h.host.test_composeRunService(service).startRun(
+            tabID: session.tabID, session: session, origin: h.startCommand(for: session), initialUserMessage: row.text,
             initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
         )
         await until("host input is registered") { !session.claudeExpectedTurnIDs.isEmpty }
@@ -2002,8 +2002,8 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
             let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
             session.appendItem(row)
             let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
-            await h.host.test_composeRunService(service).startRun(
-                tabID: session.tabID, session: session, initialUserMessage: row.text,
+            try await h.host.test_composeRunService(service).startRun(
+                tabID: session.tabID, session: session, origin: h.startCommand(for: session), initialUserMessage: row.text,
                 initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
             )
             await until("host input is registered") { !session.claudeExpectedTurnIDs.isEmpty }
@@ -2026,8 +2026,8 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
         session.appendItem(row)
         let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
-        await h.host.test_composeRunService(service).startRun(
-            tabID: session.tabID, session: session, initialUserMessage: row.text,
+        try await h.host.test_composeRunService(service).startRun(
+            tabID: session.tabID, session: session, origin: h.startCommand(for: session), initialUserMessage: row.text,
             initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
         )
         await until("host input is registered") { !session.claudeExpectedTurnIDs.isEmpty }
@@ -2198,7 +2198,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         await until("provider adoption has already finished") { session.runState == .running && listener.adoptionTask == nil }
         let owner = try XCTUnwrap(session.activeRunOwnership)
         let refused = AgentRunStartOutcomeRecorder()
-        await h.host.test_composeRunService(h.service).startRun(tabID: session.tabID, session: session, initialUserMessage: "contending startup", initialMessageForRun: "contending startup", attachments: [], startOutcome: refused)
+        try await h.host.test_composeRunService(h.service).startRun(tabID: session.tabID, session: session, origin: h.startCommand(for: session), initialUserMessage: "contending startup", initialMessageForRun: "contending startup", attachments: [], startOutcome: refused)
         XCTAssertFalse(refused.outcome.didStart, "Another active owner must not overwrite a startup refusal as accepted")
         XCTAssertEqual(session.activeRunOwnership, owner)
         let row = AgentChatItem.user("local after adoption", sequenceIndex: session.nextSequenceIndex)
@@ -2356,8 +2356,8 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         await h.host.claudeCoordinator.shutdownClaudeSession(session)
         await replacement.setImmediateReplyDuringSend(true)
         let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
-        await h.host.test_composeRunService(service).startRun(
-            tabID: session.tabID, session: session, initialUserMessage: "fresh replacement input",
+        try await h.host.test_composeRunService(service).startRun(
+            tabID: session.tabID, session: session, origin: h.startCommand(for: session), initialUserMessage: "fresh replacement input",
             initialMessageForRun: "fresh replacement input", attachments: [], preparedClaudeEvents: reservation
         )
         await until("fresh process answer reaches its replacement reservation") { session.runState == .completed && session.agentTask == nil }
@@ -2388,8 +2388,8 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         XCTAssertTrue(listener.subscription === reservation.subscription)
         await controller.setImmediateReplyDuringSend(true)
         let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
-        await h.host.test_composeRunService(service).startRun(
-            tabID: session.tabID, session: session, initialUserMessage: "host start",
+        try await h.host.test_composeRunService(service).startRun(
+            tabID: session.tabID, session: session, origin: h.startCommand(for: session), initialUserMessage: "host start",
             initialMessageForRun: "host start", attachments: [], preparedClaudeEvents: reservation
         )
         await until("host answer completes its sole attempt") { session.runState == .completed && session.agentTask == nil }
@@ -2505,8 +2505,8 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
             let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
             session.appendItem(row)
             let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
-            await h.host.test_composeRunService(service).startRun(
-                tabID: session.tabID, session: session, initialUserMessage: row.text,
+            try await h.host.test_composeRunService(service).startRun(
+                tabID: session.tabID, session: session, origin: h.startCommand(for: session), initialUserMessage: row.text,
                 initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
             )
             await until("host input is registered") { !session.claudeExpectedTurnIDs.isEmpty }
@@ -2856,8 +2856,8 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         }
         await controller.setImmediateReplyDuringSend(true)
         let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
-        await h.host.test_composeRunService(service).startRun(
-            tabID: session.tabID, session: session, initialUserMessage: row.text,
+        try await h.host.test_composeRunService(service).startRun(
+            tabID: session.tabID, session: session, origin: h.startCommand(for: session), initialUserMessage: row.text,
             initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
         )
         await until("ordinary saved-history attempt publishes", timeout: .seconds(120)) { terminalStarted != nil && session.agentTask == nil && session.runState == .completed && !session.runLifecycle.terminalCommitInProgress }
