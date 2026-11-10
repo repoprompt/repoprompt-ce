@@ -62,6 +62,60 @@ extension CodexAgentModeCoordinator {
     }
 }
 
+/// Direct Claude coordinator fixtures bypass runner admission. Require the same real restored
+/// writer here before exercising their existing intent/configuration assertions. This helper does
+/// not create a binding, restore a session, or synthesize an active run attempt. Older-attempt
+/// intents intentionally remain allowed here so the production stale-intent checks are exercised.
+@MainActor
+extension ClaudeAgentModeCoordinator {
+    private func test_hasRestoredWriter(_ session: AgentTabSession, file: StaticString, line: UInt) -> Bool {
+        guard let sessionID = session.activeAgentSessionID,
+              case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: sessionID),
+              writer.session === session,
+              case .success = writer.admitCommand(.restored)
+        else {
+            XCTFail("Direct Claude operation requires an exact restored writer", file: file, line: line)
+            return false
+        }
+        return true
+    }
+
+    func test_ensureClaudeNativeSession(
+        session: AgentTabSession,
+        intent: NativeSessionIntent,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async -> EnsureSessionOutcome {
+        guard test_hasRestoredWriter(session, file: file, line: line) else { return .superseded }
+        return await ensureClaudeNativeSession(session: session, intent: intent)
+    }
+
+    @discardableResult
+    func test_sendClaudeNativeMessage(
+        session: AgentTabSession,
+        text: String,
+        attachments: [AgentFileAttachment],
+        intent: NativeSessionIntent,
+        allowsCatalogRouteControllerRecovery: Bool,
+        autoEffortSelection: AutoEffortTurnSelection? = nil,
+        providerControlCommand: AgentProviderControlCommand? = nil,
+        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
+        reinstallRunRoutingPolicy: (@MainActor () async -> Bool)? = nil,
+        inputAttemptChanged: (@MainActor (Bool) -> Void)? = nil,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async -> NativeSendOutcome {
+        guard test_hasRestoredWriter(session, file: file, line: line) else { return .superseded }
+        return await sendClaudeNativeMessage(
+            session: session, text: text, attachments: attachments, intent: intent,
+            allowsCatalogRouteControllerRecovery: allowsCatalogRouteControllerRecovery,
+            autoEffortSelection: autoEffortSelection, providerControlCommand: providerControlCommand,
+            selfCompactDispatchID: selfCompactDispatchID, reinstallRunRoutingPolicy: reinstallRunRoutingPolicy,
+            inputAttemptChanged: inputAttemptChanged
+        )
+    }
+}
+
 /// Runner-level harness for the cross-window oversight prompt supplement.
 ///
 /// Builds the real `HeadlessAgentModeRunner` / `ACPIntegratedAgentModeRunner` (through

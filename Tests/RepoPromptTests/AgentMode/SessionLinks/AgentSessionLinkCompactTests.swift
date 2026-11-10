@@ -1499,7 +1499,7 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
         let runIntent = try intent(for: session)
         let binding = try XCTUnwrap(session.persistentSessionBindingIdentity)
 
-        let outcome = await viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+        let outcome = await viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
             session: session,
             text: "/compact",
             attachments: [],
@@ -1516,7 +1516,7 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
         XCTAssertEqual(sent, ["/compact"])
 
         // The supplement this turn skipped is still owed to the next ordinary turn.
-        _ = await viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+        _ = await viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
             session: session,
             text: "next turn",
             attachments: [],
@@ -1537,7 +1537,7 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
         let runIntent = try intent(for: session)
         let binding = try XCTUnwrap(session.persistentSessionBindingIdentity)
 
-        let outcome = await viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+        let outcome = await viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
             session: session,
             text: "/compact",
             attachments: [],
@@ -1567,6 +1567,8 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
             AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: admittedBinding.sessionID)
         )
 
+        // This deliberately invalidates admission before entry. Keep exercising the production
+        // refusal directly rather than letting the positive-fixture admission helper refuse it.
         let outcome = await viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
             session: session,
             text: "/compact",
@@ -1638,7 +1640,7 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
         let command = AgentProviderControlCommand.compact(
             expectedBinding: binding, expectedProviderConversation: "monitor-native-session"
         )
-        let commandOutcome = await viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+        let commandOutcome = await viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
             session: session, text: command.providerText, attachments: [], intent: commandIntent,
             allowsCatalogRouteControllerRecovery: false, providerControlCommand: command
         )
@@ -1646,7 +1648,7 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
         let note = "line one\nβeta line two"
         let noteIntent = try intent(for: session)
         let dispatchID = try armSelfNote(session: session, note: note)
-        let outcome = await viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+        let outcome = await viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
             session: session, text: AgentSelfCompactNoteEnvelope.frame(note), attachments: [],
             intent: noteIntent, allowsCatalogRouteControllerRecovery: false,
             selfCompactDispatchID: dispatchID
@@ -1680,7 +1682,7 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
             }
         )
 
-        let outcome = await viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+        let outcome = await viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
             session: session, text: AgentSelfCompactNoteEnvelope.frame("private continuation"),
             attachments: [], intent: runIntent, allowsCatalogRouteControllerRecovery: false,
             selfCompactDispatchID: dispatchID
@@ -1703,14 +1705,14 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
         let command = AgentProviderControlCommand.compact(
             expectedBinding: binding, expectedProviderConversation: "monitor-native-session"
         )
-        _ = await viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+        _ = await viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
             session: session, text: command.providerText, attachments: [], intent: commandIntent,
             allowsCatalogRouteControllerRecovery: false, providerControlCommand: command
         )
         let noteIntent = try intent(for: session)
         let dispatchID = try armSelfNote(session: session, note: "recover me")
         await controller.setFailSendAfterRecord(true)
-        let outcome = await viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+        let outcome = await viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
             session: session, text: AgentSelfCompactNoteEnvelope.frame("recover me"), attachments: [],
             intent: noteIntent, allowsCatalogRouteControllerRecovery: false,
             selfCompactDispatchID: dispatchID
@@ -1731,7 +1733,7 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
         let runIntent = try intent(for: session)
         let binding = try XCTUnwrap(session.persistentSessionBindingIdentity)
 
-        let outcome = await viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+        let outcome = await viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
             session: session,
             text: "/compact",
             attachments: [],

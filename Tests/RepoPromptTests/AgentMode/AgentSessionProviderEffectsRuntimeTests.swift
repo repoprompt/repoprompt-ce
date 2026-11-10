@@ -2120,9 +2120,12 @@ final class AgentSessionHandoffRuntimeTests: XCTestCase {
     }
 
     func testMissingRecoveryHostCannotStartContextlessClaudeReplacement() async {
+        let scope = AgentSessionRuntimeStore.shared.makeScope()
+        defer { scope.replaceSessions([:]) }
         let session = AgentTabSession(tabID: UUID())
+        scope.replaceSessions([session.tabID: session])
         session.hasLoadedPersistedState = true
-        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: UUID()))
         session.recordRestorationAuthoritative(.persistedPayloadApplied)
         session.selectedAgent = .claudeCode
         session.providerSessionID = "missing-original-session"
@@ -2138,7 +2141,7 @@ final class AgentSessionHandoffRuntimeTests: XCTestCase {
         let runID = UUID()
         session.installRunID(runID)
         let owner = session.beginRunAttempt(source: "test.handoff.missingHost")
-        let result = await coordinator.ensureClaudeNativeSession(session: session, intent: .runAttempt(ownership: owner, runID: runID))
+        let result = await coordinator.test_ensureClaudeNativeSession(session: session, intent: .runAttempt(ownership: owner, runID: runID))
         XCTAssertNotEqual(result, .ready)
         XCTAssertEqual(creations, 1, "No fresh controller without acknowledged recovery preparation")
         let attempts = await controller.startOrResumeExistingSessionIDs

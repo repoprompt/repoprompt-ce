@@ -476,7 +476,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         }, write: { writes.append($0) })
         let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller)
         let send = Task {
-            await coordinator.sendClaudeNativeMessage(
+            await coordinator.test_sendClaudeNativeMessage(
                 session: session, text: "first ordinary turn", attachments: [], intent: intent,
                 allowsCatalogRouteControllerRecovery: false
             )
@@ -672,8 +672,11 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         session.selectedAgent = .claudeCode
         session.selectedModelRaw = "claude-opus-5-5:high"
         session.hasLoadedPersistedState = true
-        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        let scope = AgentSessionRuntimeStore.shared.makeScope()
+        scope.replaceSessions([session.tabID: session])
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: UUID()))
         session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        addTeardownBlock { @MainActor in scope.replaceSessions([:]) }
         _ = try XCTUnwrap(
             session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
             "The restored conversation must be ready before exercising native configuration."
@@ -696,7 +699,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             )
             let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller)
             let send = Task {
-                await coordinator.sendClaudeNativeMessage(
+                await coordinator.test_sendClaudeNativeMessage(
                     session: session, text: "ordinary", attachments: [], intent: intent,
                     allowsCatalogRouteControllerRecovery: false
                 )
@@ -726,7 +729,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         )
         let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller)
         let send = Task {
-            await coordinator.sendClaudeNativeMessage(
+            await coordinator.test_sendClaudeNativeMessage(
                 session: session, text: "ordinary", attachments: [], intent: intent,
                 allowsCatalogRouteControllerRecovery: false
             )
@@ -752,7 +755,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                 initialized: true, controlRequest: { _ in throw failure }, write: { writes.append($0) }
             )
             let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller)
-            let outcome = await coordinator.sendClaudeNativeMessage(
+            let outcome = await coordinator.test_sendClaudeNativeMessage(
                 session: session, text: "ordinary", attachments: [], intent: intent,
                 allowsCatalogRouteControllerRecovery: false
             )
@@ -773,10 +776,10 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         }, write: { writes.append($0) })
         await replacement.test_installConfigurationTransport(initialized: true, write: { writes.append($0) })
         let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller, replacement: replacement)
-        let ready = await coordinator.ensureClaudeNativeSession(session: session, intent: intent)
+        let ready = await coordinator.test_ensureClaudeNativeSession(session: session, intent: intent)
         XCTAssertEqual(ready, .ready)
         session.selectedModelRaw = "claude-sonnet-4-6:high"
-        let outcome = await coordinator.sendClaudeNativeMessage(
+        let outcome = await coordinator.test_sendClaudeNativeMessage(
             session: session, text: "ordinary after model switch", attachments: [], intent: intent,
             allowsCatalogRouteControllerRecovery: false
         )
@@ -807,7 +810,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             initialized: true, controlRequest: { try await requests.respond($0) }, write: { writes.append($0) }
         )
         let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller)
-        let outcome = await coordinator.sendClaudeNativeMessage(
+        let outcome = await coordinator.test_sendClaudeNativeMessage(
             session: session, text: "ordinary", attachments: [], intent: intent,
             allowsCatalogRouteControllerRecovery: false,
             autoEffortSelection: .init(
@@ -866,7 +869,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             let disabled = AgentAutomationTurnAudit.Feature(configured: false, eligible: false, judgmentRequested: false, decision: .disabled)
             session.appendAutomationAudit(.init(turnID: auditID, createdAt: Date(), router: disabled, autoEffort: disabled))
             let send = Task {
-                await coordinator.sendClaudeNativeMessage(
+                await coordinator.test_sendClaudeNativeMessage(
                     session: session, text: "ordinary", attachments: [], intent: intent,
                     allowsCatalogRouteControllerRecovery: false
                 )
@@ -895,7 +898,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                 XCTAssertEqual(session.selfCompactState.active?.noteDispatchStarted, false)
                 XCTAssertEqual(session.selfCompactState.active?.note, "keep this exact note")
                 XCTAssertNil(session.selfCompactState.latest)
-                let retry = await coordinator.sendClaudeNativeMessage(
+                let retry = await coordinator.test_sendClaudeNativeMessage(
                     session: session, text: "retry", attachments: [], intent: intent,
                     allowsCatalogRouteControllerRecovery: false
                 )
@@ -929,7 +932,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             }, write: { writes.append($0) })
             let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller)
             let send = Task {
-                await coordinator.sendClaudeNativeMessage(
+                await coordinator.test_sendClaudeNativeMessage(
                     session: session, text: "ordinary", attachments: [], intent: intent,
                     allowsCatalogRouteControllerRecovery: false,
                     autoEffortSelection: .init(
@@ -968,7 +971,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         await replacement.test_installConfigurationTransport(initialized: true, write: { writes.append($0) })
         let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller, replacement: replacement)
         let send = Task {
-            await coordinator.sendClaudeNativeMessage(
+            await coordinator.test_sendClaudeNativeMessage(
                 session: session, text: "ordinary", attachments: [], intent: intent,
                 allowsCatalogRouteControllerRecovery: false
             )
@@ -2108,7 +2111,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         let runID = UUID()
         session.installRunID(runID)
         session.providerSessionID = "monitor-native-session"
-        let outcome = await harness.host.claudeCoordinator.ensureClaudeNativeSession(session: session, intent: .reconnect(runID: runID, providerSessionID: "monitor-native-session", currency: session.persistentBindingTransitionToken()))
+        let outcome = await harness.host.claudeCoordinator.test_ensureClaudeNativeSession(session: session, intent: .reconnect(runID: runID, providerSessionID: "monitor-native-session", currency: session.persistentBindingTransitionToken()))
         XCTAssertEqual(outcome, .ready)
         let installed = await harness.host.claudeCoordinator.test_installEventListener(for: session)
         if let id = controlledSessionID {

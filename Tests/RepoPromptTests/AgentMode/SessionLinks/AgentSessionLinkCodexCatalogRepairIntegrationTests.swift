@@ -3285,7 +3285,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                         session.runState = .running
                         XCTAssertTrue(vm.agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: claim.dispatchID))
                         let intent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: owner, runID: XCTUnwrap(session.runID))
-                        let outcome = await vm.test_claudeCoordinator.sendClaudeNativeMessage(session: session, text: "", attachments: [], intent: intent, allowsCatalogRouteControllerRecovery: false)
+                        let outcome = await vm.test_claudeCoordinator.test_sendClaudeNativeMessage(session: session, text: "", attachments: [], intent: intent, allowsCatalogRouteControllerRecovery: false)
                         guard outcome == .sent else {
                             XCTFail("W3 fixture Claude physical call refused: \(outcome)")
                             throw DiscoveryFailure.overseeRefused

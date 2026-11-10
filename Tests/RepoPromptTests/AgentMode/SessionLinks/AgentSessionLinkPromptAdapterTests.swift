@@ -2505,7 +2505,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             let fixture = try makeFixture(agent: .claudeCode, claudeController: controller)
             fixture.inventory.publish(revision: 1, targetCount: 1)
             let intent = try claudeRunIntent(for: fixture.session, source: "test.claude.localInput.\(mode)")
-            let startup = await fixture.viewModel.test_claudeCoordinator.ensureClaudeNativeSession(session: fixture.session, intent: intent)
+            let startup = await fixture.viewModel.test_claudeCoordinator.test_ensureClaudeNativeSession(session: fixture.session, intent: intent)
             XCTAssertEqual(startup, .ready)
             let gate = TestReleaseFence(name: "Claude final optional Read \(mode)")
             var baseline: String?
@@ -2518,7 +2518,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 return false
             }
             let send = Task { @MainActor in
-                await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+                await fixture.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
                     session: fixture.session, text: "existing task", attachments: [], intent: intent,
                     allowsCatalogRouteControllerRecovery: false
                 )
@@ -2593,7 +2593,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         observer.session.oversight.autoWakeOnUpdates = false
         observer.inventory.publish(revision: 1, targetCount: 1)
         let intent = try claudeRunIntent(for: observer.session, source: "test.retention.claude.observer")
-        let startup = await observer.viewModel.test_claudeCoordinator.ensureClaudeNativeSession(session: observer.session, intent: intent)
+        let startup = await observer.viewModel.test_claudeCoordinator.test_ensureClaudeNativeSession(session: observer.session, intent: intent)
         XCTAssertEqual(startup, .ready)
 
         let codex = MonitorFakeCodexController(dispatches: MonitorCodexDispatchRecorder())
@@ -2731,7 +2731,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             readCalls += 1
             return await bridge.proveLocalInputRead(decoration, observer: observerEndpoint)
         }
-        _ = await observer.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+        _ = await observer.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
             session: observer.session, text: "existing observer task", attachments: [], intent: intent,
             allowsCatalogRouteControllerRecovery: false
         )
@@ -2743,7 +2743,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         XCTAssertFalse(sent.contains("user_inputs_omitted="))
         XCTAssertEqual(readCalls, 1, "real exact Read proof at physical Claude Code boundary")
         XCTAssertNil(bridge.localInputDecoration(observer: observerEndpoint, inventory: inventory, baseline: baseline), "frozen owed range consumed, not vacuous receipt removal")
-        _ = await observer.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+        _ = await observer.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
             session: observer.session, text: "next independent observer task", attachments: [], intent: intent,
             allowsCatalogRouteControllerRecovery: false
         )
@@ -2764,7 +2764,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let replacementPassive = try XCTUnwrap(host.publishedPassiveNoticesByEndpoint[observerEndpoint])
         let replacementBaseline = AgentSessionLinkPrompts.rendered(.init(membershipKind: nil, inventory: inventory, passiveNotices: replacementPassive))
         XCTAssertNil(bridge.localInputDecoration(observer: observerEndpoint, inventory: inventory, baseline: replacementBaseline))
-        _ = await observer.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+        _ = await observer.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
             session: observer.session, text: "after genuine history replacement", attachments: [], intent: intent,
             allowsCatalogRouteControllerRecovery: false
         )
@@ -2917,13 +2917,13 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             for: fixture.session,
             source: "test.claude.native.supplement"
         )
-        let startup = await fixture.viewModel.test_claudeCoordinator.ensureClaudeNativeSession(
+        let startup = await fixture.viewModel.test_claudeCoordinator.test_ensureClaudeNativeSession(
             session: fixture.session,
             intent: intent
         )
         XCTAssertEqual(startup, .ready)
 
-        _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+        _ = await fixture.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
             session: fixture.session,
             text: "claude turn",
             attachments: [],
@@ -2940,7 +2940,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         )
         MonitorSupplementAssertions.assertNotPersisted(in: fixture.session)
 
-        _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+        _ = await fixture.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
             session: fixture.session,
             text: "second turn",
             attachments: [],
@@ -2959,7 +2959,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         fixture.session.claudeController = controller
         let intent = try claudeRunIntent(for: fixture.session, source: "test.claude.stale-catalog")
         // Establish ordinary launch settings before measuring catalog-triggered recycling.
-        let seed = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+        let seed = await fixture.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
             session: fixture.session, text: "seed", attachments: [],
             intent: intent, allowsCatalogRouteControllerRecovery: false
         )
@@ -2978,7 +2978,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             ),
             to: endpoint
         )
-        let outcome = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+        let outcome = await fixture.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
             session: fixture.session, text: "oversight despite stale tools", attachments: [],
             intent: intent, allowsCatalogRouteControllerRecovery: true
         )
@@ -3015,7 +3015,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             fixture.session.installRunID(UUID())
             fixture.session.claudeController = controller
             let intent = try claudeRunIntent(for: fixture.session, source: "test.claude.removing-route")
-            let seed = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            let seed = await fixture.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
                 session: fixture.session, text: "seed", attachments: [],
                 intent: intent, allowsCatalogRouteControllerRecovery: false
             )
@@ -3145,7 +3145,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         await controller.setConfigurationGate(gate)
         addTeardownBlock { await gate.open() }
         let send = Task { @MainActor in
-            await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            await fixture.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
                 session: fixture.session, text: "late first link", attachments: [],
                 intent: intent, allowsCatalogRouteControllerRecovery: false
             )
@@ -3171,7 +3171,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         await controller.setConfigurationGate(gate)
         addTeardownBlock { await gate.open() }
         let send = Task { @MainActor in
-            await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            await fixture.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
                 session: fixture.session, text: "late linked turn", attachments: [],
                 intent: intent, allowsCatalogRouteControllerRecovery: false
             )
@@ -3207,12 +3207,12 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             for: fixture.session,
             source: "test.claude.native.revocation"
         )
-        let startup = await fixture.viewModel.test_claudeCoordinator.ensureClaudeNativeSession(
+        let startup = await fixture.viewModel.test_claudeCoordinator.test_ensureClaudeNativeSession(
             session: fixture.session,
             intent: intent
         )
         XCTAssertEqual(startup, .ready)
-        _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+        _ = await fixture.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
             session: fixture.session,
             text: "linked",
             attachments: [],
@@ -3221,7 +3221,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         )
 
         fixture.inventory.publish(revision: 2, targetCount: 0)
-        _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+        _ = await fixture.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
             session: fixture.session,
             text: "after revoke",
             attachments: [],
@@ -3242,7 +3242,10 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
-        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        let scope = AgentSessionRuntimeStore.shared.makeScope()
+        defer { scope.replaceSessions([:]) }
+        scope.replaceSessions([session.tabID: session])
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: UUID()))
         session.recordRestorationAuthoritative(.persistedPayloadApplied)
         _ = try XCTUnwrap(
             session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
@@ -3252,7 +3255,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         session.claudeController = fake
         let intent = try claudeRunIntent(for: session, source: "test.claude.lost-fake-refusal")
 
-        let outcome = await coordinator.ensureClaudeNativeSession(session: session, intent: intent)
+        let outcome = await coordinator.test_ensureClaudeNativeSession(session: session, intent: intent)
 
         guard case let .failed(message) = outcome else {
             return XCTFail("Losing a fake must refuse real provider launch, got \(outcome)")
@@ -3294,7 +3297,10 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
-        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        let scope = AgentSessionRuntimeStore.shared.makeScope()
+        defer { scope.replaceSessions([:]) }
+        scope.replaceSessions([session.tabID: session])
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: UUID()))
         session.recordRestorationAuthoritative(.persistedPayloadApplied)
         _ = try XCTUnwrap(
             session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
@@ -3338,13 +3344,13 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             ),
             providerBindingService: AgentModeProviderBindingService()
         )
-        let initialSessionOutcome = await coordinator.ensureClaudeNativeSession(
+        let initialSessionOutcome = await coordinator.test_ensureClaudeNativeSession(
             session: session,
             intent: intent
         )
         XCTAssertEqual(initialSessionOutcome, .ready)
 
-        let outcome = await coordinator.sendClaudeNativeMessage(
+        let outcome = await coordinator.test_sendClaudeNativeMessage(
             session: session,
             text: "steer active run",
             attachments: [],
@@ -3593,7 +3599,10 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
-        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        let scope = AgentSessionRuntimeStore.shared.makeScope()
+        defer { scope.replaceSessions([:]) }
+        scope.replaceSessions([session.tabID: session])
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: UUID()))
         session.recordRestorationAuthoritative(.persistedPayloadApplied)
         _ = try XCTUnwrap(
             session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
@@ -3647,7 +3656,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             providerBindingService: providerBindingService
         )
 
-        let outcome = await coordinator.sendClaudeNativeMessage(
+        let outcome = await coordinator.test_sendClaudeNativeMessage(
             session: session,
             text: "continue oversight",
             attachments: [],

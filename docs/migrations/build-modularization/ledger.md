@@ -7988,3 +7988,36 @@ compiler warning occurrences (maximum of initial/final compiles) match integrate
 Claude runner 3, AutoWake 11. Fresh index passed at **1,262/1,360 wrong-way edges and 53/66 largest
 cycle**, unchanged baseline. Local qualification only; no both-product/full-SessionLinks, live-app,
 release, sanitizer or hosted-CI qualification for this checkpoint. Nothing pushed to #1679.
+
+### M9.2g local prerequisite — explicit Claude coordinator fixture admission (2026-11-11)
+
+Direct Claude ensure/send tests now use test-only forwarding helpers that require an exact unique
+restored writer. They do not manufacture a binding, restoration proof, scope or run attempt, and
+preserve deliberately stale run intents for the production intent checks. The intentional
+pre-entry rebind refusal test still calls production directly so the positive-fixture helper
+cannot mask that contract. Its future required receipt must be captured before the rebind.
+No production signature or behavior changed; this is preparation for the coupled startup,
+queued-steering and reconnect receipt cutover, not closure of those remaining paths.
+
+Six standalone fixture locations now retain real shared-store scopes with fresh workspace/session
+identities and their existing restoration proof; teardown explicitly removes membership. The
+periodic resume fixture already belongs to its VM scope and now uses a workspace-qualified binding.
+The shared store holds scopes weakly, observes binding changes after membership installation, and
+VM fixtures use that shared store; no fallback or alternate test authority was added. Existing
+configuration, recovery, route, stale-intent and physical-send assertions are retained. No executable
+tests were added, removed or renamed. One Oracle review (`0546`, chat `6F1A83`) found no P0/P1 issue;
+its lifetime/lookup questions were source-checked, teardown made explicit, and the stale-intent
+exception documented. The prior plan's unconditionally clearing a steering task slot was rejected:
+Stop and cancellation can replace that slot, so later work must pin the installed task identity.
+
+Initial affected `c5c1c813-80a9-499a-a7f7-9d8a47c8929d` executed 309 tests with four skips and two
+assertions in one periodic-resume fixture: its binding lacked a workspace, so the new positive
+admission helper refused it. Correcting that fixture, without relaxing either periodic refusal or
+ordinary recovery expectations, yielded final `62d77592-864e-4c56-b87d-65d5cbbc789a`: **309 tests,
+four skips, zero failures** (119.899s). All eight affected suite families ran. Full lint
+`9dd529e8-8102-433f-ac2b-1c1217705e72` and scoped pinned formatting/strict lint passed. Actual compiler
+warning occurrences (maximum of the initial/final compiles) match integrated `a0c674e9`: approval/
+resume tests 1, AutoWake 11, catalog integration 2, prompt adapter 6, other four touched Swift files
+zero. Fresh index passed at **1,262/1,360 wrong-way edges and 53/66 largest cycle**, unchanged baseline.
+These are local fixture gates, not full publication/product/live-app/release/sanitizer or hosted-CI
+qualification. Nothing pushed to #1679.

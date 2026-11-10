@@ -6754,7 +6754,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             )
             let session = host.session(for: fixture.tabID)
             session.hasLoadedPersistedState = true
-            session.testInstallPersistentSessionBinding(sessionID: UUID())
+            session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: UUID()))
             session.recordRestorationAuthoritative(.persistedPayloadApplied)
             XCTAssertNil(session.operationAdmissionFailureMessage)
             session.oversight.pendingAutoWake = fixture.session.oversight.pendingAutoWake
@@ -6765,7 +6765,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             let runID = UUID()
             session.installRunID(runID)
             let ownership = session.beginRunAttempt(source: "test.periodic.resume")
-            let result = await coordinator.ensureClaudeNativeSession(
+            let result = await coordinator.test_ensureClaudeNativeSession(
                 session: session, intent: .runAttempt(ownership: ownership, runID: runID)
             )
             let originalAttempts = await controller.startOrResumeExistingSessionIDs
@@ -6780,7 +6780,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 XCTAssertEqual(result, .ready)
                 XCTAssertEqual(attempts, ["missing-original-session", nil])
                 XCTAssertEqual(creations, 2)
-                let sent = await coordinator.sendClaudeNativeMessage(
+                let sent = await coordinator.test_sendClaudeNativeMessage(
                     session: session, text: "Continue", attachments: [],
                     intent: .runAttempt(ownership: ownership, runID: runID),
                     allowsCatalogRouteControllerRecovery: false
@@ -7753,7 +7753,7 @@ extension AgentSessionLinkAutoWakeTests {
         addTeardownBlock { await gate.open() }
         let intent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: owner, runID: XCTUnwrap(fixture.session.runID))
         let producer = Task { @MainActor in
-            await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            await fixture.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
                 session: fixture.session, text: "", attachments: [], intent: intent,
                 allowsCatalogRouteControllerRecovery: false
             )
@@ -7939,7 +7939,7 @@ extension AgentSessionLinkAutoWakeTests {
         }
         let firstIntent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: firstOwner, runID: XCTUnwrap(fixture.session.runID))
         let w1 = Task { @MainActor in
-            await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            await fixture.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
                 session: fixture.session, text: "", attachments: [], intent: firstIntent, allowsCatalogRouteControllerRecovery: false
             )
         }
@@ -7954,7 +7954,7 @@ extension AgentSessionLinkAutoWakeTests {
         let secondOwner = try beginAndAcquireQuietWake(fixture, claim: second)
         let secondIntent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: secondOwner, runID: XCTUnwrap(fixture.session.runID))
         let w2 = Task { @MainActor in
-            await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            await fixture.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
                 session: fixture.session, text: "", attachments: [], intent: secondIntent, allowsCatalogRouteControllerRecovery: false
             )
         }
@@ -8197,7 +8197,7 @@ extension AgentSessionLinkAutoWakeTests {
         let claim = try reserveQuietWake(observer)
         let owner = try beginAndAcquireQuietWake(observer, claim: claim)
         let intent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: owner, runID: XCTUnwrap(observer.session.runID))
-        _ = await observer.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+        _ = await observer.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
             session: observer.session, text: "", attachments: [], intent: intent, allowsCatalogRouteControllerRecovery: false
         )
         let physical = await observer.nativeController.sentMessages
@@ -8441,7 +8441,7 @@ extension AgentSessionLinkAutoWakeTests {
                             let owner = fixture.session.beginRunAttempt(source: "test.copy.primer")
                             fixture.session.runState = .running
                             let intent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: owner, runID: XCTUnwrap(fixture.session.runID))
-                            _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+                            _ = await fixture.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
                                 session: fixture.session, text: "primer", attachments: [], intent: intent, allowsCatalogRouteControllerRecovery: false
                             )
                             XCTAssertTrue(fixture.session.endRunAttempt(ifCurrent: owner, source: "test.copy.primer.finished"))
@@ -8459,7 +8459,7 @@ extension AgentSessionLinkAutoWakeTests {
                         XCTAssertFalse(claim.routineQuietCheckIn, "Routine opportunity alone cannot substitute for current returned-definition evidence")
                         let owner = try beginAndAcquireQuietWake(fixture, claim: claim)
                         let intent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: owner, runID: XCTUnwrap(fixture.session.runID))
-                        _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+                        _ = await fixture.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
                             session: fixture.session, text: "", attachments: [], intent: intent, allowsCatalogRouteControllerRecovery: false
                         )
                         let sent = await fixture.nativeController.sentMessages
@@ -8615,7 +8615,7 @@ extension AgentSessionLinkAutoWakeTests {
                     try await AsyncTestWait.waitUntil("failing ring running frame accepted") { await bridge.test_pairedRunStatus(for: endpoint) == .running }
                     if fixture.session.selectedAgent == .claudeCode {
                         let intent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: owner, runID: XCTUnwrap(fixture.session.runID))
-                        let outcome = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(session: fixture.session, text: "", attachments: [], intent: intent, allowsCatalogRouteControllerRecovery: false)
+                        let outcome = await fixture.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(session: fixture.session, text: "", attachments: [], intent: intent, allowsCatalogRouteControllerRecovery: false)
                         guard case .failed = outcome else { return XCTFail("Expected physical Claude failure, got \(outcome)") }
                         _ = await AgentRunTerminalCommitBarrier().commit(.init(
                             binding: terminal.hooks.bindTerminalSession(fixture.session), ownership: owner, expectedRunID: fixture.session.runID,
@@ -8683,7 +8683,7 @@ extension AgentSessionLinkAutoWakeTests {
         let owner = try beginAndAcquireQuietWake(fixture, claim: claim)
         await fixture.nativeController.setFailSendAfterRecord(true)
         let intent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: owner, runID: XCTUnwrap(fixture.session.runID))
-        _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(session: fixture.session, text: "", attachments: [], intent: intent, allowsCatalogRouteControllerRecovery: false)
+        _ = await fixture.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(session: fixture.session, text: "", attachments: [], intent: intent, allowsCatalogRouteControllerRecovery: false)
         let sendsAfterFailure = await fixture.nativeController.sentMessages.count
         XCTAssertGreaterThan(sendsAfterFailure, 0)
         let suppressed = try XCTUnwrap(fixture.session.oversight.suppressedWakeFingerprint)
