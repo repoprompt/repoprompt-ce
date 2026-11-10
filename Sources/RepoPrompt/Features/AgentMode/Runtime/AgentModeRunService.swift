@@ -358,6 +358,7 @@ final class AgentModeRunService {
             let outcome = await codexRunner.startRun(
                 tabID: tabID,
                 session: session,
+                origin: origin,
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,
                 fallbackContext: codexFallbackContext,

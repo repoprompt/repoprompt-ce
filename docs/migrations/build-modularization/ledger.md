@@ -7821,3 +7821,44 @@ Actual compiler occurrence counts across both compiles: runner 1 (baseline 1), A
 (baseline 11), execution tests/harness 0 (baseline 0); no positive deltas. Fresh index passed at
 **1,261/1,360 wrong-way edges and 53/66 largest cycle**, unchanged. Local qualification only;
 no both-product/full-SessionLinks/live-app/hosted-CI claim. No push to #1679.
+
+### M9.2g local checkpoint — Codex wrapper admission and cleanup (2026-11-11)
+
+The service now passes its actual restored Command to the Codex runner. Persistent work retains only
+an exact weak WriterReceipt, checks it before MCP preparation and after its await, and requires the
+original ACTIVE attempt at coordinator entry. An exact terminal receipt authorizes cleanup only,
+never dispatch. Periodic classification is captured before the await. Lost-claim/successor exits
+cannot publish handoff results, end a successor attempt, re-park its dedicated note, or clear its task.
+The wrapper slot is cleared after joining the send task only if Task identity and the original claim
+still match. Busy/idle readers may observe the slot through that final join rather than its old inner
+defer; the caller still returns only after its own slot cleanup.
+
+Wrapper-owned MCP failure or suspended admission restores ONLY its still-reserved exact attachment ID
+before ending a locally-created attempt. This fixes the former pre-coordinator reservation leak without
+consuming unrelated deferred cleanup. Real Stop retains its terminal ownership: cancellation/fence
+refusal bypasses local terminal cleanup, and exact original cancelled-terminal return remains
+.cancelled rather than .stale. Dedicated-note re-parking occurs before local endRunAttempt because that
+operation does not create a terminal receipt. Coordinator-entered outcomes remain truthful, but their
+old-writer projections are gated; coordinator-internal awaits and physical dispatch remain OPEN.
+
+One Oracle review (`0323`, chat `6F1A83`) requested proper replaceSessions fixture ABA, preservation of
+Stop outcome/settlement, successful-MCP refusal cases, terminal-note coverage and hook reentrancy
+checks; these were applied. The held-MCP matrix covers ten variants including claim reacquisition,
+retirement with new/existing attempts, same-claim successor, independently replaced task slot, original
+Stop and dedicated notes. It uses real runtime reservation hooks and actual current-owner cancelRun,
+which restored the retained reservation and cleared the task slot after claim loss. The existing note
+test now also proves coordinator entry through its exact malformed-note rejection. No live transport,
+physical-write fence or full coordinator cleanup closure is claimed; no assertions/budgets weakened.
+
+Initial focused jobs `cb312001-22b1-4a0d-821c-803f6a709ba0` and
+`dc9533f5-9cab-49f7-b4af-644fd7317c4f` failed compilation (typed stale reason and optional fixture
+Command respectively); neither is a test qualification. Final focused
+`8750103f-5320-4c3f-bf23-540cbb475153` passed 2 methods (0.714s), and affected
+`45bb14e5-f81b-49df-aa6b-dc1dd7906293` passed **404 tests, zero failures/skips** (86.024s).
+Final full lint `a8cef64a-1d4a-41b9-a285-a9f4631ddd07` passed. Actual compiler warning occurrence
+counts versus integrated `a0c674e9`: Codex runner/service/harness 0, AutoWake tests 11 (baseline 11),
+with no new touched-line diagnostics. Fresh index passed at **1,262/1,360 wrong-way edges and 53/66
+largest cycle**; the baseline was not raised. The added wrong-way file edge is the runner's exact
+`.reserved` match into `AgentModeViewModel+Types.swift` (existing attachment DTO placement); the
+WriterReceipt/Command edge into RuntimeStore is not wrong-way. No M10 extraction is claimed. Local qualification only, not both-product/full-SessionLinks,
+live-app, sanitizer or hosted-CI qualification. Nothing pushed to #1679.

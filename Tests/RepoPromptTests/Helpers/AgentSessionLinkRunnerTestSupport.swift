@@ -116,7 +116,8 @@ final class AgentSessionLinkRunnerHarness {
         codexController: (any CodexSessionControlling)? = nil,
         claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory? = nil,
         testWindowID: Int = 1,
-        testMCPServer: MCPServerViewModel? = nil
+        testMCPServer: MCPServerViewModel? = nil,
+        attachmentHooks: AgentModeRunService.AttachmentLifecycleHooks? = nil
     ) {
         self.stubSystemPrompt = stubSystemPrompt
         workspace = AgentRunWorkspaceInput(fallbackWorkspacePath: workspacePath)
@@ -185,7 +186,7 @@ final class AgentSessionLinkRunnerHarness {
                 startNonCodexTurnAccountingIfNeeded: { _, _ in },
                 finalizeNonCodexTurnUsage: { _, _, _, _ in }
             ),
-            attachments: .init(
+            attachments: attachmentHooks ?? .init(
                 reserveAttachmentsForTurn: { _, _ in nil },
                 markAttachmentsConsumed: { _, _ in
                     MainActor.assumeIsolated { harnessBox?.onAttachmentsConsumed?() }

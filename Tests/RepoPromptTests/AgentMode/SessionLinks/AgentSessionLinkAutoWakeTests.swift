@@ -1652,7 +1652,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     }
 
     func testCodexDedicatedNoteEarlyExitReparksWithoutProviderTransport() async throws {
-        for exit in ["entryStop", "mcpFailure", "stopAfterMCP"] {
+        for exit in ["entryStop", "mcpFailure", "stopAfterMCP", "coordinatorRefusal"] {
             let fixture = try makeFixture(fenceProviderLaunch: true)
             let session = fixture.session
             session.selectedAgent = .codexExec
@@ -1670,17 +1670,130 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 },
                 codexCoordinator: fixture.viewModel.test_codexCoordinator, hooks: harness.hooks
             )
-            let outcome = await runner.startRun(
-                tabID: fixture.tabID, session: session, initialMessageForRun: AgentSelfCompactNoteEnvelope.frame("continue safely"),
+            let outcome = try await runner.startRun(
+                tabID: fixture.tabID, session: session, origin: XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID)),
+                initialMessageForRun: exit == "coordinatorRefusal" ? "not the required note envelope" : AgentSelfCompactNoteEnvelope.frame("continue safely"),
                 attachments: [], fallbackContext: nil, selfCompactDispatchID: noteID, stopFence: fence
             )
             XCTAssertFalse(outcome.didSend)
+            if exit == "coordinatorRefusal" {
+                guard case let .preDispatchRejected(message) = outcome else { return XCTFail("Expected actual coordinator refusal") }
+                XCTAssertEqual(message, "Continuation note admission changed before Codex dispatch.")
+            }
+            if exit == "stopAfterMCP" { XCTAssertNotNil(session.activeRunOwnership, "Stop still owns terminal settlement") }
             XCTAssertEqual(mcpCalls, exit == "entryStop" ? 0 : 1)
             XCTAssertNil(session.codexController)
             XCTAssertEqual(session.selfCompactState.active?.id, noteID.requestID)
             XCTAssertEqual(session.selfCompactState.active?.phase, .parked)
             XCTAssertEqual(session.selfCompactState.active?.compactTurnSucceeded, true)
             XCTAssertEqual(session.selfCompactState.active?.noteDispatchStarted, false)
+        }
+    }
+
+    func testCodexMCPPreparationKeepsItsWriterAttemptTaskAndReservation() async throws {
+        for drift in ["none", "reacquire", "retire", "successor", "taskReplacement", "stop", "reacquireNote", "successorNote", "stopNote", "retireExisting"] {
+            let fixture = try makeFixture(fenceProviderLaunch: true)
+            let session = fixture.session
+            session.selectedAgent = .codexExec
+            let origin = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
+            let scope = origin.writer.scope
+            let noteID = drift.hasSuffix("Note") ? try installVerifiedParkedNote(fixture) : nil
+            if noteID != nil { session.selfCompactState.active?.phase = .dispatchingNote }
+            let attachment = AgentFileAttachment(source: .localFile(path: "/nonexistent-codex-startup-preservation.png"))
+            let harness = AgentSessionLinkRunnerHarness(
+                headlessProviderFactory: { _, _ in
+                    XCTFail("MCP refusal must not construct a provider")
+                    return AgentSessionLinkCapturingHeadlessProvider()
+                }, attachmentHooks: scope.attachments.makeRunHooks()
+            )
+            var handoffResults: [Bool] = []
+            harness.pendingHandoffSendOutcome = { _, sent in handoffResults.append(sent) }
+            var releaseMCP: CheckedContinuation<Bool, Never>?
+            let runner = CodexIntegratedAgentModeRunner(
+                mcpServerEnabler: { await withCheckedContinuation { releaseMCP = $0 } },
+                codexCoordinator: fixture.viewModel.test_codexCoordinator, hooks: harness.hooks
+            )
+            if drift == "retireExisting" { _ = session.beginRunAttempt(source: "existing") }
+            let task = Task {
+                await runner.startRun(
+                    tabID: fixture.tabID, session: session, origin: origin,
+                    initialMessageForRun: "preserve startup", attachments: [attachment], fallbackContext: nil,
+                    selfCompactDispatchID: noteID
+                )
+            }
+            try await AsyncTestWait.waitUntil("Codex MCP preparation held") { releaseMCP != nil }
+            let originalOwnership = try XCTUnwrap(session.activeRunOwnership)
+            let originalTask = try XCTUnwrap(session.agentTask)
+            let originalReservation = session.attachmentTurnState
+            guard case .reserved = originalReservation else { return XCTFail("Expected a real reservation") }
+            var replacementTask: Task<Void, Never>?
+            var replacementOwnership: AgentRunOwnership?
+            if drift.hasPrefix("reacquire") {
+                var members = scope.sessions
+                members.removeValue(forKey: session.tabID)
+                scope.replaceSessions(members)
+                members[session.tabID] = session
+                scope.replaceSessions(members)
+                XCTAssertFalse(origin.isCurrent)
+            } else if drift.hasPrefix("retire") {
+                scope.beginRetirement()
+            } else if drift.hasPrefix("successor") {
+                replacementOwnership = session.beginRunAttempt(source: "successor")
+                replacementTask = Task {}
+                session.agentTask = replacementTask
+            } else if drift == "taskReplacement" {
+                replacementTask = Task {}
+                session.agentTask = replacementTask
+            } else if drift.hasPrefix("stop") {
+                await harness.service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+                XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, originalOwnership)
+            }
+            let dirty = session.isDirty
+            releaseMCP?.resume(returning: drift.hasPrefix("reacquire") || drift.hasPrefix("successor") || drift.hasPrefix("stop"))
+            releaseMCP = nil
+            let outcome = await task.value
+            XCTAssertFalse(outcome.didSend, drift)
+            XCTAssertNil(session.codexController, drift)
+            let stale = drift.hasPrefix("reacquire") || drift.hasPrefix("successor") || drift.hasPrefix("stop")
+            if stale {
+                if drift.hasPrefix("stop") {
+                    guard case .cancelled = outcome else { return XCTFail("Expected original Stop cancellation") }
+                    if noteID != nil { XCTAssertEqual(session.selfCompactState.active?.phase, .parked, drift) }
+                } else {
+                    guard case .stale = outcome else { return XCTFail("Expected stale origin: \(drift)") }
+                }
+                XCTAssertTrue(handoffResults.isEmpty, drift)
+                if !drift.hasPrefix("stop") {
+                    XCTAssertEqual(session.attachmentTurnState, originalReservation, drift)
+                    XCTAssertEqual(session.isDirty, dirty, drift)
+                    XCTAssertEqual(session.activeRunOwnership, replacementOwnership ?? originalOwnership, drift)
+                    XCTAssertEqual(session.agentTask, replacementTask ?? originalTask, drift)
+                    if noteID != nil { XCTAssertEqual(session.selfCompactState.active?.phase, .dispatchingNote, drift) }
+                }
+            } else {
+                if drift.hasPrefix("retire") {
+                    guard case .cancelled = outcome else { return XCTFail("Expected suspended cancellation") }
+                } else {
+                    guard case .failed = outcome else { return XCTFail("Expected original MCP failure") }
+                }
+                XCTAssertEqual(handoffResults, [false], drift)
+                XCTAssertEqual(session.attachmentTurnState, .idle, drift)
+                XCTAssertTrue(session.pendingFileAttachments.contains { $0.id == attachment.id }, drift)
+                if drift == "retireExisting" {
+                    XCTAssertEqual(session.activeRunOwnership, originalOwnership, drift)
+                } else {
+                    XCTAssertNil(session.activeRunOwnership, drift)
+                }
+                XCTAssertEqual(session.agentTask, replacementTask, drift)
+            }
+            // The old task cannot reclaim its resources through a reacquired writer. The current
+            // owner's real Stop remains responsible for the retained reservation and task slot.
+            await harness.service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+            XCTAssertEqual(session.attachmentTurnState, .idle, drift)
+            XCTAssertNil(session.agentTask, drift)
+            XCTAssertTrue(session.pendingFileAttachments.contains { $0.id == attachment.id }, drift)
+            await originalTask.value
+            await replacementTask?.value
         }
     }
 
