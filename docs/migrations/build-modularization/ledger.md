@@ -8134,3 +8134,43 @@ versus integrated `a0c674e9` remain VM four and other four touched Swift files z
 passed **1,262/1,360 wrong-way edges, 53/66 largest cycle**, unchanged baselines. These are local
 focused/affected/style/index receipts, not full publication/product/live-app/release/sanitizer or
 hosted-CI qualification. Nothing pushed.
+
+### M9.2g local prerequisite — retain MCP ingress writer through effort judgment (2026-11-11)
+
+MCP dispatch captures its existing controlled Writer before effort selection and rechecks the exact
+claim/control provenance after judgment and both external initial-start validation callbacks. A
+new context installed on the same object under a reacquired claim can no longer authorize the old
+request. This is not restored-command admission: existing creation/configuration checks remain the
+first-start policy. Original persistent-claim ownership is used deliberately, not Writer.isCurrent:
+a completed restoration retry can advance the restoration generation without rotating the claim,
+and the retained control context must remain usable after the existing readiness checks succeed.
+Retirement rejects new dispatch. The already-present binding-token fence still rejects a transition
+during this operation. No new registry or compatibility bypass was added.
+
+One Oracle review (`0710`, chat `6F1A83`) requested restoration-token preservation, deactivation
+coverage, registration cleanup, and bound-creation coverage. Source confirmed the generation-only
+retry; a positive refresh variant was added. The real backend test also covers unchanged, stale
+context, successor context, deactivation and retirement. Reactivation goes through the production
+control installer, not a fabricated context. Domain registration replaces the prior UUID entry and
+does not invoke its cancellation handler; the test additionally checks no reactivation change to
+run state/task and explicitly cleans the captured predecessor registration. The external MCP
+starter commits configured creation before calling dispatch (AgentExternalMCPRunStarter); this
+patch does not admit an uncommitted creating session. That sequencing remains covered by existing
+creation suites, not a new held-judgment creation fixture. Auto-effort's internal effort-retention writes and judgment-ID/UI cleanup remain
+OPEN, as do post-submission waits, queue starter/wake/acknowledgement and physical dispatch. In
+particular currentClaudeEffortLevel is confirmed to call retainClaudeEffort; this ingress fence is
+not claimed to prevent those internal post-await writes. Initial focused
+`60d9d8d3-2775-438b-8d97-8237fcef106e` compiled but failed a new fixture assertion waiting for a
+connected provider launch. The synthetic fixture qualifies scheduled input admission, so its
+positive oracle now checks the admitted user row and recorded effort feedback; no existing timeout
+or assertion was weakened. Final focused `7371e4ee-83ff-4cfe-a7ce-baeeac49bb60` passed the single
+method's six variants (0.966s). Full lint `4c380fef-312c-42d0-a4a0-636e280e6284` passed; the
+fixture-only positive-oracle correction also passed scoped pinned formatting and strict lint.
+Affected `73482dd8-68d8-4c08-9894-442396fc9f07` passed **818 tests, zero failures** (234.936s),
+including creation/restoration, MCP Steer/resume, routing, Stop, ACP and full handoff selections.
+Actual compile warning occurrence maxima against integrated `a0c674e9` remain VM four and routing
+integration tests zero; no positive touched-file deltas. Fresh index passed **1,262/1,360 wrong-way
+edges, 53/66 largest cycle**, unchanged baseline. These are local focused/affected/style/index
+gates, not full publication/products/live-app/release/sanitizer/hosted-CI qualification. Nothing
+pushed. The successful synthetic MCP cases attest input admission and effort feedback, not physical
+provider launch. Same-writer control reactivation is not separately fenced by activation ID.

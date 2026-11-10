@@ -11481,13 +11481,24 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         preserveRoutedInitialEffort: Bool = false,
         validateInitialStart: (@MainActor () throws -> Void)? = nil
     ) async throws -> MCPInstructionDispatch {
-        guard let session = mcpControlledSession(sessionID: sessionID) else {
+        guard let originalWriter = mcpRuntime.controlledWriter(sessionID: sessionID),
+              originalWriter.ownsPersistentClaim, !originalWriter.scope.isRetiring
+        else {
             throw MCPError.invalidParams("The requested agent run is no longer active.")
+        }
+        let session = originalWriter.session
+        func requireOriginalDispatchWriter() throws {
+            // Control registration may outlive a restoration retry on the same claim.
+            // Keep that provenance, while the separate binding/admission checks qualify this turn.
+            guard originalWriter.ownsPersistentClaim, !originalWriter.scope.isRetiring,
+                  mcpRuntime.controlledWriter(sessionID: sessionID)?.identity == originalWriter.identity
+            else { throw MCPError.invalidParams("The session changed while choosing effort. Retry the turn.") }
         }
         if let message = session.operationAdmissionFailureMessage {
             throw MCPError.invalidParams(message)
         }
         try validateInitialStart?()
+        try requireOriginalDispatchWriter()
         let dispatchBindingToken = session.currentRestorationBindingToken
         guard session.autoEffortJudgmentID == nil else {
             throw MCPError.invalidParams("Auto effort is already choosing effort for this session. Retry after that turn starts.")
@@ -11520,8 +11531,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             : nil
         let autoEffortSelection = autoEffortChoice?.selection
         try Task.checkCancellation()
-        guard mcpControlledSession(sessionID: sessionID) === session,
-              session.currentRestorationBindingToken == dispatchBindingToken
+        try requireOriginalDispatchWriter()
+        guard session.currentRestorationBindingToken == dispatchBindingToken
         else {
             throw MCPError.invalidParams("The session changed while choosing effort. Retry the turn.")
         }
@@ -11529,6 +11540,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             throw MCPError.invalidParams(message)
         }
         try validateInitialStart?()
+        try requireOriginalDispatchWriter()
 
         // Classify after the async judgment: a composer turn may have started the run
         // while Jev was deciding. In that case this MCP message is steering, not a
