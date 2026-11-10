@@ -10,6 +10,8 @@ final class ACPIntegratedAgentModeRunner {
     private enum TransientOperationResult {
         case completed
         case cancelled
+        /// Reused setup was interrupted before sending; retain the warm controller.
+        case cancelledBeforeSend
         case failed(errorText: String?)
         /// A provider control command refused before anything reached the provider. It fails the run
         /// like `.failed`, but the live controller it was addressed to is left in place: nothing about
@@ -23,6 +25,8 @@ final class ACPIntegratedAgentModeRunner {
                 "state=completed error=nil"
             case .cancelled:
                 "state=cancelled error=nil"
+            case .cancelledBeforeSend:
+                "state=cancelledBeforeSend error=nil"
             case let .failed(errorText):
                 "state=failed error=\(errorText ?? "nil")"
             case let .refusedBeforeSend(errorText):
@@ -140,6 +144,9 @@ final class ACPIntegratedAgentModeRunner {
                 return .completed(assistantText: nil)
             case .cancelled:
                 throw CancellationError()
+            case .cancelledBeforeSend:
+                refusedBeforeSend = true
+                throw CancellationError()
             case let .failed(errorText):
                 explicitFailureText = .some(errorText)
                 throw ExplicitTerminalFailure(errorText: errorText)
@@ -183,6 +190,7 @@ final class ACPIntegratedAgentModeRunner {
     enum StartupBoundary {
         case taskEntry, toolTrackingCompleted, leaseAcquired, acquireFailureOutcome
         case bootstrapStarting, bootstrapCompleted, resumeRecoveryStaged, configuration, routingReleased, prePromptFailure
+        case reusabilityProbed, deferredLeaseAcquired
     }
 
     #if DEBUG
@@ -591,6 +599,7 @@ final class ACPIntegratedAgentModeRunner {
                     controller: controller,
                     runRequest: runRequest,
                     deferredLease: deferredLease,
+                    receipt: receipt,
                     attachmentReservationID: attachmentReservationID,
                     providerControlCommand: providerControlCommand,
                     leaseDisposition: leaseDisposition,
@@ -1252,15 +1261,33 @@ final class ACPIntegratedAgentModeRunner {
         controller: ACPAgentSessionController,
         runRequest: ACPRunRequest,
         deferredLease: MCPBootstrapLease?,
+        receipt: AgentSessionRuntimeStore.WriterReceipt,
         attachmentReservationID: UUID?,
         providerControlCommand: AgentProviderControlCommand? = nil,
         leaseDisposition: ProviderControlLeaseDisposition? = nil,
         localComposerCandidate: UUID? = nil
     ) async {
+        var reachedPromptTurn = false
+        let admitReused: (StartupBoundary) async -> Bool = { [self] boundary in
+            await admitStartupTask(
+                boundary, session: session, runID: runID, runAttemptID: runAttemptID,
+                controller: controller, receipt: receipt, attachmentReservationID: attachmentReservationID,
+                retainsController: true, dedicatedNoteID: dedicatedNoteID
+            )
+        }
         let classification = await Self.executeTransientOperation {
-            var reachedPromptTurn = false
             defer {
-                if let dedicatedNoteID, !reachedPromptTurn {
+                // Stop may already have ended this attempt. Its exact terminal receipt permits
+                // re-parking, but a later attempt (even on the same writer) must remain untouched.
+                let originalAttempt = session.activeRunOwnership?.attemptID == runAttemptID
+                    || (
+                        session.activeRunOwnership == nil
+                            && session.lastTerminalCommitRevision?.ownership.attemptID == runAttemptID
+                            && session.lastTerminalCommitRevision?.expectedRunID == runID
+                    )
+                if let dedicatedNoteID, !reachedPromptTurn, originalAttempt,
+                   receipt.disposition(for: session) != .claimLost
+                {
                     AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(
                         dedicatedNoteID, session: session
                     ) { hooks.persistence.scheduleSave(session) }
@@ -1269,13 +1296,14 @@ final class ACPIntegratedAgentModeRunner {
             do {
                 // A controller that can no longer run turns is retired as after any failed turn, even
                 // when the turn was a control command that never got as far as sending.
-                guard await controller.hasReusableSession else {
+                let reusable = await controller.hasReusableSession
+                let retired = !reusable && providerControlCommand != nil ? await controller.isRetired : false
+                guard await admitReused(.reusabilityProbed) else { return .superseded }
+                guard reusable else {
                     guard providerControlCommand != nil else {
                         return .failed(errorText: "\(runRequest.agentKind.displayName) ACP session is no longer reusable.")
                     }
-                    // A control command retires a controller that can never run another turn, as after
-                    // any failed turn, but leaves one that is merely busy alone.
-                    return await Self.controlCommandUnreusableOutcome(controller: controller, runRequest: runRequest)
+                    return Self.controlCommandUnreusableOutcome(isRetired: retired, runRequest: runRequest)
                 }
 
                 // A control command runs in the session exactly as it is: applying the run's model or
@@ -1288,17 +1316,25 @@ final class ACPIntegratedAgentModeRunner {
                         controller: controller,
                         runRequest: runRequest,
                         admission: { [self] in
-                            // Reused writer admission remains a separate cutover.
-                            isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID)
+                            #if DEBUG
+                                testAtStartupBoundary?(.configuration)
+                            #endif
+                            return isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID)
                                 && session.acpController === controller
+                                && receipt.disposition(for: session) == .current
                         }
                     ) else {
-                        return .superseded
+                        guard await admitReused(.configuration) else { return .superseded }
+                        // Admission returned after an interrupted sequence; do not send with
+                        // partially applied configuration or discard the still-warm controller.
+                        hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
+                        return .cancelledBeforeSend
                     }
                 }
 
                 if let deferredLease {
                     let acquired = await deferredLease.acquire()
+                    guard await admitReused(.deferredLeaseAcquired) else { return .superseded }
                     guard acquired else {
                         let errorText = "RepoPrompt MCP routing policy could not be prepared before \(runRequest.agentKind.displayName) ACP prompt submission."
                         return providerControlCommand == nil
@@ -1309,6 +1345,7 @@ final class ACPIntegratedAgentModeRunner {
                     log("deferred MCP routing until ACP follow-up prompt", runID: runID)
                 }
 
+                guard await admitReused(.routingReleased) else { return .superseded }
                 reachedPromptTurn = true
                 return await runPromptTurn(
                     session: session,
@@ -1330,11 +1367,23 @@ final class ACPIntegratedAgentModeRunner {
                 let normalized = await controller.normalizeError(error)
                 let normalizedText = displayText(for: normalized)
                 log("continue failed raw=\(String(describing: error)) normalized=\(normalizedText)", runID: runID)
+                #if DEBUG
+                    if !reachedPromptTurn { testAtStartupBoundary?(.prePromptFailure) }
+                #endif
                 return .failed(errorText: normalizedText)
             }
         }
 
-        leaseDisposition?.controllerRetained = classification.retainsController
+        if !reachedPromptTurn {
+            let superseded = if case .superseded = classification.report.result { true } else { false }
+            if superseded || receipt.disposition(for: session) == .claimLost {
+                await deferredLease?.releaseGateForDeferredRouting()
+            }
+            guard receipt.disposition(for: session) != .claimLost else { return }
+        }
+        if case .terminal = classification.report.result {
+            leaseDisposition?.controllerRetained = classification.retainsController
+        }
         await settleTransientExecution(
             classification,
             session: session,
@@ -1553,11 +1602,11 @@ final class ACPIntegratedAgentModeRunner {
     /// A control command's controller that cannot take a turn now: retired as after any failed turn
     /// when it can never run another, left in place (nothing was sent) when it is merely busy.
     private static func controlCommandUnreusableOutcome(
-        controller: ACPAgentSessionController,
+        isRetired: Bool,
         runRequest: ACPRunRequest
-    ) async -> TransientOperationResult {
+    ) -> TransientOperationResult {
         let displayName = runRequest.agentKind.displayName
-        return await controller.isRetired
+        return isRetired
             ? .failed(errorText: "\(displayName) ACP session is no longer reusable, so the requested command was not run.")
             : .refusedBeforeSend(errorText: "\(displayName) ACP session was busy, so the requested command was not run.")
     }
@@ -1578,7 +1627,7 @@ final class ACPIntegratedAgentModeRunner {
         setRunningStatus(statusText, source: .transport, session: session, urgent: true)
 
         guard await controller.prepareForNextTurn() else {
-            return await Self.controlCommandUnreusableOutcome(controller: controller, runRequest: runRequest)
+            return await Self.controlCommandUnreusableOutcome(isRetired: controller.isRetired, runRequest: runRequest)
         }
         let events = await controller.events
         let consumeTask = Task { @MainActor [weak self, weak session] in

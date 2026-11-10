@@ -7689,3 +7689,41 @@ pinned formatting and strict lint. Actual compiler occurrence counts remain runn
 matching integrated baseline `a0c674e9-c5be-4f38-b010-bf620211cfb2`; final test recompilation added no
 warning. Fresh index passed at **1,261/1,360 wrong-way edges and 53/66 largest cycle**, unchanged.
 Local checkpoint only: both-product/full-SessionLinks/live-app/hosted-CI qualification is not claimed.
+
+### M9.2g local checkpoint — reused ACP setup and deferred routing (2026-11-11)
+
+Reused `continueRun` now receives the existing weak writer receipt and rechecks it after reusability
+(including the control command's retired probe), each configuration operation, deferred lease acquisition
+and gate release. A lost claim cannot classify a pre-prompt provider error, change terminal lease
+metadata or publish a terminal result. Only its captured serialization gate is released; installed
+policy/controller resources remain with the current owner's Stop. A temporarily conflicting writer
+that becomes current again cancels the interrupted configuration, marks the handoff unsent and retains
+the warm controller rather than dispatching a partially configured turn. Ordinary current provider errors
+keep their normalized failure and existing shutdown policy. No strong command is captured by the task.
+
+Dedicated-note cleanup requires the original active attempt or its exact terminal revision (attempt ID
+and expected run ID), plus the original persistent writer claim. This preserves original Stop cleanup
+without allowing an old task to re-park a new same-claim attempt's note. `beginAttempt` clears the old
+terminal revision. The existing note state machine makes a second same-attempt re-park idempotent.
+There is no new session field, manager, default-true authority or terminal-barrier replacement.
+
+One Oracle review (`0154`, chat `6F1A83`) found the missing unsent-handoff call on the new retained-cancel
+branch; the first focused run `e45d2533-f788-42e5-99f7-bf5e6dd657a2` independently failed precisely that
+assertion. The production call is now present. Review-requested explicit deferred-lease precondition,
+policy/controller teardown assertions and an original-Stop/dedicated-note witness are also added.
+Focused `c3259638-e09d-46b4-ae97-2c53f34072bf` passed both new tests: a 17-variant reused-setup matrix
+and a real held-configuration RPC cancelled by Stop. The matrix covers post-RPC configuration, successful
+and failed deferred acquisition, claim reacquisition, retirement, a current-again conflict, provider error,
+positive dispatch, and same-claim successor note preservation. Lost-claim gate checks remain before
+current-owner Stop; owned terminal checks join their exact teardown first. No test budgets were weakened.
+
+Still open: prompt preparation/proof/physical writes, post-dispatch acceptance/consumer/catch/terminal
+mutations, tool-tracking callbacks, multi-RPC actor internals and terminal-barrier internal awaits.
+This is not a physical actor-write fence or M9.4 handoff implementation. Full lint
+`6db879bf-fbae-4cb6-83b9-d321595ecf05` passed. Affected ticket
+`4fc05b34-6843-46a5-be0f-0a595804cd24` passed **401 tests, zero failures/skips** (75.427s).
+Actual compiler occurrence counts in both focused compiles are runner 1 and tests 0, matching
+integrated baseline `a0c674e9-c5be-4f38-b010-bf620211cfb2`; no new warning occurrence was added.
+Fresh index passed at **1,261/1,360 wrong-way edges and 53/66 largest cycle**, unchanged.
+Both-product/full-SessionLinks/live-app/hosted-CI qualification is not claimed for this local checkpoint.
+No push; #1679 remains untouched.

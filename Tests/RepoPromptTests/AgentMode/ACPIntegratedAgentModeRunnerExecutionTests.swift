@@ -744,6 +744,213 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
         }
     }
 
+    func testACPReusedSetupAndDeferredLeaseKeepTheirOriginalWriter() async throws {
+        typealias Boundary = ACPIntegratedAgentModeRunner.StartupBoundary
+        enum Drift { case reacquire, retire, transientConflict, successor, none }
+        @MainActor final class Counters { var installed = 0, cleared = 0 }
+        let boundaries: [Boundary] = [.reusabilityProbed, .configuration, .deferredLeaseAcquired, .routingReleased, .prePromptFailure]
+        let cases = boundaries.flatMap { [($0, Drift.reacquire, false, false), ($0, Drift.retire, false, false)] }
+            + [
+                (.configuration, .transientConflict, false, false), (.routingReleased, .none, false, false),
+                (.deferredLeaseAcquired, .reacquire, true, false), (.deferredLeaseAcquired, .retire, true, false),
+                (.configuration, .reacquire, false, true), (.configuration, .retire, false, true),
+                (.configuration, .successor, false, true)
+            ]
+        for (boundary, drift, acquireFails, dedicatedNote) in cases {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let script = try AgentSessionLinkACPServerScript.write(to: directory)
+            let rpcLog = directory.appendingPathComponent("requests.jsonl")
+            var environment = ["ACP_RPC_LOG": rpcLog.path]
+            if boundary == .prePromptFailure { environment["ACP_FAIL_METHOD"] = "session/set_config_option" }
+            let provider = AgentSessionLinkCapturingACPProvider(providerID: .antigravity, commandPath: script.path, environment: environment)
+            let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: directory.path, resumeSessionID: nil, attachments: [], taskLabelKind: nil, sessionModeID: "auto_edit")
+            let controller = try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
+            addTeardownBlock { await controller.shutdown() }
+            _ = try await controller.bootstrap()
+            let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+            let session = try harness.makeBoundSession(agent: .antigravity)
+            session.acpController = controller
+            let processRunID = AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
+            let origin = try harness.startCommand(for: session)
+            let scope = origin.writer.scope
+            harness.pendingHandoffSendOutcome = { session, sent in scope.handoff.recordSendOutcome(for: session, didSend: sent) }
+            session.pendingHandoff.payload = "unsent handoff"
+            session.pendingHandoff.isStagedForSend = true
+            let message: String
+            if dedicatedNote {
+                var state = AgentSelfCompactState()
+                _ = state.reserve(note: "dedicated note", idempotencyKey: "reuse-note", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes)
+                state.active?.phase = .dispatchingNote
+                session.selfCompactState = state
+                message = AgentSelfCompactNoteEnvelope.frame("dedicated note")
+            } else { message = "turn" }
+            let barrier = AgentRunTerminalCommitBarrier()
+            let runner = ACPIntegratedAgentModeRunner(hooks: harness.hooks, terminalCommitBarrier: barrier, toolTrackingHooks: .noOp)
+            let conflicting = AgentSessionRuntimeStore.shared.makeScope()
+            defer { conflicting.replaceSessions([:]) }
+            var reached = false
+            var task: Task<Void, Never>?
+            var owner: AgentRunOwnership?
+            var previousTeardown: AgentRunAttemptTerminalResources.Teardown?
+            var saves: UInt64 = 0
+            var dirty = false
+            var consumers = 0
+            runner.testPromptConsumerCreated = { consumers += 1 }
+            runner.testAtStartupBoundary = { point in
+                if point == boundary, reached, drift == .transientConflict {
+                    conflicting.replaceSessions([:])
+                    XCTAssertTrue(origin.isCurrent)
+                }
+                guard point == boundary, !reached else { return }
+                // Cover the post-RPC configuration gate, not just its entry check.
+                if boundary == .configuration, drift != .transientConflict {
+                    let text = (try? String(contentsOf: rpcLog, encoding: .utf8)) ?? ""
+                    guard text.contains("session/set_config_option") else { return }
+                }
+                reached = true
+                task = session.agentTask
+                saves = session.saveRequestGeneration
+                dirty = session.isDirty
+                switch drift {
+                case .reacquire:
+                    var members = scope.sessions
+                    members.removeValue(forKey: session.tabID)
+                    scope.replaceSessions(members)
+                    members[session.tabID] = session
+                    scope.replaceSessions(members)
+                case .retire:
+                    scope.beginRetirement()
+                case .transientConflict:
+                    let duplicate = conflicting.makeSession(tabID: UUID())
+                    duplicate.installPersistentSessionBinding(.init(tabID: duplicate.tabID, sessionID: origin.identity.sessionID, workspaceID: origin.identity.workspaceID))
+                    conflicting.replaceSessions([duplicate.tabID: duplicate])
+                case .successor:
+                    if let previous = session.activeRunOwnership {
+                        previousTeardown = session.claimRunAttemptTerminalTeardown(ownership: previous, terminalState: .cancelled)
+                    }
+                    _ = session.beginRunAttempt(source: "successor dedicated note")
+                case .none:
+                    break
+                }
+                owner = session.activeRunOwnership
+            }
+            let counters = Counters()
+            let gateID = UUID()
+            var lease: MCPBootstrapLease?
+            let prepared = await runner.prepareRun(
+                tabID: session.tabID, session: session, origin: origin, workspace: harness.workspace,
+                initialUserMessage: message, initialMessageForRun: message, attachments: [], runRequest: request,
+                makeLease: { runID in
+                    let value = MCPBootstrapLease(
+                        spec: MCPBootstrapLeaseSpec(runID: runID, gateID: gateID, windowID: 1, tabID: session.tabID, clientName: "RepoPromptCE", restrictedTools: [], additionalTools: nil, oneShot: true, reason: "reused setup writer test", ttl: 60, purpose: .agentModeRun, taskLabelKind: nil, allowsAgentExternalControlTools: false, requiresExpectedAgentPID: false),
+                        mcpServerEnabler: { !acquireFails },
+                        policyInstaller: { spec in
+                            await MainActor.run { counters.installed += 1 }
+                            await MCPRoutingWaiter.notifyRouted(runID: spec.runID)
+                        },
+                        expectedPIDPolicyArmer: { _ in true },
+                        policyClearer: { _ in await MainActor.run { counters.cleared += 1 } }
+                    )
+                    lease = value
+                    return value
+                }
+            )
+            XCTAssertNil(prepared, "A warm controller requires no provider construction")
+            XCTAssertNotNil(lease, "Reused fixture needs a deferred lease")
+            try await AsyncTestWait.waitUntil("reused ACP boundary \(boundary), \(drift)") { reached }
+            await task?.value
+            XCTAssertNotNil(task)
+            if drift == .retire || drift == .transientConflict {
+                try await barrier.awaitTerminalTeardown(for: XCTUnwrap(owner), lifecycle: session.runLifecycle)
+            }
+            let gate = await HeadlessAgentConnectionGate.snapshot()
+            XCTAssertNotEqual(gate.activeConnectionID, gateID)
+            XCTAssertEqual(consumers, drift == .none ? 1 : 0)
+            let rpcText = (try? String(contentsOf: rpcLog, encoding: .utf8)) ?? ""
+            XCTAssertEqual(rpcText.contains("session/prompt"), drift == .none)
+            if drift == .none {
+                XCTAssertEqual(session.runState, .completed)
+            } else if drift == .retire || drift == .transientConflict {
+                XCTAssertEqual(session.runState, boundary == .prePromptFailure ? .failed : .cancelled)
+                if boundary == .prePromptFailure { XCTAssertNil(session.acpController) }
+                else {
+                    XCTAssertTrue(session.acpController === controller)
+                    XCTAssertEqual(session.runID, processRunID)
+                    let reusable = await controller.hasReusableSession
+                    XCTAssertTrue(reusable)
+                    XCTAssertFalse(session.pendingHandoff.isStagedForSend)
+                }
+                if dedicatedNote { XCTAssertEqual(session.selfCompactState.active?.phase, .parked) }
+                if boundary == .deferredLeaseAcquired, !acquireFails {
+                    XCTAssertEqual(counters.installed, 1)
+                    XCTAssertEqual(counters.cleared, 1)
+                }
+            } else {
+                XCTAssertEqual(session.activeRunOwnership, owner)
+                XCTAssertEqual(session.saveRequestGeneration, saves)
+                XCTAssertEqual(session.isDirty, dirty)
+                XCTAssertNil(session.lastTerminalCommitRevision)
+                XCTAssertTrue(session.acpController === controller)
+                if dedicatedNote { XCTAssertEqual(session.selfCompactState.active?.phase, .dispatchingNote) }
+                if !acquireFails { XCTAssertEqual(counters.cleared, 0) }
+                if boundary == .deferredLeaseAcquired, !acquireFails { XCTAssertEqual(counters.installed, 1) }
+                if let previousTeardown { await previousTeardown() }
+                await harness.service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+                XCTAssertEqual(session.runState, .cancelled)
+                XCTAssertNil(session.acpController)
+                let reusable = await controller.hasReusableSession
+                XCTAssertFalse(reusable, "Current-owner Stop must retire the installed controller")
+                if boundary == .deferredLeaseAcquired, !acquireFails { XCTAssertEqual(counters.cleared, 1) }
+            }
+            if let lease { await lease.cancelAndCleanup() }
+            await controller.shutdown()
+            session.saveDebounceTask?.cancel()
+        }
+    }
+
+    func testACPStoppedReusedSetupReparksOnlyItsOriginalDedicatedNote() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let script = try AgentSessionLinkACPServerScript.write(to: directory)
+        let gate = try AgentSessionLinkACPResponseGate(directory: directory)
+        defer { gate.release() }
+        let provider = AgentSessionLinkCapturingACPProvider(providerID: .antigravity, commandPath: script.path, environment: ["ACP_HOLD_METHOD": "session/set_config_option", "ACP_RESPONSE_GATE": gate.path])
+        let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: directory.path, resumeSessionID: nil, attachments: [], taskLabelKind: nil, sessionModeID: "auto_edit")
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
+        addTeardownBlock { await controller.shutdown() }
+        _ = try await controller.bootstrap()
+        let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+        let session = try harness.makeBoundSession(agent: .antigravity)
+        session.acpController = controller
+        _ = AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
+        var state = AgentSelfCompactState()
+        _ = state.reserve(note: "stopped note", idempotencyKey: "stopped-reuse", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes)
+        state.active?.phase = .dispatchingNote
+        session.selfCompactState = state
+        let message = AgentSelfCompactNoteEnvelope.frame("stopped note")
+        let runner = ACPIntegratedAgentModeRunner(hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(), toolTrackingHooks: .noOp)
+        _ = try await runner.prepareRun(
+            tabID: session.tabID, session: session, origin: harness.startCommand(for: session), workspace: harness.workspace,
+            initialUserMessage: message, initialMessageForRun: message, attachments: [], runRequest: request,
+            makeLease: { harness.makeLease(runID: $0, tabID: session.tabID) }
+        )
+        let task = try XCTUnwrap(session.agentTask)
+        let owner = try XCTUnwrap(session.activeRunOwnership)
+        try await gate.waitUntilEntered()
+        await harness.service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+        gate.release()
+        await task.value
+        XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, owner)
+        XCTAssertNil(session.activeRunOwnership)
+        XCTAssertEqual(session.runState, .cancelled)
+        XCTAssertEqual(session.selfCompactState.active?.phase, .parked)
+        await controller.shutdown()
+        session.saveDebounceTask?.cancel()
+    }
+
     func testACPTaskEntryAndLeaseCompletionKeepTheirOriginalWriter() async throws {
         typealias Boundary = ACPIntegratedAgentModeRunner.StartupBoundary
         @MainActor final class Counters {
