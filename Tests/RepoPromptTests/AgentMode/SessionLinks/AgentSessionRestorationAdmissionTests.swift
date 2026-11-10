@@ -41,6 +41,61 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
         XCTAssertTrue(reopened.providerRequests.events.isEmpty, "Opening an empty session must not start a provider")
     }
 
+    func testHydrationReadCannotSettleAReacquiredSameObjectWriter() async throws {
+        for outcome in ["payload", "missing", "error", "revision"] {
+            let fixture = try await makeFixture()
+            let created = await fixture.vm.createAndActivateSessionTab()
+            let tabID = try XCTUnwrap(created)
+            let session = try XCTUnwrap(fixture.vm.sessions[tabID])
+            let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+            guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+                workspaceID: fixture.workspaceID, sessionID: sessionID
+            ) else { return XCTFail("Fixture must own its canonical writer") }
+            let scope = writer.scope
+            let bytes = try Data(contentsOf: sessionFile(root: fixture.root, sessionID: sessionID))
+            if outcome == "missing" { try FileManager.default.removeItem(at: sessionFile(root: fixture.root, sessionID: sessionID)) }
+            let generation = session.beginPersistentBindingTransition()
+            session.finishPersistentBindingTransition(generation: generation)
+            session.hasLoadedPersistedState = false
+            let gate = TestReleaseFence(name: "hydration before reacquisition \(outcome)")
+            await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook { id in
+                guard id == sessionID else { return }
+                await gate.enterAndWait()
+                if outcome == "error" { throw CocoaError(.fileReadCorruptFile) }
+            }
+            addTeardownBlock { await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook(nil) }
+            let loading = Task { @MainActor in await fixture.vm.ensureSessionReady(tabID: tabID) }
+            defer { gate.release() }
+            guard await gate.waitUntilEntered() else { return }
+            let transition = session.persistentBindingTransitionToken()
+            scope.replaceSessions([:])
+            scope.replaceSessions([tabID: session])
+            XCTAssertTrue(transition.matches(session))
+            if outcome == "revision" {
+                session.setItemsSilently([.init(kind: .user, text: "Successor local input", sequenceIndex: 0)], reason: .persistedSessionHydration)
+            }
+            let items = session.items
+            gate.release()
+            _ = await loading.value
+            await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook(nil)
+            XCTAssertEqual(session.items, items, outcome)
+            XCTAssertFalse(session.hasLoadedPersistedState, outcome)
+            guard case .pending = session.qualifiedRestorationReadiness else { return XCTFail("Old \(outcome) read must not publish a proof") }
+            XCTAssertTrue(fixture.providerRequests.events.isEmpty)
+            // Local input is retained without authorizing a new read over it. Deciding whether
+            // a later new load may replace that projection is a separate admission policy.
+            if outcome == "revision" {
+                XCTAssertEqual(session.items.map(\.text), ["Successor local input"])
+                continue
+            }
+            // An ordinary successor load can still earn its own proof; stale-drop is not a
+            // cancelled saved outcome that permanently disables automatic hydration.
+            if outcome == "missing" { try bytes.write(to: sessionFile(root: fixture.root, sessionID: sessionID)) }
+            _ = await fixture.vm.ensureSessionReady(tabID: tabID)
+            XCTAssertTrue(session.qualifiedRestorationReadiness.isAuthoritative, outcome)
+        }
+    }
+
     func testRejectedRoutePreservesOnlyTheSourceBindingsPreviouslyEarnedReadiness() async throws {
         for priorState in ["authoritative", "pending", "terminal"] {
             let fixture = try await makeFixture()

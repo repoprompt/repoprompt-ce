@@ -116,14 +116,24 @@ extension AgentSavedSessionTargetLoader {
         sessions[session.tabID] = session
         scope.replaceSessions(sessions)
         let transition = session.persistentBindingTransitionToken()
+        guard let hydration = AgentSessionHydrationRuntime.Attempt.capture(session, in: scope, transition: transition) else {
+            // No suspension or external callback separates installation from this refusal.
+            var remaining = scope.sessions
+            remaining.removeValue(forKey: session.tabID)
+            scope.replaceSessions(remaining)
+            return .failure(.init(reason: .lookup(.changed), effects: .loadingClaimReleased))
+        }
+        let writer = hydration.writer
 
         func failLoading(_ reason: RuntimeLoadFailure.Reason) -> Result<RuntimeLoad, RuntimeLoadFailure> {
             // Release only the clean loading claim we installed. Never evict a successor, a
             // rebound object, a locally modified payload or an independently admitted effect.
+            // Raw conflicting claims also prevent cleanup: repairing that corruption must not
+            // grant this failed read authority to remove a writer while uniqueness is absent.
             guard scope.sessions[session.tabID] === session else {
                 return .failure(.init(reason: reason, effects: .loadingClaimDisplaced))
             }
-            guard transition.matches(session),
+            guard writer.ownsPersistentClaim, transition.matches(session),
                   !session.isDirty, session.activeRunOwnership == nil, !session.runState.isActive,
                   session.activeComposerSubmitAttempt == nil, !session.terminalCommitInProgress
             else { return .failure(.init(reason: reason, effects: .loadingClaimRetained)) }
@@ -145,15 +155,15 @@ extension AgentSavedSessionTargetLoader {
         }
         guard !Task.isCancelled, isStillAuthorized(), available(), !storage.isSuppressed(),
               catalog.isCurrent(target), let current = storage.workspace, sameStorage(current, workspace),
-              scope.sessions[session.tabID] === session, transition.matches(session), !scope.isRetiring
+              scope.sessions[session.tabID] === session, transition.matches(session)
         else { return failLoading(.lookup(.changed)) }
-        let writer: AgentSessionRuntimeStore.Writer
-        switch scope.resolveWriter(sessionID: sessionID, expectedWorkspaceID: workspace.id) {
-        case .conflicting: return failLoading(.lookup(.ambiguous))
-        case let .unavailable(reason): return failLoading(.writerUnavailable(reason))
-        case let .unique(current):
-            guard current.scope === scope, current.session === session else { return failLoading(.lookup(.changed)) }
-            writer = current
+        guard hydration.isCurrent else {
+            // Diagnose only. Never adopt a freshly resolved writer after the read.
+            switch scope.resolveWriter(sessionID: sessionID, expectedWorkspaceID: workspace.id) {
+            case .conflicting: return failLoading(.lookup(.ambiguous))
+            case let .unavailable(reason): return failLoading(.writerUnavailable(reason))
+            case .unique: return failLoading(.lookup(.changed))
+            }
         }
         guard let payload else { return failLoading(.lookup(.missing)) }
         // The earlier disk metadata is not a newer placement authority than this payload. Only
@@ -164,7 +174,7 @@ extension AgentSavedSessionTargetLoader {
         }
         let resolvedSelection = selection(payload)
         guard let applied = AgentSessionHydrationRuntime.apply(
-            payload, to: session, expected: transition, selection: resolvedSelection,
+            payload, attempt: hydration, selection: resolvedSelection,
             codexPolicy: codexPolicy(resolvedSelection), indexedPlacement: currentMetadata, usage: scope.usage
         ) else { return failLoading(.lookup(.changed)) }
         guard applied.commitReadiness() else {

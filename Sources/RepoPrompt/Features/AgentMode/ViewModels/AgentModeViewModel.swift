@@ -6517,6 +6517,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         let startRevision: Int
         let hydrationToken: PersistedHydrationCommitToken?
+        let hydration: AgentSessionHydrationRuntime.Attempt?
         let loadAttempt: AgentPersistedLoadAttempt?
         if let admittedAttempt {
             // Explicit Retry pre-admitted this attempt; adopt it (never mint twice) while still current.
@@ -6528,6 +6529,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             else { return }
             startRevision = admittedAttempt.sourceItemsRevision
             hydrationToken = commitToken
+            guard let captured = AgentSessionHydrationRuntime.Attempt.capture(
+                session, in: runtimeSessionStore, transition: commitToken.transition
+            ) else {
+                settlePersistedLoadAttempt(admittedAttempt, exit: .cancelled)
+                return
+            }
+            hydration = captured
             loadAttempt = admittedAttempt
         } else {
             startRevision = session.sourceItemsRevision
@@ -6536,6 +6544,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     transition: session.persistentBindingTransitionToken(),
                     requestedSessionID: $0.sessionID
                 )
+            }
+            if let hydrationToken {
+                guard let captured = AgentSessionHydrationRuntime.Attempt.capture(
+                    session, in: runtimeSessionStore, transition: hydrationToken.transition
+                ) else { return }
+                hydration = captured
+            } else {
+                hydration = nil
             }
             loadAttempt = hydrationToken.flatMap {
                 admitSavedLoadAttempt(for: session, commitToken: $0, sourceItemsRevision: startRevision)
@@ -6547,6 +6563,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             await performPersistedSessionLoad(
                 for: session,
                 hydrationToken: hydrationToken,
+                hydration: hydration,
                 startRevision: startRevision,
                 attempt: loadAttempt
             )
@@ -7091,6 +7108,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private func performPersistedSessionLoad(
         for session: TabSession,
         hydrationToken: PersistedHydrationCommitToken?,
+        hydration: AgentSessionHydrationRuntime.Attempt?,
         startRevision: Int,
         attempt: AgentPersistedLoadAttempt? = nil
     ) async {
@@ -7117,6 +7135,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 restorePerfRecorder.event("agentSessionHydration.perform", fields: fields)
             }
         #endif
+        if let hydration, !hydration.ownsBinding { return }
         if suppressesAgentSessionPersistence {
             session.hasLoadedPersistedState = true
             settlePersistedLoadAttempt(attempt, exit: .persistenceSuppressed)
@@ -7139,6 +7158,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return
         }
 
+        guard let hydration, hydration.ownsBinding,
+              workspace.id == hydration.writer.identity.workspaceID else { return }
         let request = AgentSessionHydrationRequest(
             workspace: workspace,
             tabID: session.tabID,
@@ -7158,6 +7179,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 prepareStartMS = restorePerfRecorder.timestampMSIfEnabled()
             #endif
             let preparedPayload = try await dataService.preparePersistedHydration(request)
+            // Currency precedes revision-only drift and terminal proofs: an old read cannot
+            // settle a same-object successor merely because its binding token still matches.
+            guard hydration.ownsBinding else { return }
             guard persistentBindingTransitionIsCurrent(hydrationToken.transition) else {
                 // A revision-only change on the same current attempt is the real source-superseded
                 // outcome (§4.3), not an obsolete owner; every other mismatch stays a silent drop.
@@ -7254,7 +7278,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             #if DEBUG
                 let applyStartMS = restorePerfRecorder.timestampMSIfEnabled()
             #endif
-            guard await applyPersistedHydration(payload, to: session, token: hydrationToken) else {
+            guard await applyPersistedHydration(payload, to: session, token: hydrationToken, hydration: hydration) else {
                 #if DEBUG
                     logPerform(outcome: "staleBeforeApply")
                 #endif
@@ -7269,6 +7293,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             #endif
         } catch {
             print("[AgentModeVM] Failed to load session: \(error)")
+            guard hydration.ownsBinding else { return }
             if persistentBindingTransitionIsCurrent(hydrationToken.transition) {
                 // Cancellation is not a hydration failure: a successor binding owns the retry and
                 // must not inherit a terminal proof from the task it superseded.
@@ -7306,9 +7331,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private func applyPersistedHydration(
         _ payload: AgentSessionHydrationPayload,
         to session: TabSession,
-        token: PersistedHydrationCommitToken
+        token: PersistedHydrationCommitToken,
+        hydration: AgentSessionHydrationRuntime.Attempt
     ) async -> Bool {
-        guard payload.sessionID == token.requestedSessionID,
+        guard hydration.writer.session === session, hydration.isCurrent,
+              payload.sessionID == token.requestedSessionID,
               persistentBindingTransitionIsCurrent(token.transition)
         else {
             #if DEBUG
@@ -7330,7 +7357,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             for: payload, availability: agentAvailabilityContext, codexDynamicModels: codexDynamicModels
         )
         guard let appliedPayload = AgentSessionHydrationRuntime.apply(
-            payload, to: session, expected: token.transition, selection: selection,
+            payload, attempt: hydration, selection: selection,
             codexPolicy: codexCoordinator.selectionPolicy(forModelRaw: selection.modelRaw, includeGlobalFallback: true),
             indexedPlacement: ownerValidatedSessionIndex[agentSession.id], usage: usageRuntime
         ) else { return false }
@@ -7356,7 +7383,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let autoEditEnabled = agentSession.autoEditEnabled
         let tabID = session.tabID
         Task { @MainActor [weak self] in
-            guard let self,
+            guard let self, hydration.ownsBinding,
                   persistentBindingTransitionIsCurrent(token.transition)
             else {
                 return
@@ -7687,12 +7714,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             transition: session.persistentBindingTransitionToken(),
             requestedSessionID: binding.sessionID
         )
+        guard let hydration = AgentSessionHydrationRuntime.Attempt.capture(
+            session, in: runtimeSessionStore, transition: hydrationToken.transition
+        ) else { return .sessionNotFound }
         let routeAttempt = admitSavedLoadAttempt(
             for: session,
             commitToken: hydrationToken,
             sourceItemsRevision: session.sourceItemsRevision
         )
-        guard await applyPersistedHydration(payload, to: session, token: hydrationToken) else {
+        guard await applyPersistedHydration(payload, to: session, token: hydrationToken, hydration: hydration) else {
             return .sessionNotFound
         }
         settlePersistedLoadAttempt(routeAttempt, exit: .payloadApplied)

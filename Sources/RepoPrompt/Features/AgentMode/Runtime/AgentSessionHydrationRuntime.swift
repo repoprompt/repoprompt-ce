@@ -23,16 +23,53 @@ struct AgentPersistentBindingTransitionToken: Equatable {
 /// presentation/index publication are outside this synchronous commit; no UI object is needed.
 @MainActor
 enum AgentSessionHydrationRuntime {
+    /// An operation-local capture made before reading storage. A binding token alone survives
+    /// removal/reacquisition of the same object; the existing writer incarnation does not.
+    @MainActor
+    struct Attempt {
+        let writer: AgentSessionRuntimeStore.Writer
+        let transition: AgentPersistentBindingTransitionToken
+
+        static func capture(
+            _ session: AgentTabSession,
+            in scope: AgentSessionRuntimeStore.Scope,
+            transition: AgentPersistentBindingTransitionToken
+        ) -> Attempt? {
+            guard let binding = transition.binding,
+                  let workspaceID = binding.workspaceID,
+                  case let .unique(writer) = scope.resolveWriter(sessionID: binding.sessionID, expectedWorkspaceID: workspaceID),
+                  writer.scope === scope, writer.session === session
+            else { return nil }
+            let attempt = Self(writer: writer, transition: transition)
+            return attempt.ownsBinding ? attempt : nil
+        }
+
+        /// Revision drift is classified separately, and field application itself advances the
+        /// revision. Neither permits an old operation to acquire a successor's writer.
+        var ownsBinding: Bool {
+            let session = writer.session
+            return writer.isCurrent && !writer.scope.isRetiring
+                && session.tabID == transition.tabID
+                && ObjectIdentifier(session) == transition.sessionIdentity
+                && session.persistentSessionBindingIdentity == transition.binding
+                && session.bindingTransitionGeneration == transition.transitionGeneration
+        }
+
+        var isCurrent: Bool {
+            ownsBinding && transition.matches(writer.session)
+        }
+    }
+
     /// Evidence of a full field application, qualified to one binding. Callers finish
     /// synchronous provider repairs before publishing readiness through the existing authority.
     struct AppliedPayload {
-        fileprivate let session: AgentTabSession
-        fileprivate let binding: AgentSessionRestorationBindingToken
+        fileprivate let attempt: Attempt
 
         @MainActor
         @discardableResult
         func commitReadiness() -> Bool {
-            guard session.currentRestorationBindingToken == binding else { return false }
+            guard attempt.ownsBinding else { return false }
+            let session = attempt.writer.session
             session.recordRestorationAuthoritative(.persistedPayloadApplied)
             guard session.qualifiedRestorationReadiness.isAuthoritative else { return false }
             session.hasLoadedPersistedState = true
@@ -99,15 +136,15 @@ enum AgentSessionHydrationRuntime {
     @discardableResult
     static func apply(
         _ payload: AgentSessionHydrationPayload,
-        to session: AgentTabSession,
-        expected: AgentPersistentBindingTransitionToken,
+        attempt: Attempt,
         selection: Selection,
         codexPolicy: AgentCodexSelectionPolicy,
         indexedPlacement: AgentSessionIndexEntry?,
         usage: AgentSessionUsageRuntime
     ) -> AppliedPayload? {
-        guard expected.matches(session),
-              let binding = session.currentRestorationBindingToken,
+        let session = attempt.writer.session
+        let expected = attempt.transition
+        guard attempt.isCurrent,
               expected.binding?.sessionID == payload.sessionID,
               payload.persistedSession.id == payload.sessionID,
               expected.binding?.workspaceID.map({ $0 == payload.sourceWorkspaceID }) ?? true,
@@ -208,6 +245,6 @@ enum AgentSessionHydrationRuntime {
         session.selectedClaudeEffortRaw = session.selectedAgent.usesClaudeTooling ? persisted.agentReasoningEffort : nil
         // No suspension separates currency verification and the full field application.
         // The caller retains this proof while completing synchronous provider repairs.
-        return AppliedPayload(session: session, binding: binding)
+        return AppliedPayload(attempt: attempt)
     }
 }

@@ -7048,3 +7048,63 @@ post-test compiler-index check remains **1,253/1,360 wrong-way edges, 53/66 larg
 baseline change. These are local-commit gates: no new full broad selection, both-product build,
 full lint, live-app smoke, release or hosted-CI result is claimed for this slice. The publication
 gates will run before the explicitly authorized next draft PR; nothing is pushed now.
+
+#### M9.2e — hydration field/readiness writer capture (local follow-up)
+
+Hydration now captures an operation-local `AgentSessionHydrationRuntime.Attempt` containing the
+existing canonical writer and binding transition before the disk read. The transition token alone
+survives removal/re-addition of the same object; the writer incarnation does not. Full field apply
+requires this attempt, and the applied-payload receipt retains it through readiness publication.
+Revision-only drift is still classified separately, but only while the originating writer remains
+current; payload, nil, error and source-superseded results cannot publish proofs to a reacquisition.
+Hydration deliberately does not require restored-command admission, which it is supposed to earn.
+
+The VM captures before its producer task and automatic presentation admission, matches the read
+workspace to the binding, and settles an already-admitted Retry as cancelled if capture refuses.
+An unscoped/conflicting/retiring bound object does not gain even the suppressed-persistence loaded
+latch through this path: suppression is not a bypass around canonical mutation ownership. Unbound
+fresh-session suppression remains unchanged. Existing presentation coalescing, stale-drop recovery,
+explicit Retry entry scheduling, deletion policy, route pre-binding catalog reads and VM loader/body
+retirement remain open. In particular, this slice does not grant a later read permission to replace
+new local input: the stale-result test pins its preservation and does not initiate that separate read.
+
+The only overlap with M9.3 is necessary hydration-API wiring in
+`AgentSavedSessionTargetLoader+Runtime`: capture its newly installed writer before `readPayload`,
+never adopt a post-read resolution, and release a failed clean loading claim only while its original
+persistent claim still belongs to it. Retirement can release the original clean claim; reacquisition
+or raw conflict retains it rather than evicting a successor. A fresh resolution after refusal is
+used only to preserve failure classification, never as replacement authority. Storage inputs,
+composition, prepared owners and attachment configuration are untouched.
+
+One Oracle review (`untitled-chat-27CBAF`, snapshot `2026-11-10/1114`) requested the Retry settlement
+and failure-taxonomy corrections, which are applied. The existing auto-edit projection keeps its
+revision/binding predicate and tab-store compensation unchanged, adding only an originating-writer
+entry check. Its physical setter ordering and successor compensation remain explicitly open; this
+is not an approval-store receipt cutover or a host-lifetime/drain claim. Attempt values are local to
+operations, not added to the session store or presentation records.
+
+The first two compile attempts found missing explicit main-actor isolation on the new nested
+attempt type and a test-local apply helper respectively; both are corrected at those declarations,
+without package settings, blanket annotations or unchecked sendability. The third run was cancelled,
+not counted as a pass: `testOldAttemptUnwindDoesNotClearSuccessorLoadTaskAfterRebind` installed an
+unscoped test binding, then awaited a second preparation the canonical boundary correctly refused.
+The fixture now preserves its workspace while performing the same real transition, asserts the
+successor writer, and retains every existing task-ownership assertion and timing budget.
+
+Final focused `dba11dc3-030a-407d-9cc5-1f435c8ae037` passed **175 tests** across all eight selected
+families: window-free runtime loading (12), target lookup (7), restoration admission (23), transcript
+runtime (9), sidebar restoration stability (14), pane classification (42), snapshot publication (4)
+and real restoration lifecycle (64). The new VM disk-result matrix covers payload, missing, error
+and revision drift; the loader matrix covers both old-read hydration and failed cleanup after
+same-object reacquisition. Runtime tests cover the pre-apply and pre-readiness boundaries plus
+retirement without requiring restored admission. No test budgets or behavioral assertions were
+weakened. The earlier compile/cancelled tickets are not validation passes.
+
+Full lint `4db5c0cb-8129-4bfa-a6c4-4c86169377fb` and pinned scoped formatting/strict lint passed.
+The final fixture correction was formatted before the full lint began. Actual compilation across
+the successful source compile and corrected fixture recompile matches the M9.2c per-file warning
+occurrence baseline: VM **4→4**, the other six touched Swift files **0→0**. The fresh post-test
+compiler-index check remains **1,253/1,360 wrong-way edges, 53/66 largest cycle**, without baseline
+changes. These remain local checkpoint receipts: no full SessionLinks publication selection,
+both-product build, live-app smoke, release or new hosted-CI qualification is claimed. Nothing is
+pushed; #1676 remains scoped to checkpoints 9–12.

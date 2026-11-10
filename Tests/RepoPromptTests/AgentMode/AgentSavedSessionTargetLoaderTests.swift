@@ -264,6 +264,32 @@ final class AgentSavedSessionRuntimeLoadingTests: XCTestCase {
         XCTAssertTrue(retried.writer.session.permitsBoundOperationAndSave)
     }
 
+    func testReacquiredLoadingClaimCannotBeHydratedOrReleasedByItsOldRead() async throws {
+        for failsRead in [false, true] {
+            let f = Fixture()
+            defer { f.cleanUp() }
+            try await f.save()
+            var retained: AgentTabSession?
+            f.beforePayload = { _ in
+                let session = try XCTUnwrap(f.scope.sessions[f.tab.id])
+                let transition = session.persistentBindingTransitionToken()
+                f.scope.replaceSessions([:])
+                f.scope.replaceSessions([session.tabID: session])
+                XCTAssertTrue(transition.matches(session))
+                retained = session
+                if failsRead { throw CocoaError(.fileReadCorruptFile) }
+            }
+            await assertFailure(
+                f.load(), reason: .lookup(failsRead ? .unreadable : .changed), effects: .loadingClaimRetained
+            )
+            let session = try XCTUnwrap(retained)
+            XCTAssertTrue(f.scope.sessions[f.tab.id] === session)
+            XCTAssertTrue(session.items.isEmpty)
+            XCTAssertFalse(session.hasLoadedPersistedState)
+            XCTAssertFalse(session.qualifiedRestorationReadiness.isAuthoritative)
+        }
+    }
+
     func testRevocationAndStorageMoveAfterReadCannotPublishReadiness() async throws {
         for moveStorage in [false, true] {
             let f = Fixture()

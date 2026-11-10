@@ -1480,7 +1480,15 @@ extension AgentTranscriptRestorationLifecycleTests {
 
             // Real rebind to a new incarnation (new scope), then admit its load through the real entry.
             fixture.viewModel.cancelPersistedLoad(for: session)
-            session.testInstallPersistentSessionBinding(sessionID: fixture.sessionID)
+            let workspaceID = try XCTUnwrap(session.persistentSessionBindingIdentity?.workspaceID)
+            _ = session.beginPersistentBindingTransition()
+            session.installPersistentSessionBinding(.init(
+                tabID: session.tabID, sessionID: fixture.sessionID, workspaceID: workspaceID
+            ))
+            guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+                workspaceID: workspaceID, sessionID: fixture.sessionID
+            ) else { return XCTFail("The successor must be a scoped hydration owner") }
+            XCTAssertTrue(writer.session === session)
             let successorCall = Task { await fixture.viewModel.ensureSessionReady(tabID: fixture.tabID) }
             await fixture.gate.waitUntilEntered(count: 2)
             let successorLoad = try XCTUnwrap(session.persistedLoadTask)
