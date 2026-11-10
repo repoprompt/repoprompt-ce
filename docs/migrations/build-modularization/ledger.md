@@ -6702,3 +6702,44 @@ edges, 53/66 largest-cycle components**; no baseline change. Actual compile warn
 counts across seven touched Swift files match retained base: **four VM, two link-runtime-bridge
 test warnings**, zero in the other five. No positive occurrence delta. No full-suite, live-app,
 release or hosted-CI qualification is claimed; M9.2b remains open.
+
+#### M9.2d checkpoint 1 — administration fork command and destination receipt
+
+`session_admin fork` now resolves the canonical writer instead of selecting an owning view model.
+The scope-owned administration runtime captures source admission and passes its exact command
+through destination preparation. An absent writer or a bound, unvisited saved source uses the
+existing targeted preparation; conflicting identities, provisional creation, retirement and deletion
+cannot become hydration fallbacks. Runtime admission failures are mapped to the host's refusal
+rather than leaking an internal command error. The existing reference-counted preparation hold
+keeps a prepared source alive until the fork settles.
+
+The existing Handoff creation owner still performs background-tab creation, transcript/attachment
+copying, worktree installation and configured first-save acknowledgement; this checkpoint does not
+move those other-lane responsibilities. Its minimal new optional acknowledgement callback captures
+the destination writer identity synchronously after the actual configured durable save. The runtime
+returns that immutable receipt, never a tab's later occupant. Late source revocation or cancellation
+after acknowledgement cannot discard the saved fork. Existing partial-fork errors retain their exact
+destination identity; there is no compensating deletion or replacement fork.
+
+One bounded review completed. Its admission concern was addressed; the suspected nested-hold issue
+was checked against the existing counted begin/end implementation, not worked around. Tests cover
+reacquired source claims, preparation suspension, a replacement destination after its receipt,
+foreign receipt refusal, agreeing UI replicas, real saved-source preparation and real destination
+persistence after late authorization loss and task cancellation. The production persistence witness
+performs no test flush. No provider starts or visible-app lifecycle actions were introduced.
+
+Validation: final Conductor ticket `1c9df7aa-72c9-4b0c-aaec-67109240c3a0` passed **37 tests,
+zero failures**: four administration-runtime, ten writer-store, twenty handoff/worktree persistence,
+two production fork and one preparation-refusal cases. Scoped pinned SwiftFormat and strict
+SwiftLint passed. The initial ticket failed test-fixture compilation (missing initializer isolation);
+the second executed 35 with one new fixture hydration-latch failure. Both were corrected without
+weakening production admission; the intermediate third ticket passed 35 before final review coverage.
+Commit preflight caught the app-test import-count ratchet; the four new tests were moved unchanged
+into the existing writer-store test file rather than raising its baseline. Rerun
+`f743effa-7d01-4414-a6a3-ce8af29a61d0` passed the same **37** tests after that consolidation.
+
+Remaining M9.2d: worktree bind/unbind/create/relocation and merge preview/apply/continue/abort routing,
+including post-effect durable receipts and physical mutation fences. This is a local fork checkpoint,
+not completion of the administration/worktree group, M9.2 or #1406. Both-product, full-lint, broad-suite,
+fresh-index and per-file base-warning comparison push gates have not yet run; no push, full-suite,
+live smoke, release or hosted-CI qualification is claimed.

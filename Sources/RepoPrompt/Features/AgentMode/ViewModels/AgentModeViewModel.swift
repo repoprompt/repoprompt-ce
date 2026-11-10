@@ -3008,6 +3008,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
             )
         }
+        installAdministrationComposition(runtimeSessionStore.administration)
         configureCodexRuntime(codexCoordinator)
         observeCodexComputerUseSetting()
         claudeCoordinator.installHostCapabilities(
@@ -3247,6 +3248,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 claudeCoordinator: claudeCoordinator
             )
             providerBindingService = AgentModeProviderBindingService()
+            installAdministrationComposition(runtimeSessionStore.administration)
             configureCodexRuntime(codexCoordinator)
             observeCodexComputerUseSetting()
             claudeCoordinator.installHostCapabilities(
@@ -20208,7 +20210,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         inheritOversightLinks: Bool = true,
         missingImagePolicy: AgentSessionAttachmentStore.HandoffMissingImagePolicy = .strict,
         onImagesOmitted: (@MainActor (Int) -> Void)? = nil,
-        isStillAuthorized: (@MainActor () -> Bool)? = nil
+        isStillAuthorized: (@MainActor () -> Bool)? = nil,
+        onConfiguredDestination: (@MainActor (AgentSessionRuntimeStore.WriterIdentity) -> Void)? = nil
     ) async throws -> UUID {
         guard let promptManager,
               let workspaceManager,
@@ -20534,6 +20537,21 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 sessionID: destinationClaim.sessionID, code: "target_changed",
                 detail: "The fork was saved, but its destination changed during its first save."
             )
+        }
+        if let onConfiguredDestination {
+            // Return the exact creation receipt, not a tab ID that an awaiting administrator
+            // could later resolve to a replacement. Query the writer without admitting new work:
+            // retirement or late cancellation cannot undo an acknowledged configured save.
+            guard let writer = try? runtimeWriter(sessionID: destinationClaim.sessionID),
+                  writer.scope === runtimeSessionStore, writer.session === destSession,
+                  writer.restoration == expectedChildBindingToken
+            else {
+                throw SessionAdminPartialForkError(
+                    sessionID: destinationClaim.sessionID, code: "target_changed",
+                    detail: "The fork was saved, but its exact destination writer changed before acknowledgement."
+                )
+            }
+            onConfiguredDestination(writer.identity)
         }
         // Acknowledged configured durability cannot be undone by late cancellation. Keep the
         // saved session and omit optional inheritance/focus changes when its caller has ended.

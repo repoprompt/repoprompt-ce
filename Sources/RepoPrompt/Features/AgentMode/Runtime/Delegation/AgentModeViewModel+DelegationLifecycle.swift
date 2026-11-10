@@ -1,41 +1,37 @@
 import Foundation
 
 extension AgentModeViewModel {
-    /// Delegation-scope `fork`: the ordinary Handoff/Fork transcript migration into a background tab,
-    /// with no focus change and no oversight-link inheritance (a scope may not mint links to
-    /// sessions outside it). Returns the new session ID.
-    func delegationFork(
-        sessionID: UUID, upToItemID: UUID?, isStillAuthorized: @escaping @MainActor () -> Bool
-    ) async throws -> UUID {
-        guard let source = try authoritativeLiveSession(for: sessionID) else {
-            throw SessionAdminHostError.sessionUnavailable
-        }
-        guard let cutoff = upToItemID ?? source.items.last?.id else {
-            throw SessionAdminHostError.invalid("The target session has no transcript to fork.")
-        }
-        let workspaceID = workspaceManager?.activeWorkspaceID
-        let binding = source.currentRestorationBindingToken
-        let destinationTabID = try await prepareHandoffToNewTab(
-            upToItemID: cutoff,
-            destinationAgent: source.selectedAgent,
-            destinationModelRaw: source.selectedModelRaw,
-            destinationReasoningEffortRaw: source.persistedReasoningEffortRaw,
-            sourceTabID: source.tabID,
-            activateDestination: false,
-            inheritOversightLinks: false,
-            missingImagePolicy: .strict,
-            isStillAuthorized: { [weak self] in
-                guard let self else { return false }
-                return isStillAuthorized()
-                    && workspaceManager?.activeWorkspaceID == workspaceID
-                    && sessions[source.tabID] === source
-                    && source.activeAgentSessionID == sessionID
-                    && source.currentRestorationBindingToken == binding
+    /// Transitional destination-creation adapter. The existing handoff owner acknowledges the
+    /// configured durable first save; administration owns exact source command admission.
+    func installAdministrationComposition(_ runtime: AgentSessionAdministrationRuntime) {
+        runtime.prepareForkDestination = { [weak self] request in
+            guard let self,
+                  workspaceManager?.activeWorkspaceID == request.workspaceID,
+                  sessions[request.source.tabID] === request.source,
+                  request.isStillAuthorized()
+            else { throw SessionAdminHostError.sessionUnavailable }
+            let source = request.source
+            var receipt: AgentSessionAdministrationRuntime.ForkReceipt?
+            _ = try await prepareHandoffToNewTab(
+                upToItemID: request.cutoff,
+                destinationAgent: source.selectedAgent,
+                destinationModelRaw: source.selectedModelRaw,
+                destinationReasoningEffortRaw: source.persistedReasoningEffortRaw,
+                sourceTabID: source.tabID,
+                activateDestination: false,
+                inheritOversightLinks: false,
+                missingImagePolicy: .strict,
+                isStillAuthorized: { [weak self] in
+                    guard let self else { return false }
+                    return request.isStillAuthorized()
+                        && workspaceManager?.activeWorkspaceID == request.workspaceID
+                },
+                onConfiguredDestination: { receipt = .init(identity: $0) }
+            )
+            guard let receipt else {
+                throw SessionAdminHostError.invalid("The fork did not acknowledge its configured durable destination. Inspect the created tab before retrying.")
             }
-        )
-        guard let forkedSessionID = sessions[destinationTabID]?.activeAgentSessionID else {
-            throw SessionAdminHostError.invalid("The fork was created but its session did not bind.")
+            return receipt
         }
-        return forkedSessionID
     }
 }

@@ -364,18 +364,40 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
     ) async throws -> UUID {
         // A saved or never-visited source is prepared the same way targeted oversight prepares
         // one: point read, no tab focus, no provider run. Authority is re-checked throughout.
-        if SessionAdminWindows.liveSession(sessionID) == nil, let preparation {
+        let manager = WindowStatesManager.shared
+        manager.beginPreparedOversightPreparation(sessionID)
+        defer { manager.endPreparedOversightPreparation(sessionID) }
+        guard isStillAuthorized(), !Task.isCancelled else { throw SessionAdminHostError.authorityEnded }
+        if try forkCommand(for: sessionID, allowingPreparation: true) == nil, let preparation {
             let outcome = await preparation(sessionID, isStillAuthorized)
             guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
             guard outcome == .ready else { throw Self.preparationRefusal(outcome) }
         }
         guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
-        guard let viewModel = SessionAdminWindows.owningViewModel(for: sessionID) else {
+        guard let command = try forkCommand(for: sessionID, allowingPreparation: false) else {
             throw SessionAdminHostError.sessionUnavailable
         }
-        return try await viewModel.delegationFork(
-            sessionID: sessionID, upToItemID: upToItemID, isStillAuthorized: isStillAuthorized
+        return try await command.writer.scope.administration.fork(
+            command: command, upToItemID: upToItemID, isStillAuthorized: isStillAuthorized
         )
+    }
+
+    private func forkCommand(
+        for sessionID: UUID, allowingPreparation: Bool
+    ) throws -> AgentSessionRuntimeStore.Command? {
+        do {
+            return try SessionAdminWindows.command(for: sessionID)
+        } catch let rejection as AgentSessionRuntimeStore.CommandRejection {
+            // A bound, unvisited saved tab still needs the existing targeted hydration path.
+            // Never turn a provisional creation, retirement, deletion or conflict into a load.
+            if allowingPreparation, rejection == .restorationUnavailable,
+               case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: sessionID),
+               writer.session.creationState == nil, !writer.session.hasLoadedPersistedState
+            {
+                return nil
+            }
+            throw SessionAdminHostError.sessionUnavailable
+        }
     }
 }
 

@@ -311,6 +311,102 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
         }
     }
 
+    func testForkUsesCanonicalWriterWithAgreeingReplicaAndAcknowledgesSavedDestination() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let fixture = try await Fixture.make(isolated: true)
+            let mirror = try await fixture.addReplica()
+            do {
+                let viewModel = fixture.window.agentModeViewModel
+                let sourceID = try XCTUnwrap(fixture.targetTab.activeAgentSessionID)
+                let source = viewModel.session(for: fixture.targetTab.id)
+                _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+                    sessionID: sourceID, on: source, updateWorkspaceMetadata: true
+                ))
+                source.recordRestorationAuthoritative(.persistedPayloadApplied)
+                source.hasLoadedPersistedState = true
+                source.replaceItems([.user("Fork source", sequenceIndex: 0)])
+                let command = try XCTUnwrap(SessionAdminWindows.command(for: sourceID))
+                XCTAssertTrue(command.writer.session === source)
+                var preparations = 0
+                let host = SessionAdminWindowsStructureHost(preparation: { _, _ in
+                    preparations += 1
+                    return .changed
+                })
+                var authorized = true
+                var acknowledgements = 0
+                viewModel.test_afterConfiguredCreationAcknowledgement = { _ in
+                    acknowledgements += 1
+                    authorized = false
+                    withUnsafeCurrentTask { $0?.cancel() }
+                }
+                defer { viewModel.test_afterConfiguredCreationAcknowledgement = nil }
+                let fork = Task { @MainActor in
+                    try await host.fork(sessionID: sourceID, upToItemID: nil, isStillAuthorized: { authorized })
+                }
+                let destinationID = try await fork.value
+                XCTAssertTrue(fork.isCancelled)
+                XCTAssertEqual(acknowledgements, 1)
+                XCTAssertEqual(preparations, 0, "An agreeing UI witness must not trigger a second writer")
+                XCTAssertNotEqual(destinationID, sourceID)
+                let destinationCommand = try XCTUnwrap(SessionAdminWindows.command(for: destinationID))
+                XCTAssertFalse(destinationCommand.writer.session.isDirty)
+                let workspace = try fixture.workspace()
+                let saved = try await AgentSessionDataService.shared.loadAgentSession(id: destinationID, for: workspace)
+                XCTAssertEqual(saved?.id, destinationID, "Success must acknowledge the configured first save without a test flush")
+                XCTAssertEqual(saved?.items.count(where: { $0.kind == .user }), 1)
+                XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, fixture.callerTab.id)
+                XCTAssertEqual(mirror.promptManager.activeComposeTabID, fixture.callerTab.id)
+                XCTAssertNil(WindowStatesManager.shared.preparedOversightPreparationInFlight[sourceID])
+            } catch {
+                await fixture.removeReplica(mirror)
+                await fixture.cleanup()
+                throw error
+            }
+            await fixture.removeReplica(mirror)
+            await fixture.cleanup()
+        }
+    }
+
+    func testForkPreparesBoundUnrestoredSourceThroughRealSavedTargetPath() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let fixture = try await Fixture.make(isolated: true)
+            do {
+                let sourceID = try XCTUnwrap(fixture.targetTab.activeAgentSessionID)
+                let workspace = try fixture.workspace()
+                _ = try await AgentSessionDataService.shared.saveAgentSession(
+                    AgentSession(
+                        id: sourceID, workspaceID: workspace.id, composeTabID: fixture.targetTab.id,
+                        name: "Saved source", items: [AgentChatItemPersist(from: .user("Saved fork source", sequenceIndex: 0))]
+                    ), for: workspace
+                )
+                let source = fixture.window.agentModeViewModel.session(for: fixture.targetTab.id)
+                _ = try XCTUnwrap(fixture.window.agentModeViewModel.test_installPersistentSessionBinding(
+                    sessionID: sourceID, on: source, updateWorkspaceMetadata: true
+                ))
+                XCTAssertFalse(source.hasLoadedPersistedState)
+                XCTAssertFalse(source.permitsBoundOperationAndSave)
+                var preparations = 0
+                let host = SessionAdminWindowsStructureHost(preparation: { id, authorized in
+                    preparations += 1
+                    XCTAssertEqual(id, sourceID)
+                    XCTAssertEqual(WindowStatesManager.shared.preparedOversightPreparationInFlight[id], 1)
+                    return await SessionAdminWindowsStructureHost.savedTargetPreparation(id, authorized)
+                })
+                let destinationID = try await host.fork(sessionID: sourceID, upToItemID: nil, isStillAuthorized: { true })
+                XCTAssertEqual(preparations, 1)
+                XCTAssertTrue(source.hasLoadedPersistedState)
+                let saved = try await AgentSessionDataService.shared.loadAgentSession(id: destinationID, for: workspace)
+                XCTAssertEqual(saved?.items.first(where: { $0.kind == .user })?.text, "Saved fork source")
+                XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, fixture.callerTab.id)
+                XCTAssertNil(WindowStatesManager.shared.preparedOversightPreparationInFlight[sourceID])
+            } catch {
+                await fixture.cleanup()
+                throw error
+            }
+            await fixture.cleanup()
+        }
+    }
+
     func testFirstPlacementAcrossColdReplicasUsesOnePreparedWriterAndProjectsEveryWitness() async throws {
         try await MCPSharedServerTestLease.shared.withLease { _ in
             let originalFullAccess = OverseerGlobalAutoApprove.isEnabled
