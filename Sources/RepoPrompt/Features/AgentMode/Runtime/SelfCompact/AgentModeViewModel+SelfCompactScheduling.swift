@@ -3,53 +3,6 @@ import RepoPromptDomainRuntime
 
 /// App-side owner of the self-only MCP admission and terminal boundary, not a second overseer transaction.
 extension AgentModeViewModel {
-    /// Synchronous admission captures the authoritative run attempt before a future MCP await.
-    func agentSelfCompactSchedule(
-        endpoint: DomainAgentSessionLinkEndpointIdentity,
-        runID: UUID,
-        runAttemptID: UUID,
-        note: String,
-        idempotencyKey: String,
-        support: AgentSessionLinkCompactSupport
-    ) -> AgentSelfCompactState.Reservation? {
-        guard let session = sessions[endpoint.tabID],
-              agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
-              session.runID == runID,
-              session.runState == .running,
-              session.activeRunOwnership?.attemptID == runAttemptID,
-              let bindingGeneration = endpoint.persistentBindingGeneration,
-              !session.terminalCommitInProgress
-        else { return nil }
-        let owner = AgentSelfCompactOwner(
-            windowID: endpoint.windowID,
-            workspaceID: endpoint.workspaceID,
-            tabID: endpoint.tabID,
-            sessionID: endpoint.sessionID,
-            persistentBindingGeneration: bindingGeneration,
-            bindingTransitionGeneration: endpoint.bindingTransitionGeneration,
-            runID: runID,
-            runAttemptID: runAttemptID
-        )
-        var state = session.selfCompactState
-        let reservation = state.reserve(
-            note: note, idempotencyKey: idempotencyKey,
-            maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.maximumNoteUTF8Bytes(
-                windowTokens: Self.observationContextLoad(for: session)?.windowTokens
-            ),
-            owner: owner
-        )
-        if case .scheduled = reservation {
-            guard support == .codex || support == .claudeCode || support == .acpAdvertisedCommand else {
-                return nil
-            }
-            state.active?.admittedSupport = support
-            session.selfCompactState = state
-            session.isDirty = true
-            scheduleSave(for: session)
-        }
-        return reservation
-    }
-
     /// Exact self read: never hydrate a target or search by a caller-supplied session UUID.
     func agentSelfContextSnapshot(
         endpoint: DomainAgentSessionLinkEndpointIdentity,
@@ -65,143 +18,6 @@ extension AgentModeViewModel {
             context: Self.observationContextLoad(for: session),
             selfCompact: session.selfCompactState.status
         )
-    }
-
-    /// MCP admission is synchronous until the reservation exists. The required save completes while
-    /// this tool execution still owns the originating run's active-tool slot, so terminal dispatch
-    /// cannot outrun durability. A failed/ambiguous save never leaves an executable request armed.
-    func agentSelfCompactMCPAdmission(
-        endpoint: DomainAgentSessionLinkEndpointIdentity,
-        origin: AgentSelfMCPCallOrigin,
-        note: String,
-        idempotencyKey: String
-    ) async -> AgentSelfMCPToolService.Admission {
-        guard endpoint == origin.endpoint,
-              let session = sessions[endpoint.tabID],
-              agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
-              session.runID == origin.runID,
-              session.activeRunOwnership?.attemptID == origin.runAttemptID
-        else { return .unavailable }
-
-        var candidate = session.selfCompactState
-        let reservation = candidate.reserve(
-            note: note, idempotencyKey: idempotencyKey,
-            maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.maximumNoteUTF8Bytes(
-                windowTokens: Self.observationContextLoad(for: session)?.windowTokens
-            )
-        )
-        if let answer = agentSelfCompactUnscheduledAdmission(reservation, session: session, endpoint: endpoint) {
-            return answer
-        }
-
-        guard agentSelfCompactHasExclusiveWriter(session, endpoint: endpoint) else {
-            return .blocked(reason: "session_not_exclusive")
-        }
-        guard !session.selfCompactPersistenceWarning,
-              endpoint.persistentBindingGeneration != nil
-        else { return .blocked(reason: "session_not_exclusive") }
-
-        let support = await linkExecutionRuntime.agentSessionLinkCompactSupport(for: session)
-        guard sessions[endpoint.tabID] === session,
-              agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
-              session.runID == origin.runID,
-              session.activeRunOwnership?.attemptID == origin.runAttemptID
-        else { return .unavailable }
-        guard agentSelfCompactHasExclusiveWriter(session, endpoint: endpoint) else {
-            return .blocked(reason: "session_not_exclusive")
-        }
-        switch support {
-        case .notSupported: return .blocked(reason: "not_supported")
-        case .noProviderSession: return .blocked(reason: "no_provider_session")
-        case .codex, .claudeCode, .acpAdvertisedCommand: break
-        }
-        var readiness = Self.agentSessionLinkDeliveryReadinessSnapshot(
-            session: session, endpointMatchesGrant: true, isClosing: false
-        )
-        readiness.runStateIsActive = false // The caller's own still-running turn is expected.
-        readiness.pendingSelfCompact = false
-        let hasInteraction = readiness.hasWaitingPrompt || readiness.hasPendingAskUser
-            || readiness.hasPendingUserInputRequest || readiness.hasPendingApproval
-            || readiness.hasPendingPermissionsRequest || readiness.hasPendingMCPElicitationRequest
-            || readiness.hasPendingApplyEditsReview || readiness.hasPendingWorktreeMergeReview
-        if hasInteraction { return .blocked(reason: "pending_interaction") }
-        guard AgentSessionLinkDeliveryReadiness.evaluate(snapshot: readiness) == .ready,
-              !AgentSessionLinkExecutionRuntime.agentSessionLinkCompactHasQueuedProviderWork(session)
-        else { return .blocked(reason: "busy") }
-
-        guard let accepted = agentSelfCompactSchedule(
-            endpoint: endpoint, runID: origin.runID, runAttemptID: origin.runAttemptID,
-            note: note, idempotencyKey: idempotencyKey, support: support
-        ) else { return .blocked(reason: "busy") }
-        // A concurrent same-key call may have reserved while this one awaited provider support.
-        // Answer it exactly as the first check would have, not as a generic busy refusal.
-        if let answer = agentSelfCompactUnscheduledAdmission(accepted, session: session, endpoint: endpoint) {
-            return answer
-        }
-        guard case let .scheduled(attempt) = accepted else { return .blocked(reason: "busy") }
-        session.selfCompactAdmissionPendingID = attempt.id
-        defer {
-            if session.selfCompactAdmissionPendingID == attempt.id {
-                session.selfCompactAdmissionPendingID = nil
-            }
-        }
-        guard case .success = await flushSaveRequired(for: endpoint.tabID, workspaceID: endpoint.workspaceID) else {
-            var state = session.selfCompactState
-            if state.active?.id == attempt.id {
-                state.settle(.recoveryRequired, noteDelivery: .notSent, completionVerified: false)
-                session.selfCompactState = state
-                session.isDirty = true
-                scheduleSave(for: session)
-            }
-            return .blocked(reason: "persistence_indeterminate")
-        }
-        guard sessions[endpoint.tabID] === session,
-              agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
-              session.selfCompactState.active?.id == attempt.id
-        else { return .blocked(reason: "busy") }
-        guard agentSelfCompactHasExclusiveWriter(session, endpoint: endpoint) else {
-            var state = session.selfCompactState
-            state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
-            session.selfCompactState = state
-            scheduleSave(for: session)
-            return .blocked(reason: "session_not_exclusive")
-        }
-        return .scheduled(session.selfCompactState.active ?? attempt)
-    }
-
-    /// The admission answer for every reservation that did not schedule a new request; nil only
-    /// for `.scheduled`, which the caller continues to persist.
-    private func agentSelfCompactUnscheduledAdmission(
-        _ reservation: AgentSelfCompactState.Reservation,
-        session: TabSession,
-        endpoint: DomainAgentSessionLinkEndpointIdentity
-    ) -> AgentSelfMCPToolService.Admission? {
-        switch reservation {
-        case let .duplicate(requestID):
-            guard session.selfCompactAdmissionPendingID != requestID else {
-                return .blocked(reason: "persistence_pending")
-            }
-            if session.selfCompactState.active?.id == requestID,
-               !agentSelfCompactHasExclusiveWriter(session, endpoint: endpoint, allowRetiringWriter: true)
-            {
-                return .blocked(reason: "session_not_exclusive")
-            }
-            return .duplicate(requestID: requestID, status: session.selfCompactState.status)
-        case .conflict:
-            return .blocked(reason: "idempotency_conflict")
-        case .alreadyPending:
-            return .blocked(reason: "compact_already_pending")
-        case let .invalidNote(.tooLong(byteCount, maximum)):
-            // Reservation and this projection are synchronous; report the same window basis.
-            let limit = AgentSessionSelfCompactNotePolicy.noteLimit(
-                windowTokens: Self.observationContextLoad(for: session)?.windowTokens
-            )
-            return .noteTooLong(byteCount: byteCount, maximum: maximum, basis: limit.basis)
-        case .invalidNote, .invalidIdempotencyKey:
-            return .blocked(reason: "busy") // Service content/key validation rejects these before admission.
-        case .scheduled:
-            return nil
-        }
     }
 
     /// Readiness for this request's dedicated continuation note. The generic ACP background-compaction
@@ -228,17 +44,6 @@ extension AgentModeViewModel {
             snapshot.backgroundCompactionSettling = false
         }
         return snapshot
-    }
-
-    private func agentSelfCompactHasExclusiveWriter(_ session: TabSession, endpoint: DomainAgentSessionLinkEndpointIdentity, allowRetiringWriter: Bool = false) -> Bool {
-        // A window census misses independent runtime scopes. Use the same exact writer
-        // authority as persistence, before reserving a request or spending its key.
-        guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
-            workspaceID: endpoint.workspaceID, sessionID: endpoint.sessionID
-        ) else { return false }
-        return writer.session === session && writer.binding.tabID == endpoint.tabID
-            && writer.binding.generation == endpoint.persistentBindingGeneration
-            && (allowRetiringWriter || !writer.scope.isRetiring)
     }
 
     func agentSelfCompactTerminalSettled(
@@ -332,7 +137,7 @@ extension AgentModeViewModel {
             && endpoint.sessionID == owner.sessionID
             && endpoint.persistentBindingGeneration == owner.persistentBindingGeneration
             && endpoint.bindingTransitionGeneration == owner.bindingTransitionGeneration
-            && agentSelfCompactHasExclusiveWriter(session, endpoint: endpoint)
+            && linkExecutionRuntime.agentSelfCompactHasExclusiveWriter(session, endpoint: endpoint)
     }
 
     /// Evaluation can release a stale parked note without requiring a send that the note itself

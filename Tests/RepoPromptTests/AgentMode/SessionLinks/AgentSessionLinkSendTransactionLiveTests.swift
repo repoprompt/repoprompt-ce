@@ -1073,6 +1073,74 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         )
     }
 
+    func testDeliveryQueuedBehindSaveKeepsItsOriginalWriter() async throws {
+        for drift in ["reacquired", "replacement", "retiring"] {
+            let fixture = try makeFixture()
+            let runtime = fixture.viewModel.linkExecutionRuntime
+            let command = try XCTUnwrap(runtime.admit(fixture.candidate))
+            let scope = command.writer.scope
+            let persistence = scope.persistence
+            let staged = expectation(description: "attributed row staged before required-save queue wait")
+            var observedRow = false
+            let attachment = scope.presentation.attach(fixture.session, sink: .init(
+                activityChanged: { _, _ in }, refresh: { _, _, _ in },
+                turnComplete: { _ in }, turnFailed: { _, _ in }, binding: { session in
+                    if !observedRow, session.items.contains(where: { $0.crossSessionAttribution != nil }) {
+                        observedRow = true
+                        staged.fulfill()
+                    }
+                }
+            ))
+            XCTAssertTrue(persistence.queue.begin(sessionID: fixture.sessionID))
+            var ownsQueueSlot = true
+            var successor: AgentTabSession?
+            let delivery = Task { await self.send(fixture) }
+            defer {
+                if ownsQueueSlot { _ = persistence.queue.finish(sessionID: fixture.sessionID) }
+                delivery.cancel()
+                fixture.session.saveDebounceTask?.cancel()
+                successor?.saveDebounceTask?.cancel()
+                scope.presentation.detach(attachment)
+            }
+            await fulfillment(of: [staged], timeout: 3)
+            XCTAssertFalse(fixture.events.contains(.save))
+            switch drift {
+            case "reacquired":
+                scope.replaceSessions([:])
+                scope.replaceSessions([fixture.tabID: fixture.session])
+            case "replacement":
+                let next = scope.makeSession(tabID: fixture.tabID)
+                try next.installPersistentSessionBinding(XCTUnwrap(fixture.session.persistentSessionBindingIdentity))
+                next.recordRestorationAuthoritative(.persistedPayloadApplied)
+                next.isDirty = false
+                successor = next
+                scope.replaceSessions([fixture.tabID: next])
+            default:
+                scope.beginRetirement()
+            }
+            XCTAssertFalse(command.isCurrent)
+            XCTAssertEqual(command.writer.isCurrent, drift == "retiring")
+            _ = persistence.queue.finish(sessionID: fixture.sessionID)
+            ownsQueueSlot = false
+            let outcome = await delivery.value
+            if drift == "retiring" {
+                guard case let .delivered(receipt) = outcome else { return XCTFail("An original retiring writer retains its final-write capability") }
+                XCTAssertEqual(receipt.deliveryState, .persisted)
+                XCTAssertEqual(fixture.events.count(.save), 1)
+            } else {
+                XCTAssertEqual(outcome, .blocked(.persistenceIndeterminate))
+                XCTAssertFalse(fixture.events.contains(.save), "The waiting send must not persist through a replacement claim")
+            }
+            XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
+            XCTAssertNil(fixture.session.activeComposerSubmitAttempt)
+            XCTAssertNotNil(fixture.session.items.first(where: { $0.crossSessionAttribution != nil }))
+            if let successor {
+                XCTAssertTrue(successor.items.isEmpty)
+                XCTAssertFalse(successor.isDirty)
+            }
+        }
+    }
+
     // MARK: - Host-backed liveness across the committed send
 
     /// Regression: an observer rebind/close between the commit fence and the transcript append must

@@ -152,6 +152,8 @@ enum AgentCodexHookReviewResolutionError: Error, LocalizedError, Equatable {
     case invalidDecision
     case invalidSelection
     case staleController
+    case staleWriter
+    case superseded(trustWriteAttempted: Bool)
     case strictModeRequiresApproval
 
     var errorDescription: String? {
@@ -168,6 +170,12 @@ enum AgentCodexHookReviewResolutionError: Error, LocalizedError, Equatable {
             "Approve Selected requires one or more unique hook keys from the current review."
         case .staleController:
             "The Codex controller binding changed. Start the turn again to review the current project hooks."
+        case .staleWriter:
+            "The session writer changed. No hook decision was admitted; fetch the current interaction."
+        case let .superseded(trustWriteAttempted):
+            trustWriteAttempted
+                ? "The hook decision was superseded after trust submission. Trust may have been written; inspect the current inventory before retrying."
+                : "The hook review was superseded. No result was published to a successor session."
         case .strictModeRequiresApproval:
             "Codex hook approval strict mode requires approving every project hook in the current review before continuing."
         }

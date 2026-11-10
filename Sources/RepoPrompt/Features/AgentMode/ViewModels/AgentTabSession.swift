@@ -853,12 +853,22 @@ final class AgentTabSession: ObservableObject {
     }
 
     /// Instruction steering coordination state
-    var instructionContinuation: CheckedContinuation<UserInstructionResponse, Error>? {
+    var instructionWait: AgentInstructionWait? {
         didSet { noteMonitorObservationInputsChanged() }
     }
 
-    var instructionTimeoutTask: Task<Void, Never>?
-    var instructionWaitID: UUID?
+    /// Read-only projections; installation, consumption and cleanup own the exact wait record.
+    var instructionContinuation: CheckedContinuation<UserInstructionResponse, Error>? {
+        instructionWait?.continuation
+    }
+
+    var instructionTimeoutTask: Task<Void, Never>? {
+        instructionWait?.timeoutTask
+    }
+
+    var instructionWaitID: UUID? {
+        instructionWait?.id
+    }
 
     /// Agent run — transient run-attempt lifecycle/settlement state is owned by
     /// the extracted `AgentRunAttemptLifecycle` facade. Run identity is
@@ -1680,6 +1690,8 @@ final class AgentTabSession: ObservableObject {
     var lastUserMessageAt: Date?
     var lastCommandOutputSaveAt: Date?
     var saveDebounceTask: Task<Void, Never>?
+    /// Identifies a pending timer independently of the payload/save revision.
+    var saveDebounceRequestID: UUID?
     var isDirty: Bool = false {
         didSet {
             if isDirty {
@@ -1806,6 +1818,7 @@ final class AgentTabSession: ObservableObject {
         guard codexHookGateDispatchOwnerToken == token else { return }
         codexHookGateDispatchOwnerToken = nil
         codexHookGateActiveBinding = nil
+        codexHookGateOrigin = nil
         let continuations = Array(codexHookGateCoalescedContinuations.values)
         codexHookGateCoalescedContinuations.removeAll()
         for continuation in continuations {
@@ -1839,10 +1852,19 @@ final class AgentTabSession: ObservableObject {
         return true
     }
 
+    struct CodexHookGateOrigin: Equatable {
+        let writer: AgentSessionRuntimeStore.WriterIdentity
+        let runID: UUID?
+        let runAttemptID: UUID?
+    }
+
+    var codexHookGateOrigin: CodexHookGateOrigin?
+
     func resetCodexHookGateBinding() {
         _ = cancelCodexHookReview()
         codexHookGateInventoryFingerprint = nil
         codexHookGateActiveBinding = nil
+        codexHookGateOrigin = nil
         codexHookGateBindingMemo = nil
         codexHookGateAudit = nil
     }

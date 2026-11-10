@@ -3740,6 +3740,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     /// Composition installs concrete execution services independently of the optional UI attachment.
     func configureCodexRuntime(_ coordinator: CodexAgentModeCoordinator) {
+        let interactions = runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore)
+        coordinator.installInteractionRuntime(interactions)
+        interactions.observer = coordinator
         coordinator.installPersistenceRuntime(persistenceRuntime)
         coordinator.installAttachmentRuntime(attachmentRuntime)
         coordinator.installMCPRuntime(mcpRuntime)
@@ -5082,7 +5085,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         cancelPendingQuestion(for: session)
                         cancelPendingApproval(for: session)
                         await teardownApplyEditsApprovalSessionSync(for: session, cleanupScope: true)
-                        cancelPendingInstruction(for: session)
+                        AgentSessionInteractionRuntime.cancelPendingInstruction(for: session)
                         await teardownMCPControl(for: session, cleanupSessionStore: true)
                         if session.runState.isActive {
                             await cancelAgentRun(
@@ -5136,7 +5139,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         cancelPendingQuestion(for: session)
         cancelPendingApproval(for: session)
         await teardownApplyEditsApprovalSessionSync(for: session, cleanupScope: true)
-        cancelPendingInstruction(for: session)
+        AgentSessionInteractionRuntime.cancelPendingInstruction(for: session)
         await teardownMCPControl(for: session, cleanupSessionStore: true)
         if workspaceManager?.isSessionRuntimeProjection == true {
             // Private retirement releases supporting infrastructure next. Join existing owned
@@ -8575,7 +8578,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             },
             cancelRun: { [weak self] session in
                 guard let self else { return }
-                cancelPendingInstruction(for: session)
+                AgentSessionInteractionRuntime.cancelPendingInstruction(for: session)
                 await runService.cancelRun(tabID: session.tabID, session: session, intent: .executionLocationChange, completion: .terminalPublished)
             },
             stageRecovery: { [weak self] session in
@@ -11749,7 +11752,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 guard !payload.containsArgument("answers") else {
                     throw MCPError.invalidParams("continue_without_hooks requires the answers argument to be absent.")
                 }
-                guard !codexCoordinator.isCodexHookApprovalStrictModeEnabled(for: session) else {
+                guard !interactionRuntime.isCodexHookApprovalStrictModeEnabled(for: session) else {
                     throw MCPError.invalidParams(
                         AgentCodexHookReviewResolutionError.strictModeRequiresApproval.localizedDescription
                     )
@@ -11765,8 +11768,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 decision = .retryDiscovery
             }
             do {
-                try await codexCoordinator.resolveCodexHookReview(
-                    session: session,
+                try await interactionRuntime.submitCodexHookReviewDecision(
+                    command: command,
                     requestID: request.id,
                     decision: decision
                 )
@@ -11775,7 +11778,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             } catch {
                 throw MCPError.invalidParams("The hook approval operation could not be completed. Review the current interaction and retry.")
             }
-            handleObservedMCPStateChange(for: session)
             return nil
         }
     }
@@ -13461,7 +13463,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         cancelPendingQuestion(for: session)
         cancelPendingApproval(for: session)
         reconcileInteractiveRunState(session)
-        cancelPendingInstruction(for: session)
+        AgentSessionInteractionRuntime.cancelPendingInstruction(for: session)
         if let runID = session.runID {
             _ = mcpRunToolCanceller(runID, "workspace_switch")
         }
@@ -14481,7 +14483,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 cancelPendingApproval(for: session)
                 cancelPendingApplyEditsReview(for: session, reason: "Cancelled because tab is closing")
                 await teardownApplyEditsApprovalSessionSync(for: session, cleanupScope: true)
-                cancelPendingInstruction(for: session)
+                AgentSessionInteractionRuntime.cancelPendingInstruction(for: session)
                 await teardownMCPControl(for: session, cleanupSessionStore: true)
 
                 // Cancel agent run
@@ -16002,6 +16004,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) {
         let expectedOwnership = session.activeRunOwnership
         let expectedWaitID = session.instructionWaitID
+        let instructionCommand = linkExecutionRuntime.instructionCommand(for: session)
         let expectedControllerID = session.codexController.map(ObjectIdentifier.init)
         let dispatchID = AgentSessionLinkPromptDispatchID.waitingContinuation(
             waitID: expectedWaitID ?? session.tabID
@@ -16027,7 +16030,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
 
             let stillOwnsContinuation = {
-                self.sessions[tabID] === session
+                guard let instructionCommand, let expectedWaitID,
+                      self.linkExecutionRuntime.ownsInstructionWait(command: instructionCommand, waitID: expectedWaitID)
+                else { return false }
+                return self.sessions[tabID] === session
                     && (
                         expectedOwnership.map { session.isCurrentRunAttemptForCurrentBinding($0) && session.quietLedger.isOpen(owner: $0) }
                             ?? (session.activeRunOwnership == nil)
@@ -16181,14 +16187,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 )
                 return
             }
-            guard stillOwnsContinuation(), resumeWaitingInstructionContinuation(
-                session: session,
-                providerText: monitoring.text,
-                claim: monitoring.claim,
-                origin: .user,
-                inputProof: inputProof,
-                undecoratedProviderText: augmentedText
-            ) else {
+            guard stillOwnsContinuation(), let instructionCommand, let expectedWaitID,
+                  linkExecutionRuntime.resumeWaitingInstructionContinuation(
+                      command: instructionCommand, waitID: expectedWaitID,
+                      providerText: monitoring.text,
+                      claim: monitoring.claim,
+                      origin: .user,
+                      inputProof: inputProof,
+                      undecoratedProviderText: augmentedText
+                  )
+            else {
                 // (A managed steer's rollback below settles its sink and skips the composer.)
                 agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
                 rollbackWaitingInstructionSubmission(
@@ -18477,6 +18485,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         lifecycleTarget: AgentSessionLifecycleAuthority.MutationTarget? = nil
     ) async throws -> UserInstructionResponse {
         let original = session(for: tabID)
+        guard let sessionID = original.activeAgentSessionID,
+              let writer = try? runtimeWriter(sessionID: sessionID),
+              writer.scope === runtimeSessionStore, writer.session === original
+        else {
+            throw MCPError.invalidParams("The Agent session is unavailable for its instruction wait.")
+        }
         let bindingToken = original.currentRestorationBindingToken
         let session = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true)
         guard sessions[tabID] === original, session === original,
@@ -18494,37 +18508,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
 
-        if session.instructionContinuation != nil || session.instructionTimeoutTask != nil {
-            cancelPendingInstruction(for: session)
+        guard case let .success(command) = writer.admitCommand() else {
+            throw MCPError.invalidParams("The Agent session changed while preparing to wait.")
         }
+        try linkExecutionRuntime.replacePriorInstructionWait(command: command)
+        guard command.isCurrent else { throw MCPError.invalidParams("The Agent session changed while replacing its wait.") }
+        let waitID = UUID()
 
         // Check for queued instructions first
         if !session.pendingInstructions.isEmpty {
             let queuedText = session.pendingInstructions.removeFirst()
-            let text = await augmentUserMessageForProviderSend(
-                queuedText.providerText,
-                agent: session.selectedAgent,
-                session: session,
-                skipsSlashExpansion: queuedText.skipsSlashExpansion
-            )
-            guard sessions[tabID] === session, session.currentRestorationBindingToken == bindingToken,
-                  session.operationAdmissionFailureMessage == nil
-            else {
-                throw MCPError.invalidParams("The Agent session changed while preparing its queued instruction.")
-            }
-            // The queue stored undecorated text; this is the immediate-continuation variant of the
-            // waiting-instruction dispatch, so it renders the membership revision that is current
-            // now. Returning the response *is* the acceptance boundary here: the provider consumes it
-            // as this wait's result with no further failure point.
-            let dispatchID = AgentSessionLinkPromptDispatchID.waitingContinuation(waitID: session.instructionWaitID ?? UUID())
-            let monitoring = agentSessionLinkDecoratedProviderText(text, session: session, dispatchID: dispatchID)
             let inputFence = AgentRunStartStopFence(session: session)
             var returnedInstruction = false
             defer {
-                // The new optional proof suspends after this entry left the queue. Until return,
-                // retain its recovery ownership without replaying into a rebound session.
-                if !returnedInstruction, monitoring.claim?.localInput != nil,
-                   sessions[session.tabID] === session,
+                // Dequeue owns this original input until physical return, including both
+                // augmentation and optional Read proof. Never restore into a rebound payload.
+                if !returnedInstruction, sessions[session.tabID] === session,
                    inputFence.binding == session.persistentSessionBindingIdentity
                 {
                     if inputFence.permitsStart(of: session) {
@@ -18533,13 +18532,31 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     } else if let draft = queuedText.localDraftText {
                         restoreComposerDraft(
                             tabID: session.tabID, text: draft,
-                            message: "Restored local queued instruction after cancelled Read proof",
+                            message: "Restored local queued instruction after refused preparation",
                             strategy: .prependAlways
                         )
                     }
                 }
             }
+            let text = await augmentUserMessageForProviderSend(
+                queuedText.providerText,
+                agent: session.selectedAgent,
+                session: session,
+                skipsSlashExpansion: queuedText.skipsSlashExpansion
+            )
+            guard command.isCurrent, sessions[tabID] === session, session.currentRestorationBindingToken == bindingToken,
+                  session.operationAdmissionFailureMessage == nil
+            else {
+                throw MCPError.invalidParams("The Agent session changed while preparing its queued instruction.")
+            }
+            // The queue stored undecorated text; this is the immediate-continuation variant of the
+            // waiting-instruction dispatch, so it renders the membership revision that is current
+            // now. Returning the response *is* the acceptance boundary here: the provider consumes it
+            // as this wait's result with no further failure point.
+            let dispatchID = AgentSessionLinkPromptDispatchID.waitingContinuation(waitID: waitID)
+            let monitoring = agentSessionLinkDecoratedProviderText(text, session: session, dispatchID: dispatchID)
             let proof = await agentSessionLinkProveProviderInput(for: session, claim: monitoring.claim)
+            guard command.isCurrent else { throw CancellationError() }
             if monitoring.claim?.localInput != nil {
                 guard !Task.isCancelled, sessions[session.tabID] === session, inputFence.permitsStart(of: session) else { throw CancellationError() }
                 if let lifecycleTarget {
@@ -18555,52 +18572,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return response
         }
 
-        // Set waiting state
-        session.waitingPrompt = prompt
-        session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
-        session.setRunningStatus(nil, source: nil)
-        session.runState = .waitingForUser
-        let waitID = UUID()
-        session.instructionWaitID = waitID
-        updateBindingsFromSession(session)
-
-        let waitMessage = (prompt?.isEmpty == false) ? prompt! : "What would you like me to do next?"
-        let inlineItem = AgentChatItem.assistantInline(waitMessage, sequenceIndex: session.nextSequenceIndex)
-        session.appendItem(inlineItem)
-        updateBindingsFromSession(session)
-        // The instruction wait surfaces through the attention-notification reconciler once the
-        // continuation below is installed (see `AgentPendingInteractionDescriptor.make`).
-
-        return try await withCheckedThrowingContinuation { continuation in
-            session.instructionContinuation = continuation
-
-            // Setup timeout if specified
-            if let timeout = timeoutSeconds {
-                session.instructionTimeoutTask = Task { @MainActor in
-                    try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                    guard session.instructionWaitID == waitID,
-                          session.runState == .waitingForUser
-                    else { return }
-
-                    session.waitingPrompt = nil
-                    cancelPendingQuestion(for: session)
-                    session.instructionContinuation = nil
-                    session.instructionTimeoutTask = nil
-                    session.instructionWaitID = nil
-                    await runService.cancelRun(
-                        tabID: session.tabID,
-                        session: session,
-                        intent: .userStop,
-                        completion: .terminalPublished
-                    )
-                    continuation.resume(returning: UserInstructionResponse(
-                        text: nil,
-                        timedOut: true,
-                        elapsedSeconds: Int(timeout)
-                    ))
-                }
-            }
-        }
+        // Compose the existing cancellation owner now; a timeout must not need a live VM to
+        // lazily create execution services, including for an otherwise unowned instruction wait.
+        if timeoutSeconds != nil { _ = runService }
+        return try await linkExecutionRuntime.waitForInstruction(
+            command: command, waitID: waitID, prompt: prompt, timeoutSeconds: timeoutSeconds
+        )
     }
 
     func waitForNextUserInstruction(
@@ -18613,46 +18590,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             prompt: prompt,
             timeoutSeconds: timeoutSeconds,
             lifecycleTarget: target
-        )
-    }
-
-    /// The single consumption path for a one-shot waiting-instruction continuation.
-    ///
-    /// Two callers resume the same continuation — the local user's waiting-turn submission and
-    /// RepoPrompt's own lane-update follow-up — and they are deliberately *one* function rather than
-    /// two similar ones. The waiting-state teardown (timeout task, wait ID, waiting prompt, run
-    /// state) has to be identical or a resumed run is left describing a wait that no longer exists,
-    /// and the difference between the two callers has to be stated in one place instead of being a
-    /// property of which copy happened to be edited.
-    ///
-    /// `origin` is what that difference is: it is carried on the response rather than inferred from
-    /// the text, because a lane-update envelope is byte-wise indistinguishable from a user
-    /// instruction that happens to quote one.
-    ///
-    /// - `.user`: the resumed turn is the user's, so its provider text is charged to the user input
-    ///   budget exactly as an ordinary send is.
-    /// - `.laneUpdateAutoWake`: RepoPrompt authored the envelope. Nothing here attributes authorship
-    ///   to the user — no `.user` row, no `lastUserMessageAt` movement, no user token charge, and no
-    ///   staged handoff consumption. `acceptAgentSessionLinkPromptClaim` records the wake's own
-    ///   provenance row instead.
-    ///
-    /// Successful `resume(returning:)` is the physical acceptance boundary for this route, exactly as
-    /// it already was for an ordinary instruction. No acceptance point moves earlier.
-    ///
-    /// - Returns: `false` when the continuation was already consumed or cancelled, in which case
-    ///   nothing was resumed and `claim` is deliberately left unacknowledged.
-    @discardableResult
-    func resumeWaitingInstructionContinuation(
-        session: TabSession,
-        providerText: String,
-        claim: AgentSessionLinkOutboundPromptClaim?,
-        origin: UserInstructionResponse.Origin,
-        inputProof: AgentSessionLinkProviderInputRelease.Proof? = nil,
-        undecoratedProviderText: String? = nil
-    ) -> Bool {
-        linkExecutionRuntime.resumeWaitingInstructionContinuation(
-            session: session, providerText: providerText, claim: claim, origin: origin,
-            inputProof: inputProof, undecoratedProviderText: undecoratedProviderText
         )
     }
 
@@ -18763,7 +18700,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // Clear it before the cancels below so their reconcile/publish sees the final state.
         session.pendingUserInputRequest = nil
         session.queuedUserInputRequests.removeAll()
-        cancelPendingInstruction(for: session)
+        AgentSessionInteractionRuntime.cancelPendingInstruction(for: session)
         cancelPendingQuestion(for: session)
         cancelPendingApproval(for: session)
         cancelPendingApplyEditsReview(for: session, reason: "Provider switch")
@@ -18833,10 +18770,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         origin: AgentModeRunService.CancellationOrigin
     ) -> (@MainActor () async -> Void)? {
         interactionRuntime.prepareRunCancellation(session: session, intent: intent, origin: origin, links: linkExecutionRuntime)
-    }
-
-    private func cancelPendingInstruction(for session: TabSession) {
-        AgentSessionInteractionRuntime.cancelPendingInstruction(for: session)
     }
 
     // MARK: - Helpers
@@ -19310,7 +19243,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             cancelPendingApproval(for: session)
             cancelPendingApplyEditsReview(for: session, reason: "Session deleted")
             await teardownApplyEditsApprovalSessionSync(for: session, cleanupScope: true)
-            cancelPendingInstruction(for: session)
+            AgentSessionInteractionRuntime.cancelPendingInstruction(for: session)
             await cleanupACPStateForDeletedSession(session)
             await teardownMCPControl(for: session, cleanupSessionStore: true)
             await cleanupProviderConversationForDeletedAgentSession(session)
@@ -19407,7 +19340,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             cancelPendingApproval(for: session)
             cancelPendingApplyEditsReview(for: session, reason: "Session deleted")
             await teardownApplyEditsApprovalSessionSync(for: session, cleanupScope: true)
-            cancelPendingInstruction(for: session)
+            AgentSessionInteractionRuntime.cancelPendingInstruction(for: session)
             await cleanupACPStateForDeletedSession(session)
             await teardownMCPControl(for: session, cleanupSessionStore: true)
             providerCleanupOutcome = await cleanupProviderConversationForDeletedAgentSession(session)

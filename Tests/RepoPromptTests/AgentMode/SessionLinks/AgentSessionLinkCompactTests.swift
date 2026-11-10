@@ -345,7 +345,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
                 )
                 fixture.session.noteLiveContextUsageReport(contextUsedTokens: 1, promptTokens: nil, modelContextWindow: window)
             }
-            let admission = await fixture.viewModel.agentSelfCompactMCPAdmission(
+            let admission = await fixture.viewModel.linkExecutionRuntime.agentSelfCompactMCPAdmission(
                 endpoint: endpoint, origin: origin,
                 note: String(repeating: "x", count: maximum + 1), idempotencyKey: "oversized"
             )
@@ -366,7 +366,8 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         fixture.session.installRunID(runID)
         fixture.session.runState = .running
         let ownership = fixture.session.beginRunAttempt(source: "test.selfCompact.origin")
-        let reservation = fixture.viewModel.agentSelfCompactSchedule(
+        let reservation = try fixture.viewModel.linkExecutionRuntime.agentSelfCompactSchedule(
+            command: XCTUnwrap(fixture.viewModel.linkExecutionRuntime.admit(fixture.candidate)),
             endpoint: fixture.candidate.domainEndpoint,
             runID: runID,
             runAttemptID: ownership.attemptID,
@@ -425,7 +426,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         let ownership = fixture.session.beginRunAttempt(source: "test.selfCompact.lateWriter")
         let endpoint = fixture.candidate.domainEndpoint
         let origin = AgentSelfMCPCallOrigin(endpoint: endpoint, runID: runID, runAttemptID: ownership.attemptID)
-        guard case .scheduled = await fixture.viewModel.agentSelfCompactMCPAdmission(
+        guard case .scheduled = await fixture.viewModel.linkExecutionRuntime.agentSelfCompactMCPAdmission(
             endpoint: endpoint, origin: origin, note: "private continuation", idempotencyKey: "late-writer"
         ) else { return XCTFail("Expected a durable scheduled receipt") }
 
@@ -468,7 +469,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
             let ownership = fixture.session.beginRunAttempt(source: "test.selfCompact.runtimeOwnerFence")
             let endpoint = fixture.candidate.domainEndpoint
             let origin = AgentSelfMCPCallOrigin(endpoint: endpoint, runID: runID, runAttemptID: ownership.attemptID)
-            guard case let .scheduled(attempt) = await fixture.viewModel.agentSelfCompactMCPAdmission(
+            guard case let .scheduled(attempt) = await fixture.viewModel.linkExecutionRuntime.agentSelfCompactMCPAdmission(
                 endpoint: endpoint, origin: origin, note: "preserve continuation", idempotencyKey: "runtime-owner-fence"
             ) else { return XCTFail("Expected an acknowledged reservation") }
             let scope = AgentSessionRuntimeStore.shared.makeScope()
@@ -478,7 +479,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
             }
             if retires {
                 retireRuntime(in: fixture)
-                let replay = await fixture.viewModel.agentSelfCompactMCPAdmission(
+                let replay = await fixture.viewModel.linkExecutionRuntime.agentSelfCompactMCPAdmission(
                     endpoint: endpoint, origin: origin, note: "preserve continuation", idempotencyKey: "runtime-owner-fence"
                 )
                 guard case let .duplicate(id, _) = replay else { return XCTFail("Retirement must not erase an already-acknowledged receipt") }
@@ -525,7 +526,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         )
         fixture.session.isDirty = false // The reservation itself must make the required save necessary.
 
-        let first = await fixture.viewModel.agentSelfCompactMCPAdmission(
+        let first = await fixture.viewModel.linkExecutionRuntime.agentSelfCompactMCPAdmission(
             endpoint: endpoint, origin: origin,
             note: "continue exactly", idempotencyKey: "self-mcp-key"
         )
@@ -536,7 +537,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         XCTAssertTrue(fixture.events.contains(.save), "reservation must persist before receipt")
         XCTAssertFalse(fixture.events.contains(.providerControllerCreated), "no inline native dispatch")
 
-        let replay = await fixture.viewModel.agentSelfCompactMCPAdmission(
+        let replay = await fixture.viewModel.linkExecutionRuntime.agentSelfCompactMCPAdmission(
             endpoint: endpoint, origin: origin,
             note: "continue exactly", idempotencyKey: "self-mcp-key"
         )
@@ -546,7 +547,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         XCTAssertEqual(requestID, attempt.id)
         XCTAssertEqual(status?.phase, AgentSelfCompactAttempt.Phase.scheduled.rawValue)
 
-        let conflict = await fixture.viewModel.agentSelfCompactMCPAdmission(
+        let conflict = await fixture.viewModel.linkExecutionRuntime.agentSelfCompactMCPAdmission(
             endpoint: endpoint, origin: origin,
             note: "changed", idempotencyKey: "self-mcp-key"
         )
@@ -555,7 +556,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         let rebound = AgentSelfMCPCallOrigin(
             endpoint: endpoint, runID: runID, runAttemptID: UUID()
         )
-        let unavailable = await fixture.viewModel.agentSelfCompactMCPAdmission(
+        let unavailable = await fixture.viewModel.linkExecutionRuntime.agentSelfCompactMCPAdmission(
             endpoint: endpoint, origin: rebound,
             note: "continue exactly", idempotencyKey: "other-key"
         )
@@ -576,13 +577,13 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
             endpoint: endpoint, runID: runID, runAttemptID: ownership.attemptID
         )
         let first = Task { @MainActor in
-            await fixture.viewModel.agentSelfCompactMCPAdmission(
+            await fixture.viewModel.linkExecutionRuntime.agentSelfCompactMCPAdmission(
                 endpoint: endpoint, origin: origin,
                 note: "pending note", idempotencyKey: "same-key-pending"
             )
         }
         await gate.waitUntilEntered()
-        let retry = await fixture.viewModel.agentSelfCompactMCPAdmission(
+        let retry = await fixture.viewModel.linkExecutionRuntime.agentSelfCompactMCPAdmission(
             endpoint: endpoint, origin: origin,
             note: "pending note", idempotencyKey: "same-key-pending"
         )
@@ -595,7 +596,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         guard case let .scheduled(attempt) = await first.value else {
             return XCTFail("Expected the first admission after its save")
         }
-        let committedRetry = await fixture.viewModel.agentSelfCompactMCPAdmission(
+        let committedRetry = await fixture.viewModel.linkExecutionRuntime.agentSelfCompactMCPAdmission(
             endpoint: endpoint, origin: origin,
             note: "pending note", idempotencyKey: "same-key-pending"
         )
@@ -625,7 +626,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
             scope.replaceSessions([:])
         }
 
-        let refused = await fixture.viewModel.agentSelfCompactMCPAdmission(
+        let refused = await fixture.viewModel.linkExecutionRuntime.agentSelfCompactMCPAdmission(
             endpoint: endpoint, origin: origin, note: "keep this note", idempotencyKey: "window-free-conflict"
         )
         guard case .conflicting = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: endpoint.sessionID) else {
@@ -638,13 +639,193 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
 
         scope.replaceSessions([:])
-        let retry = await fixture.viewModel.agentSelfCompactMCPAdmission(
+        let retry = await fixture.viewModel.linkExecutionRuntime.agentSelfCompactMCPAdmission(
             endpoint: endpoint, origin: origin, note: "keep this note", idempotencyKey: "window-free-conflict"
         )
         guard case let .scheduled(attempt) = retry else { return XCTFail("Removing the competing claim permits a fresh admission with the unused key") }
         XCTAssertEqual(attempt.idempotencyKey, "window-free-conflict")
         XCTAssertTrue(fixture.events.contains(.save))
         XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
+    }
+
+    func testSelfCompactSupportAwaitCannotAdoptAnotherWriterOrRun() async throws {
+        for drift in ["reacquired", "conflict", "retiring", "run"] {
+            let fixture = try makeFixture()
+            let session = fixture.session
+            let runtime = fixture.viewModel.linkExecutionRuntime
+            session.installRunID(UUID())
+            session.runState = .running
+            let ownership = session.beginRunAttempt(source: "support origin")
+            let endpoint = fixture.candidate.domainEndpoint
+            let origin = try AgentSelfMCPCallOrigin(endpoint: endpoint, runID: XCTUnwrap(session.runID), runAttemptID: ownership.attemptID)
+            let command = try XCTUnwrap(runtime.admit(fixture.candidate))
+            let scope = command.writer.scope
+            let gate = FirstSaveGate()
+            runtime.test_selfCompactAfterSupport = { await gate.pause() }
+            session.isDirty = false
+            let admission = Task { await runtime.agentSelfCompactMCPAdmission(endpoint: endpoint, origin: origin, note: "same key remains available", idempotencyKey: "support-held") }
+            defer {
+                gate.release()
+                runtime.test_selfCompactAfterSupport = nil
+                admission.cancel()
+                session.saveDebounceTask?.cancel()
+            }
+            await gate.waitUntilEntered()
+            switch drift {
+            case "reacquired":
+                scope.replaceSessions([:])
+                scope.replaceSessions([session.tabID: session])
+                XCTAssertFalse(command.isCurrent)
+            case "conflict":
+                let other = scope.makeSession(tabID: UUID())
+                other.installPersistentSessionBinding(.init(tabID: other.tabID, sessionID: endpoint.sessionID, workspaceID: endpoint.workspaceID))
+                scope.replaceSessions([session.tabID: session, other.tabID: other])
+            case "retiring": scope.beginRetirement()
+            default: _ = session.beginRunAttempt(source: "successor run")
+            }
+            gate.release()
+            let result = await admission.value
+            switch result {
+            case let .blocked(reason):
+                XCTAssertTrue(drift == "reacquired" || drift == "retiring")
+                XCTAssertEqual(reason, "session_not_exclusive")
+            case .unavailable: XCTAssertTrue(drift == "conflict" || drift == "run")
+            default: XCTFail("Support drift must refuse before reserving: \(drift)")
+            }
+            XCTAssertNil(session.selfCompactState.active)
+            XCTAssertNil(session.selfCompactState.latest)
+            XCTAssertFalse(fixture.events.contains(.save))
+            XCTAssertNil(runtime.agentSelfCompactSchedule(command: command, endpoint: endpoint, runID: origin.runID, runAttemptID: origin.runAttemptID, note: "stale", idempotencyKey: "stale", support: .claudeCode))
+            if drift == "reacquired" {
+                runtime.test_selfCompactAfterSupport = nil
+                guard case .scheduled = await runtime.agentSelfCompactMCPAdmission(endpoint: endpoint, origin: origin, note: "same key remains available", idempotencyKey: "support-held") else {
+                    return XCTFail("A fresh admission may use the unspent key")
+                }
+            }
+        }
+    }
+
+    func testSelfCompactRequiredSaveCannotCreditReacquiredOrReboundOwners() async throws {
+        for drift in ["reacquired", "replacement", "rebound"] {
+            let gate = FirstSaveGate()
+            let fixture = try makeFixture(firstSaveGate: gate)
+            let runtime = fixture.viewModel.linkExecutionRuntime
+            let session = fixture.session
+            session.installRunID(UUID())
+            session.runState = .running
+            let ownership = session.beginRunAttempt(source: "save origin")
+            let command = try XCTUnwrap(runtime.admit(fixture.candidate))
+            let scope = command.writer.scope
+            let debounce = TestReleaseFence(name: "unrelated coalesced save")
+            scope.persistence.debounce = { await debounce.enterAndWait()
+                try Task.checkCancellation()
+            }
+            let endpoint = fixture.candidate.domainEndpoint
+            let origin = try AgentSelfMCPCallOrigin(endpoint: endpoint, runID: XCTUnwrap(session.runID), runAttemptID: ownership.attemptID)
+            let admission = Task { await runtime.agentSelfCompactMCPAdmission(endpoint: endpoint, origin: origin, note: "retain original evidence", idempotencyKey: "save-held") }
+            var successor: AgentTabSession?
+            defer {
+                gate.release()
+                admission.cancel()
+                session.saveDebounceTask?.cancel()
+                successor?.saveDebounceTask?.cancel()
+                debounce.release()
+            }
+            await gate.waitUntilEntered()
+            let originalState = session.selfCompactState
+            switch drift {
+            case "reacquired":
+                scope.replaceSessions([:])
+                scope.replaceSessions([session.tabID: session])
+            case "replacement":
+                let next = scope.makeSession(tabID: session.tabID)
+                try next.installPersistentSessionBinding(XCTUnwrap(session.persistentSessionBindingIdentity))
+                next.recordRestorationAuthoritative(.persistedPayloadApplied)
+                next.selfCompactState = originalState
+                next.isDirty = false
+                successor = next
+                scope.replaceSessions([next.tabID: next])
+            default:
+                session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: endpoint.workspaceID))
+                session.isDirty = false
+            }
+            XCTAssertFalse(command.isCurrent)
+            gate.release()
+            guard case let .blocked(reason) = await admission.value else { return XCTFail("A stale save cannot acknowledge scheduling") }
+            XCTAssertEqual(reason, "persistence_indeterminate")
+            XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
+            if drift == "rebound" {
+                XCTAssertEqual(session.selfCompactState, originalState, "Old cleanup cannot rewrite a new record, even when its transient fields still contain the old attempt")
+                XCTAssertFalse(session.isDirty)
+                XCTAssertFalse(try XCTUnwrap(originalState.active?.owner).matchesLocalBinding(session), "The old attempt is not executable on the new binding")
+            } else {
+                XCTAssertNil(session.selfCompactState.active)
+                XCTAssertEqual(session.selfCompactState.latest?.outcome, .recoveryRequired)
+                XCTAssertEqual(session.selfCompactState.latest?.recoveryNote, "retain original evidence")
+                XCTAssertTrue(session.isDirty)
+            }
+            if let successor {
+                XCTAssertEqual(successor.selfCompactState, originalState)
+                XCTAssertFalse(successor.isDirty)
+            }
+            if drift == "reacquired" {
+                let pending = try XCTUnwrap(session.saveDebounceTask, "The owner's pre-existing save request must survive a failed exact write")
+                XCTAssertNotNil(session.saveDebounceRequestID)
+                XCTAssertFalse(pending.isCancelled)
+                debounce.release()
+                await pending.value
+                XCTAssertFalse(session.isDirty, "The independently pending request may save through the current owner")
+            }
+        }
+    }
+
+    func testExactRequiredSaveKeepsItsWriterAcrossTheInFlightQueue() async throws {
+        let fixture = try makeFixture()
+        let session = fixture.session
+        let runtime = fixture.viewModel.linkExecutionRuntime
+        let command = try XCTUnwrap(runtime.admit(fixture.candidate))
+        let scope = command.writer.scope
+        let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+        let persistence = scope.persistence
+        session.isDirty = true
+        let debounce = TestReleaseFence(name: "ordinary owner save while exact flush waits")
+        persistence.debounce = { await debounce.enterAndWait()
+            try Task.checkCancellation()
+        }
+        persistence.scheduleSave(for: session)
+        let pendingID = try XCTUnwrap(session.saveDebounceRequestID)
+        XCTAssertTrue(persistence.queue.begin(sessionID: sessionID))
+        var ownsQueueSlot = true
+        let entered = expectation(description: "required flush entered before queue wait")
+        let flush = Task {
+            await persistence.flushSaveRequired(for: session.tabID, workspaceID: fixture.candidate.workspaceID, writer: .exact(command.writer), observingSavePhase: { phase in
+                if phase == .beforeWrite { entered.fulfill() }
+            })
+        }
+        defer {
+            if ownsQueueSlot { _ = persistence.queue.finish(sessionID: sessionID) }
+            flush.cancel()
+            session.saveDebounceTask?.cancel()
+            debounce.release()
+        }
+        await fulfillment(of: [entered], timeout: 3)
+        scope.replaceSessions([:])
+        scope.replaceSessions([session.tabID: session])
+        _ = persistence.queue.finish(sessionID: sessionID)
+        ownsQueueSlot = false
+        guard case .failure = await flush.value else { return XCTFail("The queue must not substitute today's writer") }
+        XCTAssertEqual(session.saveDebounceRequestID, pendingID, "A queued stale flush must not cancel the owner's ordinary timer")
+        XCTAssertEqual(session.saveDebounceTask?.isCancelled, false)
+        XCTAssertFalse(fixture.events.contains(.save))
+        guard case .failure = await persistence.flushSaveRequired(for: session.tabID, workspaceID: fixture.candidate.workspaceID, writer: .exact(command.writer)) else {
+            return XCTFail("An already stale exact writer is refused at entry")
+        }
+        XCTAssertFalse(fixture.events.contains(.save))
+        let fresh = try XCTUnwrap(runtime.admit(fixture.candidate))
+        guard case .success = await persistence.flushSaveRequired(for: session.tabID, workspaceID: fixture.candidate.workspaceID, writer: .exact(fresh.writer)) else {
+            return XCTFail("The fresh command can request its own write")
+        }
+        XCTAssertTrue(fixture.events.contains(.save))
     }
 
     private func retireRuntime(in fixture: Fixture) {
@@ -670,7 +851,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
             workspaceID: endpoint.workspaceID, sessionID: endpoint.sessionID
         ) else { return XCTFail("Expected the originating runtime writer") }
         retireRuntime(in: fixture)
-        let result = await fixture.viewModel.agentSelfCompactMCPAdmission(
+        let result = await fixture.viewModel.linkExecutionRuntime.agentSelfCompactMCPAdmission(
             endpoint: endpoint,
             origin: .init(endpoint: endpoint, runID: runID, runAttemptID: ownership.attemptID),
             note: "do not admit during drain", idempotencyKey: "retiring-runtime"
@@ -700,7 +881,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         fixture.session.isDirty = false
         let endpoint = fixture.candidate.domainEndpoint
         let admission = Task { @MainActor in
-            await fixture.viewModel.agentSelfCompactMCPAdmission(
+            await fixture.viewModel.linkExecutionRuntime.agentSelfCompactMCPAdmission(
                 endpoint: endpoint, origin: .init(endpoint: endpoint, runID: runID, runAttemptID: ownership.attemptID),
                 note: "keep after retirement", idempotencyKey: "retirement-during-save"
             )
@@ -746,7 +927,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
             endpoint: endpoint, runID: runID, runAttemptID: ownership.attemptID
         )
         let admission = Task { @MainActor in
-            await fixture.viewModel.agentSelfCompactMCPAdmission(
+            await fixture.viewModel.linkExecutionRuntime.agentSelfCompactMCPAdmission(
                 endpoint: endpoint, origin: origin,
                 note: "retain for recovery", idempotencyKey: "writer-during-save"
             )
@@ -801,13 +982,13 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         )
 
         let first = Task { @MainActor in
-            await fixture.viewModel.agentSelfCompactMCPAdmission(
+            await fixture.viewModel.linkExecutionRuntime.agentSelfCompactMCPAdmission(
                 endpoint: endpoint, origin: origin,
                 note: "retain after failed save", idempotencyKey: "failed-save-key"
             )
         }
         await gate.waitUntilEntered()
-        let retry = await fixture.viewModel.agentSelfCompactMCPAdmission(
+        let retry = await fixture.viewModel.linkExecutionRuntime.agentSelfCompactMCPAdmission(
             endpoint: endpoint, origin: origin,
             note: "retain after failed save", idempotencyKey: "failed-save-key"
         )
@@ -844,7 +1025,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
             endpoint: endpoint, runID: runID, runAttemptID: ownership.attemptID
         )
 
-        let result = await fixture.viewModel.agentSelfCompactMCPAdmission(
+        let result = await fixture.viewModel.linkExecutionRuntime.agentSelfCompactMCPAdmission(
             endpoint: endpoint, origin: origin,
             note: "continue", idempotencyKey: "duplicate-writer-key"
         )

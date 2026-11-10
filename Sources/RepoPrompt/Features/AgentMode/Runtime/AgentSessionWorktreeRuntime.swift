@@ -194,7 +194,7 @@ final class AgentSessionWorktreeRuntime {
                 guard command.writer.isCurrent, resources.isCurrent() else {
                     return .failure(.init(operation: .save, tabID: session.tabID, message: "The originating writer changed before persistence."))
                 }
-                return await scope.persistence.flushSaveRequired(for: session.tabID, workspaceID: command.identity.workspaceID)
+                return await scope.persistence.flushSaveRequired(writer: command.writer)
             }.value
         }
         do {

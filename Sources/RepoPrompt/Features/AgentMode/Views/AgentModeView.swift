@@ -2396,15 +2396,17 @@ struct AgentModeChatDetailView: View {
             runtime: AgentSessionLinkRuntimeBridge.shared.delegationScopes
         )
         if let request = runInteractionSnapshot.pendingCodexHookReview {
+            let command = agentModeVM.activeSession?.activeAgentSessionID.flatMap { try? agentModeVM.runtimeCommand(sessionID: $0) }
+            let runtime = agentModeVM.interactionRuntime
             CodexHookReviewCard(
                 request: request,
                 isStrictModeEnabled: {
-                    agentModeVM.isCodexHookApprovalStrictModeEnabled()
+                    command.map { runtime.isCodexHookApprovalStrictModeEnabled(for: $0.writer.session) } ?? true
                 },
                 onDecision: { decision in
-                    guard let tabID = currentTabID else { return }
-                    try await agentModeVM.submitCodexHookReviewDecision(
-                        tabID: tabID,
+                    guard let command else { throw AgentCodexHookReviewResolutionError.staleWriter }
+                    try await runtime.submitCodexHookReviewDecision(
+                        command: command,
                         requestID: request.id,
                         decision: decision
                     )

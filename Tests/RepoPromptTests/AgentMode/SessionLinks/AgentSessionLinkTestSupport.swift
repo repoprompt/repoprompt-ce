@@ -13,6 +13,22 @@ extension CodexServerRequestReceipt {
     }
 }
 
+/// Fixture installation still requires the real restored writer; a missing origin fails the test
+/// and releases its continuation rather than manufacturing a legacy bypass.
+@MainActor
+func installInstructionWaitForTest(
+    session: AgentTabSession, runtime: AgentSessionLinkExecutionRuntime,
+    continuation: CheckedContinuation<UserInstructionResponse, Error>, waitID: UUID = UUID(),
+    file: StaticString = #filePath, line: UInt = #line
+) {
+    do {
+        let command = try XCTUnwrap(runtime.instructionCommand(for: session), "Restored instruction writer", file: file, line: line)
+        runtime.test_installInstructionWait(command: command, waitID: waitID, continuation: continuation)
+    } catch {
+        continuation.resume(throwing: error)
+    }
+}
+
 private struct AgentSessionLinkAsyncWaitTimeout: Error, LocalizedError {
     let description: String
     let timeout: TimeInterval
