@@ -7639,3 +7639,53 @@ Full lint `6f390d01-e29f-4270-914a-79045f6f32e4` and scoped pinned formatting/st
 Actual compiler warnings on the three touched Swift files: runner 1 (existing), tests/harness 0;
 no positive per-file occurrence delta. Fresh index remained **1,261/1,360 and 53/66**. These are local
 checkpoint receipts, not both-product/full-SessionLinks/live-app or hosted-CI qualification. No push.
+
+### M9.2g local checkpoint — fresh ACP bootstrap/configuration/route ownership
+
+Fresh startup now rechecks its weak originating writer receipt after lease initialization diagnostics,
+bootstrap, resume-recovery staging, every configuration step and route release. Configuration receives
+an explicit admission closure; the fresh route checks the writer and the reused route retains its
+existing run/attempt/controller predicate (reused writer cutover remains open). Cursor discovery has
+an internal interruption sentinel so it cannot silently skip selections and continue a partially
+configured sequence. A temporary refusal that becomes current again cancels its original attempt
+instead of continuing that partial sequence.
+
+The operation-local `promptTurnEntered` boundary limits the final error/diagnostic backstop: before
+prompt entry a lost claim cannot reach terminal publication. Only the captured lease gate is released
+for a lost or superseded operation; installed policy and controller teardown remain with current-owner
+Stop. An installed controller is not shut down merely because a later attempt shares it. A detached
+controller still gets late-bootstrap cleanup: actor `bootstrap` can suspend before process launch,
+and its existing physical actor internals are not a main-actor writer fence. Normal current-claim
+provider errors retain their normalized failure rather than being converted to cancellation. The
+execution core inherits `#isolation`; it is not a nonisolated hidden owner.
+
+One Oracle review (`0120`, chat `6F1A83`) requested preserving detached cleanup, actual Stop-retirement
+assertions, a post-RPC configuration case, temporary-interruption coverage, explicit routing notification
+and complete prior-attempt fixture teardown. These are addressed without widening production admission.
+The successor fixture claims its previous terminal resources before beginning another attempt and
+joins that exact teardown; `AgentRunAttemptLifecycle.beginAttempt` expressly forbids dropping unclaimed
+resources. The raw conflicting-claim fixture clears its conflict at the subsequent admission check,
+proving that the current-again path cancels instead of resuming configuration. Cursor-specific discovery
+interruption is source-reviewed, not yet covered by a Cursor fixture. The error case uses an actual
+rejected `session/new` followed by post-normalization claim loss; it does not claim an in-flight wire
+failure/claim-loss interleaving. All gates keep operation identity, not a newly resolved writer.
+
+Still open: reused setup and deferred acquisition, awaits within resume-recovery helpers, model-parameter
+multi-RPC/controller spawn internals, prompt preparation/proof/physical writes, post-dispatch consumer
+and terminal work, tool-tracking callbacks, and terminal-barrier internal awaits. A temporarily conflicting
+claim that remains refused leaves shared attempt resources for the restored current owner's Stop,
+matching the prior task-entry behavior; this is not a new handoff/recovery lifecycle. No push.
+
+Validation: first focused ticket `d848b337-75ed-4a0f-b8d3-c1a454983b1c` was cancelled after compilation
+to apply review corrections, with no test qualification claimed. Focused
+`f1d5df68-2ead-43bc-b50d-3e255e0263ef` passed the new **18-variant method** (6.671s). Affected
+`cbe527fc-1591-4abe-9d82-a26a29484173` ran 399 tests with one new-fixture failure: gate cleanup was
+checked before joining the owned-error attempt's asynchronous terminal teardown. The fixture now
+joins that existing teardown before its gate assertion; claim-lost checks remain before current-owner
+Stop, with no timeout/assertion relaxation or production cleanup change. Final affected ticket
+`fb185e8d-24f6-4313-8156-3f354a156c0c` passed **399 tests, zero failures/skips** (65.691s).
+Full lint `8577c089-2b10-4b12-9a67-bc7911bbade9` passed, and the final fixture correction passed
+pinned formatting and strict lint. Actual compiler occurrence counts remain runner 1, tests/harness 0,
+matching integrated baseline `a0c674e9-c5be-4f38-b010-bf620211cfb2`; final test recompilation added no
+warning. Fresh index passed at **1,261/1,360 wrong-way edges and 53/66 largest cycle**, unchanged.
+Local checkpoint only: both-product/full-SessionLinks/live-app/hosted-CI qualification is not claimed.

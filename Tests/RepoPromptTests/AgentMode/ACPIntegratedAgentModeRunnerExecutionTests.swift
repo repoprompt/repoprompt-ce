@@ -560,6 +560,190 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
         }
     }
 
+    func testACPFreshBootstrapAndConfigurationKeepTheirOriginalWriter() async throws {
+        typealias Boundary = ACPIntegratedAgentModeRunner.StartupBoundary
+        enum Drift { case reacquire, retire, successor, detached, transientConflict, none }
+        @MainActor final class Counters { var installed = 0, cleared = 0 }
+        let boundaries: [Boundary] = [.bootstrapStarting, .bootstrapCompleted, .resumeRecoveryStaged, .configuration, .routingReleased, .prePromptFailure]
+        let cases = boundaries.flatMap { [($0, Drift.reacquire, false), ($0, Drift.retire, false)] }
+            + [
+                (.bootstrapCompleted, .successor, false),
+                (.routingReleased, .none, false),
+                (.bootstrapCompleted, .detached, false),
+                (.configuration, .transientConflict, false),
+                (.configuration, .reacquire, true),
+                (.configuration, .retire, true)
+            ]
+        for (boundary, drift, afterConfigurationRPC) in cases {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let script = try AgentSessionLinkACPServerScript.write(to: directory)
+            let rpcLog = directory.appendingPathComponent("requests.jsonl")
+            var environment = ["ACP_RPC_LOG": rpcLog.path]
+            if boundary == .prePromptFailure { environment["ACP_FAIL_METHOD"] = "session/new" }
+            if boundary == .resumeRecoveryStaged { environment["ACP_FAIL_LOAD"] = "1" }
+            let provider = AgentSessionLinkCapturingACPProvider(providerID: .antigravity, commandPath: script.path, environment: environment)
+            let request = ACPRunRequest(
+                agentKind: .antigravity, modelString: nil, workspacePath: directory.path,
+                resumeSessionID: boundary == .resumeRecoveryStaged ? "missing-session" : nil,
+                attachments: [], taskLabelKind: nil, sessionModeID: "auto_edit"
+            )
+            let controller = try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
+            addTeardownBlock { await controller.shutdown() }
+            let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+            let session = try harness.makeBoundSession(agent: .antigravity)
+            let origin = try harness.startCommand(for: session)
+            let scope = origin.writer.scope
+            harness.pendingHandoffSendOutcome = { session, sent in scope.handoff.recordSendOutcome(for: session, didSend: sent) }
+            session.pendingHandoff.payload = "unsent handoff"
+            session.pendingHandoff.isStagedForSend = true
+            let barrier = AgentRunTerminalCommitBarrier()
+            let runner = ACPIntegratedAgentModeRunner(hooks: harness.hooks, terminalCommitBarrier: barrier, toolTrackingHooks: .noOp)
+            var reached = false
+            var task: Task<Void, Never>?
+            var owner: AgentRunOwnership?
+            var dirty = false
+            var saves: UInt64 = 0
+            var identity: String?
+            var previousTeardown: AgentRunAttemptTerminalResources.Teardown?
+            let conflicting = AgentSessionRuntimeStore.shared.makeScope()
+            defer { conflicting.replaceSessions([:]) }
+            var consumers = 0
+            runner.testPromptConsumerCreated = { consumers += 1 }
+            runner.testAtStartupBoundary = { point in
+                if point == boundary, reached, drift == .transientConflict {
+                    conflicting.replaceSessions([:])
+                    XCTAssertTrue(origin.isCurrent)
+                }
+                guard point == boundary, !reached else { return }
+                if afterConfigurationRPC {
+                    let text = (try? String(contentsOf: rpcLog, encoding: .utf8)) ?? ""
+                    guard text.contains("session/set_config_option") else { return }
+                }
+                reached = true
+                task = session.agentTask
+                dirty = session.isDirty
+                saves = session.saveRequestGeneration
+                identity = session.providerSessionID
+                switch drift {
+                case .reacquire:
+                    var members = scope.sessions
+                    members.removeValue(forKey: session.tabID)
+                    scope.replaceSessions(members)
+                    members[session.tabID] = session
+                    scope.replaceSessions(members)
+                case .retire:
+                    scope.beginRetirement()
+                case .successor, .detached:
+                    if let oldOwner = session.activeRunOwnership {
+                        previousTeardown = session.claimRunAttemptTerminalTeardown(ownership: oldOwner, terminalState: .cancelled)
+                    }
+                    if drift == .successor {
+                        _ = session.beginRunAttempt(source: "successor during bootstrap")
+                    } else {
+                        session.acpController = nil
+                    }
+                case .transientConflict:
+                    let duplicate = conflicting.makeSession(tabID: UUID())
+                    duplicate.installPersistentSessionBinding(.init(
+                        tabID: duplicate.tabID, sessionID: origin.identity.sessionID,
+                        workspaceID: origin.identity.workspaceID
+                    ))
+                    conflicting.replaceSessions([duplicate.tabID: duplicate])
+                    XCTAssertFalse(origin.isCurrent)
+                case .none:
+                    break
+                }
+                owner = session.activeRunOwnership
+            }
+            let gateID = UUID()
+            let counters = Counters()
+            var lease: MCPBootstrapLease?
+            let prepared = await runner.prepareRun(
+                tabID: session.tabID, session: session, origin: origin, workspace: harness.workspace,
+                initialUserMessage: "turn", initialMessageForRun: "turn", attachments: [], runRequest: request,
+                makeLease: { runID in
+                    let result = MCPBootstrapLease(
+                        spec: MCPBootstrapLeaseSpec(
+                            runID: runID, gateID: gateID, windowID: 1, tabID: session.tabID,
+                            clientName: "RepoPromptCE", restrictedTools: [], additionalTools: nil,
+                            oneShot: true, reason: "fresh bootstrap writer test", ttl: 60, purpose: .agentModeRun,
+                            taskLabelKind: nil, allowsAgentExternalControlTools: false, requiresExpectedAgentPID: false
+                        ),
+                        mcpServerEnabler: { true },
+                        policyInstaller: { spec in
+                            await MainActor.run { counters.installed += 1 }
+                            await MCPRoutingWaiter.notifyRouted(runID: spec.runID)
+                        },
+                        expectedPIDPolicyArmer: { _ in true },
+                        policyClearer: { _ in await MainActor.run { counters.cleared += 1 } }
+                    )
+                    lease = result
+                    return result
+                }
+            )
+            let resources = AgentRunProviderComposition(
+                headless: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
+                acp: { _, _ in provider }, controller: { _, _ in controller }
+            )
+            await resources.fulfill(prepared)
+            try await AsyncTestWait.waitUntil("fresh ACP boundary \(boundary), \(drift)") { reached }
+            await task?.value
+            XCTAssertNotNil(task)
+            XCTAssertEqual(counters.installed, 1)
+            if drift == .retire || drift == .transientConflict {
+                try await barrier.awaitTerminalTeardown(for: XCTUnwrap(owner), lifecycle: session.runLifecycle)
+            }
+            let gate = await HeadlessAgentConnectionGate.snapshot()
+            XCTAssertNotEqual(gate.activeConnectionID, gateID, "boundary=\(boundary), drift=\(drift)")
+            XCTAssertEqual(consumers, drift == .none ? 1 : 0)
+            let rpcText = (try? String(contentsOf: rpcLog, encoding: .utf8)) ?? ""
+            if drift == .none {
+                XCTAssertEqual(session.runState, .completed)
+                XCTAssertTrue(rpcText.contains("session/set_config_option"))
+                XCTAssertTrue(rpcText.contains("session/prompt"))
+            } else {
+                XCTAssertFalse(rpcText.contains("session/prompt"))
+                if boundary == .bootstrapStarting { XCTAssertTrue(rpcText.isEmpty) }
+                if boundary != .routingReleased, !afterConfigurationRPC { XCTAssertFalse(rpcText.contains("session/set_config_option")) }
+                if afterConfigurationRPC { XCTAssertTrue(rpcText.contains("session/set_config_option")) }
+                if drift == .retire || drift == .transientConflict {
+                    XCTAssertEqual(session.runState, boundary == .prePromptFailure ? .failed : .cancelled)
+                    XCTAssertNil(session.acpController)
+                    XCTAssertEqual(counters.cleared, 1)
+                } else {
+                    XCTAssertEqual(session.activeRunOwnership, owner)
+                    XCTAssertEqual(session.providerSessionID, identity)
+                    XCTAssertEqual(session.isDirty, dirty)
+                    XCTAssertEqual(session.saveRequestGeneration, saves)
+                    XCTAssertNil(session.lastTerminalCommitRevision)
+                    XCTAssertEqual(session.acpController === controller, drift != .detached)
+                    XCTAssertEqual(counters.cleared, 0)
+                    if drift == .detached {
+                        let retired = await controller.isRetired
+                        XCTAssertTrue(retired, "Detached late bootstrap remains the original operation's cleanup")
+                    } else if boundary != .bootstrapStarting, boundary != .prePromptFailure {
+                        let reusable = await controller.hasReusableSession
+                        XCTAssertTrue(reusable, "The stale task must not retire the installed controller")
+                    }
+                    if let previousTeardown { await previousTeardown() }
+                    if drift == .reacquire || drift == .successor || drift == .detached {
+                        await harness.service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+                        XCTAssertEqual(session.runState, .cancelled)
+                        XCTAssertEqual(counters.cleared, 1)
+                        XCTAssertNil(session.acpController)
+                        let reusable = await controller.hasReusableSession
+                        XCTAssertFalse(reusable, "Current-owner Stop must retire the bootstrapped controller")
+                    }
+                }
+            }
+            if let lease { await lease.cancelAndCleanup() }
+            await controller.shutdown()
+            session.saveDebounceTask?.cancel()
+        }
+    }
+
     func testACPTaskEntryAndLeaseCompletionKeepTheirOriginalWriter() async throws {
         typealias Boundary = ACPIntegratedAgentModeRunner.StartupBoundary
         @MainActor final class Counters {

@@ -182,6 +182,7 @@ final class ACPIntegratedAgentModeRunner {
 
     enum StartupBoundary {
         case taskEntry, toolTrackingCompleted, leaseAcquired, acquireFailureOutcome
+        case bootstrapStarting, bootstrapCompleted, resumeRecoveryStaged, configuration, routingReleased, prePromptFailure
     }
 
     #if DEBUG
@@ -1010,7 +1011,7 @@ final class ACPIntegratedAgentModeRunner {
         ))
     }
 
-    /// Until provider bootstrap begins, only the admitted writer may publish or advance this
+    /// Before prompt entry, only the admitted writer may publish or advance this
     /// attempt. Lost claims leave installed resources to the current owner's Stop path.
     private func admitStartupTask(
         _ boundary: StartupBoundary,
@@ -1096,32 +1097,43 @@ final class ACPIntegratedAgentModeRunner {
             return
         }
 
+        let admitFresh: @MainActor (StartupBoundary) async -> Bool = { [self] boundary in
+            await admitStartupTask(
+                boundary, session: session, runID: runID, runAttemptID: runAttemptID,
+                controller: controller, receipt: receipt, attachmentReservationID: attachmentReservationID,
+                retainsController: false
+            )
+        }
         var providerInitializationCompleted = false
+        var promptTurnEntered = false
         let classification = await Self.executeTransientOperation {
             do {
                 let providerName = runRequest.agentKind.rawValue
                 await lease.providerInitializationStarted(provider: providerName)
+                guard await admitFresh(.bootstrapStarting) else { return .superseded }
                 log("bootstrap begin", runID: runID)
                 let bootstrap = try await controller.bootstrap()
                 providerInitializationCompleted = true
                 await lease.providerInitializationCompleted(provider: providerName, outcome: "ready")
                 log("bootstrap completed sessionID=\(bootstrap.sessionID)", runID: runID)
-                guard session.runID == runID,
-                      session.activeRunAttemptID == runAttemptID,
-                      let ingressOwner = session.activeRunOwnership,
-                      session.isCurrentRunAttemptForCurrentBinding(ingressOwner)
-                else {
-                    await controller.shutdown()
+                guard await admitFresh(.bootstrapCompleted) else {
+                    // Preserve cleanup of a late bootstrap after Stop detached this controller,
+                    // but never retire the controller still reachable by a successor attempt.
+                    if session.acpController !== controller { await controller.shutdown() }
                     return .superseded
                 }
+                guard let ingressOwner = session.activeRunOwnership,
+                      session.isCurrentRunAttemptForCurrentBinding(ingressOwner)
+                else { throw CancellationError() }
                 var initialMessageForPromptTurn = initialMessageForRun
                 if bootstrap.didFallbackToNewSessionAfterLoadFailure {
                     // Periodic turns preserve handoffs, so they cannot adopt a contextless replacement.
                     // Existing cancellation cleanup retires this unprompted controller.
                     guard !isPeriodic else { throw CancellationError() }
 
-                    guard await hooks.providerInput.stageResumeRecoveryHandoffIfNeeded(session),
-                          !Task.isCancelled,
+                    let stagedRecovery = await hooks.providerInput.stageResumeRecoveryHandoffIfNeeded(session)
+                    guard await admitFresh(.resumeRecoveryStaged) else { return .superseded }
+                    guard stagedRecovery, !Task.isCancelled,
                           session.isCurrentRunAttemptForCurrentBinding(ingressOwner, expectedRunID: runID)
                     else { throw CancellationError() }
                     initialMessageForPromptTurn = hooks.providerInput.prependPendingHandoffIfNeeded(initialMessageForRun, session)
@@ -1141,9 +1153,19 @@ final class ACPIntegratedAgentModeRunner {
                     runID: runID,
                     runAttemptID: runAttemptID,
                     controller: controller,
-                    runRequest: runRequest
+                    runRequest: runRequest,
+                    admission: { [self] in
+                        #if DEBUG
+                            testAtStartupBoundary?(.configuration)
+                        #endif
+                        return receipt.disposition(for: session) == .current
+                            && isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID)
+                            && session.acpController === controller
+                    }
                 ) else {
-                    return .superseded
+                    // A temporary interruption must not resume a partially applied sequence.
+                    guard await admitFresh(.configuration) else { return .superseded }
+                    throw CancellationError()
                 }
                 setRunningStatus(waitingForConnectionStatusText(for: runRequest.agentKind), source: .transport, session: session, urgent: true)
 
@@ -1160,6 +1182,8 @@ final class ACPIntegratedAgentModeRunner {
                     log("deferred MCP routing until ACP prompt", runID: runID)
                 }
 
+                guard await admitFresh(.routingReleased) else { return .superseded }
+                promptTurnEntered = true
                 return await runPromptTurn(
                     session: session,
                     runID: runID,
@@ -1178,6 +1202,9 @@ final class ACPIntegratedAgentModeRunner {
                 let normalized = await controller.normalizeError(error)
                 let normalizedText = displayText(for: normalized)
                 log("fresh start failed raw=\(String(describing: error)) normalized=\(normalizedText)", runID: runID)
+                #if DEBUG
+                    if !promptTurnEntered { testAtStartupBoundary?(.prePromptFailure) }
+                #endif
                 return .failed(errorText: normalizedText)
             }
         }
@@ -1193,6 +1220,16 @@ final class ACPIntegratedAgentModeRunner {
         }
         if case let .terminal(outcome) = classification.report.result, outcome.kind == .cancelled {
             log("fresh start cancelled", runID: runID)
+        }
+        // Normalize/diagnostic awaits can also lose the claim. Only this operation's gate
+        // may be released; current-owner Stop retains installed policy/controller cleanup.
+        if !promptTurnEntered {
+            if case .superseded = classification.report.result {
+                await lease.releaseGateForDeferredRouting()
+            } else if receipt.disposition(for: session) == .claimLost {
+                await lease.releaseGateForDeferredRouting()
+            }
+            guard receipt.disposition(for: session) != .claimLost else { return }
         }
         await settleTransientExecution(
             classification,
@@ -1249,7 +1286,12 @@ final class ACPIntegratedAgentModeRunner {
                         runID: runID,
                         runAttemptID: runAttemptID,
                         controller: controller,
-                        runRequest: runRequest
+                        runRequest: runRequest,
+                        admission: { [self] in
+                            // Reused writer admission remains a separate cutover.
+                            isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID)
+                                && session.acpController === controller
+                        }
                     ) else {
                         return .superseded
                     }
@@ -1705,14 +1747,11 @@ final class ACPIntegratedAgentModeRunner {
         runID: UUID,
         runAttemptID: UUID,
         controller: ACPAgentSessionController,
-        runRequest: ACPRunRequest
+        runRequest: ACPRunRequest,
+        admission: @escaping @MainActor () -> Bool
     ) async throws -> Bool {
-        let isCurrent = { [self] in
-            isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID)
-                && session.acpController === controller
-        }
-        return try await Self.performConfigurationSequenceIfCurrent(
-            isCurrent: isCurrent,
+        try await Self.performConfigurationSequenceIfCurrent(
+            isCurrent: admission,
             operations: [
                 { [self] in
                     try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
@@ -1724,6 +1763,7 @@ final class ACPIntegratedAgentModeRunner {
                         let explicit = ACPModelParameterSelection.selections(for: .cursor, activeBaseModelRaw: specifier.baseModelRaw, from: selections)
                         // New explicit intent replaces inherited pins before fresh validation.
                         let encoded = try await specifier.selections(in: controller.currentDiscoveredSessionModels(), excludingConfigIDs: Set(explicit.map(\.configID)), supersededKinds: Set(explicit.map(\.kind)))
+                        guard admission() else { throw ConfigurationInterrupted() }
                         selections = ACPModelParameterSelection.normalized(encoded.map { ACPModelParameterSelection(providerID: .cursor, baseModelRaw: $0.baseModelRaw, kind: $0.kind, configID: $0.configID, valueRaw: $0.valueRaw) } + selections)
                     }
                     let report = try await controller.applySessionModelParameterSelections(selections)
@@ -1744,6 +1784,8 @@ final class ACPIntegratedAgentModeRunner {
         )
     }
 
+    private struct ConfigurationInterrupted: Error {}
+
     /// Configuration calls can suspend on provider RPCs. Re-check ownership before and after
     /// every step so an attempt superseded during one response cannot continue with later writes.
     private static func performConfigurationSequenceIfCurrent(
@@ -1752,7 +1794,11 @@ final class ACPIntegratedAgentModeRunner {
     ) async throws -> Bool {
         for operation in operations {
             guard isCurrent() else { return false }
-            try await operation()
+            do {
+                try await operation()
+            } catch is ConfigurationInterrupted {
+                return false
+            }
             guard isCurrent() else { return false }
         }
         return true

@@ -599,6 +599,7 @@ enum AgentSessionLinkACPServerScript {
     /// - `ACP_ADVERTISE_AFTER_PROMPT` (comma list, may be empty): a replacement list during each prompt.
     /// - `ACP_PROMPT_LOG` (path): each `session/prompt` `prompt` array, one JSON line per prompt.
     /// - `ACP_RPC_LOG` (path): actual JSON-RPC requests and successful responses.
+    /// - `ACP_FAIL_METHOD`: rejects the named RPC after any response gate has released.
     /// - `ACP_DEVIN_FIXTURE` (`1`): advertises SWE-2 with medium/high/max thinking choices.
     /// - `ACP_USAGE_UPDATE_ON_PROMPT` (`used,size`): a `usage_update` during each prompt.
     /// - `ACP_FOREIGN_ADVERTISE_AFTER_PROMPT` (comma list): a list for another session during each prompt.
@@ -708,6 +709,9 @@ enum AgentSessionLinkACPServerScript {
                     pass
                 with open(gate_path, "rb", buffering=0) as gate:
                     gate.read(1)
+            if method == os.environ.get("ACP_FAIL_METHOD"):
+                respond_error(request.get("id"), "injected startup failure")
+                continue
             if method == "initialize":
                 respond(request.get("id"), {"agentCapabilities": {"loadSession": True}, "authMethods": []})
             elif method == "session/load" and os.environ.get("ACP_FAIL_LOAD"):
