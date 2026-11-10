@@ -7241,4 +7241,56 @@ matches the M9.2c warning occurrence baseline: VM **4→4**, other three **0→0
 check remains **1,254/1,360 wrong-way edges, 53/66 largest cycle**, baseline unchanged. These are
 local checkpoint receipts, not full publication qualification. The overseer subsequently confirmed
 #1676's squash merge and authorized exact-squash ancestry reconciliation, broader gates and a new
-M9.2e draft PR; that integration/publication is still pending.
+M9.2e draft PR; that integration/publication is recorded below.
+
+#### M9.2e — main reconciliation and publication gates
+
+The receipt checkpoint is `43d4554b2`. Normal merge `e224fcc9c` brings #1673 (`52cfc603c`)
+without conflicts. Recomputed `git merge-tree --write-tree c4397ec3d 52cfc603c` yields tree
+`8dd4fdba975f6ddad9f0bca16ab4323919462a56`, exactly equal to squash `e8e49c5d4`.
+Ancestry-only merge `29d28068d` targets that exact squash, **not** `origin/main`. The following
+normal merge of `origin/main` was already up to date at `e8e49c5d4`. Main-relative changes are
+only M9.2e's five checkpoints (14 files); merge-tree with that main is clean. The incoming keychain
+fix remains intact. No rebase, force push or published-history rewrite occurred.
+
+Process deviation: the receipt commit passed its staged preflight, but the two merge commits were
+then created in the same command without separate staged preflights before each merge commit.
+This is not represented as satisfying that per-commit requirement. The final outgoing-range safety
+check will cover all outgoing commits before publication; future merges must use `--no-commit`
+and a staged preflight. No protected investigation/export artifact entered a commit.
+
+Integrated broad, isolated handoff, both-product and full-lint gates are in progress. The broad filter
+contains all SessionLinks families plus admission/sidebar/lane policy, all affected creation/hydration/
+save/persistence families and #1673's keychain/provider-error coverage. It includes 133 existing suite
+names plus one inert legacy `SessionAdminProductionOrganizerTests` filter name; no such suite exists
+and no coverage is claimed for it. The saved future filter removes that inert name.
+
+Publication is held: broad ticket `779d1e16-925d-418e-a479-4e3d83ca4615` failed two app cases
+(resident Steer `CancellationError`, and restoration's `index batch applied` precondition). Its app
+selection executed 2,376 tests, 22 skipped, with two failures. Isolated handoff ticket
+`d491e011-fba0-4152-9ee0-a46f5a539382` executed 104 tests with two assertions failing in one
+restored provider-switch refusal case (disconnected Claude rather than handover-length refusal).
+None is classified as the previously known render/scale or skill-expansion intermittent. Exact-case
+head/main isolation is pending; no assertion, precondition or timeout has been changed.
+Both products `ffb048ac-134e-4cab-865a-416e7675a514` and full lint
+`c8b9f4fb-31f0-4a20-ad9f-97af96daf44c` passed. The actual broad compilation has no positive
+warning-occurrence deltas across 13 changed Swift files: VM 4→4, AutoWake tests 11→11, others 0→0.
+Shared `origin/main` subsequently advanced to `fafdc9050` (#1669 and #1672); the tested head remains
+`29d28068d`, and comparisons must record the exact main SHA rather than assume the ref stayed fixed.
+
+Exact single-case isolation passed on both revisions, without changing code, assertions or budgets:
+
+| Case | M9.2e `29d28068d` | Main `fafdc9050` |
+| --- | --- | --- |
+| Resident Steer | `ae31bf57-e9b7-4b81-a044-1e3db76ed307`, 1.355s | `71a403b1-6bfb-4291-8731-f89863e5efe3`, 1.351s |
+| Transcript index batch | `7a5d79e3-b35b-4845-846c-be06b804dff7`, 0.876s | `0ddb0d05-695c-46c9-a163-3536738f7ab7`, 0.725s |
+| Restored provider-switch refusal | `f04ea34d-5f50-48ce-ab67-2351cdf96ebd`, 4.908s | `8e068458-75e4-44c8-ba1e-834bfa69de11`, 14.013s |
+
+Each isolation executed one test with no failures. The main comparison used a ledger-only recovery
+stash, restored afterward; the four local investigation/export artifacts were untouched. The overseer
+explicitly authorized publication with the classification **broad-run only, not root-caused, isolated
+pass on head and main**, under watch in the PR. This does not prove inheritance or repair. A reported
+CI recurrence belongs to this lane for production root-cause work. No CI logs were read.
+The index check attempted while validation was active refused to attest freshness (zero stale/unindexed
+source files but freshness unproven); the last successful checkpoint check was 1,254/1,360 wrong-way
+edges and 53/66 largest cycle. This is not recorded as a fresh integrated index pass.
