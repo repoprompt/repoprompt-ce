@@ -14,7 +14,6 @@ final class AgentSessionRunStartRuntime {
         let prepareSession: (AgentTabSession) async -> Void
         let availabilityFailure: (AgentProviderKind) -> String?
         let bindSession: (AgentTabSession) -> BindingAdmission?
-        let commitCreation: (AgentSessionCreationHandle) async -> Bool
         let providerSwitchRefusal: (AgentTabSession) -> String
         let input: AgentSessionProviderInputRuntime
         let workspacePaths: () -> [String]
@@ -221,10 +220,12 @@ final class AgentSessionRunStartRuntime {
             writer = created
         }
         guard let writer, writer.identity.sessionID == bindingAdmission.sessionID, isCurrent() else { return nil }
-        if let directCreation = bindingAdmission.creation, await !environment.commitCreation(directCreation) {
-            let message = "The new session could not save its initial configuration. Retry saving it before starting a run."
-            startOutcome?.recordStartFailure(message: message)
-            return .failed(message: message)
+        if let directCreation = bindingAdmission.creation {
+            guard case .durablySaved = await owner.persistence.commitConfiguredCreation(directCreation, writer: writer) else {
+                let message = "The new session could not save its initial configuration. Retry saving it before starting a run."
+                startOutcome?.recordStartFailure(message: message)
+                return .failed(message: message)
+            }
         }
         guard isCurrent() else { return nil }
         let stopFence = directStartOptions.stopFence ?? AgentRunStartStopFence(session: session)

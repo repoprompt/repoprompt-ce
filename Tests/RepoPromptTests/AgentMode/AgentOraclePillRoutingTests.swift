@@ -2649,7 +2649,7 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
                     guard case let .localFile(path) = attachment.source else { return XCTFail("Expected owned local file") }
                     XCTAssertTrue(message.contains(path), "Non-images must reach the provider as file references, not be silently discarded")
                 }
-                await viewModel.prepareForWindowClose()
+                await viewModel.test_retireAndCancelFixture()
             }
         }
     }
@@ -2713,7 +2713,7 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
         await fulfillment(of: [finished], timeout: 5)
         XCTAssertEqual(original.pendingFileAttachments.count, 1)
         XCTAssertTrue(switched.pendingFileAttachments.isEmpty)
-        await viewModel.prepareForWindowClose()
+        await viewModel.test_retireAndCancelFixture()
     }
 
     func testDirectEditorExitClearsOverlayWithoutASwiftUIPaneExit() {
@@ -2777,7 +2777,7 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
         XCTAssertEqual(Set(session.pendingFileAttachments.map(\.kind)), [.text, .image])
         XCTAssertFalse(session.items.contains { $0.kind == .error })
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: temporaryRoot.path), [])
-        await viewModel.prepareForWindowClose()
+        await viewModel.test_retireAndCancelFixture()
     }
 
     func testPlainTextDropsAreNotHighlightedOrAccepted() {

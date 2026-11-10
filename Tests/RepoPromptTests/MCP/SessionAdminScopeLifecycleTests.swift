@@ -9865,12 +9865,23 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     )
                     XCTAssertEqual(stillLinked, .alreadyLinked, "An exact live runtime stays usable after its UI carrier closes")
                 case "visit":
+                    let origin = try controlWriterIdentity(for: XCTUnwrap(targetVM.sessions[targetTab.id]))
                     let blocked = try await targetFixture.window.agentModeViewModel.activateRoutedAgentSession(
                         tabID: targetTab.id, sessionID: targetID,
                         workspace: XCTUnwrap(targetFixture.window.workspaceManager.workspace(withID: workspace.id))
                     )
                     XCTAssertEqual(blocked, .blockedByActiveDifferentSession)
                     XCTAssertNotNil(manager.preparedOversightPendingVisits[targetID])
+                    XCTAssertEqual(
+                        try controlWriterIdentity(for: XCTUnwrap(targetVM.sessions[targetTab.id])),
+                        origin,
+                        "A deferred visit keeps the exact prepared writer, never elects the visitor"
+                    )
+                    XCTAssertNotEqual(
+                        targetFixture.window.agentModeViewModel.sessions[targetTab.id]?.activeAgentSessionID,
+                        targetID,
+                        "A busy prepared owner must not be hydrated into the visiting scope"
+                    )
                 default: XCTFail("Unknown active transition")
                 }
                 manager.schedulePreparedOversightCleanup()
@@ -9905,7 +9916,9 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                         && targetFixture.window.agentModeViewModel.sessions[targetTab.id]?.activeAgentSessionID == targetID
                         && targetFixture.window.agentModeViewModel.sessions[targetTab.id]?.items.contains { $0.text.contains("Hi!") } == true
                 }
+                XCTAssertNil(manager.preparedOversightPendingVisits[targetID], "The single queued visit was consumed at settlement")
                 targetVM = targetFixture.window.agentModeViewModel
+                _ = try controlWriterIdentity(for: XCTUnwrap(targetVM.sessions[targetTab.id]))
             }
             XCTAssertTrue(targetVM.sessions[targetTab.id]?.items.contains { $0.kind == .assistant && $0.text.contains("Hi!") } == true)
             do {

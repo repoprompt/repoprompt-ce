@@ -211,6 +211,10 @@ final class AgentSessionInteractionRuntime {
         pendingEffects[id] = PendingEffect(sessionIdentity: ObjectIdentifier(session), task: task)
     }
 
+    func hasPendingEffects(for session: AgentTabSession) -> Bool {
+        pendingEffects.values.contains { $0.sessionIdentity == ObjectIdentifier(session) }
+    }
+
     func drainPendingEffects(for session: AgentTabSession? = nil) async {
         let identity = session.map(ObjectIdentifier.init)
         while true {

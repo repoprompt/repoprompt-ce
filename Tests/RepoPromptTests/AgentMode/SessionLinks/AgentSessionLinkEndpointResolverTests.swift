@@ -135,7 +135,7 @@ final class AgentSessionLinkEndpointResolverTests: XCTestCase {
             } else {
                 XCTAssertEqual(vm.sessions[sourceTabID]?.persistentSessionBindingIdentity, sourceBinding)
             }
-            await vm.prepareForWindowClose()
+            await vm.test_retireAndCancelFixture()
             await vm.test_drainSessionPersistenceAfterWindowClose()
         }
     }

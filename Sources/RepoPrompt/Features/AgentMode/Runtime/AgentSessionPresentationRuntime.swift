@@ -7,6 +7,11 @@ enum AgentSessionPresentationRefreshScope: String, Equatable, Hashable {
     case runtimeMetrics
 }
 
+enum AgentSessionHydrationProjection {
+    case sortDate(Date?)
+    case restored(AgentSessionIndexEntry)
+}
+
 /// Optional exact-object presentation attachment. This is not a writer registration or a run
 /// lifecycle owner: detach only stops projections. Runtime activity is updated even when no
 /// presenter exists, and a late detach token cannot disconnect a newer presenter.
@@ -33,6 +38,25 @@ final class AgentSessionPresentationRuntime {
         var modelConfiguration: ((AgentTabSession, AgentModelCatalogRuntime.Selection) -> Void)?
         var reasoningEffort: ((AgentTabSession) -> Void)?
         var mcpControl: ((AgentTabSession, Bool) -> Void)?
+        var hydration: ((AgentTabSession, AgentSessionHydrationProjection) -> Void)?
+        var isAvailable: (() -> Bool)?
+    }
+
+    /// App-only projection. This sink cannot mutate a view model or supply runtime commands.
+    struct DetachedSink {
+        let turnComplete: (AgentTabSession) -> Void
+        let turnFailed: (AgentTabSession, String?) -> Void
+        let stateChanged: () -> Void
+    }
+
+    var detachedSink: DetachedSink?
+
+    func hasPresenter(for session: AgentTabSession) -> Bool {
+        sink(for: session) != nil
+    }
+
+    func refreshDetachedState() {
+        detachedSink?.stateChanged()
     }
 
     struct Attachment: Equatable {
@@ -73,16 +97,19 @@ final class AgentSessionPresentationRuntime {
         entries = entries.filter { $0.value.session != nil }
         let attachment = Attachment(sessionIdentity: ObjectIdentifier(session), generation: UUID())
         entries[attachment.sessionIdentity] = Entry(session: session, attachment: attachment, sink: sink)
+        refreshDetachedState()
         return attachment
     }
 
     func detach(_ attachment: Attachment) {
         guard entries[attachment.sessionIdentity]?.attachment == attachment else { return }
         entries.removeValue(forKey: attachment.sessionIdentity)
+        refreshDetachedState()
     }
 
     private func sink(for session: AgentTabSession) -> Sink? {
-        guard let entry = entries[ObjectIdentifier(session)], entry.session === session else { return nil }
+        guard let entry = entries[ObjectIdentifier(session)], entry.session === session,
+              entry.sink.isAvailable?() != false else { return nil }
         return entry.sink
     }
 
@@ -91,7 +118,12 @@ final class AgentSessionPresentationRuntime {
     }
 
     func mcpControlChanged(_ session: AgentTabSession, controlled: Bool) {
-        sink(for: session)?.mcpControl?(session, controlled)
+        if let sink = sink(for: session) { sink.mcpControl?(session, controlled) }
+        else { refreshDetachedState() }
+    }
+
+    func hydrationProjected(_ session: AgentTabSession, event: AgentSessionHydrationProjection) {
+        sink(for: session)?.hydration?(session, event)
     }
 
     func permissionsChanged(_ session: AgentTabSession) {
@@ -123,7 +155,8 @@ final class AgentSessionPresentationRuntime {
     }
 
     func runStateChanged(_ session: AgentTabSession) {
-        sink(for: session)?.runState?(session)
+        if let sink = sink(for: session) { sink.runState?(session) }
+        else { refreshDetachedState() }
     }
 
     func elapsedTimeChanged(_ session: AgentTabSession) {
@@ -131,11 +164,13 @@ final class AgentSessionPresentationRuntime {
     }
 
     func bindingChanged(_ session: AgentTabSession) {
-        sink(for: session)?.binding?(session)
+        if let sink = sink(for: session) { sink.binding?(session) }
+        else { refreshDetachedState() }
     }
 
     func interactionChanged(_ session: AgentTabSession) {
-        sink(for: session)?.interaction?(session)
+        if let sink = sink(for: session) { sink.interaction?(session) }
+        else { refreshDetachedState() }
     }
 
     func derivedTranscriptChanged(_ session: AgentTabSession) {
@@ -166,8 +201,14 @@ final class AgentSessionPresentationRuntime {
                 setAgentRunActive(session, isActive: isActive)
             },
             requestUIRefresh: { [self] session, urgent in requestUIRefresh(for: session, urgent: urgent) },
-            notifyAgentTurnComplete: { [self] session in sink(for: session)?.turnComplete(session) },
-            notifyAgentTurnFailed: { [self] session, error in sink(for: session)?.turnFailed(session, error) }
+            notifyAgentTurnComplete: { [self] session in
+                if let sink = sink(for: session) { sink.turnComplete(session) }
+                else { detachedSink?.turnComplete(session) }
+            },
+            notifyAgentTurnFailed: { [self] session, error in
+                if let sink = sink(for: session) { sink.turnFailed(session, error) }
+                else { detachedSink?.turnFailed(session, error) }
+            }
         )
     }
 }
