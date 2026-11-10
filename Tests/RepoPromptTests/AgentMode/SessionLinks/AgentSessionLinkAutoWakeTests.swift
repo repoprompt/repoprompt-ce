@@ -94,6 +94,66 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         XCTAssertFalse(successor.pendingHandoff.hasPayload)
     }
 
+    func testComposerStopDuringRuntimePreparationRestoresOnceAndPreventsPrologue() async throws {
+        let f = try fixture()
+        guard case let .unique(writer) = f.scope.resolveWriter(sessionID: f.endpoint.sessionID),
+              case let .success(command) = writer.admitCommand(),
+              let target = f.scope.submissions.programmaticTarget(command) else { return XCTFail("Expected exact writer") }
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "unsent")
+        guard case let .claimed(claim) = f.scope.submissions.claim(attempt, command: command) else { return XCTFail("Expected claim") }
+        claim.cancellation.oweDraftRestoration("unsent")
+        f.session.draftText = "new typing"
+        let item = AgentChatItem.user("unsent", sequenceIndex: f.session.nextSequenceIndex)
+        f.session.appendItem(item)
+        claim.cancellation.recordOptimisticInput(item.id, on: f.session)
+        let gate = AutoWakeCatalogAuthorityGate()
+        let environment = AgentSessionRunStartRuntime.Environment(
+            currentWorkspaceID: { f.endpoint.workspaceID },
+            prepareSession: { _ in _ = await gate.requirement() },
+            availabilityFailure: { _ in XCTFail("Stop must refuse before availability")
+                return "Refused"
+            },
+            bindSession: { _ in XCTFail("Stop must not bind")
+                return nil
+            },
+            commitCreation: { _ in XCTFail("Stop must not acknowledge creation")
+                return false
+            },
+            providerSwitchRefusal: { _ in XCTFail("Stop must not switch providers")
+                return "Refused"
+            },
+            input: AgentSessionProviderInputRuntime(skillCatalog: AgentSkillCatalog()),
+            workspacePaths: { XCTFail("Stop must not augment")
+                return []
+            },
+            inputWorkspace: { _ in nil }, initialThreadInput: { _ in nil },
+            composition: { preconditionFailure("Stop must not construct a provider execution") }
+        )
+        let coordinator = ClaudeAgentModeCoordinator(windowID: 401, workspacePathProvider: { _ in nil })
+        let stopFence = try XCTUnwrap(claim.cancellation.pendingStartFence(for: f.session))
+        claim.cancellation.retainProducer()
+        let starting = Task {
+            defer { claim.cancellation.releaseProducer() }
+            _ = await f.scope.startup.start(
+                session: f.session, initialMessage: "unsent", directStartOptions: .init(stopFence: stopFence),
+                claudeCoordinator: coordinator, links: f.runtime, environment: environment
+            )
+        }
+        f.scope.submissions.release(claim)
+        await gate.waitUntilEntered()
+        XCTAssertTrue(claim.cancellation.withdraw(on: f.session))
+        XCTAssertFalse(claim.cancellation.isFinalized)
+        XCTAssertEqual(f.session.draftText, "unsent\nnew typing")
+        XCTAssertFalse(f.session.items.contains { $0.id == item.id })
+        await gate.open()
+        await starting.value
+        XCTAssertTrue(claim.cancellation.isFinalized)
+        XCTAssertNil(f.session.activeRunOwnership)
+        XCTAssertNil(f.session.activeRunAttemptID)
+        XCTAssertNil(f.session.lastTerminalCommitRevision)
+        XCTAssertEqual(f.session.draftText, "unsent\nnew typing")
+    }
+
     func testStartupRetainsExactScopeAndRefusesChangesAcrossPreparationWithoutPresentation() async throws {
         for change in ["entryRefusal", "entryWorkspace", "stop", "replacement", "binding", "retirement", "reacquired", "workspace"] {
             var f: Fixture? = try fixture()

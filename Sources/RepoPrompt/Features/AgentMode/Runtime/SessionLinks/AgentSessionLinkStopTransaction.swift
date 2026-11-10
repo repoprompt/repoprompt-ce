@@ -43,14 +43,18 @@ enum AgentSessionLinkStopAdmission: Equatable {
         if !snapshot.hasLoadedPersistedState {
             return .blocked(.targetLoading)
         }
-        if snapshot.terminalCommitInProgress || snapshot.isComposerSubmissionInFlight
-            || snapshot.isPreparingInitialWorktree || snapshot.isChangingExecutionLocation
-            || snapshot.selfCompactBlocksManagedStop
-            || snapshot.stopInProgress
+        if snapshot.terminalCommitInProgress || snapshot.isChangingExecutionLocation
+            || snapshot.selfCompactBlocksManagedStop || snapshot.stopInProgress
         {
             return .blocked(.targetBusy)
         }
+        if snapshot.isPreparingInitialWorktree || snapshot.isComposerSubmissionInFlight {
+            if snapshot.hasCancellableComposerStart { return .pendingStart }
+            if snapshot.composerStartHasLaunched, snapshot.runStateIsActive { return .activeRun }
+            return .blocked(.targetBusy)
+        }
         if snapshot.runStateIsActive { return .activeRun }
+        if snapshot.hasCancellableComposerStart { return .pendingStart }
         // Queued instructions are cancellable work even if a failed scheduled start has
         // already cleared its own pending flag. Stop must own their withdrawal.
         if snapshot.mcpFollowUpRunPending || snapshot.pendingInstructionCount > 0 { return .pendingStart }

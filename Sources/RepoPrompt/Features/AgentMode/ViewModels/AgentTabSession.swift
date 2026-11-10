@@ -359,6 +359,8 @@ final class AgentTabSession: ObservableObject {
     /// and intentionally never persisted as session state.
     var pendingInitialStartLocation: AgentModeViewModel.InitialStartLocation = .local
     var composerSubmissionToken = UUID()
+    /// Exact pending-start capability; runtime-only and never persisted.
+    var composerStartCancellation: AgentComposerStartCancellation?
     var activeComposerSubmitAttempt: AgentComposerSubmitAttempt? {
         didSet {
             // Only the in-flight transition matters to an observer; attempt-internal churn does
@@ -370,7 +372,7 @@ final class AgentTabSession: ObservableObject {
     }
 
     var isComposerSubmissionInFlight: Bool {
-        activeComposerSubmitAttempt != nil
+        activeComposerSubmitAttempt != nil || composerStartCancellation != nil
     }
 
     /// These gate delivery readiness and published `idle_for_send`, so wake observers when either
@@ -2128,7 +2130,7 @@ final class AgentTabSession: ObservableObject {
     }
 
     @discardableResult
-    func beginRunAttempt(source: String, attemptID: UUID = UUID()) -> AgentRunOwnership {
+    func beginRunAttempt(source: String, attemptID: UUID = UUID(), beginsProviderRun: Bool = true) -> AgentRunOwnership {
         claudeProviderOutputBoundary = nil
         claudeLiveSuccessorTurnIDs.removeAll()
         claudeAcceptedHostTurnIDs.removeAll()
@@ -2160,6 +2162,9 @@ final class AgentTabSession: ObservableObject {
             ),
             attemptID: attemptID
         )
+        // Cancellation/startup-failure bookkeeping can manufacture a terminal-only attempt.
+        // That is not the pending input's provider prologue and must not retire its capability.
+        if beginsProviderRun { composerStartCancellation?.runAttemptBegan(on: self) }
         if pendingHandoff.providerSwitchDelivery == .sending,
            let proof = pendingHandoff.providerSwitchDispatch
         {

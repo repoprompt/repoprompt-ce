@@ -81,6 +81,8 @@ extension AgentModeViewModel {
         else { return nil }
         let catalog = autoWorkflowCatalog()
         guard !catalog.isEmpty else { return nil }
+        claim.cancellation.retainProducer()
+        defer { claim.cancellation.releaseProducer() }
         let generation = session.userWorkflowSelectionMutationGeneration
         guard let registration = await runtime.registry.registration(for: backendID),
               !Task.isCancelled, composerSubmitClaimIsCurrent(claim),

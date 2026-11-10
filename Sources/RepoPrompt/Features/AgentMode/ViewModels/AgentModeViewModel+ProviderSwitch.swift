@@ -966,7 +966,7 @@ extension AgentModeViewModel {
         providerSwitchExactOwnerProbe?(session) ?? false
     }
 
-    private func providerSwitchClaim(_ preview: ProviderSwitchPreview, discard: Bool = false) -> AgentComposerSubmitClaim? {
+    private func providerSwitchClaim(_ preview: ProviderSwitchPreview, discard: Bool = false, allowsPendingStartWithdrawal: Bool = true) -> AgentComposerSubmitClaim? {
         guard providerSwitchPreviewIsCurrent(preview, content: !discard), providerSwitchHasExactOwner(preview.session),
               let target = makeComposerSubmitTarget(tabID: preview.session.tabID, session: preview.session) else { return nil }
         let attempt = AgentComposerSubmitAttempt(
@@ -976,7 +976,7 @@ extension AgentModeViewModel {
             noticeRevision: 0,
             rawDraftSnapshot: preview.session.draftText
         )
-        guard case let .claimed(claim) = claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: false) else { return nil }
+        guard case let .claimed(claim) = claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: false, allowsPendingStartWithdrawal: allowsPendingStartWithdrawal) else { return nil }
         return claim
     }
 
@@ -1134,7 +1134,9 @@ extension AgentModeViewModel {
               ? providerSwitchDiscardBlocker(preview) == nil
               : providerSwitchPreviewAdmission(preview).isAdmissible(forcing: forcing),
               discard ? preview.isReview : (preview.chosen != nil && preview.chosen?.unavailable == nil),
-              let claim = providerSwitchClaim(preview, discard: discard), let workspaceID = workspaceManager?.activeWorkspaceID else { return false }
+              // This claim owns a lifecycle mutation, not an input waiting to start. Forced
+              // quiescence withdraws queued input through Stop without cancelling its own claim.
+              let claim = providerSwitchClaim(preview, discard: discard, allowsPendingStartWithdrawal: false), let workspaceID = workspaceManager?.activeWorkspaceID else { return false }
         defer { releaseComposerSubmitClaim(claim) }
         let session = preview.session
         var rollback = ProviderSwitchRollback(session)

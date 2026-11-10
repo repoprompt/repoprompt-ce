@@ -7008,8 +7008,9 @@ No CI logs were read; no full-suite, live-app, release or sanitizer qualificatio
 
 Base `534e2c759`. This slice does **not** implement close-preserves-run, host leases,
 workspace-switch detach, handoff UI or pending-start cancellation capability. Legacy close and
-workspace switch still cancel. The pending-start capability waits for M9.2c and explicit lane
-coordination; visible/no-window host composition remains a separate prerequisite.
+workspace switch still cancel. At the initial groundwork checkpoint, the pending-start capability
+waited for M9.2c and explicit lane coordination; it is implemented in the follow-up below.
+Visible/no-window host composition remains a separate prerequisite.
 
 - Characterization pins the two legacy cancelling paths in `AgentSessionRuntimeStoreTests` and
   strengthens `SessionAdminInventoryReadTests/testVisitDuringManagedRunAutomaticallyHandsOffAfterCompletion`:
@@ -7053,3 +7054,117 @@ including the corrected prepared-owner visit case (one), runtime store (16), pre
 notification coordinator (15) and notification planner (12). Full lint
 `fdb3ba6e-3fcd-4566-ad9d-8ea4dba50a45` passed. These tickets survived the host-app restart;
 their terminal state and exact selected cases were reconciled before more work was submitted.
+
+Groundwork was published in draft PR #1678 at normal merge `aaef76bc3`, integrating M9.2c's
+main `e8e49c5d4` without rewriting the lane commits. Both products
+`ebcfd66a-4fe5-4291-999d-0e32b668d42a` and full lint
+`32ab653a-6d4a-46d9-92ff-5a8727d4fa81` passed. Broad selection
+`8ad8b943-e0a2-4ecb-a698-09740ddbb60e` passed **1,936 tests, 18 skipped, zero failures**;
+isolated handoff `d6ae4342-b777-41ac-9574-a2126981da83` passed **104**. Fresh index check was
+**1,256/1,360 wrong-way file edges, 53/66 largest-cycle components**. Actual compilation
+occurrences across the 25 touched Swift files were VM **4→4**, auto-wake tests **11→11**,
+admin lifecycle tests **5→5**, and zero in the other 22 files; normalized diagnostic signatures
+had no positive delta. That retained baseline is the original lane compilation with only
+characterization/helper changes, not a fresh exact-clean-main build. Mandatory push preflight
+passed after the nested SwiftPM sandbox restriction was resolved through approved execution;
+local investigation copies and Oracle exports were preserved outside the clean push boundary
+and restored afterward, never staged.
+
+### M9.4 phase 0 follow-up: pending-start capability (refs #1406)
+
+After #1676 merged and the lane was unblocked, the existing composer claim gained one exact
+pre-prologue cancellation receipt. The session stores it before publishing its claim; a newly
+created, already-bound destination aliases that same receipt before showing preparation. It
+uses weak session/runtime back references and existing writer identities, not a second session
+registry or lifecycle manager. Creation, hydration and provider runner ownership remain unchanged.
+
+- A pending Stop withdraws only that exact source/destination claim, invalidates its deferred start
+  generations, removes its owned optimistic input and restores the owed source draft once, above
+  newer typing. A stale writer, recycled object or successor attempt cannot be withdrawn through
+  an old target. Unrelated execution-location changes and the existing native self-compact
+  busy-until-dispatch policy remain fail-closed.
+- Suspended executors and child producers retain the receipt before awaiting or scheduling. UI
+  withdrawal is not drain acknowledgment: settlement and managed Stop keep the real effect until
+  its finalizer runs. A managed deadline returns an honest incomplete-teardown result while that
+  effect remains installed. Local teardown uses the existing bounded deadline as well.
+- The narrow `beginRunAttempt` hook observes installed provider-run ownership before running is
+  published. Active-run cancellation then takes precedence, and the composer claim can unlock
+  without waiting for the provider transport to return. Synthetic cancellation/startup-failure
+  bookkeeping does not upgrade a pending input into an actual provider start. Deferred producers
+  capture a fresh fence at the final synchronous claim handoff, never after suspension; an explicit
+  Stop prevents that handoff, while internal preparation invalidation does not lose an input.
+- Cancelling an unsent prospective steer is row-only cancellation, not Stop on the existing run;
+  it preserves that run's continuation generations. Blocked-executor draft recovery is cleanup,
+  not new-command admission, and therefore survives writer retirement/rebinding on the original
+  object without restoring into a replacement. Optional metadata recovery stays in a presentation
+  sink, never a VM capture in the runtime command.
+- Existing typed ACP/plain continuation tasks retain their session-keyed producer/fence ownership.
+  Self-compact admission remains owned by its existing active run; no new generic startup owner
+  was introduced. Prepared-owner busy/handoff projections remain compatible. The legacy drain
+  projection additionally sees a newly withdrawn composer producer until its real release.
+
+The bounded step-4 review identified blocked-steer draft loss, row-only Cancel regressions,
+post-prologue claim retention, premature fence capture, orphan destination cleanup and bounded
+local-wait/UI ordering issues. These were corrected before qualification, without weakening
+existing assertions or increasing timeout budgets. Added cases live in existing test files;
+there is no new app-importing test file or ratchet-baseline change.
+
+The first three step-4 attempts were cancelled rather than credited: the first exposed an old
+routing fixture's unbound fake destination and unbounded backend wait; the second was stopped
+while correcting the stale-target setup; the third was still waiting for heavy admission when
+the terminal-only attempt hook correction was included. The routing fixture now binds its fake
+destination before routing, captures the stale target before alias publication and uses a bounded
+wait plus teardown release. The production first-send Computer Use case instead exercises the real
+configured creation transaction and asserts its binding. Focused attempt
+`008937de-df30-4ef0-b778-f233f819d1b3` failed compilation because the new startup-gate fixture
+returned `nil` from a string-valued provider-switch refusal callback. That fixture type mismatch
+was corrected; it is not an assertion failure or a completed test qualification.
+Focused `2af5df0e-6c90-457a-8ed2-9c9cec63c5f2` then executed **274 tests with 15 failures**.
+Those exposed fixture expectations, not a passing qualification: draft joins use the existing
+single newline, a pending Stop must join Stop effects rather than Send effects, a UI-only test
+must model the executor's release explicitly, fake destinations must satisfy configured creation's
+bound-writer contract, and real foreground creation needs the prompt/carrier plus isolated durable
+storage that the endpoint-only fixture intentionally omitted. These setups were corrected while
+retaining dispatch, exactly-once recovery, stale-target and real-producer-drain assertions.
+The creation-only reruns additionally exposed the fixture's missing `RepoPromptShared` import,
+restored-versus-fresh provenance and availability updates completing across creation's awaits.
+Both creation cases now use real configured creation with isolated durable storage; fake-provider
+availability is published at its returned boundary. Creation-path ticket
+`e9fe365a-6e62-40fb-abb3-adfbb0068ce6` passed **two tests**, including actual first-provider
+Computer Use approval command admission without post-creation binding repair.
+
+Local step-4 products `86daf60a-4123-4a75-b82d-b724deecfb8f` and full lint
+`d5cd72c4-85c1-4ca8-87cb-9a396898ca54` passed. The fresh index check remains
+**1,256/1,360 wrong-way file edges, 53/66 largest-cycle components**. Expanded actual-compilation
+warning audit across **41 owned Swift files** is VM **4→4**, Codex resume tests **17→17**,
+auto-wake tests **11→11**, admin lifecycle tests **5→5**, and zero in the other 37 files.
+Counts use retained compilation receipts rather than empty incremental product logs; repeated
+compilations are not summed. Complete later diagnostics confirm the same count where an earlier
+log truncated a diagnostic suffix. There is no positive per-file or normalized-signature delta.
+
+The first broad step-4 ticket `76b5af49-1e22-44c0-825d-664427c7905f` executed **2,121 tests,
+18 skipped, three assertion failures in one case**: forced provider switch with queued work but
+no active run. Its internal mutation claim was incorrectly withdrawn by its own quiescence's
+explicit-Stop queue cleanup. Claim installation now distinguishes that lifecycle mutation from
+cancellable pending input before publication; the forced-switch queue/auto-wake withdrawal stays
+unchanged, and an exact mutation claim remains busy to managed Stop. A runtime case pins this
+policy alongside the existing full forced-switch regression. The handoff-model/worktree selection
+`98c3171c-88ef-477c-8a33-f01a70e033dc` passed **26**, but its filter was not the isolated
+`AgentSessionLinkHandoffInheritanceTests` suite and is not credited as that gate.
+
+Correction-focused `93e075a8-539f-4654-a8d3-11a6efbf6577` passed **120 tests**: composer
+runtime **16** and the actual handoff-inheritance suite **104**, including the forced-switch
+regression. Full lint `bf35d8f8-05b9-47f2-98ec-0a53fea4ff52` and corrected-tree products
+`4eb420cf-8b93-4655-af94-602bca4accaa` passed. The expanded audit now includes the provider-switch
+adapter: **42 owned Swift files**, the same four nonzero counts above, and zero in the other
+38 files; no positive count or normalized-signature delta. This is still local work, withheld from
+#1678 by lane instruction for a separate phase-0b PR after groundwork merges. No CI logs were
+read; no full-suite, live-app, release or sanitizer qualification is claimed.
+
+Final corrected-tree broad selection `6c13992a-4462-455f-a952-9df921472d35` passed
+**2,122 tests, 18 skipped, zero failures**, including the new pending-start cases, real creation
+paths, SessionLinks, self-compaction, restoration/admission, handoff, sidebar, runtime store and
+the actual prepared-owner visit. The post-product fresh index check remains **1,256/1,360 edges,
+53/66 largest-cycle components**; no baseline changed. All owned validation tickets were terminal
+before the local checkpoint. Publication waits for #1678's merge and the instructed squash
+integration into a separate phase-0b draft PR.

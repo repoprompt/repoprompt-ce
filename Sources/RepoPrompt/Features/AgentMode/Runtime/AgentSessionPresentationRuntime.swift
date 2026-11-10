@@ -21,6 +21,7 @@ final class AgentSessionPresentationRuntime {
         var derivedTranscript: ((AgentTabSession) -> Void)?
         var prepareTerminal: ((AgentTabSession) -> Void)?
         var composerClaim: ((AgentTabSession) -> Void)?
+        var composerStartWithdrawal: ((AgentTabSession, UUID) -> Void)?
         var binding: ((AgentTabSession) -> Void)?
         var interaction: ((AgentTabSession) -> Void)?
         var elapsedTime: ((AgentTabSession) -> Void)?
@@ -76,6 +77,10 @@ final class AgentSessionPresentationRuntime {
         activeUISyncSuppressionDepth += 1
         defer { activeUISyncSuppressionDepth -= 1 }
         return try body()
+    }
+
+    func composerStartWithdrawn(_ session: AgentTabSession, attemptID: UUID) {
+        sink(for: session)?.composerStartWithdrawal?(session, attemptID)
     }
 
     func composerClaimChanged(_ session: AgentTabSession) {

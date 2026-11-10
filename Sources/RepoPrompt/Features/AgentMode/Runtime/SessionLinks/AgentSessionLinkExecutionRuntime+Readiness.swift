@@ -100,6 +100,8 @@ extension AgentSessionLinkExecutionRuntime {
                 : session.isComposerSubmissionInFlight,
             isPreparingInitialWorktree: session.isPreparingInitialWorktree,
             isChangingExecutionLocation: session.isChangingExecutionLocation,
+            hasCancellableComposerStart: session.composerStartCancellation?.canWithdraw(on: session) == true,
+            composerStartHasLaunched: session.composerStartCancellation?.didLaunch == true,
             pendingInstructionCount: session.pendingInstructions.count,
             pendingACPSteeringCount: session.pendingACPSteeringInstructions.count,
             pendingClaudeSteeringCount: session.pendingClaudeSteeringInstructions.count,
