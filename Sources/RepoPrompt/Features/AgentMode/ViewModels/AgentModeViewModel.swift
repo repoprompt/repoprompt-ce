@@ -2226,6 +2226,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     if controlled { mcpControlledTabIDs.insert(session.tabID) }
                     else { mcpControlledTabIDs.remove(session.tabID) }
                     if session.tabID == currentTabID { updateBindingsFromSession(session) }
+                },
+                hydration: { [weak self] session, event in
+                    guard let self, sessions[session.tabID] === session else { return }
+                    switch event {
+                    case let .sortDate(date):
+                        if let date { sessionIndexStore.setSortDate(date, forTabID: session.tabID) }
+                        else { sessionIndexStore.removeSortDate(forTabID: session.tabID) }
+                    case let .restored(entry):
+                        if session.tabID == currentTabID {
+                            applyCodexSelectionToBindings(
+                                modelRaw: session.selectedModelRaw,
+                                reasoningEffortRaw: session.selectedReasoningEffortRaw
+                            )
+                        }
+                        applyLocalSessionIndexUpsert(entry)
+                    }
                 }
             ))
         }
@@ -7329,60 +7345,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             #endif
             return false
         }
-        let agentSession = payload.persistedSession
-
         let selection = AgentSessionHydrationRuntime.selection(
             for: payload, availability: agentAvailabilityContext, codexDynamicModels: codexDynamicModels
         )
-        guard let appliedPayload = AgentSessionHydrationRuntime.apply(
+        // Install the existing app composition before entering the runtime transaction.
+        // The cold saved-target loader supplies its own configuration and remains separate.
+        _ = attachmentRuntime
+        _ = persistenceRuntime
+        return AgentSessionHydrationRuntime.commit(
             payload, attempt: hydration, selection: selection,
             codexPolicy: codexCoordinator.selectionPolicy(forModelRaw: selection.modelRaw, includeGlobalFallback: true),
-            indexedPlacement: ownerValidatedSessionIndex[agentSession.id], usage: usageRuntime
-        ) else { return false }
-        repairRetainedAttachmentPathsAfterHydration(session, sessionID: payload.sessionID)
-        if let lastUserMessageAt = payload.lastUserMessageAt {
-            sessionIndexStore.setSortDate(lastUserMessageAt, forTabID: session.tabID)
-        } else {
-            sessionIndexStore.removeSortDate(forTabID: session.tabID)
-        }
-        if session.selectedAgent == .codexExec {
-            codexCoordinator.reconcilePersistedCodexCommandStatusIfNeeded(session: session)
-        }
-        if session.tabID == currentTabID {
-            applyCodexSelectionToBindings(modelRaw: session.selectedModelRaw, reasoningEffortRaw: session.selectedReasoningEffortRaw)
-        }
-        applyLocalSessionIndexUpsert(payload.restoredIndexEntry)
-        if payload.needsReloadMigrationSave { scheduleSave(for: session.tabID) }
-        guard appliedPayload.commitReadiness() else { return false }
-        if session.selectedAgent.usesClaudeTooling {
-            _ = claudeCoordinator.currentClaudeEffortLevel(for: session)
-        }
-
-        let autoEditEnabled = agentSession.autoEditEnabled
-        let tabID = session.tabID
-        Task { @MainActor [weak self] in
-            guard let self, hydration.ownsBinding,
-                  persistentBindingTransitionIsCurrent(token.transition)
-            else {
-                return
-            }
-            await applyEditsApprovalStore.setAutoEditEnabled(
-                autoEditEnabled,
-                for: applyEditsScope(for: tabID),
-                updateGlobalDefault: false
-            )
-            guard !persistentBindingTransitionIsCurrent(token.transition),
-                  let currentSession = sessions[tabID]
-            else {
-                return
-            }
-            await applyEditsApprovalStore.setAutoEditEnabled(
-                currentSession.autoEditEnabled,
-                for: applyEditsScope(for: tabID),
-                updateGlobalDefault: false
-            )
-        }
-        return true
+            indexedPlacement: ownerValidatedSessionIndex[payload.sessionID],
+            codex: codexCoordinator, claude: claudeCoordinator
+        )
     }
 
     private func reconnectClaudeNativeSessionIfNeeded(_ session: TabSession) async {

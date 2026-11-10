@@ -19,8 +19,8 @@ struct AgentPersistentBindingTransitionToken: Equatable {
     }
 }
 
-/// Reads and applies persisted payloads for an exact runtime incarnation. Optional
-/// presentation/index publication remains outside this owner; no UI object is needed.
+/// Reads and commits persisted payloads for an exact runtime incarnation. Optional display
+/// updates pass through the presentation owner; no attached UI is needed to earn readiness.
 @MainActor
 enum AgentSessionHydrationRuntime {
     /// An operation-local capture made before reading storage. A binding token alone survives
@@ -159,6 +159,47 @@ enum AgentSessionHydrationRuntime {
             model = AgentModelCatalog.defaultModelRaw(for: agent, availability: availability, codexDynamicModels: codexDynamicModels)
         }
         return .init(agent: agent, modelRaw: model, explicitReasoningEffortRaw: effort)
+    }
+
+    /// Commits an app-composed hydration through its original writer. Provider repair owners
+    /// remain concrete dependencies; presentation is optional and cannot grant readiness.
+    /// The cold saved-target loader deliberately keeps its separate apply/readiness path.
+    @discardableResult
+    static func commit(
+        _ payload: AgentSessionHydrationPayload,
+        attempt: Attempt,
+        selection: Selection,
+        codexPolicy: AgentCodexSelectionPolicy,
+        indexedPlacement: AgentSessionIndexEntry?,
+        codex: CodexAgentModeCoordinator,
+        claude: ClaudeAgentModeCoordinator
+    ) -> Bool {
+        let scope = attempt.writer.scope
+        let session = attempt.writer.session
+        guard let applied = apply(
+            payload, attempt: attempt, selection: selection, codexPolicy: codexPolicy,
+            indexedPlacement: indexedPlacement, usage: scope.usage
+        ) else { return false }
+        // Field application advances the source revision. Subsequent stages must check the
+        // incarnation/binding, not the pre-application source revision. Recheck after each
+        // synchronous external callback; this does not fence mutations inside those owners.
+        guard attempt.ownsBinding else { return false }
+        scope.attachments.repairRetainedAttachmentPathsAfterHydration(session, sessionID: payload.sessionID)
+        guard attempt.ownsBinding else { return false }
+        scope.presentation.hydrationProjected(session, event: .sortDate(payload.lastUserMessageAt))
+        guard attempt.ownsBinding else { return false }
+        if session.selectedAgent == .codexExec {
+            codex.reconcilePersistedCodexCommandStatusIfNeeded(session: session)
+        }
+        guard attempt.ownsBinding else { return false }
+        scope.presentation.hydrationProjected(session, event: .restored(payload.restoredIndexEntry))
+        guard attempt.ownsBinding else { return false }
+        if payload.needsReloadMigrationSave { scope.persistence.scheduleSave(for: session) }
+        guard applied.commitReadiness() else { return false }
+        if attempt.ownsBinding, session.selectedAgent.usesClaudeTooling {
+            _ = claude.currentClaudeEffortLevel(for: session)
+        }
+        return true
     }
 
     static func restoreLinkState(from persisted: AgentSession, to session: AgentTabSession) {

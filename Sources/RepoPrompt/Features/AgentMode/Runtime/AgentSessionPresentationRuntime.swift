@@ -7,6 +7,11 @@ enum AgentSessionPresentationRefreshScope: String, Equatable, Hashable {
     case runtimeMetrics
 }
 
+enum AgentSessionHydrationProjection {
+    case sortDate(Date?)
+    case restored(AgentSessionIndexEntry)
+}
+
 /// Optional exact-object presentation attachment. This is not a writer registration or a run
 /// lifecycle owner: detach only stops projections. Runtime activity is updated even when no
 /// presenter exists, and a late detach token cannot disconnect a newer presenter.
@@ -33,6 +38,7 @@ final class AgentSessionPresentationRuntime {
         var modelConfiguration: ((AgentTabSession, AgentModelCatalogRuntime.Selection) -> Void)?
         var reasoningEffort: ((AgentTabSession) -> Void)?
         var mcpControl: ((AgentTabSession, Bool) -> Void)?
+        var hydration: ((AgentTabSession, AgentSessionHydrationProjection) -> Void)?
     }
 
     struct Attachment: Equatable {
@@ -92,6 +98,10 @@ final class AgentSessionPresentationRuntime {
 
     func mcpControlChanged(_ session: AgentTabSession, controlled: Bool) {
         sink(for: session)?.mcpControl?(session, controlled)
+    }
+
+    func hydrationProjected(_ session: AgentTabSession, event: AgentSessionHydrationProjection) {
+        sink(for: session)?.hydration?(session, event)
     }
 
     func permissionsChanged(_ session: AgentTabSession) {

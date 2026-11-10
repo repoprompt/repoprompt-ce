@@ -7157,3 +7157,43 @@ validation against `Features/Workspaces/WorkspaceModel.swift` (`id`); this is di
 placement debt, not a target-extraction claim or a reason to weaken the identity check. These are
 local checkpoint gates, not a new both-product/full SessionLinks/live-app/release/hosted-CI
 qualification. Nothing is pushed; binding and startup work remains in progress.
+
+#### M9.2e — runtime-owned hydration commit (local follow-up)
+
+`AgentSessionHydrationRuntime.commit` now owns the app-composed field/attachment/provider-repair/
+migration-save/readiness sequence formerly in the VM. It uses the captured writer's existing usage,
+attachment, persistence and optional presentation owners, with incarnation/binding checks between
+synchronous external stages. Source-revision checks are intentionally not used after applying the
+payload, which itself advances that revision. The sort-date projection still precedes Codex repair;
+active-model/index projection follows it; readiness still precedes Claude effort repair. The VM
+installs its existing attachment/persistence composition and supplies concrete provider dependencies,
+not a callback containing the old mutation body. Migration save now deliberately uses the exact
+session overload rather than re-resolving a tab. Provider-internal refresh/save mutation fences and
+full binding/startup retirement remain open. No M9.3 storage or cold-loader behavior was changed.
+
+The former AutoEdit task was removed rather than made newly effective: its first guard compared the
+pre-application source revision, but every hydration, including an empty payload, increments that
+revision. The property is writable (not `private(set)`); the production-source audit found only its
+initialization and four increment sites, no resetting assignment. This does not claim that other
+permission-store setters are fenced. The VM attachment-repair wrapper remains test-used in the
+other lane's file; there is no production caller after this cutover.
+
+One Oracle review (`untitled-chat-D9F4D8`, snapshot `2026-11-10/1324`) found no new correctness
+regression and requested a real VM projection witness, a direct source-revision assertion, and
+updated ownership wording. Those changes are applied. The direct runtime matrix covers optional
+presenter absence and same-object writer reacquisition at each projection boundary, checking provider
+repair order and refusal of later migration saves/readiness. A second test keeps the actual VM sink
+and checks that normal hydration replaces stale index, sort-date and model display state. No test
+budget or existing assertion was weakened. Two initial focused tickets were explicitly cancelled
+before global heavy admission to finish review coverage and correct the new fixture's sort-date
+expectation to the existing last-user-message-only policy; neither is a test result.
+
+Final focused `ee620fc0-9d51-48a3-96e7-ecba6e59d196` passed **180 tests**, no skips or failures,
+across the same eight loading/restoration/transcript/sidebar families. Both new cases passed, using
+real provider repair and the real VM sink respectively. Full lint
+`b9519454-ea43-4bc3-8d47-749b97e9ce52` passed; the final fixture-only expectation correction also
+passed pinned scoped formatting and strict lint. Actual compiler warning occurrences match the
+M9.2c baseline across all four touched Swift files: VM **4→4**, the other three **0→0**. The fresh
+index check remains **1,254/1,360 wrong-way edges, 53/66 largest cycle**, with no baseline change.
+These are local checkpoint gates only, not a new both-product/full SessionLinks/live-app/release/
+hosted-CI qualification. Nothing is pushed; #1676 remains untouched and binding/startup is ongoing.

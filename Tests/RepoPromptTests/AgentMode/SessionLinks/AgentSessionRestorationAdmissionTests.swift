@@ -96,6 +96,126 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
         }
     }
 
+    func testRuntimeHydrationCommitKeepsProviderOrderWithoutRequiringAPresenter() async throws {
+        for change in ["none", "detached", "sortReacquire", "restoredReacquire"] {
+            let fixture = try await makeFixture()
+            let created = await fixture.vm.createAndActivateSessionTab()
+            let session = try XCTUnwrap(fixture.vm.sessions[XCTUnwrap(created)])
+            let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+            guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+                workspaceID: fixture.workspaceID, sessionID: sessionID
+            ) else { return XCTFail("Fixture must own its canonical writer") }
+            let request = try AgentSessionHydrationRequest(
+                workspace: XCTUnwrap(fixture.manager.activeWorkspace), tabID: session.tabID,
+                sessionID: sessionID, resolvedDisplayName: "Commit hydration",
+                hasPendingQuestionUI: false, transcriptViewportState: .liveBottom,
+                isCompressedHistoryRevealed: false, initialPerformanceSnapshot: session.transcriptPerformanceSnapshot
+            )
+            let prepared = try await fixture.writer.preparePersistedHydration(request)
+            let source = try XCTUnwrap(prepared)
+            let payload = AgentSessionHydrationPayload(
+                sourceWorkspaceID: source.sourceWorkspaceID, sessionID: source.sessionID,
+                persistedSession: source.persistedSession, canonicalLiveItems: source.canonicalLiveItems,
+                transcript: source.transcript, builtPresentation: source.builtPresentation,
+                normalizedRunState: source.normalizedRunState, normalizedSelection: source.normalizedSelection,
+                lastUserMessageAt: source.lastUserMessageAt, restoredIndexEntry: source.restoredIndexEntry,
+                needsReloadMigrationSave: true
+            )
+            let generation = session.beginPersistentBindingTransition()
+            session.finishPersistentBindingTransition(generation: generation)
+            session.hasLoadedPersistedState = false
+            session.hasReconciledPersistedCodexCommandStatus = false
+            let attempt = try XCTUnwrap(AgentSessionHydrationRuntime.Attempt.capture(
+                session, in: writer.scope, transition: session.persistentBindingTransitionToken()
+            ))
+            _ = fixture.vm.attachmentRuntime
+            fixture.vm.test_setSuppressesAgentSessionPersistence(false)
+            let saves = session.saveRequestGeneration
+            var events: [String] = []
+            let attachment = writer.scope.presentation.attach(session, sink: .init(
+                activityChanged: { _, _ in }, refresh: { _, _, _ in },
+                turnComplete: { _ in }, turnFailed: { _, _ in },
+                hydration: { observed, event in
+                    XCTAssertTrue(observed === session)
+                    XCTAssertFalse(session.hasLoadedPersistedState)
+                    XCTAssertFalse(session.qualifiedRestorationReadiness.isAuthoritative)
+                    switch event {
+                    case .sortDate:
+                        events.append("sort")
+                        XCTAssertFalse(session.hasReconciledPersistedCodexCommandStatus)
+                    case let .restored(entry):
+                        events.append("restored")
+                        XCTAssertEqual(entry.id, sessionID)
+                        XCTAssertTrue(session.hasReconciledPersistedCodexCommandStatus)
+                    }
+                    if change == "sortReacquire" || (change == "restoredReacquire" && events.last == "restored") {
+                        writer.scope.replaceSessions([:])
+                        writer.scope.replaceSessions([session.tabID: session])
+                    }
+                }
+            ))
+            if change == "detached" { writer.scope.presentation.detach(attachment) }
+            let committed = AgentSessionHydrationRuntime.commit(
+                payload, attempt: attempt,
+                selection: .init(agent: .codexExec, modelRaw: session.selectedModelRaw, explicitReasoningEffortRaw: nil),
+                codexPolicy: fixture.vm.codexCoordinator.selectionPolicy(forModelRaw: session.selectedModelRaw, includeGlobalFallback: true),
+                indexedPlacement: nil, codex: fixture.vm.codexCoordinator, claude: fixture.vm.claudeCoordinator
+            )
+            let expectedCommit = change == "none" || change == "detached"
+            XCTAssertEqual(committed, expectedCommit, change)
+            XCTAssertEqual(session.hasLoadedPersistedState, expectedCommit, change)
+            XCTAssertEqual(session.qualifiedRestorationReadiness.isAuthoritative, expectedCommit, change)
+            XCTAssertEqual(session.saveRequestGeneration, saves + (expectedCommit ? 1 : 0), change)
+            XCTAssertEqual(session.hasReconciledPersistedCodexCommandStatus, change != "sortReacquire", change)
+            XCTAssertEqual(events, change == "detached" ? [] : change == "sortReacquire" ? ["sort"] : ["sort", "restored"], change)
+            // Even an empty payload advances the source revision. The removed AutoEdit task's
+            // pre-apply transition could never pass its first guard after this application.
+            XCTAssertGreaterThan(session.sourceItemsRevision, attempt.transition.sourceItemsRevision)
+            XCTAssertFalse(attempt.transition.matches(session))
+            XCTAssertTrue(fixture.providerRequests.events.isEmpty)
+            session.saveDebounceTask?.cancel()
+            writer.scope.presentation.detach(attachment)
+        }
+    }
+
+    func testVMHydrationProjectsRestoredIndexSortDateAndCurrentModel() async throws {
+        let fixture = try await makeFixture()
+        let created = await fixture.vm.createAndActivateSessionTab()
+        let session = try XCTUnwrap(fixture.vm.sessions[XCTUnwrap(created)])
+        let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+        let workspace = try XCTUnwrap(fixture.manager.activeWorkspace)
+        let request = AgentSessionHydrationRequest(
+            workspace: workspace, tabID: session.tabID, sessionID: sessionID,
+            resolvedDisplayName: fixture.vm.resolvedSessionDisplayName(for: session.tabID),
+            hasPendingQuestionUI: false, transcriptViewportState: .liveBottom,
+            isCompressedHistoryRevealed: false, initialPerformanceSnapshot: session.transcriptPerformanceSnapshot
+        )
+        let prepared = try await fixture.writer.preparePersistedHydration(request)
+        let payload = try XCTUnwrap(prepared)
+        var stale = payload.restoredIndexEntry
+        stale.name = "Stale projection"
+        stale.lastUserMessageAt = Date(timeIntervalSince1970: 1)
+        let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: fixture.workspaceID, activationEpoch: 1)
+        fixture.vm.test_installSessionIndexSnapshot([sessionID: stale], owner: owner, latestOwner: owner, activeWorkspace: workspace)
+        fixture.vm.test_setCurrentTabIDOverride(session.tabID)
+        fixture.vm.applyCodexSelectionToBindings(modelRaw: "stale-display-only", reasoningEffortRaw: nil)
+        fixture.vm.test_setSuppressesAgentSessionPersistence(false)
+        XCTAssertEqual(fixture.vm.test_ownerValidatedSessionIndex[sessionID], stale)
+        XCTAssertEqual(fixture.vm.sessionListSortDates[session.tabID], stale.lastUserMessageAt)
+        let generation = session.beginPersistentBindingTransition()
+        session.finishPersistentBindingTransition(generation: generation)
+        session.hasLoadedPersistedState = false
+        // Keep the real VM sink installed. A replaced or absent hydration handler would leave
+        // the stale index/date in place even though the runtime payload earns readiness.
+        _ = await fixture.vm.ensureSessionReady(tabID: session.tabID)
+        XCTAssertTrue(session.qualifiedRestorationReadiness.isAuthoritative)
+        XCTAssertEqual(fixture.vm.test_ownerValidatedSessionIndex[sessionID], payload.restoredIndexEntry)
+        XCTAssertEqual(fixture.vm.sessionListSortDates[session.tabID], payload.restoredIndexEntry.lastUserMessageAt)
+        XCTAssertEqual(fixture.vm.selectedModelRaw, session.selectedModelRaw)
+        XCTAssertEqual(fixture.vm.selectedReasoningEffortRaw, session.selectedReasoningEffortRaw)
+        XCTAssertTrue(fixture.providerRequests.events.isEmpty)
+    }
+
     func testRuntimeHydrationReadClassifiesBeforeTerminalSettlement() async throws {
         for disk in ["payload", "missing", "error"] {
             for change in ["none", "revision", "cancel", "revisionCancel", "reacquire", "reacquireRevision"] {
