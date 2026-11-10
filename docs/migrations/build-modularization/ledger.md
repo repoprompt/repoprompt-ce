@@ -7003,3 +7003,48 @@ restored without dropping the recovery stash. Final restored-tree products
 **1,253/1,360 wrong-way file edges, 53/66 largest-cycle components**. No ratchet baseline changed.
 Its actual compile diagnostics were also included in the warning audit with no positive deltas.
 No CI logs were read; no full-suite, live-app, release or sanitizer qualification is claimed.
+
+#### M9.2e — configured first-save transaction (validated locally; publication held)
+
+M9.2c is isolated for review as draft #1676 at `c4397ec3d`; no feature work is added to that
+branch. M9.2e starts locally at that exact head and must not be pushed until the overseer directs
+main integration after #1676 merges. The first bounded binding/creation/hydration slice moves the
+actual configured first-save transaction into `AgentSessionPersistenceRuntime`. Run start removes
+its VM commit callback and supplies the writer captured synchronously at binding. The VM retains
+thin receipt ingress for existing callers, including M9.2d's administrative caller; that caller's
+body and all administrative/worktree behavior remain untouched.
+
+The transaction retains its writer through the existing save queue, configured physical save and
+acknowledgement. Even an already-durable fast path requires a current unique writer. Same-object
+reacquisition is not credited after the queue wait or acknowledgement. Cancellation alone after
+acknowledgement still preserves the durability fact. A shared private debounce-preservation helper
+retains the M9.2c independent-owner-save rule; generic required-flush semantics are unchanged.
+
+One Oracle review (`untitled-chat-27CBAF`, snapshot `2026-11-10/1029`) confirmed the production
+writer/debounce boundaries and requested direct run-start coverage. Queue cancellation is
+preservation coverage; the reacquisition variants distinguish the old late-owner behavior.
+Only an exact current writer may fail creation preparation: cancellation with a stale/conflicting
+writer now refuses without mutating that claim's creation state. A valid pre-write dirty mutation
+is not rolled back through a reacquired successor after storage returns. Neither behavior grants
+new admission or schedules a stale retry. Read-only creation catalog policy, binding installation,
+hydration, first-bind preparation and inner provider execution remain open. M9.3 composition,
+M9.4 handoff/drain and M10 relocation are not claimed here.
+
+The review-requested run-start witness now uses the actual blank-tab binding admission and runtime
+creation commit: exactly one configured acknowledgement precedes intercepted dispatch, while
+same-object reacquisition at that acknowledgement prevents dispatch without erasing the saved
+payload. It supplements (rather than claiming equivalent coverage from) the retired callback
+fixtures' acknowledgement hooks. Caller/body search finds no `Environment.commitCreation` or
+`environment.commitCreation`; the VM result method is a one-line receipt ingress, not an alternate
+transaction body. No new coordinator, save queue, lifecycle authority or mutable fallback exists.
+
+Initial focused `3890a3e0-29ec-4f92-a5af-9a8f7cb201a5` passed **288 tests**. Final focused
+`c01e3c72-fe3a-4a23-90dc-0fbdb183a70a` passed **289 tests**, including the new direct run-start
+witness, restoration/creation, auto-wake, compact/send required-save, persistence and first-save
+regressions. Pinned scoped formatting and strict lint passed on all five touched Swift files;
+the final two-file review correction was checked again. Actual compiler warning occurrence counts
+match the M9.2c base: VM **4→4**, auto-wake tests **11→11**, other three files **0→0**. A fresh
+post-test compiler-index check remains **1,253/1,360 wrong-way edges, 53/66 largest cycle**, with no
+baseline change. These are local-commit gates: no new full broad selection, both-product build,
+full lint, live-app smoke, release or hosted-CI result is claimed for this slice. The publication
+gates will run before the explicitly authorized next draft PR; nothing is pushed now.

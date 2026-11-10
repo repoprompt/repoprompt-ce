@@ -1227,7 +1227,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         /// bindings are revalidated and installed on the destination.
         var test_beforeHandoffDestinationWorktreeInstall: (@MainActor () async -> Void)?
         var test_afterFreshForegroundSessionCreation: (@MainActor (AgentSessionCreationHandle) async -> Void)?
-        var test_afterConfiguredCreationAcknowledgement: (@MainActor (AgentSessionCreationHandle) async -> Void)?
+        var test_afterConfiguredCreationAcknowledgement: (@MainActor (AgentSessionCreationHandle) async -> Void)? {
+            get { runtimeSessionStore.persistence.test_afterConfiguredCreationAcknowledgement }
+            set { runtimeSessionStore.persistence.test_afterConfiguredCreationAcknowledgement = newValue }
+        }
+
         var test_afterHandoffDestinationCreation: (@MainActor (TabSession) async -> Void)?
         var test_afterHandoffChatClone: (@MainActor (TabSession) async -> Void)?
         var test_updateBindingsCallCount: Int = 0
@@ -18211,6 +18215,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func makeRunStartEnvironment() -> AgentSessionRunStartRuntime.Environment {
+        _ = persistenceRuntime
         var environment = AgentSessionRunStartRuntime.Environment(
             currentWorkspaceID: { self.workspaceManager?.activeWorkspaceID },
             prepareSession: { await self.prepareSessionForRunStart(tabID: $0.tabID, session: $0) },
@@ -18223,7 +18228,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 guard let id = self.ensureSessionBoundToTab(session, onCreated: { creation = $0 }) else { return nil }
                 return .init(sessionID: id, creation: creation)
             },
-            commitCreation: { await self.commitConfiguredSessionCreation(handle: $0) },
             providerSwitchRefusal: { Self.providerSwitchStartRefusal($0).message },
             input: providerInputRuntime,
             workspacePaths: { self.runtimeInputWorkspacePaths() },
@@ -19881,38 +19885,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private func commitConfiguredSessionCreationResult(
         handle: AgentSessionCreationHandle
     ) async -> AgentSessionSaveCoreResult {
-        guard freshSessionCreationIsCurrent(handle) else { return .deferred("The session creation owner changed.") }
-        if handle.session.qualifiedRestorationReadiness == .authoritative(handle.bindingToken, .freshBindingDurablyCreated) {
-            return .durablySaved(handle.bindingToken)
-        }
-        guard !Task.isCancelled, handle.session.creationHandleIsCurrent(handle) else {
-            failSessionCreation(handle, message: "Initial session creation was cancelled or replaced.")
-            return .deferred("Initial session creation was cancelled or replaced.")
-        }
-        handle.session.saveDebounceTask?.cancel()
-        handle.session.saveDebounceTask = nil
-        while saveInFlightSessionIDs.contains(handle.bindingToken.bindingIdentity.sessionID) {
-            await waitForInFlightSave(sessionID: handle.bindingToken.bindingIdentity.sessionID)
-            guard !Task.isCancelled, freshSessionCreationIsCurrent(handle),
-                  handle.session.creationHandleIsCurrent(handle)
-            else {
-                return .deferred("Initial session creation changed while an earlier save completed.")
-            }
-        }
-        handle.session.isDirty = true
-        let result = await saveSessionCore(for: handle.session.tabID, creationSave: .configured(handle))
-        guard case let .durablySaved(token) = result else { return result }
-        guard token == handle.bindingToken, freshSessionCreationIsCurrent(handle),
-              handle.session.qualifiedRestorationReadiness == .authoritative(token, .freshBindingDurablyCreated)
-        else { return .deferred("The session creation owner changed after persistence.") }
-        #if DEBUG
-            await test_afterConfiguredCreationAcknowledgement?(handle)
-        #endif
-        // Cancellation after acknowledgement does not erase the persistence fact.
-        guard freshSessionCreationIsCurrent(handle),
-              handle.session.qualifiedRestorationReadiness == .authoritative(token, .freshBindingDurablyCreated)
-        else { return .deferred("The saved session was replaced before completion.") }
-        return .durablySaved(token)
+        await persistenceRuntime.commitConfiguredCreation(handle)
     }
 
     /// Retry restoration of the same identity. An absent payload is never a new-session claim.

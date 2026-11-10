@@ -110,6 +110,9 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             session.appendItem(item)
             let candidateFence = AgentRunStartStopFence(session: session)
             let candidate = session.registerLocalComposerCandidate(itemID: item.id, at: session.items.count - 1)
+            try XCTUnwrap(f).scope.persistence.test_afterConfiguredCreationAcknowledgement = { _ in
+                XCTFail("Changed preparation must not acknowledge creation")
+            }
             let environment = AgentSessionRunStartRuntime.Environment(
                 currentWorkspaceID: { workspaceID },
                 prepareSession: { _ in _ = await gate.requirement() },
@@ -118,9 +121,6 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 },
                 bindSession: { _ in XCTFail("Changed preparation must not bind or allocate a session")
                     return nil
-                },
-                commitCreation: { _ in XCTFail("Changed preparation must not acknowledge creation")
-                    return false
                 },
                 providerSwitchRefusal: { _ in "Provider switch pending" },
                 input: AgentSessionProviderInputRuntime(skillCatalog: AgentSkillCatalog()),
@@ -190,6 +190,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         }
         var preparations = 0
         var starts = 0
+        f.scope.persistence.test_afterConfiguredCreationAcknowledgement = { _ in XCTFail("Existing writer is not a creation") }
         session.pendingHandoff = .init(payload: "<forked_session>Admitted continuity</forked_session>", createdAt: Date())
         let outcome = AgentRunStartOutcomeRecorder()
         var environment = AgentSessionRunStartRuntime.Environment(
@@ -201,9 +202,6 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             },
             availabilityFailure: { _ in nil },
             bindSession: { .init(sessionID: $0.activeAgentSessionID!, creation: nil) },
-            commitCreation: { _ in XCTFail("Existing writer is not a creation")
-                return false
-            },
             providerSwitchRefusal: { _ in "Unexpected switch" },
             input: AgentSessionProviderInputRuntime(skillCatalog: AgentSkillCatalog()),
             workspacePaths: { [] }, inputWorkspace: { _ in nil }, initialThreadInput: { _ in nil },
@@ -245,14 +243,14 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             session.pendingHandoff = .init(payload: "<forked_session>Retained continuity</forked_session>", createdAt: Date())
             XCTAssertNil(session.mcpControlContext, "This ordinary start has no MCP epoch to prepare")
             f.scope.mcp.test_afterEpochBegan = { XCTFail("An ordinary start must not create an MCP epoch") }
+            f.scope.persistence.test_afterConfiguredCreationAcknowledgement = { _ in
+                XCTFail("Already persisted identity must not claim new creation")
+            }
             let environment = AgentSessionRunStartRuntime.Environment(
                 currentWorkspaceID: { workspaceID },
                 prepareSession: { _ in preparations += 1 },
                 availabilityFailure: { _ in nil },
                 bindSession: { .init(sessionID: $0.activeAgentSessionID!, creation: nil) },
-                commitCreation: { _ in XCTFail("Already persisted identity must not claim new creation")
-                    return false
-                },
                 providerSwitchRefusal: { _ in "Provider switch pending" },
                 input: AgentSessionProviderInputRuntime(skillCatalog: catalog),
                 workspacePaths: { [root.path] },

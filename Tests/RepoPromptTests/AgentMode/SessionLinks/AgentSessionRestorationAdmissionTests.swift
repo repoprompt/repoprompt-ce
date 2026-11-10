@@ -387,6 +387,175 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
         XCTAssertTrue(fixture.providerRequests.events.isEmpty)
     }
 
+    func testConfiguredCreationKeepsItsWriterAcrossTheSaveQueue() async throws {
+        for cancelWhileQueued in [false, true] {
+            let fixture = try await makeFixture()
+            let failed = try await failConfiguredCreation(fixture)
+            let retry = try XCTUnwrap(fixture.vm.captureSessionCreationRetry(for: failed.session))
+            try await removeWriteObstruction(fixture, sessionID: failed.sessionID)
+            let command = try XCTUnwrap(fixture.vm.runtimeCommand(sessionID: failed.sessionID, requirement: .creation(retry)))
+            let writer = command.writer
+            let scope = writer.scope
+            let runtime = scope.persistence
+            XCTAssertEqual(writer.restoration, retry.bindingToken)
+            XCTAssertTrue(runtime.queue.begin(sessionID: failed.sessionID))
+            let composition = try XCTUnwrap(runtime.composition)
+            var entered = false
+            runtime.composition = .init(
+                workspace: composition.workspace, workspaceWithID: composition.workspaceWithID,
+                displayName: composition.displayName, isSuppressed: composition.isSuppressed,
+                bypassesSuppression: composition.bypassesSuppression,
+                isPreparedSavedHost: composition.isPreparedSavedHost, saveAdmission: composition.saveAdmission,
+                creationIsCurrent: { handle in
+                    entered = true
+                    return composition.creationIsCurrent(handle)
+                },
+                admitBinding: composition.admitBinding, isRestoringConfiguration: composition.isRestoringConfiguration
+            )
+            let beforeDirty = failed.session.isDirty
+            let task = Task { @MainActor in await fixture.vm.retrySessionInitialSave(retry) }
+            addTeardownBlock { @MainActor in
+                if runtime.queue.inFlightSessionIDs.contains(failed.sessionID) {
+                    _ = runtime.queue.finish(sessionID: failed.sessionID)
+                }
+                task.cancel()
+                _ = await task.value
+            }
+            try await AsyncTestWait.waitUntil("configured creation reached its existing save queue") { entered }
+            if cancelWhileQueued {
+                task.cancel()
+            } else {
+                let sessions = scope.sessions
+                var removed = sessions
+                removed.removeValue(forKey: failed.session.tabID)
+                scope.replaceSessions(removed)
+                scope.replaceSessions(sessions)
+                XCTAssertFalse(writer.isCurrent)
+                XCTAssertEqual(failed.session.currentRestorationBindingToken, retry.bindingToken)
+            }
+            XCTAssertFalse(runtime.queue.finish(sessionID: failed.sessionID), "A queued creator cannot invent a follow-up save")
+            let committed = await task.value
+            XCTAssertFalse(committed)
+            XCTAssertEqual(failed.session.isDirty, beforeDirty)
+            XCTAssertNil(failed.session.saveDebounceRequestID)
+            XCTAssertNotNil(fixture.vm.captureSessionCreationRetry(for: failed.session))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: sessionFile(root: fixture.root, sessionID: failed.sessionID).path))
+            XCTAssertTrue(fixture.providerRequests.events.isEmpty)
+        }
+    }
+
+    func testConfiguredCreationDoesNotCreditAReacquiredWriterAfterAcknowledgement() async throws {
+        let fixture = try await makeFixture()
+        let failed = try await failConfiguredCreation(fixture)
+        let retry = try XCTUnwrap(fixture.vm.captureSessionCreationRetry(for: failed.session))
+        try await removeWriteObstruction(fixture, sessionID: failed.sessionID)
+        let command = try XCTUnwrap(fixture.vm.runtimeCommand(sessionID: failed.sessionID, requirement: .creation(retry)))
+        let runtime = command.writer.scope.persistence
+        let saver = runtime.saver
+        var writes = 0
+        var acknowledgements = 0
+        runtime.saver = { payload, workspace, count in
+            writes += 1
+            return try await saver(payload, workspace, count)
+        }
+        fixture.vm.test_afterConfiguredCreationAcknowledgement = { handle in
+            acknowledgements += 1
+            XCTAssertEqual(handle.session.qualifiedRestorationReadiness, .authoritative(handle.bindingToken, .freshBindingDurablyCreated))
+            let scope = command.writer.scope
+            let sessions = scope.sessions
+            var removed = sessions
+            removed.removeValue(forKey: handle.session.tabID)
+            scope.replaceSessions(removed)
+            scope.replaceSessions(sessions)
+            XCTAssertFalse(command.writer.isCurrent)
+        }
+        let committed = await fixture.vm.retrySessionInitialSave(retry)
+        XCTAssertFalse(committed, "A durable record does not credit an operation whose writer was replaced")
+        XCTAssertEqual(writes, 1)
+        XCTAssertEqual(acknowledgements, 1)
+        XCTAssertEqual(try readPayload(fixture, sessionID: failed.sessionID).id, failed.sessionID)
+        XCTAssertEqual(failed.session.qualifiedRestorationReadiness, .authoritative(retry.bindingToken, .freshBindingDurablyCreated))
+        XCTAssertFalse(failed.session.isDirty)
+        XCTAssertNil(failed.session.saveDebounceRequestID)
+        let staleRetry = await runtime.commitConfiguredCreation(retry, writer: command.writer)
+        guard case .deferred = staleRetry else { return XCTFail("The old writer cannot use the durable fast path") }
+        let acknowledged = await fixture.vm.commitConfiguredSessionCreation(handle: retry)
+        XCTAssertTrue(acknowledged, "Fresh ingress may observe the same durable record without another write")
+        XCTAssertEqual(writes, 1)
+        XCTAssertEqual(acknowledgements, 1)
+        XCTAssertTrue(fixture.providerRequests.events.isEmpty)
+    }
+
+    func testRunStartCommitsItsFreshBindingBeforeDispatchAndRefusesReacquiredAcknowledgement() async throws {
+        for reacquireAfterAcknowledgement in [false, true] {
+            let fixture = try await makeFixture()
+            let tabID = try XCTUnwrap(fixture.prompt.currentComposeTabs.first?.id)
+            // Obtain the existing scope through an independently admitted identity, without
+            // binding the original blank tab or inventing a runtime writer for it.
+            let bootstrap = try await fixture.vm.mcpResolveOrCreateSessionTarget(
+                tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Scope fixture",
+                expectedWorkspaceID: fixture.workspaceID
+            )
+            let bootstrapHandle = try XCTUnwrap(bootstrap.creationHandle)
+            let command = try XCTUnwrap(fixture.vm.runtimeCommand(
+                sessionID: XCTUnwrap(bootstrap.sessionID), requirement: .creation(bootstrapHandle)
+            ))
+            let scope = command.writer.scope
+            let runtime = fixture.vm.persistenceRuntime
+            let bind = try XCTUnwrap(runtime.composition?.admitBinding)
+            let session = try XCTUnwrap(fixture.vm.session(for: tabID, createIfNeeded: true))
+            XCTAssertNil(session.activeAgentSessionID)
+            session.selectedAgent = .openCode
+            var acknowledgements = 0
+            var dispatches = 0
+            var created: AgentSessionCreationHandle?
+            runtime.test_afterConfiguredCreationAcknowledgement = { handle in
+                acknowledgements += 1
+                XCTAssertTrue(handle.session === session)
+                XCTAssertEqual(handle.session.qualifiedRestorationReadiness, .authoritative(handle.bindingToken, .freshBindingDurablyCreated))
+                XCTAssertEqual(dispatches, 0)
+                if reacquireAfterAcknowledgement {
+                    let sessions = scope.sessions
+                    var removed = sessions
+                    removed.removeValue(forKey: tabID)
+                    scope.replaceSessions(removed)
+                    scope.replaceSessions(sessions)
+                }
+            }
+            var environment = AgentSessionRunStartRuntime.Environment(
+                currentWorkspaceID: { fixture.workspaceID }, prepareSession: { _ in },
+                availabilityFailure: { _ in nil },
+                bindSession: { exact in
+                    let admission = bind(exact)
+                    created = admission?.creation
+                    return admission
+                },
+                providerSwitchRefusal: { _ in "Unexpected provider switch" },
+                input: fixture.vm.providerInputRuntime,
+                workspacePaths: { [] }, inputWorkspace: { _ in nil }, initialThreadInput: { _ in nil },
+                composition: { preconditionFailure("The fixture intercepts physical provider dispatch") }
+            )
+            environment.test_startOverride = { exact, _, _ in
+                XCTAssertTrue(exact === session)
+                XCTAssertEqual(acknowledgements, 1)
+                dispatches += 1
+                return true
+            }
+            let outcome = AgentRunStartOutcomeRecorder()
+            _ = await scope.startup.start(
+                session: session, initialMessage: "Start only after configured persistence", startOutcome: outcome,
+                claudeCoordinator: .init(windowID: -1, workspacePathProvider: { _ in nil }),
+                links: fixture.vm.linkExecutionRuntime, environment: environment
+            )
+            let handle = try XCTUnwrap(created)
+            XCTAssertEqual(acknowledgements, 1)
+            XCTAssertEqual(dispatches, reacquireAfterAcknowledgement ? 0 : 1)
+            XCTAssertEqual(outcome.outcome.didStart, !reacquireAfterAcknowledgement)
+            XCTAssertEqual(try readPayload(fixture, sessionID: handle.bindingToken.bindingIdentity.sessionID).composeTabID, tabID)
+            XCTAssertTrue(fixture.providerRequests.events.isEmpty)
+        }
+    }
+
     func testExternalMCPStartHonorsPendingStopAfterConfiguredSaveBeforeDispatch() async throws {
         for stopPendingStart in [false, true] {
             let fixture = try await makeFixture()
