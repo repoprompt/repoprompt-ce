@@ -190,7 +190,7 @@ final class ACPIntegratedAgentModeRunner {
     enum StartupBoundary {
         case taskEntry, toolTrackingCompleted, leaseAcquired, acquireFailureOutcome
         case bootstrapStarting, bootstrapCompleted, resumeRecoveryStaged, configuration, routingReleased, prePromptFailure
-        case reusabilityProbed, deferredLeaseAcquired
+        case reusabilityProbed, deferredLeaseAcquired, controlPromptAdmission
     }
 
     #if DEBUG
@@ -1630,36 +1630,20 @@ final class ACPIntegratedAgentModeRunner {
             return await Self.controlCommandUnreusableOutcome(isRetired: controller.isRetired, runRequest: runRequest)
         }
         let events = await controller.events
-        let consumeTask = Task { @MainActor [weak self, weak session] in
-            guard let self, let session else {
-                return TransientOperationResult.failed(errorText: "ACP event consumer deallocated.")
-            }
-            return await consumeEvents(
-                events,
-                session: session,
-                runID: runID,
-                runAttemptID: runAttemptID
-            )
-        }
-        /// Stops the consumer of a turn that never started, so no terminal event is awaited.
-        func abandonConsumer() async {
-            consumeTask.cancel()
-            _ = await consumeTask.value
-        }
+        #if DEBUG
+            testAtStartupBoundary?(.controlPromptAdmission)
+        #endif
 
         // This run attempt and the admitted app-session incarnation and provider conversation, after
         // every await above. A cancelled or superseded attempt must never reach the write.
         guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else {
-            await abandonConsumer()
             return .superseded
         }
         guard !Task.isCancelled else {
-            await abandonConsumer()
             return .cancelled
         }
         guard session.acpController === controller else {
             // An orphan: no longer the session's controller, so nothing else will retire it.
-            await abandonConsumer()
             await controller.shutdown()
             return .refusedBeforeSend(
                 errorText: "\(displayName) could not run the requested command because the session changed before it was sent."
@@ -1670,7 +1654,6 @@ final class ACPIntegratedAgentModeRunner {
               session.providerSessionID == command.expectedProviderConversation,
               command.selfCompactDispatchID == nil || session.selfCompactDispatchIsCurrent?() != false
         else {
-            await abandonConsumer()
             return .refusedBeforeSend(
                 errorText: "\(displayName) could not run the requested command because the session changed before it was sent."
             )
@@ -1688,18 +1671,34 @@ final class ACPIntegratedAgentModeRunner {
         // empty turn.
         let dispatchedAt = Date()
         let transcriptItemsAtDispatch = session.items.count
+        if command.selfCompactDispatchID?.stage == .compact {
+            // Defensive recheck after withdrawing the count vouch; no await has intervened.
+            guard session.selfCompactDispatchIsCurrent?() != false else {
+                session.restoreContextCountVouchAfterUnsentCompaction(withdrawnVouch)
+                return .refusedBeforeSend(
+                    errorText: "\(displayName) did not run the requested command because self-compaction was no longer admissible."
+                )
+            }
+            session.selfCompactACPCommandItemIDs = Set(session.items.map(\.id))
+        }
+        // As with an ordinary prompt, buffered events belong to a dispatched turn. Refusal
+        // above must not create a consumer that advances shared state before admission.
+        #if DEBUG
+            testPromptConsumerCreated?()
+        #endif
+        let consumeTask = Task { @MainActor [weak self, weak session] in
+            guard let self, let session else {
+                return TransientOperationResult.failed(errorText: "ACP event consumer deallocated.")
+            }
+            return await consumeEvents(events, session: session, runID: runID, runAttemptID: runAttemptID)
+        }
+        /// Actor-side refusal still needs to cancel and join its dispatched consumer.
+        func abandonConsumer() async {
+            consumeTask.cancel()
+            _ = await consumeTask.value
+        }
         do {
             log("controller.promptAdvertisedCommand begin", runID: runID)
-            if command.selfCompactDispatchID?.stage == .compact {
-                guard session.selfCompactDispatchIsCurrent?() != false else {
-                    await abandonConsumer()
-                    session.restoreContextCountVouchAfterUnsentCompaction(withdrawnVouch)
-                    return .refusedBeforeSend(
-                        errorText: "\(displayName) did not run the requested command because self-compaction was no longer admissible."
-                    )
-                }
-                session.selfCompactACPCommandItemIDs = Set(session.items.map(\.id))
-            }
             try await controller.promptAdvertisedCommand(
                 command.kind.rawValue,
                 expectedSessionID: command.expectedProviderConversation,

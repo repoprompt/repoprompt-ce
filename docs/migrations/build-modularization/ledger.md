@@ -7727,3 +7727,29 @@ integrated baseline `a0c674e9-c5be-4f38-b010-bf620211cfb2`; no new warning occur
 Fresh index passed at **1,261/1,360 wrong-way edges and 53/66 largest cycle**, unchanged.
 Both-product/full-SessionLinks/live-app/hosted-CI qualification is not claimed for this local checkpoint.
 No push; #1679 remains untouched.
+
+### M9.2g local prerequisite — control-command consumer placement (2026-11-11)
+
+ACP control commands now create their event consumer only after all synchronous app-side dispatch
+refusals, matching the ordinary prompt path. Attempt/cancellation, controller, binding/conversation
+and defensive self-compaction checks no longer create and cancel a consumer for an unsent command.
+The stream is still acquired after next-turn preparation. Context-count suspension, pre-dispatch
+transcript snapshots and self-compaction item capture still occur before buffered events can run.
+Actor-side command refusals/cancellation still cancel and join their already-created consumer; generic
+transport failures retain their existing terminal-event join. This is placement, not the pending writer
+receipt cutover or a physical actor-write proof.
+
+One Oracle review (`0212`, chat `6F1A83`) approved the mechanical change. Its defensive-check wording
+is added. The new three-variant test exercises a real advertised command, conversation-change refusal
+and cancellation; it checks real prompt RPC presence/absence plus positive/negative consumer creation.
+The DEBUG creation counter is the direct differentiating oracle for unsent-consumer absence; wire and
+terminal assertions alone also passed before this move. No claim of a deterministic old-consumer
+execution race is made, and no extra harness callback was added solely to observe progress. The existing
+compact suites cover real actor-side refusal and context-vouch behavior. Focused
+`dc21bc00-b6f9-4c7c-a5b4-2706e526c936` passed. Affected ticket
+`8bdfa6cd-df50-427c-bc02-5c74f058c730` passed **402 tests, zero failures/skips** (66.375s);
+full lint `a44b7e15-fdfa-4279-8e84-f046fc5e14ee` passed. Actual compiler warning occurrences in
+both focused/affected compiles remain runner 1 and tests 0, matching integrated baseline `a0c674e9`.
+Fresh index passed at **1,261/1,360 wrong-way edges and 53/66 largest cycle**, unchanged.
+Local checkpoint only; both-product/full-SessionLinks/live-app/hosted-CI qualification is not claimed.
+No push.

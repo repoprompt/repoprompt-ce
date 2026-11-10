@@ -560,6 +560,62 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
         }
     }
 
+    func testACPControlCommandDoesNotConsumeEventsBeforeAdmission() async throws {
+        enum Refusal { case none, conversationChanged, cancelled }
+        for refusal in [Refusal.none, .conversationChanged, .cancelled] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let script = try AgentSessionLinkACPServerScript.write(to: directory)
+            let rpcLog = directory.appendingPathComponent("requests.jsonl")
+            let provider = AgentSessionLinkCapturingACPProvider(providerID: .antigravity, commandPath: script.path, environment: [
+                "ACP_RPC_LOG": rpcLog.path, "ACP_ADVERTISE_COMMANDS": "compact", "ACP_ADVERTISE_BEFORE_NEW_RESPONSE": "1"
+            ])
+            let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: directory.path, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
+            let controller = try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
+            addTeardownBlock { await controller.shutdown() }
+            let bootstrap = try await controller.bootstrap()
+            let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+            let session = try harness.makeBoundSession(agent: .antigravity)
+            session.acpController = controller
+            session.providerSessionID = bootstrap.providerSessionIdentity.loadSessionID ?? bootstrap.providerSessionIdentity.runtimeSessionID
+            _ = AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
+            let command = try AgentProviderControlCommand.compact(expectedBinding: XCTUnwrap(session.persistentSessionBindingIdentity), expectedProviderConversation: XCTUnwrap(session.providerSessionID))
+            let runner = ACPIntegratedAgentModeRunner(hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(), toolTrackingHooks: .noOp)
+            var consumers = 0
+            var task: Task<Void, Never>?
+            runner.testPromptConsumerCreated = { consumers += 1 }
+            runner.testAtStartupBoundary = { boundary in
+                guard boundary == .controlPromptAdmission else { return }
+                task = session.agentTask
+                XCTAssertEqual(consumers, 0)
+                switch refusal {
+                case .none: break
+                case .conversationChanged: session.providerSessionID = "replacement-conversation"
+                case .cancelled: session.agentTask?.cancel()
+                }
+            }
+            _ = try await runner.prepareRun(
+                tabID: session.tabID, session: session, origin: harness.startCommand(for: session), workspace: harness.workspace,
+                initialUserMessage: command.providerText, initialMessageForRun: command.providerText, attachments: [], runRequest: request,
+                providerControlCommand: command, makeLease: { harness.makeLease(runID: $0, tabID: session.tabID) }
+            )
+            try await AsyncTestWait.waitUntil("control command admission") { task != nil }
+            await task?.value
+            XCTAssertEqual(consumers, refusal == .none ? 1 : 0)
+            let rpcText = try String(contentsOf: rpcLog, encoding: .utf8)
+            XCTAssertEqual(rpcText.contains("session/prompt"), refusal == .none)
+            if refusal == .none { XCTAssertEqual(session.runState, .completed) }
+            if refusal == .conversationChanged {
+                XCTAssertEqual(session.runState, .failed)
+                XCTAssertTrue(session.acpController === controller)
+            }
+            if refusal == .cancelled { XCTAssertEqual(session.runState, .cancelled) }
+            await controller.shutdown()
+            session.saveDebounceTask?.cancel()
+        }
+    }
+
     func testACPFreshBootstrapAndConfigurationKeepTheirOriginalWriter() async throws {
         typealias Boundary = ACPIntegratedAgentModeRunner.StartupBoundary
         enum Drift { case reacquire, retire, successor, detached, transientConflict, none }
