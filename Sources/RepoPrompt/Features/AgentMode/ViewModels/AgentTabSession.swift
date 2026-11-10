@@ -578,8 +578,11 @@ final class AgentTabSession: ObservableObject {
     }
 
     var mcpFollowUpRunPendingUpdatedAt: Date?
+    /// The self-relocation lease only. Any direct setter transfers ownership away from old cleanup.
+    var selfWorktreeRelocationFollowUpOwner: UUID?
     var mcpFollowUpRunPending: Bool = false {
         didSet {
+            selfWorktreeRelocationFollowUpOwner = nil
             if oldValue != mcpFollowUpRunPending {
                 mcpFollowUpRunPendingUpdatedAt = Date()
                 noteMonitorObservationInputsChanged()

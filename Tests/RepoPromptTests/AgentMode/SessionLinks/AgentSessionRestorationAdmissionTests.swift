@@ -41,6 +41,377 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
         XCTAssertTrue(reopened.providerRequests.events.isEmpty, "Opening an empty session must not start a provider")
     }
 
+    func testRebindPreparationRejectsReacquiredBoundAndUnboundMembers() async throws {
+        for loss in ["none", "boundSuccess", "unboundTarget", "boundTarget", "source"] {
+            let fixture = try await makeFixture()
+            let originalTabID = try XCTUnwrap(fixture.manager.activeWorkspace?.activeComposeTabID)
+            let sourceTab = await fixture.vm.createAndActivateSessionTab()
+            let source = try XCTUnwrap(fixture.vm.sessions[XCTUnwrap(sourceTab)])
+            let sourceID = try XCTUnwrap(source.activeAgentSessionID)
+            guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+                workspaceID: fixture.workspaceID, sessionID: sourceID
+            ) else { return XCTFail("Fixture must have an exclusive source writer") }
+            let target: AgentTabSession
+            if loss == "boundTarget" || loss == "boundSuccess" {
+                let targetTab = await fixture.vm.createAndActivateSessionTab()
+                target = try XCTUnwrap(fixture.vm.sessions[XCTUnwrap(targetTab)])
+            } else {
+                target = fixture.vm.session(for: originalTabID)
+                XCTAssertNil(target.activeAgentSessionID)
+            }
+            let targetBinding = target.persistentSessionBindingIdentity
+            let sourceBinding = source.persistentSessionBindingIdentity
+            let bytes = try Data(contentsOf: sessionFile(root: fixture.root, sessionID: sourceID))
+            let gate = TestReleaseFence(name: "binding ownership checks \(loss)")
+            fixture.vm.test_afterRebindOwnershipChecks = { await gate.enterAndWait() }
+            let rebind = Task { @MainActor in
+                try await fixture.vm.test_rebindPersistentSession(sourceID, to: target)
+            }
+            defer { gate.release()
+                fixture.vm.test_afterRebindOwnershipChecks = nil
+            }
+            guard await gate.waitUntilEntered() else { return XCTFail("Rebind never reached the ownership barrier: \(loss)") }
+            XCTAssertTrue(source.bindingTransitionInProgress)
+            XCTAssertTrue(target.bindingTransitionInProgress)
+            let oldTarget = try XCTUnwrap(writer.scope.membership(of: target))
+            let oldSource = try XCTUnwrap(writer.scope.membership(of: source))
+            let succeeds = loss == "none" || loss == "boundSuccess"
+            if !succeeds {
+                let victim = loss == "source" ? source : target
+                let members = writer.scope.sessions
+                writer.scope.replaceSessions(members.filter { $0.key != victim.tabID })
+                writer.scope.replaceSessions(members)
+                XCTAssertEqual(victim.persistentSessionBindingIdentity, loss == "source" ? sourceBinding : targetBinding)
+                XCTAssertFalse((loss == "source" ? oldSource : oldTarget).isCurrent)
+            }
+            gate.release()
+            do {
+                let binding = try await rebind.value
+                XCTAssertTrue(succeeds, "A stale preparer cannot install a binding")
+                XCTAssertEqual(binding.sessionID, sourceID)
+                XCTAssertEqual(target.activeAgentSessionID, sourceID)
+                XCTAssertNil(source.activeAgentSessionID)
+                XCTAssertEqual(fixture.manager.activeAgentSessionID(forTabID: target.tabID), sourceID)
+                XCTAssertNil(fixture.manager.activeAgentSessionID(forTabID: source.tabID))
+            } catch {
+                XCTAssertFalse(succeeds)
+                XCTAssertEqual(error as? AgentModeViewModel.PersistentBindingMutationError, .staleTransition)
+                XCTAssertEqual(source.persistentSessionBindingIdentity, sourceBinding)
+                XCTAssertEqual(target.persistentSessionBindingIdentity, targetBinding)
+                XCTAssertEqual(fixture.manager.activeAgentSessionID(forTabID: source.tabID), sourceID)
+                XCTAssertEqual(fixture.manager.activeAgentSessionID(forTabID: target.tabID), targetBinding?.sessionID)
+                XCTAssertEqual(
+                    source.qualifiedRestorationReadiness.isAuthoritative,
+                    loss != "source",
+                    "Only the unchanged source may regain its pre-transition proof"
+                )
+            }
+            fixture.vm.test_afterRebindOwnershipChecks = nil
+            XCTAssertFalse(source.bindingTransitionInProgress, "The original preparation must release its generation latch")
+            XCTAssertFalse(target.bindingTransitionInProgress)
+            XCTAssertEqual(try Data(contentsOf: sessionFile(root: fixture.root, sessionID: sourceID)), bytes)
+            XCTAssertTrue(fixture.providerRequests.events.isEmpty)
+        }
+    }
+
+    func testHydrationReadCannotSettleAReacquiredSameObjectWriter() async throws {
+        for outcome in ["payload", "missing", "error", "revision"] {
+            let fixture = try await makeFixture()
+            let created = await fixture.vm.createAndActivateSessionTab()
+            let tabID = try XCTUnwrap(created)
+            let session = try XCTUnwrap(fixture.vm.sessions[tabID])
+            let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+            guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+                workspaceID: fixture.workspaceID, sessionID: sessionID
+            ) else { return XCTFail("Fixture must own its canonical writer") }
+            let scope = writer.scope
+            let bytes = try Data(contentsOf: sessionFile(root: fixture.root, sessionID: sessionID))
+            if outcome == "missing" { try FileManager.default.removeItem(at: sessionFile(root: fixture.root, sessionID: sessionID)) }
+            let generation = session.beginPersistentBindingTransition()
+            session.finishPersistentBindingTransition(generation: generation)
+            session.hasLoadedPersistedState = false
+            let gate = TestReleaseFence(name: "hydration before reacquisition \(outcome)")
+            await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook { id in
+                guard id == sessionID else { return }
+                await gate.enterAndWait()
+                if outcome == "error" { throw CocoaError(.fileReadCorruptFile) }
+            }
+            addTeardownBlock { await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook(nil) }
+            let loading = Task { @MainActor in await fixture.vm.ensureSessionReady(tabID: tabID) }
+            defer { gate.release() }
+            guard await gate.waitUntilEntered() else { return }
+            let transition = session.persistentBindingTransitionToken()
+            scope.replaceSessions([:])
+            scope.replaceSessions([tabID: session])
+            XCTAssertTrue(transition.matches(session))
+            if outcome == "revision" {
+                session.setItemsSilently([.init(kind: .user, text: "Successor local input", sequenceIndex: 0)], reason: .persistedSessionHydration)
+            }
+            let items = session.items
+            gate.release()
+            _ = await loading.value
+            await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook(nil)
+            XCTAssertEqual(session.items, items, outcome)
+            XCTAssertFalse(session.hasLoadedPersistedState, outcome)
+            guard case .pending = session.qualifiedRestorationReadiness else { return XCTFail("Old \(outcome) read must not publish a proof") }
+            XCTAssertTrue(fixture.providerRequests.events.isEmpty)
+            // Local input is retained without authorizing a new read over it. Deciding whether
+            // a later new load may replace that projection is a separate admission policy.
+            if outcome == "revision" {
+                XCTAssertEqual(session.items.map(\.text), ["Successor local input"])
+                continue
+            }
+            // An ordinary successor load can still earn its own proof; stale-drop is not a
+            // cancelled saved outcome that permanently disables automatic hydration.
+            if outcome == "missing" { try bytes.write(to: sessionFile(root: fixture.root, sessionID: sessionID)) }
+            _ = await fixture.vm.ensureSessionReady(tabID: tabID)
+            XCTAssertTrue(session.qualifiedRestorationReadiness.isAuthoritative, outcome)
+        }
+    }
+
+    func testRuntimeHydrationCommitKeepsProviderOrderWithoutRequiringAPresenter() async throws {
+        for change in ["none", "detached", "sortReacquire", "restoredReacquire"] {
+            let fixture = try await makeFixture()
+            let created = await fixture.vm.createAndActivateSessionTab()
+            let session = try XCTUnwrap(fixture.vm.sessions[XCTUnwrap(created)])
+            let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+            guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+                workspaceID: fixture.workspaceID, sessionID: sessionID
+            ) else { return XCTFail("Fixture must own its canonical writer") }
+            let request = try AgentSessionHydrationRequest(
+                workspace: XCTUnwrap(fixture.manager.activeWorkspace), tabID: session.tabID,
+                sessionID: sessionID, resolvedDisplayName: "Commit hydration",
+                hasPendingQuestionUI: false, transcriptViewportState: .liveBottom,
+                isCompressedHistoryRevealed: false, initialPerformanceSnapshot: session.transcriptPerformanceSnapshot
+            )
+            let prepared = try await fixture.writer.preparePersistedHydration(request)
+            let source = try XCTUnwrap(prepared)
+            let payload = AgentSessionHydrationPayload(
+                sourceWorkspaceID: source.sourceWorkspaceID, sessionID: source.sessionID,
+                persistedSession: source.persistedSession, canonicalLiveItems: source.canonicalLiveItems,
+                transcript: source.transcript, builtPresentation: source.builtPresentation,
+                normalizedRunState: source.normalizedRunState, normalizedSelection: source.normalizedSelection,
+                lastUserMessageAt: source.lastUserMessageAt, restoredIndexEntry: source.restoredIndexEntry,
+                needsReloadMigrationSave: true
+            )
+            let generation = session.beginPersistentBindingTransition()
+            session.finishPersistentBindingTransition(generation: generation)
+            session.hasLoadedPersistedState = false
+            session.hasReconciledPersistedCodexCommandStatus = false
+            let attempt = try XCTUnwrap(AgentSessionHydrationRuntime.Attempt.capture(
+                session, in: writer.scope, transition: session.persistentBindingTransitionToken()
+            ))
+            _ = fixture.vm.attachmentRuntime
+            fixture.vm.test_setSuppressesAgentSessionPersistence(false)
+            let saves = session.saveRequestGeneration
+            var events: [String] = []
+            let attachment = writer.scope.presentation.attach(session, sink: .init(
+                activityChanged: { _, _ in }, refresh: { _, _, _ in },
+                turnComplete: { _ in }, turnFailed: { _, _ in },
+                hydration: { observed, event in
+                    XCTAssertTrue(observed === session)
+                    XCTAssertFalse(session.hasLoadedPersistedState)
+                    XCTAssertFalse(session.qualifiedRestorationReadiness.isAuthoritative)
+                    switch event {
+                    case .sortDate:
+                        events.append("sort")
+                        XCTAssertFalse(session.hasReconciledPersistedCodexCommandStatus)
+                    case let .restored(entry):
+                        events.append("restored")
+                        XCTAssertEqual(entry.id, sessionID)
+                        XCTAssertTrue(session.hasReconciledPersistedCodexCommandStatus)
+                    }
+                    if change == "sortReacquire" || (change == "restoredReacquire" && events.last == "restored") {
+                        writer.scope.replaceSessions([:])
+                        writer.scope.replaceSessions([session.tabID: session])
+                    }
+                }
+            ))
+            if change == "detached" { writer.scope.presentation.detach(attachment) }
+            let committed = AgentSessionHydrationRuntime.commit(
+                payload, attempt: attempt,
+                selection: .init(agent: .codexExec, modelRaw: session.selectedModelRaw, explicitReasoningEffortRaw: nil),
+                codexPolicy: fixture.vm.codexCoordinator.selectionPolicy(forModelRaw: session.selectedModelRaw, includeGlobalFallback: true),
+                indexedPlacement: nil, codex: fixture.vm.codexCoordinator, claude: fixture.vm.claudeCoordinator
+            )
+            let expectedCommit = change == "none" || change == "detached"
+            XCTAssertEqual(committed, expectedCommit, change)
+            XCTAssertEqual(session.hasLoadedPersistedState, expectedCommit, change)
+            XCTAssertEqual(session.qualifiedRestorationReadiness.isAuthoritative, expectedCommit, change)
+            XCTAssertEqual(session.saveRequestGeneration, saves + (expectedCommit ? 1 : 0), change)
+            XCTAssertEqual(session.hasReconciledPersistedCodexCommandStatus, change != "sortReacquire", change)
+            XCTAssertEqual(events, change == "detached" ? [] : change == "sortReacquire" ? ["sort"] : ["sort", "restored"], change)
+            // Even an empty payload advances the source revision. The removed AutoEdit task's
+            // pre-apply transition could never pass its first guard after this application.
+            XCTAssertGreaterThan(session.sourceItemsRevision, attempt.transition.sourceItemsRevision)
+            XCTAssertFalse(attempt.transition.matches(session))
+            XCTAssertTrue(fixture.providerRequests.events.isEmpty)
+            session.saveDebounceTask?.cancel()
+            writer.scope.presentation.detach(attachment)
+        }
+    }
+
+    func testVMHydrationProjectsRestoredIndexSortDateAndCurrentModel() async throws {
+        let fixture = try await makeFixture()
+        let created = await fixture.vm.createAndActivateSessionTab()
+        let session = try XCTUnwrap(fixture.vm.sessions[XCTUnwrap(created)])
+        let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+        let workspace = try XCTUnwrap(fixture.manager.activeWorkspace)
+        let request = AgentSessionHydrationRequest(
+            workspace: workspace, tabID: session.tabID, sessionID: sessionID,
+            resolvedDisplayName: fixture.vm.resolvedSessionDisplayName(for: session.tabID),
+            hasPendingQuestionUI: false, transcriptViewportState: .liveBottom,
+            isCompressedHistoryRevealed: false, initialPerformanceSnapshot: session.transcriptPerformanceSnapshot
+        )
+        let prepared = try await fixture.writer.preparePersistedHydration(request)
+        let payload = try XCTUnwrap(prepared)
+        var stale = payload.restoredIndexEntry
+        stale.name = "Stale projection"
+        stale.lastUserMessageAt = Date(timeIntervalSince1970: 1)
+        let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: fixture.workspaceID, activationEpoch: 1)
+        fixture.vm.test_installSessionIndexSnapshot([sessionID: stale], owner: owner, latestOwner: owner, activeWorkspace: workspace)
+        fixture.vm.test_setCurrentTabIDOverride(session.tabID)
+        fixture.vm.applyCodexSelectionToBindings(modelRaw: "stale-display-only", reasoningEffortRaw: nil)
+        fixture.vm.test_setSuppressesAgentSessionPersistence(false)
+        XCTAssertEqual(fixture.vm.test_ownerValidatedSessionIndex[sessionID], stale)
+        XCTAssertEqual(fixture.vm.sessionListSortDates[session.tabID], stale.lastUserMessageAt)
+        let generation = session.beginPersistentBindingTransition()
+        session.finishPersistentBindingTransition(generation: generation)
+        session.hasLoadedPersistedState = false
+        // Keep the real VM sink installed. A replaced or absent hydration handler would leave
+        // the stale index/date in place even though the runtime payload earns readiness.
+        _ = await fixture.vm.ensureSessionReady(tabID: session.tabID)
+        XCTAssertTrue(session.qualifiedRestorationReadiness.isAuthoritative)
+        XCTAssertEqual(fixture.vm.test_ownerValidatedSessionIndex[sessionID], payload.restoredIndexEntry)
+        XCTAssertEqual(fixture.vm.sessionListSortDates[session.tabID], payload.restoredIndexEntry.lastUserMessageAt)
+        XCTAssertEqual(fixture.vm.selectedModelRaw, session.selectedModelRaw)
+        XCTAssertEqual(fixture.vm.selectedReasoningEffortRaw, session.selectedReasoningEffortRaw)
+        XCTAssertTrue(fixture.providerRequests.events.isEmpty)
+    }
+
+    func testRuntimeHydrationReadClassifiesBeforeTerminalSettlement() async throws {
+        for disk in ["payload", "missing", "error"] {
+            for change in ["none", "revision", "cancel", "revisionCancel", "reacquire", "reacquireRevision"] {
+                let fixture = try await makeFixture()
+                let created = await fixture.vm.createAndActivateSessionTab()
+                let session = try XCTUnwrap(fixture.vm.sessions[XCTUnwrap(created)])
+                let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+                guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+                    workspaceID: fixture.workspaceID, sessionID: sessionID
+                ) else { return XCTFail("Fixture must own its writer") }
+                let generation = session.beginPersistentBindingTransition()
+                session.finishPersistentBindingTransition(generation: generation)
+                session.hasLoadedPersistedState = false
+                let attempt = try XCTUnwrap(AgentSessionHydrationRuntime.Attempt.capture(
+                    session, in: writer.scope, transition: session.persistentBindingTransitionToken()
+                ))
+                let request = try AgentSessionHydrationRequest(
+                    workspace: XCTUnwrap(fixture.manager.activeWorkspace), tabID: session.tabID,
+                    sessionID: sessionID, resolvedDisplayName: "Runtime hydration",
+                    hasPendingQuestionUI: false, transcriptViewportState: .liveBottom,
+                    isCompressedHistoryRevealed: false, initialPerformanceSnapshot: session.transcriptPerformanceSnapshot
+                )
+                if disk == "missing" { try FileManager.default.removeItem(at: sessionFile(root: fixture.root, sessionID: sessionID)) }
+                let gate = TestReleaseFence(name: "runtime read \(disk) \(change)")
+                await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook { id in
+                    guard id == sessionID else { return }
+                    await gate.enterAndWait()
+                    if disk == "error" { throw CocoaError(.fileReadCorruptFile) }
+                }
+                addTeardownBlock { await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook(nil) }
+                let loading = Task { @MainActor in
+                    await AgentSessionHydrationRuntime.read(request, attempt: attempt, dataService: .shared)
+                }
+                defer { gate.release() }
+                guard await gate.waitUntilEntered() else { return }
+                let drift = change == "revision" || change == "revisionCancel" || change == "reacquireRevision"
+                let reacquired = change == "reacquire" || change == "reacquireRevision"
+                if drift {
+                    session.setItemsSilently([.init(kind: .user, text: "Local", sequenceIndex: 0)], reason: .persistedSessionHydration)
+                }
+                if reacquired {
+                    writer.scope.replaceSessions([:])
+                    writer.scope.replaceSessions([session.tabID: session])
+                }
+                if change == "cancel" || change == "revisionCancel" { loading.cancel() }
+                gate.release()
+                let outcome = await loading.value
+                await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook(nil)
+                let context = "\(disk) \(change)"
+                let actual = switch outcome {
+                case .payload: "payload"
+                case .missing: "missing"
+                case .failed: "error"
+                case .cancelled: "cancel"
+                case .sourceSuperseded: "superseded"
+                case .localProjection: "local"
+                case .obsolete: "obsolete"
+                }
+                let expected = reacquired ? "obsolete"
+                    : drift ? (disk == "error" || change == "revisionCancel" ? "local" : "superseded")
+                    : change == "cancel" ? "cancel" : disk
+                XCTAssertEqual(actual, expected, context)
+                XCTAssertFalse(session.hasLoadedPersistedState, "Reading alone grants no readiness: \(context)")
+                guard case .pending = session.qualifiedRestorationReadiness else { return XCTFail(context) }
+                if drift || reacquired {
+                    XCTAssertFalse(AgentSessionHydrationRuntime.settleTerminal(attempt, reason: .missingPayload), context)
+                    XCTAssertFalse(AgentSessionHydrationRuntime.settleTerminal(attempt, reason: .loadFailed), context)
+                }
+                if reacquired || !drift {
+                    XCTAssertFalse(AgentSessionHydrationRuntime.settleTerminal(attempt, reason: .sourceRevisionSuperseded), context)
+                }
+                if actual == "superseded" {
+                    XCTAssertTrue(AgentSessionHydrationRuntime.settleTerminal(attempt, reason: .sourceRevisionSuperseded), context)
+                    XCTAssertEqual(session.items.map(\.text), ["Local"])
+                    XCTAssertTrue(session.hasLoadedPersistedState)
+                    guard case .terminal(_, .sourceRevisionSuperseded) = session.qualifiedRestorationReadiness else { return XCTFail(context) }
+                } else if change == "none", disk != "payload" {
+                    XCTAssertTrue(AgentSessionHydrationRuntime.settleTerminal(attempt, reason: disk == "missing" ? .missingPayload : .loadFailed), context)
+                    XCTAssertTrue(session.hasLoadedPersistedState)
+                }
+                let readiness = session.qualifiedRestorationReadiness
+                let loaded = session.hasLoadedPersistedState
+                writer.scope.beginRetirement()
+                for reason in [AgentSessionRestorationReadiness.Failure.missingPayload, .loadFailed, .sourceRevisionSuperseded] {
+                    XCTAssertFalse(AgentSessionHydrationRuntime.settleTerminal(attempt, reason: reason), context)
+                }
+                XCTAssertEqual(session.qualifiedRestorationReadiness, readiness)
+                XCTAssertEqual(session.hasLoadedPersistedState, loaded)
+            }
+        }
+    }
+
+    func testRuntimeHydrationRefusesMismatchedReadIdentityBeforeStorage() async throws {
+        let fixture = try await makeFixture()
+        let created = await fixture.vm.createAndActivateSessionTab()
+        let session = try XCTUnwrap(fixture.vm.sessions[XCTUnwrap(created)])
+        let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+        guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+            workspaceID: fixture.workspaceID, sessionID: sessionID
+        ) else { return XCTFail("Fixture must own its writer") }
+        let attempt = try XCTUnwrap(AgentSessionHydrationRuntime.Attempt.capture(
+            session, in: writer.scope, transition: session.persistentBindingTransitionToken()
+        ))
+        await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook { _ in
+            XCTFail("Mismatched identity must never reach storage preparation")
+        }
+        addTeardownBlock { await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook(nil) }
+        for mismatch in ["workspace", "session", "tab"] {
+            let request = try AgentSessionHydrationRequest(
+                workspace: mismatch == "workspace" ? makeWorkspace(root: fixture.root) : XCTUnwrap(fixture.manager.activeWorkspace),
+                tabID: mismatch == "tab" ? UUID() : session.tabID,
+                sessionID: mismatch == "session" ? UUID() : sessionID,
+                resolvedDisplayName: "Refused read", hasPendingQuestionUI: false,
+                transcriptViewportState: .liveBottom, isCompressedHistoryRevealed: false,
+                initialPerformanceSnapshot: session.transcriptPerformanceSnapshot
+            )
+            guard case .obsolete = await AgentSessionHydrationRuntime.read(request, attempt: attempt, dataService: .shared) else {
+                return XCTFail("Mismatched \(mismatch) was admitted")
+            }
+        }
+        await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook(nil)
+    }
+
     func testRejectedRoutePreservesOnlyTheSourceBindingsPreviouslyEarnedReadiness() async throws {
         for priorState in ["authoritative", "pending", "terminal"] {
             let fixture = try await makeFixture()
@@ -385,6 +756,175 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
         XCTAssertEqual(failed.session.qualifiedRestorationReadiness, .authoritative(retry.bindingToken, .freshBindingDurablyCreated))
         XCTAssertNil(fixture.vm.captureSessionCreationRetry(for: failed.session))
         XCTAssertTrue(fixture.providerRequests.events.isEmpty)
+    }
+
+    func testConfiguredCreationKeepsItsWriterAcrossTheSaveQueue() async throws {
+        for cancelWhileQueued in [false, true] {
+            let fixture = try await makeFixture()
+            let failed = try await failConfiguredCreation(fixture)
+            let retry = try XCTUnwrap(fixture.vm.captureSessionCreationRetry(for: failed.session))
+            try await removeWriteObstruction(fixture, sessionID: failed.sessionID)
+            let command = try XCTUnwrap(fixture.vm.runtimeCommand(sessionID: failed.sessionID, requirement: .creation(retry)))
+            let writer = command.writer
+            let scope = writer.scope
+            let runtime = scope.persistence
+            XCTAssertEqual(writer.restoration, retry.bindingToken)
+            XCTAssertTrue(runtime.queue.begin(sessionID: failed.sessionID))
+            let composition = try XCTUnwrap(runtime.composition)
+            var entered = false
+            runtime.composition = .init(
+                workspace: composition.workspace, workspaceWithID: composition.workspaceWithID,
+                displayName: composition.displayName, isSuppressed: composition.isSuppressed,
+                bypassesSuppression: composition.bypassesSuppression,
+                isPreparedSavedHost: composition.isPreparedSavedHost, saveAdmission: composition.saveAdmission,
+                creationIsCurrent: { handle in
+                    entered = true
+                    return composition.creationIsCurrent(handle)
+                },
+                admitBinding: composition.admitBinding, isRestoringConfiguration: composition.isRestoringConfiguration
+            )
+            let beforeDirty = failed.session.isDirty
+            let task = Task { @MainActor in await fixture.vm.retrySessionInitialSave(retry) }
+            addTeardownBlock { @MainActor in
+                if runtime.queue.inFlightSessionIDs.contains(failed.sessionID) {
+                    _ = runtime.queue.finish(sessionID: failed.sessionID)
+                }
+                task.cancel()
+                _ = await task.value
+            }
+            try await AsyncTestWait.waitUntil("configured creation reached its existing save queue") { entered }
+            if cancelWhileQueued {
+                task.cancel()
+            } else {
+                let sessions = scope.sessions
+                var removed = sessions
+                removed.removeValue(forKey: failed.session.tabID)
+                scope.replaceSessions(removed)
+                scope.replaceSessions(sessions)
+                XCTAssertFalse(writer.isCurrent)
+                XCTAssertEqual(failed.session.currentRestorationBindingToken, retry.bindingToken)
+            }
+            XCTAssertFalse(runtime.queue.finish(sessionID: failed.sessionID), "A queued creator cannot invent a follow-up save")
+            let committed = await task.value
+            XCTAssertFalse(committed)
+            XCTAssertEqual(failed.session.isDirty, beforeDirty)
+            XCTAssertNil(failed.session.saveDebounceRequestID)
+            XCTAssertNotNil(fixture.vm.captureSessionCreationRetry(for: failed.session))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: sessionFile(root: fixture.root, sessionID: failed.sessionID).path))
+            XCTAssertTrue(fixture.providerRequests.events.isEmpty)
+        }
+    }
+
+    func testConfiguredCreationDoesNotCreditAReacquiredWriterAfterAcknowledgement() async throws {
+        let fixture = try await makeFixture()
+        let failed = try await failConfiguredCreation(fixture)
+        let retry = try XCTUnwrap(fixture.vm.captureSessionCreationRetry(for: failed.session))
+        try await removeWriteObstruction(fixture, sessionID: failed.sessionID)
+        let command = try XCTUnwrap(fixture.vm.runtimeCommand(sessionID: failed.sessionID, requirement: .creation(retry)))
+        let runtime = command.writer.scope.persistence
+        let saver = runtime.saver
+        var writes = 0
+        var acknowledgements = 0
+        runtime.saver = { payload, workspace, count in
+            writes += 1
+            return try await saver(payload, workspace, count)
+        }
+        fixture.vm.test_afterConfiguredCreationAcknowledgement = { handle in
+            acknowledgements += 1
+            XCTAssertEqual(handle.session.qualifiedRestorationReadiness, .authoritative(handle.bindingToken, .freshBindingDurablyCreated))
+            let scope = command.writer.scope
+            let sessions = scope.sessions
+            var removed = sessions
+            removed.removeValue(forKey: handle.session.tabID)
+            scope.replaceSessions(removed)
+            scope.replaceSessions(sessions)
+            XCTAssertFalse(command.writer.isCurrent)
+        }
+        let committed = await fixture.vm.retrySessionInitialSave(retry)
+        XCTAssertFalse(committed, "A durable record does not credit an operation whose writer was replaced")
+        XCTAssertEqual(writes, 1)
+        XCTAssertEqual(acknowledgements, 1)
+        XCTAssertEqual(try readPayload(fixture, sessionID: failed.sessionID).id, failed.sessionID)
+        XCTAssertEqual(failed.session.qualifiedRestorationReadiness, .authoritative(retry.bindingToken, .freshBindingDurablyCreated))
+        XCTAssertFalse(failed.session.isDirty)
+        XCTAssertNil(failed.session.saveDebounceRequestID)
+        let staleRetry = await runtime.commitConfiguredCreation(retry, writer: command.writer)
+        guard case .deferred = staleRetry else { return XCTFail("The old writer cannot use the durable fast path") }
+        let acknowledged = await fixture.vm.commitConfiguredSessionCreation(handle: retry)
+        XCTAssertTrue(acknowledged, "Fresh ingress may observe the same durable record without another write")
+        XCTAssertEqual(writes, 1)
+        XCTAssertEqual(acknowledgements, 1)
+        XCTAssertTrue(fixture.providerRequests.events.isEmpty)
+    }
+
+    func testRunStartCommitsItsFreshBindingBeforeDispatchAndRefusesReacquiredAcknowledgement() async throws {
+        for reacquireAfterAcknowledgement in [false, true] {
+            let fixture = try await makeFixture()
+            let tabID = try XCTUnwrap(fixture.prompt.currentComposeTabs.first?.id)
+            // Obtain the existing scope through an independently admitted identity, without
+            // binding the original blank tab or inventing a runtime writer for it.
+            let bootstrap = try await fixture.vm.mcpResolveOrCreateSessionTarget(
+                tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Scope fixture",
+                expectedWorkspaceID: fixture.workspaceID
+            )
+            let bootstrapHandle = try XCTUnwrap(bootstrap.creationHandle)
+            let command = try XCTUnwrap(fixture.vm.runtimeCommand(
+                sessionID: XCTUnwrap(bootstrap.sessionID), requirement: .creation(bootstrapHandle)
+            ))
+            let scope = command.writer.scope
+            let runtime = fixture.vm.persistenceRuntime
+            let bind = try XCTUnwrap(runtime.composition?.admitBinding)
+            let session = try XCTUnwrap(fixture.vm.session(for: tabID, createIfNeeded: true))
+            XCTAssertNil(session.activeAgentSessionID)
+            session.selectedAgent = .openCode
+            var acknowledgements = 0
+            var dispatches = 0
+            var created: AgentSessionCreationHandle?
+            runtime.test_afterConfiguredCreationAcknowledgement = { handle in
+                acknowledgements += 1
+                XCTAssertTrue(handle.session === session)
+                XCTAssertEqual(handle.session.qualifiedRestorationReadiness, .authoritative(handle.bindingToken, .freshBindingDurablyCreated))
+                XCTAssertEqual(dispatches, 0)
+                if reacquireAfterAcknowledgement {
+                    let sessions = scope.sessions
+                    var removed = sessions
+                    removed.removeValue(forKey: tabID)
+                    scope.replaceSessions(removed)
+                    scope.replaceSessions(sessions)
+                }
+            }
+            var environment = AgentSessionRunStartRuntime.Environment(
+                currentWorkspaceID: { fixture.workspaceID }, prepareSession: { _ in },
+                availabilityFailure: { _ in nil },
+                bindSession: { exact in
+                    let admission = bind(exact)
+                    created = admission?.creation
+                    return admission
+                },
+                providerSwitchRefusal: { _ in "Unexpected provider switch" },
+                input: fixture.vm.providerInputRuntime,
+                workspacePaths: { [] }, inputWorkspace: { _ in nil }, initialThreadInput: { _ in nil },
+                composition: { preconditionFailure("The fixture intercepts physical provider dispatch") }
+            )
+            environment.test_startOverride = { exact, _, _ in
+                XCTAssertTrue(exact === session)
+                XCTAssertEqual(acknowledgements, 1)
+                dispatches += 1
+                return true
+            }
+            let outcome = AgentRunStartOutcomeRecorder()
+            _ = await scope.startup.start(
+                session: session, initialMessage: "Start only after configured persistence", startOutcome: outcome,
+                claudeCoordinator: .init(windowID: -1, workspacePathProvider: { _ in nil }),
+                links: fixture.vm.linkExecutionRuntime, environment: environment
+            )
+            let handle = try XCTUnwrap(created)
+            XCTAssertEqual(acknowledgements, 1)
+            XCTAssertEqual(dispatches, reacquireAfterAcknowledgement ? 0 : 1)
+            XCTAssertEqual(outcome.outcome.didStart, !reacquireAfterAcknowledgement)
+            XCTAssertEqual(try readPayload(fixture, sessionID: handle.bindingToken.bindingIdentity.sessionID).composeTabID, tabID)
+            XCTAssertTrue(fixture.providerRequests.events.isEmpty)
+        }
     }
 
     func testExternalMCPStartHonorsPendingStopAfterConfiguredSaveBeforeDispatch() async throws {

@@ -1305,6 +1305,45 @@ final class AgentTranscriptRestorationLifecycleTests: XCTestCase {
         }
     }
 
+    func testHydrationDriftCannotSettleAReplacedPresentationAttempt() async throws {
+        for failsRead in [false, true] {
+            try await withSavedSelectedTab { fixture in
+                let workspace = try XCTUnwrap(fixture.manager.activeWorkspace)
+                _ = try await AgentSessionDataService.shared.saveAgentSession(
+                    AgentSession(id: fixture.sessionID, name: "Saved", savedAt: Date()), for: workspace
+                )
+                fixture.viewModel.setAgentModeActive(true)
+                let activationGeneration = fixture.viewModel.test_sessionActivationGeneration
+                await fixture.gate.waitUntilEntered()
+                let session = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabID])
+                let loading = try XCTUnwrap(session.persistedLoadTask)
+                guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+                    workspaceID: workspace.id, sessionID: fixture.sessionID
+                ) else { return XCTFail("Fixture must own its writer") }
+                let original = try XCTUnwrap(fixture.viewModel.persistedLoadAttemptByTabID[session.tabID])
+                session.setItemsSilently([.init(kind: .user, text: "Local replacement", sequenceIndex: 0)], reason: .persistedSessionHydration)
+                let replacement = try XCTUnwrap(fixture.viewModel.test_replacePersistedLoadPresentationAttempt(for: session))
+                XCTAssertNotEqual(replacement.attemptID, original.attemptID)
+                XCTAssertTrue(writer.isCurrent, "The presentation gate must be independent of writer loss")
+                if failsRead {
+                    await fixture.gate.fail(CocoaError(.fileReadCorruptFile))
+                } else {
+                    await fixture.gate.open()
+                }
+                await loading.value
+                await fixture.completions.wait(tabID: fixture.tabID, generation: activationGeneration)
+                XCTAssertFalse(session.hasLoadedPersistedState)
+                guard case .pending = session.qualifiedRestorationReadiness else { return XCTFail("Obsolete presentation cannot publish a proof") }
+                XCTAssertEqual(session.items.map(\.text), ["Local replacement"])
+                guard case let .loading(current)? = fixture.viewModel.transcriptPresentationRecordsByTabID[session.tabID]?.phase else {
+                    return XCTFail("Old producer settled the replacement presentation")
+                }
+                XCTAssertEqual(current, replacement)
+                XCTAssertTrue(writer.isCurrent)
+            }
+        }
+    }
+
     /// §4.3/§4.4: a cancelled current attempt first reclassifies current local facts. Usable local
     /// content is presented as transcript, without newly latching completion or recording proof.
     func testCancelledCurrentLoadWithLocalContentPresentsTranscriptWithoutLatchOrProof() async throws {
@@ -1480,7 +1519,15 @@ extension AgentTranscriptRestorationLifecycleTests {
 
             // Real rebind to a new incarnation (new scope), then admit its load through the real entry.
             fixture.viewModel.cancelPersistedLoad(for: session)
-            session.testInstallPersistentSessionBinding(sessionID: fixture.sessionID)
+            let workspaceID = try XCTUnwrap(session.persistentSessionBindingIdentity?.workspaceID)
+            _ = session.beginPersistentBindingTransition()
+            session.installPersistentSessionBinding(.init(
+                tabID: session.tabID, sessionID: fixture.sessionID, workspaceID: workspaceID
+            ))
+            guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+                workspaceID: workspaceID, sessionID: fixture.sessionID
+            ) else { return XCTFail("The successor must be a scoped hydration owner") }
+            XCTAssertTrue(writer.session === session)
             let successorCall = Task { await fixture.viewModel.ensureSessionReady(tabID: fixture.tabID) }
             await fixture.gate.waitUntilEntered(count: 2)
             let successorLoad = try XCTUnwrap(session.persistedLoadTask)

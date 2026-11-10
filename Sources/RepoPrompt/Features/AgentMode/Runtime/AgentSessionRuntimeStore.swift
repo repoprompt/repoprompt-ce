@@ -106,10 +106,7 @@ final class AgentSessionRuntimeStore {
         /// admission. It still belongs to this exact, exclusive claim, never a reacquisition.
         /// This is not permission to publish control or start another operation.
         var ownsPersistentClaim: Bool {
-            !scope.hasReleasedWriterClaims
-                && scope.sessions[session.tabID] === session
-                && session.persistentSessionBindingIdentity == binding
-                && scope.liveClaimByTabID[session.tabID]?.incarnationID == identity.incarnationID
+            scope.holdsSlot(session: session, incarnationID: identity.incarnationID, binding: binding)
                 && !scope.store.hasOtherClaim(sessionID: binding.sessionID, scope: scope, session: session)
         }
 
@@ -119,6 +116,32 @@ final class AgentSessionRuntimeStore {
             else { return false }
             return current.scope === scope && current.session === session
                 && current.identity == identity
+        }
+    }
+
+    /// Provenance for binding preparation, including an unbound local draft. This is not a
+    /// restored command or permission to save. Keeping it across an await cannot adopt a
+    /// remove/re-add of the same object, even when its persistent binding is unchanged.
+    @MainActor
+    struct Membership {
+        fileprivate let scope: Scope
+        fileprivate let session: AgentTabSession
+        fileprivate let incarnationID: UUID
+        fileprivate let binding: AgentPersistentSessionBindingIdentity?
+
+        var isCurrent: Bool {
+            scope.holdsSlot(session: session, incarnationID: incarnationID, binding: binding)
+        }
+
+        /// New binding work needs exclusive ownership; originating transition cleanup may
+        /// still use isCurrent while retirement or a conflicting claim blocks new work.
+        var permitsBindingPreparation: Bool {
+            isCurrent && !scope.isRetiring
+                && !scope.store.scopes.values.contains { reference in
+                    guard let other = reference.value, other !== scope else { return false }
+                    return other.sessions[session.tabID] === session
+                }
+                && (binding.map { !scope.store.hasOtherClaim(sessionID: $0.sessionID, scope: scope, session: session) } ?? true)
         }
     }
 
@@ -410,7 +433,7 @@ final class AgentSessionRuntimeStore {
         private(set) var sessions: [UUID: AgentTabSession] = [:]
         private var releasedSessionTabIDs: Set<UUID> = []
         fileprivate struct LiveClaim {
-            let sessionID: UUID
+            let sessionID: UUID?
             let incarnationID = UUID()
         }
 
@@ -436,6 +459,18 @@ final class AgentSessionRuntimeStore {
             presentation.refreshDetachedState()
         }
 
+        fileprivate func holdsSlot(session: AgentTabSession, incarnationID: UUID, binding: AgentPersistentSessionBindingIdentity?) -> Bool {
+            !hasReleasedWriterClaims && sessions[session.tabID] === session
+                && liveClaimByTabID[session.tabID]?.incarnationID == incarnationID
+                && session.persistentSessionBindingIdentity == binding
+        }
+
+        func membership(of session: AgentTabSession) -> Membership? {
+            guard !hasReleasedWriterClaims, sessions[session.tabID] === session,
+                  let claim = liveClaimByTabID[session.tabID] else { return nil }
+            return Membership(scope: self, session: session, incarnationID: claim.incarnationID, binding: session.persistentSessionBindingIdentity)
+        }
+
         func bindingRejection(_ sessionID: UUID, on session: AgentTabSession) -> BindingRejection? {
             guard !store.hasOtherClaim(sessionID: sessionID, scope: self, session: session) else { return .conflictingWriter }
             if sessions[session.tabID] === session, session.activeAgentSessionID == sessionID {
@@ -457,15 +492,18 @@ final class AgentSessionRuntimeStore {
         }
 
         fileprivate func updateLiveSessionBindingIndex(tabID: UUID) {
-            if let previous = liveClaimByTabID.removeValue(forKey: tabID) {
-                liveTabIDsBySessionID[previous.sessionID]?.remove(tabID)
-                if liveTabIDsBySessionID[previous.sessionID]?.isEmpty == true {
-                    liveTabIDsBySessionID.removeValue(forKey: previous.sessionID)
+            if let previous = liveClaimByTabID.removeValue(forKey: tabID)?.sessionID {
+                liveTabIDsBySessionID[previous]?.remove(tabID)
+                if liveTabIDsBySessionID[previous]?.isEmpty == true {
+                    liveTabIDsBySessionID.removeValue(forKey: previous)
                 }
             }
-            if let current = sessions[tabID]?.activeAgentSessionID {
+            if let session = sessions[tabID] {
+                // Unbound members need the same ABA fence as persistent writers. They never
+                // enter the reverse session-ID index or resolve as a persistent Writer.
+                let current = session.activeAgentSessionID
                 liveClaimByTabID[tabID] = LiveClaim(sessionID: current)
-                liveTabIDsBySessionID[current, default: []].insert(tabID)
+                if let current { liveTabIDsBySessionID[current, default: []].insert(tabID) }
             }
         }
     }

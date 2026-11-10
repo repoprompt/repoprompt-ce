@@ -22,6 +22,7 @@ struct AgentSelfWorktreeRelocation: Equatable {
     }
 
     let id: UUID
+    let writer: AgentSessionRuntimeStore.WriterIdentity
     let originRunID: UUID
     let originRunAttemptID: UUID
     let previousBindings: [AgentSessionWorktreeBinding]
@@ -47,13 +48,18 @@ extension AgentModeViewModel {
     func scheduleSelfWorktreeRelocation(
         _ desiredBindings: [AgentSessionWorktreeBinding],
         forSessionID sessionID: UUID,
+        admission capturedAdmission: AgentSessionWorktreeRuntime.Admission? = nil,
         originRunID: UUID,
         originRunAttemptID: UUID,
         beforeRecord: @MainActor () async throws -> Void = {}
     ) async throws -> AgentSelfWorktreeRelocation? {
-        guard let session = try authoritativeLiveSession(for: sessionID) else {
+        guard let admission = capturedAdmission ?? admitWorktreeTransition(forSessionID: sessionID),
+              admission.command.identity.sessionID == sessionID
+        else {
             throw MCPError.invalidParams("The requested agent session is not currently available.")
         }
+        try admission.requireCurrent()
+        let session = admission.session
         func originTurnIsLive() -> Bool {
             session.runState.isActive
                 && session.runID == originRunID
@@ -62,13 +68,15 @@ extension AgentModeViewModel {
         }
         guard originTurnIsLive() else { return nil }
         try requireNoPendingSelfWorktreeRelocation(in: session, originRunAttemptID: originRunAttemptID)
-        let previousBindings = session.worktreeBindings
-        guard worktreeBindingsChangeExecutionRoots(from: previousBindings, to: desiredBindings) else { return nil }
+        let previousBindings = admission.bindings
+        guard AgentSessionWorktreeRuntime.changesExecutionRoots(
+            from: previousBindings, to: desiredBindings, fallbackWorkspacePath: admission.resources.fallbackWorkspacePath
+        ) else { return nil }
         if !desiredBindings.isEmpty {
             try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(desiredBindings)
         }
         try await beforeRecord()
-        guard sessions[session.tabID] === session,
+        guard admission.isCurrent,
               session.activeAgentSessionID == sessionID,
               session.worktreeBindings == previousBindings,
               originTurnIsLive()
@@ -81,6 +89,7 @@ extension AgentModeViewModel {
         try requireNoPendingSelfWorktreeRelocation(in: session, originRunAttemptID: originRunAttemptID)
         let relocation = AgentSelfWorktreeRelocation(
             id: UUID(),
+            writer: admission.command.identity,
             originRunID: originRunID,
             originRunAttemptID: originRunAttemptID,
             previousBindings: previousBindings,
@@ -102,7 +111,7 @@ extension AgentModeViewModel {
         try requireNoPendingSelfWorktreeRelocation(in: session, originRunAttemptID: originRunAttemptID)
     }
 
-    private func requireNoPendingSelfWorktreeRelocation(in session: TabSession, originRunAttemptID: UUID) throws {
+    func requireNoPendingSelfWorktreeRelocation(in session: TabSession, originRunAttemptID: UUID) throws {
         guard let pending = session.pendingSelfWorktreeRelocation,
               pending.originRunAttemptID == originRunAttemptID
         else { return }
@@ -124,6 +133,11 @@ extension AgentModeViewModel {
               pending.phase == .scheduled,
               pending.originRunAttemptID == revision.ownership.attemptID
         else { return }
+        guard let command = try? runtimeCommand(sessionID: pending.writer.sessionID),
+              command.identity == pending.writer, command.writer.session === session
+        else {
+            return settleSelfWorktreeRelocation(pending, session: session, row: nil)
+        }
         let refusal: String? = if revision.successorKind != nil || revision.providerSuccessorID != nil {
             "queued input started another turn first"
         } else {
@@ -166,19 +180,27 @@ extension AgentModeViewModel {
         teardownSettled: @escaping @MainActor () -> Bool
     ) async {
         let stopFence = pending.stopFence
-        guard let sessionID = session.activeAgentSessionID else {
+        guard let command = try? runtimeCommand(sessionID: pending.writer.sessionID),
+              command.identity == pending.writer, command.writer.session === session
+        else {
             return settleSelfWorktreeRelocation(pending, session: session, row: nil)
         }
+        guard let admission = try? command.writer.scope.worktrees.admit(command) else {
+            return settleSelfWorktreeRelocation(
+                pending, session: session,
+                row: "The requested worktree switch was not applied because the session's execution workspace was unavailable."
+            )
+        }
         func isCurrent() -> Bool {
-            sessions[session.tabID] === session
-                && session.activeAgentSessionID == sessionID
+            command.writer.isCurrent
+                && session.activeAgentSessionID == pending.writer.sessionID
                 && session.pendingSelfWorktreeRelocation?.id == pending.id
         }
         var lastRefusal: String?
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: Self.selfWorktreeRelocationIdleBudget)
         while true {
-            guard isCurrent() else { return }
+            guard isCurrent() else { return settleSelfWorktreeRelocation(pending, session: session, row: nil) }
             guard stopFence.permitsQueuedDelivery(to: session) else {
                 return settleSelfWorktreeRelocation(
                     pending, session: session,
@@ -191,10 +213,16 @@ extension AgentModeViewModel {
                     row: "The requested worktree switch was not applied because another turn started first. The session remains in its previous location."
                 )
             }
-            guard session.worktreeBindings == pending.previousBindings else {
+            guard session.worktreeBindings == pending.previousBindings, admission.bindings == pending.previousBindings else {
                 return settleSelfWorktreeRelocation(
                     pending, session: session,
                     row: "The requested worktree switch was not applied because the session's binding changed in the meantime."
+                )
+            }
+            guard admission.resources.isCurrent() else {
+                return settleSelfWorktreeRelocation(
+                    pending, session: session,
+                    row: "The requested worktree switch was not applied because the session's execution workspace changed."
                 )
             }
             let drained = teardownSettled()
@@ -207,13 +235,11 @@ extension AgentModeViewModel {
                 // the transition releasing its gate and the continuation's run start.
                 var reservedContinuation = false
                 do {
-                    _ = try await transitionWorktreeBindings(
-                        pending.desiredBindings,
-                        forSessionID: sessionID,
-                        intent: .externalManagement,
-                        beforeCommit: { [weak self, weak session] in
-                            guard let self, let session,
-                                  sessions[session.tabID] === session,
+                    _ = try await command.writer.scope.worktrees.transition(
+                        pending.desiredBindings, admission: admission, intent: .externalManagement,
+                        beforeCommit: { [weak session] in
+                            guard let session,
+                                  admission.isCurrent,
                                   session.pendingSelfWorktreeRelocation?.id == pending.id,
                                   stopFence.permitsQueuedDelivery(to: session)
                             else { throw CancellationError() }
@@ -221,11 +247,12 @@ extension AgentModeViewModel {
                         afterCommit: { [weak session] in
                             guard let session, !session.mcpFollowUpRunPending else { return }
                             session.mcpFollowUpRunPending = true
+                            session.selfWorktreeRelocationFollowUpOwner = pending.id
                             reservedContinuation = true
                         }
                     )
                     return await continueAfterSelfWorktreeRelocation(
-                        pending, session: session, reservedContinuation: reservedContinuation
+                        pending, session: session, command: command, reservedContinuation: reservedContinuation
                     )
                 } catch let error as MCPError where session.worktreeBindings == pending.previousBindings {
                     // Pre-mutation refusal (provider still settling, or its idle probe failed).
@@ -235,8 +262,8 @@ extension AgentModeViewModel {
                     // The commit fence saw Stop or an already-settled request; the guards above settle it.
                     lastRefusal = nil
                 } catch {
-                    releaseSelfWorktreeRelocationReservation(session, reserved: reservedContinuation)
-                    guard isCurrent() else { return }
+                    releaseSelfWorktreeRelocationReservation(session, owner: pending.id, reserved: reservedContinuation)
+                    guard isCurrent() else { return settleSelfWorktreeRelocation(pending, session: session, row: nil) }
                     return settleSelfWorktreeRelocation(
                         pending, session: session,
                         row: "The requested worktree switch did not complete: \(error.localizedDescription)"
@@ -257,10 +284,15 @@ extension AgentModeViewModel {
     private func continueAfterSelfWorktreeRelocation(
         _ pending: AgentSelfWorktreeRelocation,
         session: TabSession,
+        command: AgentSessionRuntimeStore.Command,
         reservedContinuation: Bool
     ) async {
+        guard command.writer.isCurrent else {
+            releaseSelfWorktreeRelocationReservation(session, owner: pending.id, reserved: reservedContinuation)
+            return settleSelfWorktreeRelocation(pending, session: session, row: nil)
+        }
         guard session.pendingSelfWorktreeRelocation?.id == pending.id else {
-            return releaseSelfWorktreeRelocationReservation(session, reserved: reservedContinuation)
+            return releaseSelfWorktreeRelocationReservation(session, owner: pending.id, reserved: reservedContinuation)
         }
         session.pendingSelfWorktreeRelocation = nil
         let location = Self.selfWorktreeRelocationLocationSummary(pending.desiredBindings)
@@ -276,7 +308,7 @@ extension AgentModeViewModel {
             nil
         }
         if let blocker {
-            releaseSelfWorktreeRelocationReservation(session, reserved: reservedContinuation)
+            releaseSelfWorktreeRelocationReservation(session, owner: pending.id, reserved: reservedContinuation)
             appendSelfWorktreeRelocationRow(
                 "Execution worktree switched to \(location). The automatic continuation did not start because \(blocker); send a message to continue in the new location.",
                 session: session
@@ -299,8 +331,12 @@ extension AgentModeViewModel {
         #else
             await startSelfWorktreeRelocationContinuation(session, message: message, outcome: outcome)
         #endif
+        guard command.writer.isCurrent else {
+            releaseSelfWorktreeRelocationReservation(session, owner: pending.id, reserved: reservedContinuation)
+            return settleSelfWorktreeRelocation(pending, session: session, row: nil)
+        }
         if !session.runState.isActive {
-            releaseSelfWorktreeRelocationReservation(session, reserved: reservedContinuation)
+            releaseSelfWorktreeRelocationReservation(session, owner: pending.id, reserved: reservedContinuation)
         }
         if case let .startFailed(message) = outcome.outcome {
             appendSelfWorktreeRelocationRow(
@@ -326,8 +362,9 @@ extension AgentModeViewModel {
         )
     }
 
-    private func releaseSelfWorktreeRelocationReservation(_ session: TabSession, reserved: Bool) {
-        guard reserved, session.mcpFollowUpRunPending, session.scheduledACPFollowUp == nil else { return }
+    private func releaseSelfWorktreeRelocationReservation(_ session: TabSession, owner: UUID, reserved: Bool) {
+        guard reserved, session.selfWorktreeRelocationFollowUpOwner == owner,
+              session.mcpFollowUpRunPending, session.scheduledACPFollowUp == nil else { return }
         session.mcpFollowUpRunPending = false
         handleObservedMCPStateChange(for: session)
     }
