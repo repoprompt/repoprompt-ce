@@ -7542,3 +7542,61 @@ including the corrected prepared-owner visit case (one), runtime store (16), pre
 notification coordinator (15) and notification planner (12). Full lint
 `fdb3ba6e-3fcd-4566-ad9d-8ea4dba50a45` passed. These tickets survived the host-app restart;
 their terminal state and exact selected cases were reconciled before more work was submitted.
+
+#### M9.2g — local integration of the overseer M9.4 merge
+
+Normal merge `308c469396d19fe896fc40989786db5c7d3f669b` joins local ACP checkpoint
+`9063054cae425a867d0031d2c50822cf59559805` with the overseer's pushed `fb19813cb5f8e8e4f194002f578562aac10c3fea`.
+Only the appended ledger sections conflicted; both are retained. `AgentSessionPresentationRuntime`
+and `AgentModeViewModel` are byte-identical to the incoming resolution, preserving hydration,
+`isAvailable` and detached-sink intent. This merge used `--no-commit` and passed staged commit preflight
+before recording the merge. No startup work was pushed to #1679.
+
+Merged focused ticket `a0c674e9-c5be-4f38-b010-bf620211cfb2` passed **412 tests, zero failures or
+skips**, including the ACP/runner selection plus runtime-store, presentation and notification-planner
+coverage. Full lint `79e5adbe-5417-4a1c-bf63-c793dad45855` passed. Actual merged compilation preserves
+the five probe-checkpoint files' warning counts (ACP runner 1, other four 0). Fresh index check passed
+at **1,261/1,360 wrong-way edges, 53/66 largest cycle** after integration (previous local tree: 1,254;
+ratchet baseline unchanged). This focused integration receipt is not a full publication/product gate.
+
+#### M9.2g — persistent ACP task admission through fresh lease acquisition (local)
+
+`WriterReceipt` retains only a weak scope and exact value writer identity, and accepts restored
+commands only. It reconstitutes the originating claim, never a newly resolved writer. Fresh and
+reused ACP tasks check it at entry and after tool-tracking setup; fresh tasks also check after
+successful lease acquisition and after awaiting the failure outcome. An exclusive but suspended
+original writer cancels through the existing terminal barrier (retaining a warm reused controller).
+A lost claim performs no shared terminal/controller/policy mutation. Its captured bootstrap gate
+alone is released after acquisition; the installed attempt's current-owner Stop retains resource
+cleanup responsibility. Composer-candidate settlement checks claim ownership, not active-attempt
+presence: an ordinary terminal clears the attempt before the task's defer runs.
+
+Two regression methods cover twelve task/lease/reuse/retirement boundaries plus weak scope/session
+lifetime, same-object reacquisition, conflict and creation-command refusal. They assert actual
+scripted-provider request absence, gate release, policy retention until Stop, controller retention,
+and composer-candidate settlement/preservation. Existing creation coverage also asserts receipt
+refusal. Oracle review `untitled-chat-6F1A83`, snapshot `2026-11-11/0010`, completed once; its candidate
+settlement, actor-isolated test-counter and weak-session coverage findings are addressed.
+
+Initial focused ticket `9e7ed0a5-2ecf-40f8-abc4-02e210be8d39` failed compilation because the new test
+used a nonexistent controller process accessor. The test now observes the existing scripted RPC
+log instead; its associated unnecessary-await warning is gone. Focused retry
+`3fe25e78-163a-4b8a-ae81-65a3de31d5f2` passed both methods (4.993s and 0.005s). Full lint
+`425e9e8e-f865-45cd-94a5-6694da464281` passed. The first affected run
+`87d18eef-76bf-4200-a8b7-6a2c16532cbe` ran 397 tests with one new-test failure: it inspected policy
+cleanup after task completion, although terminal publication and terminal teardown are distinct.
+The fixture now joins `awaitTerminalTeardown` for the captured retiring attempt before that assertion;
+no production timeout, cleanup timing or assertion was weakened. Final affected ticket
+`d1d5670d-d77b-4597-8ca1-8ecd03c7fcec` passed **397 tests, zero failures/skips** (107.318s; the new
+boundary matrix 2.159s). Final fixture formatting and strict lint passed. Actual compiled warning
+occurrences remain ACP runner 1 and the other three touched Swift files 0, matching the integrated
+baseline; the corrected test was recompiled without its initial accessor/await diagnostic. Fresh
+index check passed at **1,261/1,360 wrong-way edges and 53/66 largest cycle**, unchanged. These are
+local checkpoint gates, not both-product/full-SessionLinks/live-app or hosted-CI qualification.
+
+This is not full startup closure: reused configuration/deferred acquisition, bootstrap/configuration/
+routing/prompt writes, tool-tracking callbacks, post-dispatch events/terminal work, and barrier-internal
+awaits remain open. Claim loss before a reused dedicated note starts deliberately does not re-park
+successor state; recovery belongs to the current owner. Gate-only release currently uses the existing
+`route_wait_deferred` diagnostic, not a new policy-cleanup operation. No shared lease manager,
+strong-command task cycle, physical actor-write fence, lifecycle-handoff change or push is claimed.

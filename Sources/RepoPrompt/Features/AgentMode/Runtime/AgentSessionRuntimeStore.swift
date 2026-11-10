@@ -67,6 +67,32 @@ final class AgentSessionRuntimeStore {
         }
     }
 
+    /// Persistent tasks remember their admitted writer without retaining the scope through its
+    /// session/task graph. This is not new admission and cannot adopt a replacement writer.
+    @MainActor
+    struct WriterReceipt {
+        enum Disposition {
+            case current, ownedSuspended, claimLost
+        }
+
+        private weak var scope: Scope?
+        private let identity: WriterIdentity
+
+        init?(_ command: Command) {
+            guard case .restored = command.requirement else { return nil }
+            scope = command.writer.scope
+            identity = command.identity
+        }
+
+        func disposition(for session: AgentTabSession) -> Disposition {
+            guard let writer = scope?.originatingWriter(identity: identity, session: session) else {
+                return .claimLost
+            }
+            if case .success = writer.admitCommand(.restored) { return .current }
+            return .ownedSuspended
+        }
+    }
+
     /// Exact-object capability. Holding one keeps its scope alive across suspension; it does
     /// not grant consent, bypass restoration, or survive replacement/rebinding in the store.
     @MainActor
