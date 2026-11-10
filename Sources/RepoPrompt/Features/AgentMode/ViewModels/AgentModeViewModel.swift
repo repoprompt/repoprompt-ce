@@ -6714,9 +6714,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     /// Existing source-superseded producer outcome: keep local items, record the existing proof and
     /// latch, build/synchronize the current local projection, then settle presentation.
-    private func completeSourceSupersededLoad(_ session: TabSession, attempt: AgentPersistedLoadAttempt?) {
-        session.recordRestorationTerminal(.sourceRevisionSuperseded)
-        session.hasLoadedPersistedState = true
+    private func completeSourceSupersededLoad(
+        _ session: TabSession,
+        attempt: AgentPersistedLoadAttempt?,
+        hydration: AgentSessionHydrationRuntime.Attempt
+    ) {
+        guard AgentSessionHydrationRuntime.settleTerminal(hydration, reason: .sourceRevisionSuperseded) else { return }
         if session.tabID == currentTabID {
             applySessionToBindings(session)
         }
@@ -6794,6 +6797,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         syncTranscriptUIState()
         return attempt
     }
+
+    #if DEBUG
+        /// Exercises a replaced presentation attempt independently of persistent writer rotation.
+        /// Uses the real admission path; no producer, readiness proof or binding is manufactured.
+        func test_replacePersistedLoadPresentationAttempt(for session: TabSession) -> AgentPersistedLoadAttempt? {
+            guard let binding = session.persistentSessionBindingIdentity else { return nil }
+            return admitSavedLoadAttempt(
+                for: session,
+                commitToken: .init(transition: session.persistentBindingTransitionToken(), requestedSessionID: binding.sessionID),
+                sourceItemsRevision: session.sourceItemsRevision
+            )
+        }
+    #endif
 
     /// The live session's current saved attempt settled cancelled for its full current scope.
     private func currentCancelledSavedAttempt(_ session: TabSession) -> AgentPersistedLoadAttempt? {
@@ -7172,72 +7188,61 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
 
         #if DEBUG
-            var prepareStartMS: Double?
+            let prepareStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
-        do {
-            #if DEBUG
-                prepareStartMS = restorePerfRecorder.timestampMSIfEnabled()
-            #endif
-            let preparedPayload = try await dataService.preparePersistedHydration(request)
-            // Currency precedes revision-only drift and terminal proofs: an old read cannot
-            // settle a same-object successor merely because its binding token still matches.
-            guard hydration.ownsBinding else { return }
-            guard persistentBindingTransitionIsCurrent(hydrationToken.transition) else {
-                // A revision-only change on the same current attempt is the real source-superseded
-                // outcome (§4.3), not an obsolete owner; every other mismatch stays a silent drop.
-                if isSourceRevisionOnlyDrift(hydrationToken.transition, session: session, attempt: attempt) {
-                    // Cancellation is checked before any latch/proof: a cancelled attempt only
-                    // reclassifies from the current local projection.
-                    if Task.isCancelled {
-                        synchronizeCancelledLocalProjection(session, attempt: attempt)
-                        #if DEBUG
-                            logPerform(outcome: "cancelledWithSourceDrift", currentRevision: session.sourceItemsRevision)
-                        #endif
-                        return
-                    }
-                    completeSourceSupersededLoad(session, attempt: attempt)
-                    #if DEBUG
-                        logPerform(outcome: "revisionSuperseded", currentRevision: session.sourceItemsRevision)
-                    #endif
-                    return
-                }
+        let outcome = await AgentSessionHydrationRuntime.read(request, attempt: hydration, dataService: dataService)
+        #if DEBUG
+            if let prepareStartMS {
+                prepareDurationMS = restorePerfRecorder.elapsedMS(since: prepareStartMS)
+            }
+        #endif
+        // The runtime classifies storage/cancellation and owns terminal proof writes. Only
+        // this presenter knows whether a revision-only result still belongs to its attempt.
+        switch outcome {
+        case .obsolete:
+            return
+        case .sourceSuperseded:
+            guard isSourceRevisionOnlyDrift(hydrationToken.transition, session: session, attempt: attempt) else {
                 #if DEBUG
                     logPerform(outcome: "staleAfterPrepare")
                 #endif
                 return
             }
-            // Cancellation is interpreted before a nil payload: a cancelled attempt is never
-            // "missing", records no proof and does not newly latch completion (§4.3).
-            guard !Task.isCancelled else {
-                Self.logCodexDebug("[AgentModeVM][PersistedLoad] cancelled before hydrate tab=\(session.tabID)")
-                settlePersistedLoadAttempt(attempt, exit: .cancelled)
-                #if DEBUG
-                    logPerform(outcome: "cancelledBeforeHydrate")
-                #endif
-                return
-            }
-            guard let payload = preparedPayload else {
-                #if DEBUG
-                    if let prepareStartMS {
-                        prepareDurationMS = restorePerfRecorder.elapsedMS(since: prepareStartMS)
-                    }
-                #endif
-                // Recorded before the completion latch: `hasLoadedPersistedState` is about to say
-                // "done", and automatic oversight restoration must be able to tell that apart from
-                // "a payload actually loaded".
-                session.recordRestorationTerminal(.missingPayload)
-                session.hasLoadedPersistedState = true
-                settlePersistedLoadAttempt(attempt, exit: .missingPayload)
-                #if DEBUG
-                    logPerform(outcome: "noPayload")
-                #endif
-                return
-            }
+            completeSourceSupersededLoad(session, attempt: attempt, hydration: hydration)
             #if DEBUG
-                if let prepareStartMS {
-                    prepareDurationMS = restorePerfRecorder.elapsedMS(since: prepareStartMS)
-                }
+                logPerform(outcome: "revisionSuperseded", currentRevision: session.sourceItemsRevision)
             #endif
+        case let .localProjection(error):
+            guard hydration.ownsBinding,
+                  isSourceRevisionOnlyDrift(hydrationToken.transition, session: session, attempt: attempt) else { return }
+            synchronizeCancelledLocalProjection(session, attempt: attempt)
+            #if DEBUG
+                let label = error == nil ? "cancelledWithSourceDrift"
+                    : (error is CancellationError || Task.isCancelled ? "cancelledDuringPrepare" : "error")
+                logPerform(outcome: label, currentRevision: session.sourceItemsRevision, error: error)
+            #endif
+        case let .cancelled(error):
+            guard hydration.isCurrent else { return }
+            if error == nil {
+                Self.logCodexDebug("[AgentModeVM][PersistedLoad] cancelled before hydrate tab=\(session.tabID)")
+            }
+            settlePersistedLoadAttempt(attempt, exit: .cancelled)
+            #if DEBUG
+                logPerform(outcome: error == nil ? "cancelledBeforeHydrate" : "cancelledDuringPrepare", error: error)
+            #endif
+        case .missing:
+            guard AgentSessionHydrationRuntime.settleTerminal(hydration, reason: .missingPayload) else { return }
+            settlePersistedLoadAttempt(attempt, exit: .missingPayload)
+            #if DEBUG
+                logPerform(outcome: "noPayload")
+            #endif
+        case let .failed(error):
+            guard AgentSessionHydrationRuntime.settleTerminal(hydration, reason: .loadFailed) else { return }
+            settlePersistedLoadAttempt(attempt, exit: .loadFailed)
+            #if DEBUG
+                logPerform(outcome: "error", error: error)
+            #endif
+        case let .payload(payload):
             guard sessions[session.tabID] === session else {
                 Self.logCodexDebug("[AgentModeVM][PersistedLoad] skip stale owner tab=\(session.tabID)")
                 #if DEBUG
@@ -7268,7 +7273,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 Self.logCodexDebug(
                     "[AgentModeVM][PersistedLoad] skip superseded hydrate tab=\(session.tabID) startRevision=\(startRevision) currentRevision=\(session.sourceItemsRevision)"
                 )
-                completeSourceSupersededLoad(session, attempt: attempt)
+                completeSourceSupersededLoad(session, attempt: attempt, hydration: hydration)
                 #if DEBUG
                     logPerform(outcome: "revisionSuperseded", currentRevision: session.sourceItemsRevision)
                 #endif
@@ -7290,33 +7295,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     applyDurationMS = restorePerfRecorder.elapsedMS(since: applyStartMS)
                 }
                 logPerform(outcome: "applied")
-            #endif
-        } catch {
-            print("[AgentModeVM] Failed to load session: \(error)")
-            guard hydration.ownsBinding else { return }
-            if persistentBindingTransitionIsCurrent(hydrationToken.transition) {
-                // Cancellation is not a hydration failure: a successor binding owns the retry and
-                // must not inherit a terminal proof from the task it superseded.
-                if error is CancellationError || Task.isCancelled {
-                    // Cancellation is not a failure and does not newly latch completion (§4.3).
-                    settlePersistedLoadAttempt(attempt, exit: .cancelled)
-                } else {
-                    session.recordRestorationTerminal(.loadFailed)
-                    session.hasLoadedPersistedState = true
-                    settlePersistedLoadAttempt(attempt, exit: .loadFailed)
-                }
-            } else if isSourceRevisionOnlyDrift(hydrationToken.transition, session: session, attempt: attempt) {
-                // Revision-only drift on the current attempt: the discarded disk result cannot settle it,
-                // but the current local projection does (no latch, proof or overwrite), so neither the
-                // pane nor the sidebar join is stranded in loading (§4.3/§5.5).
-                synchronizeCancelledLocalProjection(session, attempt: attempt)
-            }
-            #if DEBUG
-                if let prepareStartMS, prepareDurationMS == nil {
-                    prepareDurationMS = restorePerfRecorder.elapsedMS(since: prepareStartMS)
-                }
-                let outcome = (error is CancellationError || Task.isCancelled) ? "cancelledDuringPrepare" : "error"
-                logPerform(outcome: outcome, error: error)
             #endif
         }
     }

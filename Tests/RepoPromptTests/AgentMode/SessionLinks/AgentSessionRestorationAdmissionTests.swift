@@ -96,6 +96,129 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
         }
     }
 
+    func testRuntimeHydrationReadClassifiesBeforeTerminalSettlement() async throws {
+        for disk in ["payload", "missing", "error"] {
+            for change in ["none", "revision", "cancel", "revisionCancel", "reacquire", "reacquireRevision"] {
+                let fixture = try await makeFixture()
+                let created = await fixture.vm.createAndActivateSessionTab()
+                let session = try XCTUnwrap(fixture.vm.sessions[XCTUnwrap(created)])
+                let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+                guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+                    workspaceID: fixture.workspaceID, sessionID: sessionID
+                ) else { return XCTFail("Fixture must own its writer") }
+                let generation = session.beginPersistentBindingTransition()
+                session.finishPersistentBindingTransition(generation: generation)
+                session.hasLoadedPersistedState = false
+                let attempt = try XCTUnwrap(AgentSessionHydrationRuntime.Attempt.capture(
+                    session, in: writer.scope, transition: session.persistentBindingTransitionToken()
+                ))
+                let request = try AgentSessionHydrationRequest(
+                    workspace: XCTUnwrap(fixture.manager.activeWorkspace), tabID: session.tabID,
+                    sessionID: sessionID, resolvedDisplayName: "Runtime hydration",
+                    hasPendingQuestionUI: false, transcriptViewportState: .liveBottom,
+                    isCompressedHistoryRevealed: false, initialPerformanceSnapshot: session.transcriptPerformanceSnapshot
+                )
+                if disk == "missing" { try FileManager.default.removeItem(at: sessionFile(root: fixture.root, sessionID: sessionID)) }
+                let gate = TestReleaseFence(name: "runtime read \(disk) \(change)")
+                await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook { id in
+                    guard id == sessionID else { return }
+                    await gate.enterAndWait()
+                    if disk == "error" { throw CocoaError(.fileReadCorruptFile) }
+                }
+                addTeardownBlock { await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook(nil) }
+                let loading = Task { @MainActor in
+                    await AgentSessionHydrationRuntime.read(request, attempt: attempt, dataService: .shared)
+                }
+                defer { gate.release() }
+                guard await gate.waitUntilEntered() else { return }
+                let drift = change == "revision" || change == "revisionCancel" || change == "reacquireRevision"
+                let reacquired = change == "reacquire" || change == "reacquireRevision"
+                if drift {
+                    session.setItemsSilently([.init(kind: .user, text: "Local", sequenceIndex: 0)], reason: .persistedSessionHydration)
+                }
+                if reacquired {
+                    writer.scope.replaceSessions([:])
+                    writer.scope.replaceSessions([session.tabID: session])
+                }
+                if change == "cancel" || change == "revisionCancel" { loading.cancel() }
+                gate.release()
+                let outcome = await loading.value
+                await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook(nil)
+                let context = "\(disk) \(change)"
+                let actual = switch outcome {
+                case .payload: "payload"
+                case .missing: "missing"
+                case .failed: "error"
+                case .cancelled: "cancel"
+                case .sourceSuperseded: "superseded"
+                case .localProjection: "local"
+                case .obsolete: "obsolete"
+                }
+                let expected = reacquired ? "obsolete"
+                    : drift ? (disk == "error" || change == "revisionCancel" ? "local" : "superseded")
+                    : change == "cancel" ? "cancel" : disk
+                XCTAssertEqual(actual, expected, context)
+                XCTAssertFalse(session.hasLoadedPersistedState, "Reading alone grants no readiness: \(context)")
+                guard case .pending = session.qualifiedRestorationReadiness else { return XCTFail(context) }
+                if drift || reacquired {
+                    XCTAssertFalse(AgentSessionHydrationRuntime.settleTerminal(attempt, reason: .missingPayload), context)
+                    XCTAssertFalse(AgentSessionHydrationRuntime.settleTerminal(attempt, reason: .loadFailed), context)
+                }
+                if reacquired || !drift {
+                    XCTAssertFalse(AgentSessionHydrationRuntime.settleTerminal(attempt, reason: .sourceRevisionSuperseded), context)
+                }
+                if actual == "superseded" {
+                    XCTAssertTrue(AgentSessionHydrationRuntime.settleTerminal(attempt, reason: .sourceRevisionSuperseded), context)
+                    XCTAssertEqual(session.items.map(\.text), ["Local"])
+                    XCTAssertTrue(session.hasLoadedPersistedState)
+                    guard case .terminal(_, .sourceRevisionSuperseded) = session.qualifiedRestorationReadiness else { return XCTFail(context) }
+                } else if change == "none", disk != "payload" {
+                    XCTAssertTrue(AgentSessionHydrationRuntime.settleTerminal(attempt, reason: disk == "missing" ? .missingPayload : .loadFailed), context)
+                    XCTAssertTrue(session.hasLoadedPersistedState)
+                }
+                let readiness = session.qualifiedRestorationReadiness
+                let loaded = session.hasLoadedPersistedState
+                writer.scope.beginRetirement()
+                for reason in [AgentSessionRestorationReadiness.Failure.missingPayload, .loadFailed, .sourceRevisionSuperseded] {
+                    XCTAssertFalse(AgentSessionHydrationRuntime.settleTerminal(attempt, reason: reason), context)
+                }
+                XCTAssertEqual(session.qualifiedRestorationReadiness, readiness)
+                XCTAssertEqual(session.hasLoadedPersistedState, loaded)
+            }
+        }
+    }
+
+    func testRuntimeHydrationRefusesMismatchedReadIdentityBeforeStorage() async throws {
+        let fixture = try await makeFixture()
+        let created = await fixture.vm.createAndActivateSessionTab()
+        let session = try XCTUnwrap(fixture.vm.sessions[XCTUnwrap(created)])
+        let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+        guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+            workspaceID: fixture.workspaceID, sessionID: sessionID
+        ) else { return XCTFail("Fixture must own its writer") }
+        let attempt = try XCTUnwrap(AgentSessionHydrationRuntime.Attempt.capture(
+            session, in: writer.scope, transition: session.persistentBindingTransitionToken()
+        ))
+        await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook { _ in
+            XCTFail("Mismatched identity must never reach storage preparation")
+        }
+        addTeardownBlock { await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook(nil) }
+        for mismatch in ["workspace", "session", "tab"] {
+            let request = try AgentSessionHydrationRequest(
+                workspace: mismatch == "workspace" ? makeWorkspace(root: fixture.root) : XCTUnwrap(fixture.manager.activeWorkspace),
+                tabID: mismatch == "tab" ? UUID() : session.tabID,
+                sessionID: mismatch == "session" ? UUID() : sessionID,
+                resolvedDisplayName: "Refused read", hasPendingQuestionUI: false,
+                transcriptViewportState: .liveBottom, isCompressedHistoryRevealed: false,
+                initialPerformanceSnapshot: session.transcriptPerformanceSnapshot
+            )
+            guard case .obsolete = await AgentSessionHydrationRuntime.read(request, attempt: attempt, dataService: .shared) else {
+                return XCTFail("Mismatched \(mismatch) was admitted")
+            }
+        }
+        await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook(nil)
+    }
+
     func testRejectedRoutePreservesOnlyTheSourceBindingsPreviouslyEarnedReadiness() async throws {
         for priorState in ["authoritative", "pending", "terminal"] {
             let fixture = try await makeFixture()

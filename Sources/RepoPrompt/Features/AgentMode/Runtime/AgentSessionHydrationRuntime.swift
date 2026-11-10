@@ -19,8 +19,8 @@ struct AgentPersistentBindingTransitionToken: Equatable {
     }
 }
 
-/// Applies a loaded payload to its exact runtime incarnation. Storage reads and optional
-/// presentation/index publication are outside this synchronous commit; no UI object is needed.
+/// Reads and applies persisted payloads for an exact runtime incarnation. Optional
+/// presentation/index publication remains outside this owner; no UI object is needed.
 @MainActor
 enum AgentSessionHydrationRuntime {
     /// An operation-local capture made before reading storage. A binding token alone survives
@@ -58,6 +58,62 @@ enum AgentSessionHydrationRuntime {
         var isCurrent: Bool {
             ownsBinding && transition.matches(writer.session)
         }
+    }
+
+    enum ReadOutcome {
+        case payload(AgentSessionHydrationPayload)
+        case missing
+        case failed(Error)
+        case cancelled(Error?)
+        // Candidates only: the presenter must still own its exact presentation attempt.
+        case sourceSuperseded
+        case localProjection(Error?)
+        case obsolete
+    }
+
+    /// Runs on the caller's task so cancellation retains the loader's existing meaning.
+    /// Reading never grants readiness; the same writer must separately commit its outcome.
+    static func read(
+        _ request: AgentSessionHydrationRequest,
+        attempt: Attempt,
+        dataService: AgentSessionDataService
+    ) async -> ReadOutcome {
+        guard attempt.ownsBinding,
+              request.tabID == attempt.transition.tabID,
+              request.sessionID == attempt.transition.binding?.sessionID,
+              request.workspace.id == attempt.writer.identity.workspaceID
+        else { return .obsolete }
+        do {
+            let payload = try await dataService.preparePersistedHydration(request)
+            guard attempt.ownsBinding else { return .obsolete }
+            // Revision drift is interpreted before cancellation/nil. A cancelled drift keeps
+            // the local projection without manufacturing a terminal restoration proof.
+            guard attempt.isCurrent else {
+                return Task.isCancelled ? .localProjection(nil) : .sourceSuperseded
+            }
+            guard !Task.isCancelled else { return .cancelled(nil) }
+            return payload.map(ReadOutcome.payload) ?? .missing
+        } catch {
+            print("[AgentSessionHydrationRuntime] Failed to load session: \(error)")
+            guard attempt.ownsBinding else { return .obsolete }
+            guard attempt.isCurrent else { return .localProjection(error) }
+            return error is CancellationError || Task.isCancelled ? .cancelled(error) : .failed(error)
+        }
+    }
+
+    /// Commits only the original writer's terminal proof, before its compatibility latch.
+    /// Source supersession additionally requires the caller's current presentation-attempt
+    /// check; it alone may settle despite revision drift. This is not a retry or payload apply.
+    @discardableResult
+    static func settleTerminal(_ attempt: Attempt, reason: AgentSessionRestorationReadiness.Failure) -> Bool {
+        let canSettle = reason == .sourceRevisionSuperseded
+            ? attempt.ownsBinding && !attempt.isCurrent
+            : attempt.isCurrent
+        guard canSettle else { return false }
+        let session = attempt.writer.session
+        session.recordRestorationTerminal(reason)
+        session.hasLoadedPersistedState = true
+        return true
     }
 
     /// Evidence of a full field application, qualified to one binding. Callers finish

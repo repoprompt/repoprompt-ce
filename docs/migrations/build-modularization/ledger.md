@@ -7108,3 +7108,52 @@ compiler-index check remains **1,253/1,360 wrong-way edges, 53/66 largest cycle*
 changes. These remain local checkpoint receipts: no full SessionLinks publication selection,
 both-product build, live-app smoke, release or new hosted-CI qualification is claimed. Nothing is
 pushed; #1676 remains scoped to checkpoints 9–12.
+
+#### M9.2e — runtime-owned hydration read and terminal settlement (local follow-up)
+
+The concrete persisted-hydration storage read and its writer/revision/cancellation classification
+now live in `AgentSessionHydrationRuntime.read`, directly awaited on the existing loader task.
+It validates the request's tab, session and workspace before IO, never resolves a replacement writer,
+and returns a typed result without mutating readiness. `settleTerminal` owns the existing terminal
+proof followed by the loaded latch, rechecking the original writer at that separate mutation boundary.
+The VM retains the exact presentation-attempt check for revision-only candidates, provider/payload
+application, and optional projection; it no longer owns the storage `do/catch` or those proof writes.
+Cancellation still precedes nil/missing, and a failed read with local revision drift preserves local
+projection without manufacturing a restoration proof. No new task, callback owner or state manager
+was added. Full payload/provider-repair retirement, AutoEdit's physical setter fence, binding,
+coalescing/presentation recovery and deletion admission remain open.
+
+One Oracle review (`untitled-chat-27CBAF`, snapshot `2026-11-10/1213`) checked branch equivalence
+and requested tighter superseded-proof evidence, independent reacquisition coverage, presentation-gate
+coverage and preserved diagnostic labels. The superseded proof now also requires actual revision
+drift: both automatic admission and explicit Retry capture their start revision and transition in
+one synchronous operation, so the retained late payload guard cannot legitimately grant that proof
+without drift. The matrix independently refuses superseded settlement after reacquisition, including
+reacquisition plus revision drift, before retirement could mask the cause. A narrow DEBUG seam calls
+the real presentation admission path without rotating the writer or starting a producer; the VM test
+uses it during payload/error reads and verifies the old producer cannot settle the replacement.
+No runtime fallback or test timing budget was introduced. Restore-trace cancellation labels are kept;
+the error print now identifies the runtime owner. No tests or diagnostic scripts consume those labels.
+
+The first focused ticket `6ea07216-d5ea-4ab2-9b93-f076356478ba` passed **177 tests** before the
+review follow-ups. The next build caught a pinned-formatter transformation of `&&` inside a ternary
+guard into a comma; the condition is now a local Boolean followed by its guard. The subsequent run
+compiled and passed 177 of 178 cases, exposing that the new presentation replacement test had used
+a first-save fixture with no presentation owner. That test now uses the existing saved-tab lifecycle
+fixture and its real owner adoption/read gate, without changing production admission or weakening
+any assertion or budget. Failed build/test tickets are not counted as validation passes.
+
+Final focused `985e7abd-bcde-49e4-9e7e-aa110fbadce0` passed **178 tests**, no skips or failures,
+across the same eight runtime-loading/target-lookup/restoration/transcript/sidebar/presentation
+families. The read matrix covers 18 payload/missing/error and revision/cancellation/reacquisition
+combinations; a separate identity test refuses wrong workspace, session and tab before storage.
+The real presenter test covers both successful and failed obsolete read results while the canonical
+writer remains current. Full lint `0271feb8-08b2-40ff-901d-5bb32a4811dd` passed; the later guard and
+fixture corrections passed pinned scoped formatting and strict lint. Actual compilation of all four
+touched Swift files matches the M9.2c per-file warning occurrence baseline: VM **4→4**, the other
+three **0→0**. The fresh compiler-index check is **1,254/1,360 wrong-way edges, 53/66 largest
+cycle**, with the baseline unchanged. The added edge is the runtime read's explicit workspace-ID
+validation against `Features/Workspaces/WorkspaceModel.swift` (`id`); this is disclosed cross-feature
+placement debt, not a target-extraction claim or a reason to weaken the identity check. These are
+local checkpoint gates, not a new both-product/full SessionLinks/live-app/release/hosted-CI
+qualification. Nothing is pushed; binding and startup work remains in progress.
