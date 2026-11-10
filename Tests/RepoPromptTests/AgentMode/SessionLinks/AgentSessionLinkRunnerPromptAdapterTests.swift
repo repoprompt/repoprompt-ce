@@ -546,15 +546,15 @@ final class AgentSessionLinkACPRunnerPromptAdapterTests: XCTestCase {
 
     // MARK: Composition point
 
-    func testMembershipChangeDuringPrepareForNextTurnIsReflectedAtDispatch() async throws {
+    func testMembershipChangeAfterMessageConstructionIsReflectedAtDispatch() async throws {
         let fixture = try makeFixture()
         fixture.harness.publishInventory(revision: 1, targetCount: 1)
         await startRun(fixture, message: "acp initial")
         XCTAssertEqual(fixture.harness.acceptedClaims.count, 1)
 
-        // Fires after the message is built and before `prepareForNextTurn()` suspends — exactly the
-        // window the old composition point sat in. Composing there would ship revision 1 (already
-        // acknowledged, so: nothing at all); composing after the suspension ships revision 2.
+        // Fires after message construction, now downstream of controller preparation. Composing
+        // next to the builder would ship revision 1 (already acknowledged, so: nothing at all);
+        // composition must still observe this later synchronous projection's revision 2.
         fixture.harness.onAttachmentsConsumed = { [weak harness = fixture.harness] in
             harness?.publishInventory(revision: 2, targetCount: 4)
             harness?.onAttachmentsConsumed = nil
@@ -570,7 +570,7 @@ final class AgentSessionLinkACPRunnerPromptAdapterTests: XCTestCase {
         )
         XCTAssertTrue(
             reused.userMessage.contains("count=\"4\""),
-            "membership added while the turn was suspended must reach the provider"
+            "membership added after message construction must reach the provider"
         )
         XCTAssertEqual(fixture.harness.acceptedClaims.count, 2)
     }

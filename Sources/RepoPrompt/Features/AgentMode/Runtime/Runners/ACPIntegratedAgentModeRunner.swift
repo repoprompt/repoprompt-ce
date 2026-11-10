@@ -190,7 +190,7 @@ final class ACPIntegratedAgentModeRunner {
     enum StartupBoundary {
         case taskEntry, toolTrackingCompleted, leaseAcquired, acquireFailureOutcome
         case bootstrapStarting, bootstrapCompleted, resumeRecoveryStaged, configuration, routingReleased, prePromptFailure
-        case reusabilityProbed, deferredLeaseAcquired, controlPromptAdmission
+        case reusabilityProbed, deferredLeaseAcquired, controlPromptAdmission, promptPrepared, promptStreamAcquired
     }
 
     #if DEBUG
@@ -1192,6 +1192,8 @@ final class ACPIntegratedAgentModeRunner {
                 }
 
                 guard await admitFresh(.routingReleased) else { return .superseded }
+                let events = await controller.events
+                guard await admitFresh(.promptStreamAcquired) else { return .superseded }
                 promptTurnEntered = true
                 return await runPromptTurn(
                     session: session,
@@ -1202,7 +1204,7 @@ final class ACPIntegratedAgentModeRunner {
                     controller: controller,
                     runRequest: runRequest,
                     attachmentReservationID: attachmentReservationID,
-                    prepareControllerForNextTurn: false,
+                    events: events,
                     localComposerCandidate: localComposerCandidate
                 )
             } catch is CancellationError {
@@ -1346,6 +1348,27 @@ final class ACPIntegratedAgentModeRunner {
                 }
 
                 guard await admitReused(.routingReleased) else { return .superseded }
+                if let providerControlCommand {
+                    reachedPromptTurn = true
+                    return await runProviderControlCommandTurn(
+                        session: session, runID: runID, runAttemptID: runAttemptID,
+                        command: providerControlCommand, controller: controller, runRequest: runRequest
+                    )
+                }
+                let prepared = await controller.prepareForNextTurn()
+                // Check the origin even on refusal: neither failure publication nor handoff
+                // repair belongs to a writer that replaced the caller during preparation.
+                guard await admitStartupTask(
+                    .promptPrepared, session: session, runID: runID, runAttemptID: runAttemptID,
+                    controller: controller, receipt: receipt, attachmentReservationID: attachmentReservationID,
+                    retainsController: prepared, dedicatedNoteID: dedicatedNoteID
+                ) else { return .superseded }
+                guard prepared else {
+                    hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
+                    return .failed(errorText: "\(runRequest.agentKind.displayName) ACP session is no longer reusable.")
+                }
+                let events = await controller.events
+                guard await admitReused(.promptStreamAcquired) else { return .superseded }
                 reachedPromptTurn = true
                 return await runPromptTurn(
                     session: session,
@@ -1356,9 +1379,8 @@ final class ACPIntegratedAgentModeRunner {
                     controller: controller,
                     runRequest: runRequest,
                     attachmentReservationID: attachmentReservationID,
-                    prepareControllerForNextTurn: true,
+                    events: events,
                     dedicatedNoteID: dedicatedNoteID,
-                    providerControlCommand: providerControlCommand,
                     localComposerCandidate: localComposerCandidate
                 )
             } catch is CancellationError {
@@ -1403,22 +1425,11 @@ final class ACPIntegratedAgentModeRunner {
         controller: ACPAgentSessionController,
         runRequest: ACPRunRequest,
         attachmentReservationID: UUID?,
-        prepareControllerForNextTurn: Bool,
+        events: AsyncStream<NormalizedAgentRuntimeEvent>,
         dedicatedNoteID: AgentSelfCompactionDispatchID? = nil,
-        providerControlCommand: AgentProviderControlCommand? = nil,
         localComposerCandidate: UUID? = nil
     ) async -> TransientOperationResult {
-        if let providerControlCommand {
-            return await runProviderControlCommandTurn(
-                session: session,
-                runID: runID,
-                runAttemptID: runAttemptID,
-                command: providerControlCommand,
-                controller: controller,
-                runRequest: runRequest
-            )
-        }
-        log("prompt turn begin prepare=\(prepareControllerForNextTurn)", runID: runID)
+        log("prompt turn begin", runID: runID)
         setRunningStatus("Thinking…", source: .transport, session: session, urgent: true)
         var carry = AgentSelfCompactParkedPrefix.prepare(initialMessageForRun, session: session) {
             hooks.persistence.scheduleSave(session)
@@ -1451,24 +1462,9 @@ final class ACPIntegratedAgentModeRunner {
         hooks.attachments.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session)
         hooks.attachments.markAttachmentsConsumed(session, attachmentReservationID)
 
-        if prepareControllerForNextTurn {
-            let prepared = await controller.prepareForNextTurn()
-            guard prepared else {
-                if carry.exactNote, let dispatchID = carry.dispatchID {
-                    if session.selfCompactNoteDispatchIsCurrent(dispatchID) {
-                        AgentSelfCompactParkedPrefix.markNotAttempted(dispatchID, session: session)
-                        hooks.persistence.scheduleSave(session)
-                    }
-                }
-                return .failed(errorText: "\(runRequest.agentKind.displayName) ACP session is no longer reusable.")
-            }
-        }
-        let events = await controller.events
-
-        // Composed here, not next to `buildHeadlessAgentMessage`: `prepareForNextTurn()` and the
-        // event-stream acquisition above both suspend, and an oversight link can be added or revoked while
-        // they do. Reading membership before those awaits would ship enqueue-time inventory on every
-        // reused/follow-up turn. This covers the initial, resumed, reusable-session, and follow-up
+        // The callers prepare the controller and acquire its event stream before admitting
+        // prompt entry. Compose after those awaits and after message construction: membership
+        // may have changed during preparation or synchronous input projection. This covers the initial, resumed, reusable-session, and follow-up
         // routes, which all converge here. Resumed providers still omit `AgentMessage.systemPrompt`;
         // the supplement rides the user-message channel precisely because a resumed thread cannot
         // refresh system text.

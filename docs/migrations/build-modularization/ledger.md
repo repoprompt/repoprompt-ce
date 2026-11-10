@@ -7753,3 +7753,35 @@ both focused/affected compiles remain runner 1 and tests 0, matching integrated 
 Fresh index passed at **1,261/1,360 wrong-way edges and 53/66 largest cycle**, unchanged.
 Local checkpoint only; both-product/full-SessionLinks/live-app/hosted-CI qualification is not claimed.
 No push.
+
+### M9.2g local prerequisite — ordinary prompt stream-entry admission (2026-11-11)
+
+Ordinary ACP controller preparation and stream acquisition now precede prompt entry. Fresh and
+reused callers revalidate their captured writer after each actor await; the reused preparation
+result is classified only after admission, including the false result. A refused preparation no
+longer clears the handoff or consumes attachments. A current refusal still fails and retires the
+controller; suspended-owned refusal retains it only when preparation actually succeeded. Lost
+claims leave shared state to their current owner. Dedicated-note setup cleanup retains the existing
+exact attempt/terminal-receipt rule. Control-command preparation remains separate and unchanged.
+
+One Oracle review (`0234`, chat `6F1A83`) approved with narrow fixes: refused preparation during
+retirement now retires rather than preserving a known-refusing controller, and dedicated-note
+preparation refusal is covered. Expanded fresh/reused matrices assert no attachment-consumption
+callback, handoff preservation, no RPC/consumer, and original versus successor cleanup. The renamed
+adapter test preserves its wire assertion and accurately describes its synchronous post-message
+construction hook; it is not evidence of an actor suspension. The new writer-boundary cases cover
+authority loss after the real actor awaits. An additional membership-at-await wire test was not added.
+
+Intentional ordering: Thinking status now follows preparation, and rejected preparation leaves the
+attachment reservation unconsumed for existing terminal `.deleteFiles` settlement instead of consumed
+plus deferred cleanup. Harness callbacks witness consumption, not physical attachment-file deletion.
+Provider-input proof awaits after entry, physical controller actor writes, and post-dispatch mutation
+remain OPEN; this prerequisite does not claim to close those boundaries.
+
+Focused `1970386e-69e7-4e32-9ba1-41d2959f24e1` passed 13 tests (two runner matrices
+plus all 11 ACP prompt-adapter cases). Affected `3ed4c0b0-b0b7-404c-9bf9-d7e0b719ba54`
+passed **402 tests, zero failures/skips** (70.078s). Full lint
+`4f76698f-87a9-44cd-9d71-b26fba42ee95` passed. Actual focused compiler warning counts
+match integrated `a0c674e9`: runner 1, prompt-adapter tests 1, execution tests/harness 0.
+Fresh index passed at **1,261/1,360 wrong-way edges and 53/66 largest cycle**, unchanged.
+Local qualification only; no both-product/full-SessionLinks/live-app/hosted-CI claim and no push.

@@ -56,10 +56,9 @@ final class AgentSessionLinkRunnerHarness {
     /// monitor being added or revoked while a dispatch is suspended.
     private(set) var inventory: AgentSessionLinkPromptInventory
 
-    /// Runs immediately before `prepareForNextTurn()` on the ACP path, inside the window the old
-    /// (buggy) composition point sat in. A test uses it to prove composition reads membership *after*
-    /// that suspension.
     var onTurnComplete: (() -> Void)?
+    /// Runs after ACP message construction but before dispatch decoration. Controller preparation
+    /// and stream acquisition now precede prompt entry; this hook tests the later projection window.
     var onAttachmentsConsumed: (@MainActor () -> Void)?
 
     /// Runs while the message is being built, i.e. the last synchronous MainActor point before the

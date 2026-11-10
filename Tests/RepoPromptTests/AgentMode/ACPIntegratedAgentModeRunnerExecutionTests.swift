@@ -620,7 +620,7 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
         typealias Boundary = ACPIntegratedAgentModeRunner.StartupBoundary
         enum Drift { case reacquire, retire, successor, detached, transientConflict, none }
         @MainActor final class Counters { var installed = 0, cleared = 0 }
-        let boundaries: [Boundary] = [.bootstrapStarting, .bootstrapCompleted, .resumeRecoveryStaged, .configuration, .routingReleased, .prePromptFailure]
+        let boundaries: [Boundary] = [.bootstrapStarting, .bootstrapCompleted, .resumeRecoveryStaged, .configuration, .routingReleased, .prePromptFailure, .promptStreamAcquired]
         let cases = boundaries.flatMap { [($0, Drift.reacquire, false), ($0, Drift.retire, false)] }
             + [
                 (.bootstrapCompleted, .successor, false),
@@ -666,6 +666,8 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
             let conflicting = AgentSessionRuntimeStore.shared.makeScope()
             defer { conflicting.replaceSessions([:]) }
             var consumers = 0
+            var consumedAttachments = 0
+            harness.onAttachmentsConsumed = { consumedAttachments += 1 }
             runner.testPromptConsumerCreated = { consumers += 1 }
             runner.testAtStartupBoundary = { point in
                 if point == boundary, reached, drift == .transientConflict {
@@ -754,6 +756,8 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
             let gate = await HeadlessAgentConnectionGate.snapshot()
             XCTAssertNotEqual(gate.activeConnectionID, gateID, "boundary=\(boundary), drift=\(drift)")
             XCTAssertEqual(consumers, drift == .none ? 1 : 0)
+            XCTAssertEqual(consumedAttachments, drift == .none ? 1 : 0)
+            if drift != .none { XCTAssertEqual(session.pendingHandoff.payload, "unsent handoff") }
             let rpcText = (try? String(contentsOf: rpcLog, encoding: .utf8)) ?? ""
             if drift == .none {
                 XCTAssertEqual(session.runState, .completed)
@@ -762,7 +766,7 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
             } else {
                 XCTAssertFalse(rpcText.contains("session/prompt"))
                 if boundary == .bootstrapStarting { XCTAssertTrue(rpcText.isEmpty) }
-                if boundary != .routingReleased, !afterConfigurationRPC { XCTAssertFalse(rpcText.contains("session/set_config_option")) }
+                if boundary != .routingReleased, boundary != .promptStreamAcquired, !afterConfigurationRPC { XCTAssertFalse(rpcText.contains("session/set_config_option")) }
                 if afterConfigurationRPC { XCTAssertTrue(rpcText.contains("session/set_config_option")) }
                 if drift == .retire || drift == .transientConflict {
                     XCTAssertEqual(session.runState, boundary == .prePromptFailure ? .failed : .cancelled)
@@ -804,7 +808,7 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
         typealias Boundary = ACPIntegratedAgentModeRunner.StartupBoundary
         enum Drift { case reacquire, retire, transientConflict, successor, none }
         @MainActor final class Counters { var installed = 0, cleared = 0 }
-        let boundaries: [Boundary] = [.reusabilityProbed, .configuration, .deferredLeaseAcquired, .routingReleased, .prePromptFailure]
+        let boundaries: [Boundary] = [.reusabilityProbed, .configuration, .deferredLeaseAcquired, .routingReleased, .prePromptFailure, .promptPrepared, .promptStreamAcquired]
         let cases = boundaries.flatMap { [($0, Drift.reacquire, false, false), ($0, Drift.retire, false, false)] }
             + [
                 (.configuration, .transientConflict, false, false), (.routingReleased, .none, false, false),
@@ -812,7 +816,17 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
                 (.configuration, .reacquire, false, true), (.configuration, .retire, false, true),
                 (.configuration, .successor, false, true)
             ]
-        for (boundary, drift, acquireFails, dedicatedNote) in cases {
+        let preparationCases = cases.map { ($0.0, $0.1, $0.2, $0.3, false) }
+            + [
+                (.promptPrepared, .none, false, false, true),
+                (.promptPrepared, .reacquire, false, false, true),
+                (.promptPrepared, .retire, false, false, true),
+                (.promptPrepared, .none, false, true, true),
+                (.promptPrepared, .reacquire, false, true, true),
+                (.promptStreamAcquired, .reacquire, false, true, false),
+                (.promptStreamAcquired, .retire, false, true, false)
+            ]
+        for (boundary, drift, acquireFails, dedicatedNote, rejectPreparation) in preparationCases {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: directory) }
@@ -825,6 +839,7 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
             let controller = try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
             addTeardownBlock { await controller.shutdown() }
             _ = try await controller.bootstrap()
+            if rejectPreparation { await controller.test_rejectNextTurnPreparation() }
             let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
             let session = try harness.makeBoundSession(agent: .antigravity)
             session.acpController = controller
@@ -853,6 +868,8 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
             var saves: UInt64 = 0
             var dirty = false
             var consumers = 0
+            var consumedAttachments = 0
+            harness.onAttachmentsConsumed = { consumedAttachments += 1 }
             runner.testPromptConsumerCreated = { consumers += 1 }
             runner.testAtStartupBoundary = { point in
                 if point == boundary, reached, drift == .transientConflict {
@@ -923,15 +940,28 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
             }
             let gate = await HeadlessAgentConnectionGate.snapshot()
             XCTAssertNotEqual(gate.activeConnectionID, gateID)
-            XCTAssertEqual(consumers, drift == .none ? 1 : 0)
+            let sent = drift == .none && !rejectPreparation
+            XCTAssertEqual(consumers, sent ? 1 : 0)
+            XCTAssertEqual(consumedAttachments, sent ? 1 : 0)
+            if !sent { XCTAssertEqual(session.pendingHandoff.payload, "unsent handoff") }
             let rpcText = (try? String(contentsOf: rpcLog, encoding: .utf8)) ?? ""
-            XCTAssertEqual(rpcText.contains("session/prompt"), drift == .none)
+            XCTAssertEqual(rpcText.contains("session/prompt"), sent)
             if drift == .none {
-                XCTAssertEqual(session.runState, .completed)
+                XCTAssertEqual(session.runState, rejectPreparation ? .failed : .completed)
+                if rejectPreparation {
+                    XCTAssertEqual(session.pendingHandoff.payload, "unsent handoff")
+                    XCTAssertFalse(session.pendingHandoff.isStagedForSend)
+                    try await barrier.awaitTerminalTeardown(for: XCTUnwrap(owner), lifecycle: session.runLifecycle)
+                    XCTAssertNil(session.acpController)
+                    if dedicatedNote { XCTAssertEqual(session.selfCompactState.active?.phase, .parked) }
+                }
             } else if drift == .retire || drift == .transientConflict {
                 XCTAssertEqual(session.runState, boundary == .prePromptFailure ? .failed : .cancelled)
-                if boundary == .prePromptFailure { XCTAssertNil(session.acpController) }
-                else {
+                if boundary == .prePromptFailure || rejectPreparation {
+                    XCTAssertNil(session.acpController)
+                    let reusable = await controller.hasReusableSession
+                    XCTAssertFalse(reusable)
+                } else {
                     XCTAssertTrue(session.acpController === controller)
                     XCTAssertEqual(session.runID, processRunID)
                     let reusable = await controller.hasReusableSession
