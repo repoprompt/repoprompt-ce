@@ -97,6 +97,41 @@ final class AgentSessionPresentationRuntimeTests: XCTestCase {
         XCTAssertNil(session.activeAgentRunStartedAt)
     }
 
+    func testDetachedSinkTakesOverOnlyAfterExactPresenterIsGone() throws {
+        let runtime = AgentSessionPresentationRuntime()
+        let session = AgentTabSession(tabID: UUID())
+        var complete = 0, failed = 0, stateChanges = 0
+        runtime.detachedSink = .init(
+            turnComplete: { _ in complete += 1 }, turnFailed: { _, _ in failed += 1 },
+            stateChanged: { stateChanges += 1 }
+        )
+        var presenter: Events? = Events()
+        weak let weakPresenter = presenter
+        var sink = try XCTUnwrap(presenter).sink
+        sink.isAvailable = { [weak presenter] in presenter != nil }
+        let old = runtime.attach(session, sink: sink)
+        let hooks = runtime.makeRunHooks()
+        hooks.notifyAgentTurnComplete(session)
+        runtime.interactionChanged(session)
+        XCTAssertEqual(presenter?.completions, 1)
+        XCTAssertEqual(complete, 0)
+        let beforeLoss = stateChanges
+        presenter = nil
+        XCTAssertNil(weakPresenter)
+        hooks.notifyAgentTurnComplete(session)
+        hooks.notifyAgentTurnFailed(session, "failure without a presenter")
+        runtime.interactionChanged(session)
+        XCTAssertEqual(complete, 1)
+        XCTAssertEqual(failed, 1)
+        XCTAssertEqual(stateChanges, beforeLoss + 1)
+        let next = Events()
+        _ = runtime.attach(session, sink: next.sink)
+        runtime.detach(old)
+        hooks.notifyAgentTurnComplete(session)
+        XCTAssertEqual(next.completions, 1)
+        XCTAssertEqual(complete, 1, "A stale detach cannot re-enable fallback over a newer presenter")
+    }
+
     @MainActor
     private final class Events {
         var activity: [Bool] = []

@@ -20,6 +20,35 @@ in routine suite or CI environments. No production menu behavior is disabled.
 
 Use this guide for contributor-facing XCTest changes. Follow `AGENTS.md` for coordinated daemon use, style checks, and lifecycle approvals. Use `$rpce-test-quality` when deciding whether coverage is worth adding, retaining, consolidating, or removing.
 
+## Agent session fixture retirement (M9.4 phase 0)
+
+Use `await viewModel.test_retireAndCancelFixture()` for fixture cleanup that must
+cancel producers/providers, retire the writer and join persistence. Do not use
+`prepareForWindowClose()` as a synonym for fixture disposal: its presentation policy
+will change in later M9.4 phases. Today both entries share the unchanged cancelling
+implementation; the fixture entry explicitly names the lifetime it owns.
+
+Audit at `534e2c759`: the 95 textual `prepareForWindowClose()` references under
+`Tests/RepoPromptTests` include 35 asynchronous Agent Mode calls. The other 60
+references are unrelated workspace/API-settings/Context Builder/git teardown or
+comments, and remain unchanged. Of the Agent Mode calls:
+
+- 30 cleanup-only calls now use explicit fixture retirement: composer (7), quiet
+  display masks (7), Oracle pill routing (3), provider effects (2), transcript
+  restoration cleanup (4), restoration admission/reopen (2), and one each in Auto-wake, canonical transcript,
+  endpoint resolver, oversight hydration and admission recovery.
+- Five close-contract calls remain deliberate: presentation detach (1), ACP steer
+  drain (1), Stop owner lifetime (1), and transcript
+  restoration UI/baseline teardown (2). When close becomes detach-only, retain the
+  presentation assertions and explicitly retire these fixtures after them.
+
+`AgentSessionRuntimeStoreTests` pins legacy close-cancels-run and workspace-switch
+cancellation. `SessionAdminInventoryReadTests/testVisitDuringManagedRunAutomaticallyHandsOffAfterCompletion`
+pins the distinct prepared-owner policy: the visitor has no writer while busy,
+the original identity survives the visit, and one queued visit hydrates after the
+managed turn settles. These are characterization tests, not close-preserves-run
+qualification.
+
 ## Fast local feedback and CI escalation
 
 Start with `make check-fast` while iterating. It checks unstaged/staged whitespace,

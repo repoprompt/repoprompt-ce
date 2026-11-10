@@ -8,7 +8,8 @@ final class AgentSelfCompactTerminalScheduler {
     typealias Dispatch = @MainActor (
         _ requestID: UUID,
         _ support: AgentSessionLinkCompactSupport,
-        _ stillAdmissible: @escaping @MainActor () -> Bool
+        _ stillAdmissible: @escaping @MainActor () -> Bool,
+        _ physicalStartIsSafe: @escaping @MainActor () -> Bool
     ) async -> Bool
 
     private let load: @MainActor () -> AgentSelfCompactState
@@ -19,6 +20,7 @@ final class AgentSelfCompactTerminalScheduler {
     private let dispatch: Dispatch
     private let sleep: @MainActor (Duration) async -> Void
     private let maximumDrainPolls: Int
+    private let now: @MainActor () -> ContinuousClock.Instant
 
     init(
         load: @escaping @MainActor () -> AgentSelfCompactState,
@@ -28,6 +30,7 @@ final class AgentSelfCompactTerminalScheduler {
         support: @escaping @MainActor () async -> AgentSessionLinkCompactSupport,
         dispatch: @escaping Dispatch,
         maximumDrainPolls: Int = 600,
+        now: @escaping @MainActor () -> ContinuousClock.Instant = { .now },
         sleep: @escaping @MainActor (Duration) async -> Void = { duration in
             try? await Task.sleep(for: duration)
         }
@@ -39,6 +42,7 @@ final class AgentSelfCompactTerminalScheduler {
         self.support = support
         self.dispatch = dispatch
         self.maximumDrainPolls = maximumDrainPolls
+        self.now = now
         self.sleep = sleep
     }
 
@@ -111,26 +115,39 @@ final class AgentSelfCompactTerminalScheduler {
         owner: AgentSelfCompactOwner,
         teardownSettled: @escaping @MainActor () -> Bool
     ) async {
-        for poll in 0 ... maximumDrainPolls {
-            guard isPending(requestID, owner: owner) else { return }
-            guard isCurrentOwner(owner) else {
-                settleCancellation(requestID)
-                return
+        let deadline = now().advanced(by: .milliseconds(100 * maximumDrainPolls))
+        var polls = 0
+        func drain() async -> Bool {
+            while true {
+                guard isPending(requestID, owner: owner) else { return false }
+                guard isCurrentOwner(owner) else {
+                    settleCancellation(requestID)
+                    return false
+                }
+                guard now() < deadline else {
+                    settleFailure(requestID)
+                    return false
+                }
+                if teardownSettled(), !hasActiveTools(owner.runID) { return true }
+                guard polls < maximumDrainPolls else {
+                    settleFailure(requestID)
+                    return false
+                }
+                polls += 1
+                await sleep(.milliseconds(100))
+                await Task.yield()
             }
-            if teardownSettled(), !hasActiveTools(owner.runID) { break }
-            guard poll < maximumDrainPolls else {
-                settleFailure(requestID)
-                return
-            }
-            await sleep(.milliseconds(100))
-            await Task.yield()
         }
+        guard await drain() else { return }
         guard isPending(requestID, owner: owner) else { return }
         guard isCurrentOwner(owner) else {
             settleCancellation(requestID)
             return
         }
         let admittedSupport = await support()
+        // A new tool can arrive while support suspends. Continue the same bounded drain,
+        // rather than granting a second budget or dispatching over it.
+        guard await drain() else { return }
         guard isPending(requestID, owner: owner) else { return }
         guard isCurrentOwner(owner) else {
             settleCancellation(requestID)
@@ -147,11 +164,19 @@ final class AgentSelfCompactTerminalScheduler {
         state.active?.phase = .dispatchingCompact
         state.active?.compactDispatchStarted = true
         store(state)
-        let didStart = await dispatch(requestID, admittedSupport) { [self] in
+        // This separate closure survives the asynchronous runner start without capturing the
+        // scheduler (and thus the session) through the session's own provider fence.
+        let toolsAreActive = hasActiveTools
+        let clockNow = now
+        let physicalStartIsSafe: @MainActor () -> Bool = {
+            clockNow() < deadline && teardownSettled() && !toolsAreActive(owner.runID)
+        }
+        let didStart = await dispatch(requestID, admittedSupport, { [self] in
             isDispatching(requestID, owner: owner)
                 && isCurrentOwner(owner)
                 && load().active?.admittedSupport == admittedSupport
-        }
+                && physicalStartIsSafe()
+        }, physicalStartIsSafe)
         guard isDispatching(requestID, owner: owner) else { return }
         guard isCurrentOwner(owner) else {
             if didStart {

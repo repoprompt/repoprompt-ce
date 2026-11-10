@@ -342,7 +342,7 @@ final class AgentQuietCheckInDisplayMaskTests: XCTestCase {
             XCTAssertTrue(final.result.presentation.bindingsHydrated)
             XCTAssertEqual(session.quietLedger.hiddenSourceIDs, hidden)
             if let quietRowID { XCTAssertFalse(final.result.presentation.visibleRows.contains(where: { $0.id == quietRowID })) }
-            await vm.prepareForWindowClose()
+            await vm.test_retireAndCancelFixture()
             print("QUIET_A3_HYDRATION mask=\(hasMask) sameBaseRevision=true sameMaskRevision=true getterSyncIterations=100 unchangedPublications=\(publications) suppressedPublicationObserved=\(observedSuppressedPublication) blockVisits=\(final.result.blockVisits) rowVisits=\(final.result.rowVisits) anchorVisits=\(final.result.anchorVisits)")
         }
     }
@@ -403,7 +403,7 @@ final class AgentQuietCheckInDisplayMaskTests: XCTestCase {
         XCTAssertNotEqual(session.quietTranscriptDisplayCache?.key, before.key)
         session.clearDerivedTranscriptCaches()
         XCTAssertNil(session.quietTranscriptDisplayCache)
-        await vm.prepareForWindowClose()
+        await vm.test_retireAndCancelFixture()
     }
 
     func testW4StableArchivedProofAndWindowedAliasesReusePreparedStorage() async throws {
@@ -506,7 +506,7 @@ final class AgentQuietCheckInDisplayMaskTests: XCTestCase {
         _ = vm.test_publishTranscriptPresentation(tabID: session.tabID, forceRevision: true)
         vm.syncTranscriptUIState()
         XCTAssertTrue(vm.ui.transcript.snapshot.presentation.visibleRows.contains { $0.text == "Unstamped ordinary reload" })
-        await vm.prepareForWindowClose()
+        await vm.test_retireAndCancelFixture()
     }
 
     func testW4FrozenSummaryInputsSharePreparedStorage() throws {
@@ -1083,8 +1083,8 @@ final class AgentQuietRetainedViewFeasibilityTests: XCTestCase {
             XCTAssertTrue(certifiedIDs.isSubset(of: Set(session.transcript.allActivities.map(\.id))), "Local hiding never deletes canonical audit members")
             print("W4_STAMP_SUCCESSOR origin=\(origin) publications=\(publications) certified=\(certifiedIDs.count)")
             subscriptions.forEach { $0.cancel() }
-            await window.agentModeViewModel.prepareForWindowClose()
-            if window !== f.window { await f.window.agentModeViewModel.prepareForWindowClose() }
+            await window.agentModeViewModel.test_retireAndCancelFixture()
+            if window !== f.window { await f.window.agentModeViewModel.test_retireAndCancelFixture() }
         }
     }
 
@@ -1145,7 +1145,7 @@ final class AgentQuietRetainedViewFeasibilityTests: XCTestCase {
                 XCTAssertTrue(fresh.quietLedger.hiddenSourceIDs.isEmpty)
                 XCTAssertNil(fresh.quietDisplayCandidate)
                 assertFixedProjection(fresh.transcript, expected: fixedRetentionReference(fresh.transcript, origin: ordinaryOrigin, members: members), members: members, label: "fresh saved hydration \(tier) tools=\(tools)")
-                await vm.prepareForWindowClose()
+                await vm.test_retireAndCancelFixture()
             }
             XCTAssertEqual(session.transcript, canonical, "Local projection never rewrites canonical source")
         }
@@ -1782,7 +1782,7 @@ final class AgentQuietRetainedViewFeasibilityTests: XCTestCase {
             XCTAssertEqual(conclusion.timestamp, ordinaryRecipient.completedAt)
             XCTAssertFalse(actualRows.contains { $0.id == marker.id })
         }
-        await vm.prepareForWindowClose()
+        await vm.test_retireAndCancelFixture()
     }
 
     func testCanonicalRetainedSummaryDoesNotDependOnQuietLocalMetadata() throws {

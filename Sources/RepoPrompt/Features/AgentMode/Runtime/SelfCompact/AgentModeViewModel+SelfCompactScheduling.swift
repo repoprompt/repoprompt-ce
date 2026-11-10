@@ -112,13 +112,14 @@ extension AgentModeViewModel {
             support: { [weak self] in
                 await self?.linkExecutionRuntime.agentSessionLinkCompactSupport(for: session) ?? .notSupported
             },
-            dispatch: { [weak self] requestID, support, stillAdmissible in
+            dispatch: { [weak self] requestID, support, stillAdmissible, physicalStartIsSafe in
                 guard let self else { return false }
                 return await agentSelfCompactDispatchNative(
                     requestID: requestID,
                     session: session,
                     support: support,
-                    stillAdmissible: stillAdmissible
+                    stillAdmissible: stillAdmissible,
+                    physicalStartIsSafe: physicalStartIsSafe
                 )
             }
         )
@@ -156,10 +157,40 @@ extension AgentModeViewModel {
         completion.cancelUnattemptedNoteIfOwnerLost(.init(requestID: attempt.id, stage: .note))
     }
 
+    /// The acquisition hold ends only after the correlated compact terminal has been verified.
+    /// A Codex success event alone can set `compactTurnSucceeded` before that terminal arrives.
+    func agentSelfCompactHoldsWakeAcquisition(_ session: TabSession) -> Bool {
+        guard let attempt = session.selfCompactState.active else { return false }
+        switch attempt.phase {
+        case .awaitingNoteBoundary, .noteDispatchPending, .dispatchingNote, .parked:
+            return session.selfCompactVerifiedWakeRequestID != attempt.id
+        case .scheduled, .compactDispatchPending, .dispatchingCompact, .awaitingCompactTurn, .acpSettling:
+            return true
+        }
+    }
+
+    /// A wake that has not started preparation owns no provider boundary and may wait while this
+    /// already-admitted self-compaction starts. Ordinary send and MCP admission remain unchanged.
+    func agentSelfCompactCanIgnoreParkedWake(_ session: TabSession) -> Bool {
+        guard let attempt = session.oversight.pendingAutoWake,
+              !attempt.isManual, !attempt.isPeriodic,
+              attempt.phase == .scheduled || attempt.phase == .awaitingSettlement,
+              attempt.physicalOutcome == .notAttempted,
+              attempt.periodicProducerDispatchID == nil, attempt.periodicProducerTask == nil,
+              agentSessionLinkObserverEndpoint(tabID: session.tabID) == attempt.observerEndpoint,
+              agentSessionLinkPromptClaimStore.pendingClaim(
+                  dispatchID: .autoWake(wakeID: attempt.wakeID),
+                  observerSessionID: attempt.observerEndpoint.sessionID
+              ) == nil
+        else { return false }
+        return true
+    }
+
     /// Only event-driven wakes can carry this note; periodic prompting remains excluded.
     func agentSelfCompactBlocksNotificationWake(_ session: TabSession) -> Bool {
         guard session.selfCompactState.blocksAutomaticWake else { return false }
-        guard let owner = session.selfCompactState.verifiedParkedNoteOwner else { return true }
+        guard !agentSelfCompactHoldsWakeAcquisition(session),
+              let owner = session.selfCompactState.verifiedParkedNoteOwner else { return true }
         return !agentSelfCompactOwnerIsCurrent(owner, session: session)
     }
 
@@ -167,7 +198,8 @@ extension AgentModeViewModel {
         requestID: UUID,
         session: TabSession,
         support: AgentSessionLinkCompactSupport,
-        stillAdmissible: @escaping @MainActor () -> Bool
+        stillAdmissible: @escaping @MainActor () -> Bool,
+        physicalStartIsSafe: @escaping @MainActor () -> Bool
     ) async -> Bool {
         guard let owner = session.selfCompactState.active?.owner,
               stillAdmissible(),
@@ -175,9 +207,18 @@ extension AgentModeViewModel {
               target.route == .existingAgentSession,
               target.expectedSourceAgentSessionID == owner.sessionID
         else { return false }
-        session.selfCompactDispatchIsCurrent = { [weak self, weak session] in
+        let ownerIsCurrent: @MainActor () -> Bool = { [weak self, weak session] in
             guard let self, let session else { return false }
             return agentSelfCompactOwnerIsCurrent(owner, session: session)
+        }
+        session.selfCompactNoteOwnerIsCurrent = ownerIsCurrent
+        session.selfCompactDispatchIsCurrent = { [weak session] in
+            guard let session, ownerIsCurrent(), let active = session.selfCompactState.active,
+                  active.id == requestID,
+                  active.phase == .dispatchingCompact || active.phase == .awaitingCompactTurn
+            else { return false }
+            // Claude and ACP can return from run startup before their compact transport write.
+            return physicalStartIsSafe()
         }
         let attempt = AgentComposerSubmitAttempt(
             id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: ""
@@ -192,15 +233,17 @@ extension AgentModeViewModel {
                   !AgentSessionLinkExecutionRuntime.agentSessionLinkCompactHasQueuedProviderWork(session),
                   workspaceManager?.activeWorkspace?.id == owner.workspaceID
             else { return false }
-            return AgentSessionLinkDeliveryReadiness.evaluate(
-                snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
-                    session: session,
-                    endpointMatchesGrant: agentSelfCompactOwnerIsCurrent(owner, session: session),
-                    isClosing: false,
-                    ignoresComposerSubmissionInFlight: true,
-                    ignoresSelfCompactRequestID: requestID
-                )
-            ) == .ready
+            var snapshot = Self.agentSessionLinkDeliveryReadinessSnapshot(
+                session: session,
+                endpointMatchesGrant: agentSelfCompactOwnerIsCurrent(owner, session: session),
+                isClosing: false,
+                ignoresComposerSubmissionInFlight: true,
+                ignoresSelfCompactRequestID: requestID
+            )
+            if agentSelfCompactCanIgnoreParkedWake(session) {
+                snapshot.pendingOversightAutoWake = false
+            }
+            return AgentSessionLinkDeliveryReadiness.evaluate(snapshot: snapshot) == .ready
         }
         guard ready() else { return false }
 

@@ -103,7 +103,7 @@ import XCTest
             let saveTask = session?.saveDebounceTask
             loadTask?.cancel()
             saveTask?.cancel()
-            await viewModel?.prepareForWindowClose()
+            await viewModel?.test_retireAndCancelFixture()
             _ = await loadTask?.value
             _ = await saveTask?.value
             fixture.manager.prepareForWindowClose()

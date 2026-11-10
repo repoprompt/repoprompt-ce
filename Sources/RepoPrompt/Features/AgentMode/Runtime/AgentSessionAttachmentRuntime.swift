@@ -161,6 +161,11 @@ final class AgentSessionAttachmentRuntime {
         !retentionTasks.isEmpty
     }
 
+    func hasPendingRetention(for session: AgentTabSession) -> Bool {
+        guard let sessionID = session.activeAgentSessionID else { return false }
+        return retentionTasks.values.contains { $0.sessionID == sessionID }
+    }
+
     /// Cancellation of a waiter is not completion of the admitted disk operation.
     func waitForRetention() async {
         while let operation = retentionTasks.values.first {

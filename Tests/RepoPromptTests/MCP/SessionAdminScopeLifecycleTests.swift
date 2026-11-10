@@ -4006,6 +4006,42 @@ final class SessionAdminStructureTests: XCTestCase {
         XCTAssertEqual(fixture.worktrees.bound[target]?.map(\.worktreeID), ["w1"])
     }
 
+    func testProviderRetirementThenScopeRevocationReportsPartialEffectsWithoutBindingOrRetry() async throws {
+        let fixture = Fixture()
+        let caller = UUID(), target = UUID(), workspaceID = UUID()
+        fixture.provenance.add(caller, parent: nil)
+        fixture.provenance.add(target, parent: caller)
+        try fixture.grant(caller)
+        let store = AgentSessionRuntimeStore()
+        let scope = store.makeScope()
+        defer { withExtendedLifetime((store, scope)) {} }
+        let session = scope.makeSession(tabID: UUID())
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: target, workspaceID: workspaceID))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        scope.replaceSessions([session.tabID: session])
+        guard case let .unique(writer) = scope.resolveWriter(sessionID: target) else { return XCTFail("Missing exact test writer") }
+        fixture.worktrees.afterBindAdmission = { _, _ in
+            throw AgentSessionWorktreeRuntime.PartialTransition(
+                writer: writer.identity, bindingsPublished: false, providerRetired: true, recoverySaved: true,
+                detail: "Authority ended after provider retirement.", cause: SessionAdminHostError.authorityEnded
+            )
+        }
+        let reply = try await fixture.value(
+            .adminWorktreeBind, caller: caller, targets: [target],
+            args: ["worktree": .string("w1"), "apply": .string("next_boundary")]
+        )
+        let item = try XCTUnwrap(items(reply)[target.uuidString])
+        XCTAssertEqual(reply["result"], .string("partial"))
+        XCTAssertEqual(item["code"], .string("scope_revoked"))
+        XCTAssertEqual(item["bindings_published"], .bool(false))
+        XCTAssertEqual(item["provider_retired"], .bool(true))
+        XCTAssertEqual(item["recovery_saved"], .bool(true))
+        XCTAssertEqual(item["retryable"], .bool(false))
+        XCTAssertEqual(item[AgentSessionAdminRendering.committedChangesKey], .bool(true))
+        XCTAssertTrue(fixture.worktreeHandler.pendingBinds.isEmpty)
+        XCTAssertTrue(fixture.worktrees.bindCalls.isEmpty)
+    }
+
     func testCommittedImmediateBindWithLateFailureIsNotRequeuedOrRevoked() async throws {
         let lateErrors: [any Error] = [SessionAdminHostError.notIdle, SessionAdminHostError.authorityEnded, CancellationError()]
         for lateError in lateErrors {
@@ -9827,12 +9863,23 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     )
                     XCTAssertEqual(stillLinked, .alreadyLinked, "An exact live runtime stays usable after its UI carrier closes")
                 case "visit":
+                    let origin = try controlWriterIdentity(for: XCTUnwrap(targetVM.sessions[targetTab.id]))
                     let blocked = try await targetFixture.window.agentModeViewModel.activateRoutedAgentSession(
                         tabID: targetTab.id, sessionID: targetID,
                         workspace: XCTUnwrap(targetFixture.window.workspaceManager.workspace(withID: workspace.id))
                     )
                     XCTAssertEqual(blocked, .blockedByActiveDifferentSession)
                     XCTAssertNotNil(manager.preparedOversightPendingVisits[targetID])
+                    XCTAssertEqual(
+                        try controlWriterIdentity(for: XCTUnwrap(targetVM.sessions[targetTab.id])),
+                        origin,
+                        "A deferred visit keeps the exact prepared writer, never elects the visitor"
+                    )
+                    XCTAssertNotEqual(
+                        targetFixture.window.agentModeViewModel.sessions[targetTab.id]?.activeAgentSessionID,
+                        targetID,
+                        "A busy prepared owner must not be hydrated into the visiting scope"
+                    )
                 default: XCTFail("Unknown active transition")
                 }
                 manager.schedulePreparedOversightCleanup()
@@ -9867,7 +9914,9 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                         && targetFixture.window.agentModeViewModel.sessions[targetTab.id]?.activeAgentSessionID == targetID
                         && targetFixture.window.agentModeViewModel.sessions[targetTab.id]?.items.contains { $0.text.contains("Hi!") } == true
                 }
+                XCTAssertNil(manager.preparedOversightPendingVisits[targetID], "The single queued visit was consumed at settlement")
                 targetVM = targetFixture.window.agentModeViewModel
+                _ = try controlWriterIdentity(for: XCTUnwrap(targetVM.sessions[targetTab.id]))
             }
             XCTAssertTrue(targetVM.sessions[targetTab.id]?.items.contains { $0.kind == .assistant && $0.text.contains("Hi!") } == true)
             do {

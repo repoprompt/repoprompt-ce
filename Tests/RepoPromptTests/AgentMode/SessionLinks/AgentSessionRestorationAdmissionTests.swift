@@ -1715,7 +1715,7 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
             for session in vm.sessions.values {
                 session.saveDebounceTask?.cancel()
             }
-            await vm.prepareForWindowClose()
+            await vm.test_retireAndCancelFixture()
             manager.prepareForWindowClose()
         }
         return fixture
@@ -1749,9 +1749,7 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
         for session in fixture.vm.sessions.values {
             session.saveDebounceTask?.cancel()
         }
-        await fixture.vm.prepareForWindowClose()
-        await fixture.vm.attachmentRuntime.waitForRetention()
-        await fixture.vm.test_drainSessionPersistenceAfterWindowClose()
+        await fixture.vm.test_retireAndCancelFixture()
         fixture.manager.prepareForWindowClose()
         // These cases model a fresh runtime reading only durable state, not a second live host.
         // The fixture and its XCTest teardown retain the old VM past close, so explicitly discard
