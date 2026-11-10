@@ -501,6 +501,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) async -> AsyncThrowingStream<AgentSessionSidebarBuildBatch, Error>
 
     private let runtimeSessionStore = AgentSessionRuntimeStore.shared.makeScope()
+
+    /// Captured before asynchronous draft preparation; not permission to save or dispatch.
+    func runtimeMembership(for session: TabSession) -> AgentSessionRuntimeStore.Membership? {
+        runtimeSessionStore.membership(of: session)
+    }
+
     private var runPresentationAttachments: [ObjectIdentifier: AgentSessionPresentationRuntime.Attachment] = [:]
     private(set) var sessions: [UUID: TabSession] {
         get { runtimeSessionStore.sessions }
@@ -11527,7 +11533,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             preserveRoutedInitialEffort: preserveRoutedInitialEffort
         )
         let autoEffortChoice = judgesUserTurn
-            ? await chooseAutoEffortForUserTurn(text: trimmedText, session: session, workflow: workflow)
+            ? await chooseAutoEffortForUserTurn(text: trimmedText, session: session, workflow: workflow, isCurrent: {
+                originalWriter.ownsPersistentClaim && !originalWriter.scope.isRetiring
+                    && mcpRuntime.controlledWriter(sessionID: sessionID)?.identity == originalWriter.identity
+                    && session.currentRestorationBindingToken == dispatchBindingToken
+            })
             : nil
         let autoEffortSelection = autoEffortChoice?.selection
         try Task.checkCancellation()
@@ -15231,7 +15241,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             // pending-switch composition while the existing composer owner retains its draft.
             let judgingText = Self.automationJudgingText(original: text, reprompted: repromptedText)
             let choice = modelRouterSettingsStore.autoEffortEnabled()
-                ? await chooseAutoEffortForUserTurn(text: judgingText, session: session, workflow: session.selectedWorkflow, isRepromptReplacement: repromptedText != nil) : nil
+                ? await chooseAutoEffortForUserTurn(text: judgingText, session: session, workflow: session.selectedWorkflow, isRepromptReplacement: repromptedText != nil, isCurrent: {
+                    composerSubmitClaimIsCurrent(claim) && sessions[destinationTabID] === session
+                }) : nil
             guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session else {
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }

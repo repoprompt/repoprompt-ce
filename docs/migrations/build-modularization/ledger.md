@@ -8174,3 +8174,56 @@ edges, 53/66 largest cycle**, unchanged baseline. These are local focused/affect
 gates, not full publication/products/live-app/release/sanitizer/hosted-CI qualification. Nothing
 pushed. The successful synthetic MCP cases attest input admission and effort feedback, not physical
 provider launch. Same-writer control reactivation is not separately fenced by activation ID.
+
+### M9.2g local checkpoint — auto-effort preparation keeps its ingress admission
+
+`chooseAutoEffortForUserTurn` now requires a non-escaping MainActor admission predicate, with no
+legacy/default-true overload. Its latched checks guard entry, the first effort normalizer, registry
+lookup completion, decision completion before the second normalizer, and the returned selection.
+The three composer call sites preserve their existing exact claim/destination predicate. MCP uses
+its captured control writer's persistent claim, retirement/control identity and binding token;
+it does not accidentally require a retained registration's old restoration generation to be current.
+Claude's getter can retain effort, dirty the session and schedule a save. Codex's effective-selection
+getter only reads selection policy. This patch qualifies the shared helper's writes, not the later
+submission/queue/provider boundary or every coordinator getter caller.
+
+Speculative effort captures existing runtime membership synchronously before creating its task,
+including legitimate unbound drafts. Membership stays only in the finite task frame, not on the
+speculation record/session or in a new authority registry. A refused speculation returns nil rather
+than an ordinary policy fallback, so the accepting composer recomputes after legitimate first
+binding. A narrow VM membership accessor exposes the existing scope receipt, not save/dispatch
+permission. The model-router speculative task is unchanged. Exact judgment-UUID cleanup remains
+operation-resource release after loss: it cannot clear a different judgment and avoids permanently
+blocking successor MCP turns. Its existing status-pill projection remains; it does not normalize
+effort. Upstream unbound composer-claim ABA provenance remains OPEN: a claim predicate that itself
+recovers could still accept a fallback audit after a latched refusal. No new claim-manager or
+physical-write/cancellation guarantee is inferred from this helper fence.
+
+One Oracle review (`0740`) approved with fixes. Whole Sources/Tests `effortTask` inventory found
+only the migrated optional-result consumer, cancellation/presence checks and the new fixture.
+Added the requested held-composer refusal witness. Existing six-variant MCP coverage now checks
+positive normalization and no stale normalization/dirty/save after loss. New three-variant
+speculation coverage proves task-entry ABA refusal, unchanged unbound success and first-binding
+recomputation (zero old requests then exactly one accepting-claim request). Registry-hop and
+post-normalizer checks are defensive source coverage, not separately injected test seams.
+
+Initial focused `62fb77a4-b8b6-4967-ad24-bd832a8e7beb` and labeled rerun
+`512d8e62-9953-4f75-be95-53594b96400b` compiled but failed three new assertions in the
+reactivated-context variant. Diagnostic jobs `58ff8fcd-0ece-4418-8c42-0027875d6277` and
+`7f342127-70a1-43de-bcee-789ed6f7b2e3` isolated a different call stack: successor approval-sync
+`applyApprovalSnapshot` requested full UI refresh, whose `updatePermissionBindingState` legitimately
+normalized the active tab. The fixture now makes the tab inactive before clearing the raw effort,
+so its no-write oracle isolates the old judgment, not independently admitted successor permission
+projection. Existing outcome/state assertions remain. Both temporary traces were removed, and the
+Claude coordinator is byte-identical to HEAD. No production fallback or weakened budget was added.
+
+Final focused `4ec1e6ad-95d8-4a38-9aef-2d2f431ee403` passed all **10 routing-integration tests**
+(5.231s), including the six MCP, three speculation and released-composer cases. Affected
+`8b6fe746-8321-4302-9943-93bdd36c935d` passed **820 tests, zero failures** (305.017s).
+Full lint `d6d4a555-fde2-4d6e-a042-24d8e0c6fe32` and scoped pinned formatting/strict lint passed.
+Actual compile warning occurrence maxima versus integrated `a0c674e9` remain VM four,
+RepromptAutomation two, Routing and routing-integration tests zero. Fresh index passed
+**1,262/1,360 wrong-way edges, 53/66 largest cycle**, unchanged baseline. These are local
+focused/affected/style/index gates, not full publication/products/live-app/release qualification.
+The overseer subsequently authorized publication after #1679 merged as `99d4e718d`; integrate that
+exact tree-identical squash and revalidate the publication tree before opening M9.2g.
