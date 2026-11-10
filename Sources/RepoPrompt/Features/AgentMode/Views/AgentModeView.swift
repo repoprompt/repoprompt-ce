@@ -3305,11 +3305,12 @@ struct AgentModeChatDetailView: View {
     }
 
     private var runningIndicatorSlot: some View {
-        runningIndicator
-            .frame(height: runningIndicatorReservedHeight, alignment: .leading)
-            .opacity(shouldShowRunningIndicator ? 1 : 0)
-            .allowsHitTesting(shouldShowRunningIndicator)
-            .accessibilityHidden(!shouldShowRunningIndicator)
+        AgentReservedIndicatorSlot(
+            isShown: shouldShowRunningIndicator,
+            reservedHeight: runningIndicatorReservedHeight
+        ) {
+            runningIndicator
+        }
     }
 
     private var runningIndicator: some View {
