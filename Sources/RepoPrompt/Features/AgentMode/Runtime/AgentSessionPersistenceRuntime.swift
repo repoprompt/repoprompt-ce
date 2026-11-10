@@ -85,6 +85,10 @@ final class AgentSessionPersistenceRuntime {
         )
     }
 
+    #if DEBUG
+        var test_afterConfiguredCreationAcknowledgement: (@MainActor (AgentSessionCreationHandle) async -> Void)?
+    #endif
+
     var debounce: () async throws -> Void = { try await Task.sleep(nanoseconds: 1_000_000_000) }
     private var sessions: [UUID: AgentTabSession] {
         scope?.sessions ?? [:]
@@ -559,28 +563,94 @@ final class AgentSessionPersistenceRuntime {
             ))
         }
 
-        if case .exact = expectation {
-            // Do not cancel an owner's ordinary request while this exact operation is queued.
-            // Once admitted to write, remember that request separately from our acknowledgment.
-            let hadPendingDebounce = capturedSession.saveDebounceRequestID != nil
-                && capturedSession.saveDebounceTask?.isCancelled == false
-            capturedSession.saveDebounceTask?.cancel()
-            capturedSession.saveDebounceTask = nil
-            capturedSession.saveDebounceRequestID = nil
-            defer {
-                if hadPendingDebounce, !permits(expectation, tabID: tabID),
-                   sessions[tabID] === capturedSession,
-                   capturedSession.persistentSessionBindingIdentity == capturedBinding,
-                   capturedSession.isDirty, capturedSession.saveDebounceRequestID == nil
-                {
-                    // Preserve only the pre-existing same-record owner's request, not a retry
-                    // invented by this failed exact operation or a write to a recycled tab.
-                    scheduleSave(for: capturedSession)
-                }
+        if case let .exact(writer) = expectation {
+            return await withPreservedOwnerDebounce(for: capturedSession, writer: writer) {
+                await finishRequiredSave(for: tabID, session: capturedSession, writer: expectation, observingSavePhase: observingSavePhase)
             }
-            return await finishRequiredSave(for: tabID, session: capturedSession, writer: expectation, observingSavePhase: observingSavePhase)
         }
         return await finishRequiredSave(for: tabID, session: capturedSession, writer: expectation, observingSavePhase: observingSavePhase)
+    }
+
+    /// Call after the in-flight wait and exact-owner guard, without suspending before the
+    /// operation reaches saveSessionCore's queue admission. Preserve an independently pending
+    /// ordinary save, never invent a retry on behalf of a stale exact operation.
+    private func withPreservedOwnerDebounce<Value>(
+        for session: TabSession, writer: AgentSessionRuntimeStore.Writer,
+        operation: () async -> Value
+    ) async -> Value {
+        let binding = session.persistentSessionBindingIdentity
+        let hadPendingDebounce = session.saveDebounceRequestID != nil
+            && session.saveDebounceTask?.isCancelled == false
+        session.saveDebounceTask?.cancel()
+        session.saveDebounceTask = nil
+        session.saveDebounceRequestID = nil
+        defer {
+            if hadPendingDebounce, !permits(.exact(writer), tabID: session.tabID),
+               sessions[session.tabID] === session, session.persistentSessionBindingIdentity == binding,
+               session.isDirty, session.saveDebounceRequestID == nil
+            {
+                scheduleSave(for: session)
+            }
+        }
+        return await operation()
+    }
+
+    /// Receipt-based ingress captures the writer synchronously; all awaited work retains it.
+    /// A creation handle is not permission to resolve a different writer after queueing.
+    func commitConfiguredCreation(_ handle: AgentSessionCreationHandle) async -> AgentSessionSaveCoreResult {
+        guard let scope,
+              case let .unique(writer) = scope.resolveWriter(
+                  workspaceID: handle.workspaceID, sessionID: handle.bindingToken.bindingIdentity.sessionID
+              ), writer.scope === scope
+        else {
+            return .deferred("The session does not have a unique runtime writer for this workspace.")
+        }
+        return await commitConfiguredCreation(handle, writer: writer)
+    }
+
+    func commitConfiguredCreation(
+        _ handle: AgentSessionCreationHandle, writer: AgentSessionRuntimeStore.Writer
+    ) async -> AgentSessionSaveCoreResult {
+        let session = handle.session
+        guard writer.session === session, writer.restoration == handle.bindingToken,
+              writer.identity.workspaceID == handle.workspaceID,
+              permits(.exact(writer), tabID: session.tabID), composition?.creationIsCurrent(handle) == true
+        else { return .deferred("The session creation owner changed.") }
+        let durableReadiness = AgentSessionRestorationReadiness.authoritative(handle.bindingToken, .freshBindingDurablyCreated)
+        if session.qualifiedRestorationReadiness == durableReadiness {
+            return .durablySaved(handle.bindingToken)
+        }
+        guard !Task.isCancelled, session.creationHandleIsCurrent(handle) else {
+            session.failCreationPreparation(handle, message: "Initial session creation was cancelled or replaced.")
+            return .deferred("Initial session creation was cancelled or replaced.")
+        }
+        while queue.inFlightSessionIDs.contains(writer.identity.sessionID) {
+            await waitForInFlightSave(sessionID: writer.identity.sessionID)
+            guard !Task.isCancelled, permits(.exact(writer), tabID: session.tabID),
+                  composition?.creationIsCurrent(handle) == true, session.creationHandleIsCurrent(handle)
+            else { return .deferred("Initial session creation changed while an earlier save completed.") }
+        }
+        guard permits(.exact(writer), tabID: session.tabID),
+              session.currentRestorationBindingToken == handle.bindingToken,
+              composition?.creationIsCurrent(handle) == true
+        else { return .deferred("The originating writer changed before persistence.") }
+        let result = await withPreservedOwnerDebounce(for: session, writer: writer) {
+            session.isDirty = true
+            return await saveSessionCore(for: session.tabID, creationSave: .configured(handle), writer: .exact(writer))
+        }
+        guard case let .durablySaved(token) = result else { return result }
+        guard token == handle.bindingToken, permits(.exact(writer), tabID: session.tabID),
+              composition?.creationIsCurrent(handle) == true, session.qualifiedRestorationReadiness == durableReadiness
+        else { return .deferred("The session creation owner changed after persistence.") }
+        #if DEBUG
+            await test_afterConfiguredCreationAcknowledgement?(handle)
+        #endif
+        // Cancellation alone after acknowledgement does not erase the persistence fact. Loss of
+        // the exact writer still refuses this operation, even if the same object reacquires it.
+        guard permits(.exact(writer), tabID: session.tabID), composition?.creationIsCurrent(handle) == true,
+              session.qualifiedRestorationReadiness == durableReadiness
+        else { return .deferred("The saved session was replaced before completion.") }
+        return .durablySaved(token)
     }
 
     private func finishRequiredSave(

@@ -61,8 +61,8 @@ final class AgentSessionTranscriptRuntimeTests: XCTestCase {
             var placement = payload.restoredIndexEntry
             placement.organizationalParentID = UUID()
             placement.delegationScopeID = UUID()
-            let applied = try XCTUnwrap(AgentSessionHydrationRuntime.apply(
-                payload, to: session, expected: session.persistentBindingTransitionToken(),
+            let applied = try XCTUnwrap(try AgentSessionHydrationRuntime.apply(
+                payload, attempt: hydrationAttempt(for: session),
                 selection: selection, codexPolicy: policy, indexedPlacement: placement, usage: AgentSessionUsageRuntime()
             ))
             XCTAssertFalse(session.qualifiedRestorationReadiness.isAuthoritative)
@@ -91,12 +91,12 @@ final class AgentSessionTranscriptRuntimeTests: XCTestCase {
     func testFullHydrationRejectsStaleIncarnationBeforeAnyPayloadMutation() async throws {
         try await withPayload { payload in
             let session = AgentTabSession(tabID: payload.restoredIndexEntry.tabID)
-            session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: payload.sessionID))
-            let previous = session.persistentBindingTransitionToken()
+            session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: payload.sessionID, workspaceID: payload.sourceWorkspaceID))
+            let previous = try hydrationAttempt(for: session)
             session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: payload.sessionID))
             let originalItems = session.items
             XCTAssertNil(AgentSessionHydrationRuntime.apply(
-                payload, to: session, expected: previous,
+                payload, attempt: previous,
                 selection: .init(agent: .codexExec, modelRaw: "gpt-5", explicitReasoningEffortRaw: "high"),
                 codexPolicy: .init(options: [.high], defaultEffort: .high, lastUsed: nil),
                 indexedPlacement: nil, usage: AgentSessionUsageRuntime()
@@ -114,8 +114,8 @@ final class AgentSessionTranscriptRuntimeTests: XCTestCase {
             session.installPersistentSessionBinding(.init(
                 tabID: session.tabID, sessionID: payload.sessionID, workspaceID: UUID()
             ))
-            XCTAssertNil(AgentSessionHydrationRuntime.apply(
-                payload, to: session, expected: session.persistentBindingTransitionToken(),
+            XCTAssertNil(try AgentSessionHydrationRuntime.apply(
+                payload, attempt: hydrationAttempt(for: session),
                 selection: .init(agent: .codexExec, modelRaw: "gpt-5", explicitReasoningEffortRaw: nil),
                 codexPolicy: .init(options: [], defaultEffort: nil, lastUsed: nil),
                 indexedPlacement: nil, usage: AgentSessionUsageRuntime()
@@ -134,8 +134,8 @@ final class AgentSessionTranscriptRuntimeTests: XCTestCase {
             session.installPersistentSessionBinding(.init(
                 tabID: session.tabID, sessionID: payload.sessionID, workspaceID: payload.sourceWorkspaceID
             ))
-            let applied = try XCTUnwrap(AgentSessionHydrationRuntime.apply(
-                payload, to: session, expected: session.persistentBindingTransitionToken(),
+            let applied = try XCTUnwrap(try AgentSessionHydrationRuntime.apply(
+                payload, attempt: hydrationAttempt(for: session),
                 selection: AgentSessionHydrationRuntime.selection(for: payload, availability: .current, codexDynamicModels: nil),
                 codexPolicy: .init(options: [], defaultEffort: nil, lastUsed: nil),
                 indexedPlacement: nil, usage: AgentSessionUsageRuntime()
@@ -155,6 +155,74 @@ final class AgentSessionTranscriptRuntimeTests: XCTestCase {
                 .reasoningEffort(modelRaw: "gpt-5", explicitRaw: "high"),
             nil
         )
+    }
+
+    private func hydrationAttempt(for session: AgentTabSession) throws -> AgentSessionHydrationRuntime.Attempt {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        scope.replaceSessions([session.tabID: session])
+        return try XCTUnwrap(AgentSessionHydrationRuntime.Attempt.capture(
+            session, in: scope, transition: session.persistentBindingTransitionToken()
+        ))
+    }
+
+    func testHydrationCannotApplyOrGrantReadinessToAReacquiredWriter() async throws {
+        try await withPayload { payload in
+            for afterApplication in [false, true] {
+                let session = AgentTabSession(tabID: payload.restoredIndexEntry.tabID)
+                session.installPersistentSessionBinding(.init(
+                    tabID: session.tabID, sessionID: payload.sessionID, workspaceID: payload.sourceWorkspaceID
+                ))
+                let attempt = try hydrationAttempt(for: session)
+                @MainActor func apply() -> AgentSessionHydrationRuntime.AppliedPayload? {
+                    AgentSessionHydrationRuntime.apply(
+                        payload, attempt: attempt,
+                        selection: .init(agent: .codexExec, modelRaw: "gpt-5", explicitReasoningEffortRaw: nil),
+                        codexPolicy: .init(options: [], defaultEffort: nil, lastUsed: nil),
+                        indexedPlacement: nil, usage: attempt.writer.scope.usage
+                    )
+                }
+                let applied = afterApplication ? try XCTUnwrap(apply()) : nil
+                XCTAssertTrue(attempt.writer.isCurrent, "Field application must not rotate the writer")
+                let before = session.items
+                let transition = session.persistentBindingTransitionToken()
+                attempt.writer.scope.replaceSessions([:])
+                attempt.writer.scope.replaceSessions([session.tabID: session])
+                XCTAssertTrue(transition.matches(session), "Binding/revision tokens alone do not detect reacquisition")
+                XCTAssertFalse(attempt.ownsBinding)
+                if let applied {
+                    XCTAssertFalse(applied.commitReadiness())
+                } else {
+                    XCTAssertNil(apply())
+                }
+                XCTAssertEqual(session.items, before)
+                XCTAssertFalse(session.hasLoadedPersistedState)
+                XCTAssertFalse(session.qualifiedRestorationReadiness.isAuthoritative)
+            }
+        }
+    }
+
+    func testHydrationRefusesRetirementWithoutRequiringRestoredAdmission() async throws {
+        try await withPayload { payload in
+            let session = AgentTabSession(tabID: payload.restoredIndexEntry.tabID)
+            session.installPersistentSessionBinding(.init(
+                tabID: session.tabID, sessionID: payload.sessionID, workspaceID: payload.sourceWorkspaceID
+            ))
+            let attempt = try hydrationAttempt(for: session)
+            XCTAssertTrue(attempt.isCurrent)
+            XCTAssertFalse(session.permitsBoundOperationAndSave)
+            attempt.writer.scope.beginRetirement()
+            XCTAssertNil(AgentSessionHydrationRuntime.Attempt.capture(
+                session, in: attempt.writer.scope, transition: attempt.transition
+            ))
+            XCTAssertNil(AgentSessionHydrationRuntime.apply(
+                payload, attempt: attempt,
+                selection: .init(agent: .codexExec, modelRaw: "gpt-5", explicitReasoningEffortRaw: nil),
+                codexPolicy: .init(options: [], defaultEffort: nil, lastUsed: nil),
+                indexedPlacement: nil, usage: attempt.writer.scope.usage
+            ))
+            XCTAssertTrue(session.items.isEmpty)
+            XCTAssertFalse(session.hasLoadedPersistedState)
+        }
     }
 
     private func withPayload(legacyWorkspace: Bool = false, _ body: (AgentSessionHydrationPayload) throws -> Void) async throws {

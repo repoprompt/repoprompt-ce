@@ -7094,6 +7094,297 @@ restored without dropping the recovery stash. Final restored-tree products
 Its actual compile diagnostics were also included in the warning audit with no positive deltas.
 No CI logs were read; no full-suite, live-app, release or sanitizer qualification is claimed.
 
+#### M9.2e — configured first-save transaction (validated locally; publication held)
+
+M9.2c is isolated for review as draft #1676 at `c4397ec3d`; no feature work is added to that
+branch. M9.2e starts locally at that exact head and must not be pushed until the overseer directs
+main integration after #1676 merges. The first bounded binding/creation/hydration slice moves the
+actual configured first-save transaction into `AgentSessionPersistenceRuntime`. Run start removes
+its VM commit callback and supplies the writer captured synchronously at binding. The VM retains
+thin receipt ingress for existing callers, including M9.2d's administrative caller; that caller's
+body and all administrative/worktree behavior remain untouched.
+
+The transaction retains its writer through the existing save queue, configured physical save and
+acknowledgement. Even an already-durable fast path requires a current unique writer. Same-object
+reacquisition is not credited after the queue wait or acknowledgement. Cancellation alone after
+acknowledgement still preserves the durability fact. A shared private debounce-preservation helper
+retains the M9.2c independent-owner-save rule; generic required-flush semantics are unchanged.
+
+One Oracle review (`untitled-chat-27CBAF`, snapshot `2026-11-10/1029`) confirmed the production
+writer/debounce boundaries and requested direct run-start coverage. Queue cancellation is
+preservation coverage; the reacquisition variants distinguish the old late-owner behavior.
+Only an exact current writer may fail creation preparation: cancellation with a stale/conflicting
+writer now refuses without mutating that claim's creation state. A valid pre-write dirty mutation
+is not rolled back through a reacquired successor after storage returns. Neither behavior grants
+new admission or schedules a stale retry. Read-only creation catalog policy, binding installation,
+hydration, first-bind preparation and inner provider execution remain open. M9.3 composition,
+M9.4 handoff/drain and M10 relocation are not claimed here.
+
+The review-requested run-start witness now uses the actual blank-tab binding admission and runtime
+creation commit: exactly one configured acknowledgement precedes intercepted dispatch, while
+same-object reacquisition at that acknowledgement prevents dispatch without erasing the saved
+payload. It supplements (rather than claiming equivalent coverage from) the retired callback
+fixtures' acknowledgement hooks. Caller/body search finds no `Environment.commitCreation` or
+`environment.commitCreation`; the VM result method is a one-line receipt ingress, not an alternate
+transaction body. No new coordinator, save queue, lifecycle authority or mutable fallback exists.
+
+Initial focused `3890a3e0-29ec-4f92-a5af-9a8f7cb201a5` passed **288 tests**. Final focused
+`c01e3c72-fe3a-4a23-90dc-0fbdb183a70a` passed **289 tests**, including the new direct run-start
+witness, restoration/creation, auto-wake, compact/send required-save, persistence and first-save
+regressions. Pinned scoped formatting and strict lint passed on all five touched Swift files;
+the final two-file review correction was checked again. Actual compiler warning occurrence counts
+match the M9.2c base: VM **4→4**, auto-wake tests **11→11**, other three files **0→0**. A fresh
+post-test compiler-index check remains **1,253/1,360 wrong-way edges, 53/66 largest cycle**, with no
+baseline change. These are local-commit gates: no new full broad selection, both-product build,
+full lint, live-app smoke, release or hosted-CI result is claimed for this slice. The publication
+gates will run before the explicitly authorized next draft PR; nothing is pushed now.
+
+#### M9.2e — hydration field/readiness writer capture (local follow-up)
+
+Hydration now captures an operation-local `AgentSessionHydrationRuntime.Attempt` containing the
+existing canonical writer and binding transition before the disk read. The transition token alone
+survives removal/re-addition of the same object; the writer incarnation does not. Full field apply
+requires this attempt, and the applied-payload receipt retains it through readiness publication.
+Revision-only drift is still classified separately, but only while the originating writer remains
+current; payload, nil, error and source-superseded results cannot publish proofs to a reacquisition.
+Hydration deliberately does not require restored-command admission, which it is supposed to earn.
+
+The VM captures before its producer task and automatic presentation admission, matches the read
+workspace to the binding, and settles an already-admitted Retry as cancelled if capture refuses.
+An unscoped/conflicting/retiring bound object does not gain even the suppressed-persistence loaded
+latch through this path: suppression is not a bypass around canonical mutation ownership. Unbound
+fresh-session suppression remains unchanged. Existing presentation coalescing, stale-drop recovery,
+explicit Retry entry scheduling, deletion policy, route pre-binding catalog reads and VM loader/body
+retirement remain open. In particular, this slice does not grant a later read permission to replace
+new local input: the stale-result test pins its preservation and does not initiate that separate read.
+
+The only overlap with M9.3 is necessary hydration-API wiring in
+`AgentSavedSessionTargetLoader+Runtime`: capture its newly installed writer before `readPayload`,
+never adopt a post-read resolution, and release a failed clean loading claim only while its original
+persistent claim still belongs to it. Retirement can release the original clean claim; reacquisition
+or raw conflict retains it rather than evicting a successor. A fresh resolution after refusal is
+used only to preserve failure classification, never as replacement authority. Storage inputs,
+composition, prepared owners and attachment configuration are untouched.
+
+One Oracle review (`untitled-chat-27CBAF`, snapshot `2026-11-10/1114`) requested the Retry settlement
+and failure-taxonomy corrections, which are applied. The existing auto-edit projection keeps its
+revision/binding predicate and tab-store compensation unchanged, adding only an originating-writer
+entry check. Its physical setter ordering and successor compensation remain explicitly open; this
+is not an approval-store receipt cutover or a host-lifetime/drain claim. Attempt values are local to
+operations, not added to the session store or presentation records.
+
+The first two compile attempts found missing explicit main-actor isolation on the new nested
+attempt type and a test-local apply helper respectively; both are corrected at those declarations,
+without package settings, blanket annotations or unchecked sendability. The third run was cancelled,
+not counted as a pass: `testOldAttemptUnwindDoesNotClearSuccessorLoadTaskAfterRebind` installed an
+unscoped test binding, then awaited a second preparation the canonical boundary correctly refused.
+The fixture now preserves its workspace while performing the same real transition, asserts the
+successor writer, and retains every existing task-ownership assertion and timing budget.
+
+Final focused `dba11dc3-030a-407d-9cc5-1f435c8ae037` passed **175 tests** across all eight selected
+families: window-free runtime loading (12), target lookup (7), restoration admission (23), transcript
+runtime (9), sidebar restoration stability (14), pane classification (42), snapshot publication (4)
+and real restoration lifecycle (64). The new VM disk-result matrix covers payload, missing, error
+and revision drift; the loader matrix covers both old-read hydration and failed cleanup after
+same-object reacquisition. Runtime tests cover the pre-apply and pre-readiness boundaries plus
+retirement without requiring restored admission. No test budgets or behavioral assertions were
+weakened. The earlier compile/cancelled tickets are not validation passes.
+
+Full lint `4db5c0cb-8129-4bfa-a6c4-4c86169377fb` and pinned scoped formatting/strict lint passed.
+The final fixture correction was formatted before the full lint began. Actual compilation across
+the successful source compile and corrected fixture recompile matches the M9.2c per-file warning
+occurrence baseline: VM **4→4**, the other six touched Swift files **0→0**. The fresh post-test
+compiler-index check remains **1,253/1,360 wrong-way edges, 53/66 largest cycle**, without baseline
+changes. These remain local checkpoint receipts: no full SessionLinks publication selection,
+both-product build, live-app smoke, release or new hosted-CI qualification is claimed. Nothing is
+pushed; #1676 remains scoped to checkpoints 9–12.
+
+#### M9.2e — runtime-owned hydration read and terminal settlement (local follow-up)
+
+The concrete persisted-hydration storage read and its writer/revision/cancellation classification
+now live in `AgentSessionHydrationRuntime.read`, directly awaited on the existing loader task.
+It validates the request's tab, session and workspace before IO, never resolves a replacement writer,
+and returns a typed result without mutating readiness. `settleTerminal` owns the existing terminal
+proof followed by the loaded latch, rechecking the original writer at that separate mutation boundary.
+The VM retains the exact presentation-attempt check for revision-only candidates, provider/payload
+application, and optional projection; it no longer owns the storage `do/catch` or those proof writes.
+Cancellation still precedes nil/missing, and a failed read with local revision drift preserves local
+projection without manufacturing a restoration proof. No new task, callback owner or state manager
+was added. Full payload/provider-repair retirement, AutoEdit's physical setter fence, binding,
+coalescing/presentation recovery and deletion admission remain open.
+
+One Oracle review (`untitled-chat-27CBAF`, snapshot `2026-11-10/1213`) checked branch equivalence
+and requested tighter superseded-proof evidence, independent reacquisition coverage, presentation-gate
+coverage and preserved diagnostic labels. The superseded proof now also requires actual revision
+drift: both automatic admission and explicit Retry capture their start revision and transition in
+one synchronous operation, so the retained late payload guard cannot legitimately grant that proof
+without drift. The matrix independently refuses superseded settlement after reacquisition, including
+reacquisition plus revision drift, before retirement could mask the cause. A narrow DEBUG seam calls
+the real presentation admission path without rotating the writer or starting a producer; the VM test
+uses it during payload/error reads and verifies the old producer cannot settle the replacement.
+No runtime fallback or test timing budget was introduced. Restore-trace cancellation labels are kept;
+the error print now identifies the runtime owner. No tests or diagnostic scripts consume those labels.
+
+The first focused ticket `6ea07216-d5ea-4ab2-9b93-f076356478ba` passed **177 tests** before the
+review follow-ups. The next build caught a pinned-formatter transformation of `&&` inside a ternary
+guard into a comma; the condition is now a local Boolean followed by its guard. The subsequent run
+compiled and passed 177 of 178 cases, exposing that the new presentation replacement test had used
+a first-save fixture with no presentation owner. That test now uses the existing saved-tab lifecycle
+fixture and its real owner adoption/read gate, without changing production admission or weakening
+any assertion or budget. Failed build/test tickets are not counted as validation passes.
+
+Final focused `985e7abd-bcde-49e4-9e7e-aa110fbadce0` passed **178 tests**, no skips or failures,
+across the same eight runtime-loading/target-lookup/restoration/transcript/sidebar/presentation
+families. The read matrix covers 18 payload/missing/error and revision/cancellation/reacquisition
+combinations; a separate identity test refuses wrong workspace, session and tab before storage.
+The real presenter test covers both successful and failed obsolete read results while the canonical
+writer remains current. Full lint `0271feb8-08b2-40ff-901d-5bb32a4811dd` passed; the later guard and
+fixture corrections passed pinned scoped formatting and strict lint. Actual compilation of all four
+touched Swift files matches the M9.2c per-file warning occurrence baseline: VM **4→4**, the other
+three **0→0**. The fresh compiler-index check is **1,254/1,360 wrong-way edges, 53/66 largest
+cycle**, with the baseline unchanged. The added edge is the runtime read's explicit workspace-ID
+validation against `Features/Workspaces/WorkspaceModel.swift` (`id`); this is disclosed cross-feature
+placement debt, not a target-extraction claim or a reason to weaken the identity check. These are
+local checkpoint gates, not a new both-product/full SessionLinks/live-app/release/hosted-CI
+qualification. Nothing is pushed; binding and startup work remains in progress.
+
+#### M9.2e — runtime-owned hydration commit (local follow-up)
+
+`AgentSessionHydrationRuntime.commit` now owns the app-composed field/attachment/provider-repair/
+migration-save/readiness sequence formerly in the VM. It uses the captured writer's existing usage,
+attachment, persistence and optional presentation owners, with incarnation/binding checks between
+synchronous external stages. Source-revision checks are intentionally not used after applying the
+payload, which itself advances that revision. The sort-date projection still precedes Codex repair;
+active-model/index projection follows it; readiness still precedes Claude effort repair. The VM
+installs its existing attachment/persistence composition and supplies concrete provider dependencies,
+not a callback containing the old mutation body. Migration save now deliberately uses the exact
+session overload rather than re-resolving a tab. Provider-internal refresh/save mutation fences and
+full binding/startup retirement remain open. No M9.3 storage or cold-loader behavior was changed.
+
+The former AutoEdit task was removed rather than made newly effective: its first guard compared the
+pre-application source revision, but every hydration, including an empty payload, increments that
+revision. The property is writable (not `private(set)`); the production-source audit found only its
+initialization and four increment sites, no resetting assignment. This does not claim that other
+permission-store setters are fenced. The VM attachment-repair wrapper remains test-used in the
+other lane's file; there is no production caller after this cutover.
+
+One Oracle review (`untitled-chat-D9F4D8`, snapshot `2026-11-10/1324`) found no new correctness
+regression and requested a real VM projection witness, a direct source-revision assertion, and
+updated ownership wording. Those changes are applied. The direct runtime matrix covers optional
+presenter absence and same-object writer reacquisition at each projection boundary, checking provider
+repair order and refusal of later migration saves/readiness. A second test keeps the actual VM sink
+and checks that normal hydration replaces stale index, sort-date and model display state. No test
+budget or existing assertion was weakened. Two initial focused tickets were explicitly cancelled
+before global heavy admission to finish review coverage and correct the new fixture's sort-date
+expectation to the existing last-user-message-only policy; neither is a test result.
+
+Final focused `ee620fc0-9d51-48a3-96e7-ecba6e59d196` passed **180 tests**, no skips or failures,
+across the same eight loading/restoration/transcript/sidebar families. Both new cases passed, using
+real provider repair and the real VM sink respectively. Full lint
+`b9519454-ea43-4bc3-8d47-749b97e9ce52` passed; the final fixture-only expectation correction also
+passed pinned scoped formatting and strict lint. Actual compiler warning occurrences match the
+M9.2c baseline across all four touched Swift files: VM **4→4**, the other three **0→0**. The fresh
+index check remains **1,254/1,360 wrong-way edges, 53/66 largest cycle**, with no baseline change.
+These are local checkpoint gates only, not a new both-product/full SessionLinks/live-app/release/
+hosted-CI qualification. Nothing is pushed; #1676 remains untouched and binding/startup is ongoing.
+
+#### M9.2e — exact membership during binding preparation (local follow-up)
+
+The existing runtime claim registry now gives unbound members an incarnation as well. Only bound
+members enter the reverse persistent-session index; unbound membership neither elects a writer nor
+grants workspace, restoration, save or command authority. `Membership` is an operation-local receipt
+from that same registry, not another owner. Structural currency is shared with persistent writers;
+new binding preparation additionally refuses retirement, a competing persistent claim, or the same
+object held by another scope. Republishing an unchanged member preserves its receipt, while removal
+and reacquisition, replacement and every binding install invalidate it.
+
+The VM's async rebind preparation captures the target before its first await and the source before
+its drain, then checks both after preparation awaits and before touching carriers/unbinding. Deferred
+generation-latch completion remains originating cleanup, but requalifying the unchanged source's
+old restoration proof now requires its exact membership. This checkpoint deliberately stops at the
+pre-install boundary: synchronous install/callout fencing, source-unbind/target-install rollback,
+the later worktree await, the caller's earlier `expectedTransition` awaits and the M9.3 queued-visit
+closure remain open. It does not retire the actual VM binding body or claim that this group is done.
+No admin/VCS implementation, prepared-owner registry or saved-host composition was changed.
+
+One Oracle review (`untitled-chat-D9F4D8`, snapshot `2026-11-10/1423`) requested verification of new
+refusal assumptions, a shared structural predicate, a loud test-barrier failure and positive bound-
+target coverage. Those changes/checks are applied. The VM's `sessions` directly gets/sets the scope's
+map, so a VM member cannot be absent from that scope. The production rebind caller obtains its target
+through `session(for:)`; the DEBUG entry follows the same contract. Production membership insertion
+sites are VM-created fresh objects and the cold loader's `scope.makeSession`; no production insertion
+shares one object across scopes. The store still represents deliberate/raw duplicate ownership as a
+conflict, rather than electing one owner. Future host adoption must transfer, not overlap, authority.
+
+The new store witnesses cover unbound ABA, explicit nil installs, unchanged publication, unscoped
+qualification without command admission, conflicts, retirement and release. The real VM rebind matrix
+covers successful bound/unbound targets and same-object target/source reacquisition at the registration-
+check boundary, asserting unchanged carriers/payload bytes and no stale readiness grant. Early prepared-
+owner/no-op and synchronous transition-observer reentry are source-checked, not separately injected in
+this checkpoint.
+
+Focused `14239920-de45-4010-a2d1-b054c92b3cfe` passed **165 tests**, no skips or failures:
+runtime-store 12, restoration-admission 28, lane first-save 48, saved-runtime loading 12 and restoration
+lifecycle 65. The real rebind matrix passed all five variants. Full lint
+`8fd7cc57-30d1-491b-a465-4d202500450b` passed. Actual compilation of all four touched Swift files
+matches the M9.2c warning occurrence baseline: VM **4→4**, other three **0→0**. The fresh index
+check remains **1,254/1,360 wrong-way edges, 53/66 largest cycle**, baseline unchanged. These are
+local checkpoint receipts, not full publication qualification. The overseer subsequently confirmed
+#1676's squash merge and authorized exact-squash ancestry reconciliation, broader gates and a new
+M9.2e draft PR; that integration/publication is recorded below.
+
+#### M9.2e — main reconciliation and publication gates
+
+The receipt checkpoint is `43d4554b2`. Normal merge `e224fcc9c` brings #1673 (`52cfc603c`)
+without conflicts. Recomputed `git merge-tree --write-tree c4397ec3d 52cfc603c` yields tree
+`8dd4fdba975f6ddad9f0bca16ab4323919462a56`, exactly equal to squash `e8e49c5d4`.
+Ancestry-only merge `29d28068d` targets that exact squash, **not** `origin/main`. The following
+normal merge of `origin/main` was already up to date at `e8e49c5d4`. Main-relative changes are
+only M9.2e's five checkpoints (14 files); merge-tree with that main is clean. The incoming keychain
+fix remains intact. No rebase, force push or published-history rewrite occurred.
+
+Process deviation: the receipt commit passed its staged preflight, but the two merge commits were
+then created in the same command without separate staged preflights before each merge commit.
+This is not represented as satisfying that per-commit requirement. The final outgoing-range safety
+check will cover all outgoing commits before publication; future merges must use `--no-commit`
+and a staged preflight. No protected investigation/export artifact entered a commit.
+
+Integrated broad, isolated handoff, both-product and full-lint gates are in progress. The broad filter
+contains all SessionLinks families plus admission/sidebar/lane policy, all affected creation/hydration/
+save/persistence families and #1673's keychain/provider-error coverage. It includes 133 existing suite
+names plus one inert legacy `SessionAdminProductionOrganizerTests` filter name; no such suite exists
+and no coverage is claimed for it. The saved future filter removes that inert name.
+
+Publication is held: broad ticket `779d1e16-925d-418e-a479-4e3d83ca4615` failed two app cases
+(resident Steer `CancellationError`, and restoration's `index batch applied` precondition). Its app
+selection executed 2,376 tests, 22 skipped, with two failures. Isolated handoff ticket
+`d491e011-fba0-4152-9ee0-a46f5a539382` executed 104 tests with two assertions failing in one
+restored provider-switch refusal case (disconnected Claude rather than handover-length refusal).
+None is classified as the previously known render/scale or skill-expansion intermittent. Exact-case
+head/main isolation is pending; no assertion, precondition or timeout has been changed.
+Both products `ffb048ac-134e-4cab-865a-416e7675a514` and full lint
+`c8b9f4fb-31f0-4a20-ad9f-97af96daf44c` passed. The actual broad compilation has no positive
+warning-occurrence deltas across 13 changed Swift files: VM 4→4, AutoWake tests 11→11, others 0→0.
+Shared `origin/main` subsequently advanced to `fafdc9050` (#1669 and #1672); the tested head remains
+`29d28068d`, and comparisons must record the exact main SHA rather than assume the ref stayed fixed.
+
+Exact single-case isolation passed on both revisions, without changing code, assertions or budgets:
+
+| Case | M9.2e `29d28068d` | Main `fafdc9050` |
+| --- | --- | --- |
+| Resident Steer | `ae31bf57-e9b7-4b81-a044-1e3db76ed307`, 1.355s | `71a403b1-6bfb-4291-8731-f89863e5efe3`, 1.351s |
+| Transcript index batch | `7a5d79e3-b35b-4845-846c-be06b804dff7`, 0.876s | `0ddb0d05-695c-46c9-a163-3536738f7ab7`, 0.725s |
+| Restored provider-switch refusal | `f04ea34d-5f50-48ce-ab67-2351cdf96ebd`, 4.908s | `8e068458-75e4-44c8-ba1e-834bfa69de11`, 14.013s |
+
+Each isolation executed one test with no failures. The main comparison used a ledger-only recovery
+stash, restored afterward; the four local investigation/export artifacts were untouched. The overseer
+explicitly authorized publication with the classification **broad-run only, not root-caused, isolated
+pass on head and main**, under watch in the PR. This does not prove inheritance or repair. A reported
+CI recurrence belongs to this lane for production root-cause work. No CI logs were read.
+The index check attempted while validation was active refused to attest freshness (zero stale/unindexed
+source files but freshness unproven); the last successful checkpoint check was 1,254/1,360 wrong-way
+edges and 53/66 largest cycle. This is not recorded as a fresh integrated index pass.
+
 ### M9.4 phase 0: presentation-lifetime groundwork (refs #1406)
 
 Base `534e2c759`. This slice does **not** implement close-preserves-run, host leases,
