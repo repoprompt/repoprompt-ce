@@ -7247,8 +7247,8 @@ runtime **16** and the actual handoff-inheritance suite **104**, including the f
 regression. Full lint `bf35d8f8-05b9-47f2-98ec-0a53fea4ff52` and corrected-tree products
 `4eb420cf-8b93-4655-af94-602bca4accaa` passed. The expanded audit now includes the provider-switch
 adapter: **42 owned Swift files**, the same four nonzero counts above, and zero in the other
-38 files; no positive count or normalized-signature delta. This is still local work, withheld from
-#1678 by lane instruction for a separate phase-0b PR after groundwork merges. No CI logs were
+38 files; no positive count or normalized-signature delta. At local checkpoint `3bed4d24b`, this
+work was withheld from #1678 by lane instruction for a separate phase-0b PR after groundwork merged. No CI logs were
 read; no full-suite, live-app, release or sanitizer qualification is claimed.
 
 Final corrected-tree broad selection `6c13992a-4462-455f-a952-9df921472d35` passed
@@ -7256,5 +7256,25 @@ Final corrected-tree broad selection `6c13992a-4462-455f-a952-9df921472d35` pass
 paths, SessionLinks, self-compaction, restoration/admission, handoff, sidebar, runtime store and
 the actual prepared-owner visit. The post-product fresh index check remains **1,256/1,360 edges,
 53/66 largest-cycle components**; no baseline changed. All owned validation tickets were terminal
-before the local checkpoint. Publication waits for #1678's merge and the instructed squash
+before the local checkpoint. Publication then waited for #1678's merge and the instructed squash
 integration into a separate phase-0b draft PR.
+
+After #1678 merged as `ac8a6f3a9`, integration used normal merge `d50e898a0` of checkpoint
+`884fda621`. The actual tree from `merge-tree(aaef76bc3, 884fda621)` was
+`df5c3f9c53dcbad8675902c233e68d21828238f6`, identical to the exact #1678 squash. Only after
+that empty-diff proof, ancestry-only merge `3a6418aee` adopted that squash commit alone, with
+no tree changes. Normal `merge origin/main` was then already up to date. Main is an ancestor;
+merge-tree with main is clean and equals HEAD's tree. The main-relative diff contains only
+step 4 and its tests/ledger, on new branch `runtime/20261111-m9-4-phase0b`. No published
+history was rewritten and no additional work was pushed to #1678.
+
+Merged runtime tree `3a6418aee` then passed **385 focused tests** in ticket
+`14b7c115-0853-430e-8e04-7e37d0253e02`, covering composer, pending Stop/drain, first-send
+creation, self-compaction, runtime store and all 104 handoff-inheritance cases. All 22 changed
+Swift files passed scoped pinned formatting and strict SwiftLint; the latter used an explicit
+`/tmp` cache after the default cache directory refused a sandboxed write. Fresh merged-tree
+compilation retained VM **4**, Codex resume tests **17**, auto-wake tests **11** and admin
+lifecycle tests **5**, with no positive count/signature delta across the 42 audited Swift files.
+The 2,122-case broad, both-product and full-lint receipts above qualify the pre-integration
+step-4 checkpoint; they are not misrepresented as a new merged-tree full-suite run. No source
+changed after merged-tree execution; this final addition records its integration receipts.
