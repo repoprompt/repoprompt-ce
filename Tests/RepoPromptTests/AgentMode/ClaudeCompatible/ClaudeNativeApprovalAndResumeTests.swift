@@ -1837,6 +1837,77 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         }
     }
 
+    func testClaudeSteeringPreparationKeepsRecoverableInputUntilAdmission() async throws {
+        for withdraw in [false, true] {
+            let (h, session, controller, _) = try await spyFixture()
+            let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+            let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
+            session.appendItem(row)
+            try await h.host.test_composeRunService(service).startRun(
+                tabID: session.tabID, session: session, origin: h.startCommand(for: session), initialUserMessage: row.text,
+                initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
+            )
+            await until("host input is registered") { !session.claudeExpectedTurnIDs.isEmpty }
+            let originalMessages = await controller.sentMessages
+            let gate = Gate()
+            let catalog = h.host.test_providerSwitchSkillCatalog
+            catalog.markDirty()
+            catalog.test_beforePublish = { await gate.wait() }
+            addTeardownBlock { @MainActor in
+                gate.open()
+                catalog.test_beforePublish = nil
+                await service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+                await h.host.claudeCoordinator.shutdownClaudeSession(session)
+            }
+            session.pendingHandoff = .init(payload: "<forked_session>Retained continuity</forked_session>", createdAt: Date())
+            try queueSteer("prepared steer", in: session, service: service)
+            session.pendingNonCodexUserInputTokenQueue = [17]
+            let accepted = await service.submitQueuedClaudeSteeringIfSupported(session: session)
+            XCTAssertTrue(accepted)
+            await until("real skill discovery is held") { gate.isWaiting }
+            let first = try XCTUnwrap(session.claudeSteeringFlushTask)
+            XCTAssertEqual(session.pendingClaudeSteeringInstructions.map(\.draftText), ["prepared steer"])
+            XCTAssertEqual(session.pendingNonCodexUserInputTokenQueue, [17])
+            XCTAssertFalse(session.pendingHandoff.isStagedForSend)
+            if withdraw {
+                service.withdrawQueuedWorkForManagedStop(tabID: session.tabID, session: session)
+                XCTAssertEqual(session.draftText, "prepared steer")
+                XCTAssertTrue(session.pendingClaudeSteeringInstructions.isEmpty)
+                XCTAssertTrue(session.pendingNonCodexUserInputTokenQueue.isEmpty)
+            }
+            catalog.test_beforePublish = nil
+            await controller.setTurnInFlight(false)
+            gate.open()
+            await first.task.value
+            let messages = await controller.sentMessages
+            if withdraw {
+                XCTAssertEqual(messages, originalMessages)
+                XCTAssertFalse(session.pendingHandoff.isStagedForSend, "Refused discovery must not stage handoff continuity")
+                XCTAssertTrue(session.pendingHandoff.hasPayload)
+                XCTAssertEqual(session.draftText, "prepared steer")
+                // The next installed drain can use the retained handoff exactly once.
+                try queueSteer("replacement B", in: session, service: service)
+                let replacementAccepted = await service.submitQueuedClaudeSteeringIfSupported(session: session)
+                XCTAssertTrue(replacementAccepted)
+                let replacement = try XCTUnwrap(session.claudeSteeringFlushTask)
+                await replacement.task.value
+                let replacementMessages = await controller.sentMessages
+                XCTAssertEqual(replacementMessages.count, originalMessages.count + 1)
+                XCTAssertTrue(try XCTUnwrap(replacementMessages.last).contains("replacement B"))
+                XCTAssertTrue(try XCTUnwrap(replacementMessages.last).contains("Retained continuity"))
+            } else {
+                XCTAssertEqual(messages.count, originalMessages.count + 1)
+                XCTAssertTrue(try XCTUnwrap(messages.last).contains("prepared steer"))
+                XCTAssertTrue(try XCTUnwrap(messages.last).contains("Retained continuity"))
+                XCTAssertTrue(session.pendingClaudeSteeringInstructions.isEmpty)
+                XCTAssertTrue(session.pendingNonCodexUserInputTokenQueue.isEmpty)
+            }
+            XCTAssertNil(session.claudeSteeringFlushTask)
+            await service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+            await h.host.claudeCoordinator.shutdownClaudeSession(session)
+        }
+    }
+
     func testSteeringRetainedProviderSuccessorDoesNotCancelReplacement() async throws {
         for successorFinishesBeforeSend in [true, false] {
             let (h, session, controller, _) = try await spyFixture()

@@ -8057,3 +8057,39 @@ compiler-warning occurrence maxima versus integrated baseline `a0c674e9` are unc
 session zero, approval/resume test file one. Fresh index passed at **1,262/1,360 wrong-way edges and
 53/66 largest cycle**, without baseline changes. These are local focused/style/index gates, not full
 publication/product/live-app/release/sanitizer or hosted-CI qualification. Nothing pushed.
+
+### M9.2g local prerequisite — admitted steering preparation retains recoverable input (2026-11-11)
+
+Claude now peeks at the queued instruction while skill/context/tagged-file preparation suspends,
+then dequeues the exact head and token only after its original flush and attempt still admit the
+result. The existing shared augmentation hook requires a predicate and the VM forwards it into the
+actual runtime's discovery/publication and handoff-staging checks. Current-owner withdrawal can see
+and restore the queued draft while discovery is held. Preparation refusal is latched locally, so a
+later permissive check cannot promote partially prepared text into a send. If another operation
+removed the head while the attempt stayed current, the drain continues with the remaining queue
+instead of restoring unrelated later instructions. No second queue owner or writer registry exists.
+
+ACP supplies its existing cancellation/flush-ID/controller check to that same hook, with the same
+latched refusal and existing withdraw/restore branch. It does not add a transient run-state condition
+or change ACP's dequeue-before-preparation recovery policy. Writer-incarnation provenance and
+post-dispatch outcome authority remain OPEN; neither this predicate nor the previous task-slot fix
+is claimed as physical provider-write admission. A Claude coordinator `.superseded` result after
+admitted dequeue still has its existing recovery semantics.
+
+One Oracle review (`0623`, chat `6F1A83`) requested guarding against partial augmentation if an
+admission predicate flips back to permissive, and preserving later queue entries on a changed head.
+Both were addressed. New Claude coverage holds the REAL catalog discovery hook for unchanged and
+withdrawn flushes, asserts queue/token retention, no stale handoff staging/send, and a replacement's
+single successful use of retained continuity. Added ACP coverage holds that same discovery boundary,
+tears down the actual controller, and checks draft recovery plus no handoff staging/provider input.
+These use existing fixture/hooks, not a new production test seam. Focus
+`f81304f9-e7ca-444a-b3f2-548c745ba367` passed both methods (Claude two variants 0.082s; ACP 0.990s).
+Affected `232027a6-9482-432e-aa4c-94c15a0d0a2c` passed **569 tests, zero failures** (122.212s),
+including the full ACP steer and MCP Steer/resume selections. Full lint
+`9ef83866-8c02-416c-93c3-84e153a98948` passed. Scoped pinned formatting/strict lint passed.
+Actual focused/affected warning-occurrence maxima versus integrated `a0c674e9` stayed unchanged:
+VM four, approval/resume tests one, other four touched Swift files zero. Fresh index passed
+**1,262/1,360 wrong-way edges, 53/66 largest cycle**, unchanged baseline. These are local focused,
+style and index gates, not full publication/products/live-app/release/sanitizer/hosted-CI qualification.
+Nothing pushed. Changed-head continuation and the refusal latch are source-reviewed; no separate
+injected transient-refusal matrix is claimed.

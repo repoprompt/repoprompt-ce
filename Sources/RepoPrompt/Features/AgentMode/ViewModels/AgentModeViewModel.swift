@@ -3851,7 +3851,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         links: links
                     )
                 },
-                augmentUserMessageForProviderSend: { [weak self] text, attachments, taggedFileAttachments, session, skipsSlashExpansion in
+                augmentUserMessageForProviderSend: { [weak self] text, attachments, taggedFileAttachments, session, skipsSlashExpansion, isCurrent in
                     guard let self else { return text }
                     return await augmentUserMessageForProviderSend(
                         text,
@@ -3859,7 +3859,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         taggedFileAttachments: taggedFileAttachments,
                         agent: session?.selectedAgent,
                         session: session,
-                        skipsSlashExpansion: skipsSlashExpansion
+                        skipsSlashExpansion: skipsSlashExpansion,
+                        shouldPublishCatalog: isCurrent
                     )
                 },
                 stageResumeRecoveryHandoffIfNeeded: { [weak self] session in

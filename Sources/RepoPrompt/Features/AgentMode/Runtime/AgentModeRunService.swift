@@ -701,15 +701,24 @@ final class AgentModeRunService {
                     : hooks.usage.estimateRuntimeTokens(providerTextForSend)
                 hooks.usage.addUserInputTokensToActiveNonCodexTurn(steeringUserInputTokens, session)
 
+                var preparationRefused = false
                 let augmentedSteeringText = await hooks.providerInput.augmentUserMessageForProviderSend(
                     providerTextForSend,
                     steeringBatch.flatMap(\.attachments),
                     steeringBatch.flatMap(\.taggedFileAttachments),
-                    session, steeringBatch.contains(where: \.skipsSlashExpansion)
+                    session, steeringBatch.contains(where: \.skipsSlashExpansion),
+                    {
+                        if Task.isCancelled || session.acpSteeringFlushID != flushID
+                            || session.acpController !== controller
+                        {
+                            preparationRefused = true
+                        }
+                        return !preparationRefused
+                    }
                 )
                 // Augmentation suspended. A retired flush owns this dequeued batch, which teardown
                 // cannot see in the queue; withdraw it rather than requeueing into a dead controller.
-                guard !Task.isCancelled, session.acpSteeringFlushID == flushID,
+                guard !preparationRefused, !Task.isCancelled, session.acpSteeringFlushID == flushID,
                       session.acpController === controller
                 else {
                     releaseSupersedingProtectionIfUnused()
@@ -1286,20 +1295,43 @@ final class AgentModeRunService {
                     return
                 }
 
-                let steering = session.pendingClaudeSteeringInstructions.removeFirst()
-                steeringDebugLog("[AgentRunSteeringWake] Claude flush dequeued steering id=\(steering.id) tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) remaining=\(session.pendingClaudeSteeringInstructions.count)")
-                let dequeuedUserInputTokens: Int? = {
-                    guard !session.pendingNonCodexUserInputTokenQueue.isEmpty else { return nil }
-                    return session.pendingNonCodexUserInputTokenQueue.removeFirst()
-                }()
-
+                // Keep recoverable input in the queue while preparation suspends. Current-owner
+                // withdrawal can then restore it, rather than losing an already-dequeued draft.
+                let steering = session.pendingClaudeSteeringInstructions[0]
+                var preparationRefused = false
+                @MainActor func admitsPreparation() -> Bool {
+                    if !ownsFlush()
+                        || !self.isCurrentClaudeSteeringAttempt(session: session, runID: runID, runAttemptID: runAttemptID)
+                        || session.pendingClaudeSteeringInstructions.first?.id != steering.id
+                    {
+                        preparationRefused = true
+                    }
+                    return !preparationRefused
+                }
                 let augmentedSteeringText = await hooks.providerInput.augmentUserMessageForProviderSend(
                     steering.providerText,
                     steering.attachments,
                     steering.taggedFileAttachments,
-                    session, steering.skipsSlashExpansion
+                    session, steering.skipsSlashExpansion, admitsPreparation
                 )
                 guard ownsFlush() else { return }
+                guard admitsPreparation() else {
+                    if session.pendingClaudeSteeringInstructions.first?.id != steering.id,
+                       isCurrentClaudeSteeringAttempt(session: session, runID: runID, runAttemptID: runAttemptID)
+                    {
+                        continue
+                    }
+                    restoreQueuedClaudeSteeringDrafts(
+                        tabID: tabID, session: session, strategy: .prependAlways,
+                        matching: { $0.targetRunID == runID && $0.targetRunAttemptID == runAttemptID }
+                    )
+                    return
+                }
+                session.pendingClaudeSteeringInstructions.removeFirst()
+                let dequeuedUserInputTokens: Int? = {
+                    guard !session.pendingNonCodexUserInputTokenQueue.isEmpty else { return nil }
+                    return session.pendingNonCodexUserInputTokenQueue.removeFirst()
+                }()
                 steeringDebugLog("[AgentRunSteeringWake] Claude flush sending native interrupt id=\(steering.id) tab=\(tabID) runID=\(runID) attempt=\(runAttemptID)")
                 var inputWasAttempted = false
                 let sendOutcome = await dependencies.claudeCoordinator.sendClaudeNativeMessage(
