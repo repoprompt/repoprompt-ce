@@ -146,14 +146,13 @@ extension AgentSessionLinkExecutionRuntime {
               let payload = preparation.handoff.payload
         else { return nil }
         let writer = preparation.command.writer
-        let workspaceID = writer.identity.workspaceID
         session.pendingHandoff.providerSwitchDelivery = .sending
         session.pendingHandoff.isStagedForSend = true
         session.pendingHandoff.providerSwitchDispatch = preparation.physicalDispatch
         let sending = session.pendingHandoff
         session.isDirty = true
         var sendingSaverReturned = false
-        let sendingSave = await flushSaveRequired(for: session.tabID, workspaceID: workspaceID, observingSavePhase: {
+        let sendingSave = await flushSaveRequired(writer: writer, observingSavePhase: {
             if case .writeReturned = $0 { sendingSaverReturned = true }
         })
         guard case .success = sendingSave else {
@@ -220,7 +219,6 @@ extension AgentSessionLinkExecutionRuntime {
     ) async {
         guard writer.scope === scope, writer.isCurrent else { return }
         let session = writer.session
-        let workspaceID = writer.identity.workspaceID
         guard sessions[session.tabID] === session, session.pendingHandoff == sending,
               let proof = sending.providerSwitchDispatch, proof.binding == session.currentRestorationBindingToken,
               proof.runOwnership == nil, proof.runID == nil, proof.dispatchID == nil,
@@ -232,7 +230,7 @@ extension AgentSessionLinkExecutionRuntime {
         let ready = session.pendingHandoff
         session.isDirty = true
         var readySaverReturned = false
-        let readySave = await flushSaveRequired(for: session.tabID, workspaceID: workspaceID, observingSavePhase: {
+        let readySave = await flushSaveRequired(writer: writer, observingSavePhase: {
             if case .writeReturned = $0 { readySaverReturned = true }
         })
         if case .failure = readySave, writer.isCurrent,
@@ -305,7 +303,6 @@ extension AgentSessionLinkExecutionRuntime {
               let writer = providerSwitchWriter(for: session, proof: staged) else { return }
         // Physical acceptance acknowledges an already-dispatched effect. Retirement blocks a new
         // dispatch, not this originating acknowledgement or its final durable clear.
-        let workspaceID = writer.identity.workspaceID
         let sending = session.pendingHandoff
         let binding = session.currentRestorationBindingToken
         session.pendingHandoff.clearAfterSend()
@@ -325,7 +322,7 @@ extension AgentSessionLinkExecutionRuntime {
             // A returned frozen clear must survive later save-token drift. The ordinary fresh-save
             // owner carries it forward; only an unacknowledged write restores uncertainty.
             var saverReturned = false
-            let result = await flushSaveRequired(for: session.tabID, workspaceID: workspaceID, observingSavePhase: {
+            let result = await flushSaveRequired(writer: writer, observingSavePhase: {
                 if case .writeReturned = $0 { saverReturned = true }
             })
             if case .failure = result, !saverReturned, writer.isCurrent,
@@ -612,7 +609,7 @@ extension AgentSessionLinkExecutionRuntime {
         updateBindingsFromSession(liveSession)
         requestUIRefresh(tabID: tabID, urgent: true)
 
-        if case .failure = await flushSaveRequired(for: tabID, workspaceID: workspaceID) {
+        if case .failure = await flushSaveRequired(writer: writer) {
             // The saver may have returned for the originating payload after this object was rebound.
             // A stale writer may neither acknowledge that write nor compensate against its successor.
             guard writer.isCurrent else {
@@ -630,7 +627,7 @@ extension AgentSessionLinkExecutionRuntime {
             // rather than leaving it to a scheduled save: releasing the idempotency key for a fresh
             // retry while a committed row might survive is exactly how one logical send becomes two
             // transcript rows.
-            if case .failure = await flushSaveRequired(for: tabID, workspaceID: workspaceID) {
+            if case .failure = await flushSaveRequired(writer: writer) {
                 releaseComposerSubmitClaim(claim)
                 return .blocked(.persistenceIndeterminate)
             }
@@ -792,9 +789,15 @@ extension AgentSessionLinkExecutionRuntime {
         scope?.presentation.bindingChanged(session)
     }
 
-    func flushSaveRequired(for tabID: UUID, workspaceID: UUID, observingSavePhase: ((AgentSessionRequiredSavePhase) -> Void)? = nil) async -> Result<Void, AgentSessionPersistenceFailure> {
-        guard let owner = scope else { return .failure(.init(operation: .save, tabID: tabID, message: "The runtime owner is unavailable.")) }
-        return await owner.persistence.flushSaveRequired(for: tabID, workspaceID: workspaceID, observingSavePhase: observingSavePhase)
+    func flushSaveRequired(writer: AgentSessionRuntimeStore.Writer, observingSavePhase: ((AgentSessionRequiredSavePhase) -> Void)? = nil) async -> Result<Void, AgentSessionPersistenceFailure> {
+        let tabID = writer.binding.tabID
+        guard let owner = scope, writer.scope === owner else {
+            return .failure(.init(operation: .save, tabID: tabID, message: "The originating runtime owner is unavailable."))
+        }
+        return await owner.persistence.flushSaveRequired(
+            writer: writer,
+            observingSavePhase: observingSavePhase
+        )
     }
 
     func drainPendingSendEffects(for session: AgentTabSession? = nil) async {

@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import MCP
 import RepoPromptACPProviders
 import RepoPromptAIContracts
 @testable import RepoPromptApp
@@ -445,6 +446,97 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         XCTAssertEqual(f.session.pendingInstructions.map(\.providerText), ["still owed", "later"])
     }
 
+    func testInstructionWaitReplacementRejectsOldReceiptAndStaleInstallation() async throws {
+        let f = try fixture()
+        let command = try XCTUnwrap(f.runtime.instructionCommand(for: f.session))
+        let firstID = UUID(), secondID = UUID()
+        let first = Task { try await f.runtime.waitForInstruction(command: command, waitID: firstID, prompt: "First", timeoutSeconds: nil) }
+        try await AsyncTestWait.waitUntil("first runtime instruction wait") { f.session.instructionWaitID == firstID }
+        try f.runtime.replacePriorInstructionWait(command: command)
+        do { _ = try await first.value
+            XCTFail("Replacement must settle the original waiter")
+        } catch { XCTAssertTrue(error is CancellationError) }
+        let second = Task { try await f.runtime.waitForInstruction(command: command, waitID: secondID, prompt: "Second", timeoutSeconds: nil) }
+        try await AsyncTestWait.waitUntil("second runtime instruction wait") { f.session.instructionWaitID == secondID }
+        await f.runtime.expireInstructionWait(session: f.session, waitID: firstID, timeout: 1)
+        XCTAssertFalse(f.runtime.resumeWaitingInstructionContinuation(command: command, waitID: firstID, providerText: "Old", claim: nil, origin: .user))
+        XCTAssertEqual(f.session.instructionWaitID, secondID)
+        XCTAssertTrue(f.runtime.resumeWaitingInstructionContinuation(command: command, waitID: secondID, providerText: "Current", claim: nil, origin: .user))
+        let delivered = try await second.value
+        XCTAssertEqual(delivered.text, "Current")
+        XCTAssertFalse(delivered.timedOut)
+        f.scope.replaceSessions([:])
+        f.scope.replaceSessions([f.session.tabID: f.session])
+        let rows = f.session.items.count
+        do {
+            _ = try await f.runtime.waitForInstruction(command: command, waitID: UUID(), prompt: "Stale", timeoutSeconds: nil)
+            XCTFail("Stale command cannot install a wait")
+        } catch { XCTAssertTrue(error is MCPError) }
+        XCTAssertNil(f.session.instructionWait)
+        XCTAssertEqual(f.session.items.count, rows)
+    }
+
+    func testInstructionWaitOriginSurvivesLossWithoutConsumingOrMutatingSuccessors() async throws {
+        for drift in ["detached", "reacquired", "rebound", "newRun", "conflict"] {
+            let f = try fixture()
+            let command = try XCTUnwrap(f.runtime.instructionCommand(for: f.session))
+            let waitID = UUID()
+            let installed = expectation(description: "instruction installed \(drift)")
+            var bindings = 0
+            var interactions = 0
+            let attachment = f.scope.presentation.attach(f.session, sink: .init(
+                activityChanged: { _, _ in }, refresh: { _, _, _ in }, turnComplete: { _ in }, turnFailed: { _, _ in },
+                binding: { _ in
+                    bindings += 1
+                    XCTAssertNotNil(f.session.instructionWait, "Publish the receipt before waiting state")
+                    if bindings == 1 { installed.fulfill() }
+                }, interaction: { _ in interactions += 1 }
+            ))
+            defer { f.scope.presentation.detach(attachment) }
+            let waiting = Task { try await f.runtime.waitForInstruction(command: command, waitID: waitID, prompt: "Original", timeoutSeconds: nil) }
+            await fulfillment(of: [installed], timeout: 3)
+            switch drift {
+            case "detached": f.scope.replaceSessions([:])
+            case "reacquired":
+                f.scope.replaceSessions([:])
+                f.scope.replaceSessions([f.session.tabID: f.session])
+                let fresh = try XCTUnwrap(f.runtime.instructionCommand(for: f.session))
+                XCTAssertFalse(f.runtime.resumeWaitingInstructionContinuation(command: fresh, waitID: waitID, providerText: "Wrong claim", claim: nil, origin: .user))
+            case "rebound":
+                f.session.installPersistentSessionBinding(.init(tabID: f.session.tabID, sessionID: UUID(), workspaceID: f.endpoint.workspaceID))
+                f.session.waitingPrompt = "Successor prompt"
+                f.session.runState = .waitingForApproval
+            case "newRun":
+                f.session.installRunID(UUID())
+                _ = f.session.beginRunAttempt(source: "instruction successor")
+                f.session.waitingPrompt = "Successor prompt"
+                f.session.runState = .waitingForApproval
+            default:
+                let duplicate = AgentTabSession(tabID: UUID())
+                duplicate.installPersistentSessionBinding(.init(tabID: duplicate.tabID, sessionID: f.endpoint.sessionID, workspaceID: f.endpoint.workspaceID))
+                f.scope.replaceSessions([f.session.tabID: f.session, duplicate.tabID: duplicate])
+            }
+            let state = f.session.runState
+            let owner = f.session.activeRunOwnership
+            XCTAssertFalse(f.runtime.resumeWaitingInstructionContinuation(command: command, waitID: waitID, providerText: "Stale", claim: nil, origin: .user))
+            let saveGeneration = f.session.saveRequestGeneration
+            let baselineInteractions = interactions
+            await f.runtime.expireInstructionWait(session: f.session, waitID: waitID, timeout: 3)
+            let response = try await waiting.value
+            XCTAssertTrue(response.timedOut)
+            XCTAssertEqual(response.elapsedSeconds, 3)
+            XCTAssertNil(f.session.instructionWait)
+            XCTAssertEqual(f.session.activeRunOwnership, owner)
+            XCTAssertEqual(f.session.saveRequestGeneration, saveGeneration)
+            XCTAssertEqual(bindings, 1)
+            XCTAssertEqual(interactions - baselineInteractions, drift == "detached" ? 0 : 1, "Only an exact-object repaint is allowed after claim or run loss")
+            if drift == "rebound" || drift == "newRun" {
+                XCTAssertEqual(f.session.runState, state)
+                XCTAssertEqual(f.session.waitingPrompt, "Successor prompt")
+            }
+        }
+    }
+
     private struct Fixture {
         let scope: AgentSessionRuntimeStore.Scope
         let session: AgentTabSession
@@ -690,11 +782,12 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             f.session.mcpFollowUpRunPending = true
             let startFence = AgentRunStartStopFence(session: f.session)
             let explicitGeneration = f.session.stopState.explicitStopGeneration
+            let command = try XCTUnwrap(f.runtime.instructionCommand(for: f.session))
+            let waitID = UUID()
             let installed = expectation(description: "Runtime instruction cancellation capability")
             let waiter = Task { @MainActor in
                 try await withCheckedThrowingContinuation { continuation in
-                    f.session.instructionWaitID = UUID()
-                    f.session.instructionContinuation = continuation
+                    f.runtime.test_installInstructionWait(command: command, waitID: waitID, continuation: continuation)
                     f.session.waitingPrompt = "Continue?"
                     installed.fulfill()
                 }
@@ -789,11 +882,12 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             )
             let dispatch = AgentSessionLinkPromptDispatchID.headlessRun(runID: UUID())
             let claim = try XCTUnwrap(f.runtime.agentSessionLinkPromptClaim(for: f.session, dispatchID: dispatch))
+            let command = try XCTUnwrap(f.runtime.instructionCommand(for: f.session))
+            let waitID = UUID()
             let installed = expectation(description: "Instruction continuation installed before response")
             let response = Task { @MainActor in
                 try await withCheckedThrowingContinuation { continuation in
-                    f.session.instructionWaitID = UUID()
-                    f.session.instructionContinuation = continuation
+                    f.runtime.test_installInstructionWait(command: command, waitID: waitID, continuation: continuation)
                     f.session.waitingPrompt = "Continue?"
                     f.session.runState = .waitingForUser
                     installed.fulfill()
@@ -811,13 +905,13 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 }
             ))
             XCTAssertTrue(f.runtime.resumeWaitingInstructionContinuation(
-                session: f.session, providerText: baseText, claim: claim, origin: origin,
+                command: command, waitID: waitID, providerText: baseText, claim: claim, origin: origin,
                 inputProof: proof, undecoratedProviderText: proof == nil ? nil : baseText
             ))
             XCTAssertFalse(available, "Presentation ran only after the delivery and receipt")
             f.scope.presentation.detach(attachment)
             available = true
-            XCTAssertFalse(f.runtime.resumeWaitingInstructionContinuation(session: f.session, providerText: "Duplicate", claim: claim, origin: origin))
+            XCTAssertFalse(f.runtime.resumeWaitingInstructionContinuation(command: command, waitID: waitID, providerText: "Duplicate", claim: claim, origin: origin))
             if f.session.instructionContinuation != nil { AgentSessionInteractionRuntime.cancelPendingInstruction(for: f.session) }
             let delivered = try await response.value
             XCTAssertEqual(delivered.text, text)
@@ -837,18 +931,19 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
     func testInstructionResumeRefusesReplacementAndUnavailableOwnerWithoutConsumingContinuation() async throws {
         var available = true
         let f = try fixture(isAvailable: { available })
+        let command = try XCTUnwrap(f.runtime.instructionCommand(for: f.session))
+        let waitID = UUID()
         let installed = expectation(description: "Original wait is installed")
         let response = Task { @MainActor in
             try await withCheckedThrowingContinuation { continuation in
-                f.session.instructionWaitID = UUID()
-                f.session.instructionContinuation = continuation
+                f.runtime.test_installInstructionWait(command: command, waitID: waitID, continuation: continuation)
                 f.session.runState = .waitingForUser
                 installed.fulfill()
             }
         }
         await fulfillment(of: [installed], timeout: 3)
         available = false
-        XCTAssertFalse(f.runtime.resumeWaitingInstructionContinuation(session: f.session, providerText: "Unavailable", claim: nil, origin: .user))
+        XCTAssertFalse(f.runtime.resumeWaitingInstructionContinuation(command: command, waitID: waitID, providerText: "Unavailable", claim: nil, origin: .user))
         XCTAssertNotNil(f.session.instructionContinuation)
         available = true
         let replacement = AgentTabSession(tabID: f.session.tabID)
@@ -856,7 +951,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         f.scope.replaceSessions([replacement.tabID: replacement])
         XCTAssertFalse(f.runtime.ownsSession(f.session))
         XCTAssertTrue(f.runtime.ownsSession(replacement))
-        XCTAssertFalse(f.runtime.resumeWaitingInstructionContinuation(session: f.session, providerText: "Stale", claim: nil, origin: .user))
+        XCTAssertFalse(f.runtime.resumeWaitingInstructionContinuation(command: command, waitID: waitID, providerText: "Stale", claim: nil, origin: .user))
         XCTAssertNotNil(f.session.instructionContinuation)
         XCTAssertNil(replacement.instructionContinuation)
         AgentSessionInteractionRuntime.cancelPendingInstruction(for: f.session)
@@ -908,20 +1003,20 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         XCTAssertTrue(claim.dispatchID.isAutoWakeFamily)
         XCTAssertFalse(claim.managedMetadataRequirements.isEmpty)
         let proof = await AgentSessionLinkProviderInputRelease.prove(claim, readProof: { _ in false })
+        let command = try XCTUnwrap(f.runtime.instructionCommand(for: f.session))
+        let waitID = UUID()
         let installed = expectation(description: "Original wait before late proof refusal")
         let response = Task { @MainActor in
             try await withCheckedThrowingContinuation { continuation in
-                f.session.instructionWaitID = UUID()
-                f.session.instructionContinuation = continuation
+                f.runtime.test_installInstructionWait(command: command, waitID: waitID, continuation: continuation)
                 f.session.runState = .waitingForUser
                 installed.fulfill()
             }
         }
         await fulfillment(of: [installed], timeout: 3)
-        let waitID = f.session.instructionWaitID
         let notices = f.runtime.agentSessionLinkPassiveNoticesBySessionID[f.endpoint.sessionID]
         XCTAssertFalse(f.runtime.resumeWaitingInstructionContinuation(
-            session: f.session, providerText: "Must not send", claim: claim,
+            command: command, waitID: waitID, providerText: "Must not send", claim: claim,
             origin: .laneUpdateAutoWake(wakeID: wakeID), inputProof: proof, undecoratedProviderText: "Undecorated"
         ))
         XCTAssertEqual(f.session.instructionWaitID, waitID)
@@ -3493,8 +3588,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         let waiting = Task { @MainActor in try await fixture.viewModel.waitForNextUserInstruction(tabID: fixture.tabID) }
         defer { gate.release()
             let continuation = fixture.session.instructionContinuation
-            fixture.session.instructionContinuation = nil
-            fixture.session.instructionWaitID = nil
+            fixture.session.instructionWait = nil
+
             continuation?.resume(throwing: CancellationError())
             waiting.cancel()
         }
@@ -3518,10 +3613,70 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         XCTAssertEqual(fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID], snapshot)
         fixture.session.oversight.autoWakeOnUpdates = false
         let continuation = fixture.session.instructionContinuation
-        fixture.session.instructionContinuation = nil
-        fixture.session.instructionWaitID = nil
+        fixture.session.instructionWait = nil
+
         continuation?.resume(throwing: CancellationError())
         _ = try? await waiting.value
+    }
+
+    func testWaitingAutoWakeProofCannotCancelSuccessorWakeOrConsumeReplacementWait() async throws {
+        let fixture = try makeFixture()
+        try publishInventory(fixture, revision: 1)
+        let gate = TestReleaseFence(name: "old waiting wake proof")
+        fixture.viewModel.test_agentSessionLinkLocalInputDecoration = { baseline in
+            .init(fragment: baseline.fragment + "\n<user_input>old wake</user_input>", markupDeltaBytes: 33, requirements: [])
+        }
+        fixture.viewModel.test_agentSessionLinkLocalInputReadProof = { _ in await gate.enterAndWait()
+            return false
+        }
+        let first = Task { try await fixture.viewModel.waitForNextUserInstruction(tabID: fixture.tabID) }
+        defer {
+            gate.release()
+            fixture.session.oversight.pendingAutoWake?.task?.cancel()
+            AgentSessionInteractionRuntime.cancelPendingInstruction(for: fixture.session)
+            first.cancel()
+        }
+        try await AsyncTestWait.waitUntil("first instruction wait before wake") { fixture.session.instructionWait != nil }
+        fixture.session.oversight.autoWakeOnUpdates = true
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        let entered = await gate.waitUntilEntered()
+        guard entered else { return XCTFail("Old wake must reach its proof boundary") }
+        let old = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        let oldTask = try XCTUnwrap(old.task)
+        let runtime = fixture.viewModel.linkExecutionRuntime
+        let command = try XCTUnwrap(runtime.instructionCommand(for: fixture.session))
+        try runtime.replacePriorInstructionWait(command: command)
+        do { _ = try await first.value
+            XCTFail("Replacement settles the first wait")
+        } catch { XCTAssertTrue(error is CancellationError) }
+        let nextID = UUID()
+        let second = Task { try await runtime.waitForInstruction(command: command, waitID: nextID, prompt: "Replacement", timeoutSeconds: nil) }
+        defer {
+            gate.release()
+            fixture.session.oversight.autoWakeOnUpdates = false
+            fixture.session.oversight.pendingAutoWake?.task?.cancel()
+            fixture.session.oversight.pendingAutoWake = nil
+            AgentSessionInteractionRuntime.cancelPendingInstruction(for: fixture.session)
+            second.cancel()
+        }
+        try await AsyncTestWait.waitUntil("replacement instruction wait") { fixture.session.instructionWaitID == nextID }
+        let successorID = UUID()
+        fixture.session.oversight.pendingAutoWake = .init(
+            wakeID: successorID, observerEndpoint: old.observerEndpoint,
+            queueEpoch: old.queueEpoch, queueRevision: old.queueRevision, wakeFingerprint: old.wakeFingerprint,
+            admissionBasis: old.admissionBasis, attemptedFingerprint: nil,
+            physicalOutcome: .notAttempted, phase: .scheduled, task: nil
+        )
+        let notices = fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID]
+        gate.release()
+        await oldTask.value
+        XCTAssertEqual(fixture.session.instructionWaitID, nextID)
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.wakeID, successorID)
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .scheduled)
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID], notices)
+        XCTAssertFalse(fixture.session.items.contains { $0.id == old.wakeID && $0.kind == .system })
+        AgentSessionInteractionRuntime.cancelPendingInstruction(for: fixture.session)
+        _ = try? await second.value
     }
 
     /// Drives the real waiting-instruction continuation from suspension through lane acceptance.
@@ -3561,7 +3716,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         defer {
             session.instructionTimeoutTask?.cancel()
             session.instructionContinuation?.resume(throwing: CancellationError())
-            session.instructionContinuation = nil
+            session.instructionWait = nil
             waiting.cancel()
         }
         try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
@@ -3670,10 +3825,10 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             fixture.session.codexController = controller
             defer {
                 fixture.session.instructionTimeoutTask?.cancel()
-                fixture.session.instructionTimeoutTask = nil
+                fixture.session.instructionWait?.timeoutTask = nil
                 fixture.session.instructionContinuation?.resume(throwing: CancellationError())
-                fixture.session.instructionContinuation = nil
-                fixture.session.instructionWaitID = nil
+                fixture.session.instructionWait = nil
+
                 fixture.session.waitingPrompt = nil
                 withExtendedLifetime(controller) {}
             }
@@ -3839,10 +3994,10 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             // that has already been consumed, and it fires long after this test ends — crashing
             // whichever unrelated test happens to be running with a checked-continuation misuse.
             fixture.session.instructionTimeoutTask?.cancel()
-            fixture.session.instructionTimeoutTask = nil
+            fixture.session.instructionWait?.timeoutTask = nil
             fixture.session.instructionContinuation?.resume(throwing: CancellationError())
-            fixture.session.instructionContinuation = nil
-            fixture.session.instructionWaitID = nil
+            fixture.session.instructionWait = nil
+
             fixture.session.waitingPrompt = nil
             _ = try? await waiting.value
             withExtendedLifetime(controller) {}
@@ -6164,9 +6319,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         acquired.physicalOutcome = .ambiguous
         acquired.periodicProducerDispatchID = raw
         fixture.session.runState = .waitingForUser
-        fixture.session.instructionWaitID = UUID()
         let _: UserInstructionResponse = try await withCheckedThrowingContinuation { continuation in
-            fixture.session.instructionContinuation = continuation
+            installInstructionWaitForTest(session: fixture.session, runtime: fixture.viewModel.linkExecutionRuntime, continuation: continuation)
             for phase: AgentSessionLinkAutoWakeAttempt.Phase in [.preparingDispatch, .cancelledBeforeDispatch, .dispatching] {
                 var attempt = acquired
                 attempt.phase = phase
@@ -6186,8 +6340,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             fixture.session.codexHookGateAttemptToken = UUID()
             fixture.viewModel.agentSessionLinkReleasePeriodicACPContinuationSlot(for: fixture.session)
             XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.wakeID, wakeID, "a hook approval is not an ordinary wait")
-            fixture.session.instructionContinuation = nil
-            fixture.session.instructionWaitID = nil
+            fixture.session.instructionWait = nil
+
             fixture.session.codexHookGateAttemptToken = nil
             continuation.resume(returning: UserInstructionResponse(text: nil, timedOut: false, elapsedSeconds: 0))
         }

@@ -213,7 +213,6 @@ extension AgentSessionLinkExecutionRuntime {
             releaseComposerSubmitClaim(claim)
             return .blocked(postCommitSupport == .noProviderSession ? .noProviderSession : .notSupported)
         }
-        let workspaceID = command.identity.workspaceID
 
         // 6. Durable acceptance of the *request*. A `.system` row with fixed text plus typed
         //    attribution: no user row, no turn anchor, no draft, workflow, or handoff mutation.
@@ -225,7 +224,7 @@ extension AgentSessionLinkExecutionRuntime {
         writer.scope.presentation.bindingChanged(liveSession)
         requestUIRefresh(tabID: candidate.tabID, urgent: true)
 
-        if case .failure = await writer.scope.persistence.flushSaveRequired(for: candidate.tabID, workspaceID: workspaceID) {
+        if case .failure = await writer.scope.persistence.flushSaveRequired(writer: writer) {
             // An indeterminate write belongs to this incarnation. Never compensate against a
             // replacement writer, even if it reused the tab or persistent session identity.
             guard writer.isCurrent else {
@@ -234,7 +233,7 @@ extension AgentSessionLinkExecutionRuntime {
             }
             agentSessionLinkRemoveStagedCompactRow(itemID: requestItem.id, tabID: candidate.tabID, session: liveSession)
             // As for a send: only a durably confirmed removal makes "nothing was requested" true.
-            if case .failure = await writer.scope.persistence.flushSaveRequired(for: candidate.tabID, workspaceID: workspaceID) {
+            if case .failure = await writer.scope.persistence.flushSaveRequired(writer: writer) {
                 releaseComposerSubmitClaim(claim)
                 return .blocked(.persistenceIndeterminate)
             }

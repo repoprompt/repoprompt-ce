@@ -822,7 +822,7 @@ package enum SecureStorageIdentityMigrationBootstrap {
     private static func prepareLegacyBridge(bundle: Bundle) {
         guard preparerCatalogSupportsFrozenCatalog(),
               bundle.bundleIdentifier == RuntimeCodeSigningPolicy.developerIDBundleIdentifier,
-              let executableURL = bundle.executableURL,
+              bundle.executableURL != nil,
               let resourceURL = bundle.resourceURL,
               let relativeAnchorPath = bundle.object(forInfoDictionaryKey: anchorRelativePathInfoKey) as? String,
               !relativeAnchorPath.isEmpty,
@@ -848,20 +848,9 @@ package enum SecureStorageIdentityMigrationBootstrap {
 
         let authority: KeychainAccessAuthority
         do {
-            authority = try KeychainAccessAuthority(
-                descriptor: "RepoPrompt CE identity migration bridge",
-                applications: [
-                    TrustedApplicationCodeRequirement(
-                        trustedApplicationPath: executableURL.path,
-                        codeURL: bundle.bundleURL,
-                        requirementSource: RuntimeCodeSigningPolicy.developerIDRequirement
-                    ),
-                    TrustedApplicationCodeRequirement(
-                        trustedApplicationPath: anchorURL.path,
-                        codeURL: anchorURL,
-                        requirementSource: RuntimeCodeSigningPolicy.successorDeveloperIDRequirement
-                    )
-                ]
+            authority = try KeychainAccessAuthority.identityMigration(
+                bundleURL: bundle.bundleURL,
+                anchorURL: anchorURL
             )
         } catch {
             recordDiagnostic(

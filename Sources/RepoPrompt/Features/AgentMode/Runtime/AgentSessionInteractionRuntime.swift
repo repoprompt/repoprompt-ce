@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
 
 /// Provider interaction state and approval-store work belong to the runtime scope, not its
 /// presentation. The route ID preserves the existing MCP approval namespace; it is not a window
@@ -16,12 +17,14 @@ enum AgentRunInteractionStateChangeReason: String, Equatable {
     case approvalResponseSubmitted
     case permissionsResponseSubmitted
     case mcpElicitationResponseSubmitted
+    case codexHookReviewChanged
 }
 
 @MainActor
 final class AgentSessionInteractionRuntime {
     private(set) weak var scope: AgentSessionRuntimeStore.Scope?
     private(set) weak var claudeCommands: ClaudeAgentModeCoordinator?
+    var codexHookApprovalSettings: (any CodexHookApprovalSettingsProviding)?
 
     func installClaudeCancellationCommands(_ claude: ClaudeAgentModeCoordinator) {
         precondition(claudeCommands == nil || claudeCommands === claude)
@@ -74,6 +77,7 @@ final class AgentSessionInteractionRuntime {
     #if DEBUG
         var test_beforeApprovalCancellation: (@MainActor () async -> Void)?
         var test_beforeApprovalDecision: (@MainActor () async -> Void)?
+        var test_onHookGateCoalescedWaiterInstalled: (@MainActor () -> Void)?
     #endif
 
     init(scope: AgentSessionRuntimeStore.Scope, routeID: Int, approvalStore: ApplyEditsApprovalStore) {
@@ -285,13 +289,11 @@ final class AgentSessionInteractionRuntime {
     }
 
     static func cancelPendingInstruction(for session: AgentTabSession) {
-        session.instructionTimeoutTask?.cancel()
-        session.instructionTimeoutTask = nil
-        if let continuation = session.instructionContinuation {
-            continuation.resume(throwing: CancellationError())
-        }
-        session.instructionContinuation = nil
-        session.instructionWaitID = nil
+        let wait = session.instructionWait
+        session.instructionWait = nil
+        wait?.timeoutTask?.cancel()
+        wait?.timeoutTask = nil
         session.waitingPrompt = nil
+        wait?.continuation.resume(throwing: CancellationError())
     }
 }

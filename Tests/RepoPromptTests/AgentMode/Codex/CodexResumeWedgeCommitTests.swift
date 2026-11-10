@@ -406,7 +406,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             failedStart.cancel()
             await failedStart.value
         }
-        try await waitForPendingStart(fixture)
+        try await waitForPendingStart(fixture, description: "initial route to revoke")
         let revokedRunID = try XCTUnwrap(fixture.session.runID)
         await MCPRoutingWaiter.shared.notifyFailed(runID: revokedRunID)
         await failedStart.value
@@ -427,7 +427,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             compact.cancel()
             _ = await compact.value
         }
-        try await waitForPendingStart(fixture)
+        try await waitForPendingStart(fixture, description: "cold compact after revocation")
         let controller = try XCTUnwrap(fixture.factory.controllers.last)
         XCTAssertEqual(fixture.factory.controllers.count, 2)
         XCTAssertEqual(controller.receivedExistingIDs, [Self.oldThreadID])
@@ -448,6 +448,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         if let ownership = fixture.session.activeRunOwnership {
             _ = fixture.session.endRunAttempt(ifCurrent: ownership, source: "fake-compact-completed")
         }
+        _ = try installRestoredBinding(fixture)
         fixture.session.runState = .idle
         fixture.session.beginRunAttempt(source: "send-after-cold-compact")
         let send = Task {
@@ -460,7 +461,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             _ = await send.value
         }
         // Synthetic routing left no live app connection, so the ordinary send must rebind.
-        try await waitForPendingStart(fixture)
+        try await waitForPendingStart(fixture, description: "send after cold compact")
         XCTAssertEqual(fixture.factory.controllers.count, 3)
         let sendController = try XCTUnwrap(fixture.factory.controllers.last)
         XCTAssertEqual(sendController.receivedExistingIDs, [Self.oldThreadID])
@@ -1405,7 +1406,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
     /// The managed-auth recovery retry ("Refreshing Codex authentication…") registers the same
     /// CU-including retirement before calling `ensureCodexNativeSession`; it must keep Computer
     /// Use armed and activate it once the retirement completes.
-    func testComputerUseArmedSurvivesManagedAuthRecoveryRetirement() async {
+    func testComputerUseArmedSurvivesManagedAuthRecoveryRetirement() async throws {
         CodexComputerUseWorkflow.setEnabledForTesting(true)
         defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
         let fixture = makeFixture(
@@ -1413,6 +1414,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             shouldManageCodexTooling: false,
             authRecovery: MonitorStubCodexAuthRecovery()
         )
+        _ = try installRestoredBinding(fixture)
         let session = fixture.session
         let gate = TestReleaseFence(name: "managed-auth Computer Use retirement")
         let controller = WedgeFakeCodexController(
@@ -1469,6 +1471,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             shouldManageCodexTooling: false,
             authRecovery: MonitorStubCodexAuthRecovery()
         )
+        _ = try installRestoredBinding(fixture)
         let session = fixture.session
         let gate = TestReleaseFence(name: "managed-auth event-task Computer Use retirement")
         let controller = WedgeFakeCodexController(
@@ -1882,8 +1885,8 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         await coordinator.shutdownCodexSession(session)
     }
 
-    private func waitForPendingStart(_ fixture: Fixture) async throws {
-        try await AsyncTestWait.waitUntil("Codex start staged", timeout: 4) {
+    private func waitForPendingStart(_ fixture: Fixture, description: String = "Codex start staged") async throws {
+        try await AsyncTestWait.waitUntil(description, timeout: 4) {
             fixture.coordinator.test_hasPendingCodexStart(for: fixture.session)
         }
     }
