@@ -253,7 +253,7 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
             var bindingsAtCallback: [AgentSessionWorktreeBinding]?
             do {
                 _ = try await SessionAdminWindowsWorktreeHost().unbindWorktrees(
-                    sessionID: fixture.sessionID, worktreeID: nil, viewModel: fixture.viewModel, session: fixture.session,
+                    command: XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID)), worktreeID: nil,
                     isStillAuthorized: { true },
                     bindingsRemoved: { ids in
                         removed = ids
@@ -270,6 +270,35 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
             XCTAssertEqual(bindingsAtCallback, [], "The callback runs at publication")
             XCTAssertEqual(fixture.session.worktreeBindings, [])
         }
+    }
+
+    func testSessionAdminUnbindNoOpNeedsWriterButNotWorkspaceResources() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let command = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
+        command.writer.scope.worktrees.captureResources = { _ in nil }
+        let host = SessionAdminWindowsWorktreeHost()
+        let removed = try await host.unbindWorktrees(
+            command: command, worktreeID: "not-bound", isStillAuthorized: { true },
+            bindingsRemoved: { _ in XCTFail("No publication for a no-op") }
+        )
+        XCTAssertTrue(removed.isEmpty)
+        do {
+            _ = try await host.unbindWorktrees(
+                command: command, worktreeID: nil, isStillAuthorized: { true }, bindingsRemoved: { _ in XCTFail() }
+            )
+            XCTFail("A real change requires workspace resources")
+        } catch SessionAdminHostError.sessionUnavailable {} catch {
+            XCTFail("Missing resources are not revoked consent: \(error)")
+        }
+        fixture.viewModel.test_removeSession(tabID: fixture.session.tabID)
+        fixture.viewModel.test_installLiveSession(fixture.session)
+        do {
+            _ = try await host.unbindWorktrees(
+                command: command, worktreeID: "not-bound", isStillAuthorized: { true }, bindingsRemoved: { _ in XCTFail() }
+            )
+            XCTFail("Even a no-op cannot adopt a reacquired writer")
+        } catch SessionAdminHostError.authorityEnded {} catch { XCTFail("\(error)") }
     }
 
     func testVisualOnlyChangePreservesActiveRuntimeAndExecutionMapping() async throws {
@@ -538,7 +567,7 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         fixture.viewModel.test_setAgentSessionSaver { _, _, _ in fixture.git.sandbox.appendingPathComponent("session.json") }
         do {
             try await SessionAdminWindowsWorktreeHost().transition(
-                [], sessionID: fixture.sessionID, viewModel: fixture.viewModel,
+                [], command: XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID)),
                 isStillAuthorized: { scopes.hasLiveScope(grantedTo: grantee) }
             )
             XCTFail("Revoked scope must refuse publication")
@@ -1423,7 +1452,7 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
             // These unit cases stop before materialization. Only resources are substituted;
             // canonical claim/restoration admission and production provider probes remain real.
             writer.scope.worktrees.captureResources = { _ in
-                .init(store: nil, fallbackWorkspacePath: workspacePath, isCurrent: { true })
+                .init(store: nil, fallbackWorkspacePath: workspacePath, declaredRepoPaths: [], isCurrent: { true })
             }
         }
         session.worktreeBindings = [.init(

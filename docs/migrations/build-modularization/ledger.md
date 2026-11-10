@@ -6793,6 +6793,42 @@ awaits, self-relocation provenance, and all merge command routing/physical mutat
 acknowledgements. Both-product, full-lint, broad SessionLinks/admission/sidebar, fresh-index and
 base-warning push gates remain unrun. No push, full-suite, live-app or hosted-CI qualification is claimed.
 
+#### M9.2d checkpoint 3 — outer administration worktree command provenance
+
+`session_admin` create/bind/unbind now captures the canonical command before repository discovery,
+not a presenting window's view model. The captured workspace resources, declared root order and full
+binding value remain the authority across every pre-transition await and the Git creation fence.
+Full value equality deliberately replaces the lookup fingerprint for mutation freshness: visual
+metadata and binding identity can change without changing execution lookup paths. Discovery may
+never overwrite those intervening changes or switch to a reacquired writer on the same tab object.
+
+Saved targets use the existing targeted preparation owner with a counted hold spanning the command.
+Fork and worktree commands share the same narrow preparation admission: absent or legitimate
+unrestored writers may prepare; creating, retiring and conflicting writers remain refusals. Bind and
+unbind invoke the original command's scope transition directly, retaining authorization and ownership
+callbacks and partial-effect receipts. Exact no-op unbind needs a current writer, but no workspace
+resources. Idle waiting samples one captured writer and ends on replacement instead of following its
+successor. Read-only retained-root/index accounting is unchanged.
+
+Regression coverage includes a cold saved target's real create/bind/unbind and durable reads without
+post-command test flushes or focus changes; writer reacquisition while discovery or idle waiting is
+held; metadata-only changes with an unchanged lookup fingerprint; and resource-free no-op refusal on
+a stale command. The cold fixture retains a separate preparation hold across its three commands and
+durable reads, checks that each host releases its own nested hold, then drains its prepared owner.
+This avoids racing normal idle retirement; no production retirement/admission rule was relaxed.
+
+Local validation: scoped pinned formatter, strict lint and whitespace checks passed. Conductor
+`d9f652ae-1be0-472a-91bf-7a5af4feff86` passed **84 tests**, zero failures (50 binding-admission,
+32 administration recovery and two fork journey cases). Earlier execution found the cold fixture's
+between-command retirement race; a subsequent compile exposed missing MainActor isolation on its
+local async cleanup helper. Both test-only corrections are included in the final full focused run.
+The preceding normal merge of M9.2c (`37471342f`) passed 425 integration tests, both products, full
+lint and the index ratchet. This checkpoint's separate push gates are not yet claimed.
+
+Remaining M9.2d: outer UI/MCP creation and binding provenance, deferred self-relocation identity,
+and merge preview/apply/continue/abort runtime ownership, physical fences and acknowledgements.
+This is not completion of M9.2 or #1406; no live-app or hosted-CI qualification is claimed here.
+
 #### M9.2b checkpoint 9 — hook-review runtime ownership (validated locally; push frozen)
 
 The hook gate's actual discovery, waiting, response, refresh and completion bodies now live in

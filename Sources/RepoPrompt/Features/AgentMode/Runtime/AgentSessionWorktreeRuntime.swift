@@ -48,7 +48,18 @@ final class AgentSessionWorktreeRuntime {
     struct Resources {
         let store: WorkspaceFileContextStore?
         let fallbackWorkspacePath: String?
+        let declaredRepoPaths: [String]
         let isCurrent: @MainActor () -> Bool
+
+        init(
+            store: WorkspaceFileContextStore?, fallbackWorkspacePath: String?,
+            declaredRepoPaths: [String], isCurrent: @escaping @MainActor () -> Bool
+        ) {
+            self.store = store
+            self.fallbackWorkspacePath = fallbackWorkspacePath
+            self.declaredRepoPaths = declaredRepoPaths
+            self.isCurrent = isCurrent
+        }
     }
 
     struct Effects {
