@@ -916,7 +916,7 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
 
     func testHydrationDeferredSubmissionNeverRestoresIntoReplacementSession() async throws {
         let fixture = try makeFixture()
-        let originalBinding = fixture.session.persistentSessionBindingIdentity
+        let originalWriter = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.candidate.sessionID)).writer
         let heldFence = AgentRunStartStopFence(session: fixture.session)
         let replacement = AgentTabSession(tabID: fixture.tabID)
         replacement.hasLoadedPersistedState = true
@@ -925,8 +925,7 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         fixture.viewModel.storeDraftText(for: fixture.tabID, "replacement draft")
 
         await fixture.viewModel.submitUserTurnAfterHydration(
-            tabID: fixture.tabID, originalSession: fixture.session,
-            originalBinding: originalBinding, trimmedText: "old session draft",
+            tabID: fixture.tabID, originalWriter: originalWriter, trimmedText: "old session draft",
             attachmentsToSend: [], taggedFilesToSend: [], activeWorkflow: nil,
             stopFence: heldFence
         )

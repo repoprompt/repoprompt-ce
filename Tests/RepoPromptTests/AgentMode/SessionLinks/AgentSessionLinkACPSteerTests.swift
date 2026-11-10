@@ -917,9 +917,9 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         bridge.attach(host: host)
         defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }
         let before = bridge.captureWaitInput(for: endpoint)
-        await fixture.viewModel.submitUserTurnAfterHydration(
-            tabID: fixture.session.tabID, originalSession: fixture.session,
-            originalBinding: fixture.session.persistentSessionBindingIdentity,
+        try await fixture.viewModel.submitUserTurnAfterHydration(
+            tabID: fixture.session.tabID,
+            originalWriter: XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: XCTUnwrap(fixture.session.activeAgentSessionID))).writer,
             trimmedText: "deferred MCP input", attachmentsToSend: [], taggedFilesToSend: [],
             activeWorkflow: nil, stopFence: AgentRunStartStopFence(session: fixture.session),
             isLocalComposerInput: false

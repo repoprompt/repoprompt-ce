@@ -15743,15 +15743,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         if session.activeAgentSessionID != nil, !session.hasLoadedPersistedState {
             Self.logCodexDebug("[AgentModeVM][RunID] deferring send until hydration completes for tab \(tabID)")
+            guard let sessionID = session.activeAgentSessionID,
+                  let originalWriter = try? runtimeWriter(sessionID: sessionID),
+                  originalWriter.scope === runtimeSessionStore, originalWriter.session === session,
+                  originalWriter.isCurrent, !originalWriter.scope.isRetiring
+            else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
             agentSelfCompactCancelForAcceptedLocalInput(session)
             let stopFence = AgentRunStartStopFence(session: session)
-            let originalBinding = session.persistentSessionBindingIdentity
+            // This operation-local task retains its original owner until hydration settles;
+            // do not store it as a persistent session-owned task.
             let deferred = Task<UserTurnSubmissionResult, Never> { [weak self] in
                 guard let self else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
                 return await submitUserTurnAfterHydration(
                     tabID: tabID,
-                    originalSession: session,
-                    originalBinding: originalBinding,
+                    originalWriter: originalWriter,
                     trimmedText: trimmedText,
                     attachmentsToSend: attachmentsToSend,
                     taggedFilesToSend: taggedFilesToSend,
@@ -15809,8 +15814,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     @discardableResult
     func submitUserTurnAfterHydration(
         tabID: UUID,
-        originalSession: TabSession,
-        originalBinding: AgentPersistentSessionBindingIdentity?,
+        originalWriter: AgentSessionRuntimeStore.Writer,
         trimmedText: String,
         attachmentsToSend: [AgentFileAttachment],
         taggedFilesToSend: [AgentTaggedFileAttachment],
@@ -15830,12 +15834,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         isLocalComposerInput: Bool = true,
         providerSwitchClaim: AgentComposerSubmitClaim? = nil
     ) async -> UserTurnSubmissionResult {
-        guard sessions[tabID] === originalSession,
-              originalSession.persistentSessionBindingIdentity == originalBinding
+        let session = originalWriter.session
+        guard originalWriter.scope === runtimeSessionStore, sessions[tabID] === session,
+              originalWriter.ownsPersistentClaim
         else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
-        let session = originalSession
         func rejected(_ message: String) -> UserTurnSubmissionResult {
-            if isLocalComposerInput, sessions[tabID] === session, session.persistentSessionBindingIdentity == originalBinding {
+            if isLocalComposerInput, originalWriter.ownsPersistentClaim {
                 let submittedDraft = rawDraftText ?? trimmedText
                 restoreRejectedManualSubmissionComposerState(
                     repromptedText: repromptedText,
@@ -15849,6 +15853,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             return .blocked(message: message)
         }
+        guard originalWriter.isCurrent, !originalWriter.scope.isRetiring else {
+            return rejected(Self.staleComposerSubmitTargetMessage)
+        }
         guard !Task.isCancelled, stopFence.permitsStart(of: session) else {
             return rejected("This scheduled run was cancelled by Stop.")
         }
@@ -15856,11 +15863,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return rejected(CodexManagedSessionFence.blockedMessage)
         }
         await prepareSessionForRunStart(tabID: tabID, session: session)
-        guard let hydratedSession = sessions[tabID], hydratedSession === session,
-              hydratedSession.persistentSessionBindingIdentity == originalBinding,
-              !Task.isCancelled, stopFence.permitsStart(of: hydratedSession)
+        guard originalWriter.isCurrent, sessions[tabID] === session else {
+            return rejected(Self.staleComposerSubmitTargetMessage)
+        }
+        let hydratedSession = session
+        guard !Task.isCancelled, stopFence.permitsStart(of: hydratedSession)
         else { return rejected("This scheduled run was cancelled by Stop.") }
         if let message = hydratedSession.operationAdmissionFailureMessage { return rejected(message) }
+        guard case .success = originalWriter.admitCommand() else {
+            return rejected(Self.staleComposerSubmitTargetMessage)
+        }
         let carriedSwitch = hydratedSession.pendingHandoff.providerSwitchDelivery != nil
         var pending: Task<UserTurnSubmissionResult, Never>?
         let immediate = submitPreparedUserTurn(
@@ -15891,6 +15903,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         } else { immediate }
         if case let .blocked(message) = result { return rejected(message) }
         guard result == .submitted else { return result }
+        guard originalWriter.ownsPersistentClaim else { return result }
         if !carriedSwitch {
             // Consume only the submitted snapshot, never B/W2 added while A/W1 was hydrating.
             if isLocalComposerInput, hydratedSession.userWorkflowSelectionMutationGeneration == restorationSelectedWorkflowMutationGeneration,

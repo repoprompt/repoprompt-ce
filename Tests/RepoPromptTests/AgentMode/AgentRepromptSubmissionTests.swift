@@ -1116,7 +1116,7 @@ final class AgentRepromptSubmissionTests: XCTestCase {
                 let result = await fixture.viewModel.submitUserTurnAfterAutoEffort(text: "Source words", claim: claim, session: fixture.session, destinationTabID: fixture.session.tabID, repromptedText: approved)
                 XCTAssertEqual(result, .submitted)
             default:
-                await fixture.viewModel.submitUserTurnAfterHydration(tabID: fixture.session.tabID, originalSession: fixture.session, originalBinding: fixture.session.persistentSessionBindingIdentity, trimmedText: "Source words", attachmentsToSend: [], taggedFilesToSend: [], activeWorkflow: nil, rawDraftText: raw, composerOrigin: .localComposer, repromptedText: approved, stopFence: AgentRunStartStopFence(session: fixture.session))
+                try await fixture.viewModel.submitUserTurnAfterHydration(tabID: fixture.session.tabID, originalWriter: XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: XCTUnwrap(fixture.session.activeAgentSessionID))).writer, trimmedText: "Source words", attachmentsToSend: [], taggedFilesToSend: [], activeWorkflow: nil, rawDraftText: raw, composerOrigin: .localComposer, repromptedText: approved, stopFence: AgentRunStartStopFence(session: fixture.session))
             }
             XCTAssertEqual(fixture.session.items.last(where: { $0.kind == .user })?.text, approved)
             XCTAssertEqual(fixture.session.pendingClaudeSteeringInstructions.last?.providerText, approved)

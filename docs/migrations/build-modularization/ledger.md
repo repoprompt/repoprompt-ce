@@ -8093,3 +8093,44 @@ VM four, approval/resume tests one, other four touched Swift files zero. Fresh i
 style and index gates, not full publication/products/live-app/release/sanitizer/hosted-CI qualification.
 Nothing pushed. Changed-head continuation and the refusal latch are source-reviewed; no separate
 injected transient-refusal matrix is claimed.
+
+### M9.2g local prerequisite — original writer through hydration-deferred submit (2026-11-11)
+
+The unloaded, already-bound submission branch captures its exact canonical Writer before its
+self-compact cancellation and before scheduling hydration. The deferred operation requires that
+writer at entry and after preparation, admits restored work only after hydration, and restores
+rejected local input only through the original persistent claim. A same-object remove/re-add can
+no longer authorize the old task via an unchanged binding token. After an awaited provider switch,
+an already-submitted result stays truthful, but a lost writer cannot consume successor workflow or
+attachments. This intentionally leaves those inputs pending rather than mutating the successor;
+subsequent input policy is not a claim that they can never be sent again. The task retains its owner
+only for this operation, not in a persistent session-owned task.
+
+Unscoped, transitioning, absent or conflicting bound writers are refused before this branch's
+shared mutation; no fallback is added. The existing HydrationRuntime.Attempt already refuses those
+unqualified loads and independently fences application/readiness across reacquisition. One Oracle
+review (`0647`, chat `6F1A83`) found no P0/P1 issues, requested retirement coverage and explicit
+hydration-state evidence, and speculated that hydration itself remained unfenced. Source inspection
+of the existing Attempt/read guards rejects that speculation; the new test also asserts that stale
+hydration does not set the loaded latch. Earlier accepted self-compact cancellation is not rolled
+back after later claim loss. MCP auto-effort ingress and steering queue writer provenance remain
+OPEN. The post-switch consumption guard is source-reviewed, not a new injected switch-await test.
+
+New real-submission coverage exercises same-object reacquisition before task entry and during the
+actual held persisted read, plus original-owner retirement before task entry. It checks no stale
+row, queue, draft restoration, snapshot consumption or provider start, and owned retirement draft
+recovery. The existing positive hydrated-send/snapshot-consumption test remains unchanged. Three
+direct callers now pass their actual fixture writer; the replacement-session negative captures it
+before replacement. Initial focused `921edf78-5809-4417-95d4-8a0cf363f4f2` failed compilation
+because the new fixture addressed the session's save counter through the persistence runtime;
+corrected the fixture owner without changing assertions. Final focused
+`a54c56bd-95b2-4fcb-aac7-a6e3b2fa22fd` passed **44 tests, zero failures** (26.942s), including
+three new ABA/retirement variants (0.578s), the unchanged positive hydrated-input case (0.175s),
+and all reprompt submission tests. Affected `b516149e-b7ab-45c7-9aa7-790e5216b5cc` passed
+**751 tests, zero failures** (208.357s), including the full 105-case handoff suite. Full lint
+`338d95db-9b1c-450c-b3fd-1467237cd926` passed; the subsequent fixture-only counter correction
+also passed scoped pinned formatting and strict lint. Actual compile warning occurrence maxima
+versus integrated `a0c674e9` remain VM four and other four touched Swift files zero. Fresh index
+passed **1,262/1,360 wrong-way edges, 53/66 largest cycle**, unchanged baselines. These are local
+focused/affected/style/index receipts, not full publication/product/live-app/release/sanitizer or
+hosted-CI qualification. Nothing pushed.
