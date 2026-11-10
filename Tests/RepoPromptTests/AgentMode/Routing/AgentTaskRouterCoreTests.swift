@@ -85,7 +85,7 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
         modelOption("claude-sonnet-5", "Claude Sonnet 5"),
         modelOption("opus", "Claude Opus"),
         modelOption("claude-opus-5-5", "Claude Opus 5.5"),
-        modelOption("claude-fable-5-1", "Claude Fable 5.1")
+        modelOption("claude-fable-5-2", "Claude Fable 5.2")
     ]
 
     private static func modelOption(_ raw: String, _ name: String) -> AgentModelOption {
@@ -142,11 +142,11 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
         XCTAssertEqual(lunaCandidate.descriptor.rubricVersion, RoutingModelProfileResolver.bundled.rubricVersion)
 
         let fableCandidate = try XCTUnwrap(candidates.first(where: {
-            ClaudeModelSpecifier(raw: $0.target.modelRaw).baseModel == AgentModel.claudeFable51.rawValue
+            ClaudeModelSpecifier(raw: $0.target.modelRaw).baseModel == AgentModel.claudeFable52.rawValue
         }))
         XCTAssertEqual(fableCandidate.utilityTier, "claude-fable")
-        XCTAssertTrue(fableCandidate.descriptor.targetDescription.contains("Terminal-Bench 4.0"))
-        XCTAssertTrue(fableCandidate.descriptor.targetDescription.contains("$10 input / $50 output"))
+        XCTAssertTrue(fableCandidate.descriptor.targetDescription.contains("Claude Fable 5.2"))
+        XCTAssertTrue(fableCandidate.descriptor.targetDescription.contains("$8 input / $40 output"))
         XCTAssertNil(fableCandidate.target.reasoningEffortRaw)
 
         let opusCandidate = try XCTUnwrap(candidates.first(where: {
@@ -155,6 +155,25 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
         XCTAssertEqual(opusCandidate.utilityTier, "claude-opus")
         XCTAssertTrue(opusCandidate.descriptor.targetDescription.contains("recommended starting point for most workloads"))
         XCTAssertTrue(opusCandidate.descriptor.targetDescription.contains("$4 input / $20 output"))
+    }
+
+    func testFableRoutingPrefers52ButKeeps51Fallback() throws {
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: true, codexAvailable: false, openCodeAvailable: false
+        )
+        let old = Self.modelOption("claude-fable-5-1", "Claude Fable 5.1")
+        let newest = Self.modelOption("claude-fable-5-2", "Claude Fable 5.2")
+        let alias = Self.modelOption("fable", "Fable Latest")
+        for options in [[old, newest], [newest, old], [old], [old, alias]] {
+            let candidates = try candidateBuilder(claudeOptions: options).build(
+                allowedProviders: [.claudeCode], availability: availability
+            )
+            let fable = try XCTUnwrap(candidates.first { $0.utilityTier == "claude-fable" })
+            let expectedModel = options.contains(newest) ? newest.rawValue : (options.contains(alias) ? alias.rawValue : old.rawValue)
+            XCTAssertEqual(fable.target.modelRaw, expectedModel)
+            let expectedPrice = options.count == 1 ? "$10 input / $50 output" : "$8 input / $40 output"
+            XCTAssertTrue(fable.descriptor.targetDescription.contains(expectedPrice))
+        }
     }
 
     func testModelFamilyAvailabilityProjectsPartialNoAndFullCatalogsWithoutChangingCandidates() throws {
@@ -297,7 +316,7 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
         // Strongest-first within each provider so judge position bias and truncation favor capability.
         XCTAssertEqual(candidates.map(\.target.modelRaw), [
             "gpt-6-sol", "gpt-6-astra", "gpt-5.6-terra", "gpt-6-luna",
-            "claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5", "claude-haiku-4-5"
+            "claude-opus-5-5", "claude-fable-5-2", "claude-sonnet-5", "claude-haiku-4-5"
         ])
         XCTAssertEqual(candidates.map(\.utilityTier), [
             "gpt-6-sol", "gpt-6-astra", "gpt-5.6-terra", "gpt-6-luna",
@@ -630,7 +649,7 @@ final class AgentTaskRoutingCandidateBuilderAvailabilityTests: XCTestCase {
     ].map(option)
 
     private static let fullClaude = [
-        "claude-haiku-4-5", "claude-sonnet-5", "opus", "claude-opus-5-5", "claude-fable-5-1"
+        "claude-haiku-4-5", "claude-sonnet-5", "opus", "claude-opus-5-5", "claude-fable-5-2"
     ].map(option)
 
     private static let optionFixtures: [OptionFixture] = [
@@ -1511,7 +1530,7 @@ final class RoutingModelProfileResolverTests: XCTestCase {
         let resolver = RoutingModelProfileResolver.bundled
         let document = try XCTUnwrap(resolver.document)
         XCTAssertEqual(document.schemaVersion, 1)
-        XCTAssertEqual(document.models.count, 17)
+        XCTAssertEqual(document.models.count, 18)
         let luna = resolver.resolve(model("gpt-6-luna"), catalogRevision: "catalog-1", now: date)
         XCTAssertEqual(luna.match, .exact)
         XCTAssertTrue(luna.description(snapshotDate: resolver.snapshotDate).contains("$0.10 input / $0.50 output"))

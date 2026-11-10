@@ -127,6 +127,7 @@ public enum AIModel: Equatable, Hashable {
     case claudeSonnet5
     case claudeOpus55
     case claudeOpus5
+    case claudeFable52
     case claudeFable51
     case claudeMythos51
     case claude45Haiku
@@ -168,6 +169,7 @@ public enum AIModel: Equatable, Hashable {
     case openrouterGpt6Luna
     case openrouterClaudeSonnet55
     case openrouterClaudeOpus55
+    case openrouterClaudeFable52
     case openrouterClaudeFable51
 
     case openrouterGeminiPro25
@@ -368,6 +370,7 @@ public enum AIModel: Equatable, Hashable {
         case claudeSonnet5
         case claudeOpus55
         case claudeOpus5
+        case claudeFable52
         case claudeFable51
         case claudeMythos51
         case claude45Haiku
@@ -400,6 +403,7 @@ public enum AIModel: Equatable, Hashable {
         case openrouterGpt6Luna
         case openrouterClaudeSonnet55
         case openrouterClaudeOpus55
+        case openrouterClaudeFable52
         case openrouterClaudeFable51
         case openrouterGeminiPro25
         case fireworksDeepseekV3p1Terminus
@@ -694,6 +698,8 @@ public enum AIModel: Equatable, Hashable {
             .staticCase(.claudeOpus55)
         case .claudeOpus5:
             .staticCase(.claudeOpus5)
+        case .claudeFable52:
+            .staticCase(.claudeFable52)
         case .claudeFable51:
             .staticCase(.claudeFable51)
         case .claudeMythos51:
@@ -758,6 +764,8 @@ public enum AIModel: Equatable, Hashable {
             .staticCase(.openrouterClaudeSonnet55)
         case .openrouterClaudeOpus55:
             .staticCase(.openrouterClaudeOpus55)
+        case .openrouterClaudeFable52:
+            .staticCase(.openrouterClaudeFable52)
         case .openrouterClaudeFable51:
             .staticCase(.openrouterClaudeFable51)
         case .openrouterGeminiPro25:
