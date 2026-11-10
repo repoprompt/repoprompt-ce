@@ -207,19 +207,26 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
         session.runState = .waitingForUser
         session.waitingPrompt = "Stale prompt alone"
         XCTAssertEqual(evidence(), false)
-        session.instructionWaitID = UUID()
+        // ID and continuation are read projections of one owned record now: neither half can
+        // independently turn a stale prompt into a complete instruction wait.
+        XCTAssertNil(session.instructionWaitID)
+        XCTAssertNil(session.instructionContinuation)
         XCTAssertEqual(evidence(), false)
+        let runtime = viewModel.linkExecutionRuntime
+        let command = try XCTUnwrap(runtime.admit(target))
         let wait = Task<UserInstructionResponse, Error> {
-            try await withCheckedThrowingContinuation { session.instructionContinuation = $0 }
+            try await withCheckedThrowingContinuation {
+                runtime.test_installInstructionWait(command: command, continuation: $0)
+            }
         }
         try await AsyncTestWait.waitUntil("instruction continuation installed") { session.instructionContinuation != nil }
         try await AsyncTestWait.waitUntil("instruction wait mutation observed") { publishedEvidence.last == true }
         XCTAssertEqual(evidence(), true)
         XCTAssertEqual(AgentPendingInteractionDescriptor.make(from: session)?.kind, .instruction)
-        session.instructionWaitID = nil
+        let installedWait = try XCTUnwrap(session.instructionWait)
+        session.instructionWait = nil
         XCTAssertEqual(evidence(), false)
-        session.instructionContinuation?.resume(throwing: CancellationError())
-        session.instructionContinuation = nil
+        installedWait.continuation.resume(throwing: CancellationError())
         _ = await wait.result
         try await AsyncTestWait.waitUntil("instruction teardown observed") { publishedEvidence.last == false }
         let review = AgentCodexHookReviewRequest(tabID: tabID, runAttemptID: nil, runID: nil, executionCWD: "/tmp", hooks: [], phase: .reviewRequired, gateGeneration: 1)

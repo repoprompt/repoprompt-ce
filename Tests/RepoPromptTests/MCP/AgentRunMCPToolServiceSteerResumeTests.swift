@@ -38,8 +38,8 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
             let response = try await withCheckedThrowingContinuation { continuation in
                 // Match awaitNextInstruction: install the wait identity before publishing the
                 // continuation/readiness, never rotate it while delivery is being prepared.
-                session.instructionWaitID = UUID()
-                session.instructionContinuation = continuation
+
+                installInstructionWaitForTest(session: session, runtime: viewModel.linkExecutionRuntime, continuation: continuation)
                 session.runState = .waitingForUser
             }
             deliveredText = response.text
@@ -67,15 +67,14 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         var deliveredText: String?
         let resumed = Task { @MainActor in
             let response = try await withCheckedThrowingContinuation { continuation in
-                session.instructionWaitID = UUID()
-                session.instructionContinuation = continuation
+                installInstructionWaitForTest(session: session, runtime: viewModel.linkExecutionRuntime, continuation: continuation)
                 session.runState = .waitingForUser
             }
             deliveredText = response.text
         }
         defer {
             session.instructionContinuation?.resume(throwing: CancellationError())
-            session.instructionContinuation = nil
+            session.instructionWait = nil
             resumed.cancel()
         }
         try await AsyncTestWait.waitUntil("exact instruction waiter installed") { session.instructionContinuation != nil }
@@ -201,10 +200,10 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         session.installRunID(UUID())
         _ = session.beginRunAttempt(source: "resident-steer-fixture")
         session.runState = .waitingForUser
-        session.instructionWaitID = UUID()
+
         viewModel.storeDraftText(for: session.tabID, "local draft")
         let resumed = Task { @MainActor in
-            try await withCheckedThrowingContinuation { session.instructionContinuation = $0 }
+            try await withCheckedThrowingContinuation { installInstructionWaitForTest(session: session, runtime: viewModel.linkExecutionRuntime, continuation: $0) }
         }
         try await AsyncTestWait.waitUntil("instruction continuation") {
             await MainActor.run { session.instructionContinuation != nil }

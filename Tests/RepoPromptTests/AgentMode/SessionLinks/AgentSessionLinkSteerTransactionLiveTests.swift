@@ -249,11 +249,11 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         fixture.session.runState = .waitingForUser
         fixture.session.installRunID(UUID())
         _ = fixture.session.beginRunAttempt(source: "waiting-steer-test")
-        fixture.session.instructionWaitID = UUID()
+
         let session = fixture.session
         let resumed = Task { @MainActor in
             try await withCheckedThrowingContinuation { continuation in
-                session.instructionContinuation = continuation
+                installInstructionWaitForTest(session: session, runtime: fixture.viewModel.linkExecutionRuntime, continuation: continuation)
             }
         }
         try await AsyncTestWait.waitUntil("the run to wait for its next instruction") {
@@ -283,10 +283,10 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         session.runState = .waitingForUser
         session.installRunID(UUID())
         _ = session.beginRunAttempt(source: "waiting-noncomposer-test")
-        session.instructionWaitID = UUID()
+
         let resumed = Task { @MainActor in
             try await withCheckedThrowingContinuation { continuation in
-                session.instructionContinuation = continuation
+                installInstructionWaitForTest(session: session, runtime: fixture.viewModel.linkExecutionRuntime, continuation: continuation)
             }
         }
         try await AsyncTestWait.waitUntil("the noncomposer instruction continuation") {
@@ -327,9 +327,9 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
                 let owner = session.beginRunAttempt(source: "waiting-quiet-race")
                 session.quietLedger.markRoutineWake(owner: owner, wakeID: UUID())
                 session.runState = .waitingForUser
-                session.instructionWaitID = UUID()
+
                 let resumed = Task { @MainActor in
-                    try await withCheckedThrowingContinuation { continuation in session.instructionContinuation = continuation }
+                    try await withCheckedThrowingContinuation { continuation in installInstructionWaitForTest(session: session, runtime: fixture.viewModel.linkExecutionRuntime, continuation: continuation) }
                 }
                 try await AsyncTestWait.waitUntil("waiting continuation") {
                     await MainActor.run { session.instructionContinuation != nil }
@@ -361,7 +361,7 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
                 XCTAssertNotNil(session.instructionContinuation, "Old prepared input did not resume even the same wait/controller")
                 if managed { _ = await sink.awaitOutcome(timeoutSeconds: 1) }
                 session.instructionContinuation?.resume(throwing: CancellationError())
-                session.instructionContinuation = nil
+                session.instructionWait = nil
                 _ = try? await resumed.value
                 XCTAssertEqual(session.quietLedger.facts?.ordinaryThrough, 1)
                 if replaceOwner {

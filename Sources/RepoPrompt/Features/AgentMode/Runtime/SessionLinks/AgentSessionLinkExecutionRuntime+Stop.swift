@@ -339,7 +339,7 @@ extension AgentSessionLinkExecutionRuntime {
                 return
             }
             let result = await writer.scope.persistence.flushSaveRequired(
-                for: candidate.tabID, workspaceID: writer.identity.workspaceID
+                writer: writer
             )
             guard writer.isCurrent, writer.session === session,
                   session.persistentSessionBindingIdentity == binding,

@@ -32,6 +32,22 @@ final class AgentSessionPersistenceRuntime {
     typealias RequiredSavePhase = AgentSessionRequiredSavePhase
     typealias Saver = @MainActor (AgentSession, WorkspaceModel, Int) async throws -> URL
 
+    /// Existing owner saves resolve their writer normally. A command's required write can only
+    /// narrow that authority to the claim captured before any queue or preparation suspension.
+    enum WriterExpectation {
+        case currentOwner
+        case exact(AgentSessionRuntimeStore.Writer)
+    }
+
+    private func permits(_ expectation: WriterExpectation, tabID: UUID) -> Bool {
+        switch expectation {
+        case .currentOwner: true
+        case let .exact(writer):
+            writer.scope === scope && sessions[tabID] === writer.session
+                && writer.session.tabID == tabID && writer.isCurrent
+        }
+    }
+
     struct Admission {
         let sessionID: UUID
         let creation: AgentSessionCreationHandle?
@@ -171,7 +187,15 @@ final class AgentSessionPersistenceRuntime {
         let capturedScope = scope
         let binding = session.persistentSessionBindingIdentity
         let transition = session.bindingTransitionGeneration
+        let requestID = UUID()
+        session.saveDebounceRequestID = requestID
         session.saveDebounceTask = Task { [self, session, capturedScope] in
+            defer {
+                if session.saveDebounceRequestID == requestID {
+                    session.saveDebounceRequestID = nil
+                    session.saveDebounceTask = nil
+                }
+            }
             do { try await debounce() } catch { return }
             guard !Task.isCancelled, capturedScope?.sessions[tabID] === session,
                   !session.isInstallingHandoffWorktreeBindings else { return }
@@ -228,8 +252,8 @@ final class AgentSessionPersistenceRuntime {
     }
 
     @discardableResult
-    func saveSession(for tabID: UUID, observingPhase: ((RequiredSavePhase) -> Void)? = nil) async -> AgentSessionSaveResult {
-        switch await saveSessionCore(for: tabID, observingPhase: observingPhase) {
+    func saveSession(for tabID: UUID, writer expectation: WriterExpectation = .currentOwner, observingPhase: ((RequiredSavePhase) -> Void)? = nil) async -> AgentSessionSaveResult {
+        switch await saveSessionCore(for: tabID, writer: expectation, observingPhase: observingPhase) {
         case .durablySaved:
             .saved
         case .notRequired:
@@ -245,12 +269,16 @@ final class AgentSessionPersistenceRuntime {
 
     func saveSessionCore(
         for tabID: UUID, creationSave: SessionCreationSave? = nil,
+        writer expectation: WriterExpectation = .currentOwner,
         observingPhase: ((RequiredSavePhase) -> Void)? = nil
     ) async -> AgentSessionSaveCoreResult {
         #if DEBUG
             let diagnosticsStartMS = perfRecorder.timestampMSIfEnabled()
             perfRecorder.increment("save.session.invoked", tabID: tabID)
         #endif
+        guard permits(expectation, tabID: tabID) else {
+            return .deferred("The originating writer changed before persistence.")
+        }
         guard composition != nil else { return .deferred("The runtime persistence composition is unavailable.") }
         guard composition?.isSuppressed() == false || composition?.bypassesSuppression() == true
         else {
@@ -363,7 +391,9 @@ final class AgentSessionPersistenceRuntime {
         guard let saveToken = makeSaveCommitToken(for: session, workspace: workspace),
               isSaveCommitTokenCurrent(saveToken, creationHandle: effectiveCreationSave?.handle)
         else {
-            requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
+            if permits(expectation, tabID: tabID) {
+                requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
+            }
             return .deferred("The session or its storage location changed before persistence could commit.")
         }
 
@@ -374,6 +404,13 @@ final class AgentSessionPersistenceRuntime {
             // Keep dirty state and fail required flushes honestly; do not guess a workspace,
             // bypass writer admission, or spin a debounce loop while the conflict remains.
             return .deferred("The session does not have a unique runtime writer for this workspace.")
+        }
+        if case let .exact(expected) = expectation {
+            guard expected.identity == writer.identity, expected.session === writer.session,
+                  permits(expectation, tabID: tabID)
+            else {
+                return .deferred("The originating writer changed before persistence could commit.")
+            }
         }
         let preparedWrite: AgentSessionSaveRuntime.PreparedWrite
         do {
@@ -404,12 +441,17 @@ final class AgentSessionPersistenceRuntime {
             let receipt: AgentSessionSaveRuntime.Receipt
             switch outcome {
             case let .deferred(message, requestFreshSave):
-                if requestFreshSave {
+                // A stale exact operation cannot dirty or request a retry through its successor.
+                // Independently queued owner saves still drain through the existing queue defer.
+                if requestFreshSave, permits(expectation, tabID: tabID) {
                     requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
                 }
                 return .deferred(message)
             case let .committed(committed):
                 receipt = committed
+            }
+            guard permits(expectation, tabID: tabID) else {
+                return .deferred("The originating writer changed after persistence committed.")
             }
             presentation?.didCommit(session, receipt, canonicalItemCount)
             #if DEBUG
@@ -425,8 +467,10 @@ final class AgentSessionPersistenceRuntime {
                 }
             #endif
             let durableBindingToken = receipt.binding
-            guard session.currentRestorationBindingToken == durableBindingToken else {
-                requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
+            guard permits(expectation, tabID: tabID), session.currentRestorationBindingToken == durableBindingToken else {
+                if permits(expectation, tabID: tabID) {
+                    requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
+                }
                 return .deferred("The session binding changed after persistence committed.")
             }
             observingPhase?(.durablySaved(durableBindingToken))
@@ -459,8 +503,19 @@ final class AgentSessionPersistenceRuntime {
     /// persistence as its delivery linearization point: the attributed row must be durable before a
     /// provider turn starts, and a debounced `scheduleSave` cannot provide that guarantee.
     func flushSaveRequired(
+        writer: AgentSessionRuntimeStore.Writer,
+        observingSavePhase: ((RequiredSavePhase) -> Void)? = nil
+    ) async -> Result<Void, AgentSessionPersistenceFailure> {
+        await flushSaveRequired(
+            for: writer.binding.tabID, workspaceID: writer.identity.workspaceID,
+            writer: .exact(writer), observingSavePhase: observingSavePhase
+        )
+    }
+
+    func flushSaveRequired(
         for tabID: UUID,
         workspaceID: UUID,
+        writer expectation: WriterExpectation = .currentOwner,
         observingSavePhase: ((RequiredSavePhase) -> Void)? = nil
     ) async -> Result<Void, AgentSessionPersistenceFailure> {
         observingSavePhase?(.beforeWrite)
@@ -468,13 +523,16 @@ final class AgentSessionPersistenceRuntime {
             return .failure(.init(operation: .save, tabID: tabID, message: "The runtime persistence owner is unavailable."))
         }
         defer { withExtendedLifetime(retainedScope) {} }
+        guard permits(expectation, tabID: tabID) else {
+            return .failure(.init(operation: .save, tabID: tabID, message: "The originating writer changed before required persistence."))
+        }
         guard let capturedSession = sessions[tabID] else { return .success(()) }
         let capturedBinding = capturedSession.persistentSessionBindingIdentity
         let capturedRestorationToken = capturedSession.currentRestorationBindingToken
         if let message = capturedSession.restorationAdmissionFailureMessage {
             return .failure(.init(operation: .save, tabID: tabID, message: message))
         }
-        capturedSession.saveDebounceTask?.cancel()
+        if case .currentOwner = expectation { capturedSession.saveDebounceTask?.cancel() }
 
         if let sessionID = capturedSession.activeAgentSessionID {
             while queue.inFlightSessionIDs.contains(sessionID) {
@@ -489,7 +547,7 @@ final class AgentSessionPersistenceRuntime {
                 message: "The owning workspace changed during required persistence."
             ))
         }
-        guard sessions[tabID] === capturedSession,
+        guard permits(expectation, tabID: tabID), sessions[tabID] === capturedSession,
               capturedSession.persistentSessionBindingIdentity == capturedBinding,
               capturedSession.currentRestorationBindingToken == capturedRestorationToken,
               capturedSession.restorationAdmissionFailureMessage == nil
@@ -501,7 +559,39 @@ final class AgentSessionPersistenceRuntime {
             ))
         }
 
-        switch await saveSession(for: tabID, observingPhase: observingSavePhase) {
+        if case .exact = expectation {
+            // Do not cancel an owner's ordinary request while this exact operation is queued.
+            // Once admitted to write, remember that request separately from our acknowledgment.
+            let hadPendingDebounce = capturedSession.saveDebounceRequestID != nil
+                && capturedSession.saveDebounceTask?.isCancelled == false
+            capturedSession.saveDebounceTask?.cancel()
+            capturedSession.saveDebounceTask = nil
+            capturedSession.saveDebounceRequestID = nil
+            defer {
+                if hadPendingDebounce, !permits(expectation, tabID: tabID),
+                   sessions[tabID] === capturedSession,
+                   capturedSession.persistentSessionBindingIdentity == capturedBinding,
+                   capturedSession.isDirty, capturedSession.saveDebounceRequestID == nil
+                {
+                    // Preserve only the pre-existing same-record owner's request, not a retry
+                    // invented by this failed exact operation or a write to a recycled tab.
+                    scheduleSave(for: capturedSession)
+                }
+            }
+            return await finishRequiredSave(for: tabID, session: capturedSession, writer: expectation, observingSavePhase: observingSavePhase)
+        }
+        return await finishRequiredSave(for: tabID, session: capturedSession, writer: expectation, observingSavePhase: observingSavePhase)
+    }
+
+    private func finishRequiredSave(
+        for tabID: UUID, session capturedSession: TabSession, writer expectation: WriterExpectation,
+        observingSavePhase: ((RequiredSavePhase) -> Void)?
+    ) async -> Result<Void, AgentSessionPersistenceFailure> {
+        let result = await saveSession(for: tabID, writer: expectation, observingPhase: observingSavePhase)
+        guard permits(expectation, tabID: tabID) else {
+            return .failure(.init(operation: .save, tabID: tabID, message: "The originating writer changed during required persistence."))
+        }
+        switch result {
         case .saved:
             guard !capturedSession.isDirty else {
                 return .failure(.init(
