@@ -7,26 +7,57 @@ import RepoPromptWorkspaceCore
 
 @MainActor
 extension MCPWorktreeToolProvider {
+    @MainActor
     private struct SessionResolution {
         let sessionID: UUID
         let isRoutedAgentMode: Bool
+        let command: AgentSessionRuntimeStore.Command
+        let admission: AgentSessionWorktreeRuntime.Admission?
+
+        var runtime: AgentSessionWorktreeRuntime {
+            command.writer.scope.worktrees
+        }
+
+        func requireAdmission() throws -> AgentSessionWorktreeRuntime.Admission {
+            guard let admission else { throw MCPError.invalidParams("The merge workspace is unavailable.") }
+            try admission.requireCurrent()
+            return admission
+        }
     }
 
     func executeMerge(op: Operation, args: [String: Value]) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
-        let session = try await resolveMergeSession(args: args)
-        switch op {
-        case .preview:
-            return try await executePreview(args: args, session: session)
-        case .apply:
-            return try await executeApply(args: args, session: session)
-        case .status:
-            return try executeStatus(args: args, session: session)
-        case .continue:
-            return try await executeContinue(args: args, session: session)
-        case .abort:
-            return try await executeAbort(args: args, session: session)
-        case .list, .show, .create, .bind, .select, .unbind:
-            throw MCPError.invalidParams("Invalid merge op: \(op.rawValue)")
+        let session = try await resolveMergeSession(args: args, needsResources: op != .status)
+        do {
+            switch op {
+            case .preview:
+                return try await executePreview(args: args, session: session)
+            case .apply:
+                return try await executeApply(args: args, session: session)
+            case .status:
+                return try executeStatus(args: args, session: session)
+            case .continue:
+                return try await executeContinue(args: args, session: session)
+            case .abort:
+                return try await executeAbort(args: args, session: session)
+            case .list, .show, .create, .bind, .select, .unbind:
+                throw MCPError.invalidParams("Invalid merge op: \(op.rawValue)")
+            }
+        } catch let partial as AgentSessionWorktreeRuntime.PartialMerge {
+            let result = partial.applyResult
+            let abort = partial.abortResult
+            let preview = partial.preview
+            return ToolResultDTOs.ManageWorktreeReplyDTO(op: op.rawValue, merge: .init(
+                status: "committed_incomplete", operationID: partial.operationID,
+                sessionID: partial.writer.sessionID.uuidString,
+                source: (result?.source ?? preview?.inspection.source).map(endpointDTO),
+                target: (result?.target ?? abort?.target ?? preview?.inspection.target).map(endpointDTO),
+                targetHeadAfter: result?.targetHeadAfter ?? abort?.targetHead,
+                mergeCommit: result?.mergeCommit,
+                artifacts: artifactsDTO(preview?.artifacts),
+                conflictFiles: result?.conflictFiles,
+                errorCode: "merge_completion_incomplete", error: partial.localizedDescription,
+                nextActions: ["Inspect the operation and target before retrying; a committed effect is not replayed automatically."]
+            ))
         }
     }
 
@@ -37,8 +68,8 @@ extension MCPWorktreeToolProvider {
         let target = try targetSelector(args)
         let includeGraph = parseBool(args["include_graph"]) ?? true
         let graphLimit = graphLimit(args["graph_limit"])
-        let preview = try await dependencies.execution.requireTargetWindow().agentModeViewModel.previewWorktreeMerge(
-            sessionID: session.sessionID,
+        let preview = try await session.runtime.previewMerge(
+            admission: session.requireAdmission(),
             repoRoot: trimmedString(args["repo_root"]),
             target: target,
             contextLines: contextLines(args["context_lines"]),
@@ -65,26 +96,29 @@ extension MCPWorktreeToolProvider {
         session: SessionResolution
     ) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
         let operationID = try requiredOperationID(args)
-        let pending = try dependencies.execution.requireTargetWindow().agentModeViewModel.statusWorktreeMerge(
-            sessionID: session.sessionID,
+        let pending = try session.runtime.statusMerge(
+            command: session.command,
             operationID: operationID
         )
-        try await admitMergePhysicalTargets(pending, sessionID: session.sessionID)
+        try await admitMergePhysicalTargets(pending, admission: session.requireAdmission())
+        guard try session.runtime.statusMerge(command: session.command, operationID: operationID) == pending else {
+            throw AgentSessionWorktreeRuntime.TransitionError.stale
+        }
         let commitMessage = trimmedString(args["commit_message"])
         let result: GitWorktreeMergeApplyResult
         if session.isRoutedAgentMode {
             guard parseBool(args["confirm_preview"]) != true else {
                 throw MCPError.invalidParams("Routed Agent Mode apply must use the worktree merge approval flow, not confirm_preview=true.")
             }
-            result = try await dependencies.execution.requireTargetWindow().agentModeViewModel.requestWorktreeMergeReviewAndApply(
-                sessionID: session.sessionID,
-                operationID: operationID,
+            result = try await session.runtime.applyMerge(
+                admission: session.requireAdmission(),
+                operationID: operationID, review: true,
                 commitMessage: commitMessage
             )
         } else if parseBool(args["confirm_preview"]) == true {
-            result = try await dependencies.execution.requireTargetWindow().agentModeViewModel.applyConfirmedWorktreeMerge(
-                sessionID: session.sessionID,
-                operationID: operationID,
+            result = try await session.runtime.applyMerge(
+                admission: session.requireAdmission(),
+                operationID: operationID, review: false,
                 commitMessage: commitMessage
             )
         } else {
@@ -105,8 +139,8 @@ extension MCPWorktreeToolProvider {
         args: [String: Value],
         session: SessionResolution
     ) throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
-        let operation = try dependencies.execution.requireTargetWindow().agentModeViewModel.statusWorktreeMerge(
-            sessionID: session.sessionID,
+        let operation = try session.runtime.statusMerge(
+            command: session.command,
             operationID: trimmedString(args["operation_id"])
         )
         return mergeReply(
@@ -123,19 +157,21 @@ extension MCPWorktreeToolProvider {
         args: [String: Value],
         session: SessionResolution
     ) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
-        let operation = try dependencies.execution.requireTargetWindow().agentModeViewModel.statusWorktreeMerge(
-            sessionID: session.sessionID,
+        let operation = try session.runtime.statusMerge(
+            command: session.command,
             operationID: trimmedString(args["operation_id"])
         )
         let confirmed = parseBool(args["confirm"]) ?? session.isRoutedAgentMode
         guard confirmed else {
             throw MCPError.invalidParams("continue requires confirm=true for plain MCP callers.")
         }
-        try await admitMergePhysicalTargets(operation, sessionID: session.sessionID)
-        let result = try await dependencies.execution.requireTargetWindow().agentModeViewModel.continueWorktreeMerge(
-            sessionID: session.sessionID,
+        try await admitMergePhysicalTargets(operation, admission: session.requireAdmission())
+        guard try session.runtime.statusMerge(command: session.command, operationID: operation.id) == operation else {
+            throw AgentSessionWorktreeRuntime.TransitionError.stale
+        }
+        let result = try await session.runtime.continueMerge(
+            admission: session.requireAdmission(),
             operationID: operation.id,
-            confirmed: true,
             commitMessage: trimmedString(args["commit_message"])
         )
         return mergeReply(
@@ -153,19 +189,21 @@ extension MCPWorktreeToolProvider {
         args: [String: Value],
         session: SessionResolution
     ) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
-        let operation = try dependencies.execution.requireTargetWindow().agentModeViewModel.statusWorktreeMerge(
-            sessionID: session.sessionID,
+        let operation = try session.runtime.statusMerge(
+            command: session.command,
             operationID: trimmedString(args["operation_id"])
         )
         let confirmed = parseBool(args["confirm"]) ?? session.isRoutedAgentMode
         guard confirmed else {
             throw MCPError.invalidParams("abort requires confirm=true for plain MCP callers.")
         }
-        try await admitMergePhysicalTargets(operation, sessionID: session.sessionID)
-        let result = try await dependencies.execution.requireTargetWindow().agentModeViewModel.abortWorktreeMerge(
-            sessionID: session.sessionID,
-            operationID: operation.id,
-            confirmed: true
+        try await admitMergePhysicalTargets(operation, admission: session.requireAdmission())
+        guard try session.runtime.statusMerge(command: session.command, operationID: operation.id) == operation else {
+            throw AgentSessionWorktreeRuntime.TransitionError.stale
+        }
+        let result = try await session.runtime.abortMerge(
+            admission: session.requireAdmission(),
+            operationID: operation.id
         )
         let status = result.aborted ? "aborted" : "failed"
         return ToolResultDTOs.ManageWorktreeReplyDTO(
@@ -194,16 +232,17 @@ extension MCPWorktreeToolProvider {
 
     private func admitMergePhysicalTargets(
         _ operation: AgentSessionWorktreeMergeOperation,
-        sessionID: UUID
+        admission: AgentSessionWorktreeRuntime.Admission
     ) async throws {
+        try admission.requireCurrent()
         let paths = [operation.source.path, operation.target.path]
-        let metadata = await dependencies.context.captureRequestMetadata()
-        let lookupContext = await dependencies.selection.resolveFileToolLookupContext(metadata)
-        var mappings = await lookupContext.domainMutationPhysicalRootMappings(
-            store: dependencies.context.promptVM.workspaceFileContextStore
-        )
-        let bindings = try dependencies.execution.requireTargetWindow().agentModeViewModel
-            .worktreeBindings(forAgentSessionID: sessionID)
+        guard let store = admission.resources.store else { throw MCPError.invalidParams("The merge workspace is unavailable.") }
+        let lookupContext = await AgentSessionProviderInputRuntime.WorkspaceSource(
+            store: store, lookupSource: .init(activeAgentSessionID: admission.command.identity.sessionID, worktreeBindings: admission.bindings)
+        ).lookupContext()
+        var mappings = await lookupContext.domainMutationPhysicalRootMappings(store: store)
+        try admission.requireCurrent()
+        let bindings = admission.bindings
         mappings.append(contentsOf: bindings.map {
             DomainMutationPhysicalRootMapping(
                 canonicalRoot: $0.logicalRootPath,
@@ -250,40 +289,44 @@ extension MCPWorktreeToolProvider {
         }) else {
             throw MCPError.invalidParams("Worktree merge target is outside the authorized workspace roots.")
         }
+        try admission.requireCurrent()
         try await MCPDomainMutationCommitContext.admitPhysicalTargets(
             paths,
             rootMappings: mappings
         )
+        try admission.requireCurrent()
     }
 
-    private func resolveMergeSession(args: [String: Value]) async throws -> SessionResolution {
+    private func resolveMergeSession(args: [String: Value], needsResources: Bool) async throws -> SessionResolution {
         let metadata = await dependencies.context.captureRequestMetadata()
-        let resolved = try dependencies.context.resolveTabContextSnapshot(
-            metadata,
-            MCPWindowToolName.manageWorktree
-        )
-        let isRoutedAgentMode = await (try? dependencies.execution.requireAgentModeConnection(MCPWindowToolName.manageWorktree)) != nil
-
-        if let raw = trimmedString(args["session_id"]) {
-            guard let uuid = UUID(uuidString: raw) else {
-                throw MCPError.invalidParams("session_id must be a UUID. Received: \(raw)")
+        let resolved = try dependencies.context.resolveTabContextSnapshot(metadata, MCPWindowToolName.manageWorktree)
+        let raw = trimmedString(args["session_id"])
+        let explicitID = raw.flatMap(UUID.init(uuidString:))
+        let sessionID = explicitID ?? resolved.snapshot.activeAgentSessionID
+        // Capture before authorization suspends, but reveal liveness/admission failures only after
+        // the existing routed/plain-caller authorization and argument checks.
+        let captured = Result { () throws -> (AgentSessionRuntimeStore.Command, AgentSessionWorktreeRuntime.Admission?) in
+            guard let sessionID,
+                  let command = try dependencies.execution.requireTargetWindow().agentModeViewModel.runtimeCommand(sessionID: sessionID)
+            else {
+                throw MCPError.invalidParams("The requested agent session is not currently available.")
             }
-            if isRoutedAgentMode,
-               let routedSessionID = resolved.snapshot.activeAgentSessionID,
-               routedSessionID != uuid
-            {
+            return try (command, needsResources ? command.writer.scope.worktrees.admit(command) : nil)
+        }
+        let isRoutedAgentMode = await (try? dependencies.execution.requireAgentModeConnection(MCPWindowToolName.manageWorktree)) != nil
+        if let raw {
+            guard let explicitID else { throw MCPError.invalidParams("session_id must be a UUID. Received: \(raw)") }
+            if isRoutedAgentMode, let routed = resolved.snapshot.activeAgentSessionID, routed != explicitID {
                 throw MCPError.invalidParams("session_id must match the routed Agent Mode session.")
             }
-            return SessionResolution(sessionID: uuid, isRoutedAgentMode: isRoutedAgentMode)
-        }
-
-        guard isRoutedAgentMode else {
+        } else if !isRoutedAgentMode {
             throw MCPError.invalidParams("session_id is required for plain MCP callers.")
         }
-        guard let sessionID = resolved.snapshot.activeAgentSessionID else {
-            throw MCPError.invalidParams("session_id is required because current MCP routing does not resolve an active Agent session.")
-        }
-        return SessionResolution(sessionID: sessionID, isRoutedAgentMode: true)
+        guard let sessionID else { throw MCPError.invalidParams("Current MCP routing does not resolve an active Agent session.") }
+        let (command, admission) = try captured.get()
+        guard command.isCurrent else { throw AgentSessionWorktreeRuntime.TransitionError.stale }
+        try admission?.requireCurrent()
+        return SessionResolution(sessionID: sessionID, isRoutedAgentMode: isRoutedAgentMode, command: command, admission: admission)
     }
 
     private func mergeReply(

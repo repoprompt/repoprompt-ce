@@ -467,6 +467,9 @@ final class WorktreeMergeReviewStateTests: XCTestCase {
         for drift in ["none", "detached", "reacquired", "rebound", "conflicting"] {
             let fixture = try reviewRuntimeFixture()
             let session = fixture.session
+            // This case verifies resuming an existing run after its last blocker settles.
+            // Standalone idle admin reviews must instead return to their captured idle state.
+            session.runState = .running
             let runtime = fixture.runtime
             let installed = expectation(description: "review installed before \(drift)")
             var publications = 0
