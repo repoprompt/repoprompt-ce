@@ -356,6 +356,7 @@ struct AgentMCPStartWorktreeCoordinator {
                             desiredBindings,
                             forSessionID: targetSessionID,
                             intent: .initialSend,
+                            creationHandle: target.creationHandle,
                             startupContext: startupContext,
                             initializationHintsByBindingID: initializationHintsByBindingID
                         )
@@ -365,6 +366,7 @@ struct AgentMCPStartWorktreeCoordinator {
                         desiredBindings,
                         forSessionID: targetSessionID,
                         intent: .initialSend,
+                        creationHandle: target.creationHandle,
                         startupContext: startupContext,
                         initializationHintsByBindingID: initializationHintsByBindingID
                     )

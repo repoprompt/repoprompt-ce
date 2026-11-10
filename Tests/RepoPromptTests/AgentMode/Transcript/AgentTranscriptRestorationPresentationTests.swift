@@ -1022,7 +1022,7 @@ private extension XCTestCase {
         } catch {
             firstError = firstError ?? error
         }
-        await viewModel.prepareForWindowClose()
+        await viewModel.test_retireAndCancelFixture()
         await viewModel.test_drainSessionPersistenceAfterWindowClose()
         // Reset only after every producer/index/activation path has drained.
         viewModel.test_setSuppressesAgentSessionPersistence(nil)
@@ -1141,7 +1141,7 @@ private extension XCTestCase {
         // This counts debounce handles only, not pending workspace-listener flush tasks.
         trace.pendingSaveDebounceCountBeforeClose = viewModel.sessions.values.compactMap(\.saveDebounceTask).count
         trace.phase = "close-agent-mode"
-        await viewModel.prepareForWindowClose()
+        await viewModel.test_retireAndCancelFixture()
         trace.phase = "drain-session-persistence"
         await viewModel.test_drainSessionPersistenceAfterWindowClose()
         viewModel.test_afterTabActivationContinuation = nil
@@ -2271,7 +2271,7 @@ extension AgentTranscriptRestorationLifecycleTests {
         } catch {
             firstError = firstError ?? error
         }
-        await viewModel.prepareForWindowClose()
+        await viewModel.test_retireAndCancelFixture()
         viewModel.test_afterTabActivationContinuation = nil
         await dataService.test_setAfterHydrationPrepareHook(nil)
         await dataService.test_setWorkspaceRootOverride(nil)
@@ -2376,7 +2376,7 @@ extension AgentTranscriptRestorationLifecycleTests {
         } catch {
             firstError = firstError ?? error
         }
-        await viewModel.prepareForWindowClose()
+        await viewModel.test_retireAndCancelFixture()
         viewModel.test_afterTabActivationContinuation = nil
         await dataService.test_setAfterHydrationPrepareHook(nil)
         await dataService.test_setWorkspaceRootOverride(nil)

@@ -30,6 +30,7 @@ final class AgentSessionLinkExecutionRuntime {
         let start: @MainActor (AgentTabSession, String, AgentDirectRunStartOptions, AgentRunStartOutcomeRecorder?, AgentProviderSwitchSendPreparation?) async -> CodexAgentModeCoordinator.NativeSendOutcome?
         let settleSelfCompact: @MainActor (AgentTabSession) -> Void
         let selfCompactBlocksWake: @MainActor (AgentTabSession) -> Bool
+        let selfCompactHoldsWakeAcquisition: @MainActor (AgentTabSession) -> Bool
     }
 
     private(set) weak var scope: AgentSessionRuntimeStore.Scope?
