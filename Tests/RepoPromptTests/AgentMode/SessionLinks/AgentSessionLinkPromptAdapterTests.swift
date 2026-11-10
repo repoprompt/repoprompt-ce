@@ -2569,8 +2569,10 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 claudeCoordinator: fixture.viewModel.test_claudeCoordinator, hooks: harness.hooks,
                 terminalCommitBarrier: AgentRunTerminalCommitBarrier()
             )
-            await runner.startRun(
-                tabID: fixture.tabID, session: session, initialUserMessage: item.text,
+            try await runner.startRun(
+                tabID: fixture.tabID, session: session,
+                origin: XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID)),
+                initialUserMessage: item.text,
                 initialMessageForRun: item.text, attachments: [],
                 makeLease: { runID in harness.makeLease(runID: runID, tabID: fixture.tabID) },
                 localComposerCandidate: token

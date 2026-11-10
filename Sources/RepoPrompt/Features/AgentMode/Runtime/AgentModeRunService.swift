@@ -290,7 +290,10 @@ final class AgentModeRunService {
         var claudeEventsTransferred = false
         defer {
             if !claudeEventsTransferred, let preparedClaudeEvents {
-                preparedClaudeEvents.listener.close(preparedClaudeEvents.subscription, returningTail: true)
+                preparedClaudeEvents.listener.close(
+                    preparedClaudeEvents.subscription,
+                    returningTail: origin.writer.session === session && origin.writer.ownsPersistentClaim
+                )
                 preparedClaudeEvents.listener.terminalPublished(for: preparedClaudeEvents.subscription)
             }
         }
@@ -407,6 +410,7 @@ final class AgentModeRunService {
             await claudeRunner.startRun(
                 tabID: tabID,
                 session: session,
+                origin: origin,
                 initialUserMessage: initialUserMessage,
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,

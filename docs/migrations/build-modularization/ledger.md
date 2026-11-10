@@ -7905,3 +7905,49 @@ integration 2, prompt-adapter tests 6. No new warning occurrences; this is not a
 claim. Fresh index passed at **1,262/1,360 wrong-way edges and 53/66 largest cycle**, unchanged
 baseline. Local qualification only; no both-product/full-SessionLinks, live-app, release, sanitizer
 or hosted-CI qualification for this checkpoint. Nothing pushed to #1679.
+
+### M9.2g local Claude task-entry and lease ownership checkpoint (2026-11-11)
+
+Claude startup now requires the existing restored Command, and its persistent task captures only
+its weak WriterReceipt plus exact run/attempt values. Task entry, successful/failed lease acquisition,
+and the acquire-failure-outcome await refuse a lost claim or an attempt that is no longer current
+for its original binding. The exact captured subscription is closed without replay; only the
+captured lease's serialization gate may be released. Installed routing policy and shared attempt
+cleanup remain with current-owner Stop. Owned retirement with an intact binding settles cancellation
+through the existing terminal barrier, retaining the warm controller and existing attachment policy.
+A failed acquisition retains the existing outcome mapping, including gate-timeout errors. Rechecks
+after tail replay and the handoff callback prevent reentrant ownership changes from authorizing a
+later terminal commit. No post-finalize fallback re-reads a controller or revokes a successor route.
+
+Task note cleanup and buffered-tail replay require the originating claim plus the original active
+binding/attempt or its exact terminal with no active successor. Candidate cleanup retains its exact
+UUID and originating-claim guard. Service early refusal also gates prepared-inbox replay on the
+original writer. Stopped/superseded tasks drop their captured tail rather than replaying it into a
+successor. Binding-transition settlement remains its owner's responsibility: the startup task uses
+the same exact-binding predicate as the terminal barrier and does not invent settlement authority.
+Later tool-tracking/coordinator/physical-send awaits, listener idle/adoption callbacks, and barrier
+internal awaits remain OPEN. This is not a controller-lifetime or M9.4 handoff implementation.
+
+One Oracle review (`0457`, chat `6F1A83`) approved the bounded logic with fixture/preservation fixes.
+The real-listener, held-lease regression covers ten entry/acquisition variants, including same-object
+writer ABA, retirement, acquisition refusal, actual Stop then successor, and dedicated-note cleanup.
+It asserts the listener alone still reports current after ABA, no stale buffered replay or terminal
+write, acquired policy retention until current-owner Stop, gate release, warm-controller retention
+on owned cancellation, and parked versus unmodified dedicated notes. Three existing direct runner
+calls now provide their actual restored commands. No production compatibility bypass, budget change,
+or weakened assertion was introduced.
+
+Initial focused `754b329d-da24-4174-8064-4e684444c579` compiled but failed fixture expectations:
+pre-send settlement intentionally retains a warm controller, ordinary enabler refusal maps to
+cancellation, and the fake acquired lease needed the expected-PID grant used by the existing harness.
+Those expectations were corrected; policy counters use a main-actor box. Final focus
+`7146bea8-4d84-4563-8128-b8dd5f812aeb` passed the ten-variant method; full lint
+`998a35a1-f18d-4927-91bc-b03934e2b83b` and scoped pinned formatting/strict lint passed.
+Affected `c4f9f636-9adf-4e63-993d-b889c6287aac` passed **502 tests, zero skips/failures**
+(95.933s), including the existing lease-failure/cancellation and compact-note preservation cases.
+The focused ten-variant method took 0.682s. Actual compiler warning occurrences (maximum per file
+across initial full compile and corrected test recompile) match integrated `a0c674e9`: Claude runner
+3, service 0, AutoWake 11, prompt-adapter tests 6. This is not a zero-total-warning claim. Fresh index
+passed at **1,262/1,360 wrong-way edges and 53/66 largest cycle**, unchanged baseline. Local
+qualification only: no full-SessionLinks/both-product, live-app, release, sanitizer or hosted-CI
+qualification for this checkpoint. Nothing pushed to #1679.

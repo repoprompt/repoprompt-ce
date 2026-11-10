@@ -139,9 +139,14 @@ final class ClaudeIntegratedAgentModeRunner {
         return true
     }
 
+    #if DEBUG
+        var testAtClaudeTaskEntry: (() -> Void)?
+    #endif
+
     func startRun(
         tabID: UUID,
         session: AgentTabSession,
+        origin: AgentSessionRuntimeStore.Command,
         initialUserMessage: String,
         initialMessageForRun: String,
         attachments: [AgentFileAttachment],
@@ -155,18 +160,32 @@ final class ClaudeIntegratedAgentModeRunner {
         preparedEvents: ClaudeAttemptEventReservation? = nil,
         startOutcome: AgentRunStartOutcomeRecorder? = nil
     ) async {
+        // The service transfers only admitted work, without an intervening await. A refused direct
+        // caller has no authority to repair a note prepared under a different admission.
+        guard case .restored = origin.requirement, origin.writer.session === session, origin.isCurrent,
+              let receipt = AgentSessionRuntimeStore.WriterReceipt(origin)
+        else {
+            if let preparedEvents {
+                preparedEvents.listener.close(preparedEvents.subscription, returningTail: false)
+                preparedEvents.listener.terminalPublished(for: preparedEvents.subscription)
+            }
+            startOutcome?.recordStartFailure(message: nil)
+            return
+        }
         let dedicatedNoteID = selfCompactDispatchID.flatMap { $0.stage == .note ? $0 : nil }
         var handedToRunTask = false
         var reservedEvents = preparedEvents
         defer {
             if !handedToRunTask {
-                session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
+                if receipt.disposition(for: session) != .claimLost {
+                    session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
+                }
                 if let reservedEvents {
-                    reservedEvents.listener.close(reservedEvents.subscription, returningTail: true)
+                    reservedEvents.listener.close(reservedEvents.subscription, returningTail: receipt.disposition(for: session) != .claimLost)
                     reservedEvents.listener.terminalPublished(for: reservedEvents.subscription)
                 }
             }
-            if let dedicatedNoteID, !handedToRunTask {
+            if let dedicatedNoteID, !handedToRunTask, receipt.disposition(for: session) != .claimLost {
                 AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(dedicatedNoteID, session: session) {
                     hooks.persistence.scheduleSave(session)
                 }
@@ -266,8 +285,10 @@ final class ClaudeIntegratedAgentModeRunner {
         session.agentTask = Task { [weak self, weak session, hooks] in
             guard let session else { return }
             defer {
-                session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
-                if let dedicatedNoteID {
+                if receipt.disposition(for: session) != .claimLost {
+                    session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
+                }
+                if let dedicatedNoteID, Self.ownsStartupTail(session, receipt: receipt, ownership: ownership, runID: runID) {
                     AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(dedicatedNoteID, session: session) {
                         hooks.persistence.scheduleSave(session)
                     }
@@ -277,12 +298,33 @@ final class ClaudeIntegratedAgentModeRunner {
                 return
             }
             defer {
-                listener.close(subscription, returningTail: true)
+                listener.close(subscription, returningTail: Self.ownsStartupTail(session, receipt: receipt, ownership: ownership, runID: runID))
                 listener.terminalPublished(for: subscription)
             }
+            #if DEBUG
+                testAtClaudeTaskEntry?()
+            #endif
+            guard await admitStartupLease(
+                session: session, receipt: receipt, ownership: ownership, runID: runID,
+                listener: listener, subscription: subscription, lease: lease, acquired: false,
+                attachmentReservationID: attachmentReservationID,
+                recordsHandoff: !isPeriodic && providerControlCommand == nil && selfCompactDispatchID == nil
+            ) else { return }
             await withTaskCancellationHandler {
                 let acquired = await lease.acquire()
+                if acquired {
+                    guard await self.admitStartupLease(
+                        session: session, receipt: receipt, ownership: ownership, runID: runID,
+                        listener: listener, subscription: subscription, lease: lease, acquired: true,
+                        attachmentReservationID: attachmentReservationID,
+                        recordsHandoff: !isPeriodic && providerControlCommand == nil && selfCompactDispatchID == nil
+                    ) else { return }
+                }
                 guard acquired else {
+                    guard Self.ownsStartupAttempt(session, receipt: receipt, ownership: ownership, runID: runID) else {
+                        listener.close(subscription, returningTail: false)
+                        return
+                    }
                     listener.close(subscription, returningTail: true)
                     await self.handleAcquireFailure(
                         tabID: tabID,
@@ -290,6 +332,7 @@ final class ClaudeIntegratedAgentModeRunner {
                         lease: lease,
                         runID: runID,
                         ownership: ownership,
+                        receipt: receipt,
                         attachmentReservationID: attachmentReservationID
                     )
                     return
@@ -775,16 +818,77 @@ final class ClaudeIntegratedAgentModeRunner {
         return (true, answeredUnprotected)
     }
 
+    private static func ownsStartupAttempt(
+        _ session: AgentTabSession,
+        receipt: AgentSessionRuntimeStore.WriterReceipt,
+        ownership: AgentRunOwnership,
+        runID: UUID
+    ) -> Bool {
+        receipt.disposition(for: session) != .claimLost
+            && session.isCurrentRunAttemptForCurrentBinding(ownership, expectedRunID: runID)
+    }
+
+    private static func ownsStartupTail(
+        _ session: AgentTabSession,
+        receipt: AgentSessionRuntimeStore.WriterReceipt,
+        ownership: AgentRunOwnership,
+        runID: UUID
+    ) -> Bool {
+        guard receipt.disposition(for: session) != .claimLost else { return false }
+        return session.isCurrentRunAttemptForCurrentBinding(ownership, expectedRunID: runID)
+            || (session.activeRunOwnership == nil && session.lastTerminalCommitRevision?.ownership == ownership)
+    }
+
+    /// A captured inbox and gate may be released after claim loss; shared state and routing policy
+    /// remain the current owner's responsibility. Binding-transition attempts cannot use the
+    /// terminal barrier either, so they never acquire settlement authority from this receipt.
+    private func admitStartupLease(
+        session: AgentTabSession,
+        receipt: AgentSessionRuntimeStore.WriterReceipt,
+        ownership: AgentRunOwnership,
+        runID: UUID,
+        listener: ClaudeControllerEventListener,
+        subscription: ClaudeAttemptEventSubscription,
+        lease: MCPBootstrapLease,
+        acquired: Bool,
+        attachmentReservationID: UUID?,
+        recordsHandoff: Bool
+    ) async -> Bool {
+        guard Self.ownsStartupAttempt(session, receipt: receipt, ownership: ownership, runID: runID) else {
+            listener.close(subscription, returningTail: false)
+            if acquired { await lease.releaseGateForDeferredRouting() }
+            return false
+        }
+        guard receipt.disposition(for: session) != .current else { return true }
+        listener.close(subscription, returningTail: true)
+        if Self.ownsStartupAttempt(session, receipt: receipt, ownership: ownership, runID: runID) {
+            if recordsHandoff { hooks.providerInput.recordPendingHandoffSendOutcome(session, false) }
+            if Self.ownsStartupAttempt(session, receipt: receipt, ownership: ownership, runID: runID) {
+                await finalize(
+                    session: session, runID: runID, ownership: ownership,
+                    attachmentReservationID: attachmentReservationID, terminalState: .cancelled,
+                    errorText: nil, notifyTurnComplete: false
+                )
+            }
+        }
+        // Never re-resolve the controller or revoke its policy after an awaited terminal commit.
+        if acquired { await lease.releaseGateForDeferredRouting() }
+        return false
+    }
+
     private func handleAcquireFailure(
         tabID _: UUID,
         session: AgentTabSession,
         lease: MCPBootstrapLease,
         runID: UUID,
         ownership: AgentRunOwnership,
+        receipt: AgentSessionRuntimeStore.WriterReceipt,
         attachmentReservationID: UUID?
     ) async {
         let outcome = await lease.acquireFailureOutcome
+        guard Self.ownsStartupAttempt(session, receipt: receipt, ownership: ownership, runID: runID) else { return }
         hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
+        guard Self.ownsStartupAttempt(session, receipt: receipt, ownership: ownership, runID: runID) else { return }
         await terminalCommitBarrier.commit(.init(
             binding: hooks.bindTerminalSession(session),
             ownership: ownership,
