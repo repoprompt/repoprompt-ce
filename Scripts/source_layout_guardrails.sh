@@ -854,6 +854,7 @@ allowed_tracked_docs=(
   "docs/architecture/source-layout.md"
   "docs/architecture/xcode-workspace.md"
   "docs/designs/cross-restart-durability-root-search-cas-2026-06-25.md"
+  "docs/designs/m9.4-presentation-detach-handoff-drain.md"
   "docs/mcp-progress.md"
   "docs/migrations/swift-6-2-concurrency-migration-2026-07-18.md"
   "docs/migrations/swift-6-2-concurrency/migration-ledger.md"
