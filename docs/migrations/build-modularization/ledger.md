@@ -6702,3 +6702,53 @@ edges, 53/66 largest-cycle components**; no baseline change. Actual compile warn
 counts across seven touched Swift files match retained base: **four VM, two link-runtime-bridge
 test warnings**, zero in the other five. No positive occurrence delta. No full-suite, live-app,
 release or hosted-CI qualification is claimed; M9.2b remains open.
+
+### M9.4 phase 0: presentation-lifetime groundwork (refs #1406)
+
+Base `534e2c759`. This slice does **not** implement close-preserves-run, host leases,
+workspace-switch detach, handoff UI or pending-start cancellation capability. Legacy close and
+workspace switch still cancel. The pending-start capability waits for M9.2c and explicit lane
+coordination; visible/no-window host composition remains a separate prerequisite.
+
+- Characterization pins the two legacy cancelling paths in `AgentSessionRuntimeStoreTests` and
+  strengthens `SessionAdminInventoryReadTests/testVisitDuringManagedRunAutomaticallyHandsOffAfterCompletion`:
+  an active prepared owner keeps its exact writer, the visitor has no target writer, and the queued
+  visit hydrates after settlement. No new app-importing test file was added.
+- The teardown audit in `docs/testing.md` distinguishes 35 asynchronous Agent Mode calls from 60
+  unrelated/comment references. Thirty cleanup-only sites use `test_retireAndCancelFixture()`;
+  five deliberate close-contract sites remain. Fixture retirement names the cancelling lifetime
+  explicitly rather than depending on a future presentation-only close policy.
+- Continuation producers are indexed by exact session object, not tab/persistent UUID alone.
+  `drainPendingStarts(for:)` joins only that object's producers, including for a cancelled waiter.
+  `releaseWriterClaim(for:)` is a scope-only primitive under the **existing scope-wide retirement
+  fence**; it has no production caller yet. A held sibling effect does not block it, and a stale map
+  cannot resurrect its released tab. Per-session admission fencing belongs to host cutover.
+- `Scope.settlement(for:)` consolidates synchronous run/start/provider/effect/durability facts.
+  Provider-controller and domain-registration awaits remain explicit in the prepared-owner path.
+  Compatibility projections preserve the prior prepared busy/handoff and scope-wide release
+  predicates; adopting the stronger full predicate there before effect wakeups/drain ownership
+  would strand existing queued visits. The new per-session release uses the full synchronous
+  predicate only after the caller has joined provider/domain teardown and acknowledged its save.
+  The query itself creates neither a durable receipt nor admission.
+- A scope-installed detached sink projects outcomes/attention through the existing notification
+  coordinator, never VM state. Exact live presenters take precedence; stale detach tokens cannot
+  re-enable fallback over a successor. Detached attention has a separate derived scope bucket,
+  with visible-tab deduplication, so window removal cannot erase an independent host's attention.
+  Legacy retirement **removes** that sink before presentation detaches: close must not gain new
+  background notifications or retain closed-window attention. A later host-owned detach will
+  deliberately keep it installed. Without an explicit detach, presenter loss is recognized on
+  the next projection event, not by a new lifetime observer.
+
+The bounded review identified the stricter-legacy-predicate and post-close-notification policy
+changes; both were narrowed rather than silently adopting later-phase behavior. Tests additionally
+cover held continuation/interaction effects, sibling independence, release resurrection, fallback
+terminal routing, attention withdrawal/visibility precedence and late notifications after close.
+
+Initial characterization ticket `24cef73d-c056-4618-863d-b05b4dc8fd3b` passed **12 runtime-store
+cases**, including both new legacy cancellation cases. Its prepared-visit filter named the file's
+wrong test class and selected no such case; that receipt is not prepared-handoff qualification.
+Groundwork focused ticket `61209803-8c7d-4209-a4ea-31e9f11092bd` then passed **49 tests**,
+including the corrected prepared-owner visit case (one), runtime store (16), presentation (five),
+notification coordinator (15) and notification planner (12). Full lint
+`fdb3ba6e-3fcd-4566-ad9d-8ea4dba50a45` passed. These tickets survived the host-app restart;
+their terminal state and exact selected cases were reconciled before more work was submitted.

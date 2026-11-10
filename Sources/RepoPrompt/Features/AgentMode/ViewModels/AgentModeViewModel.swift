@@ -2138,6 +2138,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         }
         guard !hasPreparedForWindowClose else { return }
+        runtimeSessionStore.installDetachedNotificationSink(routeID: windowID)
         for (tabID, session) in sessions where previous[tabID] !== session {
             runPresentationAttachments[ObjectIdentifier(session)] = runtimeSessionStore.presentation.attach(session, sink: .init(
                 activityChanged: { [weak self] session, isActive in
@@ -2222,7 +2223,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     if controlled { mcpControlledTabIDs.insert(session.tabID) }
                     else { mcpControlledTabIDs.remove(session.tabID) }
                     if session.tabID == currentTabID { updateBindingsFromSession(session) }
-                }
+                },
+                isAvailable: { [weak self] in self != nil }
             ))
         }
     }
@@ -2807,16 +2809,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return capabilities
     }
 
+    var preparedOversightSessionsAreIdle: Bool {
+        sessions.values.allSatisfy { runtimeSessionStore.settlement(for: $0).legacyPreparedOwnerIsIdle }
+    }
+
     func preparedOversightRuntimeIsBusy() async -> Bool {
         for session in sessions.values {
             let fence = AgentRunStartStopFence(session: session)
-            if session.runState.isActive || claudeCoordinator.hasPendingProviderWork(for: session) { return true }
+            if !runtimeSessionStore.settlement(for: session).legacyPreparedOwnerIsIdle || claudeCoordinator.hasPendingProviderWork(for: session) { return true }
             if let controller = session.claudeController {
                 let busy = await controller.hasTurnInFlight
                 guard sessions[session.tabID] === session, fence.permitsStart(of: session),
                       session.claudeController.map({ ObjectIdentifier($0) }) == ObjectIdentifier(controller)
                 else { return true }
-                if busy || session.runState.isActive || claudeCoordinator.hasPendingProviderWork(for: session) { return true }
+                if busy || !runtimeSessionStore.settlement(for: session).legacyPreparedOwnerIsIdle || claudeCoordinator.hasPendingProviderWork(for: session) { return true }
             }
         }
         return false
@@ -5037,6 +5043,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         await task.value
         // Preserve the legacy close path's terminal notifications/activity projection until
         // its existing drain finishes. Runtime-host detachment need not cancel that drain.
+        runtimeSessionStore.removeDetachedNotificationSink()
         detachRunPresentation()
     }
 
@@ -5735,11 +5742,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard workspaceManager?.isSessionRuntimeProjection == true else { return false }
         await attachmentRuntime.waitForRetention()
         for session in sessions.values {
-            guard !session.runState.isActive, session.permitsBoundOperationAndSave else { return false }
+            guard runtimeSessionStore.settlement(for: session).legacyPreparedOwnerIsIdle, session.permitsBoundOperationAndSave else { return false }
             flushPendingAssistantDelta(session)
             switch await saveSession(for: session.tabID) {
             case .saved, .notRequired:
-                guard !session.isDirty, !session.runState.isActive else { return false }
+                guard runtimeSessionStore.settlement(for: session).legacyPreparedHandoffIsSettled else { return false }
             case .deferred, .failed: return false
             }
         }

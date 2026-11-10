@@ -286,6 +286,93 @@ final class AgentNotificationCoordinatorTests: XCTestCase {
         )
     }
 
+    func testScopeFallbackPostsOutcomesAndAttentionWithoutTouchingAttachedSink() async throws {
+        let coordinator = makeCoordinator()
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = scope.makeSession(tabID: UUID())
+        let sessionID = UUID(), workspaceID = UUID()
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: workspaceID))
+        scope.replaceSessions([session.tabID: session])
+        scope.installDetachedNotificationSink(routeID: 7, coordinator: coordinator, displayName: { _ in "Detached task" })
+        var presentedCompletions = 0
+        let sink = AgentSessionPresentationRuntime.Sink(
+            activityChanged: { _, _ in }, refresh: { _, _, _ in },
+            turnComplete: { _ in presentedCompletions += 1 }, turnFailed: { _, _ in }
+        )
+        let old = scope.presentation.attach(session, sink: sink)
+        let hooks = scope.presentation.makeRunHooks()
+        hooks.notifyAgentTurnComplete(session)
+        await coordinator.waitForIdleForTesting()
+        XCTAssertEqual(presentedCompletions, 1)
+        XCTAssertTrue(center.addedRequests.isEmpty, "Attached sinks keep the existing notification policy")
+        scope.presentation.detach(old)
+        hooks.notifyAgentTurnComplete(session)
+        await coordinator.waitForIdleForTesting()
+        XCTAssertEqual(center.addedRequests.count, 1)
+        let completion = try XCTUnwrap(center.addedRequests.last)
+        XCTAssertEqual(completion.title, "Detached task")
+        XCTAssertEqual(completion.payload?.route?.sessionID, sessionID)
+        XCTAssertEqual(completion.payload?.route?.workspaceID, workspaceID)
+        let interactionID = UUID()
+        session.pendingAskUser = AgentAskUserPendingState(interaction: AgentAskUserInteraction(
+            id: interactionID, questions: [AgentAskUserQuestion(id: "q1", question: "Proceed?", options: [])]
+        ))
+        scope.presentation.interactionChanged(session)
+        coordinator.removeWindow(7)
+        await coordinator.waitForIdleForTesting()
+        XCTAssertEqual(center.addedRequests.last?.identifier, AppNotificationIdentifier.interaction(interactionID))
+        XCTAssertEqual(center.badgeCounts.last, 1, "A removed window must not erase detached attention")
+        XCTAssertEqual(presentedCompletions, 1)
+        _ = scope.presentation.attach(session, sink: sink)
+        scope.presentation.detach(old)
+        await coordinator.waitForIdleForTesting()
+        XCTAssertEqual(center.badgeCounts.last, 0, "Reattachment withdraws only the detached projection")
+        XCTAssertTrue(center.removedDeliveredIdentifiers.contains(AppNotificationIdentifier.interaction(interactionID)))
+    }
+
+    func testLegacyCloseDoesNotEnableDetachedAttentionOrLateTurnNotifications() async throws {
+        let coordinator = makeCoordinator()
+        let vm = AgentModeViewModel(
+            testWindowID: 7,
+            codexControllerFactory: { _, _, _, _, _, _ in preconditionFailure("Idle close must not launch a provider") }
+        )
+        let session = AgentTabSession(tabID: UUID())
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: UUID()))
+        vm.test_installLiveSession(session)
+        let identity = try controlWriterIdentity(for: session)
+        guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: identity.sessionID) else {
+            return XCTFail("Expected the legacy fixture's exact writer")
+        }
+        writer.scope.removeDetachedNotificationSink()
+        writer.scope.installDetachedNotificationSink(routeID: 7, coordinator: coordinator)
+        let hooks = vm.test_runPresentationHooks()
+        await vm.prepareForWindowClose()
+        XCTAssertNil(writer.scope.presentation.detachedSink)
+        XCTAssertNil(coordinator.liveState(tabID: session.tabID))
+        hooks.notifyAgentTurnFailed(session, "late failure after legacy close")
+        hooks.notifyAgentTurnComplete(session)
+        await coordinator.waitForIdleForTesting()
+        XCTAssertTrue(center.addedRequests.isEmpty)
+        vm.test_installLiveSession(session)
+        XCTAssertNil(writer.scope.presentation.detachedSink, "A late map publication cannot reinstall fallback after close")
+        await vm.test_retireAndCancelFixture()
+    }
+
+    func testDetachedScopeProjectionCannotReplaceVisibleWindowAttention() async {
+        let coordinator = makeCoordinator()
+        let visible = UUID(), detached = UUID(), scopeID = UUID()
+        let presented = state(tabID: UUID(), interaction: question(id: visible))
+        coordinator.update(windowID: 7, states: [presented])
+        coordinator.updateDetachedScope(scopeID, states: [presented, state(tabID: UUID(), interaction: question(id: detached))])
+        await coordinator.waitForIdleForTesting()
+        XCTAssertEqual(center.badgeCounts.last, 2, "A transient duplicate projection must not double-count attention")
+        coordinator.updateDetachedScope(scopeID, states: [])
+        await coordinator.waitForIdleForTesting()
+        XCTAssertEqual(center.badgeCounts.last, 1)
+        XCTAssertTrue(center.removedDeliveredIdentifiers.contains(AppNotificationIdentifier.interaction(detached)))
+        XCTAssertFalse(center.removedDeliveredIdentifiers.contains(AppNotificationIdentifier.interaction(visible)))
+    }
+
     func testPostsRegistersDynamicCategoryAndRetractsOnResolve() async throws {
         let coordinator = makeCoordinator()
         let tabID = UUID()

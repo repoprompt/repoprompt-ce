@@ -35,6 +35,16 @@ final class AgentNotificationCoordinator {
     private let requestUserAttention: @MainActor () -> Void
 
     private var statesByWindowID: [Int: [AgentAttentionState]] = [:]
+    private var statesByDetachedScopeID: [UUID: [AgentAttentionState]] = [:]
+
+    private var attentionStates: [AgentAttentionState] {
+        let presented = statesByWindowID.keys.sorted().flatMap { statesByWindowID[$0] ?? [] }
+        let presentedTabs = Set(presented.map(\.tabID))
+        let detached = statesByDetachedScopeID.keys.sorted { $0.uuidString < $1.uuidString }
+            .flatMap { statesByDetachedScopeID[$0] ?? [] }.filter { !presentedTabs.contains($0.tabID) }
+        return presented + detached
+    }
+
     private var firstSeenAt: [UUID: Date] = [:]
     private var announcedInteractionIDs: Set<UUID> = []
     private var posted: [String: AgentPostedInteraction] = [:]
@@ -81,6 +91,19 @@ final class AgentNotificationCoordinator {
         scheduleReconcile()
     }
 
+    /// Detached hosts publish separately, so a window update/removal cannot erase their
+    /// attention and a detached sibling cannot replace the window's other visible sessions.
+    func updateDetachedScope(_ scopeID: UUID, states: [AgentAttentionState]) {
+        guard client.isAvailable else { return }
+        if states.isEmpty {
+            guard statesByDetachedScopeID.removeValue(forKey: scopeID) != nil else { return }
+        } else {
+            guard statesByDetachedScopeID[scopeID] != states else { return }
+            statesByDetachedScopeID[scopeID] = states
+        }
+        scheduleReconcile()
+    }
+
     func removeWindow(_ windowID: Int) {
         update(windowID: windowID, states: [])
     }
@@ -88,7 +111,7 @@ final class AgentNotificationCoordinator {
     /// Focus, active tab, Agent Mode surface, or app activation changed.
     func visibilityMayHaveChanged() {
         guard client.isAvailable,
-              !statesByWindowID.isEmpty || !turnNotificationIDsByTabID.isEmpty || !pendingTurnPosts.isEmpty
+              !statesByWindowID.isEmpty || !statesByDetachedScopeID.isEmpty || !turnNotificationIDsByTabID.isEmpty || !pendingTurnPosts.isEmpty
         else { return }
         scheduleReconcile()
     }
@@ -100,7 +123,7 @@ final class AgentNotificationCoordinator {
 
     /// Live attention state for a tab, if any window currently publishes it.
     func liveState(tabID: UUID) -> AgentAttentionState? {
-        statesByWindowID.values.flatMap(\.self).first { $0.tabID == tabID }
+        attentionStates.first { $0.tabID == tabID }
     }
 
     // MARK: Edge-triggered notifications
@@ -253,7 +276,7 @@ final class AgentNotificationCoordinator {
 
     private func reconcileOnce() async {
         let preferences = preferences.currentNotificationPreferences
-        let states = statesByWindowID.keys.sorted().flatMap { statesByWindowID[$0] ?? [] }
+        let states = attentionStates
         let visibleTabIDs = Set(states.filter {
             visibility.isAgentSessionVisible(windowID: $0.windowID, tabID: $0.tabID, sessionID: $0.sessionID)
         }.map(\.tabID))
@@ -339,9 +362,7 @@ final class AgentNotificationCoordinator {
     }
 
     private func isInteractionLive(_ interactionID: UUID) -> Bool {
-        statesByWindowID.values.contains { states in
-            states.contains { $0.interaction?.id == interactionID }
-        }
+        attentionStates.contains { $0.interaction?.id == interactionID }
     }
 
     /// Returns whether the request was accepted; callers only record deliveries that happened, so a
