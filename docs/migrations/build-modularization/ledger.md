@@ -6942,7 +6942,64 @@ live-send call-site witness are exercised. No assertion or timeout budget was we
 
 Review-fix focused `b3490cf4-b39c-40da-832f-22864a7f1405` passed **132 tests**, including both
 pending-save preservation witnesses, live-send queue drift, Stop and placement suites. Scoped
-pinned formatting and strict lint passed for all 12 touched Swift files. Main integration and
-merged-tree broad/product validation are next. M9.3a's incoming host/persistence/attachment changes
-must be retained by normal merge; squash ancestry is not an excuse to drop later main changes.
+pinned formatting and strict lint passed for all 12 touched Swift files. Checkpoints 11 and 12
+were committed separately as `4d9d858d3` and `b55e7fa074b7` after mandatory commit preflights.
 M9.4 and M10 remain outside this follow-up.
+
+Main integration used normal merge `a72f6786e` for `968e21bdf`, then verified that
+`merge-tree(255d2650e, 968e21bdf)` produced tree `611efffd04f03b9c0a1059cdf9e0902f4f313db3`,
+identical to the exact M9.2b squash `5505a0a63`. Ancestry-only merge `b495ea2e3` targeted that
+squash commit alone, with no first-parent tree changes. Normal merge `d5dea6212` then brought in
+main `534e2c759`, including M9.3a, without conflicts. The incoming saved-target loader,
+attachment/storage inputs and persistence fixtures were preserved byte-for-byte. The main-relative
+diff contains only the follow-up checkpoints; merge-tree with that main is clean. No rebase or
+published-history rewrite was used. Publication moves to a new M9.2c branch and draft PR.
+
+Exact-main baseline `ce2dbcec-ed4c-4044-baf5-652271bcc4fc` passed **27 tests** and supplied an
+actual-compilation warning baseline. The first merged focused (`1071c7a7-aa38-4c70-8b74-eb837f7b4638`),
+broad (`4c2ce11d-8d71-4df0-84f9-2a99fb9acf6b`) and isolated handoff
+(`67f14c73-8143-40f5-b7ba-ce958575817d`) attempts failed compilation, not assertions:
+main's new lane-board fixture assigned instruction-wait fields that checkpoint 10 made read-only.
+The fixture now installs the atomic originating wait through the existing runtime test seam and
+settles that exact record. It retains stale-prompt, complete-wait, teardown and hook-review
+assertions; no mutable production compatibility bypass or timeout increase was added. Initial
+products `13c167d9-ff4c-4bcd-9f5b-8a7b4e31222b` and full lint
+`529d64f8-cce3-4a9f-ba04-7d25c4fdc329` passed. The fixture was scoped-formatted and strict-linted
+before repeating every merged-tree execution gate.
+
+The overseer subsequently assigned the administration/worktree-command group to parallel M9.2d:
+`session_admin` fork/owning-VM mutation, worktree transitions, and VCS preview/apply/continue/abort
+are no longer M9.2c's remaining work. Checkpoint 12's already-completed exact-writer threading at
+the existing delegation-placement save is retained; this follow-up does not start the reassigned
+administrative/VCS pipeline. The seven remaining M9.2c groups are binding/creation/hydration (L),
+startup/inner provider execution (XL), managed Steer/input/self-compaction (L–XL), MCP metadata/tool
+routing (L), provider event/tool hooks and terminal follow-ups (L–XL), persistence/payload
+forwarding (L), and residual interaction cleanup (M). Sizes describe surfaces, not elapsed time.
+
+Merged-tree focused `2461999f-618d-4f12-ad02-c17e51f9824a` passed **143 tests**, including
+saved-target loading/persistence and the migrated lane-board fixture. Broad
+`5583fe5d-1bc5-41a4-a883-6c35bc74e591` executed **2,241 tests, 22 skipped, one failure**:
+`testSwitchExpandedSkillAndTaggedFileRefusalsRetainClaimedComposer`, handoff fixture line 944,
+failed its real-content expansion precondition. This is not reported as an all-green broad run.
+The overseer supplied prior main evidence from the #1665 lane: main `48b0d82ad` reproduced the
+same skill/tagged-file assertion under broad load (then line 894), while isolation passed. The
+requested comparison here also passes unchanged: merged-head isolated handoff
+`2f15c0b8-02ed-47e1-b8b2-5c501b9cf952` passed **104**, including that case in **2.079 s**;
+exact-main `534e2c759` isolation `89852c94-2a85-46c6-8207-9e7841656bbb` passed **104**, including
+that case in **1.681 s**. Per overseer classification, this is a pre-existing broad-load intermittent,
+not root-caused here; no expansion, assertion or budget change is made. All other broad cases pass.
+
+Both products `5e634bca-7111-4644-8a1a-4e0955716735` and full lint
+`11a00a25-d01d-41f0-b04d-cedd20468abc` passed. The actual-compilation warning occurrence audit
+against exact-main baseline `ce2dbcec-ed4c-4044-baf5-652271bcc4fc` covers all **34 touched Swift
+files**: VM **4→4**, MCPServerViewModel **11→8**, CodexResumeWedgeCommitTests **17→17**,
+auto-wake tests **11→11**, prompt-adapter tests **6→6**, steer-transaction tests **5→5**, MCP
+steer/resume tests **1→1**, and zero in the other 27 files. There is no positive per-file count
+delta; this is not a zero-total-warning claim. The head audit uses actual compilation from the
+first merged attempt plus the corrected fixture recompile, not empty incremental product logs.
+After the isolated-main comparison, the exact local branch and preserved fixture/ledger edits were
+restored without dropping the recovery stash. Final restored-tree products
+`803ef502-cf6d-4ada-bd01-0942150e45e0` passed, followed by a fresh index check:
+**1,253/1,360 wrong-way file edges, 53/66 largest-cycle components**. No ratchet baseline changed.
+Its actual compile diagnostics were also included in the warning audit with no positive deltas.
+No CI logs were read; no full-suite, live-app, release or sanitizer qualification is claimed.
