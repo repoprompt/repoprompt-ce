@@ -857,8 +857,9 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
         XCTAssertTrue(fixture.providerRequests.events.isEmpty)
     }
 
-    func testRunStartCommitsItsFreshBindingBeforeDispatchAndRefusesReacquiredAcknowledgement() async throws {
-        for reacquireAfterAcknowledgement in [false, true] {
+    func testRunStartKeepsItsOriginThroughPreparationAndConfiguredAcknowledgement() async throws {
+        for drift in ["none", "republished", "preparationReacquired", "acknowledgementReacquired"] {
+            let reacquireAfterAcknowledgement = drift == "acknowledgementReacquired"
             let fixture = try await makeFixture()
             let tabID = try XCTUnwrap(fixture.prompt.currentComposeTabs.first?.id)
             // Obtain the existing scope through an independently admitted identity, without
@@ -880,6 +881,9 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
             var acknowledgements = 0
             var dispatches = 0
             var created: AgentSessionCreationHandle?
+            var preparations = 0
+            let originalMembership = try XCTUnwrap(scope.membership(of: session))
+            let originalSaveRequestGeneration = session.saveRequestGeneration
             runtime.test_afterConfiguredCreationAcknowledgement = { handle in
                 acknowledgements += 1
                 XCTAssertTrue(handle.session === session)
@@ -894,7 +898,31 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
                 }
             }
             var environment = AgentSessionRunStartRuntime.Environment(
-                currentWorkspaceID: { fixture.workspaceID }, prepareSession: { _ in },
+                currentWorkspaceID: { fixture.workspaceID }, prepareSession: { exact in
+                    preparations += 1
+                    guard preparations == 1 else { return }
+                    XCTAssertTrue(exact === session)
+                    let originalBinding = session.currentRestorationBindingToken
+                    await Task.yield()
+                    if drift == "preparationReacquired" {
+                        let sessions = scope.sessions
+                        var removed = sessions
+                        removed.removeValue(forKey: tabID)
+                        scope.replaceSessions(removed)
+                        scope.replaceSessions(sessions)
+                        XCTAssertFalse(originalMembership.isCurrent)
+                    } else if drift == "republished" {
+                        let sessions = scope.sessions
+                        let sibling = scope.makeSession(tabID: UUID())
+                        var republished = sessions
+                        republished[sibling.tabID] = sibling
+                        scope.replaceSessions(republished)
+                        XCTAssertTrue(originalMembership.isCurrent)
+                        scope.replaceSessions(sessions)
+                        XCTAssertTrue(originalMembership.isCurrent)
+                    }
+                    XCTAssertEqual(session.currentRestorationBindingToken, originalBinding)
+                },
                 availabilityFailure: { _ in nil },
                 bindSession: { exact in
                     let admission = bind(exact)
@@ -918,6 +946,18 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
                 claudeCoordinator: .init(windowID: -1, workspacePathProvider: { _ in nil }),
                 links: fixture.vm.linkExecutionRuntime, environment: environment
             )
+            if drift == "preparationReacquired" {
+                XCTAssertNil(created, "Old preparation must not bind the reacquired blank draft")
+                XCTAssertNil(session.activeAgentSessionID)
+                XCTAssertEqual(preparations, 1)
+                XCTAssertEqual(acknowledgements, 0)
+                XCTAssertEqual(session.saveRequestGeneration, originalSaveRequestGeneration)
+                XCTAssertNil(session.saveDebounceRequestID)
+                XCTAssertEqual(dispatches, 0)
+                XCTAssertFalse(outcome.outcome.didStart)
+                XCTAssertTrue(fixture.providerRequests.events.isEmpty)
+                continue
+            }
             let handle = try XCTUnwrap(created)
             XCTAssertEqual(acknowledgements, 1)
             XCTAssertEqual(dispatches, reacquireAfterAcknowledgement ? 0 : 1)

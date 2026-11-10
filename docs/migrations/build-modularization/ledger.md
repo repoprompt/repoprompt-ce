@@ -7294,3 +7294,24 @@ CI recurrence belongs to this lane for production root-cause work. No CI logs we
 The index check attempted while validation was active refused to attest freshness (zero stale/unindexed
 source files but freshness unproven); the last successful checkpoint check was 1,254/1,360 wrong-way
 edges and 53/66 largest cycle. This is not recorded as a fresh integrated index pass.
+
+#### M9.2e — unbound startup preparation provenance (local follow-up)
+
+Run start now captures the existing scope membership receipt before any host-preparation await.
+Before persistent binding exists, currency requires that exact slot incarnation, not merely the same
+object and nil restoration token. After synchronous binding installs a persistent writer, the existing
+writer checks take over; unchanged publication of the original tab remains valid. This does not close
+synchronous bind-callback reentry, host-adapter retirement or inner provider/factory/lease dispatch.
+The existing first-save/start test now covers unchanged preparation, adding/removing a sibling tab,
+same-object unbound reacquisition during preparation, and reacquisition after durable acknowledgement.
+The stale preparation cannot bind, request a save or dispatch; the original positive and post-ack
+assertions remain. Oracle review `2026-11-10/2029` approved the fence and requested a meaningful
+sibling-change witness instead of an identical-map no-op; that strengthening and explicit save-request
+assertions are applied. Scoped pinned formatting and strict lint pass. Focused ticket
+`7e24d98f-b809-4095-99dc-fe032af304c1` passed **307 tests**, no failures or skips; the expanded
+four-variant startup witness passed in 0.206s. Actual compilation emitted zero warning occurrences
+in both changed Swift files, matching their baseline. The fresh post-test index check passed at
+**1,254/1,360 wrong-way edges, 53/66 largest cycle**, baseline unchanged. These are local checkpoint
+receipts, not a new full publication gate. #1679 remains at `c10f85830`; the overseer requires no
+further push until its CI result is reported. #1677's merge `7717cb6bf` is noted but not integrated
+in this local checkpoint.
