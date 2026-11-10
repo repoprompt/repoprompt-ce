@@ -7951,3 +7951,40 @@ across initial full compile and corrected test recompile) match integrated `a0c6
 passed at **1,262/1,360 wrong-way edges and 53/66 largest cycle**, unchanged baseline. Local
 qualification only: no full-SessionLinks/both-product, live-app, release, sanitizer or hosted-CI
 qualification for this checkpoint. Nothing pushed to #1679.
+
+### M9.2g local Claude pre-coordinator suspension checkpoint (2026-11-11)
+
+The existing weak-receipt startup gate now runs after actual tool-tracking registration returns and
+inside the execution operation after provider-initialization diagnostics return. An operation-local
+refusal flag prevents an already-settled/captured-resource-only refusal from entering the old
+post-coordinator tail replay, terminal publication or shared-controller lease-cancellation fallback.
+No extra authority manager, strong persistent Command capture, or optional legacy bypass is added.
+Source verification of DomainAgentRunExecutionCore corrected the plan: it always calls the operation
+and has no pre-operation cancellation check. The nonthrowing diagnostic and gate are the only calls
+before the refusal flag/coordinator entry, so no new pre-entry terminal classification is invented.
+The initialization diagnostic pair records `superseded` for this rejected operation even when its
+original owned attempt was cancelled; this is diagnostic-only, not a provider or terminal outcome.
+
+One Oracle review (`0518`, chat `6F1A83`) found no P0/P1 issue. The positive real fake-controller send
+passed without an oversight catalog requirement. The final matrix includes six post-tracking or
+post-initialization variants, including no-note and dedicated-note retirement. It checks that a
+post-tracking refusal never reaches initialization, lost claims neither replay nor settle shared
+state, current-owner Stop releases retained policy/controller, owned cancellation keeps its warm
+committed route, and ordinary admitted startup sends and completes. The route-authority resolver
+count—not the idempotent policy-clear count—detects a second unsafe cancellation through the old
+post-coordinator path. DEBUG boundary hooks fire synchronously after the real operation returns;
+they prove refusal ordering, not that a particular await suspended. Existing entry/lease tests use
+the renamed boundary hook without changing their assertions.
+
+Tool tracking installs its callbacks before this new gate; callback ownership, coordinator ensure/
+retry/recycle/route/interrupt operations, physical actor writes, and post-coordinator report handling
+remain OPEN. Task cancellation alone is not new refusal authority here; the existing coordinator and
+terminal policies still apply. Binding-transition settlement and listener idle/adoption callbacks
+remain separate owners. Initial focus `2346e695-5bb6-4662-b69a-b118147d4b27` passed the five-variant
+method (0.695s). Final affected `ac7d422f-c5a8-4aa3-8e3e-6f4270eb7d3b` passed **503 tests,
+zero skips/failures** (97.445s), including the strengthened six-variant method (0.236s). Full lint
+`636338a8-5c66-4f98-bfb9-06b4ce192c79` and scoped pinned formatting/strict lint passed. Actual
+compiler warning occurrences (maximum of initial/final compiles) match integrated `a0c674e9`:
+Claude runner 3, AutoWake 11. Fresh index passed at **1,262/1,360 wrong-way edges and 53/66 largest
+cycle**, unchanged baseline. Local qualification only; no both-product/full-SessionLinks, live-app,
+release, sanitizer or hosted-CI qualification for this checkpoint. Nothing pushed to #1679.

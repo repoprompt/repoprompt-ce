@@ -1538,8 +1538,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                     scope.beginRetirement()
                 }
             }
-            runner.testAtClaudeTaskEntry = {
-                if drift.hasPrefix("entry") { driftWriter() }
+            runner.testAtClaudeStartupBoundary = { boundary in
+                if boundary == .taskEntry, drift.hasPrefix("entry") { driftWriter() }
             }
             await runner.startRun(
                 tabID: fixture.tabID, session: session, origin: origin,
@@ -1616,6 +1616,120 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 XCTAssertTrue(session.claudeController === fixture.nativeController, drift)
             }
             if drift == "acquiredReacquire" { XCTAssertEqual(counters.clears, 1, drift) }
+        }
+    }
+
+    func testClaudePostTrackingPreparationKeepsItsWriterBeforeCoordinatorEntry() async throws {
+        @MainActor final class LeaseCounters {
+            var installs = 0
+            var clears = 0
+            var routeChecks = 0
+        }
+        for variant in ["trackedReacquire", "trackedRetire", "initReacquire", "initRetire", "initRetireNote", "none"] {
+            let fixture = try makeFixture(catalogReady: false)
+            let session = fixture.session
+            session.selectedAgent = .claudeCode
+            session.claudeController = fixture.nativeController
+            await fixture.nativeController.setImmediateReplyDuringSend(true)
+            let stopService = fixture.viewModel.test_initializeRunService()
+            let origin = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
+            let scope = origin.writer.scope
+            let harness = AgentSessionLinkRunnerHarness(
+                headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
+                sessionLinkHost: fixture.viewModel
+            )
+            var handoffs: [Bool] = []
+            harness.pendingHandoffSendOutcome = { _, sent in handoffs.append(sent) }
+            let runner = ClaudeIntegratedAgentModeRunner(
+                claudeCoordinator: fixture.viewModel.test_claudeCoordinator, hooks: harness.hooks,
+                terminalCommitBarrier: AgentRunTerminalCommitBarrier()
+            )
+            let events = try XCTUnwrap(fixture.viewModel.test_claudeCoordinator.reserveEvents(for: session))
+            var replayed = 0
+            events.listener.onIdleEvent = { _ in replayed += 1 }
+            if variant != "none" { events.subscription.append(.native(.error("buffered pre-coordinator event"))) }
+            let noteID = variant.hasSuffix("Note") ? try installVerifiedParkedNote(fixture) : nil
+            if noteID != nil { session.selfCompactState.active?.phase = .dispatchingNote }
+            let previousTerminal = session.lastTerminalCommitRevision
+            let counters = LeaseCounters()
+            let gateID = UUID()
+            var boundaries: [ClaudeIntegratedAgentModeRunner.StartupBoundary] = []
+            runner.testAtClaudeStartupBoundary = { boundary in
+                boundaries.append(boundary)
+                let target: ClaudeIntegratedAgentModeRunner.StartupBoundary = variant.hasPrefix("tracked") ? .toolTrackingCompleted : .providerInitializationStarted
+                guard variant != "none", boundary == target else { return }
+                if variant.hasSuffix("Reacquire") {
+                    var members = scope.sessions
+                    members.removeValue(forKey: session.tabID)
+                    scope.replaceSessions(members)
+                    members[session.tabID] = session
+                    scope.replaceSessions(members)
+                    XCTAssertFalse(origin.isCurrent, variant)
+                    XCTAssertTrue(events.listener.isCurrent(), variant)
+                } else {
+                    scope.beginRetirement()
+                }
+            }
+            await runner.startRun(
+                tabID: fixture.tabID, session: session, origin: origin,
+                initialUserMessage: "Claude boundary", initialMessageForRun: "Claude boundary", attachments: [],
+                makeLease: { runID in
+                    MCPBootstrapLease(
+                        spec: .agentMode(tabID: fixture.tabID, runID: runID, gateID: gateID, windowID: 1, agent: .claudeCode),
+                        mcpServerEnabler: { true },
+                        policyInstaller: { spec in
+                            await MainActor.run { counters.installs += 1 }
+                            await MCPRoutingWaiter.notifyRouted(runID: spec.runID)
+                        }, expectedPIDPolicyArmer: { _ in true },
+                        policyClearer: { _ in await MainActor.run { counters.clears += 1 } },
+                        routeAuthorityResolver: { _ in
+                            await MainActor.run { counters.routeChecks += 1 }
+                            return .committed
+                        }
+                    )
+                }, selfCompactDispatchID: noteID, preparedEvents: events
+            )
+            let task = try XCTUnwrap(session.agentTask)
+            let original = try XCTUnwrap(session.activeRunOwnership)
+            await task.value
+            let sent = await fixture.nativeController.sentCount
+            XCTAssertEqual(sent, variant == "none" ? 1 : 0, variant)
+            XCTAssertEqual(
+                boundaries,
+                variant.hasPrefix("tracked")
+                    ? [.taskEntry, .toolTrackingCompleted]
+                    : [.taskEntry, .toolTrackingCompleted, .providerInitializationStarted],
+                variant
+            )
+            XCTAssertTrue(events.subscription.isClosed, variant)
+            let gate = await HeadlessAgentConnectionGate.snapshot()
+            XCTAssertNotEqual(gate.activeConnectionID, gateID, variant)
+            XCTAssertEqual(counters.installs, 1, variant)
+            if variant.hasSuffix("Reacquire") {
+                XCTAssertEqual(replayed, 0, variant)
+                XCTAssertTrue(handoffs.isEmpty, variant)
+                XCTAssertEqual(session.lastTerminalCommitRevision, previousTerminal, variant)
+                XCTAssertEqual(session.activeRunOwnership, original, variant)
+                XCTAssertEqual(session.agentTask, task, variant)
+                XCTAssertEqual(counters.clears, 0, variant)
+                XCTAssertTrue(session.claudeController === fixture.nativeController, variant)
+                await stopService.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+                XCTAssertEqual(counters.clears, 1, variant)
+                XCTAssertNil(session.claudeController, variant)
+            } else {
+                XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, original, variant)
+                XCTAssertEqual(session.runState, variant == "none" ? .completed : .cancelled, variant)
+                XCTAssertEqual(handoffs, variant == "none" ? [true] : (noteID == nil ? [false] : []), variant)
+                XCTAssertEqual(replayed, variant == "none" ? 0 : 1, variant)
+                if noteID != nil { XCTAssertEqual(session.selfCompactState.active?.phase, .parked, variant) }
+                if variant != "none" {
+                    XCTAssertTrue(session.claudeController === fixture.nativeController, variant)
+                    XCTAssertEqual(counters.clears, 0, "The original cancellation preserves its committed warm route")
+                    XCTAssertEqual(counters.routeChecks, 1, "The refusal must not enter post-coordinator lease cancellation a second time")
+                }
+            }
+            XCTAssertNil(session.activeRunOwnership, variant)
+            XCTAssertNil(session.agentTask, variant)
         }
     }
 

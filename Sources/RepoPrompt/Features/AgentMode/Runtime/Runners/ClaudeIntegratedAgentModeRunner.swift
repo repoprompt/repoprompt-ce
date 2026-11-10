@@ -140,7 +140,8 @@ final class ClaudeIntegratedAgentModeRunner {
     }
 
     #if DEBUG
-        var testAtClaudeTaskEntry: (() -> Void)?
+        enum StartupBoundary: Equatable { case taskEntry, toolTrackingCompleted, providerInitializationStarted }
+        var testAtClaudeStartupBoundary: ((StartupBoundary) -> Void)?
     #endif
 
     func startRun(
@@ -277,6 +278,7 @@ final class ClaudeIntegratedAgentModeRunner {
         hooks.bindingObservation.updateBindings(session)
 
         let isPeriodic = session.oversight.pendingAutoWake?.isPeriodic == true
+        let recordsHandoff = !isPeriodic && providerControlCommand == nil && selfCompactDispatchID == nil
         // Only the producer can identify its newly appended row. An Auto-wake can follow an
         // unanswered historical user row, so even a trailing-row check cannot establish ownership.
         let rollbackUserItemID = providerControlCommand == nil && selfCompactDispatchID == nil && !isPeriodic
@@ -302,13 +304,13 @@ final class ClaudeIntegratedAgentModeRunner {
                 listener.terminalPublished(for: subscription)
             }
             #if DEBUG
-                testAtClaudeTaskEntry?()
+                testAtClaudeStartupBoundary?(.taskEntry)
             #endif
             guard await admitStartupLease(
                 session: session, receipt: receipt, ownership: ownership, runID: runID,
                 listener: listener, subscription: subscription, lease: lease, acquired: false,
                 attachmentReservationID: attachmentReservationID,
-                recordsHandoff: !isPeriodic && providerControlCommand == nil && selfCompactDispatchID == nil
+                recordsHandoff: recordsHandoff
             ) else { return }
             await withTaskCancellationHandler {
                 let acquired = await lease.acquire()
@@ -317,7 +319,7 @@ final class ClaudeIntegratedAgentModeRunner {
                         session: session, receipt: receipt, ownership: ownership, runID: runID,
                         listener: listener, subscription: subscription, lease: lease, acquired: true,
                         attachmentReservationID: attachmentReservationID,
-                        recordsHandoff: !isPeriodic && providerControlCommand == nil && selfCompactDispatchID == nil
+                        recordsHandoff: recordsHandoff
                     ) else { return }
                 }
                 guard acquired else {
@@ -343,7 +345,18 @@ final class ClaudeIntegratedAgentModeRunner {
                     runID: runID
                 )
 
+                #if DEBUG
+                    self.testAtClaudeStartupBoundary?(.toolTrackingCompleted)
+                #endif
+                guard await self.admitStartupLease(
+                    session: session, receipt: receipt, ownership: ownership, runID: runID,
+                    listener: listener, subscription: subscription, lease: lease, acquired: true,
+                    attachmentReservationID: attachmentReservationID,
+                    recordsHandoff: recordsHandoff
+                ) else { return }
+
                 let providerName = session.selectedAgent.rawValue
+                var startupRefused = false
                 var didSendToProvider = false
                 var routeRefusalMessage: String?
                 var nativeFailureMetadata: (errorText: String?, shouldShutdownSession: Bool)?
@@ -351,6 +364,19 @@ final class ClaudeIntegratedAgentModeRunner {
                     failureText: { _ in nativeFailureMetadata?.errorText ?? "" }
                 ) {
                     await lease.providerInitializationStarted(provider: providerName)
+                    #if DEBUG
+                        self.testAtClaudeStartupBoundary?(.providerInitializationStarted)
+                    #endif
+                    guard await self.admitStartupLease(
+                        session: session, receipt: receipt, ownership: ownership, runID: runID,
+                        listener: listener, subscription: subscription, lease: lease, acquired: true,
+                        attachmentReservationID: attachmentReservationID,
+                        recordsHandoff: recordsHandoff
+                    ) else {
+                        startupRefused = true
+                        await lease.providerInitializationCompleted(provider: providerName, outcome: "superseded")
+                        return .superseded
+                    }
                     let sendOutcome = await self.claudeCoordinator.sendClaudeNativeMessage(
                         session: session,
                         text: initialMessageForRun,
@@ -421,6 +447,9 @@ final class ClaudeIntegratedAgentModeRunner {
                     }
                 }
 
+                // The startup gate already settled its original attempt or released captured-only
+                // resources. Never feed its refusal into post-coordinator shared-state cleanup.
+                guard !startupRefused else { return }
                 listener.close(subscription, returningTail: true)
                 switch report.result {
                 case .superseded:
