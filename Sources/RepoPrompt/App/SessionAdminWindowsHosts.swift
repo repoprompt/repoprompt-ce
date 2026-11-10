@@ -990,6 +990,9 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
             )
         } catch SessionAdminHostError.authorityEnded {
             throw SessionAdminHostError.authorityEnded
+        } catch let partial as AgentSessionWorktreeRuntime.PartialTransition {
+            // Never rewrite an already-retired provider or published binding as pre-effect busy.
+            throw partial
         } catch {
             // A run that started during preparation refuses the transition; that is "not idle".
             // After publication the change is committed: a run that starts while the required save

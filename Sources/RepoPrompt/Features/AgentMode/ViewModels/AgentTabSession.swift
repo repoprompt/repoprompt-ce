@@ -387,8 +387,11 @@ final class AgentTabSession: ObservableObject {
         }
     }
 
+    /// A direct setter takes over the gate; an old runtime lease may only clear its own token.
+    var executionLocationChangeOwner: UUID?
     var isChangingExecutionLocation: Bool = false {
         didSet {
+            executionLocationChangeOwner = nil
             if oldValue != isChangingExecutionLocation {
                 noteMonitorObservationInputsChanged()
             }
@@ -400,7 +403,10 @@ final class AgentTabSession: ObservableObject {
     /// unbound state; Handoff performs the destination's first save explicitly afterwards.
     var isInstallingHandoffWorktreeBindings = false
 
-    var worktreeBindingTransitionInProgress: Bool = false
+    var worktreeBindingTransitionOwner: UUID?
+    var worktreeBindingTransitionInProgress: Bool = false {
+        didSet { worktreeBindingTransitionOwner = nil }
+    }
 
     /// Runtime-only: an execution-worktree change this session requested for itself from its own
     /// live turn, applied at that turn's completed terminal boundary and then continued

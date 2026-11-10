@@ -6743,3 +6743,52 @@ including post-effect durable receipts and physical mutation fences. This is a l
 not completion of the administration/worktree group, M9.2 or #1406. Both-product, full-lint, broad-suite,
 fresh-index and per-file base-warning comparison push gates have not yet run; no push, full-suite,
 live smoke, release or hosted-CI qualification is claimed.
+
+#### M9.2d checkpoint 2 — runtime-owned worktree transition
+
+The canonical scope now owns the actual execution-location transition algorithm, not a forwarding
+callback to a selected VM. `AgentSessionWorktreeRuntime` carries one admitted command and an immutable
+workspace/resource witness through Oracle drain, provider probes, root preparation, authorization,
+provider retirement, root installation and binding publication. The VM entry point only admits and
+forwards. Creation callers pass their existing handle: both MCP startup branches and Handoff install;
+ordinary composer-created tabs already await configured durability before initial location selection.
+No unbound, unhydrated or provisional-creation fallback was introduced.
+
+The runtime owns dirtying, required-save completion and origin-qualified recovery. Post-effect errors
+carry the original writer identity, publication/retirement evidence and save status, rather than
+re-resolving a tab or reporting a retryable refusal. The administration handler retains a typed scope
+revocation cause while reporting partial effects, non-retryability and inspection guidance; a deferred
+provider-only failure does not claim a committed bind. Physical worktree create and Git merge fences
+are not part of this checkpoint and remain open.
+
+Provider adapters use the existing synchronous detach and captured-instance retirement APIs. All old
+context metadata is cleared before suspension; later retirement cannot clear a rebound writer or
+shut down its replacement controller. Codex detachment keeps its prior provider predicate. Claude's
+detached tracking cleanup was source-checked: it clears only the captured handler's correlation maps,
+not the session's later handler. Existing provider lifecycle owners were not moved or rewritten.
+
+One bounded review completed. Gate cleanup now uses operation tokens: claim loss still releases an
+origin-owned gate, while a direct successor setter invalidates the token and keeps its own gate.
+The existing prepared-runtime finish joins in-flight transitions before teardown/final persistence;
+only that existing drain owner releases claims. This is a minimal shared drain seam, not M9.4 closure.
+The required-save internals and prepared-window/carrier composition remain with their existing lanes.
+
+Final Conductor ticket `56dc8c62-55b2-40e3-b3ad-1b6f338d7dd1` passed **204 tests, zero failures**:
+49 worktree admission, 32 worktree provider regression, 83 administration structure, 20 Handoff,
+ten writer-store, four administration-runtime, four location-presentation and two production fork
+cases. New coverage includes same-object reacquisition and conflicts, origin versus successor gate
+cleanup, detached-provider rebinding, refusing a successor save, actual durable unbind without a test
+flush, retirement joining, explicit creation admission and handler-level partial revocation receipts.
+Pinned scoped SwiftFormat and strict SwiftLint passed; `git diff --check` passed.
+
+Initial ticket `7f78bcf6-2bc2-43a0-9591-2af790da1709` failed compilation on an optional run ID in
+the new detach adapter. The next ticket `0e24532b-b2e2-4f78-93ba-0ed5b15aac52` executed 204 with
+two failures: an omitted recovery explanation and overly broad root release after a refused
+metadata-only change. Both were corrected: receipts retain the explicit old-location recovery text,
+and metadata-only refusal keeps roots that an active provider still owns. The final run above
+re-executed the same selection, not just the two failures.
+
+Remaining M9.2d: outer admin/UI/MCP worktree creation and mutation selection across pre-transition
+awaits, self-relocation provenance, and all merge command routing/physical mutation fences and
+acknowledgements. Both-product, full-lint, broad SessionLinks/admission/sidebar, fresh-index and
+base-warning push gates remain unrun. No push, full-suite, live-app or hosted-CI qualification is claimed.

@@ -336,6 +336,8 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         do {
             let info = try await bindWithAdmission(lease: lease, scope: scope, worktree: worktree, repoRoot: repoRoot, onCommitted: { committedIDs = $0 })
             return SessionAdminItemResult(sessionID: target, result: "bound", fields: ["worktree": info.value])
+        } catch let partial as AgentSessionWorktreeRuntime.PartialTransition {
+            return Self.transitionCompletionFailure(partial, worktreeIDs: committedIDs ?? [], scopeID: scope.id)
         } catch where committedIDs != nil {
             // A published binding outranks every later error classification: it is neither a
             // refusal, a revocation, nor a busy target that may be queued or retried.
@@ -384,6 +386,29 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                 ]
             )
         }
+    }
+
+    static func transitionCompletionFailure(
+        _ receipt: AgentSessionWorktreeRuntime.PartialTransition,
+        worktreeIDs: Set<String>, scopeID: UUID? = nil
+    ) -> SessionAdminItemResult {
+        let revoked = if let cause = receipt.cause as? SessionAdminHostError, case .authorityEnded = cause { true }
+        else { false }
+        var arguments: [String: Value] = ["op": .string("get"), "session_id": .string(receipt.writer.sessionID.uuidString)]
+        if let scopeID { arguments["scope_id"] = .string(scopeID.uuidString) }
+        return SessionAdminItemResult(
+            sessionID: receipt.writer.sessionID, result: "not_applied", code: revoked ? "scope_revoked" : "worktree_transition_incomplete",
+            fields: [
+                "detail": .string(receipt.localizedDescription),
+                "bindings_published": .bool(receipt.bindingsPublished),
+                "provider_retired": .bool(receipt.providerRetired),
+                "recovery_saved": .bool(receipt.recoverySaved),
+                "worktree_ids": .array(worktreeIDs.sorted().map(Value.string)),
+                AgentSessionAdminRendering.committedChangesKey: .bool(receipt.bindingsPublished || receipt.providerRetired),
+                "retryable": .bool(false),
+                "next_call": .object(["tool": .string("session_admin"), "arguments": .object(arguments)])
+            ]
+        )
     }
 
     /// The single receipt for a binding transition that published its change and then failed to
@@ -510,6 +535,16 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                     onCommitted: { committedIDs = $0 }
                 )
                 return finishDeferredBind(pending, .applied(worktreeID: info.worktreeID))
+            } catch let partial as AgentSessionWorktreeRuntime.PartialTransition {
+                if partial.bindingsPublished {
+                    return finishDeferredBind(pending, .committedIncomplete(
+                        worktreeIDs: (committedIDs ?? []).sorted(), detail: partial.localizedDescription
+                    ))
+                }
+                return finishDeferredBind(pending, .failed(
+                    subreason: "provider_retired", detail: partial.localizedDescription,
+                    retryable: false, worktree: pending.worktree, repoRoot: pending.repoRoot
+                ))
             } catch where committedIDs != nil {
                 // Published, then completion failed: settle it. Retrying (including on a late
                 // not-idle or cancellation) would re-run an already committed bind. The pending
@@ -649,6 +684,8 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                     sessionID: target, result: release ? "released" : "unbound",
                     fields: ["worktree_ids": .array(removed.map(Value.string))]
                 ))
+            } catch let partial as AgentSessionWorktreeRuntime.PartialTransition {
+                items.append(Self.transitionCompletionFailure(partial, worktreeIDs: committedRemoved ?? []))
             } catch where committedRemoved != nil {
                 // Published, then completion failed. This outranks every refusal classification so
                 // the receipt (and the approval settlement it drives) reflects the committed effect.
