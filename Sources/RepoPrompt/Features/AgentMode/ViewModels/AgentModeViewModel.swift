@@ -5000,6 +5000,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func prepareForWindowClose() async {
+        await retireAndCancelRuntime()
+    }
+
+    #if DEBUG
+        /// Fixture cleanup deliberately retires/cancels the runtime, even after window close
+        /// becomes presentation-only. Characterisation tests still call the real close entry.
+        func test_retireAndCancelFixture() async {
+            await retireAndCancelRuntime()
+            await attachmentRuntime.waitForRetention()
+            await test_drainSessionPersistenceAfterWindowClose()
+        }
+    #endif
+
+    private func retireAndCancelRuntime() async {
         autoWorkflowJudgments.values.forEach { $0.cancel() }
         autoWorkflowJudgments.removeAll()
         cancelReprompt()

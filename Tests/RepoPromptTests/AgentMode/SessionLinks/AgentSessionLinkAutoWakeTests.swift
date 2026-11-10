@@ -6052,7 +6052,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             }
             await controller.shutdown()
             await freshController.shutdown()
-            await host.prepareForWindowClose()
+            await host.test_retireAndCancelFixture()
         }
     }
 

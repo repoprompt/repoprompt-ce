@@ -253,6 +253,46 @@ final class AgentSessionRuntimeStoreTests: XCTestCase {
         XCTAssertTrue(scope.sessions.isEmpty, "A released scope cannot resurrect its old writer")
     }
 
+    /// M9.4 phase 0 pins today's cancelling policy; later detach phases must flip this deliberately.
+    func testLegacyWindowCloseCancelsOwnedRunBeforeDetachingPresentation() async {
+        let (vm, session, ownership) = makeLegacyRunningFixture()
+        await vm.prepareForWindowClose()
+        XCTAssertEqual(session.runState, .cancelled)
+        XCTAssertNil(session.activeRunOwnership)
+        XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, ownership)
+        XCTAssertTrue(vm.tabsWithActiveAgentRun.isEmpty)
+        await vm.test_retireAndCancelFixture()
+    }
+
+    func testLegacyWorkspaceSwitchCancelsOwnedRunWithoutRetiringWriter() async throws {
+        let (vm, session, ownership) = makeLegacyRunningFixture()
+        let identity = try controlWriterIdentity(for: session)
+        let provider = AgentModeWorkspaceSwitchSessionProvider(agentModeViewModel: vm)
+        XCTAssertEqual(provider.switchSessionItems().first?.count, 1)
+        await provider.cancelSwitchSessions()
+        XCTAssertEqual(session.runState, .cancelled)
+        XCTAssertNil(session.activeRunOwnership)
+        XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, ownership)
+        XCTAssertTrue(provider.switchSessionItems().isEmpty)
+        XCTAssertEqual(try controlWriterIdentity(for: session), identity, "A workspace switch cancels but does not elect a writer")
+        await vm.test_retireAndCancelFixture()
+    }
+
+    private func makeLegacyRunningFixture() -> (AgentModeViewModel, AgentTabSession, AgentRunOwnership) {
+        let vm = AgentModeViewModel(
+            testWindowID: -1406,
+            codexControllerFactory: { _, _, _, _, _, _ in preconditionFailure("Characterisation must not launch a provider") }
+        )
+        let session = AgentTabSession(tabID: UUID())
+        session.selectedAgent = .openCode
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: UUID()))
+        vm.test_installLiveSession(session)
+        let ownership = session.beginRunAttempt(source: "m9.4.legacy-presentation-policy")
+        session.runState = .running
+        vm.test_runPresentationHooks().setAgentRunActive(session, true)
+        return (vm, session, ownership)
+    }
+
     func testViewModelPublishesBeforeStorageChangesAndUsesRuntimeIndex() {
         let vm = AgentModeViewModel(
             testWindowID: -1406,
