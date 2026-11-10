@@ -1209,6 +1209,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private nonisolated static let childAgentRunWaitDrainTimeoutSeconds: TimeInterval = 2.0
 
     #if DEBUG
+        var test_afterRebindOwnershipChecks: (@MainActor () async -> Void)?
         var test_beforeRestorationHydrationAdmission: (@MainActor () async -> Void)?
         var test_restorationHydrationTaskDidFinish: (@MainActor () -> Void)?
         var test_afterMCPControlRegistration: (@MainActor (UUID) async -> Void)? {
@@ -6313,6 +6314,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         expectedTransition: PersistentBindingTransitionToken? = nil,
         requiresHydration: Bool = false
     ) async throws -> AgentPersistentSessionBindingIdentity {
+        guard let targetMembership = runtimeSessionStore.membership(of: targetSession),
+              targetMembership.permitsBindingPreparation else { throw PersistentBindingMutationError.staleTransition }
         if workspaceManager?.isSessionRuntimeProjection != true,
            let owners = preparedSessionRuntimes,
            await !(owners.releasePreparedOversightOwnerForVisit(sessionID: requestedSessionID, preparingReplacement: false))
@@ -6330,12 +6333,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             throw PersistentBindingMutationError.blockedByOwnership
         }
+        guard targetMembership.permitsBindingPreparation else { throw PersistentBindingMutationError.staleTransition }
         if targetSession.activeAgentSessionID == requestedSessionID,
            let binding = targetSession.persistentSessionBindingIdentity
         {
             return binding
         }
         guard await awaitOracleBackgroundDrain(for: targetSession) else { throw PersistentBindingMutationError.blockedByOwnership }
+        guard targetMembership.permitsBindingPreparation else { throw PersistentBindingMutationError.staleTransition }
 
         let existingSourceTabID: UUID? = switch persistentBindingResolution(for: requestedSessionID) {
         case let .unique(tabID): tabID
@@ -6343,9 +6348,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         case .ambiguous: throw ambiguousAgentSessionError()
         }
         let sourceSession = existingSourceTabID.flatMap { sessions[$0] }
+        let sourceMembership = sourceSession.flatMap { runtimeSessionStore.membership(of: $0) }
+        @MainActor func preparationIsCurrent() -> Bool {
+            targetMembership.permitsBindingPreparation
+                && (sourceSession == nil || sourceMembership?.permitsBindingPreparation == true)
+        }
+        guard preparationIsCurrent() else { throw PersistentBindingMutationError.staleTransition }
         if let sourceSession, sourceSession !== targetSession {
             guard await awaitOracleBackgroundDrain(for: sourceSession) else { throw PersistentBindingMutationError.blockedByOwnership }
         }
+        guard preparationIsCurrent() else { throw PersistentBindingMutationError.staleTransition }
         let targetCurrentSessionID = targetSession.activeAgentSessionID
 
         let targetToken: PersistentBindingTransitionToken
@@ -6366,24 +6378,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var sourceToken: PersistentBindingTransitionToken?
         var sourceReadiness: AgentSessionRestorationReadiness?
         let sourceWorkspaceID = workspaceManager?.activeWorkspaceID
-        if let sourceSession, sourceSession !== targetSession {
-            guard !sourceSession.bindingTransitionInProgress else {
-                targetSession.finishPersistentBindingTransition(generation: targetToken.transitionGeneration)
-                throw PersistentBindingMutationError.blockedByOwnership
-            }
-            if sourceSession.permitsBoundOperationAndSave {
-                sourceReadiness = sourceSession.qualifiedRestorationReadiness
-            }
-            _ = sourceSession.beginPersistentBindingTransition()
-            sourceToken = sourceSession.persistentBindingTransitionToken()
-        }
         defer {
+            // Finish only the generations this operation began. Releasing that preparation
+            // latch is not permission to restore a proof onto a reacquired membership.
             targetSession.finishPersistentBindingTransition(generation: targetToken.transitionGeneration)
             if let sourceSession, let sourceToken {
                 sourceSession.finishPersistentBindingTransition(generation: sourceToken.transitionGeneration)
                 // A refused move must not strand the unchanged source in pending restoration.
                 // Requalify only its prior proof while this exact transition still owns its carrier.
                 if let sourceReadiness, sourceReadiness.isAuthoritative,
+                   sourceMembership?.isCurrent == true,
                    persistentBindingTransitionIsCurrent(sourceToken),
                    sourceSession.restorationReadiness == .unbound,
                    let sourceWorkspaceID,
@@ -6396,16 +6400,30 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         }
 
+        guard preparationIsCurrent() else { throw PersistentBindingMutationError.staleTransition }
+        if let sourceSession, sourceSession !== targetSession {
+            guard !sourceSession.bindingTransitionInProgress else {
+                throw PersistentBindingMutationError.blockedByOwnership
+            }
+            if sourceSession.permitsBoundOperationAndSave {
+                sourceReadiness = sourceSession.qualifiedRestorationReadiness
+            }
+            _ = sourceSession.beginPersistentBindingTransition()
+            sourceToken = sourceSession.persistentBindingTransitionToken()
+        }
+        guard preparationIsCurrent() else { throw PersistentBindingMutationError.staleTransition }
+
         if await bindingHasOwnership(targetSession, sessionID: targetCurrentSessionID) {
             throw PersistentBindingMutationError.blockedByOwnership
         }
+        guard preparationIsCurrent() else { throw PersistentBindingMutationError.staleTransition }
         if let sourceSession, sourceSession !== targetSession,
            await bindingHasOwnership(sourceSession, sessionID: requestedSessionID)
         {
             throw PersistentBindingMutationError.blockedByOwnership
         }
 
-        guard persistentBindingTransitionIsCurrent(targetToken) else {
+        guard preparationIsCurrent(), persistentBindingTransitionIsCurrent(targetToken) else {
             throw PersistentBindingMutationError.staleTransition
         }
         if let sourceToken, !persistentBindingTransitionIsCurrent(sourceToken) {
@@ -6414,6 +6432,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let targetHasRegistration = await AgentRunSessionStore.hasActiveRegistration(
             sessionID: targetCurrentSessionID ?? requestedSessionID
         )
+        guard preparationIsCurrent() else { throw PersistentBindingMutationError.staleTransition }
         guard !bindingHasSynchronousOwnership(targetSession),
               !targetHasRegistration
         else {
@@ -6423,6 +6442,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let sourceHasRegistration = await AgentRunSessionStore.hasActiveRegistration(
                 sessionID: requestedSessionID
             )
+            guard preparationIsCurrent() else { throw PersistentBindingMutationError.staleTransition }
             guard !bindingHasSynchronousOwnership(sourceSession),
                   !sourceHasRegistration
             else {
@@ -6430,6 +6450,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         }
 
+        #if DEBUG
+            await test_afterRebindOwnershipChecks?()
+        #endif
+        guard preparationIsCurrent() else { throw PersistentBindingMutationError.staleTransition }
         if let workspaceManager {
             guard workspaceManager.activeAgentSessionID(forTabID: targetSession.tabID) == targetCurrentSessionID else {
                 throw PersistentBindingMutationError.staleTransition

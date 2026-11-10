@@ -7197,3 +7197,48 @@ M9.2c baseline across all four touched Swift files: VM **4→4**, the other thre
 index check remains **1,254/1,360 wrong-way edges, 53/66 largest cycle**, with no baseline change.
 These are local checkpoint gates only, not a new both-product/full SessionLinks/live-app/release/
 hosted-CI qualification. Nothing is pushed; #1676 remains untouched and binding/startup is ongoing.
+
+#### M9.2e — exact membership during binding preparation (local follow-up)
+
+The existing runtime claim registry now gives unbound members an incarnation as well. Only bound
+members enter the reverse persistent-session index; unbound membership neither elects a writer nor
+grants workspace, restoration, save or command authority. `Membership` is an operation-local receipt
+from that same registry, not another owner. Structural currency is shared with persistent writers;
+new binding preparation additionally refuses retirement, a competing persistent claim, or the same
+object held by another scope. Republishing an unchanged member preserves its receipt, while removal
+and reacquisition, replacement and every binding install invalidate it.
+
+The VM's async rebind preparation captures the target before its first await and the source before
+its drain, then checks both after preparation awaits and before touching carriers/unbinding. Deferred
+generation-latch completion remains originating cleanup, but requalifying the unchanged source's
+old restoration proof now requires its exact membership. This checkpoint deliberately stops at the
+pre-install boundary: synchronous install/callout fencing, source-unbind/target-install rollback,
+the later worktree await, the caller's earlier `expectedTransition` awaits and the M9.3 queued-visit
+closure remain open. It does not retire the actual VM binding body or claim that this group is done.
+No admin/VCS implementation, prepared-owner registry or saved-host composition was changed.
+
+One Oracle review (`untitled-chat-D9F4D8`, snapshot `2026-11-10/1423`) requested verification of new
+refusal assumptions, a shared structural predicate, a loud test-barrier failure and positive bound-
+target coverage. Those changes/checks are applied. The VM's `sessions` directly gets/sets the scope's
+map, so a VM member cannot be absent from that scope. The production rebind caller obtains its target
+through `session(for:)`; the DEBUG entry follows the same contract. Production membership insertion
+sites are VM-created fresh objects and the cold loader's `scope.makeSession`; no production insertion
+shares one object across scopes. The store still represents deliberate/raw duplicate ownership as a
+conflict, rather than electing one owner. Future host adoption must transfer, not overlap, authority.
+
+The new store witnesses cover unbound ABA, explicit nil installs, unchanged publication, unscoped
+qualification without command admission, conflicts, retirement and release. The real VM rebind matrix
+covers successful bound/unbound targets and same-object target/source reacquisition at the registration-
+check boundary, asserting unchanged carriers/payload bytes and no stale readiness grant. Early prepared-
+owner/no-op and synchronous transition-observer reentry are source-checked, not separately injected in
+this checkpoint.
+
+Focused `14239920-de45-4010-a2d1-b054c92b3cfe` passed **165 tests**, no skips or failures:
+runtime-store 12, restoration-admission 28, lane first-save 48, saved-runtime loading 12 and restoration
+lifecycle 65. The real rebind matrix passed all five variants. Full lint
+`8fd7cc57-30d1-491b-a465-4d202500450b` passed. Actual compilation of all four touched Swift files
+matches the M9.2c warning occurrence baseline: VM **4→4**, other three **0→0**. The fresh index
+check remains **1,254/1,360 wrong-way edges, 53/66 largest cycle**, baseline unchanged. These are
+local checkpoint receipts, not full publication qualification. The overseer subsequently confirmed
+#1676's squash merge and authorized exact-squash ancestry reconciliation, broader gates and a new
+M9.2e draft PR; that integration/publication is still pending.

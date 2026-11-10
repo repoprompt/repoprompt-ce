@@ -41,6 +41,79 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
         XCTAssertTrue(reopened.providerRequests.events.isEmpty, "Opening an empty session must not start a provider")
     }
 
+    func testRebindPreparationRejectsReacquiredBoundAndUnboundMembers() async throws {
+        for loss in ["none", "boundSuccess", "unboundTarget", "boundTarget", "source"] {
+            let fixture = try await makeFixture()
+            let originalTabID = try XCTUnwrap(fixture.manager.activeWorkspace?.activeComposeTabID)
+            let sourceTab = await fixture.vm.createAndActivateSessionTab()
+            let source = try XCTUnwrap(fixture.vm.sessions[XCTUnwrap(sourceTab)])
+            let sourceID = try XCTUnwrap(source.activeAgentSessionID)
+            guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+                workspaceID: fixture.workspaceID, sessionID: sourceID
+            ) else { return XCTFail("Fixture must have an exclusive source writer") }
+            let target: AgentTabSession
+            if loss == "boundTarget" || loss == "boundSuccess" {
+                let targetTab = await fixture.vm.createAndActivateSessionTab()
+                target = try XCTUnwrap(fixture.vm.sessions[XCTUnwrap(targetTab)])
+            } else {
+                target = fixture.vm.session(for: originalTabID)
+                XCTAssertNil(target.activeAgentSessionID)
+            }
+            let targetBinding = target.persistentSessionBindingIdentity
+            let sourceBinding = source.persistentSessionBindingIdentity
+            let bytes = try Data(contentsOf: sessionFile(root: fixture.root, sessionID: sourceID))
+            let gate = TestReleaseFence(name: "binding ownership checks \(loss)")
+            fixture.vm.test_afterRebindOwnershipChecks = { await gate.enterAndWait() }
+            let rebind = Task { @MainActor in
+                try await fixture.vm.test_rebindPersistentSession(sourceID, to: target)
+            }
+            defer { gate.release()
+                fixture.vm.test_afterRebindOwnershipChecks = nil
+            }
+            guard await gate.waitUntilEntered() else { return XCTFail("Rebind never reached the ownership barrier: \(loss)") }
+            XCTAssertTrue(source.bindingTransitionInProgress)
+            XCTAssertTrue(target.bindingTransitionInProgress)
+            let oldTarget = try XCTUnwrap(writer.scope.membership(of: target))
+            let oldSource = try XCTUnwrap(writer.scope.membership(of: source))
+            let succeeds = loss == "none" || loss == "boundSuccess"
+            if !succeeds {
+                let victim = loss == "source" ? source : target
+                let members = writer.scope.sessions
+                writer.scope.replaceSessions(members.filter { $0.key != victim.tabID })
+                writer.scope.replaceSessions(members)
+                XCTAssertEqual(victim.persistentSessionBindingIdentity, loss == "source" ? sourceBinding : targetBinding)
+                XCTAssertFalse((loss == "source" ? oldSource : oldTarget).isCurrent)
+            }
+            gate.release()
+            do {
+                let binding = try await rebind.value
+                XCTAssertTrue(succeeds, "A stale preparer cannot install a binding")
+                XCTAssertEqual(binding.sessionID, sourceID)
+                XCTAssertEqual(target.activeAgentSessionID, sourceID)
+                XCTAssertNil(source.activeAgentSessionID)
+                XCTAssertEqual(fixture.manager.activeAgentSessionID(forTabID: target.tabID), sourceID)
+                XCTAssertNil(fixture.manager.activeAgentSessionID(forTabID: source.tabID))
+            } catch {
+                XCTAssertFalse(succeeds)
+                XCTAssertEqual(error as? AgentModeViewModel.PersistentBindingMutationError, .staleTransition)
+                XCTAssertEqual(source.persistentSessionBindingIdentity, sourceBinding)
+                XCTAssertEqual(target.persistentSessionBindingIdentity, targetBinding)
+                XCTAssertEqual(fixture.manager.activeAgentSessionID(forTabID: source.tabID), sourceID)
+                XCTAssertEqual(fixture.manager.activeAgentSessionID(forTabID: target.tabID), targetBinding?.sessionID)
+                XCTAssertEqual(
+                    source.qualifiedRestorationReadiness.isAuthoritative,
+                    loss != "source",
+                    "Only the unchanged source may regain its pre-transition proof"
+                )
+            }
+            fixture.vm.test_afterRebindOwnershipChecks = nil
+            XCTAssertFalse(source.bindingTransitionInProgress, "The original preparation must release its generation latch")
+            XCTAssertFalse(target.bindingTransitionInProgress)
+            XCTAssertEqual(try Data(contentsOf: sessionFile(root: fixture.root, sessionID: sourceID)), bytes)
+            XCTAssertTrue(fixture.providerRequests.events.isEmpty)
+        }
+    }
+
     func testHydrationReadCannotSettleAReacquiredSameObjectWriter() async throws {
         for outcome in ["payload", "missing", "error", "revision"] {
             let fixture = try await makeFixture()
