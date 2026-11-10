@@ -8021,3 +8021,39 @@ resume tests 1, AutoWake 11, catalog integration 2, prompt adapter 6, other four
 zero. Fresh index passed at **1,262/1,360 wrong-way edges and 53/66 largest cycle**, unchanged baseline.
 These are local fixture gates, not full publication/product/live-app/release/sanitizer or hosted-CI
 qualification. Nothing pushed to #1679.
+
+### M9.2g local prerequisite — exact Claude steering-flush task ownership (2026-11-11)
+
+The existing Claude flush slot now stores an immutable `{ id, task }` record with its cancellation
+operation; the property name and nil/cancel readers remain, without a compatibility setter, sidecar
+registry or second task owner. Installation occurs synchronously before the inherited MainActor task
+can run. The flush rechecks its installed ID at loop entry, after observer/MCP/child waits, after
+augmentation, and before failed-send recovery. Its old cancellation catch can no longer restore a
+replacement's queue, and its defer cannot clear or resubmit through a replacement slot. The three
+current-owner cancel/clear sites discard the same record. This follows ACP's existing flush-ID
+principle while keeping Claude's task and ID in one value; ACP policy is unchanged.
+
+The existing same-attempt settlement recheck is retained when a current-owner withdrawal has already
+cleared the slot. It can produce a redundant settlement event if a replacement has already finished
+and also cleared its slot; the consumer still checks its existing terminal conditions. Delivered-send
+handling and the ownership-guarded uncertain-write notification are unchanged: outcome authority
+after dispatch remains OPEN. This is task-slot ownership, not writer-incarnation admission. Dequeue
+still precedes augmentation, whose host callback defaults to allowing catalog/handoff staging, so
+loss during that operation can still drop the dequeued draft or stage handoff state. No peek/reorder
+or new rollback policy is claimed; that requires an original-admission predicate through the actual
+augmentation hook before the writer-provenance cutover.
+
+One Oracle review (`0608`, chat `6F1A83`) approved the ordering and causal test, with no P0/P1 finding.
+The existing plain MainActor test hook captures an ordinal; no Sendable escape hatch or new seam was
+needed. New `testWithdrawnClaudeFlushCannotRecoverOrClearItsReplacement` runs normal and throwing
+returns from an uncancellable held MCP-idle hook. It uses actual startup, actual synchronous managed-
+Stop withdrawal, and a second held flush on the SAME attempt; old completion must preserve the new
+record, queue, token, composer draft and sent messages. Releasing the new flush sends exactly B once,
+then actual cancellation joins terminal teardown. This characterizes withdrawal, not full Stop or
+writer handoff. Focus `a93b9c2b-ad7f-4471-9be7-7e225abee894` passed both variants (one method, 0.266s).
+Affected selection `70807909-d340-4e93-8b45-77ca9d3068f2` passed **537 tests, zero failures**
+(101.509s). Full lint `3049b4d7-7280-42d8-ba3b-06129aacf562` passed. Actual focused/affected
+compiler-warning occurrence maxima versus integrated baseline `a0c674e9` are unchanged: service and
+session zero, approval/resume test file one. Fresh index passed at **1,262/1,360 wrong-way edges and
+53/66 largest cycle**, without baseline changes. These are local focused/style/index gates, not full
+publication/product/live-app/release/sanitizer or hosted-CI qualification. Nothing pushed.

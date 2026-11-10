@@ -671,8 +671,19 @@ final class AgentTabSession: ObservableObject {
 
     /// Claude turn IDs whose terminal events should be treated as superseded by accepted steering.
     var claudeSupersedingProtectedTurnIDs: Set<UUID> = []
+    /// One installed queue drain. Its identity survives cancellation so an old continuation
+    /// cannot clear or recover work belonging to a replacement flush.
+    struct ClaudeSteeringFlushTask {
+        let id: UUID
+        let task: Task<Void, Never>
+
+        func cancel() {
+            task.cancel()
+        }
+    }
+
     /// Task that drains `pendingClaudeSteeringInstructions` one-by-one, waiting for MCP tool idle between each.
-    var claudeSteeringFlushTask: Task<Void, Never>?
+    var claudeSteeringFlushTask: ClaudeSteeringFlushTask?
 
     /// ACP steering queue — carries text accepted for serialized live steering.
     struct ACPSteeringManagedContext {

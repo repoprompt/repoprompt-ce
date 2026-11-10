@@ -1761,6 +1761,82 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         await h.host.claudeCoordinator.shutdownClaudeSession(session)
     }
 
+    func testWithdrawnClaudeFlushCannotRecoverOrClearItsReplacement() async throws {
+        for releaseThrows in [false, true] {
+            let (h, session, controller, _) = try await spyFixture()
+            let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+            let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
+            session.appendItem(row)
+            try await h.host.test_composeRunService(service).startRun(
+                tabID: session.tabID, session: session, origin: h.startCommand(for: session), initialUserMessage: row.text,
+                initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
+            )
+            await until("host input is registered") { !session.claudeExpectedTurnIDs.isEmpty }
+            let originalOwner = try XCTUnwrap(session.activeRunOwnership)
+            let originalMessages = await controller.sentMessages
+            let firstGate = Gate(), secondGate = Gate()
+            var waits = 0
+            h.host.test_beforeACPToolIdleWait = {
+                waits += 1
+                if waits == 1 {
+                    await firstGate.wait()
+                    if releaseThrows { throw CancellationError() }
+                } else {
+                    await secondGate.wait()
+                }
+            }
+            addTeardownBlock { @MainActor in
+                firstGate.open()
+                secondGate.open()
+                h.host.test_beforeACPToolIdleWait = nil
+                await service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+                await h.host.claudeCoordinator.shutdownClaudeSession(session)
+            }
+
+            try queueSteer("withdrawn draft", in: session, service: service)
+            session.pendingNonCodexUserInputTokenQueue = [17]
+            let acceptedFirst = await service.submitQueuedClaudeSteeringIfSupported(session: session)
+            XCTAssertTrue(acceptedFirst)
+            await until("first flush is held") { firstGate.isWaiting }
+            let first = try XCTUnwrap(session.claudeSteeringFlushTask)
+            service.withdrawQueuedWorkForManagedStop(tabID: session.tabID, session: session)
+            XCTAssertNil(session.claudeSteeringFlushTask)
+            XCTAssertTrue(session.pendingClaudeSteeringInstructions.isEmpty)
+            XCTAssertTrue(session.pendingNonCodexUserInputTokenQueue.isEmpty)
+            XCTAssertEqual(session.draftText, "withdrawn draft")
+            XCTAssertEqual(session.activeRunOwnership, originalOwner, "Withdraw alone does not end the attempt")
+
+            try queueSteer("replacement B", in: session, service: service)
+            session.pendingNonCodexUserInputTokenQueue = [29]
+            let acceptedSecond = await service.submitQueuedClaudeSteeringIfSupported(session: session)
+            XCTAssertTrue(acceptedSecond)
+            await until("replacement flush is held") { secondGate.isWaiting }
+            let second = try XCTUnwrap(session.claudeSteeringFlushTask)
+            let replacementQueue = session.pendingClaudeSteeringInstructions
+            XCTAssertNotEqual(first.id, second.id)
+            firstGate.open()
+            await first.task.value
+            XCTAssertEqual(session.claudeSteeringFlushTask?.id, second.id)
+            XCTAssertEqual(session.pendingClaudeSteeringInstructions, replacementQueue)
+            XCTAssertEqual(session.pendingNonCodexUserInputTokenQueue, [29])
+            XCTAssertEqual(session.draftText, "withdrawn draft", "Old recovery must not prepend the replacement")
+            let messagesBeforeRelease = await controller.sentMessages
+            XCTAssertEqual(messagesBeforeRelease, originalMessages, "Only the installed flush may release B")
+
+            await controller.setTurnInFlight(false)
+            secondGate.open()
+            await second.task.value
+            let messages = await controller.sentMessages
+            XCTAssertEqual(messages, originalMessages + ["replacement B"])
+            XCTAssertTrue(session.pendingClaudeSteeringInstructions.isEmpty)
+            XCTAssertTrue(session.pendingNonCodexUserInputTokenQueue.isEmpty)
+            XCTAssertNil(session.claudeSteeringFlushTask)
+            h.host.test_beforeACPToolIdleWait = nil
+            await service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+            await h.host.claudeCoordinator.shutdownClaudeSession(session)
+        }
+    }
+
     func testSteeringRetainedProviderSuccessorDoesNotCancelReplacement() async throws {
         for successorFinishesBeforeSend in [true, false] {
             let (h, session, controller, _) = try await spyFixture()
