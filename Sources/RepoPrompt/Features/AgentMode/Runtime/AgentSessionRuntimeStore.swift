@@ -278,6 +278,12 @@ final class AgentSessionRuntimeStore {
         }
 
         let presentation = AgentSessionPresentationRuntime()
+        var detachedNotificationCleanup: (@Sendable () -> Void)?
+
+        deinit {
+            detachedNotificationCleanup?()
+        }
+
         let usage = AgentSessionUsageRuntime()
         lazy var turnTiming = AgentSessionTurnTimingRuntime(presentation: presentation)
         lazy var submissions = AgentSessionComposerSubmitRuntime(scope: self)
@@ -381,18 +387,28 @@ final class AgentSessionRuntimeStore {
                   !continuation.hasPendingStarts,
                   linkExecution?.pendingSendEffects.isEmpty != false,
                   linkExecution?.pendingStopEffects.isEmpty != false,
-                  sessions.values.allSatisfy({ session in
-                      !session.runState.isActive && session.activeComposerSubmitAttempt == nil
-                          && !session.terminalCommitInProgress && (!session.isDirty || session.activeAgentSessionID.map {
-                              AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: $0)
-                          } == true)
-                  }) else { return false }
+                  sessions.values.allSatisfy({ settlement(for: $0).legacyDrainCanRelease }) else { return false }
             replaceSessions([:])
             hasReleasedWriterClaims = true
             return true
         }
 
+        /// Per-session release under the existing scope retirement fence. The host must first
+        /// join provider/domain teardown and acknowledge the final save; timeout is not a receipt.
+        /// A sibling's effects never release or block this exact object's claim. This primitive
+        /// has no VM caller until host cutover; presentation removal/publication belongs to that host.
+        @discardableResult
+        func releaseWriterClaim(for session: AgentTabSession) -> Bool {
+            guard isRetiring, settlement(for: session).isSettled else { return false }
+            var remaining = sessions
+            remaining.removeValue(forKey: session.tabID)
+            releasedSessionTabIDs.insert(session.tabID)
+            replaceSessions(remaining)
+            return true
+        }
+
         private(set) var sessions: [UUID: AgentTabSession] = [:]
+        private var releasedSessionTabIDs: Set<UUID> = []
         fileprivate struct LiveClaim {
             let sessionID: UUID
             let incarnationID = UUID()
@@ -408,7 +424,7 @@ final class AgentSessionRuntimeStore {
         func replaceSessions(_ replacement: [UUID: AgentTabSession]) {
             guard !hasReleasedWriterClaims || replacement.isEmpty else { return }
             let previous = sessions
-            sessions = replacement
+            sessions = replacement.filter { !releasedSessionTabIDs.contains($0.key) }
             for (tabID, session) in previous where sessions[tabID] !== session {
                 store.refreshBindingObservation(for: session)
                 updateLiveSessionBindingIndex(tabID: tabID)
@@ -417,6 +433,7 @@ final class AgentSessionRuntimeStore {
                 store.refreshBindingObservation(for: session)
                 updateLiveSessionBindingIndex(tabID: tabID)
             }
+            presentation.refreshDetachedState()
         }
 
         func bindingRejection(_ sessionID: UUID, on session: AgentTabSession) -> BindingRejection? {

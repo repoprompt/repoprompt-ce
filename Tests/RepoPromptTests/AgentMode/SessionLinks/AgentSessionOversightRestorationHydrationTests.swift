@@ -120,7 +120,7 @@ final class AgentSessionOversightRestorationHydrationTests: XCTestCase {
         )
         addTeardownBlock {
             await AgentSessionDataService.shared.test_setBeforeLoadRepairWriteHook(nil)
-            await vm.prepareForWindowClose()
+            await vm.test_retireAndCancelFixture()
             XCTAssertTrue(requests.events.isEmpty, "Hydration must never request a provider")
         }
         let tabID = UUID(), sessionID = UUID()

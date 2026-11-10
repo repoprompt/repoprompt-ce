@@ -6,13 +6,17 @@ import RepoPromptInstrumentation
 @MainActor
 final class AgentSessionRunContinuationRuntime {
     struct Launch {
-        let start: (AgentTabSession, AgentTabSession.PendingInstruction, AgentRunStartOutcomeRecorder) async -> Void
+        let start: @MainActor (AgentTabSession, AgentTabSession.PendingInstruction, AgentRunStartOutcomeRecorder) async -> Void
     }
 
     private weak var scope: AgentSessionRuntimeStore.Scope?
-    private var pendingStarts: [UUID: Task<Void, Never>] = [:]
+    private var pendingStarts: [ObjectIdentifier: [UUID: Task<Void, Never>]] = [:]
     var hasPendingStarts: Bool {
         !pendingStarts.isEmpty
+    }
+
+    func hasPendingStarts(for session: AgentTabSession) -> Bool {
+        pendingStarts[ObjectIdentifier(session)]?.isEmpty == false
     }
 
     #if DEBUG
@@ -33,7 +37,7 @@ final class AgentSessionRunContinuationRuntime {
                     let instruction = instruction.retainingStopFence(instruction.stopFence ?? AgentRunStartStopFence(session: session))
                     guard let owner = scope else { return }
                     let launch = prepareLaunch()
-                    enqueue(owner: owner) { [self] in
+                    enqueue(owner: owner, session: session) { [self] in
                         await performFollowUp(session: session, instruction: instruction, launch: launch)
                     }
                 }
@@ -48,25 +52,34 @@ final class AgentSessionRunContinuationRuntime {
     }
 
     /// Cancelled waiters still join the originating producers. Task cancellation is not a drain receipt.
-    func drainPendingStarts() async {
+    func drainPendingStarts(for session: AgentTabSession? = nil) async {
         guard let owner = scope else { return }
         defer { withExtendedLifetime(owner) {} }
-        while let task = pendingStarts.values.first {
+        let identity = session.map(ObjectIdentifier.init)
+        while true {
+            let task = if let identity {
+                pendingStarts[identity]?.values.first
+            } else {
+                pendingStarts.values.first?.values.first
+            }
+            guard let task else { return }
             await task.value
         }
     }
 
     @discardableResult
-    private func enqueue(owner: AgentSessionRuntimeStore.Scope, operation: @escaping () async -> Void) -> Task<Void, Never> {
+    private func enqueue(owner: AgentSessionRuntimeStore.Scope, session: AgentTabSession, operation: @escaping () async -> Void) -> Task<Void, Never> {
+        let identity = ObjectIdentifier(session)
         let id = UUID()
         let task = Task { [self, owner] in
             defer {
-                pendingStarts.removeValue(forKey: id)
+                pendingStarts[identity]?.removeValue(forKey: id)
+                if pendingStarts[identity]?.isEmpty == true { pendingStarts.removeValue(forKey: identity) }
                 withExtendedLifetime(owner) {}
             }
             await operation()
         }
-        pendingStarts[id] = task
+        pendingStarts[identity, default: [:]][id] = task
         return task
     }
 
@@ -102,7 +115,7 @@ final class AgentSessionRunContinuationRuntime {
         }
         let scheduled = AgentTabSession.ScheduledACPFollowUp(id: UUID(), instruction: instruction, stopFence: stopFence)
         session.scheduledACPFollowUp = scheduled
-        enqueue(owner: owner) { [self] in
+        enqueue(owner: owner, session: session) { [self] in
             #if DEBUG
                 defer { test_didFinishScheduledACPFollowUpStart?() }
                 await test_beforeScheduledACPFollowUpStart?()
@@ -156,7 +169,7 @@ final class AgentSessionRunContinuationRuntime {
     ) async {
         guard let owner = scope else { return }
         let instruction = instruction.retainingStopFence(instruction.stopFence ?? AgentRunStartStopFence(session: session))
-        await enqueue(owner: owner) { [self] in
+        await enqueue(owner: owner, session: session) { [self] in
             await performFollowUp(session: session, instruction: instruction, launch: launch)
         }.value
     }

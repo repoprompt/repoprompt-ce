@@ -1525,7 +1525,7 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         weak let claude = runtime.claudeCommands
         XCTAssertNotNil(codex)
         XCTAssertNotNil(claude)
-        await viewModel?.prepareForWindowClose()
+        await viewModel?.test_retireAndCancelFixture()
         viewModel = nil
         XCTAssertNil(codex, "The terminal binder retains interaction hooks, not their provider command owners")
         XCTAssertNil(claude)
@@ -1990,7 +1990,7 @@ final class AgentSessionCodexRuntimeEffectsTests: XCTestCase {
         XCTAssertNil(replacement.contextUsageSnapshot)
         XCTAssertNil(replacement.activeAgentRunStartedAt)
         await predecessor.codexController?.shutdown()
-        await viewModel.prepareForWindowClose()
+        await viewModel.test_retireAndCancelFixture()
     }
 
     private func makeCoordinator(scope: AgentSessionRuntimeStore.Scope) -> CodexAgentModeCoordinator {

@@ -339,7 +339,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
             return !AgentSessionRuntimeStore.shared.hasRetiringWriter(sessionID: sessionID)
         }
         guard preparedOversightPreparationInFlight[sessionID, default: 0] <= (preparingReplacement ? 1 : 0),
-              owner.agentModeViewModel.sessions.values.allSatisfy({ !$0.runState.isActive }),
+              owner.agentModeViewModel.preparedOversightSessionsAreIdle,
               await !(AgentRunSessionStore.hasActiveRegistration(sessionID: sessionID)),
               await !owner.agentModeViewModel.preparedOversightRuntimeIsBusy(),
               preparedOversightWindows[sessionID] === owner else { return false }
@@ -418,7 +418,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
                     {
                         preparedOversightOwnerLocations[id] = location
                     }
-                    guard owner.agentModeViewModel.sessions.values.allSatisfy({ !$0.runState.isActive }),
+                    guard owner.agentModeViewModel.preparedOversightSessionsAreIdle,
                           await !AgentRunSessionStore.hasActiveRegistration(sessionID: id),
                           await !owner.agentModeViewModel.preparedOversightRuntimeIsBusy(),
                           preparedOversightWindows[id] === owner else { continue }

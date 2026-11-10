@@ -1598,7 +1598,7 @@ private extension DecisionServiceCapabilities {
 final class AgentSlashCommandSuggestionsTests: XCTestCase {
     func testClaudeCompactIsDiscoverableAndPrefixFiltered() async {
         let viewModel = makeViewModel()
-        addTeardownBlock { await viewModel.prepareForWindowClose() }
+        addTeardownBlock { await viewModel.test_retireAndCancelFixture() }
         viewModel.selectedAgent = .claudeCode
 
         let fresh = await viewModel.slashSkillSuggestions(for: "")
@@ -1623,7 +1623,7 @@ final class AgentSlashCommandSuggestionsTests: XCTestCase {
 
     func testClaudeBuiltinDoesNotLeakIntoOtherProviderMenus() async {
         let viewModel = makeViewModel()
-        addTeardownBlock { await viewModel.prepareForWindowClose() }
+        addTeardownBlock { await viewModel.test_retireAndCancelFixture() }
         for provider: AgentProviderKind in [.codexExec, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .cursor, .openCode, .grokBuild, .devin, .antigravity] {
             viewModel.selectedAgent = provider
             let suggestions = await viewModel.slashSkillSuggestions(for: "comp")
@@ -1633,7 +1633,7 @@ final class AgentSlashCommandSuggestionsTests: XCTestCase {
 
     func testActiveClaudeRuntimeCommandsReachMenuButNotOtherProviders() async {
         let viewModel = makeViewModel()
-        addTeardownBlock { await viewModel.prepareForWindowClose() }
+        addTeardownBlock { await viewModel.test_retireAndCancelFixture() }
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.providerSessionID = "restored-conversation"
@@ -1650,7 +1650,7 @@ final class AgentSlashCommandSuggestionsTests: XCTestCase {
 
     func testSuspendedRuntimeLookupCannotPublishAfterProviderSwitch() async {
         let viewModel = makeViewModel()
-        addTeardownBlock { await viewModel.prepareForWindowClose() }
+        addTeardownBlock { await viewModel.test_retireAndCancelFixture() }
         let started = expectation(description: "runtime command lookup started")
         let runtime = SlashSuggestionRuntime(holdLookup: true, onLookup: { started.fulfill() })
         let session = AgentModeViewModel.TabSession(tabID: UUID())
@@ -1701,7 +1701,7 @@ final class AgentSlashCommandSuggestionsTests: XCTestCase {
         try "---\ndescription: Local context skill\n---\nLocal context instructions".write(to: commands.appendingPathComponent("context.md"), atomically: true, encoding: .utf8)
         let catalog = AgentSkillCatalog(homeDirectoryURL: root.appendingPathComponent("home"))
         let viewModel = makeViewModel(root: root, catalog: catalog)
-        addTeardownBlock { await viewModel.prepareForWindowClose() }
+        addTeardownBlock { await viewModel.test_retireAndCancelFixture() }
         viewModel.selectedAgent = .claudeCode
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
@@ -1740,7 +1740,7 @@ final class AgentSlashCommandSuggestionsTests: XCTestCase {
         }
         runtimeCommands.append(.init(name: "review-local", description: "Runtime duplicate", argumentHint: ""))
         let viewModel = makeViewModel(root: root, catalog: AgentSkillCatalog(homeDirectoryURL: root.appendingPathComponent("home")))
-        addTeardownBlock { await viewModel.prepareForWindowClose() }
+        addTeardownBlock { await viewModel.test_retireAndCancelFixture() }
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.providerSessionID = "existing-conversation"
@@ -2099,7 +2099,7 @@ final class AutoWorkflowSubmissionTests: XCTestCase {
         addTeardownBlock { @MainActor in
             await backend.release()
             viewModel.releaseComposerSubmitClaim(claim)
-            await viewModel.prepareForWindowClose()
+            await viewModel.test_retireAndCancelFixture()
             await runtime.teardown()
             defaults.removePersistentDomain(forName: suite)
             try? FileManager.default.removeItem(at: root)

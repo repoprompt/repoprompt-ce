@@ -179,7 +179,7 @@ final class AgentSessionLinkCanonicalTranscriptTests: XCTestCase {
             XCTAssertTrue(before[2].contains("Canonical quiet closing output"))
             XCTAssertTrue(before[3].contains("Canonical quiet closing output"))
         }
-        await vm.prepareForWindowClose()
+        await vm.test_retireAndCancelFixture()
     }
 
     // MARK: - Role policy
