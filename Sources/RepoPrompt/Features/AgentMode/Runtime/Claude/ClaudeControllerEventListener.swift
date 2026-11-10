@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentProviderContracts
 
 typealias ClaudeAttemptEventReservation = (listener: ClaudeControllerEventListener, subscription: ClaudeAttemptEventSubscription)
 

@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptSettingsCore
 import XCTest
@@ -231,6 +233,19 @@ final class AgentRepromptTestFixture {
         session.selectedAgent = .claudeCode
         await runtime.reconcileDemand()
         try await AsyncTestWait.waitUntil("synthetic router ready", timeout: 5) { self.runtime.isBackendReady(self.backend.id) }
+    }
+
+    /// This isolated host has no workspace manager. Qualify the restored runtime identity;
+    /// callers still establish (or deliberately withhold) payload restoration themselves.
+    func installPersistentWriter() throws {
+        let sessionID = UUID()
+        XCTAssertNil(viewModel.test_bindingRejection(sessionID: sessionID, on: session))
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: UUID()))
+        guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: sessionID) else {
+            throw NSError(domain: "AgentRepromptTestFixture.writer", code: 1)
+        }
+        XCTAssertTrue(writer.session === session)
+        XCTAssertTrue(writer.isCurrent)
     }
 
     func enableReprompt() {

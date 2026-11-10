@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptInstrumentation
+import RepoPromptWorkspaceContext
 
 typealias AgentSelectedFilesDiagnostics = WorkspaceSelectedFilesDiagnostics
 

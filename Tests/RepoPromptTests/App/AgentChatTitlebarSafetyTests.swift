@@ -4,10 +4,13 @@ import Combine
 import Foundation
 import KeyboardShortcuts
 import MCP
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+@testable import RepoPromptMCPServer
 import RepoPromptPersistence
 import RepoPromptSettingsCore
+@testable import RepoPromptWorkspaceContext
 import SwiftUI
 import XCTest
 

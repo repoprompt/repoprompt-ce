@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
@@ -166,7 +167,7 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
 
         // Keep the obstruction until the first runtime has fully stopped, so teardown cannot retry
         // the first save successfully and accidentally turn this into a successful-restore test.
-        await close(fixture)
+        await disposeForFreshRuntimeReopen(fixture)
         await fixture.writer.test_setBeforeSessionWriteHook(nil)
         try FileManager.default.removeItem(at: payloadURL)
         let reopened = try await makeFixture(root: fixture.root, workspace: savedWorkspace)
@@ -456,7 +457,7 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
                             && handle.session.currentRestorationBindingToken == handle.bindingToken
                     }
                 )
-                XCTAssertTrue(fixture.vm.withdrawPendingStartForSessionLink(session: handle.session, admission: admission))
+                XCTAssertTrue(fixture.vm.linkExecutionRuntime.withdrawPendingStartForSessionLink(session: handle.session, admission: admission))
                 XCTAssertFalse(handle.session.mcpFollowUpRunPending)
                 XCTAssertFalse(pendingFence.permitsStart(of: handle.session))
             } else {
@@ -566,7 +567,7 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
                     && handle.session.currentRestorationBindingToken == handle.bindingToken
             }
         )
-        XCTAssertTrue(fixture.vm.withdrawPendingStartForSessionLink(session: handle.session, admission: admission))
+        XCTAssertTrue(fixture.vm.linkExecutionRuntime.withdrawPendingStartForSessionLink(session: handle.session, admission: admission))
         XCTAssertFalse(pendingFence.permitsStart(of: handle.session))
         gate.release()
         let result = await starter.result
@@ -1156,11 +1157,11 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
 
     private func reopen(_ fixture: Fixture) async throws -> Fixture {
         let workspace = try await persistCarrier(fixture)
-        await close(fixture)
+        await disposeForFreshRuntimeReopen(fixture)
         return try await makeFixture(root: fixture.root, workspace: workspace)
     }
 
-    private func close(_ fixture: Fixture) async {
+    private func disposeForFreshRuntimeReopen(_ fixture: Fixture) async {
         fixture.vm.test_afterFreshForegroundSessionCreation = nil
         fixture.vm.test_afterConfiguredCreationAcknowledgement = nil
         fixture.vm.test_setAfterDurableChildTabCreation(nil)
@@ -1169,7 +1170,24 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
             session.saveDebounceTask?.cancel()
         }
         await fixture.vm.prepareForWindowClose()
+        await fixture.vm.attachmentRuntime.waitForRetention()
+        await fixture.vm.test_drainSessionPersistenceAfterWindowClose()
         fixture.manager.prepareForWindowClose()
+        // These cases model a fresh runtime reading only durable state, not a second live host.
+        // The fixture and its XCTest teardown retain the old VM past close, so explicitly discard
+        // its drained objects as process disposal would. Do not save or grant restoration proof here.
+        let retiredSessionIDs = fixture.vm.sessions.values.compactMap(\.activeAgentSessionID)
+        for tabID in Array(fixture.vm.sessions.keys) {
+            fixture.vm.test_removeSession(tabID: tabID)
+        }
+        for sessionID in retiredSessionIDs {
+            guard case .unavailable(.absent) = AgentSessionRuntimeStore.shared.resolveWriter(
+                workspaceID: fixture.workspaceID, sessionID: sessionID
+            ) else {
+                XCTFail("A fresh-runtime reopen must not inherit a retained in-memory writer")
+                continue
+            }
+        }
     }
 
     private func sessionFile(root: URL, sessionID: UUID) -> URL {

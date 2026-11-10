@@ -29,6 +29,31 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         XCTAssertTrue(try fixture.calls().isEmpty)
     }
 
+    func testHeadlessBackgroundRefusesBeforeLaunch() async throws {
+        let fixture = try Fixture(name: "background-refusal")
+        defer { fixture.cleanup() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        let backend = DirectHeadlessConversationBackend(providerCoordinator: prepared.providerCoordinator, oracleAdapter: prepared.oracleAdapter)
+        _ = try await prepared.settingsStore.set(key: OracleRosterContract.primarySettingKey, value: .string("invalid-roster-tripwire"))
+        let cases: [(String, [String: Value])] = [
+            ("ask_oracle", ["background": .bool(true), "message": .string("must not launch")]),
+            ("ask_oracle", ["op": .string("cancel"), "oracle_group_id": .string(UUID().uuidString), "oracle_turn_id": .string(UUID().uuidString)]),
+            ("oracle_chat_log", ["op": .string("collect")])
+        ]
+        for (tool, args) in cases {
+            do {
+                _ = try await invoke(prepared: prepared, backend: backend, toolName: tool, arguments: args)
+                XCTFail("Expected pre-work refusal: \(tool)")
+            } catch {
+                guard case let MCPError.invalidParams(message) = error else { return XCTFail("Unexpected refusal: \(error)") }
+                XCTAssertEqual(message, OracleBackgroundContract.ResultCode.unsupported.message)
+            }
+            XCTAssertTrue(try fixture.calls().isEmpty)
+        }
+    }
+
     func testTwoAndFiveOracleStartsUsePhysicalLaneCarriersAndReturnLaneOrder() async throws {
         let fixture = try Fixture(name: "ordering")
         defer { fixture.cleanup() }

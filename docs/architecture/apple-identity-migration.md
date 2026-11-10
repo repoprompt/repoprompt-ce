@@ -200,3 +200,56 @@ Before the transition package is published, rollback is simply removal of the el
 item: clients remain on the legacy app, source Keychain items remain untouched, and a successfully
 prepared client can continue using the bridge. After the successor is published, keep the preparer
 and its signing material available until the supported migration window closes.
+
+## Credential deletion recovery (-25244)
+
+Older preparer builds used executable filenames (`RepoPrompt` and
+`RepoPromptIdentityAnchor`) as the descriptions of requirement-based trusted
+applications. Apple's classic `SecItemDelete` password guard compares those
+basenames with the caller's app name, independently of code-signing authorization.
+A migrated item can therefore pass the exact signing-requirement validation yet
+fail deletion with `errSecInvalidOwnerEdit` (-25244). See
+[issue #1663](https://github.com/repoprompt/repoprompt-ce/issues/1663) and
+[Apple's legacy deletion guard](https://github.com/apple-oss-distributions/Security/blob/main/OSX/libsecurity_keychain/lib/SecItem.cpp).
+
+New preparer ACLs describe the app bundle for both identities; the successor's
+embedded anchor remains its code-validation input. Neither designated requirement
+changes. Existing items are not rewritten. An **interactive** delete that fails
+with -25244 can recover by revalidating the exact held item's decrypt ACL and
+calling `SecKeychainItemDelete` on that reference. Keychain authorization still
+applies. The app then performs a reference-only absence check before reporting
+success. It never follows a replacement item with another delete, reads a secret,
+changes an ACL, or falls back to a different service/account.
+
+Noninteractive operations do **not** use this recovery API because it cannot
+suppress authentication UI per call. In particular, deletion during reconciliation
+of an unfinished migration can still fail with -25244 and leave migration paused.
+Renamed app bundles can also hit the name guard; authenticated interactive deletion
+uses the same bounded recovery path.
+
+If the current official CE app still cannot delete the credential:
+
+1. Open **Keychain Access** and inspect only the affected password item's metadata.
+   Match its **Account** and **Where** (service) fields. For Z.ai, the account is
+   `ZAIAPI`; the GLM compatible backend shares this credential. A committed bridge
+   service starts with `com.repoprompt.ce.identity-migration.keychain.v1.` followed
+   by its attempt UUID. Do not reveal or export the password.
+2. Delete only that credential in the active bridge, using normal macOS
+   authorization. If multiple attempts exist and you cannot identify the active
+   bridge, stop and contact support rather than guessing or deleting all matches.
+3. Return to CE and retry the provider's Delete action to refresh provider state.
+   Re-enter a replacement key only if wanted. Failure or cancellation does not
+   clear the app's provider settings.
+
+**Never** delete the bridge manifest account
+`RepoPromptIdentityMigrationBridgeManifestV2`, any item in the journal service
+`com.pvncher.repoprompt.ce.identity-migration.state.v2`, or unrelated credentials.
+Do not reset the login Keychain, add trusted applications, or choose “allow all
+applications.” Removing migration metadata can make the committed bridge
+unavailable and is not a credential-deletion repair.
+
+Fake-client tests cover the fallback gates, exact-reference targeting, ACL rejection,
+cancellation, replacement races, absence confirmation, and sanitized UI errors. They
+do not establish behavior under the official Developer ID identities on the
+reporter's macOS version; that signed-build check remains a release-validation
+boundary.

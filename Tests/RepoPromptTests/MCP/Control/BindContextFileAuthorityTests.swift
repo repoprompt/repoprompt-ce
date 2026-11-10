@@ -4,7 +4,9 @@ import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 @testable import RepoPromptFoundation
+@testable import RepoPromptMCPServer
 import RepoPromptSettingsCore
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 #if DEBUG

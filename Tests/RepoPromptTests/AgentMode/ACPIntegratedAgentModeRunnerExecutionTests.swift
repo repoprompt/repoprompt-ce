@@ -1,4 +1,6 @@
 import MCP
+import RepoPromptACPProviders
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
@@ -314,7 +316,7 @@ final class ACPToolObservationCorrelationTests: XCTestCase {
 
     private func fixture(toolTrackingHooks: AgentToolTrackingHooks = .noOp) -> (AgentSessionLinkRunnerHarness, AgentTabSession, ACPIntegratedAgentModeRunner) {
         let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
-        let runner = ACPIntegratedAgentModeRunner(hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(), toolTrackingHooks: toolTrackingHooks, providerFactory: { _, _ in nil }, controllerFactory: { provider, request in try ACPAgentSessionController(provider: provider, runRequest: request) })
+        let runner = ACPIntegratedAgentModeRunner(hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(), toolTrackingHooks: toolTrackingHooks)
         return (harness, harness.makeSession(agent: .devin), runner)
     }
 
@@ -332,6 +334,178 @@ final class ACPToolObservationCorrelationTests: XCTestCase {
 
 @MainActor
 final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
+    func testComposedStartupRefusalSettlesOnlyItsOwnAttemptAndCannotAcknowledgeSuccessor() async {
+        for replacesAttempt in [false, true] {
+            let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+            let session = harness.makeSession(agent: .devin)
+            let provider = AgentSessionLinkCapturingACPProvider(providerID: .devin, commandPath: "/usr/bin/false")
+            let entered = expectation(description: "Construction is held after execution admission")
+            var release: CheckedContinuation<Void, Never>?
+            defer { release?.resume() }
+            var controllerConstructions = 0
+            let resources = AgentRunProviderComposition(
+                headless: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
+                acp: { _, _ in
+                    await withCheckedContinuation { continuation in release = continuation
+                        entered.fulfill()
+                    }
+                    return provider
+                },
+                controller: { provider, request in
+                    controllerConstructions += 1
+                    return try ACPAgentSessionController(provider: provider, runRequest: request)
+                }
+            )
+            let composition = AgentModeRunComposition(execution: harness.service, resources: resources, workspace: harness.workspace)
+            let outcome = AgentRunStartOutcomeRecorder()
+            let fence = AgentRunStartStopFence(session: session)
+            let start = Task { await composition.startRun(
+                tabID: session.tabID, session: session, initialUserMessage: "turn", initialMessageForRun: "turn",
+                attachments: [], startOutcome: outcome, stopFence: fence
+            ) }
+            await fulfillment(of: [entered], timeout: 3)
+            let originating = session.activeRunOwnership
+            if replacesAttempt {
+                await harness.service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+                session.beginRunAttempt(source: "successor while old construction settles")
+                session.installRunID(UUID())
+                session.runState = .running
+            } else {
+                // A producer fence can be withdrawn before a cancellation command publishes terminal.
+                session.stopState.invalidateScheduledStarts()
+            }
+            let expectedOwner = session.activeRunOwnership
+            release?.resume()
+            release = nil
+            _ = await start.value
+            XCTAssertFalse(outcome.outcome.didStart, "A different active attempt is not evidence this request installed work")
+            XCTAssertEqual(controllerConstructions, 0)
+            XCTAssertEqual(provider.supportCallCount, 0)
+            XCTAssertNil(session.acpController)
+            if replacesAttempt {
+                XCTAssertNotEqual(expectedOwner, originating)
+                XCTAssertEqual(session.activeRunOwnership, expectedOwner)
+                XCTAssertEqual(session.runState, .running)
+                await harness.service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+            } else {
+                XCTAssertEqual(session.runState, .cancelled, "Refusal must not strand a running attempt without a task")
+                XCTAssertNil(session.activeRunOwnership)
+            }
+        }
+    }
+
+    func testWorkspaceAdmissionRetainsLogicalRootAndRevalidatesWorktreeAndBinding() throws {
+        let session = AgentTabSession(tabID: UUID())
+        let sessionID = UUID()
+        session.testInstallPersistentSessionBinding(sessionID: sessionID)
+        let ownership = session.beginRunAttempt(source: "workspace admission")
+        let input = AgentRunWorkspaceInput(fallbackWorkspacePath: "/captured/logical-root")
+        let admission = AgentACPWorkspaceAdmission(
+            input: input, ownership: ownership, session: session
+        )
+        XCTAssertTrue(admission.isCurrent(for: session))
+        XCTAssertEqual(try admission.input.resolve(bindings: []), "/captured/logical-root")
+        let missing = AgentSessionWorktreeBinding(
+            id: "binding", repositoryID: "repository", repoKey: "repository",
+            logicalRootPath: "/captured/logical-root", worktreeID: "worktree",
+            worktreeRootPath: "/nonexistent-m9-worktree-\(UUID().uuidString)", source: "test"
+        )
+        XCTAssertThrowsError(try admission.input.resolve(bindings: [missing]), "A captured root is not cached filesystem authority")
+        session.testInstallPersistentSessionBinding(sessionID: sessionID)
+        XCTAssertFalse(admission.isCurrent(for: session), "Same session UUID with a new binding cannot reuse the admitted workspace")
+        XCTAssertEqual(session.activeRunOwnership, ownership)
+        _ = session.beginPersistentBindingTransition()
+        let duringTransition = AgentACPWorkspaceAdmission(
+            input: input, ownership: ownership, session: session
+        )
+        XCTAssertFalse(duringTransition.isCurrent(for: session), "Matching values do not admit a binding transition in progress")
+
+        // Runtime-only attempts have no restoration token. Their existing transition generation
+        // still fences an old admission after a nil-to-nil binding transition settles.
+        let runtimeOnly = AgentTabSession(tabID: UUID())
+        let runtimeOwner = runtimeOnly.beginRunAttempt(source: "runtime-only workspace")
+        let runtimeAdmission = AgentACPWorkspaceAdmission(input: input, ownership: runtimeOwner, session: runtimeOnly)
+        XCTAssertTrue(runtimeAdmission.isCurrent(for: runtimeOnly))
+        let transition = runtimeOnly.beginPersistentBindingTransition()
+        runtimeOnly.finishPersistentBindingTransition(generation: transition)
+        XCTAssertNil(runtimeOnly.currentRestorationBindingToken)
+        XCTAssertFalse(runtimeAdmission.isCurrent(for: runtimeOnly))
+    }
+
+    func testPreparedHeadlessConstructionIsOneShotAndStopFencesFactoryInvocation() async throws {
+        var constructions = 0
+        let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in
+            constructions += 1
+            return AgentSessionLinkCapturingHeadlessProvider()
+        })
+        let session = harness.makeSession(agent: .claudeCode)
+        let runner = harness.makeHeadlessRunner()
+        let request = await runner.prepareRun(
+            tabID: session.tabID, session: session, initialUserMessage: "turn",
+            initialMessageForRun: "turn", attachments: [],
+            makeLease: { harness.makeLease(runID: $0, tabID: session.tabID) }
+        )
+        let prepared = try XCTUnwrap(request)
+        XCTAssertEqual(constructions, 0, "Execution must not construct a provider while admitting the turn")
+        await harness.service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+        await harness.resources.fulfill(prepared)
+        await harness.resources.fulfill(prepared)
+        XCTAssertEqual(constructions, 0, "A cancelled preparation cannot construct, including a repeated delivery")
+        XCTAssertNil(session.provider)
+        XCTAssertEqual(session.runState, .cancelled)
+    }
+
+    func testStoppedACPProviderConstructionCannotConstructControllerOrInstallSuccessor() async {
+        let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+        let session = harness.makeSession(agent: .devin)
+        let runner = ACPIntegratedAgentModeRunner(hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(), toolTrackingHooks: .noOp)
+        let provider = AgentSessionLinkCapturingACPProvider(providerID: .devin, commandPath: "/usr/bin/false")
+        let entered = expectation(description: "Provider construction held outside execution")
+        var release: CheckedContinuation<Void, Never>?
+        defer { release?.resume() }
+        var providerConstructions = 0
+        var controllerConstructions = 0
+        let resources = AgentRunProviderComposition(
+            headless: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
+            acp: { _, _ in
+                providerConstructions += 1
+                await withCheckedContinuation { continuation in
+                    release = continuation
+                    entered.fulfill()
+                }
+                return provider
+            },
+            controller: { provider, request in
+                controllerConstructions += 1
+                return try ACPAgentSessionController(provider: provider, runRequest: request)
+            }
+        )
+        let prepared = await runner.prepareRun(
+            tabID: session.tabID, session: session, workspace: .init(fallbackWorkspacePath: nil), initialUserMessage: "turn", initialMessageForRun: "turn", attachments: [],
+            runRequest: ACPRunRequest(agentKind: .devin, modelString: nil, workspacePath: nil, resumeSessionID: nil, attachments: [], taskLabelKind: nil),
+            makeLease: { harness.makeLease(runID: $0, tabID: session.tabID) }
+        )
+        XCTAssertNotNil(prepared)
+        XCTAssertEqual(providerConstructions, 0)
+        let construction = Task { await resources.fulfill(prepared) }
+        await fulfillment(of: [entered], timeout: 3)
+        await resources.fulfill(prepared)
+        XCTAssertEqual(providerConstructions, 1, "Repeated delivery during construction cannot invoke a second factory")
+        await harness.service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+        let terminal = session.lastTerminalCommitRevision
+        release?.resume()
+        release = nil
+        await construction.value
+        await resources.fulfill(prepared)
+        XCTAssertEqual(providerConstructions, 1)
+        XCTAssertEqual(controllerConstructions, 0)
+        XCTAssertEqual(provider.supportCallCount, 0, "A stale provider must not perform support work")
+        XCTAssertNil(session.acpController)
+        XCTAssertEqual(session.lastTerminalCommitRevision, terminal)
+        XCTAssertEqual(session.runState, .cancelled)
+        XCTAssertTrue(provider.promptedMessages.isEmpty)
+    }
+
     override func setUp() {
         super.setUp()
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
@@ -599,10 +773,7 @@ final class AgentToolResultPayloadRetentionTests: XCTestCase {
         let session = harness.makeSession(agent: .devin)
         let runner = ACPIntegratedAgentModeRunner(
             hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(),
-            toolTrackingHooks: .noOp, providerFactory: { _, _ in nil },
-            controllerFactory: { provider, request in
-                try ACPAgentSessionController(provider: provider, runRequest: request)
-            }
+            toolTrackingHooks: .noOp
         )
         func deliver(status: String, output: Any? = nil, content: Any? = nil) throws {
             var update: [String: Any] = [
@@ -647,10 +818,7 @@ final class AgentToolResultPayloadRetentionTests: XCTestCase {
                 let session = harness.makeSession(agent: .devin)
                 let runner = ACPIntegratedAgentModeRunner(
                     hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(),
-                    toolTrackingHooks: .noOp, providerFactory: { _, _ in nil },
-                    controllerFactory: { provider, request in
-                        try ACPAgentSessionController(provider: provider, runRequest: request)
-                    }
+                    toolTrackingHooks: .noOp
                 )
                 func deliver(_ status: String, output: Any? = nil) throws -> AIStreamResult {
                     var update: [String: Any] = [
@@ -689,61 +857,6 @@ final class AgentToolResultPayloadRetentionTests: XCTestCase {
         }
     }
 
-    private let rich = #"{"review":{"chat_id":"c","oracle_results":[]},"status":"success"}"#
-
-    func testEmptyLaterUpdateKeepsEarlierResult() {
-        for thin in [nil, "", "  \n", "{}", "[]", "null", "\"\""] {
-            XCTAssertTrue(
-                AgentToolResultPayloadRetention.shouldKeepExisting(existing: rich, incoming: thin, incomingIsError: false),
-                String(describing: thin)
-            )
-        }
-    }
-
-    func testRealUpdatesAndErrorsStillReplace() {
-        XCTAssertFalse(AgentToolResultPayloadRetention.shouldKeepExisting(existing: rich, incoming: #"{"status":"x"}"#, incomingIsError: false))
-        XCTAssertFalse(AgentToolResultPayloadRetention.shouldKeepExisting(existing: rich, incoming: "", incomingIsError: true))
-        XCTAssertFalse(AgentToolResultPayloadRetention.shouldKeepExisting(existing: "", incoming: "", incomingIsError: false))
-        XCTAssertFalse(AgentToolResultPayloadRetention.shouldKeepExisting(existing: rich, incoming: "plain text", incomingIsError: false))
-    }
-
-    func testProgressUpdatesNeverReplaceARealResult() {
-        let running = #"{"title":"Called manage_selection from RepoPromptCE","status":"running"}"#
-        let finalContent = #"[{"type":"content","content":{"type":"text","text":"Selection set"}}]"#
-        // Devin sends a progress update after RepoPrompt's own result arrived.
-        XCTAssertTrue(AgentToolResultPayloadRetention.shouldKeepExisting(
-            existing: rich, incoming: running, incomingIsError: false, requireObjectReplacement: true
-        ))
-        // A real result always replaces a progress placeholder, even a text echo.
-        XCTAssertFalse(AgentToolResultPayloadRetention.shouldKeepExisting(
-            existing: running, incoming: finalContent, incomingIsError: false, requireObjectReplacement: true
-        ))
-        XCTAssertFalse(AgentToolResultPayloadRetention.shouldKeepExisting(
-            existing: running, incoming: rich, incomingIsError: false, requireObjectReplacement: true
-        ))
-        // A result that merely has a running status plus real fields is not progress.
-        XCTAssertFalse(AgentToolResultPayloadRetention.isProgress(#"{"status":"running","context_id":"x"}"#))
-    }
-
-    func testBareTerminalMarkerCompletesStreamedProgressAndKeepsRealResults() throws {
-        let streamed = #"{"content":[{"type":"content"}],"status":"running"}"#
-        let completed = #"{"status":"completed"}"#
-        let merged = try XCTUnwrap(AgentToolResultPayloadRetention.resolvedPayload(
-            existing: streamed, incoming: completed, incomingIsError: false
-        ))
-        XCTAssertTrue(merged.contains(#""status":"completed""#), merged)
-        XCTAssertTrue(merged.contains(#""content""#), merged)
-        // A terminal marker never erases RepoPrompt's own structured result.
-        XCTAssertNil(AgentToolResultPayloadRetention.resolvedPayload(
-            existing: rich, incoming: completed, incomingIsError: false, requireObjectReplacement: true
-        ))
-        // With nothing earlier, the marker is stored as-is.
-        XCTAssertEqual(
-            AgentToolResultPayloadRetention.resolvedPayload(existing: nil, incoming: completed, incomingIsError: false),
-            completed
-        )
-    }
-
     @MainActor
     func testDetachedAgentRunSnapshotSurvivesProviderTerminalEchoOnBothRunnerPaths() {
         let snapshot = #"{"status":"running","session_id":"detached-child","context_id":"child-context"}"#
@@ -752,10 +865,7 @@ final class AgentToolResultPayloadRetentionTests: XCTestCase {
             let session = harness.makeSession(agent: .devin)
             let runner = ACPIntegratedAgentModeRunner(
                 hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(),
-                toolTrackingHooks: .noOp, providerFactory: { _, _ in nil },
-                controllerFactory: { provider, request in
-                    try ACPAgentSessionController(provider: provider, runRequest: request)
-                }
+                toolTrackingHooks: .noOp
             )
             let invocationID = UUID()
             for result in [snapshot, #"{"status":"completed"}"#] {
@@ -777,34 +887,6 @@ final class AgentToolResultPayloadRetentionTests: XCTestCase {
         }
     }
 
-    func testPrettyPrintedDevinSkillLifecycleCompletes() {
-        let running = "{\n  \"status\" : \"running\"\n}"
-        let completed = "{\n  \"status\" : \"completed\"\n}"
-        XCTAssertEqual(
-            AgentToolResultPayloadRetention.resolvedPayload(existing: running, incoming: completed, incomingIsError: false),
-            #"{"status":"completed"}"#
-        )
-    }
-
-    func testTerminalMarkerFinishesSanitizedPresentationSummary() throws {
-        let summary = #"{"render_summary":{"detail_text":"running","op":"skill","status":"running","title":"Skill","tool_name":"skill"},"status":"running","summary_only":true,"summary_text":"running"}"#
-        let merged = try XCTUnwrap(AgentToolResultPayloadRetention.resolvedPayload(
-            existing: summary, incoming: "{\n  \"status\" : \"completed\"\n}", incomingIsError: false
-        ))
-        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(merged.utf8)) as? [String: Any])
-        let render = try XCTUnwrap(object["render_summary"] as? [String: Any])
-        XCTAssertEqual(object["status"] as? String, "completed")
-        XCTAssertEqual(render["status"] as? String, "success")
-        XCTAssertNil(render["detail_text"])
-        XCTAssertNil(object["summary_text"])
-        XCTAssertEqual(render["title"] as? String, "Skill")
-        // Compaction cannot transfer ownership of native MCP status to the provider.
-        XCTAssertNil(AgentToolResultPayloadRetention.resolvedPayload(
-            existing: summary, incoming: #"{"status":"completed"}"#, incomingIsError: false,
-            requireObjectReplacement: true
-        ))
-    }
-
     func testNativeLifecycleObjectCannotBeErasedByProviderTextOrArray() throws {
         let native = #"{"status":"running","context_id":"native-context"}"#
         let events = ACPDefaultSessionUpdateNormalizer.normalize([
@@ -818,17 +900,5 @@ final class AgentToolResultPayloadRetentionTests: XCTestCase {
                 existing: native, incoming: incoming, incomingIsError: false, requireObjectReplacement: true
             ))
         }
-    }
-
-    func testObjectReplacementModeKeepsObjectOverText() {
-        XCTAssertTrue(AgentToolResultPayloadRetention.shouldKeepExisting(
-            existing: rich, incoming: "Context built.", incomingIsError: false, requireObjectReplacement: true
-        ))
-        XCTAssertFalse(AgentToolResultPayloadRetention.shouldKeepExisting(
-            existing: rich, incoming: #"{"status":"success"}"#, incomingIsError: false, requireObjectReplacement: true
-        ))
-        XCTAssertFalse(AgentToolResultPayloadRetention.shouldKeepExisting(
-            existing: "text", incoming: "other text", incomingIsError: false, requireObjectReplacement: true
-        ))
     }
 }

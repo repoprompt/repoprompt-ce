@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+@testable import RepoPromptWorkspaceContext
 
 #if DEBUG
     /// Finite headless diagnostic invoked only by testMeasurementMatrix's explicit opt-in.

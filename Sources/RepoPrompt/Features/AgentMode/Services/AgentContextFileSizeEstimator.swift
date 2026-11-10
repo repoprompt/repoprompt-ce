@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspaceContext
 
 struct AgentContextFileMetadataSnapshot: Equatable {
     let byteCount: Int64?

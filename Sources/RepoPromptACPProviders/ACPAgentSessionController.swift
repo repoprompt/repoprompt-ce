@@ -1,0 +1,4759 @@
+import Darwin
+import Foundation
+import os
+import RepoPromptAIContracts
+import RepoPromptDomainRuntime
+import RepoPromptFoundation
+import RepoPromptMCPCore
+import RepoPromptProcess
+
+package actor ACPAgentSessionController {
+    /// A successful pipe write is not provider acceptance or turn completion. It only proves
+    /// that retrying after a lost response could duplicate input. Independent of controller
+    /// teardown so the caller can classify an interrupted, dequeued steering batch.
+    package final class PromptWriteReceipt: Sendable {
+        package init() {}
+
+        private let written = OSAllocatedUnfairLock(initialState: false)
+
+        package var wasWritten: Bool {
+            written.withLock { $0 }
+        }
+
+        fileprivate func noteWritten() {
+            written.withLock { $0 = true }
+        }
+    }
+
+    package struct RequestTimeouts {
+        package let bootstrapSeconds: TimeInterval
+        package let operationalSeconds: TimeInterval
+
+        package init(bootstrapSeconds: TimeInterval, operationalSeconds: TimeInterval = 30) {
+            self.bootstrapSeconds = bootstrapSeconds
+            self.operationalSeconds = operationalSeconds
+        }
+
+        package static let `default` = RequestTimeouts(
+            bootstrapSeconds: 30,
+            operationalSeconds: 30
+        )
+    }
+
+    package enum DiagnosticEvent {
+        case phaseStarted(String)
+        case phaseCompleted(String)
+        case outboundJSON(String)
+        case inboundJSON(String)
+        case stderrLine(String)
+        case info(String)
+        case invalidJSON(String)
+        case unmatchedResponse(id: String, line: String)
+    }
+
+    package typealias DiagnosticSink = @Sendable (DiagnosticEvent) -> Void
+
+    package enum State: String {
+        case idle
+        case launching
+        case initialized
+        case openingSession
+        case sessionOpen
+        case promptRunning
+        case closing
+        case closed
+        case failed
+    }
+
+    /// The slash commands a live ACP session currently advertises through `available_commands_update`.
+    ///
+    /// Scoped to the provider session that advertised them: each update replaces the whole list, and
+    /// the snapshot is dropped when a session starts opening and whenever the controller enters
+    /// `.failed`, `.closing`, or `.closed`. Names are stored without a leading `/`.
+    package struct AdvertisedCommands: Equatable {
+        package let sessionID: String
+        package let names: Set<String>
+
+        package init(sessionID: String, names: Set<String>) {
+            self.sessionID = sessionID
+            self.names = names
+        }
+    }
+
+    /// Why an advertised provider command was refused before anything was written to the provider.
+    package struct ProviderCommandRefusal: LocalizedError, Equatable {
+        package let reason: String
+        /// False when the refusal is because this controller can no longer run turns (not open, no
+        /// process), so its owner should retire it as after any failed turn.
+        package let sessionIsUsable: Bool
+
+        package var errorDescription: String? {
+            reason
+        }
+    }
+
+    /// The caller's task was cancelled before an advertised provider command was written.
+    package struct ProviderCommandCancelledBeforeSend: Error {}
+
+    package struct BootstrapResult {
+        package let sessionID: String
+        package let providerSessionIdentity: ACPProviderSessionIdentity
+        package let loadSessionSupported: Bool
+        package let didFallbackToNewSessionAfterLoadFailure: Bool
+        package let invalidatedResumeSessionID: String?
+    }
+
+    private enum ControllerError: LocalizedError {
+        case invalidState(expected: String, actual: State)
+        case processNotRunning
+        case protocolViolation(String)
+        case requestFailed(String, code: Int? = nil)
+        case requestTimedOut(method: String, timeoutSeconds: TimeInterval, launchDescription: String?, diagnosticHint: String?)
+        case transportClosed
+
+        var errorDescription: String? {
+            switch self {
+            case let .invalidState(expected, actual):
+                return "ACP controller expected \(expected), but was \(actual.rawValue)."
+            case .processNotRunning:
+                return "ACP process is not running."
+            case let .protocolViolation(message):
+                return "ACP protocol violation: \(message)"
+            case let .requestFailed(message, code):
+                if let code {
+                    return "ACP request failed: \(message) (code \(code))"
+                }
+                return "ACP request failed: \(message)"
+            case let .requestTimedOut(method, timeoutSeconds, launchDescription, diagnosticHint):
+                var message = "ACP request \(method) timed out after \(Self.formattedTimeout(timeoutSeconds))."
+                if let launchDescription, !launchDescription.isEmpty {
+                    message += " Launched: `\(launchDescription)`."
+                }
+                if let diagnosticHint, !diagnosticHint.isEmpty {
+                    message += " \(diagnosticHint)"
+                }
+                return message
+            case .transportClosed:
+                return "ACP transport closed unexpectedly."
+            }
+        }
+
+        private static func formattedTimeout(_ seconds: TimeInterval) -> String {
+            if seconds.rounded(.towardZero) == seconds {
+                return "\(Int(seconds))s"
+            }
+            return String(format: "%.1fs", seconds)
+        }
+    }
+
+    private enum JSONRPCID: Hashable {
+        case string(String)
+        case int(Int)
+        case double(Double)
+
+        var storageKey: String {
+            switch self {
+            case let .string(value):
+                "s:\(value)"
+            case let .int(value):
+                "i:\(value)"
+            case let .double(value):
+                "d:\(value)"
+            }
+        }
+
+        var displayValue: String {
+            switch self {
+            case let .string(value):
+                value
+            case let .int(value):
+                String(value)
+            case let .double(value):
+                String(value)
+            }
+        }
+
+        var jsonValue: Any {
+            switch self {
+            case let .string(value):
+                value
+            case let .int(value):
+                value
+            case let .double(value):
+                value
+            }
+        }
+    }
+
+    private struct PendingPermissionRequest {
+        let rpcID: JSONRPCID
+        let options: [PermissionOption]
+        let request: AgentApprovalRequest
+    }
+
+    private struct RequestResponse {
+        let result: [String: Any]
+        let inboundSequence: UInt64
+    }
+
+    private struct PendingRequest {
+        let method: String
+        let continuation: CheckedContinuation<RequestResponse, Error>
+        var timeoutTask: Task<Void, Never>?
+    }
+
+    private struct SessionModeSnapshot {
+        let configID: String
+        let currentValue: String
+        let availableValues: [String]
+    }
+
+    private struct ParsedSelectConfigOption {
+        let id: String
+        let currentValue: String
+        let choices: [[String: Any]]
+    }
+
+    private enum ParsedSelectConfigOptionResult {
+        case absent
+        case valid(ParsedSelectConfigOption)
+        case malformed(String)
+    }
+
+    private enum ParsedModernModeSnapshot {
+        case absent
+        case valid(SessionModeSnapshot)
+        case malformed(String)
+    }
+
+    private enum ParsedModernModelSnapshot {
+        case absent
+        case valid(configID: String, models: ACPDiscoveredSessionModels)
+        case malformed(String)
+    }
+
+    private struct BufferedConfigOptionUpdate {
+        let sessionID: String
+        let update: [String: Any]
+        let inboundSequence: UInt64
+    }
+
+    private struct PromptSettlementWaiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
+    private struct OpenSessionResult {
+        let sessionID: String
+        let providerSessionIdentity: ACPProviderSessionIdentity
+        let invalidatedResumeSessionID: String?
+    }
+
+    private struct PermissionOption {
+        let optionID: String
+        let kind: String
+        /// The agent's own wording for this option. Agents that advertise several
+        /// distinctly-worded choices are unreadable without it, because the approval
+        /// card has no other source for what an option actually means.
+        let name: String?
+    }
+
+    private enum PermissionOptionPreference {
+        case optionID(String)
+        case kind(String)
+    }
+
+    /// Written only from the actor; read synchronously by admission checks that cannot await. The
+    /// actor-isolated `promptAdvertisedCommand` re-reads it, together with the live session state,
+    /// in the same synchronous step that writes the prompt.
+    private nonisolated let advertisedCommandsState = OSAllocatedUnfairLock<AdvertisedCommands?>(initialState: nil)
+
+    private var eventsContinuation: AsyncStream<NormalizedAgentRuntimeEvent>.Continuation?
+    private var eventsStream: AsyncStream<NormalizedAgentRuntimeEvent>
+    package var events: AsyncStream<NormalizedAgentRuntimeEvent> {
+        eventsStream
+    }
+
+    package func currentEventsStream() -> AsyncStream<NormalizedAgentRuntimeEvent> {
+        eventsStream
+    }
+
+    private let provider: any ACPAgentProvider
+    private let host: any ACPAgentSessionHost
+    private let allowsProviderProcessLaunchForTesting: Bool
+    private let runRequest: ACPRunRequest
+    private let launchConfiguration: ACPLaunchConfiguration
+    private let launchedPermissionMode: String?
+    private let sessionConfiguration: ACPSessionConfiguration
+    private let mcpClientNameHint: String?
+    private let logPrefix: String
+    private let diagnosticSink: DiagnosticSink?
+    private let requestTimeouts: RequestTimeouts
+
+    /// Modern configOptions are the only configuration authority. Mutations are serialized,
+    /// and complete snapshots apply in inbound wire order.
+    private let configurationMutationMutex = AsyncMutex()
+    #if DEBUG
+        private var debugShouldSuspendNextConfigurationMutationPostcheck = false
+        private var debugConfigurationMutationPostcheckIsSuspended = false
+        private var debugConfigurationMutationPostcheckResumeWaiters: [CheckedContinuation<Void, Never>] = []
+    #endif
+
+    private var state: State = .idle {
+        didSet {
+            // A controller that can no longer run turns advertises nothing, whichever path retired it
+            // (prompt or protocol failure, process exit, shutdown).
+            switch state {
+            case .failed, .closing, .closed:
+                clearAdvertisedCommands()
+            case .idle, .launching, .initialized, .openingSession, .sessionOpen, .promptRunning:
+                break
+            }
+        }
+    }
+
+    /// Provider-owned execution readiness, independent of the app's published run state.
+    package var hasExecutionInFlight: Bool {
+        if activePromptTurnID != nil { return true }
+        switch state {
+        case .launching, .initialized, .openingSession, .promptRunning, .closing:
+            return true
+        case .idle, .sessionOpen, .failed, .closed:
+            return false
+        }
+    }
+
+    private var process: SpawnedProcess?
+    private var stdoutChannel: FileHandleChunkChannel?
+    private var stderrChannel: FileHandleChunkChannel?
+    private var stdoutConsumerTask: Task<Void, Never>?
+    private var stderrConsumerTask: Task<Void, Never>?
+    private var processWaitTask: Task<Void, Never>?
+    private var stdoutFramer = LineFramer()
+    private var stderrFramer = LineFramer()
+    private var launchDescription: String?
+    private var stdoutByteCount = 0
+    private var stdoutLineCount = 0
+    private var invalidACPLineCount = 0
+    private var stderrLineCount = 0
+    private var lastStdoutPreview: String?
+    private var lastInvalidACPLinePreview: String?
+    private var lastStderrPreview: String?
+    private var nextRequestID = 1
+    private var inboundMessageSequence: UInt64 = 0
+    private var pendingRequests: [String: PendingRequest] = [:]
+    // Wire identity is typed; approval identity is a fresh incarnation owned by this controller.
+    private var pendingPermissionRequests: [String: PendingPermissionRequest] = [:]
+    private var permissionStorageKeyByApprovalID: [String: String] = [:]
+    private var recentDevinToolCalls: [String: [String: Any]] = [:]
+    private var recentDevinToolCallIDs: [String] = []
+    private var activePromptTurnID: UUID?
+    private var activePromptOpenCodeStderrError: String?
+    #if DEBUG
+        private var activePromptSessionUpdateCounts: [String: Int] = [:]
+        private var activePromptNormalizedStreamCount = 0
+    #endif
+    private var activePromptNormalizedContentCount = 0
+    private var activePromptNormalizedReasoningCount = 0
+    private var promptSettlementWaitersByTurnID: [UUID: [PromptSettlementWaiter]] = [:]
+    private var sessionID: String?
+    private var providerSessionIdentity: ACPProviderSessionIdentity
+    private var didEmitTerminal = false
+    private var eventStreamFinished = false
+    private var loadSessionSupported = false
+    private var promptImagesSupported = false
+    private var discoveredSessionModels: ACPDiscoveredSessionModels?
+    private var sessionModelConfigOptionID: String?
+    /// True when the provider conforms to `ACPDirectSessionModelProvider` and the session
+    /// advertised no modern `configOptions` model selector, so model application flows
+    /// through the provider-owned direct RPC (e.g. Grok's `session/set_model`).
+    private var sessionModelDirectSelectionSupported = false
+    /// True only when `discoveredSessionModels` was parsed from THIS session's live
+    /// session/new|load response. Post-mutation state updates never promote warmed
+    /// registry data to live authority — effort-bearing selections require this.
+    private var sessionModelSnapshotHasLiveAuthority = false
+    private var sessionModelFailureReason: String?
+    private var sessionModeSnapshot: SessionModeSnapshot?
+    private var sessionModeFailureReason: String?
+    private var lastAppliedConfigurationSequence: UInt64 = 0
+    private var bufferedConfigOptionUpdates: [BufferedConfigOptionUpdate] = []
+    private var suppressSessionLoadReplayUpdates = false
+    private var fallbackResumeSessionIDForPromptClearing: String?
+    private var autoApproveAllToolPermissions: Bool
+    private var expectedMCPRunID: UUID?
+    private var registeredExpectedAgentPID: pid_t?
+    #if DEBUG
+        private let rawACPCaptureURL: URL?
+    #endif
+
+    package func currentDiscoveredSessionModels() -> ACPDiscoveredSessionModels? {
+        discoveredSessionModels
+    }
+
+    package func cursorAvailableModelCatalog() async throws -> ACPDiscoveredSessionModels {
+        guard provider.providerID == .cursor else {
+            throw ControllerError.requestFailed("Cursor model catalog is only available for Cursor ACP sessions.")
+        }
+        guard state == .sessionOpen || state == .promptRunning else {
+            throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
+        }
+        let response = try await sendRequest(method: "cursor/list_available_models", params: [:])
+        guard let rawModels = response["models"] as? [[String: Any]] else {
+            throw ControllerError.protocolViolation("cursor/list_available_models response missing models")
+        }
+
+        var options: [AgentModelOption] = []
+        var parameterSets: [ACPModelParameterSet] = []
+        for rawModel in rawModels {
+            guard let option = parseDiscoveredConfigModelOption(from: rawModel) else { continue }
+            options.append(option)
+            guard let configOptions = rawModel["configOptions"] as? [[String: Any]] else { continue }
+            parameterSets.append(contentsOf: parseModelParameterSets(
+                from: configOptions,
+                baseModelRaw: option.rawValue
+            ))
+        }
+        let mergedOptions = mergeModelOptions(options)
+        guard !mergedOptions.isEmpty else {
+            throw ControllerError.protocolViolation("cursor/list_available_models response has no usable models")
+        }
+        return ACPDiscoveredSessionModels(
+            options: mergedOptions,
+            currentModelRaw: discoveredSessionModels?.currentModelRaw,
+            modelParameterSets: parameterSets
+        )
+    }
+
+    package init(
+        provider: any ACPAgentProvider,
+        runRequest: ACPRunRequest,
+        host: any ACPAgentSessionHost,
+        diagnosticSink: DiagnosticSink? = nil,
+        requestTimeouts: RequestTimeouts = .default,
+        allowsProviderProcessLaunchForTesting: Bool = false
+    ) throws {
+        self.provider = provider
+        self.host = host
+        self.allowsProviderProcessLaunchForTesting = allowsProviderProcessLaunchForTesting
+        providerSessionIdentity = ACPProviderSessionIdentity(
+            providerID: provider.providerID,
+            loadSessionID: runRequest.resumeSessionID,
+            loadSessionIDConfidence: runRequest.resumeSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? .candidate : .unavailable
+        )
+        self.runRequest = runRequest
+        let sessionConfiguration = try provider.makeSessionConfiguration(
+            for: runRequest,
+            mcpServer: host.repoPromptMCPConfiguration
+        )
+        try host.preflightInjectedMCPServers(in: sessionConfiguration)
+        self.sessionConfiguration = sessionConfiguration
+        launchConfiguration = try provider.makeLaunchConfiguration(for: runRequest)
+        launchedPermissionMode = provider.providerID == .devin
+            ? host.normalizedDevinPermissionMode(runRequest.launchPermissionMode)
+            : runRequest.launchPermissionMode
+        autoApproveAllToolPermissions = runRequest.autoApproveAllToolPermissions
+        mcpClientNameHint = host.mcpClientNameHint(for: runRequest.agentKind)
+        logPrefix = "[ACP][\(provider.providerID.rawValue)]"
+        self.diagnosticSink = diagnosticSink
+        self.requestTimeouts = requestTimeouts
+        #if DEBUG
+            rawACPCaptureURL = Self.resolveRawACPCaptureURL(for: provider.providerID)
+        #endif
+
+        let stream = Self.makeEventsStream()
+        eventsStream = stream.stream
+        eventsContinuation = stream.continuation
+        #if DEBUG
+            Self.captureLaunchConfigurationIfEnabled(
+                rawACPCaptureURL: rawACPCaptureURL,
+                providerID: provider.providerID,
+                launchConfiguration: launchConfiguration
+            )
+        #endif
+    }
+
+    package var hasReusableSession: Bool {
+        state == .sessionOpen && process != nil && sessionID != nil
+    }
+
+    /// Whether a provider session is live right now — open or running a turn — as opposed to
+    /// starting up, closed, or never begun. Busy still counts as live; turn admission is a
+    /// separate question from whether the session exists at all.
+    package var hasLiveProviderSession: Bool {
+        (state == .sessionOpen || state == .promptRunning) && process != nil && sessionID != nil
+    }
+
+    /// Whether this controller can never run another turn (failed, closing, closed, or without a
+    /// process), as opposed to being merely busy with one.
+    package var isRetired: Bool {
+        switch state {
+        case .failed, .closing, .closed:
+            true
+        case .idle, .launching, .initialized, .openingSession, .sessionOpen, .promptRunning:
+            process == nil
+        }
+    }
+
+    package func isCompatibleWith(request: ACPRunRequest) -> Bool {
+        guard let providerID = request.agentKind.acpProviderID,
+              provider.providerID == providerID,
+              normalizedWorkspacePath(runRequest.workspacePath) == normalizedWorkspacePath(request.workspacePath)
+        else {
+            return false
+        }
+        // A provider-native launch-time permission flag (Devin `--permission-mode`) is baked
+        // into the running process's argv; compare its normalized launched value so later
+        // request-carrier changes cannot drift the reuse key from the process.
+        if provider.providerID == .devin {
+            guard host.recognizedDevinPermissionMode(request.launchPermissionMode) else {
+                return false
+            }
+        }
+        let requestedPermissionMode = provider.providerID == .devin
+            ? host.normalizedDevinPermissionMode(request.launchPermissionMode)
+            : request.launchPermissionMode
+        guard launchedPermissionMode == requestedPermissionMode else {
+            return false
+        }
+        if provider.providerID == .grokBuild {
+            // Grok full access is a launch flag and "default" sends no model RPC, so a live
+            // process can never move between permission profiles or back to the provider
+            // default: those transitions must build a fresh controller.
+            guard runRequest.autoApproveAllToolPermissions == request.autoApproveAllToolPermissions else {
+                return false
+            }
+            guard normalizedModelString(runRequest.modelString) == normalizedModelString(request.modelString) else {
+                return false
+            }
+            return true
+        }
+        // Selection changes are already blocked/managed by the agent-mode UI while
+        // a run is active. For live steering, controller identity + provider +
+        // workspace are the safety boundary; model aliases/defaults/discovered
+        // current-model values should not prevent session/cancel from being sent.
+        return true
+    }
+
+    package func normalizeError(_ error: Error) -> Error {
+        provider.normalizeError(error)
+    }
+
+    package func setExpectedMCPRunID(_ runID: UUID?) {
+        expectedMCPRunID = runID
+    }
+
+    package func setAutoApproveAllToolPermissions(_ enabled: Bool) {
+        autoApproveAllToolPermissions = enabled
+    }
+
+    #if DEBUG
+        private var testRejectNextTurnPreparation = false
+        private var testHoldNextSteeringInterrupt = false
+        private var testSteeringInterruptEntered = false
+        private var testSteeringInterruptEntryWaiter: CheckedContinuation<Void, Never>?
+        private var testSteeringInterruptGate: CheckedContinuation<Void, Never>?
+
+        package func test_replayQuietNotifications(
+            _ packets: [(String, [String: Any])], sessionID: String, loadReplay: Bool, activePrompt: Bool = true
+        ) async -> [NormalizedAgentRuntimeEvent] {
+            self.sessionID = sessionID
+            suppressSessionLoadReplayUpdates = loadReplay
+            activePromptTurnID = activePrompt ? UUID() : nil
+            for (method, params) in packets {
+                handleNotification(method: method, params: params, inboundSequence: 1)
+            }
+            finishEventsIfNeeded()
+            var results: [NormalizedAgentRuntimeEvent] = []
+            for await event in eventsStream {
+                results.append(event)
+            }
+            return results
+        }
+
+        package func test_rejectNextTurnPreparation() {
+            testRejectNextTurnPreparation = true
+        }
+
+        package func test_holdNextSteeringInterrupt() {
+            testHoldNextSteeringInterrupt = true
+            testSteeringInterruptEntered = false
+        }
+
+        package func test_waitForSteeringInterruptEntry() async {
+            if testSteeringInterruptEntered { return }
+            await withCheckedContinuation { testSteeringInterruptEntryWaiter = $0 }
+        }
+
+        package func test_releaseSteeringInterrupt() {
+            testSteeringInterruptGate?.resume()
+            testSteeringInterruptGate = nil
+        }
+    #endif
+
+    @discardableResult
+    package func prepareForNextTurn() -> Bool {
+        #if DEBUG
+            if testRejectNextTurnPreparation {
+                testRejectNextTurnPreparation = false
+                return false
+            }
+        #endif
+        guard state == .sessionOpen, process != nil, sessionID != nil else { return false }
+        didEmitTerminal = false
+        eventStreamFinished = false
+        resetEventsStreamForNextTurn()
+        return true
+    }
+
+    package func bootstrap() async throws -> BootstrapResult {
+        guard state == .idle else {
+            throw ControllerError.invalidState(expected: "idle", actual: state)
+        }
+        try ProviderProcessLaunchPolicy.check(allowsLaunchInTests: allowsProviderProcessLaunchForTesting)
+        promptImagesSupported = false
+        state = .launching
+        log("Launching ACP transport")
+        diagnose(.phaseStarted("launch"))
+        let environment = await resolvedEnvironment()
+        try host.preflightInjectedMCPServers(in: sessionConfiguration, environment: environment)
+        let workingDirectory = CommandPathResolver.expandPath(
+            launchConfiguration.workingDirectory ?? FileManager.default.temporaryDirectory.path,
+            environment: environment
+        )
+        let resolvedCommand = CommandPathResolver.resolve(
+            launchConfiguration.command,
+            environment: environment,
+            additionalPaths: launchConfiguration.additionalPathHints,
+            preferredBasenames: [launchConfiguration.command]
+        )
+        do {
+            if let expectedExecutableIdentity = launchConfiguration.expectedExecutableIdentity {
+                try expectedExecutableIdentity.validateForTrustedPathLaunch(atPath: resolvedCommand)
+            }
+        } catch {
+            await recordRunLaunchContract(
+                event: "acp_launch_validation_failed",
+                resolvedCommand: resolvedCommand,
+                workingDirectory: workingDirectory,
+                pid: nil,
+                error: error
+            )
+            throw error
+        }
+        launchDescription = Self.displayCommand(
+            command: resolvedCommand,
+            arguments: Self.redactedLaunchArguments(launchConfiguration.arguments)
+        )
+        logLaunchContract(command: resolvedCommand, workingDirectory: workingDirectory)
+        diagnose(.info("Launching ACP command: \(launchDescription ?? resolvedCommand)"))
+        let spawned: SpawnedProcess
+        do {
+            spawned = try ProcessLauncher.spawn(
+                command: resolvedCommand,
+                arguments: launchConfiguration.arguments,
+                environment: environment,
+                workingDirectory: workingDirectory,
+                purpose: .provider,
+                allowsProviderProcessLaunchForTesting: allowsProviderProcessLaunchForTesting
+            )
+        } catch {
+            await recordRunLaunchContract(
+                event: "acp_launch_spawn_failed",
+                resolvedCommand: resolvedCommand,
+                workingDirectory: workingDirectory,
+                pid: nil,
+                error: error
+            )
+            throw error
+        }
+        process = spawned
+        do {
+            try startReaders(stdout: spawned.stdout, stderr: spawned.stderr)
+        } catch {
+            spawned.stdout.readabilityHandler = nil
+            spawned.stderr.readabilityHandler = nil
+            spawned.stdin?.closeFile()
+            process = nil
+            _ = await ProcessTermination.terminateAndReap(pid: spawned.pid, processGroupID: spawned.processGroupID)
+            state = .failed
+            throw ControllerError.protocolViolation("Failed to start ACP process readers: \(error.localizedDescription)")
+        }
+        await registerExpectedAgentPIDIfNeeded(spawned.pid)
+        startProcessWaitTask(for: spawned)
+        await recordRunLaunchContract(
+            event: "acp_launch_contract_resolved",
+            resolvedCommand: resolvedCommand,
+            workingDirectory: workingDirectory,
+            pid: nil,
+            error: nil
+        )
+        await recordRunLaunchContract(
+            event: "acp_process_spawned",
+            resolvedCommand: resolvedCommand,
+            workingDirectory: workingDirectory,
+            pid: spawned.pid,
+            error: nil
+        )
+        diagnose(.phaseCompleted("launch"))
+
+        log("ACP initialize")
+        diagnose(.phaseStarted("initialize"))
+        var clientCapabilities: [String: Any] = [
+            "fs": [
+                "readTextFile": false,
+                "writeTextFile": false
+            ],
+            "terminal": false
+        ]
+        if provider.supportsParameterizedModelPicker {
+            clientCapabilities["_meta"] = ["parameterizedModelPicker": true]
+        }
+        let initializeResponse = try await sendRequest(
+            method: "initialize",
+            params: [
+                "protocolVersion": 1,
+                "clientInfo": [
+                    "name": "RepoPrompt",
+                    "version": host.applicationVersion
+                ],
+                "clientCapabilities": clientCapabilities
+            ]
+        )
+        diagnose(.phaseCompleted("initialize"))
+        state = .initialized
+
+        let authMethods = initializeResponse["authMethods"] as? [[String: Any]] ?? []
+        let authContext = ACPAuthenticationContext(
+            authMethodIDs: Self.authMethodIDs(from: authMethods),
+            environment: environment
+        )
+        if let authMethodID = provider.preferredAuthMethodID(context: authContext) {
+            log("ACP authenticate via \(authMethodID)")
+            diagnose(.phaseStarted("authenticate"))
+            _ = try await sendRequest(
+                method: "authenticate",
+                params: ["methodId": authMethodID]
+            )
+            diagnose(.phaseCompleted("authenticate"))
+        }
+
+        let capabilities = initializeResponse["agentCapabilities"] as? [String: Any] ?? [:]
+        loadSessionSupported = capabilities["loadSession"] as? Bool ?? false
+        let promptCapabilities = capabilities["promptCapabilities"] as? [String: Any]
+        let imageCapability = promptCapabilities?["image"] as? NSNumber
+        promptImagesSupported = imageCapability.map {
+            CFGetTypeID($0) == CFBooleanGetTypeID() && $0.boolValue
+        } ?? false
+
+        state = .openingSession
+        log("Opening ACP session")
+        logSessionMCPInjection()
+        let openSessionResult = try await openSession()
+        if let notification = sessionConfiguration.postOpenNotification {
+            try sendJSONLine([
+                "jsonrpc": "2.0",
+                "method": notification.method,
+                "params": notification.params.mapValues { $0.toAny() }
+            ])
+        }
+        sessionID = openSessionResult.sessionID
+        state = .sessionOpen
+
+        return BootstrapResult(
+            sessionID: openSessionResult.sessionID,
+            providerSessionIdentity: openSessionResult.providerSessionIdentity,
+            loadSessionSupported: loadSessionSupported,
+            didFallbackToNewSessionAfterLoadFailure: fallbackResumeSessionIDForPromptClearing != nil,
+            invalidatedResumeSessionID: openSessionResult.invalidatedResumeSessionID
+        )
+    }
+
+    package func currentProviderSessionIdentity() -> ACPProviderSessionIdentity {
+        providerSessionIdentity
+    }
+
+    package func refreshProviderSessionIdentityAfterPromptInterruption() async -> ACPProviderSessionIdentity {
+        providerSessionIdentity
+    }
+
+    /// Whether the live provider session `sessionID` currently advertises the slash command `name`
+    /// (given without its leading `/`). A snapshot from any other session never answers. Matching is
+    /// deliberately exact and case-sensitive: a differently spelled command is not the one admitted.
+    package nonisolated func advertisesCommand(_ name: String, inProviderSession sessionID: String) -> Bool {
+        advertisedCommandsState.withLock { snapshot in
+            guard let snapshot, snapshot.sessionID == sessionID else { return false }
+            return snapshot.names.contains(name)
+        }
+    }
+
+    package nonisolated func currentAdvertisedCommands() -> AdvertisedCommands? {
+        advertisedCommandsState.withLock { $0 }
+    }
+
+    package func prompt(
+        _ message: AgentMessage,
+        request overrideRunRequest: ACPRunRequest? = nil,
+        writeReceipt: PromptWriteReceipt? = nil
+    ) async throws {
+        guard state == .sessionOpen || state == .promptRunning, let sessionID else {
+            throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
+        }
+        if state == .promptRunning, activePromptTurnID != nil {
+            throw ControllerError.invalidState(expected: "no active prompt turn", actual: state)
+        }
+        try await submitPromptTurn(.message(message), sessionID: sessionID, overrideRunRequest: overrideRunRequest, writeReceipt: writeReceipt)
+    }
+
+    /// Sends exactly `/<name>` to the idle session that still advertises it. The run's current
+    /// request must remain compatible with the live process, including its launch-time permission
+    /// mode. All checks and the prompt write run on this actor without an intervening suspension;
+    /// refusal writes nothing and retains a usable controller. No provider framing or model RPC.
+    package func promptAdvertisedCommand(
+        _ name: String,
+        expectedSessionID: String,
+        request overrideRunRequest: ACPRunRequest? = nil
+    ) async throws {
+        guard !Task.isCancelled else { throw ProviderCommandCancelledBeforeSend() }
+        guard state == .sessionOpen || state == .promptRunning, process != nil, let sessionID else {
+            throw ProviderCommandRefusal(reason: "The provider session is no longer open.", sessionIsUsable: false)
+        }
+        guard state == .sessionOpen, activePromptTurnID == nil else {
+            throw ProviderCommandRefusal(reason: "The provider session is running a turn.", sessionIsUsable: true)
+        }
+        guard sessionID == expectedSessionID else {
+            throw ProviderCommandRefusal(reason: "The provider session changed.", sessionIsUsable: true)
+        }
+        guard advertisesCommand(name, inProviderSession: sessionID) else {
+            throw ProviderCommandRefusal(
+                reason: "The provider session no longer advertises /\(name).",
+                sessionIsUsable: true
+            )
+        }
+        guard isCompatibleWith(request: effectivePromptRunRequest(override: overrideRunRequest)) else {
+            throw ProviderCommandRefusal(
+                reason: "The current request is incompatible with the live provider process.",
+                sessionIsUsable: true
+            )
+        }
+        try await submitPromptTurn(
+            .providerCommand("/\(name)"),
+            sessionID: sessionID,
+            overrideRunRequest: overrideRunRequest
+        )
+    }
+
+    private enum PromptPayload {
+        case message(AgentMessage)
+        case providerCommand(String)
+    }
+
+    private func submitPromptTurn(
+        _ payload: PromptPayload,
+        sessionID: String,
+        overrideRunRequest: ACPRunRequest?,
+        writeReceipt: PromptWriteReceipt? = nil
+    ) async throws {
+        suppressSessionLoadReplayUpdates = false
+        recentDevinToolCalls.removeAll()
+        recentDevinToolCallIDs.removeAll()
+        let promptTurnID = UUID()
+        activePromptTurnID = promptTurnID
+        resetActivePromptTrace()
+        state = .promptRunning
+        log("Submitting ACP prompt")
+        diagnose(.phaseStarted("prompt"))
+        let response: [String: Any]
+        var refusedUnsupportedImages = false
+        do {
+            let promptRequest = effectivePromptRunRequest(override: overrideRunRequest)
+            if case let .message(message) = payload,
+               !promptImagesSupported,
+               message.attachments.contains { $0.kind == .image } || promptRequest.attachments.contains { $0.kind == .image }
+            {
+                refusedUnsupportedImages = true
+                throw AIProviderError.invalidConfiguration(
+                    detail: "The connected ACP provider did not advertise image input. Retry without images or use an image-capable provider."
+                )
+            }
+            let promptBlocks: [[String: Any]] = switch payload {
+            case let .message(message):
+                try provider.buildPromptBlocks(for: message, request: promptRequest)
+            case let .providerCommand(text):
+                try ACPPromptContentBuilder.blocks(text: text, attachments: [])
+            }
+            #if DEBUG
+                if isRawACPCaptureEnabled {
+                    capturePromptTraceEvent(
+                        kind: "session.prompt.start",
+                        payload: [
+                            "sessionId": sessionID,
+                            "promptTurnID": promptTurnID.uuidString,
+                            "modelString": promptRequest.modelString ?? "default",
+                            "sessionModeID": promptRequest.sessionModeID ?? "",
+                            "workspacePath": promptRequest.workspacePath ?? "",
+                            "prompt": promptTraceSummary(for: promptBlocks)
+                        ]
+                    )
+                }
+            #endif
+            // A provider command is admitted against the current request before the write above.
+            if case .message = payload {
+                try validatePromptModelParameterSelections(promptRequest)
+            }
+            response = try await sendRequest(
+                method: "session/prompt",
+                params: [
+                    "sessionId": sessionID,
+                    "prompt": promptBlocks
+                ],
+                onWritten: { writeReceipt?.noteWritten() }
+            )
+            #if DEBUG
+                if isRawACPCaptureEnabled {
+                    capturePromptTraceEvent(
+                        kind: "session.prompt.response",
+                        payload: [
+                            "sessionId": sessionID,
+                            "promptTurnID": promptTurnID.uuidString,
+                            "response": response,
+                            "observedSessionUpdates": promptTraceCountersPayload()
+                        ]
+                    )
+                }
+            #endif
+        } catch {
+            #if DEBUG
+                if isRawACPCaptureEnabled {
+                    capturePromptTraceEvent(
+                        kind: "session.prompt.error",
+                        payload: [
+                            "sessionId": sessionID,
+                            "promptTurnID": promptTurnID.uuidString,
+                            "error": displayText(for: provider.normalizeError(error)),
+                            "observedSessionUpdates": promptTraceCountersPayload()
+                        ]
+                    )
+                }
+            #endif
+            settlePromptTurn(promptTurnID, result: .failure(error))
+            // Local admission refused before construction or transport; the connection is intact.
+            if refusedUnsupportedImages {
+                if state == .promptRunning { state = .sessionOpen }
+                throw error
+            }
+            if error is CancellationError {
+                throw error
+            }
+            let message = displayText(for: provider.normalizeError(error))
+            if case ControllerError.requestTimedOut = error {
+                emit(.stream(AIStreamResult(type: "error", text: message)))
+                log("ACP prompt request timed out; cancelling prompt")
+            } else {
+                log("ACP prompt request failed; cancelling prompt: \(message)")
+            }
+            emitTerminal(state: .failed, errorText: message)
+            if state != .closing, state != .closed {
+                state = .failed
+            }
+            await cancelPrompt()
+            throw error
+        }
+        diagnose(.phaseCompleted("prompt"))
+        let stopReason = response["stopReason"] as? String
+        // The stderr consumer task may not have processed pending stderr lines
+        // before the JSON-RPC response unblocks sendRequest. Yield to let the
+        // actor drain pending stderr so openCodeEmptyPromptDiagnosticMessage
+        // sees the error line.
+        await Task.yield()
+        if let diagnosticMessage = openCodeEmptyPromptDiagnosticMessage(from: response, stopReason: stopReason) {
+            #if DEBUG
+                if isRawACPCaptureEnabled {
+                    capturePromptTraceEvent(
+                        kind: "session.prompt.empty_content",
+                        payload: [
+                            "sessionId": sessionID,
+                            "promptTurnID": promptTurnID.uuidString,
+                            "diagnostic": diagnosticMessage,
+                            "response": response,
+                            "observedSessionUpdates": promptTraceCountersPayload()
+                        ]
+                    )
+                }
+            #endif
+            emit(.stream(AIStreamResult(type: "final_content", text: diagnosticMessage)))
+        }
+        emit(.stream(messageStopResult(from: response, sessionID: sessionID, stopReason: stopReason)))
+        emitTerminal(
+            state: terminalState(for: stopReason),
+            errorText: terminalErrorText(for: stopReason)
+        )
+        if state != .closing, state != .closed {
+            state = .sessionOpen
+        }
+        settlePromptTurn(promptTurnID, result: .success(()))
+    }
+
+    /// Apply a selected model. `forceRPC` bypasses the same-model no-op skip for providers that
+    /// only advertise model-scoped parameter metadata (e.g. OpenCode `effort`) *after* a model
+    /// set; callers with pending parameter selections pass `true` so the metadata is advertised
+    /// before the selections are applied.
+    package func setSessionModel(_ rawModel: String, forceRPC: Bool = false) async throws {
+        try await configurationMutationMutex.withLock { [weak self] in
+            guard let self else { throw CancellationError() }
+            try await setSessionModelSerialized(rawModel, forceRPC: forceRPC)
+        }
+    }
+
+    private func setSessionModelSerialized(_ rawModel: String, forceRPC: Bool = false) async throws {
+        guard let sessionID else {
+            throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
+        }
+        let model = rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !model.isEmpty, model.lowercased() != "default" else { return }
+        guard state == .sessionOpen || state == .promptRunning else {
+            throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
+        }
+
+        switch provider.providerID {
+        case .openCode, .cursor, .grokBuild, .antigravity, .devin:
+            if let sessionModelFailureReason {
+                throw ControllerError.protocolViolation("malformed modern model config option: \(sessionModelFailureReason)")
+            }
+            if provider.providerID == .grokBuild, sessionModelConfigOptionID == nil {
+                // Direct (SessionModelState) path: no modern selector was advertised, so
+                // model application flows through the provider-owned RPC.
+                guard sessionModelDirectSelectionSupported,
+                      let directProvider = provider as? ACPDirectSessionModelProvider
+                else {
+                    throw ControllerError.requestFailed("Grok Build ACP runtime does not advertise model switching.")
+                }
+                let (matchedOption, snapshotOptions, matchedLiveSnapshot) = try canonicalDirectSessionModelOption(model)
+                // Effort-compound selections (`grok-4.6-low`) decompose against the
+                // advertised option set — never by suffix guessing — into the base option
+                // plus an explicit effort. Bare raws resolve to the model's advertised
+                // default effort so a bare pick after a variant pick resets effort instead
+                // of silently keeping the previous one.
+                guard let decomposition = host.grokDecomposition(
+                    raw: matchedOption.rawValue,
+                    options: snapshotOptions
+                ) else {
+                    throw ControllerError.requestFailed("Grok Build model '\(model)' is not in the discovered model set. Refresh Grok Build models and retry.")
+                }
+                let baseModel = decomposition.base.rawValue
+                // "Effort-capable but default unknown" is not "effort-free": a bare pick on
+                // such a model could silently keep whatever effort is active. Require an
+                // explicit variant instead of guessing.
+                if decomposition.explicitEffort == nil,
+                   !decomposition.base.supportedReasoningEfforts.isEmpty,
+                   decomposition.base.defaultReasoningEffort == nil
+                {
+                    throw ControllerError.requestFailed(
+                        "Grok Build model '\(baseModel)' advertises reasoning efforts but no authoritative default; choose an explicit effort (e.g. \(baseModel)-high)."
+                    )
+                }
+                let resolvedEffort = decomposition.explicitEffort ?? decomposition.base.defaultReasoningEffort
+                // Fail closed on unadvertised efforts before any RPC: grok silently ignores
+                // unknown efforts while still acknowledging the base model, so an effort
+                // outside the base option's advertised list must never leave the client.
+                // Effort authority must also come from the LIVE session: a warmed-registry
+                // fallback can carry efforts the provider has since removed, and the wire
+                // would still Ok the base. Model-only requests may use the warmed snapshot
+                // because the echoed base id confirms them.
+                if let resolvedEffort {
+                    guard decomposition.base.supportedReasoningEfforts.contains(resolvedEffort) else {
+                        throw ControllerError.requestFailed(
+                            "Grok Build model '\(baseModel)' does not advertise reasoning effort '\(resolvedEffort.rawValue)'."
+                        )
+                    }
+                    guard matchedLiveSnapshot else {
+                        throw ControllerError.requestFailed(
+                            "Grok Build effort selection requires the live session model set. Refresh Grok Build models and retry."
+                        )
+                    }
+                }
+                let canonicalModel = host.grokCompoundRaw(base: baseModel, effort: resolvedEffort)
+                // A nil resolved effort means "no effort mutation requested" (effort-free
+                // model), not "no active effort" — it always no-ops when the base matches.
+                let effortAlreadyMatches = resolvedEffort.map {
+                    normalizedDirectEffort(discoveredSessionModels?.currentEffortRaw) == normalizedDirectEffort($0.rawValue)
+                } ?? true
+                if discoveredSessionModels?.currentModelRaw == baseModel, effortAlreadyMatches {
+                    return
+                }
+                let selectionRequest = directProvider.makeDirectModelSelectionRequest(
+                    sessionID: sessionID,
+                    baseModelRaw: baseModel,
+                    reasoningEffortRaw: resolvedEffort?.rawValue
+                )
+                // A rejected direct selection preserves the session's current model. Grok
+                // answers `session/set_model` with `_meta.model` = {"Ok": id} | {"Err": …};
+                // the Err variant is a failure even though the RPC itself succeeded. Fail
+                // closed: only an `Ok` echoing the requested base model may update local
+                // model authority — missing, malformed, or mismatched acknowledgements leave
+                // the session's real current model unknown, so local state must not move.
+                let selectionBaselineSequence = inboundMessageSequence
+                let selectionResponse: RequestResponse
+                do {
+                    selectionResponse = try await sendRequestResponse(
+                        method: selectionRequest.method,
+                        params: selectionRequest.params
+                    )
+                } catch {
+                    // A throw here (timeout, EOF, cancellation, decode failure) is also an
+                    // ambiguous post-dispatch outcome: the request may have been applied.
+                    invalidateDirectModelAuthorityAfterAmbiguousOutcome(snapshotOptions: snapshotOptions)
+                    throw error
+                }
+                let modelOutcome = (selectionResponse.result["_meta"] as? [String: Any])?["model"] as? [String: Any]
+                let hasOk = modelOutcome?.keys.contains("Ok") == true
+                let hasErr = modelOutcome?.keys.contains("Err") == true
+                if hasErr, !hasOk {
+                    // An exclusive Err is a confirmed rejection: the session's current model
+                    // is untouched, so local authority stays valid.
+                    let modelError = modelOutcome?["Err"] ?? "unknown"
+                    throw ControllerError.requestFailed("Grok Build rejected model '\(canonicalModel)': \(modelError)")
+                }
+                guard !hasErr,
+                      hasOk,
+                      let confirmedModel = modelOutcome?["Ok"] as? String,
+                      confirmedModel.trimmingCharacters(in: .whitespacesAndNewlines)
+                      .caseInsensitiveCompare(selectionRequest.expectedConfirmationModelRaw) == .orderedSame
+                else {
+                    // Ambiguous post-send outcome (missing/malformed/mixed/mismatched ack):
+                    // the server may or may not have applied anything, and neither the
+                    // requested nor the prior model is confirmed. Invalidate current
+                    // model/effort authority so stale state can never short-circuit a
+                    // corrective selection; the advertised options remain live and valid.
+                    invalidateDirectModelAuthorityAfterAmbiguousOutcome(snapshotOptions: snapshotOptions)
+                    throw ControllerError.protocolViolation(
+                        "Grok Build did not confirm model '\(canonicalModel)': unexpected session/set_model acknowledgement \(String(describing: modelOutcome))"
+                    )
+                }
+                #if DEBUG
+                    await debugSuspendConfigurationMutationPostcheckIfNeeded()
+                #endif
+                // Never overwrite a different-base report that arrived after this acknowledgement.
+                if let reported = discoveredSessionModels,
+                   reported.currentModelRaw != baseModel,
+                   let reportSequence = reported.currentEffortInboundSequence,
+                   reportSequence > selectionResponse.inboundSequence
+                {
+                    throw ControllerError.protocolViolation("newer ACP configuration state no longer confirms requested model '\(baseModel)'")
+                }
+                // The selection was already validated as a snapshot member; never append
+                // recovery options here — an appended compound would lack effortVariant
+                // provenance and later read back as a real base.
+                let updatedOptions = discoveredSessionModels?.options
+                    ?? host.resolvedModelSnapshot(for: provider.providerID)?.options
+                    ?? []
+                // The Ok confirms only the base. Preserve effort only from a report that
+                // arrived after dispatch and names this acknowledged base; a newer model-only
+                // or mode-only snapshot cannot turn old effort into fresh confirmation.
+                let reported = discoveredSessionModels
+                let hasFreshEffortReport = reported?.currentModelRaw == baseModel
+                    && reported?.currentEffortInboundSequence.map { $0 > selectionBaselineSequence } == true
+                let updated = ACPDiscoveredSessionModels(
+                    options: updatedOptions,
+                    currentModelRaw: baseModel,
+                    currentEffortRaw: hasFreshEffortReport ? reported?.currentEffortRaw : nil
+                )
+                discoveredSessionModels = updated
+                publishDiscoveredSessionModelsIfGloballyAuthoritative(updated)
+                return
+            }
+            if provider.providerID == .cursor,
+               normalizedCursorModelAlias(model) == host.cursorAutoModelRaw,
+               sessionModelConfigOptionID == nil
+            {
+                return
+            }
+            if provider.providerID == .devin,
+               let entry = host.devinThinkingSelection(for: model)
+            {
+                // Devin ACP rejects effort-encoded IDs as `model` values: select the advertised
+                // family model, then its `thought_level`. The choice is validated against the
+                // live session's definition, so an unadvertised effort fails before any prompt.
+                try await setSessionModelViaConfigOptionsRPC(entry.advertisedModelRaw, sessionID: sessionID, forceRPC: forceRPC)
+                try Task.checkCancellation()
+                let report = try await applySessionModelParameterSelectionsSerialized([
+                    ACPModelParameterSelection(
+                        providerID: .devin,
+                        baseModelRaw: entry.advertisedModelRaw,
+                        kind: .thinking,
+                        configID: entry.configID,
+                        valueRaw: entry.choiceRaw
+                    )
+                ])
+                try report.validateNoSkippedSelections()
+                return
+            }
+            try await setSessionModelViaConfigOptionsRPC(model, sessionID: sessionID, forceRPC: forceRPC)
+        }
+    }
+
+    /// Validation for direct (non-configOptions) model selection: exact/case-insensitive
+    /// match against the live session snapshot first, then the warmed persisted registry
+    /// (a `session/load` response may legitimately omit model metadata on some providers).
+    private func canonicalDirectSessionModelOption(
+        _ requestedValue: String
+    ) throws -> (option: AgentModelOption, options: [AgentModelOption], matchedLiveSnapshot: Bool) {
+        if let live = discoveredSessionModels {
+            if let match = live.option(matching: requestedValue) {
+                return (match, live.options, sessionModelSnapshotHasLiveAuthority)
+            }
+            throw ControllerError.requestFailed("Grok Build session does not advertise model '\(requestedValue)'.")
+        }
+        if let warmed = host.resolvedModelSnapshot(for: provider.providerID),
+           let match = warmed.option(matching: requestedValue)
+        {
+            return (match, warmed.options, false)
+        }
+        throw ControllerError.requestFailed("Grok Build model '\(requestedValue)' is not in the discovered model set. Refresh Grok Build models and retry.")
+    }
+
+    private func normalizedDirectEffort(_ raw: String?) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty
+        else { return nil }
+        return trimmed.lowercased()
+    }
+
+    /// Clears current model/effort authority after an ambiguous `session/set_model` outcome
+    /// (post-dispatch throw, or a missing/malformed/mixed/mismatched acknowledgement). The
+    /// advertised options stay — they came from the live session or warmed registry and are
+    /// still the valid advertisement — but nothing about the session's current model or
+    /// effort is confirmed anymore. Works for warmed-only sessions too (discoveredSessionModels
+    /// may be nil there), and never promotes warmed data to live authority.
+    private func invalidateDirectModelAuthorityAfterAmbiguousOutcome(snapshotOptions: [AgentModelOption]) {
+        let options = discoveredSessionModels?.options ?? snapshotOptions
+        guard !options.isEmpty else { return }
+        let cleared = ACPDiscoveredSessionModels(
+            options: options,
+            currentModelRaw: nil,
+            currentEffortRaw: nil
+        )
+        discoveredSessionModels = cleared
+        publishDiscoveredSessionModelsIfGloballyAuthoritative(cleared)
+    }
+
+    /// Discovers the model-scoped configuration a provider only advertises after a model
+    /// set (OpenCode's `effort` selector), by forcing one verified model-selector mutation
+    /// and returning the refreshed session snapshot.
+    ///
+    /// The forced RPC is the point: OpenCode's bootstrap `session/new` advertises only the
+    /// `model` and `mode` selectors, so skipping a "no-op" model set when the requested model
+    /// is already current would return bootstrap metadata unchanged and hide `effort`
+    /// entirely. The response flows through the same verified mutation path as interactive
+    /// selection — there is no second, unverified writer.
+    package func discoverSessionModelParameters(for modelRaw: String) async throws -> ACPDiscoveredSessionModels {
+        try await configurationMutationMutex.withLock { [weak self] in
+            guard let self else { throw CancellationError() }
+            return try await discoverSessionModelParametersSerialized(modelRaw)
+        }
+    }
+
+    private func discoverSessionModelParametersSerialized(_ modelRaw: String) async throws -> ACPDiscoveredSessionModels {
+        guard let sessionID else {
+            throw ControllerError.invalidState(expected: "sessionOpen", actual: state)
+        }
+        guard state == .sessionOpen else {
+            throw ControllerError.invalidState(expected: "sessionOpen", actual: state)
+        }
+        guard provider.supportsParameterizedModelPicker else {
+            throw ControllerError.requestFailed("ACP provider does not advertise a parameterized model picker.")
+        }
+        let model = modelRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !model.isEmpty else {
+            throw ControllerError.requestFailed("Session model parameter discovery requires a non-empty model.")
+        }
+        if let sessionModelFailureReason {
+            throw ControllerError.protocolViolation("malformed modern model config option: \(sessionModelFailureReason)")
+        }
+        // Force the selector RPC even when the requested model is already current — see the
+        // doc comment on the public operation.
+        try await setSessionModelViaConfigOptionsRPC(model, sessionID: sessionID, forceRPC: true)
+        guard let snapshot = discoveredSessionModels,
+              let currentModelRaw = snapshot.currentModelRaw
+        else {
+            throw ControllerError.protocolViolation("Session model parameter discovery produced no session snapshot.")
+        }
+        // Never return metadata belonging to a different model than the one requested.
+        guard host.canonicalParameterModelRaw(currentModelRaw, providerID: provider.providerID)
+            == host.canonicalParameterModelRaw(model, providerID: provider.providerID)
+        else {
+            throw ControllerError.protocolViolation(
+                "Session model parameter discovery confirmed a different model than requested '\(model)'."
+            )
+        }
+        return snapshot
+    }
+
+    /// Sends one verified model-selector mutation over `session/set_config_option` using the
+    /// selector ID parsed from `session/new` (`sessionModelConfigOptionID`).
+    ///
+    /// `forceRPC: true` sends the selector RPC even when the requested value already matches
+    /// the session's current model. Interactive selection callers pass `false` to keep the
+    /// no-op fast path; model-parameter discovery passes `true` because providers like
+    /// OpenCode only advertise model-scoped config options (e.g. `effort`) in response to a
+    /// model set, so skipping the RPC would leave discovery blind.
+    private func setSessionModelViaConfigOptionsRPC(
+        _ model: String,
+        sessionID: String,
+        forceRPC: Bool
+    ) async throws {
+        guard let sessionModelConfigOptionID else {
+            throw ControllerError.requestFailed("ACP runtime does not advertise model switching through configOptions.")
+        }
+        guard let mappedConfigValue = sessionModelConfigValue(forSelectedModel: model) else {
+            throw ControllerError.requestFailed("ACP runtime does not advertise a safe config value for selected model '\(model)'.")
+        }
+        let configValue = try canonicalSessionModelValue(mappedConfigValue)
+        if configValue != model {
+            log("Mapping selected model \(model) to ACP config value \(configValue)")
+        }
+        if !forceRPC, discoveredSessionModels?.currentModelRaw == configValue {
+            return
+        }
+        let response = try await sendRequestResponse(
+            method: "session/set_config_option",
+            params: [
+                "sessionId": sessionID,
+                "configId": sessionModelConfigOptionID,
+                "value": configValue
+            ]
+        )
+        try await applyVerifiedConfigOptionsMutationResponse(
+            response,
+            requiredModeValue: nil,
+            requiredModelValue: configValue
+        )
+    }
+
+    package func setSessionMode(_ modeID: String) async throws {
+        try await configurationMutationMutex.withLock { [weak self] in
+            guard let self else { throw CancellationError() }
+            try await setSessionModeSerialized(modeID)
+        }
+    }
+
+    package func applySessionModelParameterSelections(
+        _ selections: [ACPModelParameterSelection]
+    ) async throws -> ACPModelParameterApplicationReport {
+        try await configurationMutationMutex.withLock { [weak self] in
+            guard let self else { throw CancellationError() }
+            return try await applySessionModelParameterSelectionsSerialized(selections)
+        }
+    }
+
+    private func applySessionModelParameterSelectionsSerialized(
+        _ selections: [ACPModelParameterSelection]
+    ) async throws -> ACPModelParameterApplicationReport {
+        guard let sessionID else {
+            throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
+        }
+        guard state == .sessionOpen || state == .promptRunning else {
+            throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
+        }
+        guard provider.supportsParameterizedModelPicker else {
+            return .init(applied: [], skipped: selections)
+        }
+
+        let normalized = host.normalizedModelParameterSelections(selections).sorted {
+            if $0.kind.sortOrder != $1.kind.sortOrder {
+                return $0.kind.sortOrder < $1.kind.sortOrder
+            }
+            return $0.configID < $1.configID
+        }
+        typealias PendingSelection = (
+            selection: ACPModelParameterSelection,
+            currentModelRaw: String,
+            definition: ACPModelParameterDefinition,
+            choice: ACPModelParameterChoice
+        )
+        var pending: [PendingSelection] = []
+        var alreadyCurrent: [ACPModelParameterSelection] = []
+        var skipped: [ACPModelParameterSelection] = []
+
+        // Resolve the complete batch before sending any parameter mutation. A stale or
+        // unsupported selection makes the run fail closed; applying earlier valid entries first
+        // would leave the provider partially configured even though no prompt is submitted.
+        for selection in normalized {
+            guard selection.providerID == provider.providerID,
+                  let models = discoveredSessionModels,
+                  let currentModel = models.currentModelRaw,
+                  let parameterSet = models.modelParameterSets.first(where: {
+                      host.canonicalParameterModelRaw(
+                          $0.baseModelRaw,
+                          providerID: provider.providerID
+                      ) == host.canonicalParameterModelRaw(
+                          currentModel,
+                          providerID: provider.providerID
+                      )
+                  }),
+                  let definition = parameterSet.definition(kind: selection.kind),
+                  host.parameterIdentityMatches(
+                      selection,
+                      providerID: provider.providerID,
+                      baseModelRaw: parameterSet.baseModelRaw,
+                      kind: definition.kind
+                  ),
+                  let choice = definition.choice(matching: selection.valueRaw)
+            else {
+                skipped.append(selection)
+                continue
+            }
+            if definition.currentValueRaw == choice.rawValue {
+                alreadyCurrent.append(selection)
+            } else {
+                pending.append((selection, currentModel, definition, choice))
+            }
+        }
+
+        guard skipped.isEmpty else {
+            return .init(applied: [], alreadyCurrent: alreadyCurrent, skipped: skipped)
+        }
+
+        var applied: [ACPModelParameterSelection] = []
+        for resolved in pending {
+            let response = try await sendRequestResponse(
+                method: "session/set_config_option",
+                params: [
+                    "sessionId": sessionID,
+                    "configId": resolved.definition.configID,
+                    "value": resolved.choice.rawValue
+                ]
+            )
+            try await applyVerifiedConfigOptionsMutationResponse(
+                response,
+                requiredModeValue: nil,
+                requiredModelValue: nil,
+                requiredParameter: (resolved.definition.configID, resolved.choice.rawValue)
+            )
+            applied.append(.init(
+                providerID: resolved.selection.providerID,
+                baseModelRaw: resolved.currentModelRaw,
+                kind: resolved.selection.kind,
+                configID: resolved.definition.configID,
+                valueRaw: resolved.choice.rawValue
+            ))
+        }
+        return .init(applied: applied, alreadyCurrent: alreadyCurrent, skipped: [])
+    }
+
+    private func setSessionModeSerialized(_ modeID: String) async throws {
+        guard let sessionID else {
+            throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
+        }
+        let trimmedModeID = modeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedModeID.isEmpty else { return }
+        guard state == .sessionOpen || state == .promptRunning else {
+            throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
+        }
+        guard let snapshot = sessionModeSnapshot else {
+            if let sessionModeFailureReason {
+                throw ControllerError.protocolViolation("malformed modern session mode config option: \(sessionModeFailureReason)")
+            }
+            if trimmedModeID.caseInsensitiveCompare("default") == .orderedSame {
+                return
+            }
+            throw ControllerError.requestFailed("ACP runtime does not advertise a modern session mode configOptions selector.")
+        }
+        let canonicalModeID = try canonicalSessionModeValue(trimmedModeID, in: snapshot)
+        if snapshot.currentValue == canonicalModeID {
+            return
+        }
+
+        let response = try await sendRequestResponse(
+            method: "session/set_config_option",
+            params: [
+                "sessionId": sessionID,
+                "configId": snapshot.configID,
+                "value": canonicalModeID
+            ]
+        )
+        try await applyVerifiedConfigOptionsMutationResponse(
+            response,
+            requiredModeValue: canonicalModeID,
+            requiredModelValue: nil
+        )
+    }
+
+    package enum OverseerPermissionResponseResult: Equatable {
+        case submitted
+        /// The request vanished or authorization failed at the final check. Nothing was sent.
+        case notSubmitted
+        /// No genuine one-time option exists for the requested decision. Nothing was sent.
+        case noOneTimeOption
+        case failed
+    }
+
+    /// Explicit observer answer under **Answer prompts**, strictly scoped to this one request.
+    ///
+    /// Accept selects only a genuine one-time allow option; decline selects only a one-time reject
+    /// and otherwise reports `cancelled`, never a persistent reject; cancel reports `cancelled`.
+    /// Session-wide decisions are refused. `authorize` is the final suspension point before sending.
+    package func respondToPermissionRequestForOverseer(
+        id: String,
+        decision: AgentApprovalDecision,
+        authorize: @MainActor @Sendable () async -> Bool
+    ) async -> OverseerPermissionResponseResult {
+        guard let storageKey = permissionStorageKeyByApprovalID[id],
+              let initial = pendingPermissionRequests[storageKey]
+        else { return .notSubmitted }
+        let options = initial.options.map { (optionID: $0.optionID, kind: $0.kind) }
+        let selectedOptionID: String?
+        switch decision {
+        case .accept:
+            guard let optionID = host.permissionOneTimeAllow(
+                options: options,
+                providerID: provider.providerID
+            ) else { return .noOneTimeOption }
+            selectedOptionID = optionID
+        case .decline:
+            selectedOptionID = host.permissionOneTimeReject(options: options)
+        case .cancel:
+            selectedOptionID = nil
+        case .acceptForSession, .acceptWithExecpolicyAmendment:
+            return .noOneTimeOption
+        }
+        guard await authorize(),
+              permissionStorageKeyByApprovalID[id] == storageKey,
+              let pending = pendingPermissionRequests[storageKey],
+              pending.request.id == initial.request.id
+        else { return .notSubmitted }
+        do {
+            if let selectedOptionID {
+                try sendPermissionSelectionResponse(id: pending.rpcID, optionID: selectedOptionID)
+            } else {
+                try sendJSONLine([
+                    "jsonrpc": "2.0",
+                    "id": pending.rpcID.jsonValue,
+                    "result": ["outcome": ["outcome": "cancelled"]]
+                ])
+            }
+            removePendingPermissionRequest(approvalID: id)
+            return .submitted
+        } catch {
+            log("Failed to submit Overseer ACP permission response: \(error.localizedDescription)")
+            return .failed
+        }
+    }
+
+    /// Applying full access to an already surfaced prompt uses the same per-request
+    /// policy as a new request. Ineligible prompts remain available for manual approval.
+    @discardableResult
+    package func respondToPendingPermissionRequestForFullAccess(id: String) -> Bool {
+        guard state == .promptRunning,
+              let storageKey = permissionStorageKeyByApprovalID[id],
+              let pending = pendingPermissionRequests[storageKey],
+              let optionID = fullAccessAutoApprovalOptionID(for: pending.options)
+        else { return false }
+        // No suspension between checking the current flag/request and sending: the
+        // actor owns both, so preference changes and cancellation cannot interleave.
+        do {
+            try sendPermissionSelectionResponse(id: pending.rpcID, optionID: optionID)
+            removePendingPermissionRequest(approvalID: id)
+            return true
+        } catch {
+            log("Failed to apply full access to pending ACP permission request: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    package func respondToPermissionRequest(
+        id: String,
+        decision: AgentApprovalDecision
+    ) async {
+        guard let pending = removePendingPermissionRequest(approvalID: id) else {
+            return
+        }
+        let result: [String: Any] = switch decision {
+        case .cancel:
+            [
+                "outcome": [
+                    "outcome": "cancelled"
+                ]
+            ]
+        case .accept, .acceptForSession, .acceptWithExecpolicyAmendment:
+            if let optionID = preferredAllowOptionID(
+                for: pending.options,
+                sessionScoped: decision != .accept
+            ) {
+                ["outcome": ["outcome": "selected", "optionId": optionID]]
+            } else {
+                ["outcome": ["outcome": "cancelled"]]
+            }
+        case .decline:
+            if let optionID = preferredRejectOptionID(for: pending.options) {
+                [
+                    "outcome": [
+                        "outcome": "selected",
+                        "optionId": optionID
+                    ]
+                ]
+            } else {
+                [
+                    "outcome": [
+                        "outcome": "cancelled"
+                    ]
+                ]
+            }
+        }
+
+        do {
+            try sendJSONLine([
+                "jsonrpc": "2.0",
+                "id": pending.rpcID.jsonValue,
+                "result": result
+            ])
+        } catch {
+            let message = "Failed to submit ACP approval decision: \(error.localizedDescription)"
+            emit(.stream(AIStreamResult(
+                type: "error",
+                text: message
+            )))
+            failPendingRequests(with: ControllerError.requestFailed(message))
+            emitTerminal(state: .failed, errorText: message)
+            if state != .closing, state != .closed {
+                state = .failed
+            }
+        }
+    }
+
+    package func cancelPrompt() async {
+        guard sessionID != nil else { return }
+        do {
+            try sendSessionCancelNotification()
+        } catch {
+            log("ACP cancel send failed: \(error.localizedDescription)")
+        }
+        cancelPendingPermissionRequestsLocally()
+    }
+
+    #if DEBUG
+        package func debugPromptSettlementWaiterCount() -> Int {
+            promptSettlementWaitersByTurnID.values.reduce(0) { $0 + $1.count }
+        }
+    #endif
+
+    package func interruptActivePromptForSteering(timeoutSeconds: TimeInterval = 15) async throws {
+        guard sessionID != nil else {
+            throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
+        }
+        #if DEBUG
+            if testHoldNextSteeringInterrupt {
+                testHoldNextSteeringInterrupt = false
+                testSteeringInterruptEntered = true
+                testSteeringInterruptEntryWaiter?.resume()
+                testSteeringInterruptEntryWaiter = nil
+                await withCheckedContinuation { testSteeringInterruptGate = $0 }
+            }
+        #endif
+        log("ACP steering interrupt requested state=\(state.rawValue) hasActiveTurn=\(activePromptTurnID != nil)")
+
+        if let promptTurnID = activePromptTurnID {
+            guard state == .promptRunning || state == .sessionOpen else {
+                throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
+            }
+            if state == .promptRunning {
+                log("ACP steering interrupt sending session/cancel turn=\(promptTurnID)")
+                try sendSessionCancelNotification()
+            } else {
+                log("ACP steering interrupt waiting stale active turn=\(promptTurnID) state=\(state.rawValue)")
+            }
+            cancelPendingPermissionRequestsLocally()
+            try await waitForPromptSettlement(turnID: promptTurnID, timeoutSeconds: timeoutSeconds)
+            if activePromptTurnID == promptTurnID {
+                log("ACP steering interrupt clearing settled turn still marked active turn=\(promptTurnID) state=\(state.rawValue)")
+                settlePromptTurn(promptTurnID, result: .success(()))
+            }
+            log("ACP steering interrupt prompt settled turn=\(promptTurnID) state=\(state.rawValue) hasActiveTurn=\(activePromptTurnID != nil)")
+            guard state != .closing, state != .closed else {
+                throw ControllerError.transportClosed
+            }
+            resetPerTurnStateForSteeringPrompt()
+            if state == .promptRunning {
+                state = .sessionOpen
+            }
+            return
+        }
+
+        guard state == .sessionOpen || state == .promptRunning else {
+            throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
+        }
+        if state == .promptRunning {
+            log("ACP steering interrupt found promptRunning without active turn; resetting state for steering")
+            state = .sessionOpen
+        } else {
+            log("ACP steering interrupt skipped; controller already sessionOpen")
+        }
+        resetPerTurnStateForSteeringPrompt()
+    }
+
+    private func sendSessionCancelNotification() throws {
+        guard let sessionID else { return }
+        try sendJSONLine([
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": [
+                "sessionId": sessionID
+            ]
+        ])
+    }
+
+    @discardableResult
+    private func removePendingPermissionRequest(approvalID: String) -> PendingPermissionRequest? {
+        guard let storageKey = permissionStorageKeyByApprovalID.removeValue(forKey: approvalID) else { return nil }
+        return pendingPermissionRequests.removeValue(forKey: storageKey)
+    }
+
+    private func cancelPendingPermissionRequestsLocally() {
+        let pending = pendingPermissionRequests.values
+        pendingPermissionRequests.removeAll()
+        permissionStorageKeyByApprovalID.removeAll()
+        for request in pending {
+            do {
+                try sendJSONLine([
+                    "jsonrpc": "2.0",
+                    "id": request.rpcID.jsonValue,
+                    "result": [
+                        "outcome": [
+                            "outcome": "cancelled"
+                        ]
+                    ]
+                ])
+            } catch {
+                log("Failed to cancel ACP permission request \(request.rpcID.displayValue): \(error.localizedDescription)")
+            }
+            emit(.approvalCancelled(request.request.requestID))
+        }
+    }
+
+    private func resetPerTurnStateForSteeringPrompt() {
+        didEmitTerminal = false
+        eventStreamFinished = false
+        suppressSessionLoadReplayUpdates = false
+    }
+
+    private func waitForPromptSettlement(turnID: UUID, timeoutSeconds: TimeInterval) async throws {
+        guard activePromptTurnID == turnID else { return }
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { [weak self] in
+                guard let self else { throw ControllerError.transportClosed }
+                try await waitForPromptSettlement(turnID: turnID)
+            }
+            group.addTask { [launchDescription, diagnosticHint = timeoutDiagnosticHint()] in
+                let duration = UInt64((timeoutSeconds * 1_000_000_000).rounded())
+                try await Task.sleep(nanoseconds: duration)
+                throw ControllerError.requestTimedOut(
+                    method: "session/cancel",
+                    timeoutSeconds: timeoutSeconds,
+                    launchDescription: launchDescription,
+                    diagnosticHint: diagnosticHint
+                )
+            }
+            defer { group.cancelAll() }
+            try await group.next()
+        }
+    }
+
+    private func waitForPromptSettlement(turnID: UUID) async throws {
+        guard activePromptTurnID == turnID else { return }
+        let waiterID = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if activePromptTurnID != turnID {
+                    continuation.resume(returning: ())
+                    return
+                }
+                promptSettlementWaitersByTurnID[turnID, default: []].append(
+                    PromptSettlementWaiter(id: waiterID, continuation: continuation)
+                )
+            }
+        } onCancel: {
+            Task { await self.cancelPromptSettlementWaiter(turnID: turnID, waiterID: waiterID) }
+        }
+    }
+
+    private func cancelPromptSettlementWaiter(turnID: UUID, waiterID: UUID) {
+        guard var waiters = promptSettlementWaitersByTurnID[turnID],
+              let index = waiters.firstIndex(where: { $0.id == waiterID }) else { return }
+        let waiter = waiters.remove(at: index)
+        promptSettlementWaitersByTurnID[turnID] = waiters.isEmpty ? nil : waiters
+        waiter.continuation.resume(throwing: CancellationError())
+    }
+
+    private func failAllPromptSettlementWaiters(with error: Error) {
+        activePromptTurnID = nil
+        let waiters = promptSettlementWaitersByTurnID.values.flatMap(\.self)
+        promptSettlementWaitersByTurnID.removeAll()
+        for waiter in waiters {
+            waiter.continuation.resume(throwing: error)
+        }
+    }
+
+    private func settlePromptTurn(_ turnID: UUID, result: Result<Void, Error>) {
+        if activePromptTurnID == turnID {
+            activePromptTurnID = nil
+        }
+        let waiters = promptSettlementWaitersByTurnID.removeValue(forKey: turnID) ?? []
+        for waiter in waiters {
+            switch result {
+            case .success:
+                waiter.continuation.resume(returning: ())
+            case let .failure(error):
+                waiter.continuation.resume(throwing: error)
+            }
+        }
+    }
+
+    package func shutdown() async {
+        #if DEBUG
+            debugResumeConfigurationMutationPostcheck()
+        #endif
+        guard state != .closed, state != .closing else { return }
+        state = .closing
+        recentDevinToolCalls.removeAll()
+        recentDevinToolCallIDs.removeAll()
+        promptImagesSupported = false
+        log("Shutting down ACP controller")
+
+        await cancelPrompt()
+        failAllPromptSettlementWaiters(with: ControllerError.transportClosed)
+        failPendingRequests(with: ControllerError.transportClosed)
+
+        stdoutChannel?.finish()
+        stderrChannel?.finish()
+        stdoutConsumerTask?.cancel()
+        stderrConsumerTask?.cancel()
+        processWaitTask?.cancel()
+
+        if let process {
+            process.stdout.readabilityHandler = nil
+            process.stderr.readabilityHandler = nil
+            process.stdin?.closeFile()
+            _ = await ProcessTermination.terminateAndReap(pid: process.pid, processGroupID: process.processGroupID)
+        }
+
+        await clearExpectedAgentPIDIfNeeded()
+        await cleanupLaunchArtifacts()
+
+        stdoutChannel = nil
+        stderrChannel = nil
+        stdoutConsumerTask = nil
+        stderrConsumerTask = nil
+        processWaitTask = nil
+        process = nil
+        discoveredSessionModels = nil
+        sessionModelConfigOptionID = nil
+        sessionModelDirectSelectionSupported = false
+        sessionModelSnapshotHasLiveAuthority = false
+        sessionModelFailureReason = nil
+        sessionModeSnapshot = nil
+        sessionModeFailureReason = nil
+        lastAppliedConfigurationSequence = 0
+        bufferedConfigOptionUpdates.removeAll()
+        sessionID = nil
+        suppressSessionLoadReplayUpdates = false
+        state = .closed
+        finishEventsIfNeeded()
+    }
+
+    // MARK: - Transport
+
+    private func startReaders(stdout: FileHandle, stderr: FileHandle) throws {
+        try ReadSourceFDPreflight.validateOpenFD(stdout.fileDescriptor, label: "ACP stdout")
+        try ReadSourceFDPreflight.validateOpenFD(stderr.fileDescriptor, label: "ACP stderr")
+        let stdoutChannel = FileHandleChunkChannel()
+        self.stdoutChannel = stdoutChannel
+        stdout.readabilityHandler = { readable in
+            let data = readable.availableData
+            if data.isEmpty {
+                stdoutChannel.finish()
+                readable.readabilityHandler = nil
+            } else {
+                stdoutChannel.yield(data)
+            }
+        }
+        stdoutConsumerTask = Task { [weak self] in
+            guard let self else { return }
+            for await chunk in stdoutChannel.stream {
+                await handleStdoutChunk(chunk)
+            }
+        }
+
+        let stderrChannel = FileHandleChunkChannel()
+        self.stderrChannel = stderrChannel
+        stderr.readabilityHandler = { readable in
+            let data = readable.availableData
+            if data.isEmpty {
+                stderrChannel.finish()
+                readable.readabilityHandler = nil
+            } else {
+                stderrChannel.yield(data)
+            }
+        }
+        stderrConsumerTask = Task { [weak self] in
+            guard let self else { return }
+            for await chunk in stderrChannel.stream {
+                await handleStderrChunk(chunk)
+            }
+        }
+    }
+
+    private func startProcessWaitTask(for process: SpawnedProcess) {
+        processWaitTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let result = try await ProcessTermination.waitForTermination(
+                    pid: process.pid,
+                    processGroupID: process.processGroupID,
+                    timeout: nil
+                )
+                await handleProcessExit(result.exitCode, timedOut: result.timedOut)
+            } catch {
+                await handleProcessWaitFailure(error)
+            }
+        }
+    }
+
+    private func handleStdoutChunk(_ data: Data) {
+        stdoutByteCount += data.count
+        stdoutFramer.feed(data) { lineData in
+            handleJSONLine(lineData)
+        }
+    }
+
+    private func handleStderrChunk(_ data: Data) {
+        stderrFramer.feed(data) { lineData in
+            guard
+                let trimmed = trimmedASCIIWhitespace(lineData),
+                let rawText = String(data: trimmed, encoding: .utf8),
+                !rawText.isEmpty
+            else { return }
+            let text = Self.strippingANSIEscapeSequences(from: rawText)
+            guard !text.isEmpty else { return }
+            stderrLineCount += 1
+            lastStderrPreview = Self.truncatedDiagnosticPreview(text)
+            recordActivePromptStderrLine(text)
+            diagnose(.stderrLine(text))
+            guard provider.shouldEmitStderrLine(text) else { return }
+            emit(.stream(AIStreamResult(type: "system", text: text)))
+        }
+    }
+
+    /// CLI providers log with terminal colors; ANSI escape sequences would render as raw
+    /// `[2m…[0m` artifacts in the transcript.
+    private static func strippingANSIEscapeSequences(from text: String) -> String {
+        guard text.contains("\u{1B}") else { return text }
+        var result = ""
+        result.reserveCapacity(text.count)
+        var iterator = text.makeIterator()
+        while let character = iterator.next() {
+            guard character == "\u{1B}" else {
+                result.append(character)
+                continue
+            }
+            // Skip a CSI sequence: ESC [ parameters…final-byte (@–~).
+            guard let opener = iterator.next(), opener == "[" else { continue }
+            while let byte = iterator.next() {
+                if ("@" ... "~").contains(byte) {
+                    break
+                }
+            }
+        }
+        return result
+    }
+
+    /// The caller must first route server requests and exhaust owned-request correlation.
+    /// Known maintenance replies are ignored regardless of their payload or protocol version.
+    package nonisolated static func isRecognizedUnmatchedResponse(
+        _ json: [String: Any],
+        provider: any ACPAgentProvider
+    ) -> Bool {
+        guard let id = json["id"] as? String, !json.keys.contains("method") else { return false }
+        return provider.recognizesUnmatchedResponseID(id)
+    }
+
+    private func handleJSONLine(_ lineData: Data) {
+        guard let trimmed = trimmedASCIIWhitespace(lineData), !trimmed.isEmpty else { return }
+        let rawLine = String(data: trimmed, encoding: .utf8) ?? "<non-utf8>"
+        stdoutLineCount += 1
+        lastStdoutPreview = Self.truncatedDiagnosticPreview(rawLine)
+        diagnose(.inboundJSON(rawLine))
+        guard let json = try? JSONSerialization.jsonObject(with: trimmed) as? [String: Any] else {
+            let preview = String(data: trimmed.prefix(300), encoding: .utf8) ?? "<non-utf8>"
+            invalidACPLineCount += 1
+            lastInvalidACPLinePreview = Self.truncatedDiagnosticPreview(preview)
+            diagnose(.invalidJSON(preview))
+            handleProtocolViolation("Invalid ACP JSON line: \(preview)")
+            return
+        }
+        #if DEBUG
+            captureRawACPEvent(kind: "jsonrpc.inbound", payload: json)
+        #endif
+        inboundMessageSequence &+= 1
+        let messageSequence = inboundMessageSequence
+
+        if let id = parseJSONRPCID(json["id"]) {
+            if let method = json["method"] as? String {
+                handleServerRequest(id: id, method: method, params: json["params"] as? [String: Any] ?? [:])
+                return
+            }
+            for storageKey in candidateStorageKeys(for: id) {
+                guard let pendingRequest = pendingRequests.removeValue(forKey: storageKey) else { continue }
+                pendingRequest.timeoutTask?.cancel()
+                if let result = json["result"] as? [String: Any] {
+                    pendingRequest.continuation.resume(returning: RequestResponse(
+                        result: result,
+                        inboundSequence: messageSequence
+                    ))
+                } else if let error = json["error"] as? [String: Any] {
+                    let message = Self.responseErrorMessage(from: error)
+                    let code = Self.responseErrorCode(from: error)
+                    let codeText = code.map { " code=\($0)" } ?? ""
+                    diagnose(.info("ACP request \(pendingRequest.method) failed\(codeText): \(message)"))
+                    pendingRequest.continuation.resume(throwing: ControllerError.requestFailed(message, code: code))
+                } else {
+                    pendingRequest.continuation.resume(throwing: ControllerError.protocolViolation("Missing result/error for request \(id.displayValue)"))
+                }
+                return
+            }
+            if Self.isRecognizedUnmatchedResponse(json, provider: provider) {
+                log("Ignored provider-recognized unmatched ACP response provider=\(provider.providerID.rawValue) id=\(id.displayValue).")
+                return
+            }
+            diagnose(.unmatchedResponse(id: id.displayValue, line: rawLine))
+            handleProtocolViolation("Received unmatched ACP response id \(id.displayValue).")
+        }
+
+        if let method = json["method"] as? String {
+            handleNotification(
+                method: method,
+                params: json["params"] as? [String: Any] ?? [:],
+                inboundSequence: messageSequence
+            )
+        }
+    }
+
+    private func handleServerRequest(id: JSONRPCID, method: String, params: [String: Any]) {
+        switch method {
+        case "session/request_permission":
+            handlePermissionRequest(id: id, params: params)
+        default:
+            do {
+                try sendJSONLine([
+                    "jsonrpc": "2.0",
+                    "id": id.jsonValue,
+                    "error": [
+                        "code": -32601,
+                        "message": "Unsupported ACP client method: \(method)"
+                    ]
+                ])
+            } catch {
+                log("Failed to reject unsupported ACP request \(method): \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func handleNotification(method: String, params: [String: Any], inboundSequence: UInt64) {
+        guard method == "session/update" else {
+            emitDevinSemanticUncertaintyIfCurrent(params: params)
+            return
+        }
+        #if DEBUG
+            captureRawACPEvent(
+                kind: "session.update.params",
+                payload: [
+                    "method": method,
+                    "params": params
+                ]
+            )
+        #endif
+        guard let update = params["update"] as? [String: Any] else {
+            emitDevinSemanticUncertaintyIfCurrent(params: params)
+            return
+        }
+        let sessionID = (params["sessionId"] as? String) ?? sessionID ?? ""
+        #if DEBUG
+            captureRawACPEvent(
+                kind: "session.update.raw",
+                payload: [
+                    "sessionId": sessionID,
+                    "update": update
+                ]
+            )
+        #endif
+
+        // Captured before load-replay suppression and normalization (which drops the update): a
+        // replayed advertisement still describes the commands this live session accepts.
+        if (update["sessionUpdate"] as? String)?.lowercased() == "available_commands_update" {
+            recordAdvertisedCommands(paramsSessionID: params["sessionId"] as? String, update: update)
+        }
+
+        if update["sessionUpdate"] as? String == "config_option_update" {
+            handleConfigOptionUpdateNotification(
+                paramsSessionID: params["sessionId"] as? String,
+                update: update,
+                inboundSequence: inboundSequence
+            )
+            return
+        }
+
+        // Administrative metadata has its own session/retirement fences and may arrive while
+        // bootstrap has not installed sessionID yet. Quiet semantic ingress must not discard it.
+        if provider.providerID == .devin,
+           let currentSession = self.sessionID,
+           let incomingSession = params["sessionId"] as? String, incomingSession != currentSession { return }
+
+        if shouldSuppressSessionLoadReplayUpdate(update) {
+            #if DEBUG
+                captureRawACPEvent(
+                    kind: "session.update.suppressed",
+                    payload: [
+                        "sessionId": sessionID,
+                        "reason": "session_load_replay",
+                        "update": update
+                    ]
+                )
+            #endif
+            return
+        }
+
+        if provider.providerID == .devin, let toolCallID = update["toolCallId"] as? String {
+            switch update["sessionUpdate"] as? String {
+            case "tool_call":
+                if recentDevinToolCalls[toolCallID] == nil {
+                    recentDevinToolCallIDs.append(toolCallID)
+                }
+                recentDevinToolCalls[toolCallID] = update
+                if recentDevinToolCallIDs.count > 64 {
+                    recentDevinToolCalls.removeValue(forKey: recentDevinToolCallIDs.removeFirst())
+                }
+            case "tool_call_update":
+                if let status = update["status"] as? String,
+                   ["completed", "failed", "cancelled"].contains(status)
+                {
+                    recentDevinToolCalls.removeValue(forKey: toolCallID)
+                    recentDevinToolCallIDs.removeAll { $0 == toolCallID }
+                } else if update["title"] != nil || update["kind"] != nil || update["_meta"] != nil {
+                    if recentDevinToolCalls[toolCallID] != nil {
+                        recentDevinToolCalls[toolCallID] = update
+                    }
+                } else if let rawInput = update["rawInput"] {
+                    recentDevinToolCalls[toolCallID]?["rawInput"] = rawInput
+                }
+            default:
+                break
+            }
+        }
+
+        let normalizedEvents = provider.normalizeSessionUpdate(update, sessionID: sessionID)
+        #if DEBUG
+            captureNormalizedACPEvents(normalizedEvents, sessionID: sessionID, sourceUpdate: update)
+        #endif
+        recordActivePromptTraceUpdate(sourceUpdate: update, normalizedEvents: normalizedEvents)
+        for event in normalizedEvents {
+            if provider.providerID == .devin, case let .stream(result) = event,
+               result.type == "event", result.text == nil,
+               activePromptTurnID == nil || suppressSessionLoadReplayUpdates { continue }
+            if shouldSuppressACPEvent(event) {
+                continue
+            }
+            emit(event)
+        }
+    }
+
+    private func emitDevinSemanticUncertaintyIfCurrent(params: [String: Any]) {
+        guard provider.providerID == .devin, activePromptTurnID != nil,
+              !suppressSessionLoadReplayUpdates else { return }
+        if let incomingSession = params["sessionId"] as? String, incomingSession != sessionID { return }
+        emit(.stream(AIStreamResult(type: "event", text: nil)))
+    }
+
+    /// Replaces the advertised command list for the notification's own session. An update without a
+    /// session ID is ignored; one with a malformed list advertises nothing. Once a session is open, an update
+    /// naming any other session (for example a late one for a session this controller moved off) is
+    /// ignored rather than allowed to replace the open session's list.
+    private func recordAdvertisedCommands(paramsSessionID: String?, update: [String: Any]) {
+        // Without a session ID the update cannot be attributed to any session, so it changes nothing.
+        guard let paramsSessionID, !paramsSessionID.isEmpty else { return }
+        if let sessionID, sessionID != paramsSessionID {
+            return
+        }
+        // A retired controller never advertises again, whatever arrives after it failed.
+        switch state {
+        case .failed, .closing, .closed:
+            return
+        case .idle, .launching, .initialized, .openingSession, .sessionOpen, .promptRunning:
+            break
+        }
+        guard let commands = update["availableCommands"] as? [Any] else {
+            advertisedCommandsState.withLock { $0 = AdvertisedCommands(sessionID: paramsSessionID, names: []) }
+            return
+        }
+        var names = Set<String>()
+        for case let command as [String: Any] in commands {
+            guard var name = (command["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                continue
+            }
+            if name.hasPrefix("/") { name.removeFirst() }
+            if !name.isEmpty { names.insert(name) }
+        }
+        let snapshot = AdvertisedCommands(sessionID: paramsSessionID, names: names)
+        advertisedCommandsState.withLock { $0 = snapshot }
+    }
+
+    private func clearAdvertisedCommands() {
+        advertisedCommandsState.withLock { $0 = nil }
+    }
+
+    private func shouldSuppressACPEvent(_: NormalizedAgentRuntimeEvent) -> Bool {
+        false
+    }
+
+    private func shouldSuppressSessionLoadReplayUpdate(_ update: [String: Any]) -> Bool {
+        guard suppressSessionLoadReplayUpdates,
+              let sessionUpdate = (update["sessionUpdate"] as? String)?.lowercased()
+        else {
+            return false
+        }
+        switch sessionUpdate {
+        case "user_message_chunk", "agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update", "session_info_update", "available_commands_update", "plan", "usage_update":
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func handlePermissionRequest(id: JSONRPCID, params: [String: Any]) {
+        switch state {
+        case .failed, .closing, .closed:
+            return
+        default:
+            break
+        }
+        // A duplicate live wire ID is ambiguous even if it would be auto-approved.
+        guard pendingPermissionRequests[id.storageKey] == nil else {
+            handleProtocolViolation("Duplicate active ACP permission request ID")
+            return
+        }
+        guard
+            let sessionID = params["sessionId"] as? String,
+            let toolCall = params["toolCall"] as? [String: Any]
+        else {
+            return
+        }
+
+        let toolCallID = (toolCall["toolCallId"] as? String) ?? UUID().uuidString
+        let cachedToolCall = recentDevinToolCalls[toolCallID] ?? [:]
+        var resolvedToolCall = cachedToolCall
+        resolvedToolCall.merge(toolCall) { _, requestValue in requestValue }
+        // Cached tool-call fields are presentation context, never approval authority.
+        // Discard them when the permission request supplies contradictory details.
+        let identityKeys = ["title", "kind", "rawInput", "_meta"]
+        let requestSuppliesIdentity = identityKeys.contains { toolCall[$0] != nil }
+        let identityDiverges = identityKeys.contains { key in
+            guard let requestValue = toolCall[key] else { return false }
+            guard let cachedValue = cachedToolCall[key] else { return true }
+            return serializeJSON(requestValue) != serializeJSON(cachedValue)
+        }
+        if requestSuppliesIdentity, identityDiverges {
+            resolvedToolCall = toolCall
+        }
+        let toolTitle = (resolvedToolCall["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let toolKind = (resolvedToolCall["kind"] as? String)?.lowercased()
+        let rawInputJSON = serializeJSON(resolvedToolCall["rawInput"])
+        let optionDictionaries = params["options"] as? [[String: Any]] ?? []
+        let options = optionDictionaries.compactMap { optionDictionary -> PermissionOption? in
+            guard
+                let optionID = optionDictionary["optionId"] as? String,
+                let kind = optionDictionary["kind"] as? String
+            else { return nil }
+            return PermissionOption(
+                optionID: optionID,
+                kind: kind,
+                name: optionDictionary["name"] as? String
+            )
+        }
+
+        let plainAllowOptionID = preferredAllowOptionID(for: options, sessionScoped: false)
+        let plainAllowOptions = options.filter { $0.optionID == plainAllowOptionID }
+        let sessionApprovalScope: AgentApprovalSessionScope? = if provider.providerID == .grokBuild {
+            normalizedPermissionOptionValue(preferredAllowOptionID(for: options, sessionScoped: true)) == "allow-edits-session"
+                ? .editsSession : .oneTime
+        } else {
+            nil
+        }
+        let approvalID = UUID().uuidString
+        let request = AgentApprovalRequest(
+            requestID: .acp(approvalID),
+            method: "session/request_permission",
+            kind: approvalKind(for: toolKind),
+            threadID: sessionID,
+            turnID: sessionID,
+            itemID: toolCallID,
+            reason: toolTitle,
+            command: rawInputJSON,
+            cwd: sessionConfiguration.workingDirectory,
+            overseerOneTimeAllowAvailable: host.permissionOneTimeAllow(
+                options: options.map { (optionID: $0.optionID, kind: $0.kind) },
+                providerID: provider.providerID
+            ) != nil,
+            plainApproveAvailable: host.permissionOneTimeAllow(
+                options: plainAllowOptions.map { (optionID: $0.optionID, kind: $0.kind) },
+                providerID: provider.providerID
+            ) != nil,
+            sessionApprovalScope: sessionApprovalScope,
+            details: approvalDetails(
+                toolTitle: toolTitle,
+                toolKind: toolKind,
+                rawInputJSON: rawInputJSON,
+                options: options
+            )
+        )
+
+        // Supported ACP contracts do not authenticate tool metadata as an invocation
+        // of our injected RepoPrompt server. Names, titles, arguments, and `_meta`
+        // (including Devin's cognition.ai/toolName) therefore require manual approval.
+        // Only the user's explicit full-access setting can select automatically below.
+        if let fullAccessOptionID = fullAccessAutoApprovalOptionID(for: options) {
+            do {
+                try sendPermissionSelectionResponse(id: id, optionID: fullAccessOptionID)
+                log("Auto-approved ACP permission request for \(toolTitle ?? toolCallID) via \(provider.providerID.rawValue) full access option \(fullAccessOptionID)")
+                return
+            } catch {
+                log("Failed to auto-approve ACP permission request for \(toolTitle ?? toolCallID) via \(provider.providerID.rawValue) full access: \(error.localizedDescription)")
+            }
+        }
+
+        pendingPermissionRequests[id.storageKey] = PendingPermissionRequest(
+            rpcID: id,
+            options: options,
+            request: request
+        )
+        permissionStorageKeyByApprovalID[approvalID] = id.storageKey
+        emit(.approvalRequested(request))
+    }
+
+    private func handleProcessExit(_ exitCode: Int32, timedOut: Bool) async {
+        guard state != .closing, state != .closed else {
+            finishEventsIfNeeded()
+            return
+        }
+
+        if state == .promptRunning || !didEmitTerminal {
+            let message = timedOut
+                ? "ACP process timed out."
+                : "ACP process exited unexpectedly with code \(exitCode)."
+            emit(.stream(AIStreamResult(type: "error", text: message)))
+            emitTerminal(state: .failed, errorText: message)
+        }
+
+        failAllPromptSettlementWaiters(with: ControllerError.transportClosed)
+        failPendingRequests(with: ControllerError.transportClosed)
+        promptImagesSupported = false
+        state = .failed
+        await clearExpectedAgentPIDIfNeeded()
+        await cleanupLaunchArtifacts()
+        finishEventsIfNeeded()
+    }
+
+    private func handleProcessWaitFailure(_ error: Error) async {
+        guard state != .closing, state != .closed else {
+            finishEventsIfNeeded()
+            return
+        }
+
+        let message = "ACP process termination observation failed: \(error.localizedDescription)"
+        if state == .promptRunning || !didEmitTerminal {
+            emit(.stream(AIStreamResult(type: "error", text: message)))
+            emitTerminal(state: .failed, errorText: message)
+        }
+
+        failAllPromptSettlementWaiters(with: ControllerError.transportClosed)
+        failPendingRequests(with: ControllerError.transportClosed)
+        promptImagesSupported = false
+        state = .failed
+        await clearExpectedAgentPIDIfNeeded()
+        await cleanupLaunchArtifacts()
+        finishEventsIfNeeded()
+    }
+
+    private func registerExpectedAgentPIDIfNeeded(_ pid: pid_t) async {
+        guard let clientName = mcpClientNameHint else { return }
+        await host.registerExpectedAgentPID(pid, clientName: clientName, runID: expectedMCPRunID)
+        registeredExpectedAgentPID = pid
+        log("Registered expected MCP parent PID \(pid) for \(clientName) runID=\(expectedMCPRunID?.uuidString ?? "nil")")
+    }
+
+    private func clearExpectedAgentPIDIfNeeded() async {
+        guard let registeredExpectedAgentPID, let clientName = mcpClientNameHint else { return }
+        await host.clearExpectedAgentPID(registeredExpectedAgentPID, clientName: clientName, runID: expectedMCPRunID)
+        self.registeredExpectedAgentPID = nil
+        log("Cleared expected MCP parent PID for \(clientName) runID=\(expectedMCPRunID?.uuidString ?? "nil")")
+    }
+
+    // MARK: - Requests
+
+    private func openSession() async throws -> OpenSessionResult {
+        switch sessionConfiguration.mode {
+        case .new:
+            return try await openNewSession()
+        case let .load(existingSessionID):
+            guard loadSessionSupported else {
+                suppressSessionLoadReplayUpdates = false
+                throw ControllerError.requestFailed("ACP runtime does not support session/load for existing session \(existingSessionID).")
+            }
+            do {
+                suppressSessionLoadReplayUpdates = true
+                defer { suppressSessionLoadReplayUpdates = false }
+                beginOpeningSessionConfiguration()
+                log("Starting ACP session/load mcpServers=\(sessionConfiguration.mcpServers.count)")
+                diagnose(.phaseStarted("session/load"))
+                let requestResponse = try await sendRequestResponse(
+                    method: "session/load",
+                    params: sessionOpenParams(existingSessionID: existingSessionID)
+                )
+                let response = requestResponse.result
+                applyOpenedSessionConfiguration(
+                    from: response,
+                    sessionID: existingSessionID,
+                    inboundSequence: requestResponse.inboundSequence
+                )
+                diagnose(.phaseCompleted("session/load"))
+                log("Completed ACP session/load sessionID=\(existingSessionID)")
+                let identity = ACPProviderSessionIdentity(
+                    providerID: provider.providerID,
+                    runtimeSessionID: existingSessionID,
+                    loadSessionID: existingSessionID,
+                    loadSessionIDConfidence: .verified
+                )
+                providerSessionIdentity = identity
+                return OpenSessionResult(
+                    sessionID: existingSessionID,
+                    providerSessionIdentity: identity,
+                    invalidatedResumeSessionID: nil
+                )
+            } catch {
+                suppressSessionLoadReplayUpdates = false
+                log("ACP session/load failed for \(existingSessionID): \(error.localizedDescription)")
+                if shouldFallbackToNewSessionAfterLoadFailure(error, existingSessionID: existingSessionID) {
+                    fallbackResumeSessionIDForPromptClearing = existingSessionID
+                    log("Falling back to ACP session/new after missing \(provider.providerID.rawValue) session \(existingSessionID)")
+                    diagnose(.info("ACP session/load could not find \(provider.providerID.rawValue) session \(existingSessionID); opening a fresh session."))
+                    let fresh = try await openNewSession()
+                    return OpenSessionResult(
+                        sessionID: fresh.sessionID,
+                        providerSessionIdentity: fresh.providerSessionIdentity,
+                        invalidatedResumeSessionID: existingSessionID
+                    )
+                }
+                throw error
+            }
+        }
+    }
+
+    private func openNewSession() async throws -> OpenSessionResult {
+        suppressSessionLoadReplayUpdates = false
+        beginOpeningSessionConfiguration()
+        log("Starting ACP session/new mcpServers=\(sessionConfiguration.mcpServers.count)")
+        diagnose(.phaseStarted("session/new"))
+        let requestResponse = try await sendRequestResponse(
+            method: "session/new",
+            params: sessionOpenParams()
+        )
+        let response = requestResponse.result
+        guard let sessionID = response["sessionId"] as? String else {
+            throw ControllerError.protocolViolation("session/new response missing sessionId")
+        }
+        applyOpenedSessionConfiguration(
+            from: response,
+            sessionID: sessionID,
+            inboundSequence: requestResponse.inboundSequence
+        )
+        diagnose(.phaseCompleted("session/new"))
+        log("Completed ACP session/new sessionID=\(sessionID)")
+        let identity = ACPProviderSessionIdentity(
+            providerID: provider.providerID,
+            runtimeSessionID: sessionID,
+            loadSessionID: sessionID,
+            loadSessionIDConfidence: .verified
+        )
+        providerSessionIdentity = identity
+        return OpenSessionResult(
+            sessionID: sessionID,
+            providerSessionIdentity: identity,
+            invalidatedResumeSessionID: nil
+        )
+    }
+
+    private func sessionOpenParams(existingSessionID: String? = nil) -> [String: Any] {
+        var params: [String: Any] = [
+            "cwd": sessionConfiguration.workingDirectory,
+            "mcpServers": sessionConfiguration.mcpServers.map(\.acpJSONObject)
+        ]
+        if let existingSessionID {
+            params["sessionId"] = existingSessionID
+        }
+        if !sessionConfiguration.metadata.isEmpty {
+            params["_meta"] = sessionConfiguration.metadata.mapValues { $0.toAny() }
+        }
+        return params
+    }
+
+    private func sendRequest(
+        method: String,
+        params: [String: Any],
+        onWritten: (@Sendable () -> Void)? = nil
+    ) async throws -> [String: Any] {
+        try await sendRequestResponse(method: method, params: params, onWritten: onWritten).result
+    }
+
+    private func sendRequestResponse(
+        method: String,
+        params: [String: Any],
+        onWritten: (@Sendable () -> Void)? = nil
+    ) async throws -> RequestResponse {
+        guard process != nil else { throw ControllerError.processNotRunning }
+
+        let requestID = JSONRPCID.int(nextRequestID)
+        nextRequestID += 1
+
+        return try await withCheckedThrowingContinuation { continuation in
+            let timeoutTask = makeRequestTimeoutTaskIfNeeded(for: requestID, method: method)
+            pendingRequests[requestID.storageKey] = PendingRequest(
+                method: method,
+                continuation: continuation,
+                timeoutTask: timeoutTask
+            )
+            do {
+                try sendJSONLine([
+                    "jsonrpc": "2.0",
+                    "id": requestID.jsonValue,
+                    "method": method,
+                    "params": params
+                ])
+                onWritten?()
+            } catch {
+                let pendingRequest = pendingRequests.removeValue(forKey: requestID.storageKey)
+                pendingRequest?.timeoutTask?.cancel()
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+
+    private func sendJSONLine(_ payload: [String: Any]) throws {
+        guard let stdinDescriptor = process?.stdinDescriptor else {
+            throw ControllerError.processNotRunning
+        }
+        #if DEBUG
+            captureRawACPEvent(kind: "jsonrpc.outbound", payload: payload)
+        #endif
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [])
+        var frame = data
+        frame.append(0x0A)
+        if let line = String(data: data, encoding: .utf8) {
+            diagnose(.outboundJSON(line))
+        }
+        try FDWriteSupport.writeAll(frame, to: stdinDescriptor)
+    }
+
+    private func failPendingRequests(with error: Error) {
+        let permissions = pendingPermissionRequests.values
+        pendingPermissionRequests.removeAll()
+        permissionStorageKeyByApprovalID.removeAll()
+        for permission in permissions {
+            emit(.approvalCancelled(permission.request.requestID))
+        }
+        let pending = pendingRequests.values
+        pendingRequests.removeAll()
+        for pendingRequest in pending {
+            pendingRequest.timeoutTask?.cancel()
+            pendingRequest.continuation.resume(throwing: error)
+        }
+    }
+
+    private func handleProtocolViolation(_ message: String) {
+        emit(.stream(AIStreamResult(type: "error", text: message)))
+        failPendingRequests(with: ControllerError.protocolViolation(message))
+        if state == .promptRunning {
+            emitTerminal(state: .failed, errorText: message)
+        }
+        if state != .closing, state != .closed {
+            state = .failed
+        }
+    }
+
+    private func requestTimeoutInterval(for method: String) -> TimeInterval? {
+        switch method {
+        case "initialize", "authenticate", "session/new", "session/load":
+            requestTimeouts.bootstrapSeconds
+        case "cursor/list_available_models", "session/set_config_option", "session/set_model":
+            requestTimeouts.operationalSeconds
+        default:
+            nil
+        }
+    }
+
+    private func makeRequestTimeoutTaskIfNeeded(
+        for requestID: JSONRPCID,
+        method: String
+    ) -> Task<Void, Never>? {
+        guard let timeoutSeconds = requestTimeoutInterval(for: method), timeoutSeconds > 0 else {
+            return nil
+        }
+        return Task { [weak self] in
+            let duration = UInt64((timeoutSeconds * 1_000_000_000).rounded())
+            do {
+                try await Task.sleep(nanoseconds: duration)
+            } catch {
+                return
+            }
+            await self?.handleRequestTimeout(
+                requestID: requestID,
+                method: method,
+                timeoutSeconds: timeoutSeconds
+            )
+        }
+    }
+
+    private func handleRequestTimeout(
+        requestID: JSONRPCID,
+        method: String,
+        timeoutSeconds: TimeInterval
+    ) {
+        for storageKey in candidateStorageKeys(for: requestID) {
+            guard let pendingRequest = pendingRequests.removeValue(forKey: storageKey) else { continue }
+            pendingRequest.timeoutTask?.cancel()
+            let error = ControllerError.requestTimedOut(
+                method: method,
+                timeoutSeconds: timeoutSeconds,
+                launchDescription: launchDescription,
+                diagnosticHint: timeoutDiagnosticHint()
+            )
+            diagnose(.info(error.localizedDescription))
+            pendingRequest.continuation.resume(throwing: error)
+            return
+        }
+    }
+
+    private func timeoutDiagnosticHint() -> String {
+        if invalidACPLineCount > 0 {
+            let preview = lastInvalidACPLinePreview.map { " Last non-ACP stdout line: `\($0)`." } ?? ""
+            return "The process wrote stdout, but at least one line was not newline-delimited ACP JSON.\(preview)"
+        }
+        if stdoutLineCount > 0 {
+            let preview = lastStdoutPreview.map { " Last stdout line: `\($0)`." } ?? ""
+            return "The process wrote stdout, but no matching ACP response arrived for this request.\(preview)"
+        }
+        if stdoutByteCount > 0 {
+            return "The process wrote \(stdoutByteCount) stdout byte(s), but no newline-delimited ACP JSON response was parsed."
+        }
+        if stderrLineCount > 0 {
+            let preview = lastStderrPreview.map { " Last stderr line: `\($0)`." } ?? ""
+            return "The process did not write ACP stdout before timing out, but it wrote stderr.\(preview)"
+        }
+        return "The process stayed silent on ACP stdout/stderr. This usually means the selected command started an interactive/non-ACP mode instead of an ACP stdio server."
+    }
+
+    private static func displayCommand(command: String, arguments: [String]) -> String {
+        ([command] + arguments).map(displayShellToken).joined(separator: " ")
+    }
+
+    private static func displayShellToken(_ token: String) -> String {
+        guard !token.isEmpty else { return "''" }
+        let safeScalars = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-/=:"))
+        if token.unicodeScalars.allSatisfy({ safeScalars.contains($0) }) {
+            return token
+        }
+        return "'\(token.replacingOccurrences(of: "'", with: "'\\''"))'"
+    }
+
+    private static func truncatedDiagnosticPreview(_ text: String, limit: Int = 240) -> String {
+        guard text.count > limit else { return text }
+        let end = text.index(text.startIndex, offsetBy: limit)
+        return String(text[..<end]) + "…"
+    }
+
+    // MARK: - Helpers
+
+    /// A later parameter or mode mutation can invalidate an earlier successful
+    /// selection. Admit the complete effective request using only live session
+    /// authority, immediately before dispatching the prompt.
+    private func validatePromptModelParameterSelections(_ request: ACPRunRequest) throws {
+        guard provider.supportsParameterizedModelPicker,
+              !request.modelParameterSelections.isEmpty
+        else { return }
+        guard sessionModelSnapshotHasLiveAuthority,
+              let models = discoveredSessionModels,
+              let currentModel = models.currentModelRaw,
+              let parameterSet = models.modelParameterSets.first(where: {
+                  host.canonicalParameterModelRaw(
+                      $0.baseModelRaw,
+                      providerID: provider.providerID
+                  ) == host.canonicalParameterModelRaw(
+                      currentModel,
+                      providerID: provider.providerID
+                  )
+              })
+        else {
+            throw ControllerError.requestFailed("Model parameters are unavailable before prompt submission.")
+        }
+        if let requestedModel = normalizedModelString(request.modelString),
+           host.canonicalParameterModelRaw(
+               requestedModel,
+               providerID: provider.providerID
+           ) != host.canonicalParameterModelRaw(
+               currentModel,
+               providerID: provider.providerID
+           )
+        {
+            throw ControllerError.requestFailed("Model changed before prompt submission. Retry the requested configuration.")
+        }
+        for selection in host.normalizedModelParameterSelections(request.modelParameterSelections) {
+            guard host.parameterIdentityMatches(
+                selection,
+                providerID: provider.providerID,
+                baseModelRaw: currentModel,
+                kind: selection.kind
+            ),
+                let definition = parameterSet.definition(kind: selection.kind),
+                let choice = definition.choice(matching: selection.valueRaw),
+                definition.currentValueRaw == choice.rawValue
+            else {
+                throw ControllerError.requestFailed(
+                    "\(selection.kind.rawValue.capitalized) selection is no longer current before prompt submission. Retry the requested configuration."
+                )
+            }
+        }
+    }
+
+    private func effectivePromptRunRequest(override: ACPRunRequest?) -> ACPRunRequest {
+        let request = override ?? runRequest
+        let resume = request.resumeSessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let resume,
+              !resume.isEmpty,
+              resume == fallbackResumeSessionIDForPromptClearing
+        else {
+            return request
+        }
+        return ACPRunRequest(
+            agentKind: request.agentKind,
+            modelString: request.modelString,
+            workspacePath: request.workspacePath,
+            resumeSessionID: nil,
+            attachments: request.attachments,
+            taskLabelKind: request.taskLabelKind,
+            sessionModeID: request.sessionModeID,
+            autoApproveAllToolPermissions: request.autoApproveAllToolPermissions,
+            launchPermissionMode: request.launchPermissionMode,
+            modelParameterSelections: request.modelParameterSelections
+        )
+    }
+
+    private func shouldFallbackToNewSessionAfterLoadFailure(_ error: Error, existingSessionID _: String) -> Bool {
+        guard case let ControllerError.requestFailed(message, code) = error else { return false }
+        let lowercased = message.lowercased()
+        let looksLikeMissingSession = lowercased.contains("session")
+            && lowercased.contains("not found")
+        let looksLikeInvalidParams = code == -32602
+            || lowercased.contains("invalid params")
+        if looksLikeMissingSession, looksLikeInvalidParams {
+            return true
+        }
+
+        return false
+    }
+
+    private func logLaunchContract(command resolvedCommand: String, workingDirectory: String) {
+        log("ACP launch command=\(resolvedCommand) args=\(safeLaunchArgumentsDescription()) cwd=\(workingDirectory)")
+    }
+
+    private func recordRunLaunchContract(
+        event: String,
+        resolvedCommand: String,
+        workingDirectory: String,
+        pid: pid_t?,
+        error: Error?
+    ) async {
+        #if DEBUG
+            guard let runID = expectedMCPRunID else { return }
+            var fields: [String: String] = [
+                "provider_id": boundedRunDiagnosticField(provider.providerID.rawValue),
+                "mcp_client_name": boundedRunDiagnosticField(mcpClientNameHint ?? "nil"),
+                "configured_command": boundedRunDiagnosticField(displayRunDiagnosticPath(launchConfiguration.command)),
+                "resolved_executable": boundedRunDiagnosticField(displayRunDiagnosticPath(resolvedCommand)),
+                "canonical_executable": boundedRunDiagnosticField(displayRunDiagnosticPath(URL(fileURLWithPath: resolvedCommand).resolvingSymlinksInPath().standardizedFileURL.path)),
+                "final_args": boundedRunDiagnosticField(safeLaunchArgumentsDescription()),
+                "working_directory": boundedRunDiagnosticField(displayRunDiagnosticPath(workingDirectory)),
+                "injected_mcp_command": boundedRunDiagnosticField(injectedMCPCommandDescription())
+            ]
+            if let pid {
+                fields["acp_pid"] = String(pid)
+            }
+            if let error {
+                fields["error_kind"] = host.diagnosticErrorKind(error)
+                fields["error_type"] = boundedRunDiagnosticField(String(reflecting: type(of: error)))
+                fields["error_code"] = String((error as NSError).code)
+            }
+            await host.recordRunRoutingEvent(
+                runID: runID,
+                event: event,
+                fields: fields
+            )
+        #endif
+    }
+
+    private func logSessionMCPInjection() {
+        guard !sessionConfiguration.mcpServers.isEmpty else {
+            log("ACP session mcpServers empty")
+            return
+        }
+        for server in sessionConfiguration.mcpServers {
+            log("ACP session mcpServer name=\(server.name) command=\(server.command) argsCount=\(server.args.count) envCount=\(server.env.count)")
+        }
+    }
+
+    private func safeLaunchArgumentsDescription() -> String {
+        safeArgumentsDescription(launchConfiguration.arguments)
+    }
+
+    private func safeArgumentsDescription(_ arguments: [String]) -> String {
+        boundedRunDiagnosticField(Self.redactedLaunchArguments(arguments).joined(separator: " "))
+    }
+
+    private static func redactedLaunchArguments(_ arguments: [String]) -> [String] {
+        var result: [String] = []
+        var redactNext = false
+        for argument in arguments {
+            if redactNext {
+                result.append("<redacted>")
+                redactNext = false
+                continue
+            }
+            let lowercased = argument.lowercased()
+            if lowercased.contains("authorization:")
+                || lowercased.contains("proxy-authorization:")
+                || lowercased.hasPrefix("bearer ")
+            {
+                result.append("<redacted>")
+                continue
+            }
+            if let equals = argument.firstIndex(of: "="), shouldRedactLaunchArgumentName(String(argument[..<equals])) {
+                result.append("\(argument[..<equals])=<redacted>")
+                continue
+            }
+            if argument.hasPrefix("-"), shouldRedactLaunchArgumentName(argument) {
+                result.append(argument)
+                redactNext = true
+                continue
+            }
+            result.append(redactedLaunchJSONArgument(argument) ?? argument)
+        }
+        return result
+    }
+
+    private static func redactedLaunchJSONArgument(_ argument: String) -> String? {
+        let trimmed = argument.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("{") || trimmed.hasPrefix("[") else { return nil }
+        guard let data = trimmed.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data),
+              let sanitizedData = try? JSONSerialization.data(
+                  withJSONObject: sanitizedLaunchJSONValue(json),
+                  options: [.sortedKeys]
+              )
+        else {
+            return nil
+        }
+        return String(data: sanitizedData, encoding: .utf8)
+    }
+
+    private static func sanitizedLaunchJSONValue(_ value: Any) -> Any {
+        if let object = value as? [String: Any] {
+            return object.reduce(into: [String: Any]()) { result, entry in
+                result[entry.key] = shouldRedactLaunchJSONFieldName(entry.key)
+                    ? "<redacted>"
+                    : sanitizedLaunchJSONValue(entry.value)
+            }
+        }
+        if let array = value as? [Any] {
+            return array.map(sanitizedLaunchJSONValue)
+        }
+        return value
+    }
+
+    private func injectedMCPCommandDescription() -> String {
+        var commands = sessionConfiguration.mcpServers.map { server in
+            let args = safeArgumentsDescription(server.args)
+            return args.isEmpty ? "\(server.name):\(server.command)" : "\(server.name):\(server.command) \(args)"
+        }
+        if let configContent = launchConfiguration.environment["OPENCODE_CONFIG_CONTENT"],
+           let data = configContent.data(using: .utf8),
+           let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let servers = root["mcp"] as? [String: Any]
+        {
+            for key in servers.keys.sorted() where key.caseInsensitiveCompare(RepoPromptMCPServerConfiguration.defaultServerName) == .orderedSame {
+                guard let server = servers[key] as? [String: Any],
+                      server["enabled"] as? Bool != false,
+                      let command = server["command"] as? [String],
+                      let executable = command.first
+                else { continue }
+                let args = safeArgumentsDescription(Array(command.dropFirst()))
+                commands.append(args.isEmpty ? "\(key):\(executable)" : "\(key):\(executable) \(args)")
+            }
+        }
+        return boundedRunDiagnosticField(commands.isEmpty ? "none" : commands.joined(separator: " | "))
+    }
+
+    private func boundedRunDiagnosticField(_ value: String) -> String {
+        Self.truncatedDiagnosticPreview(value, limit: 480)
+    }
+
+    private static func shouldRedactLaunchArgumentName(_ argument: String) -> Bool {
+        let lowercased = argument.lowercased()
+        return [
+            "api-key", "api_key", "apikey", "auth", "bearer", "content", "cookie", "credential",
+            "env", "header", "input", "instruction", "message", "password", "prompt", "query", "secret", "token"
+        ].contains { lowercased.contains($0) }
+            || lowercased == "--key"
+            || lowercased.hasSuffix("-key")
+            || lowercased.hasSuffix("_key")
+    }
+
+    private static func shouldRedactLaunchJSONFieldName(_ fieldName: String) -> Bool {
+        let lowercased = fieldName.lowercased()
+        return lowercased.contains("token")
+            || lowercased.contains("password")
+            || lowercased.contains("secret")
+            || lowercased.contains("credential")
+            || lowercased.hasSuffix("key")
+    }
+
+    private func displayRunDiagnosticPath(_ value: String) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
+        guard value == home || value.hasPrefix(home + "/") else { return value }
+        return "~" + String(value.dropFirst(home.count))
+    }
+
+    private func resolvedEnvironment() async -> [String: String] {
+        let result = await ProcessEnvironmentBuilder.build(
+            ProcessEnvironmentRequest(
+                purpose: .acpAgent(providerID: provider.providerID.rawValue),
+                overrides: launchConfiguration.environment,
+                enableDebugLogging: launchConfiguration.enableDebugLogging
+            )
+        )
+        let filtered = await host.filterEnvironment(
+            result.environment,
+            launchConfiguration: launchConfiguration,
+            kind: runRequest.agentKind
+        )
+        return host.mergingCurrentCarrier(into: filtered)
+    }
+
+    private func beginOpeningSessionConfiguration() {
+        clearAdvertisedCommands()
+        discoveredSessionModels = nil
+        sessionModelConfigOptionID = nil
+        sessionModelDirectSelectionSupported = false
+        sessionModelSnapshotHasLiveAuthority = false
+        sessionModelFailureReason = nil
+        sessionModeSnapshot = nil
+        sessionModeFailureReason = nil
+        lastAppliedConfigurationSequence = 0
+        bufferedConfigOptionUpdates.removeAll()
+    }
+
+    private func applyOpenedSessionConfiguration(
+        from response: [String: Any],
+        sessionID: String,
+        inboundSequence: UInt64
+    ) {
+        applyInitialSessionConfiguration(from: response, inboundSequence: inboundSequence)
+        let updates = bufferedConfigOptionUpdates
+            .filter { $0.sessionID == sessionID && $0.inboundSequence > inboundSequence }
+            .sorted { $0.inboundSequence < $1.inboundSequence }
+        bufferedConfigOptionUpdates.removeAll()
+        for update in updates {
+            applyConfigOptionUpdate(update.update, inboundSequence: update.inboundSequence)
+        }
+    }
+
+    private func applyInitialSessionConfiguration(from response: [String: Any], inboundSequence: UInt64) {
+        switch parseModernModeSnapshot(from: response) {
+        case let .valid(snapshot):
+            sessionModeFailureReason = nil
+            sessionModeSnapshot = snapshot
+            if response["modes"] != nil {
+                diagnose(.info("ACP session also advertised legacy modes; ignoring them because configOptions is the only supported mode authority."))
+            }
+        case .absent:
+            sessionModeSnapshot = nil
+            sessionModeFailureReason = nil
+            if response["modes"] != nil {
+                diagnose(.info("Ignoring legacy ACP modes metadata because mode selection requires a modern configOptions selector."))
+            }
+        case let .malformed(reason):
+            sessionModeSnapshot = nil
+            sessionModeFailureReason = reason
+            diagnose(.info("ACP session advertised a malformed modern mode config option: \(reason)"))
+        }
+        applyDiscoveredSessionModels(from: response, inboundSequence: inboundSequence)
+        lastAppliedConfigurationSequence = inboundSequence
+    }
+
+    private func parseModernModeSnapshot(from response: [String: Any]) -> ParsedModernModeSnapshot {
+        guard let rawConfigOptions = response["configOptions"] else { return .absent }
+        guard let configOptions = rawConfigOptions as? [[String: Any]] else {
+            return .malformed("configOptions is not an array")
+        }
+        return parseModernModeSnapshot(fromConfigOptions: configOptions)
+    }
+
+    private func parseModernModeSnapshot(fromConfigOptions configOptions: [[String: Any]]) -> ParsedModernModeSnapshot {
+        switch parseSelectConfigOption(category: "mode", from: configOptions) {
+        case .absent:
+            return .absent
+        case let .malformed(reason):
+            return .malformed(reason)
+        case let .valid(option):
+            let values = deduplicatedExactValues(option.choices.compactMap { normalizedConfigValue($0["value"] as? String) })
+            guard !values.isEmpty else {
+                return .malformed("mode selector '\(option.id)' has no usable values")
+            }
+            guard let currentValue = canonicalAdvertisedValue(option.currentValue, in: values) else {
+                return .malformed("mode selector '\(option.id)' currentValue is not one of its advertised values")
+            }
+            return .valid(SessionModeSnapshot(
+                configID: option.id,
+                currentValue: currentValue,
+                availableValues: values
+            ))
+        }
+    }
+
+    private func parseSelectConfigOption(
+        category: String,
+        from configOptions: [[String: Any]]
+    ) -> ParsedSelectConfigOptionResult {
+        let normalizedCategory = category.lowercased()
+        let recognizedSemanticIDs: Set = ["mode", "model"]
+        let conflicting = configOptions.contains { option in
+            guard let optionID = normalizedConfigValue(option["id"] as? String)?.lowercased(),
+                  let optionCategory = normalizedConfigValue(option["category"] as? String)?.lowercased(),
+                  recognizedSemanticIDs.contains(optionID),
+                  recognizedSemanticIDs.contains(optionCategory),
+                  optionID != optionCategory
+            else {
+                return false
+            }
+            return optionID == normalizedCategory || optionCategory == normalizedCategory
+        }
+        guard !conflicting else {
+            return .malformed("\(category) config option has conflicting id/category semantics")
+        }
+
+        let candidates = configOptions.filter { option in
+            let optionCategory = normalizedConfigValue(option["category"] as? String)?.lowercased()
+            if optionCategory == normalizedCategory {
+                return true
+            }
+            guard optionCategory == nil else { return false }
+            return normalizedConfigValue(option["id"] as? String)?.lowercased() == normalizedCategory
+        }
+        guard !candidates.isEmpty else { return .absent }
+        guard candidates.count == 1, let candidate = candidates.first else {
+            return .malformed("multiple \(category) config options were advertised")
+        }
+        guard normalizedConfigValue(candidate["type"] as? String)?.lowercased() == "select" else {
+            return .malformed("\(category) config option is not a select option")
+        }
+        guard let id = normalizedConfigValue(candidate["id"] as? String) else {
+            return .malformed("\(category) config option is missing id")
+        }
+        guard let currentValue = normalizedConfigValue(candidate["currentValue"] as? String) else {
+            return .malformed("\(category) config option '\(id)' is missing currentValue")
+        }
+        guard let choices = flattenedConfigOptionChoices(from: candidate["options"]), !choices.isEmpty else {
+            return .malformed("\(category) config option '\(id)' has malformed or empty options")
+        }
+        return .valid(ParsedSelectConfigOption(id: id, currentValue: currentValue, choices: choices))
+    }
+
+    private func flattenedConfigOptionChoices(from rawValue: Any?) -> [[String: Any]]? {
+        guard let dictionaries = rawValue as? [[String: Any]] else { return nil }
+        var choices: [[String: Any]] = []
+        for dictionary in dictionaries {
+            if normalizedConfigValue(dictionary["value"] as? String) != nil {
+                choices.append(dictionary)
+                continue
+            }
+            guard let nested = flattenedConfigOptionChoices(from: dictionary["options"]), !nested.isEmpty else {
+                return nil
+            }
+            choices.append(contentsOf: nested)
+        }
+        return choices
+    }
+
+    private func normalizedConfigValue(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
+    }
+
+    private func deduplicatedExactValues(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        return values.filter { seen.insert($0).inserted }
+    }
+
+    private func canonicalAdvertisedValue(_ requestedValue: String, in availableValues: [String]) -> String? {
+        if let exact = availableValues.first(where: { $0 == requestedValue }) {
+            return exact
+        }
+        let matches = availableValues.filter { $0.caseInsensitiveCompare(requestedValue) == .orderedSame }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
+    private func canonicalSessionModelValue(_ requestedValue: String) throws -> String {
+        let availableValues = discoveredSessionModels?.options.map(\.rawValue) ?? []
+        guard !availableValues.isEmpty else {
+            throw ControllerError.protocolViolation("modern model selector has no advertised values")
+        }
+        if let exact = availableValues.first(where: { $0 == requestedValue }) {
+            return exact
+        }
+        let matches = availableValues.filter { $0.caseInsensitiveCompare(requestedValue) == .orderedSame }
+        if matches.count == 1, let canonical = matches.first {
+            return canonical
+        }
+        if matches.count > 1 {
+            throw ControllerError.requestFailed("ACP runtime advertises case-colliding models for '\(requestedValue)'. Use an exact value.")
+        }
+        throw ControllerError.requestFailed("ACP runtime does not advertise model '\(requestedValue)'.")
+    }
+
+    private func canonicalSessionModeValue(
+        _ requestedValue: String,
+        in snapshot: SessionModeSnapshot
+    ) throws -> String {
+        if let exact = snapshot.availableValues.first(where: { $0 == requestedValue }) {
+            return exact
+        }
+        let matches = snapshot.availableValues.filter { $0.caseInsensitiveCompare(requestedValue) == .orderedSame }
+        if matches.count == 1, let canonical = matches.first {
+            return canonical
+        }
+        if matches.count > 1 {
+            throw ControllerError.requestFailed("ACP runtime advertises case-colliding session modes for '\(requestedValue)'. Use an exact value. Available modes: \(advertisedSessionModeDescription(snapshot)).")
+        }
+        throw ControllerError.requestFailed("ACP runtime does not advertise session mode '\(requestedValue)'. Available modes: \(advertisedSessionModeDescription(snapshot)).")
+    }
+
+    private func advertisedSessionModeDescription(_ snapshot: SessionModeSnapshot) -> String {
+        snapshot.availableValues.isEmpty ? "none" : snapshot.availableValues.joined(separator: ", ")
+    }
+
+    #if DEBUG
+        package func debugSuspendNextConfigurationMutationPostcheck() {
+            debugShouldSuspendNextConfigurationMutationPostcheck = true
+        }
+
+        package func debugIsConfigurationMutationPostcheckSuspended() -> Bool {
+            debugConfigurationMutationPostcheckIsSuspended
+        }
+
+        package func debugResumeConfigurationMutationPostcheck() {
+            debugShouldSuspendNextConfigurationMutationPostcheck = false
+            debugConfigurationMutationPostcheckIsSuspended = false
+            let waiters = debugConfigurationMutationPostcheckResumeWaiters
+            debugConfigurationMutationPostcheckResumeWaiters.removeAll()
+            for waiter in waiters {
+                waiter.resume()
+            }
+        }
+
+        private func debugSuspendConfigurationMutationPostcheckIfNeeded() async {
+            guard debugShouldSuspendNextConfigurationMutationPostcheck else { return }
+            debugShouldSuspendNextConfigurationMutationPostcheck = false
+            debugConfigurationMutationPostcheckIsSuspended = true
+            await withCheckedContinuation { continuation in
+                debugConfigurationMutationPostcheckResumeWaiters.append(continuation)
+            }
+            debugConfigurationMutationPostcheckIsSuspended = false
+        }
+    #endif
+
+    private func applyVerifiedConfigOptionsMutationResponse(
+        _ response: RequestResponse,
+        requiredModeValue: String?,
+        requiredModelValue: String?,
+        requiredParameter: (configID: String, valueRaw: String)? = nil
+    ) async throws {
+        guard let configOptions = response.result["configOptions"] as? [[String: Any]] else {
+            throw ControllerError.protocolViolation("session/set_config_option response missing complete configOptions snapshot")
+        }
+        let parsedMode = parseModernModeSnapshot(fromConfigOptions: configOptions)
+        if requiredModeValue != nil || sessionModeSnapshot != nil {
+            guard case let .valid(modeSnapshot) = parsedMode else {
+                throw ControllerError.protocolViolation("session/set_config_option response missing a valid modern mode selector")
+            }
+            if let requiredModeValue, modeSnapshot.currentValue != requiredModeValue {
+                throw ControllerError.protocolViolation("session/set_config_option response did not confirm requested mode '\(requiredModeValue)'")
+            }
+        } else if case let .malformed(reason) = parsedMode {
+            throw ControllerError.protocolViolation("session/set_config_option response contained malformed mode metadata: \(reason)")
+        }
+
+        let parsedModel = parseModernModelSnapshot(fromConfigOptions: configOptions)
+        switch parsedModel {
+        case let .valid(_, models):
+            if let requiredModelValue, models.currentModelRaw != requiredModelValue {
+                throw ControllerError.protocolViolation("session/set_config_option response did not confirm requested model '\(requiredModelValue)'")
+            }
+            if let requiredParameter {
+                let definitions = models.modelParameterSets.flatMap(\.parameters)
+                guard let definition = definitions.first(where: { $0.configID == requiredParameter.configID }),
+                      definition.currentValueRaw == requiredParameter.valueRaw
+                else {
+                    throw ControllerError.protocolViolation(
+                        "session/set_config_option response did not confirm parameter '\(requiredParameter.configID)' value '\(requiredParameter.valueRaw)'"
+                    )
+                }
+            }
+        case .absent:
+            if requiredModelValue != nil || sessionModelConfigOptionID != nil {
+                throw ControllerError.protocolViolation("session/set_config_option response missing model selector")
+            }
+        case let .malformed(reason):
+            throw ControllerError.protocolViolation("session/set_config_option response contained malformed model metadata: \(reason)")
+        }
+
+        if response.inboundSequence >= lastAppliedConfigurationSequence {
+            applyConfigOptionsSnapshot(
+                configOptions,
+                parsedMode: parsedMode,
+                inboundSequence: response.inboundSequence
+            )
+        }
+        #if DEBUG
+            await debugSuspendConfigurationMutationPostcheckIfNeeded()
+        #endif
+        if let requiredModeValue,
+           sessionModeSnapshot?.currentValue != requiredModeValue
+        {
+            throw ControllerError.protocolViolation("newer ACP configuration state no longer confirms requested mode '\(requiredModeValue)'")
+        }
+        if let requiredModelValue,
+           discoveredSessionModels?.currentModelRaw != requiredModelValue
+        {
+            throw ControllerError.protocolViolation("newer ACP configuration state no longer confirms requested model '\(requiredModelValue)'")
+        }
+        if let requiredParameter {
+            let definitions = discoveredSessionModels?.modelParameterSets.flatMap(\.parameters) ?? []
+            guard let definition = definitions.first(where: { $0.configID == requiredParameter.configID }),
+                  definition.currentValueRaw == requiredParameter.valueRaw
+            else {
+                throw ControllerError.protocolViolation(
+                    "newer ACP configuration state no longer confirms parameter '\(requiredParameter.configID)' value '\(requiredParameter.valueRaw)'"
+                )
+            }
+        }
+    }
+
+    private func handleConfigOptionUpdateNotification(
+        paramsSessionID: String?,
+        update: [String: Any],
+        inboundSequence: UInt64
+    ) {
+        guard let notificationSessionID = normalizedConfigValue(paramsSessionID) else {
+            diagnose(.info("Ignoring config_option_update without a sessionId."))
+            return
+        }
+        guard let currentSessionID = sessionID else {
+            guard state == .openingSession else {
+                diagnose(.info("Ignoring config_option_update for unopened session \(notificationSessionID)."))
+                return
+            }
+            bufferedConfigOptionUpdates.append(BufferedConfigOptionUpdate(
+                sessionID: notificationSessionID,
+                update: update,
+                inboundSequence: inboundSequence
+            ))
+            if bufferedConfigOptionUpdates.count > 16 {
+                bufferedConfigOptionUpdates.removeFirst(bufferedConfigOptionUpdates.count - 16)
+            }
+            diagnose(.info("Buffered config_option_update until session \(notificationSessionID) is established."))
+            return
+        }
+        guard currentSessionID == notificationSessionID else {
+            diagnose(.info("Ignoring config_option_update for non-current session \(notificationSessionID)."))
+            return
+        }
+        applyConfigOptionUpdate(update, inboundSequence: inboundSequence)
+    }
+
+    private func applyConfigOptionUpdate(_ update: [String: Any], inboundSequence: UInt64) {
+        guard let configOptions = update["configOptions"] as? [[String: Any]] else {
+            diagnose(.info("Ignoring config_option_update without a complete configOptions snapshot."))
+            return
+        }
+        guard inboundSequence >= lastAppliedConfigurationSequence else {
+            diagnose(.info("Ignoring stale config_option_update snapshot."))
+            return
+        }
+        let parsedMode = parseModernModeSnapshot(fromConfigOptions: configOptions)
+        applyConfigOptionsSnapshot(
+            configOptions,
+            parsedMode: parsedMode,
+            inboundSequence: inboundSequence
+        )
+        diagnose(.info("Processed authoritative config_option_update snapshot."))
+    }
+
+    private func applyConfigOptionsSnapshot(
+        _ configOptions: [[String: Any]],
+        parsedMode: ParsedModernModeSnapshot,
+        inboundSequence: UInt64
+    ) {
+        guard inboundSequence >= lastAppliedConfigurationSequence else { return }
+        switch parsedMode {
+        case let .valid(snapshot):
+            sessionModeSnapshot = snapshot
+            sessionModeFailureReason = nil
+        case .absent:
+            sessionModeSnapshot = nil
+            sessionModeFailureReason = nil
+        case let .malformed(reason):
+            sessionModeSnapshot = nil
+            sessionModeFailureReason = reason
+            diagnose(.info("Invalidated session mode authority after malformed modern snapshot: \(reason)"))
+        }
+        let response: [String: Any] = ["configOptions": configOptions]
+        applyDiscoveredSessionModels(from: response, inboundSequence: inboundSequence)
+        lastAppliedConfigurationSequence = inboundSequence
+    }
+
+    private func applyDiscoveredSessionModels(from response: [String: Any], inboundSequence: UInt64) {
+        // A config-only report may update current direct effort authority, but it never
+        // replaces the live direct catalog or the provider-owned advertisement/wire mapping.
+        if let directProvider = provider as? ACPDirectSessionModelProvider,
+           response["models"] == nil,
+           sessionModelDirectSelectionSupported,
+           sessionModelSnapshotHasLiveAuthority
+        {
+            guard let models = discoveredSessionModels,
+                  let configOptions = response["configOptions"] as? [[String: Any]],
+                  let sessionID,
+                  let report = directProvider.parseDirectSessionEffortReport(
+                      from: configOptions, sessionID: sessionID, options: models.options
+                  )
+            else { return }
+            var updated = ACPDiscoveredSessionModels(
+                options: models.options,
+                currentModelRaw: report.baseModelRaw,
+                currentEffortRaw: report.effortRaw,
+                modelParameterSets: models.modelParameterSets,
+                hasModelParameterMetadata: models.hasModelParameterMetadata
+            )
+            updated.currentEffortInboundSequence = inboundSequence
+            discoveredSessionModels = updated
+            publishDiscoveredSessionModelsIfGloballyAuthoritative(updated)
+            return
+        }
+
+        let parsed: ACPDiscoveredSessionModels?
+        // ponytail: grok CLI >= 1.0.17 sends `configOptions` next to its legacy `models` block;
+        // only the direct provider parser carries Grok's effort wire values, so let it win and
+        // keep the provider on the direct path when no live snapshot has been established yet.
+        let useDirectParser = provider is ACPDirectSessionModelProvider
+            && (response["models"] != nil || sessionModelDirectSelectionSupported)
+        switch useDirectParser ? .absent : parseModernModelSnapshot(from: response) {
+        case let .valid(configID, models):
+            sessionModelConfigOptionID = configID
+            sessionModelDirectSelectionSupported = false
+            sessionModelFailureReason = nil
+            parsed = models
+            if response["models"] != nil {
+                diagnose(.info("ACP session advertised both configOptions and legacy models; using authoritative configOptions model selector."))
+            }
+        case .absent:
+            sessionModelConfigOptionID = nil
+            sessionModelFailureReason = nil
+            if let directProvider = provider as? ACPDirectSessionModelProvider {
+                switch directProvider.parseDirectSessionModelSnapshot(from: response) {
+                case let .valid(models):
+                    sessionModelDirectSelectionSupported = true
+                    parsed = models
+                case .absent:
+                    // Conforming providers guarantee the direct selection RPC; explicit
+                    // models validate against this snapshot or the warmed registry.
+                    sessionModelDirectSelectionSupported = true
+                    parsed = nil
+                case let .malformed(reason):
+                    sessionModelDirectSelectionSupported = false
+                    sessionModelFailureReason = reason
+                    parsed = nil
+                    diagnose(.info("ACP session advertised malformed provider model metadata: \(reason)"))
+                }
+            } else {
+                sessionModelDirectSelectionSupported = false
+                parsed = nil
+                if response["models"] != nil {
+                    diagnose(.info("Ignoring legacy ACP models metadata because model discovery and selection require configOptions."))
+                }
+            }
+        case let .malformed(reason):
+            sessionModelConfigOptionID = nil
+            sessionModelDirectSelectionSupported = false
+            sessionModelFailureReason = reason
+            parsed = nil
+            diagnose(.info("ACP session advertised a malformed modern model config option; legacy fallback is disabled: \(reason)"))
+        }
+
+        discoveredSessionModels = parsed
+        sessionModelSnapshotHasLiveAuthority = parsed != nil
+        guard let parsed else { return }
+        publishDiscoveredSessionModelsIfGloballyAuthoritative(parsed)
+    }
+
+    private func publishDiscoveredSessionModelsIfGloballyAuthoritative(_ models: ACPDiscoveredSessionModels) {
+        guard !provider.supportsParameterizedModelPicker else { return }
+        host.publishDiscoveredModels(models, for: provider.providerID)
+    }
+
+    private func parseModernModelSnapshot(from response: [String: Any]) -> ParsedModernModelSnapshot {
+        guard let rawConfigOptions = response["configOptions"] else { return .absent }
+        guard let configOptions = rawConfigOptions as? [[String: Any]] else {
+            return .malformed("configOptions is not an array")
+        }
+        return parseModernModelSnapshot(fromConfigOptions: configOptions)
+    }
+
+    private func parseModernModelSnapshot(
+        fromConfigOptions configOptions: [[String: Any]]
+    ) -> ParsedModernModelSnapshot {
+        switch parseSelectConfigOption(category: "model", from: configOptions) {
+        case .absent:
+            return .absent
+        case let .malformed(reason):
+            return .malformed(reason)
+        case let .valid(option):
+            let options = mergeModelOptions(option.choices.compactMap(parseDiscoveredConfigModelOption))
+            let availableValues = options.map(\.rawValue)
+            guard !availableValues.isEmpty else {
+                return .malformed("model selector '\(option.id)' has no usable values")
+            }
+            guard let currentModelRaw = canonicalAdvertisedValue(option.currentValue, in: availableValues) else {
+                return .malformed("model selector '\(option.id)' currentValue is not one of its advertised values")
+            }
+            return .valid(
+                configID: option.id,
+                models: ACPDiscoveredSessionModels(
+                    options: options,
+                    currentModelRaw: currentModelRaw,
+                    modelParameterSets: parseModelParameterSets(
+                        from: configOptions,
+                        baseModelRaw: currentModelRaw
+                    )
+                )
+            )
+        }
+    }
+
+    private func parseModelParameterSets(
+        from configOptions: [[String: Any]],
+        baseModelRaw: String
+    ) -> [ACPModelParameterSet] {
+        guard provider.supportsParameterizedModelPicker else { return [] }
+        var definitionsByKind: [ACPModelParameterKind: [ACPModelParameterDefinition]] = [:]
+        for rawOption in configOptions {
+            let category = normalizedConfigValue(rawOption["category"] as? String)
+            if category?.caseInsensitiveCompare("model") == .orderedSame
+                || category?.caseInsensitiveCompare("mode") == .orderedSame
+            {
+                continue
+            }
+            guard normalizedConfigValue(rawOption["type"] as? String)?.lowercased() == "select",
+                  let exactID = exactNonEmptyConfigString(rawOption["id"] as? String),
+                  let exactCurrentValue = exactNonEmptyConfigString(rawOption["currentValue"] as? String),
+                  let rawChoices = flattenedConfigOptionChoices(from: rawOption["options"]),
+                  !rawChoices.isEmpty
+            else { continue }
+            let choices = rawChoices.compactMap { rawChoice -> ACPModelParameterChoice? in
+                guard let rawValue = exactNonEmptyConfigString(rawChoice["value"] as? String) else { return nil }
+                let displayName = normalizedConfigValue(
+                    (rawChoice["name"] as? String) ?? (rawChoice["displayName"] as? String)
+                ) ?? rawValue
+                return .init(
+                    rawValue: rawValue,
+                    displayName: displayName,
+                    description: normalizedConfigValue(rawChoice["description"] as? String)
+                )
+            }
+            guard !choices.isEmpty else { continue }
+            let displayName = normalizedConfigValue(
+                (rawOption["name"] as? String) ?? (rawOption["displayName"] as? String)
+            ) ?? exactID
+            let classification = ACPModelParameterClassificationInput(
+                configID: exactID,
+                category: category,
+                displayName: displayName,
+                choices: choices
+            )
+            guard let kind = provider.modelParameterKind(for: classification) else { continue }
+            let prototype = ACPModelParameterDefinition(
+                kind: kind,
+                configID: exactID,
+                displayName: displayName,
+                choices: choices,
+                currentValueRaw: exactCurrentValue
+            )
+            guard let canonicalCurrent = prototype.choice(matching: exactCurrentValue) else { continue }
+            definitionsByKind[kind, default: []].append(.init(
+                kind: kind,
+                configID: exactID,
+                displayName: displayName,
+                choices: choices,
+                currentValueRaw: canonicalCurrent.rawValue
+            ))
+        }
+
+        let definitions = ACPModelParameterKind.allCases.compactMap { kind -> ACPModelParameterDefinition? in
+            let candidates = definitionsByKind[kind] ?? []
+            guard candidates.count == 1 else {
+                if candidates.count > 1 {
+                    diagnose(.info("Ignoring conflicting Cursor \(kind.rawValue) selectors: \(candidates.map(\.configID).joined(separator: ", "))"))
+                }
+                return nil
+            }
+            return candidates[0]
+        }
+        return definitions.isEmpty ? [] : [.init(baseModelRaw: baseModelRaw, parameters: definitions)]
+    }
+
+    private func exactNonEmptyConfigString(_ value: String?) -> String? {
+        guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return value
+    }
+
+    private func mergeModelOptions(_ rawOptions: [AgentModelOption]) -> [AgentModelOption] {
+        var options: [AgentModelOption] = []
+        var seenModelIDs = Set<String>()
+        for option in rawOptions {
+            guard seenModelIDs.insert(option.rawValue).inserted else { continue }
+            options.append(option)
+        }
+        return options
+    }
+
+    private func parseDiscoveredConfigModelOption(from rawOption: [String: Any]) -> AgentModelOption? {
+        guard let rawValue = normalizedACPModelString(
+            (rawOption["value"] as? String) ?? (rawOption["modelId"] as? String) ?? (rawOption["id"] as? String)
+        ) else {
+            return nil
+        }
+        let displayName = normalizedACPModelString(
+            (rawOption["name"] as? String) ?? (rawOption["displayName"] as? String)
+        ) ?? rawValue
+        return AgentModelOption(
+            rawValue: rawValue,
+            displayName: displayName,
+            description: normalizedACPModelString(rawOption["description"] as? String),
+            isPlaceholderDefault: false,
+            isProviderDefault: rawOption["isDefault"] as? Bool ?? false
+        )
+    }
+
+    private func sessionModelConfigValue(forSelectedModel selectedModel: String) -> String? {
+        guard provider.providerID == .cursor else { return selectedModel }
+        let normalizedSelection = normalizedCursorModelAlias(selectedModel)
+        guard !normalizedSelection.isEmpty else { return selectedModel }
+        let snapshot = discoveredSessionModels ?? host.resolvedModelSnapshot(for: .cursor)
+
+        if normalizedSelection == host.cursorAutoModelRaw {
+            guard let snapshot else { return nil }
+            if snapshot.contains(rawModel: selectedModel) {
+                return selectedModel
+            }
+            return snapshot.options.first(where: { isCursorAutoConfigOption($0) })?.rawValue
+        }
+
+        guard let snapshot else { return selectedModel }
+        if snapshot.contains(rawModel: selectedModel) {
+            return selectedModel
+        }
+
+        if let displayMatch = snapshot.options.first(where: { option in
+            normalizedCursorModelAlias(option.displayName) == normalizedSelection
+        }) {
+            return displayMatch.rawValue
+        }
+        if let baseMatch = snapshot.options.first(where: { option in
+            normalizedCursorModelAlias(option.rawValue) == normalizedSelection
+        }) {
+            return baseMatch.rawValue
+        }
+        return selectedModel
+    }
+
+    private func isCursorAutoConfigOption(_ option: AgentModelOption) -> Bool {
+        normalizedCursorModelAlias(option.rawValue) == host.cursorAutoModelRaw
+            || normalizedCursorModelAlias(option.displayName) == host.cursorAutoModelRaw
+    }
+
+    private func normalizedCursorModelAlias(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard let bracketIndex = trimmed.firstIndex(of: "[") else {
+            return trimmed.replacingOccurrences(of: " ", with: "-")
+        }
+        return String(trimmed[..<bracketIndex]).replacingOccurrences(of: " ", with: "-")
+    }
+
+    private static func responseErrorMessage(from error: [String: Any]) -> String {
+        let message = trimmedNonEmptyString(error["message"])
+        let data = error["data"]
+        let detail = responseErrorDetail(from: data)
+        let base = message ?? "Unknown ACP error"
+        guard let detail, !detail.isEmpty, detail != base else { return base }
+        return "\(base): \(detail)"
+    }
+
+    private static func responseErrorDetail(from data: Any?) -> String? {
+        guard let data else { return nil }
+        if let text = trimmedNonEmptyString(data) {
+            return text
+        }
+        if let dictionary = data as? [String: Any] {
+            for path in [["message"], ["error", "message"], ["details"], ["cause", "message"]] {
+                if let text = nestedTrimmedString(in: dictionary, path: path) {
+                    return text
+                }
+            }
+            return compactJSONPreview(data)
+        }
+        if let array = data as? [Any] {
+            return compactJSONPreview(array)
+        }
+        return nil
+    }
+
+    private static func nestedTrimmedString(in dictionary: [String: Any], path: [String]) -> String? {
+        var value: Any? = dictionary
+        for key in path {
+            guard let nested = value as? [String: Any] else { return nil }
+            value = nested[key]
+        }
+        return trimmedNonEmptyString(value)
+    }
+
+    private static func trimmedNonEmptyString(_ value: Any?) -> String? {
+        guard let string = value as? String else { return nil }
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func compactJSONPreview(_ value: Any, limit: Int = 2000) -> String? {
+        guard JSONSerialization.isValidJSONObject(value),
+              let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]),
+              let string = String(data: data, encoding: .utf8),
+              !string.isEmpty
+        else {
+            return nil
+        }
+        guard string.count > limit else { return string }
+        return String(string.prefix(limit)) + "…"
+    }
+
+    private static func responseErrorCode(from error: [String: Any]) -> Int? {
+        switch error["code"] {
+        case let code as Int:
+            code
+        case let code as Int64:
+            Int(code)
+        case let code as NSNumber:
+            code.intValue
+        case let code as String:
+            Int(code.trimmingCharacters(in: .whitespacesAndNewlines))
+        default:
+            nil
+        }
+    }
+
+    package func messageStopResult(
+        from response: [String: Any],
+        sessionID: String,
+        stopReason: String?
+    ) -> RepoPromptDomainRuntime.AIStreamResult {
+        // Grok Build carries usage under `_meta.usage` with the same field names; top-level
+        // `usage` remains the preferred ACP-standard location.
+        let usage = (response["usage"] as? [String: Any])
+            ?? ((response["_meta"] as? [String: Any])?["usage"] as? [String: Any])
+        let inputTokens = intValue(usage?["inputTokens"])
+        let outputTokens = intValue(usage?["outputTokens"])
+        let cachedReadTokens = intValue(usage?["cachedReadTokens"])
+        let cachedWriteTokens = intValue(usage?["cachedWriteTokens"])
+        let hasContextBreakdown = inputTokens != nil || cachedReadTokens != nil || cachedWriteTokens != nil
+        let contextUsedTokens: Int?
+        let modelContextWindow: Int?
+        if provider.providerID == .grokBuild {
+            let meta = response["_meta"] as? [String: Any]
+            // Grok's totalTokens tracks current conversation state, including a reseed
+            // after compaction. inputTokens can still describe the pre-compaction call.
+            // Only older responses without totalTokens may use last-call input instead;
+            // zero/invalid current-state claims must not resurrect that stale prompt.
+            let contextCount = meta?["totalTokens"] ?? meta?["inputTokens"]
+            if let number = contextCount as? NSNumber,
+               CFGetTypeID(number) != CFBooleanGetTypeID(),
+               let count = number as? Int, count > 0
+            {
+                contextUsedTokens = count
+            } else {
+                contextUsedTokens = nil
+            }
+            // Grok reports an API routing slug here, which may differ from the catalog
+            // key (including per-effort routing). Prefer a direct match, then THIS
+            // session's confirmed catalog selection, never a global/default guess.
+            let modelOption = discoveredSessionModels?.option(matching: meta?["modelId"] as? String)
+                ?? discoveredSessionModels?.option(matching: discoveredSessionModels?.currentModelRaw)
+            // Zero explicitly withdraws an unresolved capacity. Nil would make no new
+            // window claim and let the estimator retain a different model's old bound.
+            modelContextWindow = modelOption?.contextWindowTokens ?? 0
+        } else {
+            modelContextWindow = nil
+            contextUsedTokens = hasContextBreakdown
+                ? max(0, inputTokens ?? 0) + max(0, cachedReadTokens ?? 0) + max(0, cachedWriteTokens ?? 0)
+                : nil
+        }
+        let providerSessionID = providerSessionIdentity.loadSessionID ?? sessionID
+        return AIStreamResult(
+            type: "message_stop",
+            text: nil,
+            promptTokens: inputTokens,
+            completionTokens: outputTokens,
+            providerSessionID: providerSessionID,
+            stopReason: stopReason,
+            modelContextWindow: modelContextWindow,
+            contextUsedTokens: contextUsedTokens
+        )
+    }
+
+    private func intValue(_ value: Any?) -> Int? {
+        switch value {
+        case let int as Int:
+            int
+        case let int64 as Int64:
+            Int(int64)
+        case let double as Double:
+            Int(double)
+        case let number as NSNumber:
+            number.intValue
+        case let string as String:
+            Int(string.trimmingCharacters(in: .whitespacesAndNewlines))
+        default:
+            nil
+        }
+    }
+
+    private func normalizedACPModelString(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty
+        else {
+            return nil
+        }
+        return trimmed
+    }
+
+    private func normalizedModelString(_ value: String?) -> String? {
+        let trimmed = value?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard let trimmed, !trimmed.isEmpty, trimmed != "default" else {
+            return nil
+        }
+        return trimmed
+    }
+
+    private func effectiveModelString() -> String? {
+        normalizedModelString(discoveredSessionModels?.preferredModelRaw ?? runRequest.modelString)
+    }
+
+    private func normalizedWorkspacePath(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let trimmed, !trimmed.isEmpty else { return nil }
+        return URL(fileURLWithPath: trimmed).standardizedFileURL.path
+    }
+
+    private func parseJSONRPCID(_ rawValue: Any?) -> JSONRPCID? {
+        switch rawValue {
+        case let value as String:
+            return .string(value)
+        case let value as Int:
+            return .int(value)
+        case let value as NSNumber:
+            if CFGetTypeID(value) == CFBooleanGetTypeID() {
+                return nil
+            }
+            let doubleValue = value.doubleValue
+            if floor(doubleValue) == doubleValue {
+                return .int(value.intValue)
+            }
+            return .double(doubleValue)
+        case let value as Double:
+            return .double(value)
+        default:
+            return nil
+        }
+    }
+
+    private func candidateStorageKeys(for id: JSONRPCID) -> [String] {
+        var keys = [id.storageKey]
+        switch id {
+        case let .string(value):
+            if let intValue = Int(value) {
+                keys.append(JSONRPCID.int(intValue).storageKey)
+                keys.append(JSONRPCID.double(Double(intValue)).storageKey)
+            }
+            if let doubleValue = Double(value) {
+                keys.append(JSONRPCID.double(doubleValue).storageKey)
+                if floor(doubleValue) == doubleValue {
+                    keys.append(JSONRPCID.int(Int(doubleValue)).storageKey)
+                }
+            }
+        case let .int(value):
+            keys.append(JSONRPCID.string(String(value)).storageKey)
+            keys.append(JSONRPCID.double(Double(value)).storageKey)
+        case let .double(value):
+            keys.append(JSONRPCID.string(String(value)).storageKey)
+            if floor(value) == value {
+                keys.append(JSONRPCID.int(Int(value)).storageKey)
+                keys.append(JSONRPCID.string(String(Int(value))).storageKey)
+            }
+        }
+        var seen = Set<String>()
+        return keys.filter { seen.insert($0).inserted }
+    }
+
+    private static func authMethodIDs(from authMethods: [[String: Any]]) -> [String] {
+        authMethods.compactMap { dictionary -> String? in
+            let rawID = (dictionary["id"] as? String) ?? (dictionary["methodId"] as? String)
+            let authMethodID = rawID?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return authMethodID?.isEmpty == false ? authMethodID : nil
+        }
+    }
+
+    private func cleanupLaunchArtifacts() async {
+        await provider.cleanupLaunchArtifacts(for: launchConfiguration)
+    }
+
+    private func approvalKind(for toolKind: String?) -> AgentApprovalKind {
+        switch toolKind {
+        case "edit", "delete", "move":
+            .fileChange
+        default:
+            .commandExecution
+        }
+    }
+
+    private static let invisibleOptionLabelScalars = CharacterSet.whitespacesAndNewlines
+        .union(.controlCharacters)
+
+    /// The line shown for one advertised option: the agent's wording when it gives any,
+    /// otherwise its identifier. Both are agent-authored, so both go through the same
+    /// sanitiser -- routing only the name through it left the identifier able to
+    /// reintroduce the newline this is meant to prevent.
+    private static func optionLabel(name: String?, optionID: String) -> String {
+        displayableOptionLabel(name ?? "")
+            ?? displayableOptionLabel(optionID)
+            ?? ""
+    }
+
+    /// Collapse an agent-authored option string onto one display line, or `nil` when it
+    /// carries nothing visible.
+    ///
+    /// Both the name and the option ID come from the agent, and the caller joins labels
+    /// with a newline, so a value containing one would present a single option as two.
+    /// Emptiness is tested by looking for a visible scalar rather than by trimming the
+    /// invisible ones away: a trailing format character can be load-bearing, and trimming
+    /// them truncates emoji tag sequences such as the subdivision flags.
+    private static func displayableOptionLabel(_ raw: String) -> String? {
+        let collapsed = raw
+            .components(separatedBy: .newlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard collapsed.unicodeScalars.contains(where: { !invisibleOptionLabelScalars.contains($0) })
+        else { return nil }
+        return collapsed
+    }
+
+    private func approvalDetails(
+        toolTitle: String?,
+        toolKind: String?,
+        rawInputJSON: String?,
+        options: [PermissionOption]
+    ) -> [AgentApprovalDetail] {
+        var details: [AgentApprovalDetail] = []
+        if let toolTitle, !toolTitle.isEmpty {
+            details.append(AgentApprovalDetail(label: "Tool", value: toolTitle))
+        }
+        if let toolKind, !toolKind.isEmpty {
+            details.append(AgentApprovalDetail(label: "Kind", value: toolKind))
+        }
+        if let rawInputJSON, !rawInputJSON.isEmpty {
+            details.append(AgentApprovalDetail(label: "Input", value: rawInputJSON, isCode: true))
+        }
+        // Grok's raw option list does not match the scoped approval actions RPCE offers.
+        guard provider.providerID != .grokBuild else { return details }
+        let optionLabels = options.map {
+            Self.optionLabel(name: $0.name, optionID: $0.optionID)
+        }
+        if !optionLabels.isEmpty {
+            details.append(
+                AgentApprovalDetail(
+                    label: "Options",
+                    value: optionLabels.joined(separator: "\n"),
+                    isCode: false
+                )
+            )
+        }
+        return details
+    }
+
+    private func optionID(for options: [PermissionOption], preferredKinds: [String]) -> String {
+        for kind in preferredKinds {
+            guard let normalizedKind = normalizedPermissionOptionValue(kind) else { continue }
+            if let option = options.first(where: { normalizedPermissionOptionValue($0.kind) == normalizedKind }) {
+                return option.optionID
+            }
+        }
+        return options.first?.optionID ?? ""
+    }
+
+    private func optionID(for options: [PermissionOption], preferences: [PermissionOptionPreference]) -> String? {
+        for preference in preferences {
+            switch preference {
+            case let .optionID(preferredOptionID):
+                guard let normalizedOptionID = normalizedPermissionOptionValue(preferredOptionID) else { continue }
+                if let option = options.first(where: { normalizedPermissionOptionValue($0.optionID) == normalizedOptionID }) {
+                    return option.optionID
+                }
+            case let .kind(preferredKind):
+                guard let normalizedKind = normalizedPermissionOptionValue(preferredKind) else { continue }
+                if let option = options.first(where: { normalizedPermissionOptionValue($0.kind) == normalizedKind }) {
+                    return option.optionID
+                }
+            }
+        }
+        return nil
+    }
+
+    private func normalizedPermissionOptionValue(_ value: String?) -> String? {
+        let normalized = value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard let normalized, !normalized.isEmpty else { return nil }
+        return normalized
+    }
+
+    private func sendPermissionSelectionResponse(id: JSONRPCID, optionID: String) throws {
+        try sendJSONLine([
+            "jsonrpc": "2.0",
+            "id": id.jsonValue,
+            "result": [
+                "outcome": [
+                    "outcome": "selected",
+                    "optionId": optionID
+                ]
+            ]
+        ])
+    }
+
+    /// The option an `.accept`-family decision submits, or nil when the agent offered no
+    /// selectable allow option. The denylist-filtered fallback must stay allow-kind:
+    /// without it, a Devin prompt whose only allow-typed entry is a denylisted
+    /// `switch_*`/`plan_*` would collapse to submitting its `reject_once` (or an empty ID)
+    /// for an accept decision — answering the opposite of what was decided.
+    private func preferredAllowOptionID(for options: [PermissionOption], sessionScoped: Bool) -> String? {
+        let filteredOptions = safePermissionOptionsForAutoSelection(options)
+        // Devin is exact-ID only: broadening options (mode switches, persistent/global or
+        // server-wide grants) are unreachable here, which is why the denylist needs no
+        // `switch_*`/`plan_*`/`_always` pattern rules. Routing Devin through the
+        // kind-preference fallback below would silently loosen this — don't.
+        if provider.providerID == .devin {
+            if sessionScoped, let option = filteredOptions.first(where: { $0.optionID == "allow_session" }) {
+                return option.optionID
+            }
+            return filteredOptions.first(where: { $0.optionID == "allow_once" })?.optionID
+        }
+        if provider.providerID == .grokBuild {
+            // Grok's only genuine session grant is the exact edit option. All other
+            // approvals must be genuinely one-time, including ID and kind fallbacks.
+            let scopedOptions = filteredOptions.filter { option in
+                (
+                    sessionScoped
+                        && normalizedPermissionOptionValue(option.optionID) == "allow-edits-session"
+                        && normalizedPermissionOptionValue(option.kind) == "allow_always"
+                )
+                    || host.permissionOneTimeAllow(
+                        options: [(optionID: option.optionID, kind: option.kind)], providerID: .grokBuild
+                    ) != nil
+            }
+            return optionID(for: scopedOptions, preferences: grokBuildAllowOptionPreferences(sessionScoped: sessionScoped))
+        }
+        // Generic provider IDs cannot turn an explicitly persistent kind into one-time consent.
+        let scopedOptions = sessionScoped ? filteredOptions : filteredOptions.filter {
+            normalizedPermissionOptionValue($0.kind) != "allow_always"
+        }
+        if let preferred = optionID(for: scopedOptions, preferences: genericAllowOptionPreferences(sessionScoped: sessionScoped)) {
+            return preferred
+        }
+        return optionID(
+            for: scopedOptions,
+            preferences: sessionScoped ? [.kind("allow_always"), .kind("allow_once")] : [.kind("allow_once")]
+        )
+    }
+
+    private func grokBuildAllowOptionPreferences(sessionScoped: Bool) -> [PermissionOptionPreference] {
+        let oneTime: [PermissionOptionPreference] = [
+            .optionID("allow-once"),
+            .optionID("once"),
+            .optionID("allow_once"),
+            .kind("allow_once")
+        ]
+        return sessionScoped ? [.optionID("allow-edits-session")] + oneTime : oneTime
+    }
+
+    private func preferredRejectOptionID(for options: [PermissionOption]) -> String? {
+        optionID(for: options, preferences: [
+            .optionID("reject-once"),
+            .optionID("reject_once"),
+            .optionID("reject"),
+            .kind("reject_once"),
+            .kind("reject"),
+            .optionID("reject_always"),
+            .optionID("reject-always"),
+            .kind("reject_always"),
+            .optionID("deny_once"),
+            .optionID("deny-once"),
+            .optionID("deny"),
+            .kind("deny_once"),
+            .kind("deny"),
+            .optionID("cancel"),
+            .kind("cancel")
+        ])
+    }
+
+    private func fullAccessAutoApprovalOptionID(for options: [PermissionOption]) -> String? {
+        guard autoApproveAllToolPermissions else { return nil }
+        switch provider.providerID {
+        case .cursor:
+            // Full access auto-approves each request once; it must not persist a grant.
+            return host.permissionOneTimeAllow(
+                options: options.map { (optionID: $0.optionID, kind: $0.kind) }, providerID: provider.providerID
+            )
+        case .openCode, .grokBuild, .antigravity, .devin:
+            // Grok full access is provider-native (`grok agent --always-approve stdio`) and
+            // Devin's is a launch-time `--permission-mode`; the controller never
+            // auto-selects permission options for either.
+            return nil
+        }
+    }
+
+    private func genericAllowOptionPreferences(sessionScoped: Bool) -> [PermissionOptionPreference] {
+        if sessionScoped {
+            return [
+                .optionID("always"),
+                .optionID("allow_always"),
+                .kind("allow_always"),
+                .optionID("once"),
+                .optionID("allow_once"),
+                .kind("allow_once")
+            ]
+        }
+        return [
+            .optionID("once"),
+            .optionID("allow_once"),
+            .kind("allow_once")
+        ]
+    }
+
+    /// Options that must never be picked by an automatic or fallback selection path.
+    /// Grok's `enable-always-approve` is typed AllowOnce for backward compatibility, so a
+    /// bare kind match would select it — it is excluded by explicit ID before any matching.
+    private func safePermissionOptionsForAutoSelection(_ options: [PermissionOption]) -> [PermissionOption] {
+        options.filter { option in
+            host.permissionIsAutoSelectable(optionID: option.optionID, providerID: provider.providerID)
+        }
+    }
+
+    private func serializeJSON(_ value: Any?) -> String? {
+        guard let value else { return nil }
+        if let string = value as? String {
+            return string
+        }
+        guard JSONSerialization.isValidJSONObject(value),
+              let data = try? JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted]),
+              let string = String(data: data, encoding: .utf8)
+        else {
+            return nil
+        }
+        return string
+    }
+
+    private func terminalState(for stopReason: String?) -> AgentSessionRunState {
+        switch stopReason?.lowercased() {
+        case "end_turn", "max_tokens", "max_turn_requests":
+            .completed
+        case "cancelled":
+            .cancelled
+        case "refusal":
+            .failed
+        default:
+            .completed
+        }
+    }
+
+    private func displayText(for error: Error) -> String {
+        if let providerError = error as? AIProviderError {
+            switch providerError {
+            case .missingOllamaURL:
+                return "Missing Ollama URL."
+            case .missingAzureConfiguration:
+                return "Missing Azure OpenAI configuration."
+            case .missingAPIKey:
+                return "Missing API key."
+            case .missingURL:
+                return "Missing provider URL."
+            case .providerNotConfigured:
+                return "Provider is not configured."
+            case .invalidModel:
+                return "Invalid model."
+            case .invalidSystemPrompt:
+                return "Invalid system prompt."
+            case .messageCreationFailed:
+                return "Failed to create provider message."
+            case let .invalidResponse(detail), let .invalidConfiguration(detail):
+                return detail
+            case let .apiError(source), let .unknown(source):
+                return source.map(displayText) ?? String(describing: providerError)
+            }
+        }
+        if let localized = error as? LocalizedError,
+           let description = localized.errorDescription?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !description.isEmpty
+        {
+            return description
+        }
+        let nsError = error as NSError
+        if nsError.domain != NSCocoaErrorDomain || nsError.code != 0 {
+            let description = nsError.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !description.isEmpty, description != "The operation couldn’t be completed." {
+                return description
+            }
+        }
+        return String(describing: error)
+    }
+
+    private func terminalErrorText(for stopReason: String?) -> String? {
+        switch stopReason?.lowercased() {
+        case "refusal":
+            "\(host.displayName(for: runRequest.agentKind)) ACP refused to continue this turn."
+        default:
+            nil
+        }
+    }
+
+    private func emit(_ event: NormalizedAgentRuntimeEvent) {
+        _ = eventsContinuation?.yield(event)
+    }
+
+    private func emitTerminal(state: AgentSessionRunState, errorText: String?) {
+        guard !didEmitTerminal else { return }
+        didEmitTerminal = true
+        recentDevinToolCalls.removeAll()
+        recentDevinToolCallIDs.removeAll()
+        emit(.terminal(state: state, errorText: errorText))
+    }
+
+    private func finishEventsIfNeeded() {
+        guard !eventStreamFinished else { return }
+        eventStreamFinished = true
+        eventsContinuation?.finish()
+        eventsContinuation = nil
+    }
+
+    private func resetEventsStreamForNextTurn() {
+        eventsContinuation?.finish()
+        eventsContinuation = nil
+        let stream = Self.makeEventsStream()
+        eventsStream = stream.stream
+        eventsContinuation = stream.continuation
+    }
+
+    private static func makeEventsStream() -> (
+        stream: AsyncStream<NormalizedAgentRuntimeEvent>,
+        continuation: AsyncStream<NormalizedAgentRuntimeEvent>.Continuation
+    ) {
+        var capturedContinuation: AsyncStream<NormalizedAgentRuntimeEvent>.Continuation?
+        let stream = AsyncStream<NormalizedAgentRuntimeEvent> { continuation in
+            capturedContinuation = continuation
+        }
+        guard let capturedContinuation else {
+            fatalError("ACPAgentSessionController failed to create event stream continuation")
+        }
+        return (stream, capturedContinuation)
+    }
+
+    private func log(_ message: String) {
+        diagnose(.info(message))
+        guard launchConfiguration.enableDebugLogging else { return }
+        print("\(logPrefix) \(message)")
+    }
+
+    #if DEBUG
+        private static func resolveRawACPCaptureURL(for providerID: ACPProviderID) -> URL? {
+            let env = ProcessInfo.processInfo.environment
+            let providerSpecificKey: String? = switch providerID {
+            case .cursor:
+                "RP_CURSOR_RAW_CAPTURE_PATH"
+            case .openCode:
+                "RP_OPENCODE_ACP_RAW_CAPTURE_PATH"
+            case .grokBuild:
+                "RP_GROK_BUILD_ACP_RAW_CAPTURE_PATH"
+            case .antigravity:
+                "RP_ANTIGRAVITY_ACP_RAW_CAPTURE_PATH"
+            case .devin:
+                "RP_DEVIN_ACP_RAW_CAPTURE_PATH"
+            }
+            let customPath = providerSpecificKey.flatMap { key in
+                env[key]?.trimmingCharacters(in: .whitespacesAndNewlines)
+            } ?? env["RP_ACP_RAW_CAPTURE_PATH"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let customPath, !customPath.isEmpty else { return nil }
+            return URL(fileURLWithPath: customPath)
+        }
+    #endif
+
+    private func resetActivePromptTrace() {
+        #if DEBUG
+            activePromptSessionUpdateCounts = [:]
+            activePromptNormalizedStreamCount = 0
+        #endif
+        activePromptOpenCodeStderrError = nil
+        activePromptNormalizedContentCount = 0
+        activePromptNormalizedReasoningCount = 0
+    }
+
+    #if DEBUG
+        private static func captureLaunchConfigurationIfEnabled(
+            rawACPCaptureURL: URL?,
+            providerID: ACPProviderID,
+            launchConfiguration: ACPLaunchConfiguration
+        ) {
+            guard let rawACPCaptureURL else { return }
+            writeRawACPEvent(
+                to: rawACPCaptureURL,
+                kind: "launch.configuration",
+                payload: launchConfigurationTracePayload(launchConfiguration),
+                providerID: providerID,
+                controllerState: State.idle.rawValue,
+                hasActivePromptTurn: false,
+                suppressSessionLoadReplayUpdates: false,
+                sessionID: nil
+            )
+        }
+
+        package static func debugLaunchConfigurationTracePayloadForTesting(
+            _ launchConfiguration: ACPLaunchConfiguration
+        ) -> [String: Any] {
+            launchConfigurationTracePayload(launchConfiguration)
+        }
+
+        package static func debugSanitizedRawCapturePayloadForTesting(_ payload: [String: Any]) -> [String: Any] {
+            sanitizeRawCaptureDictionary(payload)
+        }
+
+        package static func debugWriteRawACPEventForTesting(to url: URL, payload: [String: Any]) {
+            writeRawACPEvent(
+                to: url,
+                kind: "test",
+                payload: payload,
+                providerID: .cursor,
+                controllerState: State.idle.rawValue,
+                hasActivePromptTurn: false,
+                suppressSessionLoadReplayUpdates: false,
+                sessionID: nil
+            )
+        }
+
+        private static func launchConfigurationTracePayload(_ launchConfiguration: ACPLaunchConfiguration) -> [String: Any] {
+            var payload: [String: Any] = [
+                "command": launchConfiguration.command,
+                "arguments": redactedLaunchArguments(launchConfiguration.arguments),
+                "workingDirectory": launchConfiguration.workingDirectory ?? "",
+                "additionalPathHints": launchConfiguration.additionalPathHints,
+                "enableDebugLogging": launchConfiguration.enableDebugLogging,
+                "environmentKeys": Array(launchConfiguration.environment.keys).sorted()
+            ]
+            if let configContent = launchConfiguration.environment["OPENCODE_CONFIG_CONTENT"] {
+                payload["opencodeConfigContentLength"] = configContent.count
+                if let data = configContent.data(using: .utf8),
+                   let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                {
+                    payload["opencodeConfigKeys"] = Array(parsed.keys).sorted()
+                    if let servers = parsed["mcp"] as? [String: Any] {
+                        payload["opencodeMCPServerNames"] = Array(servers.keys).sorted()
+                    }
+                } else {
+                    payload["opencodeConfigContentParseError"] = true
+                }
+            }
+            return payload
+        }
+    #endif
+
+    private func openCodeEmptyPromptDiagnosticMessage(from response: [String: Any], stopReason: String?) -> String? {
+        guard provider.providerID == .openCode,
+              isSuccessfulEmptyPromptStopReason(stopReason),
+              activePromptNormalizedContentCount == 0,
+              activePromptNormalizedReasoningCount == 0,
+              openCodePromptUsageIndicatesNoModelTokens(response)
+        else {
+            return nil
+        }
+
+        let usage = response["usage"] as? [String: Any]
+        let inputTokens = intValue(usage?["inputTokens"]) ?? 0
+        let outputTokens = intValue(usage?["outputTokens"]) ?? 0
+        let totalTokens = intValue(usage?["totalTokens"]) ?? 0
+        let stopDescription = stopReason?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? stopReason! : "unknown"
+        let stderrDescription = activePromptOpenCodeStderrError.map {
+            " OpenCode stderr reported: \($0)."
+        } ?? ""
+        #if DEBUG
+            let updateCounts = activePromptSessionUpdateCounts
+                .sorted { $0.key < $1.key }
+                .map { "\($0.key)=\($0.value)" }
+                .joined(separator: ", ")
+            let updateDescription = updateCounts.isEmpty ? "none" : updateCounts
+            return "OpenCode ACP completed with stopReason=\(stopDescription) but emitted no assistant content or reasoning chunks. Prompt usage was input=\(inputTokens), output=\(outputTokens), total=\(totalTokens); raw session updates during the prompt: \(updateDescription).\(stderrDescription) RepoPrompt did not receive model text to render."
+        #else
+            return "OpenCode ACP completed with stopReason=\(stopDescription) but emitted no assistant content or reasoning chunks. Prompt usage was input=\(inputTokens), output=\(outputTokens), total=\(totalTokens).\(stderrDescription) RepoPrompt did not receive model text to render."
+        #endif
+    }
+
+    private func isSuccessfulEmptyPromptStopReason(_ stopReason: String?) -> Bool {
+        guard let normalized = stopReason?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !normalized.isEmpty
+        else {
+            return true
+        }
+        return ["end_turn", "stop", "completed", "complete"].contains(normalized)
+    }
+
+    private func openCodePromptUsageIndicatesNoModelTokens(_ response: [String: Any]) -> Bool {
+        guard let usage = response["usage"] as? [String: Any] else { return false }
+        let inputTokens = intValue(usage["inputTokens"])
+        let outputTokens = intValue(usage["outputTokens"])
+        let totalTokens = intValue(usage["totalTokens"])
+        if let totalTokens {
+            return totalTokens == 0
+        }
+        if inputTokens != nil || outputTokens != nil {
+            return (inputTokens ?? 0) == 0 && (outputTokens ?? 0) == 0
+        }
+        return false
+    }
+
+    private func recordActivePromptTraceUpdate(
+        sourceUpdate: [String: Any],
+        normalizedEvents: [NormalizedAgentRuntimeEvent]
+    ) {
+        guard activePromptTurnID != nil else { return }
+        #if DEBUG
+            let sourceSessionUpdate = (sourceUpdate["sessionUpdate"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let key = sourceSessionUpdate?.isEmpty == false ? sourceSessionUpdate! : "<missing>"
+            activePromptSessionUpdateCounts[key, default: 0] += 1
+        #endif
+        for event in normalizedEvents {
+            guard case let .stream(result) = event else { continue }
+            #if DEBUG
+                activePromptNormalizedStreamCount += 1
+            #endif
+            switch result.type {
+            case "content":
+                activePromptNormalizedContentCount += 1
+            case "reasoning":
+                activePromptNormalizedReasoningCount += 1
+            default:
+                break
+            }
+        }
+    }
+
+    private func recordActivePromptStderrLine(_ line: String) {
+        guard activePromptTurnID != nil,
+              provider.providerID == .openCode
+        else {
+            return
+        }
+
+        let lowercased = line.lowercased()
+        guard lowercased.contains("level=error")
+            || lowercased.contains("stream error")
+            || lowercased.contains("ai_apicallerror")
+        else {
+            return
+        }
+
+        activePromptOpenCodeStderrError = Self.truncatedDiagnosticPreview(
+            Self.openCodeProviderErrorSummary(from: line),
+            limit: 360
+        )
+    }
+
+    private static func openCodeProviderErrorSummary(from stderrLine: String) -> String {
+        for key in ["error.error", "error"] {
+            if let value = shellStyleKeyValue(key, in: stderrLine) {
+                return cleanOpenCodeProviderError(value)
+            }
+        }
+        return truncatedDiagnosticPreview(stderrLine, limit: 360)
+    }
+
+    private static func cleanOpenCodeProviderError(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefixes = [
+            "AI_APICallError:",
+            "APICallError:"
+        ]
+        for prefix in prefixes where trimmed.hasPrefix(prefix) {
+            return trimmed.dropFirst(prefix.count)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return trimmed
+    }
+
+    private static func shellStyleKeyValue(_ key: String, in line: String) -> String? {
+        guard let keyRange = line.range(of: "\(key)=") else { return nil }
+        var index = keyRange.upperBound
+        guard index < line.endIndex else { return nil }
+        if line[index] == "\"" {
+            line.formIndex(after: &index)
+            var value = ""
+            var escaped = false
+            while index < line.endIndex {
+                let character = line[index]
+                line.formIndex(after: &index)
+                if escaped {
+                    value.append(character)
+                    escaped = false
+                } else if character == "\\" {
+                    escaped = true
+                } else if character == "\"" {
+                    return value
+                } else {
+                    value.append(character)
+                }
+            }
+            return value.isEmpty ? nil : value
+        }
+
+        let end = line[index...].firstIndex(where: { $0 == " " || $0 == "\t" }) ?? line.endIndex
+        let value = line[index ..< end].trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    #if DEBUG
+        private func promptTraceCountersPayload() -> [String: Any] {
+            [
+                "sessionUpdateCounts": activePromptSessionUpdateCounts,
+                "normalizedStreamCount": activePromptNormalizedStreamCount,
+                "normalizedContentCount": activePromptNormalizedContentCount,
+                "normalizedReasoningCount": activePromptNormalizedReasoningCount
+            ]
+        }
+
+        private func promptTraceSummary(for promptBlocks: [[String: Any]]) -> [String: Any] {
+            let blockSummaries = promptBlocks.enumerated().map { index, block in
+                promptBlockTraceSummary(index: index, block: block)
+            }
+            let totalTextLength = promptBlocks.reduce(0) { total, block in
+                total + ((block["text"] as? String)?.count ?? 0)
+            }
+            return [
+                "blockCount": promptBlocks.count,
+                "totalTextLength": totalTextLength,
+                "blocks": blockSummaries
+            ]
+        }
+
+        private func promptBlockTraceSummary(index: Int, block: [String: Any]) -> [String: Any] {
+            var summary: [String: Any] = [
+                "index": index,
+                "keys": Array(block.keys).sorted()
+            ]
+            if let type = block["type"] as? String {
+                summary["type"] = type
+            }
+            if let text = block["text"] as? String {
+                summary["textLength"] = text.count
+                summary["textHeadPreview"] = Self.normalizedACPPreview(text)
+                summary["textTailPreview"] = Self.normalizedACPTailPreview(text)
+            }
+            if let uri = block["uri"] as? String {
+                summary["uri"] = uri
+            }
+            if let mimeType = block["mimeType"] as? String {
+                summary["mimeType"] = mimeType
+            }
+            if let data = block["data"] as? String {
+                summary["dataLength"] = data.count
+            }
+            return summary
+        }
+
+        private func capturePromptTraceEvent(kind: String, payload: [String: Any]) {
+            captureRawACPEvent(kind: kind, payload: payload)
+        }
+
+        private var isRawACPCaptureEnabled: Bool {
+            rawACPCaptureURL != nil
+        }
+
+        private func captureNormalizedACPEvents(
+            _ events: [NormalizedAgentRuntimeEvent],
+            sessionID: String,
+            sourceUpdate: [String: Any]
+        ) {
+            guard isRawACPCaptureEnabled else { return }
+            var payload: [String: Any] = [
+                "sessionId": sessionID,
+                "normalizedEventCount": events.count,
+                "events": events.map(normalizedACPEventSummary)
+            ]
+            if let sourceSessionUpdate = sourceUpdate["sessionUpdate"] as? String {
+                payload["sourceSessionUpdate"] = sourceSessionUpdate
+            }
+            captureRawACPEvent(kind: "session.update.normalized", payload: payload)
+        }
+
+        private func normalizedACPEventSummary(_ event: NormalizedAgentRuntimeEvent) -> [String: Any] {
+            switch event {
+            case let .stream(result):
+                var summary: [String: Any] = [
+                    "kind": "stream",
+                    "type": result.type,
+                    "textLength": result.text?.count ?? 0,
+                    "reasoningLength": result.reasoning?.count ?? 0,
+                    "hasToolArgsJSON": result.toolArgsJSON != nil,
+                    "hasToolResultJSON": result.toolResultJSON != nil
+                ]
+                if let textPreview = Self.normalizedACPPreview(result.text) {
+                    summary["textPreview"] = textPreview
+                }
+                if let reasoningPreview = Self.normalizedACPPreview(result.reasoning) {
+                    summary["reasoningPreview"] = reasoningPreview
+                }
+                if let toolName = result.toolName {
+                    summary["toolName"] = toolName
+                }
+                if let toolInvocationID = result.toolInvocationID {
+                    summary["toolInvocationID"] = toolInvocationID.uuidString
+                }
+                if let toolArgsJSONLength = result.toolArgsJSON?.count {
+                    summary["toolArgsJSONLength"] = toolArgsJSONLength
+                }
+                if let toolResultJSONLength = result.toolResultJSON?.count {
+                    summary["toolResultJSONLength"] = toolResultJSONLength
+                }
+                if let toolIsError = result.toolIsError {
+                    summary["toolIsError"] = toolIsError
+                }
+                if let providerSessionID = result.providerSessionID {
+                    summary["providerSessionID"] = providerSessionID
+                }
+                if let stopReason = result.stopReason {
+                    summary["stopReason"] = stopReason
+                }
+                if let contextUsedTokens = result.contextUsedTokens {
+                    summary["contextUsedTokens"] = contextUsedTokens
+                }
+                if let modelContextWindow = result.modelContextWindow {
+                    summary["modelContextWindow"] = modelContextWindow
+                }
+                if let promptTokens = result.promptTokens {
+                    summary["promptTokens"] = promptTokens
+                }
+                if let completionTokens = result.completionTokens {
+                    summary["completionTokens"] = completionTokens
+                }
+                if let cost = result.cost {
+                    summary["cost"] = cost
+                }
+                if let contentMessageID = result.contentMessageID {
+                    summary["contentMessageID"] = contentMessageID
+                }
+                return summary
+            case let .approvalRequested(request):
+                return [
+                    "kind": "approvalRequested",
+                    "requestID": request.requestID.displayValue,
+                    "method": request.method,
+                    "approvalKind": String(describing: request.kind)
+                ]
+            case let .approvalCancelled(requestID):
+                return [
+                    "kind": "approvalCancelled",
+                    "requestID": requestID.displayValue
+                ]
+            case let .terminal(state, errorText):
+                var summary: [String: Any] = [
+                    "kind": "terminal",
+                    "state": state.rawValue
+                ]
+                if let errorTextPreview = Self.normalizedACPPreview(errorText) {
+                    summary["errorTextPreview"] = errorTextPreview
+                }
+                return summary
+            }
+        }
+
+        private static func normalizedACPPreview(_ text: String?, limit: Int = 200) -> String? {
+            guard let text, !text.isEmpty else { return nil }
+            if text.count <= limit {
+                return text
+            }
+            return String(text.prefix(limit))
+        }
+
+        private static func normalizedACPTailPreview(_ text: String?, limit: Int = 200) -> String? {
+            guard let text, !text.isEmpty else { return nil }
+            if text.count <= limit {
+                return text
+            }
+            return String(text.suffix(limit))
+        }
+
+        private func captureRawACPEvent(kind: String, payload: [String: Any]) {
+            guard let url = rawACPCaptureURL else { return }
+            Self.writeRawACPEvent(
+                to: url,
+                kind: kind,
+                payload: payload,
+                providerID: provider.providerID,
+                controllerState: state.rawValue,
+                hasActivePromptTurn: activePromptTurnID != nil,
+                suppressSessionLoadReplayUpdates: suppressSessionLoadReplayUpdates,
+                sessionID: sessionID
+            )
+        }
+
+        private static let rawACPCaptureWriteLock = NSLock()
+
+        private static func writeRawACPEvent(
+            to url: URL,
+            kind: String,
+            payload: [String: Any],
+            providerID: ACPProviderID,
+            controllerState: String,
+            hasActivePromptTurn: Bool,
+            suppressSessionLoadReplayUpdates: Bool,
+            sessionID: String?
+        ) {
+            var record: [String: Any] = [
+                "capturedAt": ISO8601DateFormatter().string(from: Date()),
+                "kind": kind,
+                "payload": sanitizeRawCaptureDictionary(payload),
+                "providerID": providerID.rawValue,
+                "controllerState": controllerState,
+                "hasActivePromptTurn": hasActivePromptTurn,
+                "suppressSessionLoadReplayUpdates": suppressSessionLoadReplayUpdates
+            ]
+            if let sessionID, !sessionID.isEmpty {
+                record["controllerSessionID"] = sessionID
+            }
+            guard JSONSerialization.isValidJSONObject(record),
+                  var data = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys])
+            else {
+                return
+            }
+            data.append(0x0A)
+
+            let parent = url.deletingLastPathComponent()
+            _ = try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true, attributes: nil)
+
+            rawACPCaptureWriteLock.lock()
+            defer { rawACPCaptureWriteLock.unlock() }
+            let descriptor = Darwin.open(
+                url.path,
+                O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW,
+                mode_t(0o600)
+            )
+            guard descriptor >= 0 else { return }
+            defer { _ = Darwin.close(descriptor) }
+            guard fchmod(descriptor, mode_t(0o600)) == 0 else { return }
+            try? FDWriteSupport.writeAll(data, to: descriptor)
+        }
+
+        private static func sanitizeRawCaptureDictionary(_ dictionary: [String: Any]) -> [String: Any] {
+            Dictionary(uniqueKeysWithValues: dictionary.map { key, value in
+                (key, sanitizeRawCaptureValue(value, key: key))
+            })
+        }
+
+        private static func sanitizeRawCaptureValue(_ value: Any, key: String?) -> Any {
+            if let key, isSensitiveRawCaptureKey(key) {
+                return "<redacted>"
+            }
+            if let dictionary = value as? [String: Any] {
+                return sanitizeRawCaptureDictionary(dictionary)
+            }
+            if let array = value as? [Any] {
+                return array.map { sanitizeRawCaptureValue($0, key: nil) }
+            }
+            if let string = value as? String, looksSensitiveRawCaptureString(string) {
+                return "<redacted>"
+            }
+            return value
+        }
+
+        private static func isSensitiveRawCaptureKey(_ key: String) -> Bool {
+            let normalized = key.lowercased().filter(\.isLetter)
+            return [
+                "argument", "authorization", "command", "content", "cookie", "credential",
+                "cwd", "data", "diagnostic", "environment", "error", "key", "output",
+                "password", "path", "prompt", "rawinput", "reasoning", "response", "result",
+                "secret", "text", "token", "uri", "value", "workingdirectory"
+            ].contains { normalized.contains($0) }
+        }
+
+        private static func looksSensitiveRawCaptureString(_ value: String) -> Bool {
+            let normalized = value.lowercased()
+            return normalized.contains("bearer ")
+                || normalized.contains("api_key=")
+                || normalized.contains("apikey=")
+                || normalized.contains("access_token=")
+                || normalized.contains("password=")
+                || normalized.contains("secret=")
+        }
+    #endif
+
+    private func diagnose(_ event: DiagnosticEvent) {
+        diagnosticSink?(event)
+    }
+
+    #if DEBUG
+        /// Test seam for the composed option line, covering the name-then-identifier
+        /// fallback rather than the sanitiser alone.
+        package static func test_optionLabel(name: String?, optionID: String) -> String {
+            optionLabel(name: name, optionID: optionID)
+        }
+
+        /// Test seam for approval-card option labelling: collapses an agent-authored
+        /// option string onto one line, or returns nil when nothing visible remains.
+        package static func test_displayableOptionLabel(_ raw: String) -> String? {
+            displayableOptionLabel(raw)
+        }
+    #endif
+}

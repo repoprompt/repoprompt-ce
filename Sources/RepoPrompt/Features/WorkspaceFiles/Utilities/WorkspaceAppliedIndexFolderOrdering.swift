@@ -1,3 +1,5 @@
+import RepoPromptWorkspaceContext
+
 enum WorkspaceAppliedIndexFolderOrdering {
     /// Parents precede descendants; peers retain the existing relative-path ordering.
     /// Eager decoration computes path depth once per record, never inside the comparator.

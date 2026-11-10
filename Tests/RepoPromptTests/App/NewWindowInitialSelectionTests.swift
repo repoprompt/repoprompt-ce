@@ -2,12 +2,17 @@ import AppKit
 import Combine
 import Foundation
 import MCP
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
 import RepoPromptFileSystem
+@testable import RepoPromptMCPServer
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
 import RepoPromptShared
+@testable import RepoPromptWorkspaceContext
 import SwiftUI
 import XCTest
 
@@ -2820,13 +2825,37 @@ import XCTest
             }
         }
 
+        func testCatalogBaselineCatchUpAcceptsSelfEchoWithoutRecertifyingMembership() async throws {
+            try await Fixture.run { f in
+                let (window, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
+                window.restartDomainWorkspaceProjectionForTesting()
+                let baseline = try await f.awaitCatalogProjection(window)
+                var edited = try XCTUnwrap(manager.workspace(withID: Fixture.aardvarkID))
+                edited.currentPromptText = "Owned edit after the accepted catalog"
+                let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == edited.id })
+                manager.workspaces[index] = edited
+                _ = try await manager.saveWorkspaceToFileAsync(edited)
+
+                let caughtUp = try await f.awaitCaughtUpWithCatalogBaseline(window)
+                XCTAssertEqual(caughtUp.application, .selfEchoBaseline)
+                XCTAssertNil(caughtUp.catalogReceipt, "An owned echo is not a catalog certification")
+                XCTAssertGreaterThan(caughtUp.publicationSequence, baseline.publicationSequence)
+                XCTAssertEqual(f.projectionState(for: window).catalogCheckpoint, baseline)
+                XCTAssertEqual(manager.domainCatalogReconciliationGeneration, baseline.catalogReceipt?.reconciliationGeneration)
+            }
+        }
+
         func testBridgeStaleCatalogRejectionAdvancesNoCacheOrCheckpoint() async throws {
             try await Fixture.run { f in
                 let window = f.makeWindow()
                 let manager = window.workspaceManager
                 await manager.awaitInitialWorkspaceActivationCompletion()
                 await manager.awaitInitialized()
-                let initialCheckpoint = try await f.awaitCatalogProjection(window)
+                // Startup may have advanced the current checkpoint with an owned self-echo.
+                // Require current catch-up AND the accepted catalog baseline, not a new catalog
+                // receipt through the echo's sequence. No new membership has been published yet.
+                try await f.awaitCaughtUpWithCatalogBaseline(window)
+                let initialCheckpoint = try XCTUnwrap(f.projectionState(for: window).catalogCheckpoint)
                 let initial = try XCTUnwrap(initialCheckpoint.catalogReceipt)
                 XCTAssertEqual(initial.completeness, .complete)
                 let events = f.recordProjectionEvents(window)
@@ -2852,6 +2881,7 @@ import XCTest
                     publicationSequence: afterStale.publicationSequence, reason: .staleCatalogRevision
                 )))
                 XCTAssertNil(manager.workspace(withID: stale.id))
+                XCTAssertEqual(f.projectionState(for: window).catalogCheckpoint, initialCheckpoint)
 
                 let current = try await f.commitWorkspace(named: "Current D", window: window)
                 let accepted = try XCTUnwrap(events.catalogCheckpoints.last?.catalogReceipt)
@@ -4585,6 +4615,122 @@ import XCTest
                     if case let .ready(catalog, _) = $0 { return catalog.workspaces.contains { $0.id == ghost.id } }
                     return false
                 })
+            }
+        }
+
+        // MARK: Stamp-only invalidation
+
+        func testStampOnlyCompleteReconciliationKeepsManagerAuthorityAndSubjectDelivery() async throws {
+            try await Fixture.run { f in
+                let manager = f.makeManager()
+                let snapshot = await f.runtime.workspaceStore.snapshot()
+                let models = try f.decoded(snapshot)
+                XCTAssertNotNil(manager.applyDomainWorkspaceCatalog(snapshot, projection: .full(models), preferredActiveWorkspaceID: nil, rootMapPolicy: .decodedModels).receipt)
+                let initial = manager.workspaceChooserPresentation
+                let generation = manager.domainCatalogReconciliationGeneration
+                var invalidations = 0
+                var emitted: [WorkspaceChooserPresentation] = []
+                let changes = manager.objectWillChange.sink { invalidations += 1 }
+                let subject = manager.$workspaceChooserPresentation.dropFirst().sink { emitted.append($0) }
+                defer { changes.cancel()
+                    subject.cancel()
+                }
+                let receipt = try XCTUnwrap(manager.applyDomainWorkspaceCatalog(snapshot, projection: .metadata(baselineGeneration: manager.domainCatalogReconciliationGeneration), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata).receipt)
+                XCTAssertEqual(invalidations, 0)
+                XCTAssertEqual(emitted, [manager.workspaceChooserPresentation])
+                XCTAssertNotEqual(initial, manager.workspaceChooserPresentation)
+                XCTAssertEqual(receipt.reconciliationGeneration, generation + 1)
+                guard case let .ready(catalog, .current) = manager.workspaceChooserPresentation,
+                      case let .authority(stamp) = catalog.source
+                else { return XCTFail("expected healthy authority catalog") }
+                XCTAssertEqual(catalog.workspaces, models)
+                XCTAssertEqual(stamp.reconciliationGeneration, receipt.reconciliationGeneration)
+                XCTAssertTrue(stamp.isComplete)
+            }
+        }
+
+        func testStampOnlyReconciliationFanoutAt28ManagersAnd300ChatTabs() async throws {
+            // Synthetic corpus and scheduler, NOT live startup/render timing. Real managers and
+            // authority admission; the fake sidebar drains one coalesced metadata read per turn,
+            // modeling AgentWorkspaceRootsSidebarStore's cancel/yield resnapshot (no production seam).
+            var seeds = [Fixture.model(id: Fixture.defaultID, name: "Default", isSystem: true)]
+            for index in 0 ..< 30 {
+                var row = Fixture.model(id: UUID(), name: "Saved \(index)")
+                row.composeTabs = (0 ..< 10).map { tab in
+                    ComposeTabState(id: UUID(), name: "Chat \(tab)", activeChatSessionID: UUID())
+                }
+                row.activeComposeTabID = row.composeTabs.first?.id
+                seeds.append(row)
+            }
+            XCTAssertEqual(seeds.filter { !$0.isSystemWorkspace }.flatMap(\.composeTabs).count, 300)
+            try await Fixture.run(seeds: seeds) { f in
+                let snapshot = await f.runtime.workspaceStore.snapshot()
+                let models = try f.decoded(snapshot)
+                let managers = (0 ..< 28).map { _ in f.makeManager() }
+                var invalidations = 0
+                var deliveries = 0
+                var qualifying = 0
+                var pendingSidebar = Set<Int>()
+                var sidebarResnapshots = 0
+                var last = managers.map(\.workspaceChooserPresentation)
+                var subscriptions: [AnyCancellable] = []
+                for (index, manager) in managers.enumerated() {
+                    subscriptions.append(manager.objectWillChange.sink {
+                        invalidations += 1
+                        pendingSidebar.insert(index)
+                    })
+                    subscriptions.append(manager.$workspaceChooserPresentation.dropFirst().sink { next in
+                        deliveries += 1
+                        if case let .ready(oldCatalog, .current) = last[index],
+                           case let .ready(newCatalog, .current) = next,
+                           case let .authority(oldStamp) = oldCatalog.source,
+                           case let .authority(newStamp) = newCatalog.source,
+                           oldStamp.isComplete, newStamp.isComplete,
+                           oldCatalog.workspaces == newCatalog.workspaces, oldStamp != newStamp
+                        { qualifying += 1 }
+                        last[index] = next
+                    })
+                    XCTAssertNotNil(manager.applyDomainWorkspaceCatalog(snapshot, projection: .full(models), preferredActiveWorkspaceID: nil, rootMapPolicy: .decodedModels).receipt)
+                }
+                defer { subscriptions.forEach { $0.cancel() } }
+                @MainActor func drainSidebarTurn() {
+                    for index in pendingSidebar {
+                        // Same metadata inputs as the production sidebar; no chooser stamp read.
+                        _ = managers[index].activeWorkspace?.name
+                        _ = managers[index].activeWorkspace?.isSystemWorkspace ?? true
+                        sidebarResnapshots += 1
+                    }
+                    pendingSidebar.removeAll()
+                }
+                drainSidebarTurn()
+                let baselineInvalidations = invalidations
+                let baselineResnapshots = sidebarResnapshots
+                let baselineDeliveries = deliveries
+                let clock = ContinuousClock()
+                let start = clock.now
+                let reconciliationsPerManager = 28
+                for round in 1 ... reconciliationsPerManager {
+                    let next = f.catalog(snapshot, sequence: snapshot.publicationSequence + UInt64(round), catalogRevision: snapshot.catalogRevision)
+                    for manager in managers {
+                        XCTAssertNotNil(manager.applyDomainWorkspaceCatalog(next, projection: .metadata(baselineGeneration: manager.domainCatalogReconciliationGeneration), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata).receipt)
+                    }
+                    // Four authority publications arrive in one modeled sidebar scheduler turn.
+                    if round.isMultiple(of: 4) { drainSidebarTurn() }
+                }
+                drainSidebarTurn()
+                let elapsed = start.duration(to: clock.now)
+                let tailInvalidations = invalidations - baselineInvalidations
+                let tailResnapshots = sidebarResnapshots - baselineResnapshots
+                print("CHOOSER_SYNTHETIC managers=28 workspaceRows=31 chatLinkedTabs=300 K=28 qualifying=\(qualifying) subjectDeliveries=\(deliveries - baselineDeliveries) managerInvalidations=\(tailInvalidations) fakeSidebarResnapshots=\(tailResnapshots) initialInvalidations=\(baselineInvalidations) initialFakeSidebarResnapshots=\(baselineResnapshots) elapsed=\(elapsed)")
+                XCTAssertEqual(qualifying, 28 * reconciliationsPerManager)
+                XCTAssertEqual(deliveries - baselineDeliveries, qualifying)
+                XCTAssertEqual(tailInvalidations, 0)
+                XCTAssertEqual(tailResnapshots, 0)
+                XCTAssertLessThan(elapsed, .seconds(15), "bounded fake reconciliation loop, not a live startup budget")
+                for manager in managers {
+                    XCTAssertEqual(manager.domainCatalogReconciliationGeneration, UInt64(reconciliationsPerManager + 1))
+                    XCTAssertEqual(manager.workspaces, models)
+                }
             }
         }
 
@@ -7334,5 +7480,170 @@ final class WindowRestoreLifetimeTests: XCTestCase {
             isCaptureLive(lifetime.captureDisposition(for: .persistent)),
             "Protection never overrides a real live selection"
         )
+    }
+}
+
+@MainActor
+final class WorkspaceChooserPublicationTests: XCTestCase {
+    private final class Owner: ObservableObject {
+        @WorkspaceChooserPublication var presentation: WorkspaceChooserPresentation = .loading
+
+        init(_ initial: WorkspaceChooserPresentation) {
+            _presentation = WorkspaceChooserPublication(wrappedValue: initial)
+        }
+    }
+
+    private func ready(
+        generation: UInt64, complete: Bool = true,
+        rows: [WorkspaceModel] = [], refresh: WorkspaceChooserRefresh = .current
+    ) -> WorkspaceChooserPresentation {
+        .ready(.init(workspaces: rows, source: .authority(.init(
+            publicationSequence: generation, catalogRevision: generation,
+            reconciliationGeneration: generation, isComplete: complete
+        ))), refresh: refresh)
+    }
+
+    func testStampOnlyChangeDeliversSubjectAndStoresCurrentStampWithoutManagerInvalidation() {
+        let initial = ready(generation: 1)
+        let next = ready(generation: 2)
+        let owner = Owner(initial)
+        var invalidations = 0
+        var emitted: [WorkspaceChooserPresentation] = []
+        var gettersDuringDelivery: [WorkspaceChooserPresentation] = []
+        let changes = owner.objectWillChange.sink { invalidations += 1 }
+        let subject = owner.$presentation.dropFirst().sink {
+            emitted.append($0)
+            gettersDuringDelivery.append(owner.presentation)
+        }
+        defer {
+            changes.cancel()
+            subject.cancel()
+        }
+        owner.presentation = next
+        XCTAssertEqual(invalidations, 0)
+        XCTAssertEqual(emitted, [next])
+        XCTAssertEqual(gettersDuringDelivery, [initial], "delivery retains preassignment semantics")
+        XCTAssertEqual(owner.presentation, next)
+        var newSubscriberValue: WorkspaceChooserPresentation?
+        let newSubscriber = owner.$presentation.sink { newSubscriberValue = $0 }
+        newSubscriber.cancel()
+        XCTAssertEqual(newSubscriberValue, next)
+        owner.presentation = next
+        XCTAssertEqual(emitted, [next], "identical values retain existing deduplication")
+        let third = ready(generation: 3)
+        owner.presentation = third
+        XCTAssertEqual(invalidations, 0)
+        XCTAssertEqual(emitted, [next, third])
+        let changedRows = ready(generation: 4, rows: [WorkspaceModel(id: UUID(), name: "Visible change", repoPaths: [])])
+        owner.presentation = changedRows
+        XCTAssertEqual(invalidations, 1, "stamp chain must not swallow a later row change")
+        XCTAssertEqual(emitted, [next, third, changedRows])
+        XCTAssertEqual(gettersDuringDelivery, [initial, next, third])
+        XCTAssertEqual(owner.presentation, changedRows)
+    }
+
+    func testNonStampChangesStillInvalidateAndDeliver() {
+        let failure = WorkspaceChooserFailure(id: UUID(), kind: .notBootstrapped, publicationSequence: 1, catalogRevision: 1)
+        let row = WorkspaceModel(id: UUID(), name: "Saved", repoPaths: [])
+        let healthy = ready(generation: 1)
+        let cases: [(String, WorkspaceChooserPresentation, WorkspaceChooserPresentation)] = [
+            ("rows", healthy, ready(generation: 2, rows: [row])),
+            ("refresh", healthy, ready(generation: 2, refresh: .failed(failure))),
+            ("unhealthy stamps", ready(generation: 1, refresh: .failed(failure)), ready(generation: 2, refresh: .failed(failure))),
+            ("incomplete stamps", ready(generation: 1, complete: false), ready(generation: 2, complete: false)),
+            ("complete to incomplete", healthy, ready(generation: 2, complete: false)),
+            ("incomplete to complete", ready(generation: 1, complete: false), ready(generation: 2)),
+            ("local to authority", .ready(.init(workspaces: [], source: .local), refresh: .current), ready(generation: 2)),
+            ("authority to local", healthy, .ready(.init(workspaces: [], source: .local), refresh: .current)),
+            ("loading to ready", .loading, ready(generation: 2)),
+            ("ready to loading", healthy, .loading),
+            ("failed to ready", .failed(failure), ready(generation: 2))
+        ]
+        for (label, initial, next) in cases {
+            let owner = Owner(initial)
+            var invalidations = 0
+            var emitted: [WorkspaceChooserPresentation] = []
+            let changes = owner.objectWillChange.sink { invalidations += 1 }
+            let subject = owner.$presentation.dropFirst().sink { emitted.append($0) }
+            owner.presentation = next
+            XCTAssertEqual(invalidations, 1, label)
+            XCTAssertEqual(emitted, [next], label)
+            XCTAssertEqual(owner.presentation, next, label)
+            changes.cancel()
+            subject.cancel()
+        }
+    }
+
+    func testStampOnlySubjectReentrancyKeepsNewestWriteAndAnnouncedComparison() {
+        let initial = ready(generation: 1)
+        let announced = ready(generation: 2)
+        let newest = ready(generation: 3)
+        let owner = Owner(initial)
+        var emitted: [WorkspaceChooserPresentation] = []
+        var invalidations = 0
+        let changes = owner.objectWillChange.sink { invalidations += 1 }
+        let subject = owner.$presentation.dropFirst().sink { value in
+            emitted.append(value)
+            if value == announced {
+                XCTAssertEqual(owner.presentation, initial)
+                owner.presentation = newest
+            }
+        }
+        defer {
+            changes.cancel()
+            subject.cancel()
+        }
+        owner.presentation = announced
+        XCTAssertEqual(emitted, [announced, newest])
+        XCTAssertEqual(owner.presentation, newest)
+        XCTAssertEqual(invalidations, 0)
+    }
+
+    func testReentrantStampOnlyWriteComparesAnnouncedRowsNotPreassignmentGetter() {
+        let initial = ready(generation: 1)
+        let rows = [WorkspaceModel(id: UUID(), name: "New row", repoPaths: [])]
+        let announced = ready(generation: 2, rows: rows)
+        let newest = ready(generation: 3, rows: rows)
+        let owner = Owner(initial)
+        var emitted: [WorkspaceChooserPresentation] = []
+        var invalidations = 0
+        let changes = owner.objectWillChange.sink { invalidations += 1 }
+        let subject = owner.$presentation.dropFirst().sink { value in
+            emitted.append(value)
+            if value == announced {
+                XCTAssertEqual(owner.presentation, initial)
+                owner.presentation = newest
+            }
+        }
+        defer {
+            changes.cancel()
+            subject.cancel()
+        }
+        owner.presentation = announced
+        XCTAssertEqual(emitted, [announced, newest])
+        XCTAssertEqual(owner.presentation, newest)
+        XCTAssertEqual(invalidations, 1, "only the visible row change invalidates")
+    }
+
+    func testManagerInvalidationReentrancyStillPreventsOlderSubjectAndBackingWrite() {
+        let initial = ready(generation: 1)
+        let newest = ready(generation: 3)
+        let owner = Owner(initial)
+        var emitted: [WorkspaceChooserPresentation] = []
+        let subject = owner.$presentation.dropFirst().sink { emitted.append($0) }
+        var fired = false
+        let changes = owner.objectWillChange.sink {
+            guard !fired else { return }
+            fired = true
+            owner.presentation = newest
+        }
+        defer {
+            changes.cancel()
+            subject.cancel()
+        }
+        owner.presentation = .loading
+        XCTAssertTrue(fired)
+        XCTAssertEqual(emitted, [newest])
+        XCTAssertEqual(owner.presentation, newest)
     }
 }

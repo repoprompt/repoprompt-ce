@@ -2,6 +2,8 @@ import AppKit
 import Combine
 import Foundation
 import MCP
+import RepoPromptACPProviders
+import RepoPromptAIContracts
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptPersistence
@@ -758,7 +760,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             stopLivenessReadings.append(admissionLiveness)
             guard admissionLiveness.permitsDelivery else { return .blocked(.endpointInvalidated) }
             if routeStopToInteractionViewModel, let interactionViewModel {
-                return await interactionViewModel.agentSessionLinkPerformStop(
+                return await interactionViewModel.linkExecutionRuntime.agentSessionLinkPerformStop(
                     to: candidate, request: request, liveness: liveness,
                     queueHasCommittedDrain: queueHasCommittedDrain,
                     withdrawInbound: withdrawInbound, commitAuthorization: commitAuthorization
@@ -883,8 +885,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
         func shutdown() async {}
 
-        func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async {
-            recorder.record("\(id.displayValue):\(result["decision"] as? String ?? "unknown")")
+        func respondToServerRequest(receipt: CodexServerRequestReceipt, result: [String: Any]) async -> CodexServerResponseDelivery {
+            recorder.record("\(receipt.requestID.displayValue):\(result["decision"] as? String ?? "unknown")")
+            return .written
         }
     }
 
@@ -1134,7 +1137,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let reference = DomainAgentSessionLinkReference(linkID: item.linkID, generation: item.generation)
         let targetEndpoint = target.domainEndpoint
         let permission = AgentApprovalRequest(
-            requestID: .codex(.int(102)),
+            requestID: .codex(.fixture(.int(102))),
             method: "item/commandExecution/requestApproval",
             kind: .commandExecution,
             threadID: "thread",
@@ -1221,7 +1224,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             fields: [],
             details: [.init(label: "api_key=private-label", value: "secret=private-value", isCode: false)]
         )
-        let projected = AgentModeViewModel.overseerProjection(of: interaction)
+        let projected = AgentSessionInteractionRuntime.overseerProjection(of: interaction)
         XCTAssertEqual(projected.options.map(\.label), ["continue"])
         XCTAssertFalse(projected.title?.contains("private-title") ?? false)
         XCTAssertFalse(projected.options.first?.description?.contains("private-description") ?? false)
@@ -1257,7 +1260,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             options: [], fields: [], details: []
         )
         let start = ProcessInfo.processInfo.systemUptime
-        let projected = AgentModeViewModel.overseerProjection(of: interaction)
+        let projected = AgentSessionInteractionRuntime.overseerProjection(of: interaction)
         XCTAssertEqual(projected.prompt, whitespace)
         XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 3)
         XCTAssertFalse(AgentSessionLinkPendingInteractionInspection.rawPromptExceedsWorkLimit(interaction))
@@ -1322,7 +1325,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
         // A new managed link may address a prompt that was already waiting.
         let approval = AgentApprovalRequest(
-            requestID: .codex(.int(201)),
+            requestID: .codex(.fixture(.int(201))),
             method: "item/commandExecution/requestApproval",
             kind: .commandExecution,
             threadID: "thread",
@@ -1384,7 +1387,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
         // Revocation at the final fence leaves this later prompt for the target's user.
         let later = AgentApprovalRequest(
-            requestID: .codex(.int(202)),
+            requestID: .codex(.fixture(.int(202))),
             method: "item/commandExecution/requestApproval",
             kind: .commandExecution,
             threadID: "thread",
@@ -1565,11 +1568,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
                 allowsCustom: false
             )]
         )
+        let command = try XCTUnwrap(viewModel.runtimeCommand(sessionID: sessionID))
         let answered = Task { @MainActor in
-            try await withCheckedThrowingContinuation { continuation in
-                session.askUserContinuation = continuation
-                session.pendingAskUser = AgentAskUserPendingState(interaction: interaction)
-            }
+            try await viewModel.interactionRuntime.askUser(command: command, interaction: interaction)
         }
         try await AsyncTestWait.waitUntil("the question to be pending") {
             await MainActor.run { session.askUserContinuation != nil }
@@ -1611,7 +1612,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             fields: [.init(id: "token", prompt: "Token?", isSecret: true, allowsOther: false, options: [])],
             details: []
         )
-        XCTAssertEqual(viewModel.overseerManualOnlyReason(for: secret, session: session), .secretInput)
+        XCTAssertEqual(viewModel.interactionRuntime.overseerManualOnlyReason(for: secret, session: session), .secretInput)
         let hook = AgentRunMCPSnapshot.Interaction(
             id: UUID(),
             kind: .hookApproval,
@@ -1624,7 +1625,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             fields: [],
             details: []
         )
-        XCTAssertEqual(viewModel.overseerManualOnlyReason(for: hook, session: session), .hookApproval)
+        XCTAssertEqual(viewModel.interactionRuntime.overseerManualOnlyReason(for: hook, session: session), .hookApproval)
     }
 
     private func pollState(
@@ -2835,11 +2836,13 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(viewModel.agentSidebarLaneCreator(tabID: tabID, expectedSessionID: sessionID)?.sessionID, freshCreator)
         let secondTabID = UUID()
         let second = viewModel.session(for: secondTabID)
-        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: second, updateWorkspaceMetadata: false)
+        XCTAssertEqual(viewModel.test_bindingRejection(sessionID: sessionID, on: second), .conflictingWriter)
+        XCTAssertNil(viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: second, updateWorkspaceMetadata: false))
         second.createdByOverseerSessionID = indexedCreator
-        // Both same-UUID live rows must read their own tab, not whichever dictionary value is first.
+        // A refused second writer cannot impersonate the first row's provenance.
+        XCTAssertNil(second.persistentSessionBindingIdentity)
         XCTAssertEqual(viewModel.agentSidebarLaneCreator(tabID: tabID, expectedSessionID: sessionID)?.sessionID, freshCreator)
-        XCTAssertEqual(viewModel.agentSidebarLaneCreator(tabID: secondTabID, expectedSessionID: sessionID)?.sessionID, indexedCreator)
+        XCTAssertNil(viewModel.agentSidebarLaneCreator(tabID: secondTabID, expectedSessionID: sessionID))
         first.hasLoadedPersistedState = true
         first.createdByOverseerSessionID = nil
         XCTAssertNil(viewModel.agentSidebarLaneCreator(tabID: tabID, expectedSessionID: sessionID))
@@ -3432,19 +3435,22 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             let observer = fixture.observer
             let session = AgentModeViewModel.TabSession(tabID: observer.tabID)
             session.beginPersistentBindingTransition()
-            try session.installPersistentSessionBinding(.init(tabID: observer.tabID, sessionID: observer.sessionID, generation: XCTUnwrap(observer.persistentBindingGeneration)))
+            try session.installPersistentSessionBinding(.init(tabID: observer.tabID, sessionID: observer.sessionID, generation: XCTUnwrap(observer.persistentBindingGeneration), workspaceID: observer.workspaceID))
+            let scope = AgentSessionRuntimeStore().makeScope()
+            scope.replaceSessions([session.tabID: session])
+            let controlIdentity = try controlWriterIdentity(for: session, scope: scope)
             session.hasLoadedPersistedState = true
             session.recordRestorationAuthoritative(.persistedPayloadApplied)
             let registration = await AgentRunSessionStore.register(sessionID: observer.sessionID)
             addTeardownBlock { await AgentRunSessionStore.cleanup(registration: registration) }
             func context(_ kind: AgentModelCatalog.TaskLabelKind) -> AgentModeViewModel.AgentMCPControlContext {
                 .init(
-                    sessionID: observer.sessionID, activationID: UUID(), registration: registration,
+                    sessionID: observer.sessionID, activationID: UUID(), writerIdentity: controlIdentity, registration: registration,
                     currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
                     originatingConnectionID: nil,
                     interactionTransport: .mcp(sessionID: observer.sessionID, originatingConnectionID: nil),
                     suppressUserNotifications: true, forceAutoEditEnabled: false,
-                    autoEditEnabledBeforeOverride: session.autoEditEnabled, taskLabelKind: kind
+                    autoEditEnabledBeforeOverride: session.autoEditEnabled, taskLabelKind: kind, autoEditOverride: nil
                 )
             }
             if input == "role-policy" { session.mcpControlContext = context(.pair) }
@@ -7840,7 +7846,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     // MARK: - Overseer-created lanes
 
     func testRoleLaneCreationUsesDestinationAvailabilityWithoutSubstitution() async throws {
-        let registry = AgentACPModelRegistry.shared
+        let registry = AgentModelCatalogRuntime.shared.acpRegistry
         registry.test_reset(providerID: .cursor)
         defer { registry.test_reset(providerID: .cursor) }
         let cursorModel = AgentModelOption(
@@ -9599,7 +9605,12 @@ extension AgentSessionLinkRuntimeBridgeTests {
         guard case let .reserved(reservation, _) = await fixture.authority.reserveLink(
             observer: fixture.observer.domainEndpoint, target: fixture.target.domainEndpoint, capabilities: [.poll]
         ), case .activated = await fixture.authority.activateLink(
-            reservation: reservation, initialSnapshot: quietSnapshot(fixture, status: .idle), sourcePublicationSequence: 1
+            reservation: reservation, initialSnapshot: .init(
+                sessionID: fixture.target.sessionID, displayName: "Worker", providerDisplayName: nil,
+                status: .awaitingUser, board: .empty, idleForSend: false,
+                pendingInteractionKind: .approval, latestVisibleAssistantPreview: nil,
+                visibleRowCount: 0, lastActivityAt: .distantPast
+            ), sourcePublicationSequence: 1
         ) else { return XCTFail("watch-only activation failed") }
         var samples: [AgentSessionLinkPassiveStatusNotices.Sample] = []
         fixture.bridge.test_onPassiveSample = { samples.append($0) }
@@ -9607,6 +9618,94 @@ extension AgentSessionLinkRuntimeBridgeTests {
         fixture.bridge.test_onPassiveSample = nil
         let sample = try XCTUnwrap(samples.last)
         XCTAssertNil(sample.managedMetadata)
+        XCTAssertTrue(sample.hasPendingInteraction)
+        XCTAssertNil(sample.runFacts)
+    }
+
+    func testSupplementalWaitSeedPublishesInitialProofLossWithoutPublicChange() async throws {
+        for pending in [false, true] {
+            for lossIsFirstReplay in [false, true] {
+                let fixture = makeFixture()
+                fixture.host.runFacts[fixture.target.sessionID] = .init(
+                    settledThrough: 8, ordinaryThrough: 8, supplementalNeedsUser: pending
+                )
+                guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
+                await fixture.bridge.test_settleProjections()
+                let initial = await pollState(fixture)
+                let sequence = try XCTUnwrap(fixture.bridge.test_sourcePublicationSequence(for: fixture.target.sessionID))
+                if !lossIsFirstReplay {
+                    fixture.host.fireObservation(for: fixture.target.sessionID)
+                    await fixture.bridge.test_settleTargetPublications()
+                    XCTAssertEqual(fixture.bridge.test_sourcePublicationSequence(for: fixture.target.sessionID), sequence)
+                }
+                fixture.host.runFacts.removeValue(forKey: fixture.target.sessionID)
+                fixture.host.fireObservation(for: fixture.target.sessionID)
+                await fixture.bridge.test_settleTargetPublications()
+                let envelope = await fixture.authority.observationSnapshot(forTargetEndpoint: fixture.target.domainEndpoint)
+                XCTAssertNil(try XCTUnwrap(envelope).runFacts)
+                XCTAssertEqual(fixture.bridge.test_sourcePublicationSequence(for: fixture.target.sessionID), sequence + 1)
+                let final = await pollState(fixture)
+                XCTAssertEqual(final?.changeSequence, initial?.changeSequence)
+            }
+        }
+    }
+
+    func testNeedsUserPublicationReachesManagedAndWatchObserversWithIndependentReceipts() async throws {
+        for supplementary in [false, true] {
+            let fixture = makeFixture()
+            let other = makeCandidate(windowID: 3, displayName: "Watch observer")
+            fixture.host.candidates.append(other)
+            func observation(_ pending: Bool) -> DomainAgentSessionObservationSnapshot {
+                .init(
+                    sessionID: fixture.target.sessionID,
+                    displayName: "Worker",
+                    providerDisplayName: nil,
+                    status: .awaitingUser,
+                    board: .empty,
+                    idleForSend: false,
+                    pendingInteractionKind: pending ? .approval : nil,
+                    latestVisibleAssistantPreview: nil,
+                    visibleRowCount: 0,
+                    lastActivityAt: .distantPast
+                )
+            }
+            fixture.host.snapshotOverrides[fixture.target.sessionID] = observation(false)
+            if supplementary {
+                fixture.host.runFacts[fixture.target.sessionID] = .init(settledThrough: 0, ordinaryThrough: 0, supplementalNeedsUser: false)
+            }
+            guard case .added = await addLink(fixture),
+                  case let .reserved(reservation, _) = await fixture.authority.reserveLink(observer: other.domainEndpoint, target: fixture.target.domainEndpoint, capabilities: [.poll]),
+                  case .activated = await fixture.authority.activateLink(reservation: reservation, initialSnapshot: observation(false), sourcePublicationSequence: 1)
+            else { return XCTFail("observer setup failed") }
+            await fixture.bridge.test_refreshStatus(sessionIDs: [fixture.observer.sessionID, other.sessionID])
+            let initial = await pollState(fixture)
+            if supplementary {
+                fixture.host.runFacts[fixture.target.sessionID] = .init(settledThrough: 0, ordinaryThrough: 0, supplementalNeedsUser: true)
+            } else {
+                fixture.host.snapshotOverrides[fixture.target.sessionID] = observation(true)
+            }
+            fixture.host.fireObservation(for: fixture.target.sessionID)
+            await fixture.bridge.test_settleTargetPublications()
+            if !supplementary {
+                // No change feed runs in this fixture; public changes need its scoped refresh.
+                // Supplemental-only publications must refresh both observers automatically.
+                await fixture.bridge.test_refreshStatus(sessionIDs: [fixture.observer.sessionID, other.sessionID])
+            }
+            let managed = try XCTUnwrap(fixture.host.publishedPassiveNoticesByEndpoint[fixture.observer.domainEndpoint])
+            let watch = try XCTUnwrap(fixture.host.publishedPassiveNoticesByEndpoint[other.domainEndpoint])
+            XCTAssertEqual(managed.attentionRequests.map(\.reason), [.needsUser])
+            XCTAssertEqual(watch.attentionRequests.map(\.reason), [.needsUser])
+            XCTAssertNil(watch.attentionRequests.first?.managedMetadata)
+            XCTAssertTrue(managed.entries.isEmpty)
+            XCTAssertTrue(watch.entries.isEmpty)
+            if supplementary {
+                let final = await pollState(fixture)
+                XCTAssertEqual(final?.changeSequence, initial?.changeSequence)
+            }
+            fixture.bridge.applyPassiveMonitorNoticeReceipt(.init(snapshot: managed), observerEndpoint: fixture.observer.domainEndpoint)
+            XCTAssertTrue(try XCTUnwrap(fixture.host.publishedPassiveNoticesByEndpoint[fixture.observer.domainEndpoint]).attentionRequests.isEmpty)
+            XCTAssertEqual(fixture.host.publishedPassiveNoticesByEndpoint[other.domainEndpoint]?.attentionRequests, watch.attentionRequests)
+        }
     }
 
     func testManagedPassiveSampleUsesAcceptedCachedObservationWithoutExtraTargetReads() async throws {

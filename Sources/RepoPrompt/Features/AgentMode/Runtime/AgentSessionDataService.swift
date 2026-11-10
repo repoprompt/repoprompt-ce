@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
@@ -1794,6 +1796,11 @@ actor AgentSessionDataService {
         }
         var fileRemoved = false
         do {
+            let oracleDrain = await MainActor.run {
+                OracleBackgroundInvocationRegistry.shared.closeAll(sessionID: sessionID)
+            }
+            await oracleDrain.value
+            try Task.checkCancellation()
             if let fence = Self.destructiveCommitFence.get(), await !fence() {
                 throw AgentSessionDestructiveCommitRefused()
             }
@@ -1811,6 +1818,7 @@ actor AgentSessionDataService {
         // withdrawn even while committed cleanup is suspended. A refused attempt never sets this.
         committedSessionDeletionFileURLs.insert(fileURL)
         await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(attempt, fileRemoved: fileRemoved)
+        await MainActor.run { OracleBackgroundInvocationRegistry.shared.removeSettledSession(sessionID) }
         // Retained images belong to the committed session; a refused attempt never reaches here.
         AgentSessionAttachmentStore.removeSessionFolder(sessionID: sessionID, agentSessionsFolder: fileURL.deletingLastPathComponent())
         finishDeletionAttempt(for: fileURL, committed: true)

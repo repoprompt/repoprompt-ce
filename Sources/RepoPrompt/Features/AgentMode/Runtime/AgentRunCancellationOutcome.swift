@@ -115,6 +115,29 @@ struct AgentRunStartStopFence: Equatable {
             && !session.stopState.isStopping(binding: binding)
     }
 
+    /// A committed domain publication is not permission to launch its successor on a
+    /// rebound incarnation or after Stop. Scope/object admission is checked by the caller.
+    @MainActor
+    func permitsTerminalSuccessor(
+        of session: AgentTabSession,
+        revision: AgentRunTerminalCommitRevision,
+        publication: AgentRunTerminalPublicationResult
+    ) -> Bool {
+        let binding = revision.ownership.binding
+        guard permitsStart(of: session),
+              binding.tabID == session.tabID,
+              binding.persistentSessionID == session.activeAgentSessionID,
+              binding.persistentBindingGeneration == session.persistentSessionBindingIdentity?.generation,
+              binding.bindingTransitionGeneration == session.bindingTransitionGeneration,
+              !session.bindingTransitionInProgress,
+              session.activeRunOwnership == nil || session.activeRunOwnership == revision.ownership
+        else { return false }
+        if let epoch = publication.successorEpoch {
+            return session.mcpControlContext?.currentEpoch == epoch
+        }
+        return true
+    }
+
     /// A queued inbound send survives internal lifecycle cancellations; only an explicit
     /// Stop (or a rebind or in-flight managed Stop) withdraws it.
     @MainActor
@@ -131,6 +154,9 @@ struct AgentRunCancellationAdmission {
     enum Scope {
         case activeRun
         case pendingStart
+        /// An exact runtime wait can predate run ownership. Only its originating wait claim
+        /// may use this case; ordinary active-run Stop still requires non-nil ownership.
+        case instructionWaitTimeout
     }
 
     let scope: Scope
@@ -155,6 +181,11 @@ struct AgentRunCancellationAdmission {
                   candidate.activeRunOwnership == expectedOwnership,
                   candidate.runID == expectedRunID
             else { return false }
+        case .instructionWaitTimeout:
+            guard candidate.runState == .waitingForUser,
+                  !candidate.terminalCommitInProgress,
+                  candidate.activeRunOwnership == expectedOwnership,
+                  candidate.runID == expectedRunID else { return false }
         case .pendingStart:
             guard candidate.activeRunOwnership == nil,
                   candidate.mcpFollowUpRunPending || !candidate.pendingInstructions.isEmpty,

@@ -1,0 +1,335 @@
+import Foundation
+import MCP
+import RepoPromptDomainRuntime
+
+/// Request-scoped managed responses. Endpoint and grant proofs are supplied separately;
+/// the runtime owns parsing, exact-object checks and the synchronous submission boundary.
+@MainActor
+extension AgentSessionInteractionRuntime {
+    /// Approval decisions an observer may submit. Each one affects only the current request.
+    static let overseerApprovalDecisionLabels: Set<String> = ["accept", "decline", "cancel"]
+
+    func pendingInteraction(for session: AgentTabSession) -> AgentSessionLinkPendingInteractionInspection {
+        guard owns(session),
+              let interaction = scope?.mcp.mcpPendingInteraction(for: session)
+        else { return .none }
+        if AgentSessionLinkPendingInteractionInspection.rawPromptExceedsWorkLimit(interaction) {
+            return .tooLarge(interaction)
+        }
+        return AgentSessionLinkPendingInteractionInspection(
+            interaction: Self.overseerProjection(
+                of: interaction,
+                withholdingApprovalDecisions: overseerWithheldApprovalDecisions(for: interaction, session: session)
+            ),
+            manualOnlyReason: overseerManualOnlyReason(for: interaction, session: session)
+        )
+    }
+
+    func respondToPendingInteraction(
+        session: AgentTabSession,
+        isCurrent endpointIsCurrent: @escaping @MainActor () -> Bool,
+        request: AgentSessionLinkInteractionResponseRequest,
+        authorize: @escaping @MainActor @Sendable () async -> Bool
+    ) async -> AgentSessionLinkInteractionResponseOutcome {
+        guard let owner = scope, owns(session), endpointIsCurrent(),
+              let sessionID = session.activeAgentSessionID,
+              case let .unique(writer) = owner.resolveWriter(sessionID: sessionID),
+              writer.scope === owner, writer.session === session,
+              case let .success(command) = writer.admitCommand() else { return .unavailable }
+        defer { withExtendedLifetime(owner) {} }
+        let binding = session.persistentSessionBindingIdentity
+        let transition = session.bindingTransitionGeneration
+        let isCurrent: @MainActor () -> Bool = { [weak self, weak session] in
+            guard let self, let session else { return false }
+            return command.isCurrent && owns(session) && session.persistentSessionBindingIdentity == binding
+                && session.bindingTransitionGeneration == transition && endpointIsCurrent()
+        }
+        guard let interaction = scope?.mcp.mcpPendingInteraction(for: session) else { return .noPendingInteraction }
+        guard interaction.id == request.interactionID else {
+            return .interactionMismatch(currentInteractionID: interaction.id)
+        }
+        if AgentSessionLinkPendingInteractionInspection.rawPromptExceedsWorkLimit(interaction) {
+            return .manualOnly(.tooLarge)
+        }
+        let manualOnlyReason = overseerManualOnlyReason(for: interaction, session: session)
+        let inspection = AgentSessionLinkPendingInteractionInspection(
+            interaction: Self.overseerProjection(
+                of: interaction,
+                withholdingApprovalDecisions: overseerWithheldApprovalDecisions(for: interaction, session: session)
+            ),
+            manualOnlyReason: manualOnlyReason
+        )
+        if inspection.exceedsPromptLimit {
+            return .manualOnly(.tooLarge)
+        }
+        if let manualOnlyReason {
+            return .manualOnly(manualOnlyReason)
+        }
+
+        if request.readOnlyAutoApproval {
+            guard let approval = session.pendingApproval, approval.id == interaction.id,
+                  AgentSessionLinkReadOnlyApprovalPolicy.allows(approval),
+                  request.payload.responseArgument == .scalar("accept")
+            else {
+                return .invalid("This command is outside the read-only auto-approval allowlist; manual approval is required.")
+            }
+        }
+
+        let resolution: AgentPendingInteractionResolution
+        do {
+            resolution = try mcpPendingInteractionResolution(
+                for: session,
+                kind: interaction.kind,
+                interactionID: interaction.id,
+                payload: request.payload
+            )
+        } catch let error as MCPError {
+            return .invalid(Self.overseerMessage(for: error))
+        } catch {
+            return .invalid(error.localizedDescription)
+        }
+        if Self.resolutionWidensAuthority(resolution) {
+            return .manualOnly(.persistentDecision)
+        }
+        let decision = Self.overseerDecisionLabel(for: resolution)
+
+        // ACP permissions answer through the controller so only genuine one-time options are chosen,
+        // with the final authority check running inside the controller right before it sends.
+        if case let .approval(approval, approvalDecision) = resolution,
+           case let .acp(requestID) = approval.requestID
+        {
+            return await respondToOverseenACPPermission(
+                isCurrent: isCurrent,
+                session: session,
+                approval: approval,
+                requestID: requestID,
+                decision: approvalDecision,
+                authorize: authorize,
+                decisionLabel: decision
+            )
+        }
+
+        guard await authorize() else { return .unavailable }
+        // Final compare-and-set. No suspension between here and submission.
+        guard owns(session), isCurrent()
+        else { return .unavailable }
+        guard let current = scope?.mcp.mcpPendingInteraction(for: session) else { return .noPendingInteraction }
+        guard current.id == request.interactionID else {
+            return .interactionMismatch(currentInteractionID: current.id)
+        }
+        if request.readOnlyAutoApproval {
+            guard let approval = session.pendingApproval, approval.id == current.id,
+                  AgentSessionLinkReadOnlyApprovalPolicy.allows(approval) else { return .unavailable }
+        }
+        do {
+            try applyPendingInteractionResolution(resolution, command: command)
+        } catch let error as MCPError {
+            return .invalid(Self.overseerMessage(for: error))
+        } catch {
+            return .invalid(error.localizedDescription)
+        }
+        scope?.presentation.makeRunHooks().requestUIRefresh(session, true)
+        return .submitted(kind: interaction.kind, decision: decision)
+    }
+
+    // MARK: - Policy
+
+    /// Interactions that exist but must stay with the target's own user.
+    func overseerManualOnlyReason(
+        for interaction: AgentRunMCPSnapshot.Interaction,
+        session: AgentTabSession
+    ) -> AgentSessionLinkInteractionManualOnlyReason? {
+        switch interaction.kind {
+        case .instruction:
+            return .instructionPrompt
+        case .hookApproval:
+            return .hookApproval
+        case .approval:
+            if session.pendingWorktreeMergeReview?.id == interaction.id {
+                return .worktreeMergeReview
+            }
+            // An ACP request without a genuine one-time allow option stays answerable: decline and
+            // cancel are still request-scoped. Only accept is withheld (see below).
+            return nil
+        case .userInput:
+            return interaction.fields.contains(where: \.isSecret) ? .secretInput : nil
+        case .question, .mcpElicitation:
+            return nil
+        }
+    }
+
+    /// Approval decisions an observer may not choose for this exact interaction, even though the
+    /// interaction itself is answerable.
+    ///
+    /// An ACP request whose provider offered no genuine one-time allow option cannot be accepted by
+    /// an observer (the only allow options would widen authority), but decline selects a one-time
+    /// reject or reports `cancelled`, and cancel reports `cancelled`, so both remain available.
+    func overseerWithheldApprovalDecisions(
+        for interaction: AgentRunMCPSnapshot.Interaction,
+        session: AgentTabSession
+    ) -> Set<String> {
+        guard interaction.kind == .approval,
+              let approval = session.pendingApproval,
+              approval.id == interaction.id,
+              !Self.overseerMayAccept(approval)
+        else { return [] }
+        return ["accept"]
+    }
+
+    /// False only for an ACP request whose provider offered no genuine one-time allow option.
+    /// The controller rechecks the live request's options before sending anything.
+    static func overseerMayAccept(_ approval: AgentApprovalRequest) -> Bool {
+        guard case .acp = approval.requestID else { return true }
+        return approval.overseerOneTimeAllowAvailable == true
+    }
+
+    /// Session-wide and policy-amending approvals reach beyond the one request being answered.
+    static func resolutionWidensAuthority(_ resolution: AgentPendingInteractionResolution) -> Bool {
+        switch resolution {
+        case let .approval(_, decision), let .permissions(_, decision):
+            switch decision {
+            case .accept, .decline, .cancel:
+                false
+            case .acceptForSession, .acceptWithExecpolicyAmendment:
+                true
+            }
+        case .askUserSkip, .askUser, .mcpElicitation, .userInput, .worktreeMerge:
+            false
+        }
+    }
+
+    static func overseerDecisionLabel(for resolution: AgentPendingInteractionResolution) -> String? {
+        switch resolution {
+        case .askUserSkip:
+            "skip"
+        case .askUser, .userInput:
+            "answered"
+        case let .mcpElicitation(_, response):
+            switch response.action {
+            case .accept: "accept"
+            case .decline: "decline"
+            case .cancel: "cancel"
+            }
+        case .worktreeMerge:
+            nil
+        case let .approval(_, decision), let .permissions(_, decision):
+            switch decision {
+            case .accept: "accept"
+            case .decline: "decline"
+            case .cancel: "cancel"
+            case .acceptForSession, .acceptWithExecpolicyAmendment: nil
+            }
+        }
+    }
+
+    /// Redacted copy of the interaction restricted to what an observer may choose.
+    ///
+    /// Option labels stay verbatim because they are the values an answer must name; free text
+    /// (titles, prompts, context, descriptions, details) passes through the oversight redactor.
+    static func overseerProjection(
+        of interaction: AgentRunMCPSnapshot.Interaction,
+        withholdingApprovalDecisions withheld: Set<String> = []
+    ) -> AgentRunMCPSnapshot.Interaction {
+        typealias Interaction = AgentRunMCPSnapshot.Interaction
+        let redact = { (text: String?) in text.map { AgentSessionLinkTextRedactor.redact($0) } }
+        let options = interaction.options
+            .filter { option in
+                interaction.kind != .approval
+                    || (overseerApprovalDecisionLabels.contains(option.label) && !withheld.contains(option.label))
+            }
+            .map { Interaction.Option(label: $0.label, description: redact($0.description)) }
+        let fields = interaction.fields.map { field in
+            Interaction.Field(
+                id: field.id,
+                header: redact(field.header),
+                prompt: AgentSessionLinkTextRedactor.redact(field.prompt),
+                context: redact(field.context),
+                isSecret: field.isSecret,
+                allowsOther: field.allowsOther,
+                allowsMultiple: field.allowsMultiple,
+                allowsCustom: field.allowsCustom,
+                emitAllowsOther: field.emitAllowsOther,
+                options: field.options.map {
+                    Interaction.Option(label: $0.label, description: redact($0.description))
+                }
+            )
+        }
+        return Interaction(
+            id: interaction.id,
+            kind: interaction.kind,
+            responseType: interaction.responseType,
+            title: redact(interaction.title),
+            prompt: redact(interaction.prompt),
+            context: redact(interaction.context),
+            allowsMultiple: interaction.allowsMultiple,
+            options: options,
+            fields: fields,
+            details: interaction.details.map {
+                Interaction.Detail(
+                    label: AgentSessionLinkTextRedactor.redact($0.label),
+                    value: AgentSessionLinkTextRedactor.redact($0.value),
+                    isCode: $0.isCode
+                )
+            }
+        )
+    }
+
+    // MARK: - Helpers
+
+    private func respondToOverseenACPPermission(
+        isCurrent: @escaping @MainActor () -> Bool,
+        session: AgentTabSession,
+        approval: AgentApprovalRequest,
+        requestID: String,
+        decision: AgentApprovalDecision,
+        authorize: @escaping @MainActor @Sendable () async -> Bool,
+        decisionLabel: String?
+    ) async -> AgentSessionLinkInteractionResponseOutcome {
+        // Refuse accept before touching the provider when no genuine one-time allow option was
+        // offered. Decline and cancel still go through; the controller keeps them request-scoped.
+        if decision == .accept, !Self.overseerMayAccept(approval) {
+            return .manualOnly(.noOneTimeAllowOption)
+        }
+        guard let controller = session.acpController else { return .unavailable }
+        let approvalID = approval.id
+        let result = await controller.respondToPermissionRequestForOverseer(
+            id: requestID,
+            decision: decision
+        ) { [weak self, weak session] in
+            guard await authorize(),
+                  let self, let session,
+                  owns(session), isCurrent(),
+                  session.pendingApproval?.id == approvalID
+            else { return false }
+            return true
+        }
+        switch result {
+        case .submitted:
+            if owns(session), session.pendingApproval?.id == approvalID {
+                session.pendingApproval = nil
+                // Mirrors the manual ACP path in `submitApprovalDecision`.
+                if session.runState == .waitingForApproval {
+                    session.runState = .running
+                }
+                scope?.presentation.makeRunHooks().requestUIRefresh(session, true)
+            }
+            return .submitted(kind: .approval, decision: decisionLabel)
+        case .noOneTimeOption:
+            return .manualOnly(.noOneTimeAllowOption)
+        case .notSubmitted:
+            if let current = scope?.mcp.mcpPendingInteraction(for: session), current.id != approvalID {
+                return .interactionMismatch(currentInteractionID: current.id)
+            }
+            return scope?.mcp.mcpPendingInteraction(for: session) == nil ? .noPendingInteraction : .unavailable
+        case .failed:
+            return .invalid("The provider rejected the permission response. No response was applied.")
+        }
+    }
+
+    private static func overseerMessage(for error: MCPError) -> String {
+        if case let .invalidParams(message) = error, let message {
+            return message
+        }
+        return error.localizedDescription
+    }
+}

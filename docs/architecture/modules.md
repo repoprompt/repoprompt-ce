@@ -9,8 +9,10 @@ The app target (`RepoPromptApp`) is the composition and product-flow owner, not 
 | `RepoPrompt`, `RepoPromptMCP` | Thin executable entries | App or MCP core respectively |
 | `RepoPromptApp` | Product flow, UI, composition | May depend on lower app-free targets |
 | `RepoPromptMCPCore`, `RepoPromptDomainRuntime` | Headless CLI and domain runtime | Never depend on app |
+| `RepoPromptMCPServer` | Unix/bootstrap transport, captured invocation dispatch, execution supervision and publication gates | DomainRuntime, Shared and Instrumentation; no app/UI/settings owner |
 | `RepoPromptCodeMapCore`, `RepoPromptRegexCore`, `RepoPromptWorkspaceCore`, `RepoPromptShared` | Narrow reusable cores | Never depend on app |
 | `RepoPromptFoundation`, `RepoPromptInstrumentation` | Reusable substrate and diagnostic sink contracts | Never depend on app |
+| `RepoPromptAIContracts` | Foundation-only model/effort values, record mapping and string interpretation | No first-party dependencies; lookup injected by app |
 | `RepoPromptProcess` | Headless process and CLI mechanics (no `Bundle.main` or `UserDefaults.standard`) | Foundation and Shared only |
 | `RepoPromptSecureStorage` | App-only secure storage | Never linked into MCP CLI |
 | `RepoPromptFileSystem` | File reads, FSEvents, ignore matching/compiler, catalog values, injected disk writer | No VCS or app dependency; repository authority and app defaults are supplied by adapters |
@@ -21,6 +23,8 @@ The app target (`RepoPromptApp`) is the composition and product-flow owner, not 
 | `<Module>Tests` | Tests of their corresponding module | Production target plus explicitly cataloged test support |
 
 Each extraction adds its production and test rows to the catalog, records its former app path(s) under `moved_families`, and lowers the matching ratchet baseline. This PR adds `RepoPromptFoundation`, `RepoPromptInstrumentation`, `RepoPromptProcess`, and `RepoPromptSecureStorage`, and extends `RepoPromptRegexCore`; the app remains the implementation owner of instrumentation diagnostics. The placement rule checks newly added paths against the PR merge base, so already-existing app adapters are not mistaken for new module code.
+
+`RepoPromptAIContracts` owns neutral model selection/parameter values and the shared Codex model interpretation kernel, with app-free compatibility tests. SettingsCore depends on those values; configured Cursor identity, selection normalization and persistence policy remain in SettingsCore. `ModelCatalogAppAdapters` remains app-owned for lazy persisted lookup and remote conversion; no catalog lifecycle or provider authority moves with this kernel. The target retains the root Swift 5 language mode, matching the former app owner.
 
 `RepoPromptDomainRuntime/ProviderContent` owns app-free prompt assembly, attachment values and managed storage, attachment previews, ACP/custom-OpenAI content encoding, and provider result/cleanup values, and `RepoPromptDomainRuntime/Attachments` owns attachment kind, route capability, planning, and presentation (see [`oracle-attachments.md`](oracle-attachments.md)). The app retains model policy, SDK-specific encoders, provider networking, controllers, UI, and composition. Existing app aliases preserve source compatibility; no new target dependency is needed. The Oracle attachment feature's app-line cost is offset by this extraction, so the combined change fits the existing ceiling without changing the ratchet baseline or headroom.
 

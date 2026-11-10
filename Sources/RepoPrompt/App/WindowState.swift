@@ -4,6 +4,7 @@ import Foundation
 import os
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 import SwiftUI
 
@@ -564,6 +565,7 @@ class WindowState: ObservableObject {
         }
         if !isPreparedSessionOwner { manager.detachPreparedRuntimeCarriers(from: self) }
         isClosing = true
+        agentModeViewModel.closeOracleBackgroundWindowAdmission()
         failUnstartedCommandsForWindowClose()
 
         if !manager.isTerminating, !isPreparedSessionOwner {
@@ -750,22 +752,36 @@ class WindowState: ObservableObject {
     let isPreparedSessionOwner: Bool
     private let compositionDomainRuntime: MCPDomainRuntime?
     private var didReleaseManagedSettings = false
+    private var preparedSessionTeardownTask: Task<Bool, Never>?
+    var isPreparedSessionTeardownInFlight: Bool {
+        preparedSessionTeardownTask != nil
+    }
 
     /// Retire the private route and its provider/session work, not the app-wide MCP listener or
     /// borrowed API settings. This owner has no window settings or placement document to persist.
     @discardableResult
     func tearDownPreparedSessionOwner() async -> Bool {
         guard isPreparedSessionOwner else { return false }
+        if let preparedSessionTeardownTask { return await preparedSessionTeardownTask.value }
+        if didReleaseManagedSettings { return true }
+        agentModeViewModel.beginPreparedOversightRetirement()
         beginClose()
-        let saved = await agentModeViewModel.finishPreparedOversightRuntime()
-        await mcpServer.unregisterDomainRoutingWindow()
-        mcpServer.stopServiceObservation()
-        await promptManager.gitViewModel.shutdownForWindowClose()
-        aiQueriesService.cancelQuery()
-        if !didReleaseManagedSettings {
-            didReleaseManagedSettings = true
-            apiSettingsViewModel.releaseManagedRuntime()
+        let task = Task { @MainActor in
+            guard await self.agentModeViewModel.finishPreparedOversightRuntime() else { return false }
+            await self.mcpServer.unregisterDomainRoutingWindow()
+            self.mcpServer.stopServiceObservation()
+            await self.promptManager.gitViewModel.shutdownForWindowClose()
+            self.aiQueriesService.cancelQuery()
+            guard self.agentModeViewModel.releasePreparedOversightWriterAfterDrain() else { return false }
+            if !self.didReleaseManagedSettings {
+                self.didReleaseManagedSettings = true
+                self.apiSettingsViewModel.releaseManagedRuntime()
+            }
+            return true
         }
+        preparedSessionTeardownTask = task
+        let saved = await task.value
+        preparedSessionTeardownTask = nil
         return saved
     }
 
@@ -1321,10 +1337,13 @@ class WindowState: ObservableObject {
     @discardableResult
     func stopAgentRunFromShortcut() -> Bool {
         let viewModel = agentModeViewModel
-        guard viewModel.isAgentModeActive,
-              let target = viewModel.composerRunCancelTarget(tabID: viewModel.currentTabID)
-        else { return false }
-        Task { _ = await viewModel.cancelAgentRun(target: target) }
+        guard viewModel.isAgentModeActive else { return false }
+        if let target = viewModel.composerRunCancelTarget(tabID: viewModel.currentTabID) {
+            Task { _ = await viewModel.cancelAgentRun(target: target) }
+            return true
+        }
+        guard let target = viewModel.composerOracleBackgroundCancelTarget(tabID: viewModel.currentTabID) else { return false }
+        Task { _ = await viewModel.cancelOracleBackground(target: target) }
         return true
     }
 
@@ -3097,6 +3116,7 @@ class WindowState: ObservableObject {
 
     func tearDown() async {
         beginClose()
+        if !WindowStatesManager.shared.isTerminating { await agentModeViewModel.joinOracleBackgroundWindowDrain() }
         // Join cancelled startup before saves/root drains so it cannot publish or hydrate late.
         await workspaceManager.awaitInitialWorkspaceActivationCompletion()
         await workspaceManager.awaitPostSwitchGitDataLoadShutdown()

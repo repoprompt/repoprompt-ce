@@ -282,13 +282,7 @@ extension AgentModeViewModel {
     /// publication at one incarnation. It is deliberately read-only and creates nothing: an unbound
     /// or unresolvable tab yields `nil` so the caller fails closed instead of inventing an endpoint.
     func agentSessionLinkObserverEndpoint(tabID: UUID) -> DomainAgentSessionLinkEndpointIdentity? {
-        guard let session = sessions[tabID],
-              let sessionID = session.activeAgentSessionID,
-              let identity = agentSessionLifecycleIdentity(tabID: tabID, expectedSessionID: sessionID)
-        else {
-            return nil
-        }
-        return identity.monitorEndpoint(windowID: windowID)
+        linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID)
     }
 
     func agentSessionLinkCandidate(
@@ -409,7 +403,14 @@ extension AgentModeViewModel {
         case .running: .running
         case .awaitingUser: .waitingForUser
         }
-        return session.quietRunFacts(capturedState: state)
+        guard let facts = session.quietRunFacts(capturedState: state) else { return nil }
+        let instructionWait = session.runState == .waitingForUser
+            && session.instructionContinuation != nil && session.instructionWaitID != nil
+        return AgentRunQuietFacts(
+            settledThrough: facts.settledThrough,
+            ordinaryThrough: facts.ordinaryThrough,
+            supplementalNeedsUser: session.pendingCodexHookReview != nil || instructionWait
+        )
     }
 
     /// Sanitized status projection for one live endpoint.

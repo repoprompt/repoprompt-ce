@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptACPProviders
 import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
@@ -7,11 +8,11 @@ final class GrokBuildContextUsageTests: XCTestCase {
     override func setUp() {
         super.setUp()
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
-        AgentACPModelRegistry.shared.test_reset(providerID: .grokBuild)
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .grokBuild)
     }
 
     override func tearDown() {
-        AgentACPModelRegistry.shared.test_reset(providerID: .grokBuild)
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .grokBuild)
         super.tearDown()
     }
 
@@ -77,7 +78,7 @@ final class GrokBuildContextUsageTests: XCTestCase {
         let stops = try await runResponses(responses, modelSelections: [1: "grok-small", 3: "grok-large-high", 4: "grok-unknown"])
         XCTAssertEqual(stops.count, 5)
         // Rendering must use the stored per-turn window, even if global discovery changes.
-        AgentACPModelRegistry.shared.test_reset(providerID: .grokBuild)
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .grokBuild)
         let viewModel = AgentModeViewModel(testWorkspacePath: FileManager.default.currentDirectoryPath, codexControllerFactory: { _, _, _, _, _, _ in
             preconditionFailure("Grok usage tests must not start Codex")
         })
@@ -166,7 +167,7 @@ final class GrokBuildContextUsageTests: XCTestCase {
     }
 
     func testReportedModelWindowsSurviveCatalogPersistenceIncludingVariants() async throws {
-        let registry = AgentACPModelRegistry.shared
+        let registry = AgentModelCatalogRuntime.shared.acpRegistry
         let provider = GrokBuildACPAgentProvider(config: GrokBuildAgentConfig())
         guard case let .valid(models) = try provider.parseDirectSessionModelSnapshot(from: json(Self.modelResponse)) else {
             return XCTFail("Expected parsed model metadata")

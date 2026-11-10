@@ -1,6 +1,8 @@
 import Foundation
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+@testable import RepoPromptMCPServer
 import RepoPromptShared
 import XCTest
 
@@ -279,7 +281,9 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         waitingOn: DomainAgentSessionWaitingOn? = nil,
         displayName: String? = nil,
         preview: String? = nil,
-        attentionSequence: UInt64 = 1
+        attentionSequence: UInt64 = 1,
+        status: AgentSessionLinkPassiveStatusNotices.Status = .running,
+        reason: AgentSessionLinkPassiveStatusNotices.PendingAttentionRequest.Reason = .requestedAttention
     ) -> AgentSessionLinkPassiveStatusNotices.PendingAttentionRequest {
         let targetSessionID = UUID(uuidString: uuid)!
         let reference = DomainAgentSessionLinkReference(linkID: UUID(), generation: 1)
@@ -300,9 +304,10 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
             targetSessionID: targetSessionID,
             requestedAt: requestedAt,
             displayName: displayName,
-            status: .running,
+            status: status,
             waitingOn: waitingOn,
-            latestVisibleAssistantPreview: preview
+            latestVisibleAssistantPreview: preview,
+            reason: reason
         )
     }
 
@@ -336,6 +341,43 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
             unacknowledgedOverflowCount: overflow,
             overflowProduced: overflowProduced ?? overflow
         )
+    }
+
+    func testNeedsUserRowAndConditionalGuidanceAreExactInFullAndReminderBatches() throws {
+        let epoch = UUID()
+        let request = attentionRequest(
+            "8B91C0E0-0000-0000-0000-00000000E572",
+            queueEpoch: epoch,
+            requestedAt: Date(timeIntervalSince1970: 50),
+            status: .waiting,
+            reason: .needsUser
+        )
+        let row = "<needs_user session_id=\"8B91C0E0-0000-0000-0000-00000000E572\" status=\"awaiting_user\" observed_at=\"1970-01-01T00:00:50Z\" idle_for_send=\"false\" />"
+        let guidance = "`needs_user` marks a lane waiting for its user at `observed_at`."
+        XCTAssertEqual(row.utf8.count, 144)
+        XCTAssertEqual(guidance.utf8.count, 64)
+        for mode in [AgentSessionLinkPrompts.LaneGuidanceMode.full, .reminder] {
+            let rendered = AgentSessionLinkPrompts.rendered(.init(
+                membershipKind: nil, inventory: inventory(items: []),
+                passiveNotices: passiveSnapshot(entries: [], attentionRequests: [request], queueEpoch: epoch),
+                toolReference: "agent_session_link", laneGuidanceMode: mode
+            ))
+            XCTAssertTrue(rendered.fragment.contains(row))
+            XCTAssertTrue(rendered.fragment.contains(guidance))
+            XCTAssertFalse(rendered.fragment.contains("<attention_request "))
+            XCTAssertFalse(rendered.fragment.contains("requested_at="))
+            XCTAssertEqual(try XCTUnwrap(rendered.passiveBatch).attentionRequests, [request])
+            let omitted = AgentSessionLinkPrompts.rendered(.init(
+                membershipKind: nil, inventory: inventory(items: []),
+                passiveNotices: passiveSnapshot(entries: [], attentionRequests: [attentionRequest(
+                    "8B91C0E0-0000-0000-0000-00000000E572", queueEpoch: epoch,
+                    displayName: String(repeating: "x", count: AgentSessionLinkPrompts.maximumRenderedBytes), reason: .needsUser
+                )], queueEpoch: epoch),
+                toolReference: "agent_session_link", laneGuidanceMode: mode
+            ))
+            XCTAssertFalse(omitted.fragment.contains(guidance))
+            XCTAssertNil(omitted.passiveBatch)
+        }
     }
 
     func testAttentionOnlyEnvelopeRendersMarkerLaneAndTimestampWithNoMetadata() throws {
@@ -3752,7 +3794,9 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         )
 
         // Same tab, same session UUID, new binding generation.
-        fixture.session.beginPersistentBindingTransition()
+        let generation = fixture.session.beginPersistentBindingTransition()
+        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        fixture.session.finishPersistentBindingTransition(generation: generation)
         let after = try AgentSessionLinkEndpointTestSupport.endpoint(
             fixture.viewModel,
             tabID: fixture.tabID
@@ -3844,7 +3888,9 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
             to: before
         )
 
-        fixture.session.beginPersistentBindingTransition()
+        let generation = fixture.session.beginPersistentBindingTransition()
+        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        fixture.session.finishPersistentBindingTransition(generation: generation)
         let after = try AgentSessionLinkEndpointTestSupport.endpoint(
             fixture.viewModel,
             tabID: fixture.tabID
@@ -3884,7 +3930,9 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
             before
         )
 
-        fixture.session.beginPersistentBindingTransition()
+        let generation = fixture.session.beginPersistentBindingTransition()
+        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        fixture.session.finishPersistentBindingTransition(generation: generation)
         let after = try AgentSessionLinkEndpointTestSupport.endpoint(
             fixture.viewModel,
             tabID: fixture.tabID
@@ -4524,7 +4572,9 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
             fixture.viewModel,
             tabID: fixture.tabID
         )
-        fixture.session.beginPersistentBindingTransition()
+        let generation = fixture.session.beginPersistentBindingTransition()
+        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        fixture.session.finishPersistentBindingTransition(generation: generation)
         let after = try AgentSessionLinkEndpointTestSupport.endpoint(
             fixture.viewModel,
             tabID: fixture.tabID
@@ -4558,7 +4608,9 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
             tabID: fixture.tabID
         )
 
-        fixture.session.beginPersistentBindingTransition()
+        let generation = fixture.session.beginPersistentBindingTransition()
+        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        fixture.session.finishPersistentBindingTransition(generation: generation)
         let currentEndpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
             fixture.viewModel,
             tabID: fixture.tabID

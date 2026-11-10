@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptSettingsCore
 
 /// Preparation owns draft revisions, never a submit claim or provider-history row.

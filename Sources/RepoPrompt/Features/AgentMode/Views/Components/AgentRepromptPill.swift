@@ -1,4 +1,5 @@
 import Combine
+import RepoPromptAIContracts
 import RepoPromptSettingsCore
 import SwiftUI
 
@@ -14,6 +15,7 @@ struct AgentRepromptPill: View {
     @State private var showingHowItWorks = false
     /// The composer that opened the disclosure, captured at open time rather than at dismissal.
     @State private var disclosureSourceTabID: UUID?
+    @Environment(\.windowIsPresentationVisible) private var windowIsPresentationVisible
     @ObservedObject private var shortcutDisplay = GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay
 
     private var rewriteKey: String {
@@ -44,20 +46,23 @@ struct AgentRepromptPill: View {
         .accessibilityLabel("Re-prompt")
         .accessibilityValue(props.isOn ? "On" : "Off")
         .contextMenu {
-            AgentRepromptModelPicker(
-                selection: Binding(get: { viewModel.repromptModelSelectionRaw() }, set: { viewModel.setRepromptModelRaw($0) }),
-                availableModels: viewModel.configuredRepromptModels(),
-                resolvedModel: viewModel.resolvedRepromptModel()
-            )
-            if !viewModel.repromptModelSelectionRaw().isEmpty {
-                Button("Use automatic default") { viewModel.useAutomaticRepromptModel() }
+            if windowIsPresentationVisible {
+                let models = viewModel.repromptMenuModels()
+                AgentRepromptModelPicker(
+                    selection: Binding(get: { viewModel.repromptModelSelectionRaw() }, set: { viewModel.setRepromptModelRaw($0) }),
+                    availableModels: models.configured,
+                    resolvedModel: models.resolved
+                )
+                if !viewModel.repromptModelSelectionRaw().isEmpty {
+                    Button("Use automatic default") { viewModel.useAutomaticRepromptModel() }
+                }
+                Picker("Mode", selection: Binding(get: { viewModel.repromptMode }, set: { viewModel.setRepromptMode($0) })) {
+                    ForEach(AgentRepromptMode.allCases, id: \.self) { Text($0.displayName).tag($0) }
+                }
+                Toggle("Include recent chat context", isOn: Binding(get: { viewModel.repromptIncludesRecentChat }, set: { viewModel.setRepromptIncludesRecentChat($0) }))
+                Text("Resolved: \(models.resolved?.displayName ?? "unavailable")")
+                Button("Agent Models Settings", action: openSettings)
             }
-            Picker("Mode", selection: Binding(get: { viewModel.repromptMode }, set: { viewModel.setRepromptMode($0) })) {
-                ForEach(AgentRepromptMode.allCases, id: \.self) { Text($0.displayName).tag($0) }
-            }
-            Toggle("Include recent chat context", isOn: Binding(get: { viewModel.repromptIncludesRecentChat }, set: { viewModel.setRepromptIncludesRecentChat($0) }))
-            Text("Resolved: \(props.modelDisplayName ?? "unavailable")")
-            Button("Agent Models Settings", action: openSettings)
         }
         .onAppear { viewModel.syncStatusPillsUIState() }
         .onReceive(availableModelChanges) { _ in
@@ -85,17 +90,19 @@ struct AgentRepromptPill: View {
     /// One click to a concrete model. Explicit choices are never replaced automatically.
     private var modelChooser: some View {
         Menu {
-            let models = viewModel.configuredRepromptModels()
-            if models.isEmpty { Text("No supported model is connected") }
-            ForEach(models, id: \.rawValue) { model in
-                Button(model.displayName) { viewModel.setRepromptModelRaw(model.rawValue) }
-            }
-            if !viewModel.repromptModelSelectionRaw().isEmpty {
+            if windowIsPresentationVisible {
+                let models = viewModel.configuredRepromptModels()
+                if models.isEmpty { Text("No supported model is connected") }
+                ForEach(models, id: \.rawValue) { model in
+                    Button(model.displayName) { viewModel.setRepromptModelRaw(model.rawValue) }
+                }
+                if !viewModel.repromptModelSelectionRaw().isEmpty {
+                    Divider()
+                    Button("Use automatic default") { viewModel.useAutomaticRepromptModel() }
+                }
                 Divider()
-                Button("Use automatic default") { viewModel.useAutomaticRepromptModel() }
+                Button("Agent Models Settings…", action: openSettings)
             }
-            Divider()
-            Button("Agent Models Settings…", action: openSettings)
         } label: {
             Text("Choose model").font(.caption)
         }

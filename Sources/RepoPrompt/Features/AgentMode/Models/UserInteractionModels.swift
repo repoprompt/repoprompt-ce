@@ -1,19 +1,6 @@
-import CryptoKit
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptFileSystem
-
-enum StableUserInteractionIdentity {
-    static func uuid(from seed: String) -> UUID {
-        let digest = Array(SHA256.hash(data: Data(seed.utf8)))
-        let bytes: uuid_t = (
-            digest[0], digest[1], digest[2], digest[3],
-            digest[4], digest[5], digest[6], digest[7],
-            digest[8], digest[9], digest[10], digest[11],
-            digest[12], digest[13], digest[14], digest[15]
-        )
-        return UUID(uuid: bytes)
-    }
-}
 
 /// A question asked by an agent awaiting user response
 public struct DiscoveryQuestion: Identifiable, Sendable, Hashable {
@@ -568,41 +555,7 @@ public struct UserInstructionResponse: Sendable {
     }
 }
 
-enum AgentJSONValue: Hashable {
-    case null
-    case bool(Bool)
-    case int(Int)
-    case double(Double)
-    case string(String)
-    case array([AgentJSONValue])
-    case object([String: AgentJSONValue])
-
-    func toAny() -> Any {
-        switch self {
-        case .null:
-            NSNull()
-        case let .bool(value):
-            value
-        case let .int(value):
-            value
-        case let .double(value):
-            value
-        case let .string(value):
-            value
-        case let .array(values):
-            values.map { $0.toAny() }
-        case let .object(values):
-            values.reduce(into: [String: Any]()) { partialResult, entry in
-                partialResult[entry.key] = entry.value.toAny()
-            }
-        }
-    }
-}
-
-struct AgentRequestUserInputOption: Hashable {
-    let label: String
-    let description: String
-
+extension AgentRequestUserInputOption {
     /// Legacy MCP approval answers have only display labels, not typed permission scopes.
     /// CU therefore accepts known one-shot/refusal labels only; unknown scopes fail closed.
     var isComputerUseOneShotApprovalOption: Bool {
@@ -613,15 +566,8 @@ struct AgentRequestUserInputOption: Hashable {
     }
 }
 
-struct AgentRequestUserInputQuestion: Hashable {
+extension AgentRequestUserInputQuestion {
     static let otherOptionLabel = "None of the above"
-
-    let id: String
-    let header: String
-    let question: String
-    let isOther: Bool
-    let isSecret: Bool
-    let options: [AgentRequestUserInputOption]
 
     var isOtherOptionEnabled: Bool {
         isOther && !options.isEmpty
@@ -648,67 +594,13 @@ struct AgentRequestUserInputResponse: Hashable {
     }
 }
 
-struct AgentRequestUserInputRequest: Identifiable, Hashable {
-    let id: UUID
-    let requestID: CodexAppServerRequestID
-    let method: String
-    let threadID: String
-    let turnID: String
-    let itemID: String
-    let askedAt: Date
-    let questions: [AgentRequestUserInputQuestion]
-    /// Established from structured provider metadata, never the displayed question or bare tool name.
-    let computerUseCompanionVerified: Bool
-    let repoPromptAutoApprovalVerified: Bool
-
-    init(
-        id: UUID? = nil,
-        requestID: CodexAppServerRequestID,
-        method: String,
-        threadID: String,
-        turnID: String,
-        itemID: String,
-        askedAt: Date = Date(),
-        questions: [AgentRequestUserInputQuestion],
-        repoPromptAutoApprovalVerified: Bool = false,
-        computerUseCompanionVerified: Bool = false
-    ) {
-        self.id = id ?? Self.stableID(
-            requestID: requestID,
-            method: method,
-            threadID: threadID,
-            turnID: turnID,
-            itemID: itemID
-        )
-        self.requestID = requestID
-        self.method = method
-        self.threadID = threadID
-        self.turnID = turnID
-        self.itemID = itemID
-        self.askedAt = askedAt
-        self.questions = questions
-        self.repoPromptAutoApprovalVerified = repoPromptAutoApprovalVerified
-        self.computerUseCompanionVerified = computerUseCompanionVerified
-    }
-
-    static func stableID(
-        requestID: CodexAppServerRequestID,
-        method: String,
-        threadID: String,
-        turnID: String,
-        itemID: String
-    ) -> UUID {
-        StableUserInteractionIdentity.uuid(
-            from: "request-user-input|\(requestID.displayValue)|\(method)|\(threadID)|\(turnID)|\(itemID)"
-        )
-    }
-
+extension AgentRequestUserInputRequest {
     /// Preserve request identity while removing persistent/unknown answers from CU consent UI
     /// and from other pending-interaction projections. Ordinary requests are never transformed.
     var computerUseReviewRequest: AgentRequestUserInputRequest {
         guard questions.contains(where: \.isLegacyMCPToolApproval) else { return self }
         return .init(
-            id: id, requestID: requestID, method: method, threadID: threadID,
+            id: id, receipt: receipt, method: method, threadID: threadID,
             turnID: turnID, itemID: itemID, askedAt: askedAt,
             questions: questions.map { question in
                 guard question.isLegacyMCPToolApproval else { return question }
@@ -782,76 +674,6 @@ struct AgentRequestUserInputRequest: Identifiable, Hashable {
     }
 }
 
-struct AgentMCPElicitationRequest: Identifiable, Hashable {
-    let id: UUID
-    let requestID: CodexAppServerRequestID
-    let method: String
-    let threadID: String
-    let turnID: String
-    let itemID: String
-    let serverName: String?
-    let toolName: String?
-    let title: String
-    let prompt: String?
-    let message: String?
-    let schemaJSON: String?
-    let defaultContentJSON: String?
-    let rawParamsJSON: String
-    let details: [AgentApprovalDetail]
-
-    init(
-        id: UUID? = nil,
-        requestID: CodexAppServerRequestID,
-        method: String,
-        threadID: String,
-        turnID: String,
-        itemID: String,
-        serverName: String? = nil,
-        toolName: String? = nil,
-        title: String = "MCP Elicitation Requested",
-        prompt: String? = nil,
-        message: String? = nil,
-        schemaJSON: String? = nil,
-        defaultContentJSON: String? = nil,
-        rawParamsJSON: String,
-        details: [AgentApprovalDetail] = []
-    ) {
-        self.id = id ?? Self.stableID(
-            requestID: requestID,
-            method: method,
-            threadID: threadID,
-            turnID: turnID,
-            itemID: itemID
-        )
-        self.requestID = requestID
-        self.method = method
-        self.threadID = threadID
-        self.turnID = turnID
-        self.itemID = itemID
-        self.serverName = serverName
-        self.toolName = toolName
-        self.title = title
-        self.prompt = prompt
-        self.message = message
-        self.schemaJSON = schemaJSON
-        self.defaultContentJSON = defaultContentJSON
-        self.rawParamsJSON = rawParamsJSON
-        self.details = details
-    }
-
-    static func stableID(
-        requestID: CodexAppServerRequestID,
-        method: String,
-        threadID: String,
-        turnID: String,
-        itemID: String
-    ) -> UUID {
-        StableUserInteractionIdentity.uuid(
-            from: "mcp-elicitation-request|\(requestID.displayValue)|\(method)|\(threadID)|\(turnID)|\(itemID)"
-        )
-    }
-}
-
 struct AgentMCPElicitationResponse: Equatable {
     enum Action: String, Equatable {
         case accept
@@ -886,131 +708,7 @@ struct AgentMCPElicitationResponse: Equatable {
     }
 }
 
-struct AgentApprovalDetail: Identifiable, Hashable {
-    let id: UUID
-    let label: String
-    let value: String
-    let isCode: Bool
-
-    static func stableID(
-        requestSeed: String,
-        index: Int,
-        label: String,
-        value: String,
-        isCode: Bool
-    ) -> UUID {
-        StableUserInteractionIdentity.uuid(
-            from: "approval-detail|\(requestSeed)|\(index)|\(label)|\(isCode)|\(value)"
-        )
-    }
-
-    private static func defaultStableID(
-        label: String,
-        value: String,
-        isCode: Bool
-    ) -> UUID {
-        StableUserInteractionIdentity.uuid(from: "approval-detail-default|\(label)|\(isCode)|\(value)")
-    }
-
-    init(id: UUID? = nil, label: String, value: String, isCode: Bool = false) {
-        self.id = id ?? Self.defaultStableID(label: label, value: value, isCode: isCode)
-        self.label = label
-        self.value = value
-        self.isCode = isCode
-    }
-}
-
-enum AgentApprovalKind: String, Hashable {
-    case commandExecution
-    case fileChange
-}
-
-enum AgentApprovalDecision: Hashable {
-    case accept
-    case acceptForSession
-    case acceptWithExecpolicyAmendment(String)
-    case decline
-    case cancel
-
-    static func parseExecpolicyAmendment(_ json: String) -> [String]? {
-        guard let values = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String],
-              !values.isEmpty
-        else { return nil }
-        return values
-    }
-}
-
-enum AgentApprovalRequestID: Hashable {
-    case codex(CodexAppServerRequestID)
-    case claudeControl(String)
-    case acp(String)
-
-    var displayValue: String {
-        switch self {
-        case let .codex(id):
-            id.displayValue
-        case let .claudeControl(id):
-            id
-        case let .acp(id):
-            id
-        }
-    }
-}
-
-struct AgentPermissionsRequest: Identifiable, Hashable {
-    let id: UUID
-    let requestID: CodexAppServerRequestID
-    let method: String
-    let threadID: String
-    let turnID: String
-    let itemID: String
-    let cwd: String
-    let reason: String?
-    let permissionsJSON: String
-    let details: [AgentApprovalDetail]
-
-    init(
-        id: UUID? = nil,
-        requestID: CodexAppServerRequestID,
-        method: String,
-        threadID: String,
-        turnID: String,
-        itemID: String,
-        cwd: String,
-        reason: String? = nil,
-        permissionsJSON: String,
-        details: [AgentApprovalDetail] = []
-    ) {
-        self.id = id ?? Self.stableID(
-            requestID: requestID,
-            method: method,
-            threadID: threadID,
-            turnID: turnID,
-            itemID: itemID
-        )
-        self.requestID = requestID
-        self.method = method
-        self.threadID = threadID
-        self.turnID = turnID
-        self.itemID = itemID
-        self.cwd = cwd
-        self.reason = reason
-        self.permissionsJSON = permissionsJSON
-        self.details = details
-    }
-
-    static func stableID(
-        requestID: CodexAppServerRequestID,
-        method: String,
-        threadID: String,
-        turnID: String,
-        itemID: String
-    ) -> UUID {
-        StableUserInteractionIdentity.uuid(
-            from: "permissions-request|\(requestID.displayValue)|\(method)|\(threadID)|\(turnID)|\(itemID)"
-        )
-    }
-
+extension AgentPermissionsRequest {
     var title: String {
         "Permissions Approval"
     }
@@ -1022,172 +720,5 @@ struct AgentPermissionsRequest: Identifiable, Hashable {
             return [:]
         }
         return object
-    }
-}
-
-/// Provider-projected scope of the session decision; nil preserves legacy presentation.
-enum AgentApprovalSessionScope: Hashable {
-    case oneTime
-    case editsSession
-}
-
-struct AgentApprovalRequest: Identifiable, Hashable {
-    let id: UUID
-    let requestID: AgentApprovalRequestID
-    let method: String
-    let kind: AgentApprovalKind
-    let threadID: String
-    let turnID: String
-    let itemID: String
-    let reason: String?
-    let command: String?
-    let cwd: String?
-    let grantRoot: String?
-    let proposedExecpolicyAmendmentJSON: String?
-    /// Codex's top-level advertised choices. Nil preserves legacy behavior; empty permits nothing.
-    let availableDecisions: [AgentApprovalDecision]?
-    /// ACP-only snapshot of genuine one-time allow availability; submission rechecks the live request.
-    let overseerOneTimeAllowAvailable: Bool?
-    /// ACP-only availability of the ordinary one-time decision, derived from live provider options.
-    let plainApproveAvailable: Bool?
-    /// Live request scope only; this does not store or grant consent.
-    let sessionApprovalScope: AgentApprovalSessionScope?
-    let details: [AgentApprovalDetail]
-
-    init(
-        id: UUID? = nil,
-        requestID: AgentApprovalRequestID,
-        method: String,
-        kind: AgentApprovalKind,
-        threadID: String,
-        turnID: String,
-        itemID: String,
-        reason: String? = nil,
-        command: String? = nil,
-        cwd: String? = nil,
-        grantRoot: String? = nil,
-        proposedExecpolicyAmendmentJSON: String? = nil,
-        availableDecisions: [AgentApprovalDecision]? = nil,
-        overseerOneTimeAllowAvailable: Bool? = nil,
-        plainApproveAvailable: Bool? = nil,
-        sessionApprovalScope: AgentApprovalSessionScope? = nil,
-        details: [AgentApprovalDetail] = []
-    ) {
-        self.id = id ?? Self.stableID(
-            requestID: requestID,
-            method: method,
-            kind: kind,
-            threadID: threadID,
-            turnID: turnID,
-            itemID: itemID
-        )
-        self.requestID = requestID
-        self.method = method
-        self.kind = kind
-        self.threadID = threadID
-        self.turnID = turnID
-        self.itemID = itemID
-        self.reason = reason
-        self.command = command
-        self.cwd = cwd
-        self.grantRoot = grantRoot
-        self.proposedExecpolicyAmendmentJSON = proposedExecpolicyAmendmentJSON
-        self.availableDecisions = availableDecisions
-        self.overseerOneTimeAllowAvailable = overseerOneTimeAllowAvailable
-        self.plainApproveAvailable = plainApproveAvailable
-        self.sessionApprovalScope = sessionApprovalScope
-        self.details = details
-    }
-
-    static func stableID(
-        requestID: AgentApprovalRequestID,
-        method: String,
-        kind: AgentApprovalKind,
-        threadID: String,
-        turnID: String,
-        itemID: String
-    ) -> UUID {
-        StableUserInteractionIdentity.uuid(
-            from: "approval-request|\(requestID.displayValue)|\(method)|\(kind.rawValue)|\(threadID)|\(turnID)|\(itemID)"
-        )
-    }
-
-    var title: String {
-        switch kind {
-        case .commandExecution:
-            "Command Approval"
-        case .fileChange:
-            "File Change Approval"
-        }
-    }
-
-    /// Request authority only. The coordinator additionally intersects the live Computer Use rule.
-    func allows(_ decision: AgentApprovalDecision) -> Bool {
-        guard case .codex = requestID else {
-            switch decision {
-            case .accept: return supportsPlainApprove
-            case .acceptForSession: return sessionApprovalScope != .oneTime
-            case .acceptWithExecpolicyAmendment: return kind == .commandExecution && sessionApprovalScope == nil
-            case .decline, .cancel: return true
-            }
-        }
-        if case let .acceptWithExecpolicyAmendment(json) = decision {
-            guard kind == .commandExecution,
-                  let amendment = AgentApprovalDecision.parseExecpolicyAmendment(json)
-            else { return false }
-            guard let availableDecisions else { return true }
-            return availableDecisions.contains { advertised in
-                guard case let .acceptWithExecpolicyAmendment(value) = advertised else { return false }
-                guard let advertised = AgentApprovalDecision.parseExecpolicyAmendment(value) else { return false }
-                return advertised.elementsEqual(amendment) { $0.utf8.elementsEqual($1.utf8) }
-            }
-        }
-        return availableDecisions?.contains(decision) ?? true
-    }
-
-    var rememberedDecision: AgentApprovalDecision? {
-        if case .codex = requestID, let availableDecisions {
-            if let amendment = availableDecisions.first(where: {
-                if case .acceptWithExecpolicyAmendment = $0 { return allows($0) }
-                return false
-            }) { return amendment }
-        } else if let json = proposedExecpolicyAmendmentJSON, !json.isEmpty {
-            let decision = AgentApprovalDecision.acceptWithExecpolicyAmendment(json)
-            if allows(decision) { return decision }
-        }
-        return allows(.acceptForSession) ? .acceptForSession : nil
-    }
-
-    /// The amendment shown alongside Remember, without letting legacy metadata override a list.
-    var presentedExecpolicyAmendmentJSON: String? {
-        if case .codex = requestID, availableDecisions != nil {
-            guard case let .acceptWithExecpolicyAmendment(json)? = rememberedDecision else { return nil }
-            return json
-        }
-        return proposedExecpolicyAmendmentJSON
-    }
-
-    var supportsExecpolicyAmendment: Bool {
-        guard kind == .commandExecution, sessionApprovalScope == nil else { return false }
-        guard case .codex = requestID, availableDecisions != nil else { return true }
-        if case .acceptWithExecpolicyAmendment? = rememberedDecision { return true }
-        return false
-    }
-
-    var supportsPlainApprove: Bool {
-        switch requestID {
-        case .codex: allows(.accept)
-        case .acp: plainApproveAvailable == true
-        case .claudeControl: true
-        }
-    }
-
-    var supportsAlwaysAllow: Bool {
-        if case .codex = requestID { return rememberedDecision != nil }
-        return sessionApprovalScope != .oneTime
-    }
-
-    var sessionApprovalLabel: String {
-        sessionApprovalScope == .editsSession ? "Allow edits this session" : "Always Allow"
     }
 }

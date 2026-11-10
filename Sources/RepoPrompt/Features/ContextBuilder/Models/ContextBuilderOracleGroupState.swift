@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptWorkspaceContext
 
 struct ContextBuilderOracleMemberHandle: Equatable {
     let laneID: OracleLaneID

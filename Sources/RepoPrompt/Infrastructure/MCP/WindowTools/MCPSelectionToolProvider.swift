@@ -4,7 +4,9 @@ import MCP
 import Ontology
 import RepoPromptFileSystem
 import RepoPromptInstrumentation
+import RepoPromptMCPServer
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 
 @MainActor
 final class MCPSelectionToolProvider: MCPAppToolProviding {

@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 /// Target double backed by real `AgentTabSession`s. Mutators mirror the view model's id-checked
@@ -235,7 +236,7 @@ final class AgentNotificationActionResolverTests: XCTestCase {
         let id = UUID()
         session.pendingPermissionsRequest = AgentPermissionsRequest(
             id: id,
-            requestID: .int(1),
+            receipt: .fixture(.int(1)),
             method: "item/permissions/requestApproval",
             threadID: "t",
             turnID: "t",
@@ -294,7 +295,7 @@ final class AgentNotificationActionResolverTests: XCTestCase {
         let id = UUID()
         session.pendingUserInputRequest = AgentRequestUserInputRequest(
             id: id,
-            requestID: .int(9),
+            receipt: .fixture(.int(9)),
             method: "item/tool/requestUserInput",
             threadID: "t",
             turnID: "t",
@@ -315,12 +316,18 @@ final class AgentNotificationActionResolverTests: XCTestCase {
 
     func testInstructionReplyGoesThroughComposerSubmission() async throws {
         let session = try XCTUnwrap(session)
-        session.instructionWaitID = UUID()
+        let scope = AgentSessionRuntimeStore().makeScope()
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: UUID()))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        scope.replaceSessions([session.tabID: session])
+        let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+        guard case let .unique(writer) = scope.resolveWriter(sessionID: sessionID) else { return XCTFail("Expected exact instruction writer") }
+        let command = try writer.admitCommand().get()
         session.waitingPrompt = "What next?"
         session.runState = .waitingForUser
         let wait = Task { @MainActor in
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<UserInstructionResponse, Error>) in
-                session.instructionContinuation = continuation
+                session.instructionWait = AgentInstructionWait(id: UUID(), command: command, continuation: continuation)
             }
         }
         for _ in 0 ..< 50 where session.instructionContinuation == nil {
@@ -329,11 +336,11 @@ final class AgentNotificationActionResolverTests: XCTestCase {
         let reference = try reference()
         XCTAssertEqual(reference.kind, .instruction)
 
-        XCTAssertEqual(resolve(.reply, reference: reference, text: "Run the tests"), .applied)
+        XCTAssertEqual(resolve(.reply, reference: reference, text: "Run the tests", sessionID: sessionID), .applied)
         XCTAssertEqual(target.instructions, ["Run the tests"])
 
         session.instructionContinuation?.resume(throwing: CancellationError())
-        session.instructionContinuation = nil
+        session.instructionWait = nil
         _ = try? await wait.value
     }
 

@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptFileSystem
 import RepoPromptFoundation
+import RepoPromptWorkspaceContext
 
 /// Namespace for MCP Tool result DTOs.
 /// Using a namespace avoids name collisions with existing private structs

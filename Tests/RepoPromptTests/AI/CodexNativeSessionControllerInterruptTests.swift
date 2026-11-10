@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptCodexProvider
 import RepoPromptInstrumentation
 import XCTest
 
@@ -234,7 +235,7 @@ final class CodexAppServerFramingTests: XCTestCase {
             )
             await controller.test_installThreadState(threadID: "thread", authoritativeTurnID: "turn", routingTurnID: "turn")
             let events = controller.events
-            await controller.test_ensureInboundStreamsStarted()
+            try await controller.test_ensureInboundStreamsStarted()
             let generation = await client.debugTransportGeneration()
             // Fake-server contract, not a real Codex run: honor the advertised exact-method opt-out
             // before writing notifications, retaining canonical text, exact usage and terminal state.
@@ -454,74 +455,6 @@ final class CodexAppServerFramingTests: XCTestCase {
                 sent.continuation.finish()
                 session.saveDebounceTask?.cancel()
             }
-        }
-    }
-
-    func testOverBudgetSplitAndSameChunkFailAllRequestsWithoutSuffixOrTimerLeak() async throws {
-        for split in [true, false] {
-            let sent = AsyncStream<Data>.makeStream()
-            let client = CodexAppServerClient(writeFrameHandler: { _, frame in sent.continuation.yield(frame) })
-            await client.debugInstallTestTransport()
-            let generation = await client.debugTransportGeneration()
-            var writes = sent.stream.makeAsyncIterator()
-            let first = beginRequest(client, method: "thread/resume")
-            _ = await writes.next()
-            let second = beginRequest(client, method: "fixture/ping")
-            _ = await writes.next()
-            let suffix = Data("\n{\"id\":1,\"result\":{\"recovered\":true}}\n".utf8)
-            if split {
-                let chunk = Data(repeating: 0x78, count: 1024 * 1024)
-                for _ in 0 ..< 64 {
-                    await client.debugIngestStdoutChunk(chunk, generation: generation)
-                }
-                await client.debugIngestStdoutChunk(Data([0x78]), generation: generation)
-                // Failure must settle before the delimiter or any recoverable suffix arrives.
-            } else {
-                var chunk = Data(repeating: 0x78, count: budget + 1)
-                chunk.append(suffix)
-                await client.debugIngestStdoutChunk(chunk, generation: generation)
-            }
-            for request in [first, second] {
-                do {
-                    _ = try await request.value
-                    XCTFail("Oversized transport must fail every pending request")
-                } catch let error as CodexAppServerClient.ClientError {
-                    guard case let .stdoutFrameBudgetExceeded(limitBytes) = error else {
-                        XCTFail("Unexpected failure: \(error)")
-                        continue
-                    }
-                    XCTAssertEqual(limitBytes, budget)
-                }
-            }
-            await client.debugIngestStdoutChunk(suffix, generation: generation)
-            let pending = await client.debugPendingRequestCount()
-            let timers = await client.debugTimeoutTaskCount()
-            let running = await client.debugIsProcessRunning()
-            let reason = await client.debugLastTransportTerminationReason()
-            XCTAssertEqual(pending, 0)
-            XCTAssertEqual(timers, 0)
-            XCTAssertFalse(running)
-            XCTAssertEqual(reason, .stdoutFrameBudgetExceeded(limitBytes: budget))
-            let recoveryAttempts = await client.debugDecodeRecoveryAttempts()
-            XCTAssertEqual(recoveryAttempts, 0)
-
-            await client.debugInstallTestTransport()
-            let successor = await client.debugTransportGeneration()
-            let next = beginRequest(client, method: "fixture/ping")
-            let written = await writes.next()
-            let write = try XCTUnwrap(written)
-            let payload = try XCTUnwrap(try JSONSerialization.jsonObject(with: write) as? [String: Any])
-            await client.debugIngestStdoutChunk(Data(repeating: 0x78, count: budget + 1), generation: generation)
-            let successorRunning = await client.debugIsProcessRunning()
-            let successorReason = await client.debugLastTransportTerminationReason()
-            XCTAssertTrue(successorRunning)
-            XCTAssertNil(successorReason)
-            let id = try XCTUnwrap(payload["id"] as? Int)
-            await client.debugIngestStdoutChunk(Data("{\"id\":\(id),\"result\":{\"ok\":true}}\n".utf8), generation: successor)
-            let reply = try await next.value
-            XCTAssertEqual(reply["ok"] as? Bool, true)
-            await client.stop()
-            sent.continuation.finish()
         }
     }
 

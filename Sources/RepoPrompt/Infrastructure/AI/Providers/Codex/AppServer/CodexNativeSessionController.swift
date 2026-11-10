@@ -1,7 +1,11 @@
 import Foundation
 import OSLog
+import RepoPromptAIContracts
+import RepoPromptCodexProvider
+import RepoPromptDomainRuntime
 import RepoPromptFoundation
 import RepoPromptInstrumentation
+import RepoPromptWorkspaceContext
 
 private actor CodexInboundStreamTaskStartGate {
     private var continuation: CheckedContinuation<Void, Never>?
@@ -181,6 +185,7 @@ protocol CodexSessionControlling: AnyObject {
         acceptedDispatchTurnID: String
     ) async -> Bool
     func interruptUserTurn(expectedTurnID: String) async throws -> CodexTurnInterruptReceipt
+    func interruptUserTurn(expectedThreadID: String, expectedTurnID: String, answering receipt: CodexServerRequestReceipt) async throws -> CodexTurnInterruptReceipt
     func reconcileAndInterruptCurrentTurn() async throws -> CodexTurnInterruptReceipt
     func compactThread() async throws
     func getThreadGoal() async throws -> CodexNativeSessionController.ThreadGoal?
@@ -201,7 +206,15 @@ protocol CodexSessionControlling: AnyObject {
     func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome
     func shutdown() async
     func revokeComputerUseAutoApproval()
-    func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async
+    @discardableResult
+    func respondToServerRequest(receipt: CodexServerRequestReceipt, result: [String: Any]) async -> CodexServerResponseDelivery
+}
+
+/// Written means the originating transport accepted the response line, not that Codex acted on it.
+enum CodexServerResponseDelivery: Equatable {
+    case written
+    case refused
+    case failed
 }
 
 extension CodexSessionControlling {
@@ -260,7 +273,7 @@ final class CodexNativeSessionController {
         category: "CodexNativeSessionController"
     )
 
-    private static func logCodexDebug(_ message: @autoclosure () -> String) {
+    static func logCodexDebug(_ message: @autoclosure () -> String) {
         #if DEBUG
             guard UserDefaults.standard.bool(forKey: "enableCodexDebugLogging") else { return }
             print(message())
@@ -767,7 +780,8 @@ final class CodexNativeSessionController {
             memoriesEnabledProvider: @escaping @MainActor () -> Bool = { false },
             computerUseEnabledProvider: @escaping @MainActor () -> Bool = { false },
             computerUseClientPathProvider: @escaping () -> String? = { CodexNativeSessionController.computerUseClientPath() },
-            mcpServerEntriesProvider: @escaping () -> [MCPIntegrationHelper.CodexServerEntry] = { MCPIntegrationHelper.codexMCPServerEntries() }
+            mcpServerEntriesProvider: @escaping () -> [MCPIntegrationHelper.CodexServerEntry] = { MCPIntegrationHelper.codexMCPServerEntries() },
+            contextWindowSelection: CodexContextWindowPreferences.Selection = .codexDefault
         ) -> Options {
             Options(
                 requestTimeout: 120,
@@ -790,7 +804,8 @@ final class CodexNativeSessionController {
                         memoriesEnabled: featurePolicy.memoriesEnabled,
                         computerUseEnabled: featurePolicy.computerUseEnabled,
                         computerUseClientPath: computerUseClientPathProvider(),
-                        serverEntries: mcpServerEntriesProvider()
+                        serverEntries: mcpServerEntriesProvider(),
+                        contextWindowSelection: contextWindowSelection
                     )
                 },
                 approvalPolicyProvider: approvalPolicyProvider,
@@ -897,7 +912,7 @@ final class CodexNativeSessionController {
     private let clientShutdownBehavior: ClientShutdownBehavior
     private let expectedMCPClientName: String?
     private let requestExecutor: (@Sendable (String, [String: Any]?, TimeInterval?) async throws -> [String: Any])?
-    private let serverRequestResponseExecutor: (@Sendable (CodexAppServerRequestID, [String: Any]) async throws -> Void)?
+    private let serverRequestResponseExecutor: (@Sendable (CodexServerRequestReceipt, [String: Any]) async throws -> Void)?
     private let hookTrustFaultInjection: HookTrustFaultInjection
     private let rawEventFileLoggingEnabled: Bool
     private var rawEventLogFileURL: URL?
@@ -978,6 +993,20 @@ final class CodexNativeSessionController {
     private let eventsStream: AsyncStream<Event>
     /// Protected by `eventsContinuationLock`.
     private var lifecycleState: LifecycleState = .fresh
+    /// Protected by `eventsContinuationLock`. All retirement callers join this one teardown.
+    private var shutdownTask: Task<Void, Never>?
+
+    #if DEBUG
+        enum ShutdownPhase: Equatable {
+            case joined(isOwner: Bool)
+            case waitingForEventDrain
+            case eventStateCleared
+            case finished
+        }
+
+        /// Configure before starting controller work; observations never run under the state lock.
+        var test_shutdownObserver: (@Sendable (ShutdownPhase) -> Void)?
+    #endif
     /// One-shot flag preventing double-emission of transport-closed events when both
     /// notification and serverRequest streams end. Protected by `eventsContinuationLock`.
     /// Never reset — this controller is single-use (coordinator creates a fresh instance on reconnect).
@@ -1529,7 +1558,7 @@ final class CodexNativeSessionController {
         clientShutdownBehavior: ClientShutdownBehavior = .none,
         expectedMCPClientName: String? = nil,
         requestExecutor: (@Sendable (String, [String: Any]?, TimeInterval?) async throws -> [String: Any])? = nil,
-        serverRequestResponseExecutor: (@Sendable (CodexAppServerRequestID, [String: Any]) async throws -> Void)? = nil,
+        serverRequestResponseExecutor: (@Sendable (CodexServerRequestReceipt, [String: Any]) async throws -> Void)? = nil,
         hookTrustFaultInjection: HookTrustFaultInjection = .init(),
         perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) {
@@ -1568,7 +1597,9 @@ final class CodexNativeSessionController {
         let client = client
         let shouldClearExpectedPID = expectedMCPClientName != nil
         let shouldStopClient = clientShutdownBehavior == .stopOnShutdown
-        if shouldClearExpectedPID || shouldStopClient {
+        // An explicit shutdown keeps self alive until its client cleanup has completed.
+        // Only controllers never handed to that owner need the deinit fallback.
+        if shutdownTask == nil, shouldClearExpectedPID || shouldStopClient {
             Task.detached {
                 if shouldClearExpectedPID {
                     await client.clearExpectedAgentPIDRegistration()
@@ -2479,7 +2510,20 @@ final class CodexNativeSessionController {
         }
     }
 
+    private enum TurnInterruptOrigin {
+        case standalone
+        case answering(CodexServerRequestReceipt, threadID: String)
+    }
+
     func interruptUserTurn(expectedTurnID: String) async throws -> CodexTurnInterruptReceipt {
+        try await interruptUserTurn(expectedTurnID: expectedTurnID, origin: .standalone)
+    }
+
+    func interruptUserTurn(expectedThreadID: String, expectedTurnID: String, answering receipt: CodexServerRequestReceipt) async throws -> CodexTurnInterruptReceipt {
+        try await interruptUserTurn(expectedTurnID: expectedTurnID, origin: .answering(receipt, threadID: expectedThreadID))
+    }
+
+    private func interruptUserTurn(expectedTurnID: String, origin: TurnInterruptOrigin) async throws -> CodexTurnInterruptReceipt {
         guard let threadID else { throw CodexAppServerClient.ClientError.invalidResponse }
         guard let expectedTurnID = Self.nonEmptyString(expectedTurnID) else {
             throw CodexAppServerClient.ClientError.invalidResponse
@@ -2491,14 +2535,20 @@ final class CodexNativeSessionController {
             )
         }
         do {
-            _ = try await performRequest(
-                method: "turn/interrupt",
-                params: [
-                    "threadId": threadID,
-                    "turnId": expectedTurnID
-                ],
-                timeout: options.requestTimeout
-            )
+            let params = ["threadId": threadID, "turnId": expectedTurnID]
+            switch origin {
+            case .standalone:
+                _ = try await performRequest(method: "turn/interrupt", params: params, timeout: options.requestTimeout)
+            case let .answering(receipt, expectedThreadID):
+                guard threadID == expectedThreadID else { throw CodexAppServerClient.ClientError.invalidResponse }
+                // This reply's follow-up must not use whichever wire exists after suspension.
+                _ = try await client.request(
+                    method: "turn/interrupt",
+                    params: params,
+                    timeout: options.requestTimeout,
+                    answering: receipt
+                )
+            }
             return CodexTurnInterruptReceipt(interruptedTurnID: expectedTurnID)
         } catch let error as CodexAppServerClient.ClientError {
             throw Self.mapSteerRequestError(error, expectedTurnID: expectedTurnID)
@@ -2824,28 +2874,54 @@ final class CodexNativeSessionController {
     }
 
     func shutdown() async {
-        revokeComputerUseAutoApproval()
-        withEventsStateLock {
+        let claim = withEventsStateLock { () -> (task: Task<Void, Never>, isOwner: Bool) in
+            if let shutdownTask { return (shutdownTask, false) }
+            computerUseAutoApprovalRevoked = true
             if lifecycleState != .terminated {
                 lifecycleState = .shuttingDown
             }
+            let task = Task { [self] in await performShutdown() }
+            shutdownTask = task
+            return (task, true)
         }
-        retireAllInboundStreamTasks()
-        assistantEmittedTextByTurnID.removeAll(keepingCapacity: false)
-        completedCanonicalItemScopes.removeAll(keepingCapacity: false)
-        completedCanonicalItemScopeOrder.removeAll(keepingCapacity: false)
-        canonicalAssistantCompletionTurnIDs.removeAll(keepingCapacity: false)
-        canonicalAssistantCompletionTurnOrder.removeAll(keepingCapacity: false)
-        canonicalContextCompactionTurnIDs.removeAll(keepingCapacity: false)
-        canonicalContextCompactionTurnOrder.removeAll(keepingCapacity: false)
-        deprecatedContextCompactionTurnIDs.removeAll(keepingCapacity: false)
-        deprecatedContextCompactionTurnOrder.removeAll(keepingCapacity: false)
-        pendingTurnFailuresByScope.removeAll(keepingCapacity: false)
-        pendingTurnFailureScopeOrder.removeAll(keepingCapacity: false)
-        fileChangeStateByItemID.removeAll(keepingCapacity: false)
-        terminalFileChangeItemIDs.removeAll(keepingCapacity: false)
-        commandExecutionMirrorStateByItemID.removeAll(keepingCapacity: false)
+        #if DEBUG
+            test_shutdownObserver?(.joined(isOwner: claim.isOwner))
+        #endif
+        // A cancelled retirement caller must still join the original cleanup, not start another.
+        await claim.task.value
+    }
+
+    private func performShutdown() async {
+        // Close delivery before waiting for in-flight handlers; they may still attempt to emit.
         finishEventsStreamIfNeeded()
+        // Do not nest these mutexes: recovery can acquire installation from an event handler.
+        // Closing lifecycle admission above prevents a later installation after this drain.
+        try? await inboundStreamInstallationMutex.withLockIgnoringCancellation {
+            retireAllInboundStreamTasks()
+        }
+        #if DEBUG
+            test_shutdownObserver?(.waitingForEventDrain)
+        #endif
+        // Cancelling a stream task alone does not stop its in-flight handler.
+        try? await eventHandlingMutex.withLockIgnoringCancellation {
+            assistantEmittedTextByTurnID.removeAll(keepingCapacity: false)
+            completedCanonicalItemScopes.removeAll(keepingCapacity: false)
+            completedCanonicalItemScopeOrder.removeAll(keepingCapacity: false)
+            canonicalAssistantCompletionTurnIDs.removeAll(keepingCapacity: false)
+            canonicalAssistantCompletionTurnOrder.removeAll(keepingCapacity: false)
+            canonicalContextCompactionTurnIDs.removeAll(keepingCapacity: false)
+            canonicalContextCompactionTurnOrder.removeAll(keepingCapacity: false)
+            deprecatedContextCompactionTurnIDs.removeAll(keepingCapacity: false)
+            deprecatedContextCompactionTurnOrder.removeAll(keepingCapacity: false)
+            pendingTurnFailuresByScope.removeAll(keepingCapacity: false)
+            pendingTurnFailureScopeOrder.removeAll(keepingCapacity: false)
+            fileChangeStateByItemID.removeAll(keepingCapacity: false)
+            terminalFileChangeItemIDs.removeAll(keepingCapacity: false)
+            commandExecutionMirrorStateByItemID.removeAll(keepingCapacity: false)
+        }
+        #if DEBUG
+            test_shutdownObserver?(.eventStateCleared)
+        #endif
         if expectedMCPClientName != nil {
             await client.clearExpectedAgentPIDRegistration()
         }
@@ -2863,6 +2939,9 @@ final class CodexNativeSessionController {
                 )
             #endif
         }
+        #if DEBUG
+            test_shutdownObserver?(.finished)
+        #endif
     }
 
     private func restoreThreadSnapshot(_ snapshot: ThreadSnapshot) {
@@ -3271,14 +3350,15 @@ final class CodexNativeSessionController {
         }
     }
 
-    private func shouldInstallInboundStreamTask() -> Bool {
-        withEventsStateLock {
-            switch lifecycleState {
-            case .binding, .active:
-                true
-            case .fresh, .shuttingDown, .terminated:
-                false
-            }
+    private func shouldInstallInboundStreamTask() throws -> Bool {
+        switch withEventsStateLock({ lifecycleState }) {
+        case .binding, .active:
+            return true
+        case .fresh:
+            return false
+        case .shuttingDown, .terminated:
+            // Recovery must not interpret a retired controller's refusal as successful setup.
+            throw CodexSessionControllerError.invalidLifecycleState("shutting down or terminated")
         }
     }
 
@@ -3313,6 +3393,7 @@ final class CodexNativeSessionController {
         acquireSubscription: () async throws -> (stream: AsyncStream<Element>, transportGeneration: UInt64),
         handleElement: @escaping (CodexNativeSessionController, Element) async -> Void
     ) async throws {
+        guard try shouldInstallInboundStreamTask() else { return }
         guard let healthyGeneration = await client.healthyTransportGeneration() else {
             retireInboundStreamTask(kind: kind)
             throw CodexAppServerClient.ClientError.processNotRunning
@@ -3326,7 +3407,7 @@ final class CodexNativeSessionController {
         guard await client.healthyTransportGeneration() == subscription.transportGeneration else {
             throw CodexAppServerClient.ClientError.processNotRunning
         }
-        guard shouldInstallInboundStreamTask() else { return }
+        guard try shouldInstallInboundStreamTask() else { return }
         let token = UUID()
         let startGate = CodexInboundStreamTaskStartGate()
         let task = Task { [weak self] in
@@ -4967,6 +5048,10 @@ final class CodexNativeSessionController {
     }
 
     #if DEBUG
+        func test_withEventHandlingLock(_ body: () async -> Void) async {
+            try? await eventHandlingMutex.withLockIgnoringCancellation { await body() }
+        }
+
         func test_markHookTrustTransportRetiring(generation: UInt64) {
             markHookTrustTransportRetiring(generation: generation)
         }
@@ -4975,8 +5060,8 @@ final class CodexNativeSessionController {
             shouldSuppressHookTrustStreamEnd(transportGeneration: transportGeneration)
         }
 
-        func test_ensureInboundStreamsStarted() async {
-            await ensureInboundStreamsStarted()
+        func test_ensureInboundStreamsStarted() async throws {
+            try await ensureInboundStreamsStartedForRecovery()
         }
 
         func test_inboundStreamTransportGenerations() -> (notifications: UInt64?, serverRequests: UInt64?) {
@@ -5010,8 +5095,8 @@ final class CodexNativeSessionController {
             pendingTurnFailureScopeOrder.removeAll(keepingCapacity: true)
         }
 
-        func test_handleServerRequest(method: String, params: [String: CodexJSONValue]) async {
-            await handleServerRequest(.init(id: .int(42), method: method, params: params))
+        func test_handleServerRequest(receipt: CodexServerRequestReceipt, method: String, params: [String: CodexJSONValue]) async {
+            await handleServerRequest(.init(receipt: receipt, method: method, params: params))
         }
 
         func test_computerUseApprovalPolicy() async throws -> (CodexAgentToolPreferences.ApprovalPolicy, CodexAgentToolPreferences.ApprovalReviewer) {
@@ -5266,31 +5351,33 @@ final class CodexNativeSessionController {
 
         switch Self.classifyServerRequestMethod(method) {
         case .approval:
-            if let approval = buildApprovalRequest(id: request.id, method: method, params: params) {
+            if let approval = buildApprovalRequest(receipt: request.receipt, method: method, params: params) {
                 await emit(.approvalRequest(approval))
                 return
             }
             do {
                 try await client.respondToServerRequestError(
-                    id: request.id,
+                    receipt: request.receipt,
                     code: -32602,
                     message: "Unsupported approval request payload for method: \(method)"
                 )
             } catch {
-                await emit(.error("Codex approval request response failed: \(error.localizedDescription)"))
+                if !logStaleServerResponseRefusal(error, receipt: request.receipt) {
+                    await emit(.error("Codex approval request response failed: \(error.localizedDescription)"))
+                }
                 return
             }
             await emit(.error("Codex approval request could not be parsed (\(method))."))
         case .requestUserInput:
             guard let userInputRequest = Self.parseRequestUserInputRequest(
-                requestID: request.id,
+                receipt: request.receipt,
                 method: method,
                 params: params,
                 activeThreadID: threadID,
                 currentTurnID: routingCurrentTurnID
             ) else {
                 await emitServerRequestIssue(
-                    requestID: request.id,
+                    receipt: request.receipt,
                     method: method,
                     kind: .requestUserInputInvalidParams,
                     code: -32602,
@@ -5300,7 +5387,7 @@ final class CodexNativeSessionController {
             }
             await emit(.requestUserInput(userInputRequest))
         case .authTokensRefresh:
-            await handleChatgptAuthTokensRefreshServerRequest(request.id, method: method, params: params)
+            await handleChatgptAuthTokensRefreshServerRequest(request.receipt, method: method, params: params)
         case .mcpElicitation:
             let autoApproveCompanion = shouldAutoApproveComputerUseCompanion(params: params)
             let autoApproveHost = Self.isRepoPromptMCPElicitationRequest(params: params)
@@ -5308,7 +5395,7 @@ final class CodexNativeSessionController {
                 logComputerUseApprovalDecision(path: .mcpElicitation, params: params, outcome: "accept")
                 await emitAutoApprovedServerRequestActivity(method: method, params: params)
                 await respondToServerRequest(
-                    id: request.id,
+                    receipt: request.receipt,
                     result: [
                         "action": "accept",
                         "content": [String: Any](),
@@ -5318,14 +5405,14 @@ final class CodexNativeSessionController {
                 return
             }
             guard let elicitationRequest = Self.parseMCPElicitationRequest(
-                requestID: request.id,
+                receipt: request.receipt,
                 method: method,
                 params: params,
                 activeThreadID: threadID,
                 currentTurnID: routingCurrentTurnID
             ) else {
                 await emitServerRequestIssue(
-                    requestID: request.id,
+                    receipt: request.receipt,
                     method: method,
                     kind: .mcpElicitationInvalidParams,
                     code: -32602,
@@ -5340,7 +5427,7 @@ final class CodexNativeSessionController {
             let hostApprovalResult = Self.repoPromptPermissionsAutoApprovalResult(params: params)
             if autoApproveCompanion,
                let permission = Self.parsePermissionsRequest(
-                   requestID: request.id,
+                   receipt: request.receipt,
                    method: method,
                    params: params,
                    activeThreadID: threadID,
@@ -5349,7 +5436,7 @@ final class CodexNativeSessionController {
             {
                 logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "accept")
                 await emitAutoApprovedServerRequestActivity(method: method, params: params)
-                await respondToServerRequest(id: request.id, result: [
+                await respondToServerRequest(receipt: request.receipt, result: [
                     "permissions": permission.permissionsObject, "scope": "turn", "strictAutoReview": false
                 ])
                 return
@@ -5357,18 +5444,18 @@ final class CodexNativeSessionController {
             if let approvalResult = hostApprovalResult {
                 logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "accept")
                 await emitAutoApprovedServerRequestActivity(method: method, params: params)
-                await respondToServerRequest(id: request.id, result: approvalResult)
+                await respondToServerRequest(receipt: request.receipt, result: approvalResult)
                 return
             }
             guard let permissionsRequest = Self.parsePermissionsRequest(
-                requestID: request.id,
+                receipt: request.receipt,
                 method: method,
                 params: params,
                 activeThreadID: threadID,
                 currentTurnID: routingCurrentTurnID
             ) else {
                 await emitServerRequestIssue(
-                    requestID: request.id,
+                    receipt: request.receipt,
                     method: method,
                     kind: .permissionsRequestUnsupported,
                     code: -32602,
@@ -5380,7 +5467,7 @@ final class CodexNativeSessionController {
             await emit(.permissionsRequest(permissionsRequest))
         case .dynamicToolUnsupported:
             await emitServerRequestIssue(
-                requestID: request.id,
+                receipt: request.receipt,
                 method: method,
                 kind: .dynamicToolCallUnsupported,
                 code: -32001,
@@ -5389,7 +5476,7 @@ final class CodexNativeSessionController {
         case .unknownUnsupported:
             let message = "Unsupported Codex server request method: \(method)"
             await emitServerRequestIssue(
-                requestID: request.id,
+                receipt: request.receipt,
                 method: method,
                 kind: .unsupportedMethod,
                 code: -32601,
@@ -5408,34 +5495,56 @@ final class CodexNativeSessionController {
         )))
     }
 
-    func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async {
+    @discardableResult
+    func respondToServerRequest(receipt: CodexServerRequestReceipt, result: [String: Any]) async -> CodexServerResponseDelivery {
         #if DEBUG
             writeRawEventLogRecord(
                 kind: "serverRequest.respond",
                 payload: [
-                    "requestID": id.displayValue,
+                    "requestID": receipt.requestID.displayValue,
                     "result": result
                 ]
             )
         #endif
         do {
             if let serverRequestResponseExecutor {
-                try await serverRequestResponseExecutor(id, result)
+                try await serverRequestResponseExecutor(receipt, result)
             } else {
-                try await client.respondToServerRequest(id: id, result: result)
+                try await client.respondToServerRequest(receipt: receipt, result: result)
             }
+            return .written
+        } catch let error as CodexAppServerClient.ClientError {
+            if logStaleServerResponseRefusal(error, receipt: receipt) { return .refused }
+            await emit(.error("Codex server request response failed: \(error.localizedDescription)"))
+            return .failed
         } catch {
             await emit(.error("Codex server request response failed: \(error.localizedDescription)"))
+            return .failed
         }
     }
 
+    /// Refusing an old origin is not an error in the current provider run. In particular, an
+    /// unscoped `.error` here could terminalize a successor on the same controller after reconnect.
+    private func logStaleServerResponseRefusal(_ error: Error, receipt: CodexServerRequestReceipt) -> Bool {
+        guard let clientError = error as? CodexAppServerClient.ClientError,
+              case let .staleServerRequest(reason) = clientError else { return false }
+        #if DEBUG
+            writeRawEventLogRecord(kind: "serverRequest.refused", payload: [
+                "requestID": receipt.requestID.displayValue,
+                "transportGeneration": receipt.transportGeneration,
+                "reason": reason.rawValue
+            ])
+        #endif
+        return true
+    }
+
     private func buildApprovalRequest(
-        id: CodexAppServerRequestID,
+        receipt: CodexServerRequestReceipt,
         method: String,
         params: [String: Any]
     ) -> AgentApprovalRequest? {
         Self.parseApprovalRequest(
-            requestID: id,
+            receipt: receipt,
             method: method,
             params: params,
             activeThreadID: threadID,
@@ -5444,13 +5553,13 @@ final class CodexNativeSessionController {
     }
 
     private func handleChatgptAuthTokensRefreshServerRequest(
-        _ requestID: CodexAppServerRequestID,
+        _ receipt: CodexServerRequestReceipt,
         method: String,
         params: [String: Any]
     ) async {
-        guard let refreshRequest = Self.parseChatgptAuthTokensRefreshRequest(requestID: requestID, params: params) else {
+        guard let refreshRequest = Self.parseChatgptAuthTokensRefreshRequest(requestID: receipt.requestID, params: params) else {
             await emitServerRequestIssue(
-                requestID: requestID,
+                receipt: receipt,
                 method: method,
                 kind: .authTokensRefreshInvalidParams,
                 code: -32602,
@@ -5460,7 +5569,7 @@ final class CodexNativeSessionController {
         }
         guard let handler = options.authTokensRefreshHandler else {
             await emitServerRequestIssue(
-                requestID: requestID,
+                receipt: receipt,
                 method: method,
                 kind: .authTokensRefreshUnavailable,
                 code: -32001,
@@ -5476,7 +5585,7 @@ final class CodexNativeSessionController {
             let suffix = detail.isEmpty ? "" : " \(detail)"
             let message = "Codex requested account/chatgptAuthTokens/refresh, but RepoPrompt failed to provide refreshed ChatGPT tokens.\(suffix)"
             await emitServerRequestIssue(
-                requestID: requestID,
+                receipt: receipt,
                 method: method,
                 kind: .authTokensRefreshFailed,
                 code: -32002,
@@ -5485,11 +5594,7 @@ final class CodexNativeSessionController {
             return
         }
         await emitAutoApprovedServerRequestActivity(method: method, params: params)
-        do {
-            try await client.respondToServerRequest(id: requestID, result: response.payload)
-        } catch {
-            await emit(.error("Codex server request response failed: \(error.localizedDescription)"))
-        }
+        await respondToServerRequest(receipt: receipt, result: response.payload)
     }
 
     private func logComputerUseApprovalDecision(path: CodexComputerUseWorkflow.ApprovalDecisionPath, params: [String: Any], outcome: String) {
@@ -5517,12 +5622,13 @@ final class CodexNativeSessionController {
     }
 
     static func parseMCPElicitationRequest(
-        requestID: CodexAppServerRequestID,
+        receipt: CodexServerRequestReceipt,
         method: String,
         params: [String: Any],
         activeThreadID: String?,
         currentTurnID: String?
     ) -> AgentMCPElicitationRequest? {
+        let requestID = receipt.requestID
         guard let rawParamsJSON = encodeJSONObjectString(params) else {
             return nil
         }
@@ -5557,7 +5663,7 @@ final class CodexNativeSessionController {
             in: params,
             keys: ["defaultContent", "default_content", "content"]
         )
-        let requestSeed = "mcp-elicitation|\(requestID.displayValue)|\(method)|\(threadID)|\(turnID)|\(itemID)"
+        let requestSeed = "mcp-elicitation|\(receipt.identitySeed)|\(method)|\(threadID)|\(turnID)|\(itemID)"
         var details: [AgentApprovalDetail] = []
         func appendDetail(_ label: String, _ value: String?, isCode: Bool = false) {
             guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return }
@@ -5581,7 +5687,7 @@ final class CodexNativeSessionController {
         appendDetail("Default Content", defaultContentJSON, isCode: true)
         appendDetail("Raw Request", rawParamsJSON, isCode: true)
         return AgentMCPElicitationRequest(
-            requestID: requestID,
+            receipt: receipt,
             method: method,
             threadID: threadID,
             turnID: turnID,
@@ -5645,7 +5751,7 @@ final class CodexNativeSessionController {
     }
 
     private func emitServerRequestIssue(
-        requestID: CodexAppServerRequestID,
+        receipt: CodexServerRequestReceipt,
         method: String,
         kind: ServerRequestIssue.Kind,
         code: Int,
@@ -5653,15 +5759,17 @@ final class CodexNativeSessionController {
     ) async {
         do {
             try await client.respondToServerRequestError(
-                id: requestID,
+                receipt: receipt,
                 code: code,
                 message: message
             )
         } catch {
-            await emit(.error("Codex server request response failed: \(error.localizedDescription)"))
+            if !logStaleServerResponseRefusal(error, receipt: receipt) {
+                await emit(.error("Codex server request response failed: \(error.localizedDescription)"))
+            }
             return
         }
-        await emit(.serverRequestIssue(.init(requestID: requestID, method: method, kind: kind, message: message)))
+        await emit(.serverRequestIssue(.init(requestID: receipt.requestID, method: method, kind: kind, message: message)))
     }
 
     private static func classifyServerRequestMethod(_ method: String) -> ServerRequestRouting {
@@ -5705,7 +5813,7 @@ final class CodexNativeSessionController {
     }
 
     static func parseRequestUserInputRequest(
-        requestID: CodexAppServerRequestID,
+        receipt: CodexServerRequestReceipt,
         method: String,
         params: [String: Any],
         activeThreadID: String?,
@@ -5774,7 +5882,7 @@ final class CodexNativeSessionController {
         }
 
         return AgentRequestUserInputRequest(
-            requestID: requestID,
+            receipt: receipt,
             method: method,
             threadID: threadID,
             turnID: turnID,
@@ -5786,7 +5894,7 @@ final class CodexNativeSessionController {
     }
 
     static func parsePermissionsRequest(
-        requestID: CodexAppServerRequestID,
+        receipt: CodexServerRequestReceipt,
         method: String,
         params: [String: Any],
         activeThreadID: String?,
@@ -5815,7 +5923,7 @@ final class CodexNativeSessionController {
 
         let reason = firstString(in: params, keys: ["reason"])
         let permissionsID = AgentPermissionsRequest.stableID(
-            requestID: requestID,
+            receipt: receipt,
             method: method,
             threadID: threadID,
             turnID: turnID,
@@ -5850,7 +5958,7 @@ final class CodexNativeSessionController {
 
         return AgentPermissionsRequest(
             id: permissionsID,
-            requestID: requestID,
+            receipt: receipt,
             method: method,
             threadID: threadID,
             turnID: turnID,
@@ -5863,12 +5971,13 @@ final class CodexNativeSessionController {
     }
 
     static func parseApprovalRequest(
-        requestID: CodexAppServerRequestID,
+        receipt: CodexServerRequestReceipt,
         method: String,
         params: [String: Any],
         activeThreadID: String?,
         currentTurnID: String?
     ) -> AgentApprovalRequest? {
+        let requestID = receipt.requestID
         let explicitThreadID = notificationThreadID(from: params)
             ?? firstString(in: params, keys: ["thread"])
         if let activeThreadID, let explicitThreadID, explicitThreadID != activeThreadID {
@@ -5949,7 +6058,7 @@ final class CodexNativeSessionController {
         }()
 
         let approvalID = AgentApprovalRequest.stableID(
-            requestID: .codex(requestID),
+            requestID: .codex(receipt),
             method: method,
             kind: kind,
             threadID: threadID,
@@ -5959,7 +6068,7 @@ final class CodexNativeSessionController {
         func makeRequest(details: [AgentApprovalDetail]) -> AgentApprovalRequest {
             AgentApprovalRequest(
                 id: approvalID,
-                requestID: .codex(requestID),
+                requestID: .codex(receipt),
                 method: method,
                 kind: kind,
                 threadID: threadID,
@@ -6658,69 +6767,7 @@ final class CodexNativeSessionController {
         let dedupKey: String
     }
 
-    struct CommandExecutionRunningItemIndex {
-        var indexByInvocationID: [UUID: Int] = [:]
-        var indexByProcessID: [String: Int] = [:]
-        var lastBashIndex: Int?
-
-        init(items: [AgentChatItem]) {
-            rebuild(from: items)
-        }
-
-        mutating func rebuild(from items: [AgentChatItem]) {
-            indexByInvocationID.removeAll(keepingCapacity: true)
-            indexByProcessID.removeAll(keepingCapacity: true)
-            lastBashIndex = nil
-            for index in items.indices {
-                let item = items[index]
-                guard CodexNativeSessionController.normalizedExternalToolName(item.toolName) == "bash" else { continue }
-                if let invocationID = item.toolInvocationID {
-                    indexByInvocationID[invocationID] = index
-                }
-                if let processID = CodexNativeSessionController.commandExecutionProcessID(from: item.toolResultJSON) {
-                    indexByProcessID[processID] = index
-                }
-                lastBashIndex = index
-            }
-        }
-
-        mutating func applyMutation(
-            oldItem: AgentChatItem,
-            newItem: AgentChatItem,
-            at index: Int
-        ) {
-            if let oldInvocationID = oldItem.toolInvocationID, indexByInvocationID[oldInvocationID] == index {
-                indexByInvocationID.removeValue(forKey: oldInvocationID)
-            }
-            if let oldProcessID = CodexNativeSessionController.commandExecutionProcessID(from: oldItem.toolResultJSON),
-               indexByProcessID[oldProcessID] == index
-            {
-                indexByProcessID.removeValue(forKey: oldProcessID)
-            }
-
-            guard CodexNativeSessionController.normalizedExternalToolName(newItem.toolName) == "bash" else {
-                if lastBashIndex == index {
-                    lastBashIndex = nil
-                }
-                return
-            }
-            if let invocationID = newItem.toolInvocationID {
-                indexByInvocationID[invocationID] = index
-            }
-            if let processID = CodexNativeSessionController.commandExecutionProcessID(from: newItem.toolResultJSON) {
-                indexByProcessID[processID] = index
-            }
-            if let lastBashIndex {
-                if index > lastBashIndex {
-                    self.lastBashIndex = index
-                }
-            } else {
-                lastBashIndex = index
-            }
-        }
-    }
-
-    private struct PersistedCommandSignals {
+    struct PersistedCommandSignals {
         var runningProcessIDs: Set<String> = []
         var runningCallIDs: Set<String> = []
         var terminalProcessIDs: Set<String> = []
@@ -6769,341 +6816,6 @@ final class CodexNativeSessionController {
             processID: parsed.processID,
             appendedOutput: parsed.output
         )
-    }
-
-    static func applyCommandExecutionRunningUpdate(
-        _ update: CommandExecutionRunningUpdate,
-        to items: inout [AgentChatItem]
-    ) -> Bool {
-        var index: CommandExecutionRunningItemIndex? = nil
-        return applyCommandExecutionRunningUpdate(update, to: &items, index: &index)
-    }
-
-    static func applyCommandExecutionRunningUpdates(
-        _ updates: [CommandExecutionRunningUpdate],
-        to items: inout [AgentChatItem]
-    ) -> Int {
-        guard !updates.isEmpty else { return 0 }
-        var index: CommandExecutionRunningItemIndex? = nil
-        var appliedCount = 0
-        for update in updates {
-            if applyCommandExecutionRunningUpdate(update, to: &items, index: &index) {
-                appliedCount &+= 1
-            }
-        }
-        return appliedCount
-    }
-
-    static func applyCommandExecutionRunningUpdate(
-        _ update: CommandExecutionRunningUpdate,
-        to items: inout [AgentChatItem],
-        index: inout CommandExecutionRunningItemIndex?
-    ) -> Bool {
-        if index == nil {
-            index = CommandExecutionRunningItemIndex(items: items)
-        }
-        let target = commandExecutionRunningTarget(update: update, items: items, index: &index)
-
-        guard let target else {
-            logCodexDebug("[CodexNativeController] runningUpdateMiss invocationID=\(update.invocationID?.uuidString ?? "nil") processID=\(update.processID ?? "nil") outputChars=\(update.appendedOutput?.count ?? 0) bashCount=\(items.count(where: { normalizedExternalToolName($0.toolName) == "bash" }))")
-            return false
-        }
-        let targetIndex = target.index
-        let oldItem = items[targetIndex]
-        var item = oldItem
-        var didChange = false
-
-        if item.toolIsError != true,
-           commandExecutionResultIndicatesTerminal(raw: item.toolResultJSON)
-        {
-            logCodexDebug("[CodexNativeController] runningUpdateIgnored reason=terminal targetIndex=\(targetIndex) match=\(target.reason) invocationID=\(update.invocationID?.uuidString ?? "nil") processID=\(update.processID ?? "nil")")
-            return false
-        }
-
-        if item.kind == .toolCall {
-            item.kind = .toolResult
-            didChange = true
-        }
-        if item.toolIsError != false {
-            item.toolIsError = false
-            didChange = true
-        }
-
-        if shouldPatchCommandExecutionRunningPayload(
-            raw: item.toolResultJSON,
-            processID: update.processID,
-            appendOutput: update.appendedOutput
-        ) {
-            let patched = withCommandExecutionRunningStatus(
-                raw: item.toolResultJSON,
-                processID: update.processID,
-                appendOutput: update.appendedOutput
-            )
-            if patched != item.toolResultJSON {
-                item.toolResultJSON = patched
-                didChange = true
-            }
-        }
-
-        guard didChange else { return false }
-        items[targetIndex] = item
-        index?.applyMutation(oldItem: oldItem, newItem: item, at: targetIndex)
-        logCodexDebug("[CodexNativeController] runningUpdateApplied match=\(target.reason) targetIndex=\(targetIndex) invocationID=\(update.invocationID?.uuidString ?? "nil") processID=\(update.processID ?? "nil") outputChars=\(update.appendedOutput?.count ?? 0)")
-        return true
-    }
-
-    static func matchingBashToolResultIndex(
-        in items: [AgentChatItem],
-        toolName: String,
-        invocationID: UUID?,
-        argsJSON: String?,
-        resultJSON: String
-    ) -> Int? {
-        guard normalizedExternalToolName(toolName) == "bash" else { return nil }
-
-        var metadataCacheByItemID: [UUID: BashToolResultParser.Metadata] = [:]
-        func metadata(_ item: AgentChatItem) -> BashToolResultParser.Metadata {
-            if let cached = metadataCacheByItemID[item.id] {
-                return cached
-            }
-            let parsed = BashToolResultParser.parseMetadata(raw: item.toolResultJSON)
-            metadataCacheByItemID[item.id] = parsed
-            return parsed
-        }
-
-        var parseCacheByItemID: [UUID: BashToolResultParser.ParsedResult] = [:]
-        func parsed(_ item: AgentChatItem) -> BashToolResultParser.ParsedResult {
-            if let cached = parseCacheByItemID[item.id] {
-                return cached
-            }
-            let parsed = BashToolResultParser.parse(raw: item.toolResultJSON, argsJSON: item.toolArgsJSON)
-            parseCacheByItemID[item.id] = parsed
-            return parsed
-        }
-
-        func isRunningBash(_ item: AgentChatItem) -> Bool {
-            guard item.kind == .toolResult else { return false }
-            guard normalizedExternalToolName(item.toolName) == "bash" else { return false }
-            return metadata(item).isRunning
-        }
-
-        if let invocationID,
-           let index = items.lastIndex(where: {
-               $0.toolInvocationID == invocationID && isRunningBash($0)
-           })
-        {
-            return index
-        }
-
-        let incomingMetadata = BashToolResultParser.parseMetadata(raw: resultJSON)
-        let incomingProcessID = incomingMetadata.processID?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let incomingArgs = argsJSON?.trimmingCharacters(in: .whitespacesAndNewlines)
-        var incomingParsedResult: BashToolResultParser.ParsedResult?
-        func incomingCommand() -> String? {
-            if incomingParsedResult == nil {
-                incomingParsedResult = BashToolResultParser.parse(raw: resultJSON, argsJSON: argsJSON)
-            }
-            let command = incomingParsedResult?.command?.trimmingCharacters(in: .whitespacesAndNewlines)
-            return command?.isEmpty == false ? command : nil
-        }
-
-        if let incomingProcessID, !incomingProcessID.isEmpty,
-           let index = items.lastIndex(where: { item in
-               guard isRunningBash(item) else { return false }
-               let existingProcessID = metadata(item).processID?.trimmingCharacters(in: .whitespacesAndNewlines)
-               return existingProcessID == incomingProcessID
-           })
-        {
-            return index
-        }
-
-        if let incomingArgs, !incomingArgs.isEmpty,
-           let index = items.lastIndex(where: { item in
-               guard isRunningBash(item) else { return false }
-               let existingArgs = item.toolArgsJSON?.trimmingCharacters(in: .whitespacesAndNewlines)
-               return existingArgs == incomingArgs
-           })
-        {
-            return index
-        }
-
-        if let incomingCommand = incomingCommand(), !incomingCommand.isEmpty,
-           let index = items.lastIndex(where: { item in
-               guard isRunningBash(item) else { return false }
-               let existingCommand = parsed(item).command?.trimmingCharacters(in: .whitespacesAndNewlines)
-               return existingCommand == incomingCommand
-           })
-        {
-            return index
-        }
-
-        let runningBashIndexes = items.indices.filter { isRunningBash(items[$0]) }
-        if runningBashIndexes.count == 1 {
-            return runningBashIndexes[0]
-        }
-        return nil
-    }
-
-    private static func commandExecutionRunningTarget(
-        update: CommandExecutionRunningUpdate,
-        items: [AgentChatItem],
-        index: inout CommandExecutionRunningItemIndex?
-    ) -> (index: Int, reason: String)? {
-        if let invocationID = update.invocationID,
-           let byInvocation = index?.indexByInvocationID[invocationID],
-           isBashItem(at: byInvocation, in: items)
-        {
-            return (byInvocation, "invocation-index")
-        }
-        if let processID = update.processID,
-           let byProcess = index?.indexByProcessID[processID],
-           isBashItem(at: byProcess, in: items)
-        {
-            return (byProcess, "process-index")
-        }
-        let fallbackRequiresCorrelation = update.invocationID != nil || (update.processID?.isEmpty == false)
-        if let uniqueFallback = uniqueFallbackEligibleBashIndex(
-            in: items,
-            requireCorrelationForErroredItem: fallbackRequiresCorrelation
-        ) {
-            return (uniqueFallback, "single-bash-index")
-        }
-
-        let scannedTarget: (index: Int, reason: String)? = {
-            if let invocationID = update.invocationID,
-               let byInvocation = items.lastIndex(where: {
-                   $0.toolInvocationID == invocationID && normalizedExternalToolName($0.toolName) == "bash"
-               })
-            {
-                return (byInvocation, "invocation-scan")
-            }
-            if let processID = update.processID,
-               let byProcess = items.lastIndex(where: { item in
-                   normalizedExternalToolName(item.toolName) == "bash"
-                       && commandExecutionProcessID(from: item.toolResultJSON) == processID
-               })
-            {
-                return (byProcess, "process-scan")
-            }
-            if let uniqueFallback = uniqueFallbackEligibleBashIndex(
-                in: items,
-                requireCorrelationForErroredItem: fallbackRequiresCorrelation
-            ) {
-                return (uniqueFallback, "single-bash-scan")
-            }
-            return nil
-        }()
-        if scannedTarget != nil {
-            index = CommandExecutionRunningItemIndex(items: items)
-        }
-        return scannedTarget
-    }
-
-    private static func isBashItem(at index: Int, in items: [AgentChatItem]) -> Bool {
-        guard items.indices.contains(index) else { return false }
-        return normalizedExternalToolName(items[index].toolName) == "bash"
-    }
-
-    private static func isFallbackEligibleBashItem(
-        at index: Int,
-        in items: [AgentChatItem],
-        requireCorrelationForErroredItem: Bool
-    ) -> Bool {
-        guard isBashItem(at: index, in: items) else { return false }
-        let item = items[index]
-        if item.toolIsError == true {
-            return requireCorrelationForErroredItem
-        }
-        return !commandExecutionResultIndicatesTerminal(raw: item.toolResultJSON)
-    }
-
-    private static func uniqueFallbackEligibleBashIndex(
-        in items: [AgentChatItem],
-        requireCorrelationForErroredItem: Bool
-    ) -> Int? {
-        var resolvedIndex: Int?
-        for index in items.indices where isFallbackEligibleBashItem(
-            at: index,
-            in: items,
-            requireCorrelationForErroredItem: requireCorrelationForErroredItem
-        ) {
-            if resolvedIndex != nil {
-                return nil
-            }
-            resolvedIndex = index
-        }
-        return resolvedIndex
-    }
-
-    static func reconcilePersistedCommandExecutionStatuses(
-        in items: inout [AgentChatItem],
-        rolloutPath: String
-    ) -> Bool {
-        let trimmedPath = rolloutPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedPath.isEmpty else { return false }
-        let candidateIndices = items.indices.filter { index in
-            let item = items[index]
-            guard item.kind == .toolResult else { return false }
-            guard normalizedExternalToolName(item.toolName) == "bash" else { return false }
-            let processID = commandExecutionProcessID(from: item.toolResultJSON)
-            let callID = commandExecutionCallID(from: item.toolResultJSON)
-            guard processID != nil || callID != nil else {
-                return false
-            }
-            let processIDLooksSessionScoped = processID?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased()
-                .hasPrefix("session:") == true
-            guard item.toolIsError == true || processIDLooksSessionScoped else {
-                return false
-            }
-            if item.toolIsError == true {
-                return true
-            }
-            return !commandExecutionResultIndicatesRunning(raw: item.toolResultJSON)
-        }
-        guard !candidateIndices.isEmpty else { return false }
-
-        let signals = loadPersistedCommandSignals(fromRolloutPath: trimmedPath)
-        guard !signals.runningProcessIDs.isEmpty
-            || !signals.runningCallIDs.isEmpty
-        else { return false }
-
-        var didChange = false
-        for index in candidateIndices {
-            var item = items[index]
-            let processID = commandExecutionProcessID(from: item.toolResultJSON)
-            let processSignalKeys = canonicalCommandProcessIDs(for: processID)
-            let callID = commandExecutionCallID(from: item.toolResultJSON)
-            let recoveredOutput =
-                (callID.flatMap { signals.outputByCallID[$0] })
-                    ?? processSignalKeys.lazy.compactMap { signals.outputByProcessID[$0] }.first
-            let hasTerminalSignal =
-                processSignalKeys.contains(where: { signals.terminalProcessIDs.contains($0) })
-                    || (callID.map { signals.terminalCallIDs.contains($0) } ?? false)
-            guard !hasTerminalSignal else { continue }
-
-            let shouldPatch =
-                processSignalKeys.contains(where: { signals.runningProcessIDs.contains($0) })
-                    || (callID.map { signals.runningCallIDs.contains($0) } ?? false)
-            guard shouldPatch else { continue }
-
-            if item.toolIsError != false {
-                item.toolIsError = false
-                didChange = true
-            }
-            let patched = withCommandExecutionRunningStatus(
-                raw: item.toolResultJSON,
-                processID: processID,
-                appendOutput: recoveredOutput
-            )
-            if patched != item.toolResultJSON {
-                item.toolResultJSON = patched
-                didChange = true
-            }
-            items[index] = item
-        }
-        return didChange
     }
 
     private static func isItemLifecycleNotificationMethod(_ method: String) -> Bool {
@@ -7992,7 +7704,7 @@ final class CodexNativeSessionController {
         )
     }
 
-    private static func normalizedExternalToolName(_ raw: String?) -> String? {
+    static func normalizedExternalToolName(_ raw: String?) -> String? {
         guard let acceptedName = AgentToolNamePolicy.accepted(raw) else { return nil }
         let trimmed = acceptedName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
@@ -8068,7 +7780,7 @@ final class CodexNativeSessionController {
         return object
     }
 
-    private static func commandExecutionProcessID(from raw: String?) -> String? {
+    static func commandExecutionProcessID(from raw: String?) -> String? {
         guard let object = jsonObject(from: raw) else { return nil }
         for key in ["processId", "process_id"] {
             if let value = dictString(object, key: key), !value.isEmpty {
@@ -8081,7 +7793,7 @@ final class CodexNativeSessionController {
         return nil
     }
 
-    private static func canonicalCommandProcessIDs(for rawProcessID: String?) -> [String] {
+    static func canonicalCommandProcessIDs(for rawProcessID: String?) -> [String] {
         guard let rawProcessID = rawProcessID?.trimmingCharacters(in: .whitespacesAndNewlines),
               !rawProcessID.isEmpty
         else {
@@ -8101,7 +7813,7 @@ final class CodexNativeSessionController {
         return [rawProcessID, "session:\(rawProcessID)"]
     }
 
-    private static func commandExecutionCallID(from raw: String?) -> String? {
+    static func commandExecutionCallID(from raw: String?) -> String? {
         guard let object = jsonObject(from: raw) else { return nil }
         for key in ["id", "callId", "call_id"] {
             if let value = dictString(object, key: key), !value.isEmpty {
@@ -8211,7 +7923,7 @@ final class CodexNativeSessionController {
         }
     }
 
-    private static func withCommandExecutionRunningStatus(
+    static func withCommandExecutionRunningStatus(
         raw: String?,
         processID: String?,
         appendOutput: String?
@@ -8233,7 +7945,7 @@ final class CodexNativeSessionController {
         return runningOutputTruncationMarker + suffix
     }
 
-    private static func loadPersistedCommandSignals(fromRolloutPath path: String) -> PersistedCommandSignals {
+    static func loadPersistedCommandSignals(fromRolloutPath path: String) -> PersistedCommandSignals {
         guard let contents = try? String(contentsOfFile: path, encoding: .utf8), !contents.isEmpty else {
             return PersistedCommandSignals()
         }
@@ -8908,7 +8620,7 @@ final class CodexNativeSessionController {
         "timeout", "timed_out", "killed"
     ]
 
-    private static func commandExecutionResultIndicatesRunning(raw: String?) -> Bool {
+    static func commandExecutionResultIndicatesRunning(raw: String?) -> Bool {
         guard let object = jsonObject(from: raw) else { return false }
         guard commandExecutionObjectIsCommandLike(object) else { return false }
 
@@ -8933,7 +8645,7 @@ final class CodexNativeSessionController {
         return false
     }
 
-    private static func shouldPatchCommandExecutionRunningPayload(
+    static func shouldPatchCommandExecutionRunningPayload(
         raw: String?,
         processID: String?,
         appendOutput: String?
@@ -8972,7 +8684,7 @@ final class CodexNativeSessionController {
         return !commandExecutionRunningStatusWords.contains(statusWord)
     }
 
-    private static func commandExecutionResultIndicatesTerminal(raw: String?) -> Bool {
+    static func commandExecutionResultIndicatesTerminal(raw: String?) -> Bool {
         guard let object = jsonObject(from: raw) else { return false }
         let exitCode = commandExecutionExitCode(from: object)
         let processID = commandExecutionProcessID(from: raw)
@@ -9906,7 +9618,8 @@ final class CodexNativeSessionController {
         memoriesEnabled: Bool = false,
         computerUseEnabled: Bool = false,
         computerUseClientPath: String? = computerUseClientPath(),
-        serverEntries: [MCPIntegrationHelper.CodexServerEntry] = MCPIntegrationHelper.codexMCPServerEntries()
+        serverEntries: [MCPIntegrationHelper.CodexServerEntry] = MCPIntegrationHelper.codexMCPServerEntries(),
+        contextWindowSelection: CodexContextWindowPreferences.Selection = .codexDefault
     ) -> [String: Any] {
         let readyComputerUse = computerUseEnabled && computerUseClientPath != nil && !hasReservedComputerUseEntry(serverEntries)
         let preferences = CodexAgentToolPreferences.snapshot(for: serverEntries)
@@ -9927,6 +9640,9 @@ final class CodexNativeSessionController {
                 capabilities: computerUseEnabled ? .computerUse : capabilities
             )
         )
+        for (key, value) in CodexContextWindowPreferences.overrides(contextWindowSelection) {
+            overrides[key] = value
+        }
         let mcpOverrides = appServerMCPServerOverrides(
             serverEntries: serverEntries,
             enabledMCPServerNames: preferences.enabledMCPServerNames,

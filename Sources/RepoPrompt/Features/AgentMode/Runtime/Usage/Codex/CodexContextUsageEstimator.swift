@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 
 @MainActor
 final class CodexContextUsageEstimator: ContextUsageEstimating {

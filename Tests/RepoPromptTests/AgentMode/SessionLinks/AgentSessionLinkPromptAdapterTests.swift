@@ -1,5 +1,9 @@
 import Foundation
 import MCP
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
+import RepoPromptCodexProvider
+@testable import RepoPromptMCPServer
 import RepoPromptSecureStorage
 import RepoPromptShared
 @_spi(TestSupport) @testable import RepoPromptApp
@@ -974,6 +978,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             let parked = try XCTUnwrap(state.parkedNote)
             let startsBefore = fixture.startedTurns.count
             let steersBefore = fixture.controller.steeredTurns.count
+            let priorAuthRetryTurn = fixture.session.codexPendingAuthRetryTurn
+            let priorOwnership = fixture.session.activeRunOwnership
             let gate = TestReleaseFence(name: "parked Codex optional Read cancellation")
             fixture.viewModel.test_agentSessionLinkLocalInputReadProof = { decoration in
                 await gate.enterAndWait()
@@ -993,6 +999,10 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             XCTAssertEqual(fixture.startedTurns.count, startsBefore)
             XCTAssertEqual(fixture.controller.steeredTurns.count, steersBefore)
             XCTAssertEqual(fixture.session.selfCompactState.parkedNote?.dispatchID, parked.dispatchID)
+            if steer {
+                XCTAssertEqual(fixture.session.activeRunOwnership, priorOwnership)
+                XCTAssertEqual(fixture.session.codexPendingAuthRetryTurn, priorAuthRetryTurn)
+            }
             XCTAssertEqual(fixture.session.selfCompactState.active?.noteDispatchStarted, false)
             XCTAssertNil(fixture.session.selfCompactState.latest)
             let inventory = try XCTUnwrap(input.host.publishedPromptInventories[input.observer.sessionID])
@@ -2330,10 +2340,10 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
 
     private func cancelWaitingInstructionForTest(_ session: AgentModeViewModel.TabSession) {
         session.instructionTimeoutTask?.cancel()
-        session.instructionTimeoutTask = nil
+        session.instructionWait?.timeoutTask = nil
         let continuation = session.instructionContinuation
-        session.instructionContinuation = nil
-        session.instructionWaitID = nil
+        session.instructionWait = nil
+
         session.waitingPrompt = nil
         continuation?.resume(throwing: CancellationError())
     }
@@ -2903,11 +2913,18 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 windowID: endpoint.windowID, runID: runID
             )
             fixture.viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { _, _, _ in token }
-            // Exercise the production final fence, not a simulated route-current boolean.
+            // The synthetic async authority query needs an explicit final-fence hook;
+            // otherwise the test seam deliberately bypasses live transport qualification.
+            // Exercise the composed runtime, not a simulated boolean or the server VM.
+            let routeRuntime = fixture.viewModel.mcpRuntime
             fixture.viewModel.test_agentSessionLinkCurrentRunCatalogRouteToken = { candidate, tabID in
-                server.hasCurrentRunCatalogRouteToken(candidate, expectedTabID: tabID)
+                routeRuntime.hasCurrentRunCatalogRouteToken(candidate, tabID: tabID)
             }
-            XCTAssertTrue(server.hasCurrentRunCatalogRouteToken(token, expectedTabID: fixture.tabID))
+            XCTAssertTrue(fixture.viewModel.hasCurrentRunCatalogRouteTokenInCurrentMCPServer(token, tabID: fixture.tabID))
+            let otherScope = AgentSessionRuntimeStore().makeScope()
+            XCTAssertFalse(otherScope.mcp.hasCurrentRunCatalogRouteToken(token, tabID: fixture.tabID))
+            otherScope.mcp.installRunRoute(id: endpoint.windowID + 1, bindings: server.runRouteBindings)
+            XCTAssertFalse(otherScope.mcp.hasCurrentRunCatalogRouteToken(token, tabID: fixture.tabID), "A live mapping must not authorize another runtime route")
             let configurationGate = CatalogAuthorityGate()
             await controller.setConfigurationGate(configurationGate)
             addTeardownBlock { @MainActor in
@@ -2943,7 +2960,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             XCTAssertTrue(server.hasCurrentRunRouteMapping(
                 runID: runID, connectionID: connectionID, expectedTabID: fixture.tabID
             ), "retained mappings must reproduce the unsafe cleanup interval")
-            XCTAssertFalse(server.hasCurrentRunCatalogRouteToken(token, expectedTabID: fixture.tabID))
+            XCTAssertFalse(fixture.viewModel.hasCurrentRunCatalogRouteTokenInCurrentMCPServer(token, tabID: fixture.tabID))
             await configurationGate.open()
             try await AsyncTestWait.waitUntil("removing-route refusal or physical send") {
                 let refused = await MainActor.run {
@@ -3159,7 +3176,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 isSessionCurrent: { candidate in candidate === session },
                 requestUIRefresh: { _, _ in },
                 scheduleSave: { _ in },
-                stageClaudeResumeRecoveryHandoff: { _ in },
+                stageClaudeResumeRecoveryHandoff: { _ in true },
                 prependPendingHandoff: { text, _ in text },
                 qualifyAgentSessionLinkProviderInputRoute: { _, routeWait in
                     if routeWait != nil {
@@ -3465,7 +3482,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 isSessionCurrent: { candidate in candidate === session },
                 requestUIRefresh: { _, _ in },
                 scheduleSave: { _ in },
-                stageClaudeResumeRecoveryHandoff: { _ in },
+                stageClaudeResumeRecoveryHandoff: { _ in true },
                 prependPendingHandoff: { text, _ in text },
                 qualifyAgentSessionLinkProviderInputRoute: { _, routeWait in
                     // An immediate `.unavailable` here stands in for a route wait that ran out.
@@ -3951,6 +3968,36 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         #else
             throw XCTSkip("Catalog observation diagnostics require DEBUG helpers.")
         #endif
+    }
+
+    func testDequeuedInstructionRestoresAfterWriterReacquisitionDuringAugmentation() async throws {
+        let fixture = try makeFixture(agent: .openCode)
+        let runtime = fixture.viewModel.linkExecutionRuntime
+        let original = try XCTUnwrap(runtime.instructionCommand(for: fixture.session))
+        let scope = original.writer.scope
+        let queued = AgentTabSession.PendingInstruction(providerText: "queued ordinary input", localDraftText: "original draft")
+        fixture.session.pendingInstructions = [queued]
+        let gate = TestReleaseFence(name: "queued augmentation before writer reacquisition")
+        fixture.viewModel.test_afterProviderInputAugmentation = { await gate.enterAndWait() }
+        let waiting = Task { try await fixture.viewModel.waitForNextUserInstruction(tabID: fixture.tabID) }
+        defer {
+            gate.release()
+            waiting.cancel()
+            fixture.viewModel.test_afterProviderInputAugmentation = nil
+        }
+        let entered = await gate.waitUntilEntered()
+        XCTAssertTrue(entered)
+        XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
+        scope.replaceSessions([:])
+        scope.replaceSessions([fixture.session.tabID: fixture.session])
+        XCTAssertFalse(original.isCurrent)
+        gate.release()
+        do { _ = try await waiting.value
+            XCTFail("A reacquired claim must not return old queued input")
+        } catch { XCTAssertTrue(error is MCPError) }
+        XCTAssertEqual(fixture.session.pendingInstructions, [queued], "The original dequeue still owns recovery of its input")
+        XCTAssertNil(fixture.session.instructionWait)
+        XCTAssertTrue(fixture.session.items.isEmpty)
     }
 
     func testLocalInputDequeuedInstructionDuringReadProofRecoversQueueOrStoppedDraftExactlyOnce() async throws {

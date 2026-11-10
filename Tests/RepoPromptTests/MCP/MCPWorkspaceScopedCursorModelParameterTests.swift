@@ -1,7 +1,12 @@
 import Foundation
 import MCP
+import RepoPromptACPProviders
+import RepoPromptAIContracts
+import RepoPromptCodexProvider
+import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import RepoPromptVCS
+@testable import RepoPromptWorkspaceContext
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
@@ -10,8 +15,8 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
     override func setUp() {
         super.setUp()
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
-        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor)
+        _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(
             ACPDiscoveredSessionModels(
                 options: [.init(rawValue: "grok-4.6", displayName: "Grok 4.6", description: nil, isDefault: true)],
                 currentModelRaw: "grok-4.6",
@@ -31,7 +36,7 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
     }
 
     override func tearDown() {
-        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor)
         super.tearDown()
     }
 
@@ -107,9 +112,9 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
         ]
 
         // Seed the catalog with the OpenCode model so validation/serialization see it.
-        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode)
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode) }
+        _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(
             ACPDiscoveredSessionModels(
                 options: [
                     .init(
@@ -207,6 +212,7 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
         let viewModel = window.agentModeViewModel
         let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
         let session = await viewModel.ensureSessionReady(tabID: tabID)
+        try installRestoredParameterWriter(session, in: window)
         session.selectedAgent = .openCode
         session.selectedModelRaw = "ollama-cloud/kimi-k3"
 
@@ -233,6 +239,7 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
         let viewModel = window.agentModeViewModel
         let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
         let session = await viewModel.ensureSessionReady(tabID: tabID)
+        try installRestoredParameterWriter(session, in: window)
         session.selectedAgent = .openCode
         session.selectedModelRaw = "ollama-cloud/kimi-k3"
 
@@ -305,9 +312,9 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
         window.apiSettingsViewModel.isOpenCodeConnected = true
         // Seed the OpenCode catalog so `model_id` validation resolves an OpenCode model rather
         // than rejecting it before the target is allocated.
-        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode)
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode) }
+        _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(
             ACPDiscoveredSessionModels(
                 options: [
                     .init(
@@ -435,6 +442,7 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
         let viewModel = window.agentModeViewModel
         let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
         let session = await viewModel.ensureSessionReady(tabID: tabID)
+        try installRestoredParameterWriter(session, in: window)
         session.selectedAgent = .cursor
         session.selectedModelRaw = "grok-4.6"
         try viewModel.mcpApplyModelParameterSelections(tabID: tabID, selections: [selection(value: "low")])
@@ -458,6 +466,7 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
         let viewModel = window.agentModeViewModel
         let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
         let session = await viewModel.ensureSessionReady(tabID: tabID)
+        try installRestoredParameterWriter(session, in: window)
         session.selectedAgent = .cursor
         session.selectedModelRaw = "grok-4.6"
         try viewModel.mcpApplyModelParameterSelections(tabID: tabID, selections: [selection(value: "low")])
@@ -785,8 +794,8 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
         api.isOpenCodeConnected = false
         api.isGrokBuildConnected = false
         api.compatibleBackendSecretPresence = [:]
-        let registry = AgentCodexModelRegistry.shared
-        let catalogue = AgentAdvertisedModelCatalog.shared
+        let registry = AgentModelCatalogRuntime.shared.codexRegistry
+        let catalogue = AgentModelCatalogRuntime.shared
         let originalModels = registry.currentLiveModels()
         let persistenceKey = "CodexDynamicModelRecords"
         let originalPersistence = UserDefaults.standard.object(forKey: persistenceKey)
@@ -904,7 +913,7 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
         var stagedSelections: [ACPModelParameterSelection] = []
         // Runtime membership is authoritative; this success fixture must advertise the
         // canonical target of the legacy Composer alias rather than rely on static entries.
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+        _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(
             ACPDiscoveredSessionModels(
                 options: [.init(rawValue: "composer-2.5", displayName: "Composer 2.5", description: nil, isDefault: true)],
                 currentModelRaw: "composer-2.5",
@@ -999,6 +1008,7 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
         let viewModel = window.agentModeViewModel
         let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
         let session = await viewModel.ensureSessionReady(tabID: tabID)
+        try installRestoredParameterWriter(session, in: window)
         session.selectedAgent = .cursor
         session.selectedModelRaw = "grok-4.6"
         let speed: (String) -> ACPModelParameterSelection = { value in
@@ -1071,6 +1081,20 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
 
     private var cursorModelID: String {
         AgentModelSelectionID(agentRaw: AgentProviderKind.cursor.rawValue, modelRaw: "grok-4.6").rawValue
+    }
+
+    /// Parameter-only fixtures start with a restored writer, not an unbound local draft.
+    private func installRestoredParameterWriter(_ session: AgentTabSession, in window: WindowState) throws {
+        let viewModel = window.agentModeViewModel
+        let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
+        let sessionID = UUID()
+        XCTAssertNil(viewModel.test_bindingRejection(sessionID: sessionID, on: session))
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, compareAndSetInWorkspaceID: workspaceID
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        let command = try XCTUnwrap(viewModel.runtimeCommand(sessionID: sessionID))
+        XCTAssertIdentical(command.writer.session, session)
     }
 
     /// These downstream rollback/control tests need an existing configured session. Complete its

@@ -1,9 +1,10 @@
 import Combine
 import RepoPromptFileSystem
 import RepoPromptInstrumentation
+import RepoPromptWorkspaceContext
 import SwiftUI
 
-private extension EnvironmentValues {
+extension EnvironmentValues {
     @Entry var handoffOmittedImageCount: Binding<Int> = .constant(0)
 }
 
@@ -191,6 +192,7 @@ struct AgentModeView: View {
 
     private var codexManagedLoginAction: CodexManagedLoginAction {
         CodexManagedLoginAction(
+            ownerID: ObjectIdentifier(windowState.apiSettingsViewModel),
             browser: { openURL in
                 try await windowState.apiSettingsViewModel.startCodexManagedChatgptLogin(openURL: openURL)
             },
@@ -207,7 +209,6 @@ struct AgentModeView: View {
 // Transcript scroll types extracted to Components/AgentTranscriptScrollTypes.swift
 
 struct AgentModeChatDetailView: View {
-    @Environment(\.handoffOmittedImageCount) private var omittedHandoffImageCount
     let agentModeVM: AgentModeViewModel
     @ObservedObject var transcriptUI: AgentTranscriptUIStore
     @ObservedObject var runInteractionUI: AgentRunInteractionUIStore
@@ -1457,12 +1458,6 @@ struct AgentModeChatDetailView: View {
         #endif
     }
 
-    private var markdownFileLinkOpener: MarkdownFileLinkOpener {
-        MarkdownFileLinkOpener { target in
-            await promptManager.fileManager.openFileForMarkdownLink(target)
-        }
-    }
-
     private var supportsAutoScroll: Bool {
         if #available(macOS 15.0, *) {
             return true
@@ -2401,15 +2396,17 @@ struct AgentModeChatDetailView: View {
             runtime: AgentSessionLinkRuntimeBridge.shared.delegationScopes
         )
         if let request = runInteractionSnapshot.pendingCodexHookReview {
+            let command = agentModeVM.activeSession?.activeAgentSessionID.flatMap { try? agentModeVM.runtimeCommand(sessionID: $0) }
+            let runtime = agentModeVM.interactionRuntime
             CodexHookReviewCard(
                 request: request,
                 isStrictModeEnabled: {
-                    agentModeVM.isCodexHookApprovalStrictModeEnabled()
+                    command.map { runtime.isCodexHookApprovalStrictModeEnabled(for: $0.writer.session) } ?? true
                 },
                 onDecision: { decision in
-                    guard let tabID = currentTabID else { return }
-                    try await agentModeVM.submitCodexHookReviewDecision(
-                        tabID: tabID,
+                    guard let command else { throw AgentCodexHookReviewResolutionError.staleWriter }
+                    try await runtime.submitCodexHookReviewDecision(
+                        command: command,
                         requestID: request.id,
                         decision: decision
                     )
@@ -2418,42 +2415,38 @@ struct AgentModeChatDetailView: View {
             .id("pendingCodexHookReview")
             .transition(.opacity)
         } else if let review = runInteractionSnapshot.pendingApplyEditsReview {
+            let command = agentModeVM.activeSession?.activeAgentSessionID.flatMap { try? agentModeVM.runtimeCommand(sessionID: $0) }
+            let runtime = agentModeVM.interactionRuntime
             AgentApplyEditsReviewCard(
                 review: review,
                 onAccept: {
-                    guard let tabID = currentTabID else { return }
-                    agentModeVM.submitApplyEditsReviewDecision(
-                        tabID: tabID,
-                        reviewID: review.id,
-                        decision: .accept
-                    )
+                    guard let command else { return }
+                    Task { await runtime.submitApplyEditsReviewDecision(command: command, reviewID: review.id, decision: .accept) }
                 },
                 onReject: { reason in
-                    guard let tabID = currentTabID else { return }
-                    agentModeVM.submitApplyEditsReviewDecision(
-                        tabID: tabID,
-                        reviewID: review.id,
-                        decision: .reject(reason: reason)
-                    )
+                    guard let command else { return }
+                    Task { await runtime.submitApplyEditsReviewDecision(command: command, reviewID: review.id, decision: .reject(reason: reason)) }
                 }
             )
             .id("pendingApplyEditsReview")
             .transition(.opacity)
         } else if let mergeReview = runInteractionSnapshot.pendingWorktreeMergeReview {
+            let command = agentModeVM.activeSession?.activeAgentSessionID.flatMap { try? agentModeVM.runtimeCommand(sessionID: $0) }
+            let runtime = agentModeVM.interactionRuntime
             AgentWorktreeMergeReviewCard(
                 review: mergeReview,
                 onAccept: {
-                    guard let tabID = currentTabID else { return }
-                    agentModeVM.submitWorktreeMergeReviewDecision(
-                        tabID: tabID,
+                    guard let command else { return }
+                    runtime.submitWorktreeMergeReviewDecision(
+                        command: command,
                         reviewID: mergeReview.id,
                         decision: .accept
                     )
                 },
                 onCancel: { reason in
-                    guard let tabID = currentTabID else { return }
-                    agentModeVM.submitWorktreeMergeReviewDecision(
-                        tabID: tabID,
+                    guard let command else { return }
+                    runtime.submitWorktreeMergeReviewDecision(
+                        command: command,
                         reviewID: mergeReview.id,
                         decision: .reject(reason: reason)
                     )
@@ -2462,34 +2455,42 @@ struct AgentModeChatDetailView: View {
             .id("pendingWorktreeMergeReview")
             .transition(.opacity)
         } else if let approval = runInteractionSnapshot.pendingApproval {
+            let command = agentModeVM.activeSession?.activeAgentSessionID.flatMap { try? agentModeVM.runtimeCommand(sessionID: $0) }
+            let runtime = agentModeVM.interactionRuntime
             AgentApprovalCard(
                 request: approval,
                 allowsRememberedDecision: agentModeVM.codexRememberedApprovalAllowed(for: currentTabID),
                 onDecision: { decision in
-                    guard let tabID = currentTabID else { return }
-                    agentModeVM.submitApprovalDecision(tabID: tabID, requestID: approval.id, decision: decision)
+                    guard let command else { return }
+                    runtime.submitApprovalDecision(command: command, requestID: approval.id, decision: decision)
                 }
             )
             .id("pendingApproval")
             .transition(.opacity)
         } else if let request = runInteractionSnapshot.pendingPermissionsRequest {
+            let command = agentModeVM.activeSession?.activeAgentSessionID.flatMap { try? agentModeVM.runtimeCommand(sessionID: $0) }
+            let runtime = agentModeVM.interactionRuntime
             AgentPermissionsApprovalCard(request: request, onDecision: { decision in
-                guard let tabID = currentTabID else { return }
-                agentModeVM.submitPermissionsDecision(tabID: tabID, requestID: request.id, decision: decision)
+                guard let command else { return }
+                runtime.submitPermissionsDecision(command: command, requestID: request.id, decision: decision)
             })
             .id("pendingPermissions")
             .transition(.opacity)
         } else if let request = runInteractionSnapshot.pendingMCPElicitationRequest {
+            let command = agentModeVM.activeSession?.activeAgentSessionID.flatMap { try? agentModeVM.runtimeCommand(sessionID: $0) }
+            let runtime = agentModeVM.interactionRuntime
             AgentMCPElicitationCard(
                 request: request,
                 onResponse: { response in
-                    guard let tabID = currentTabID else { return }
-                    agentModeVM.submitMCPElicitationResponse(tabID: tabID, requestID: request.id, response: response)
+                    guard let command else { return }
+                    runtime.submitMCPElicitationResponse(command: command, requestID: request.id, response: response)
                 }
             )
             .id("pendingMCPElicitation")
             .transition(.opacity)
         } else if let request = runInteractionSnapshot.pendingUserInputRequest {
+            let command = agentModeVM.activeSession?.activeAgentSessionID.flatMap { try? agentModeVM.runtimeCommand(sessionID: $0) }
+            let runtime = agentModeVM.interactionRuntime
             let cancelTarget = runInteractionSnapshot.pendingUserInputCancelTarget
             AgentRequestUserInputCard(
                 request: request,
@@ -2497,8 +2498,8 @@ struct AgentModeChatDetailView: View {
                 pendingFocusStore: runInteractionUI,
                 pendingFocusTabID: currentTabID,
                 onSubmit: { response in
-                    guard let tabID = currentTabID else { return }
-                    agentModeVM.submitUserInputResponse(tabID: tabID, requestID: request.requestID, response: response)
+                    guard let command else { return }
+                    runtime.submitUserInputResponse(command: command, requestID: request.id, response: response)
                 },
                 onStop: {
                     guard let cancelTarget else { return }
@@ -2510,36 +2511,38 @@ struct AgentModeChatDetailView: View {
             .id("pendingUserInputRequest")
             .transition(.opacity)
         } else if let pendingAskUser = runInteractionSnapshot.pendingAskUser {
+            let command = agentModeVM.activeSession?.activeAgentSessionID.flatMap { try? agentModeVM.runtimeCommand(sessionID: $0) }
+            let runtime = agentModeVM.interactionRuntime
             AgentAskUserWizardCard(
                 pending: pendingAskUser,
                 onDraftChange: { questionID, draft in
-                    guard let tabID = currentTabID else { return }
-                    agentModeVM.updateAskUserDraft(
-                        tabID: tabID,
+                    guard let command else { return }
+                    runtime.updateAskUserDraft(
+                        command: command,
                         interactionID: pendingAskUser.interaction.id,
                         questionID: questionID,
                         draft: draft
                     )
                 },
                 onQuestionIndexChange: { index in
-                    guard let tabID = currentTabID else { return }
-                    agentModeVM.updateAskUserQuestionIndex(
-                        tabID: tabID,
+                    guard let command else { return }
+                    runtime.updateAskUserQuestionIndex(
+                        command: command,
                         interactionID: pendingAskUser.interaction.id,
                         index: index
                     )
                 },
                 onSubmit: {
-                    guard let tabID = currentTabID else { return }
-                    agentModeVM.submitAskUserResponse(tabID: tabID, interactionID: pendingAskUser.interaction.id)
+                    guard let command else { return }
+                    _ = try? runtime.resolveAskUserResponse(command: command, interactionID: pendingAskUser.interaction.id, skipAll: false)
                 },
                 onSkipAll: {
-                    guard let tabID = currentTabID else { return }
-                    agentModeVM.skipAskUser(tabID: tabID, interactionID: pendingAskUser.interaction.id)
+                    guard let command else { return }
+                    runtime.skipAskUser(command: command, interactionID: pendingAskUser.interaction.id)
                 },
                 onUserActivity: {
-                    guard let tabID = currentTabID else { return }
-                    agentModeVM.noteAskUserCardActivity(tabID: tabID, interactionID: pendingAskUser.interaction.id)
+                    guard let command else { return }
+                    runtime.noteAskUserCardActivity(command: command, interactionID: pendingAskUser.interaction.id)
                 },
                 pendingFocusStore: runInteractionUI,
                 pendingFocusTabID: currentTabID
@@ -2616,12 +2619,14 @@ struct AgentModeChatDetailView: View {
                 ))
             #endif
         }
-        .environment(\.agentMessageRuntimeFooterByItemID, transcriptSnapshot.runtimeFooterByItemID)
         .messageTimestampEnvironment()
     }
 
     @ViewBuilder
     private func transcriptBlockView(block: AgentTranscriptRenderBlock, renderContext: TranscriptRenderContext) -> some View {
+        #if DEBUG
+            let _ = AgentTranscriptTailRenderProbe.sink?(.block(block.id))
+        #endif
         switch block.kind {
         case .activityCluster:
             let supportsExpansion = transcriptBlockSupportsExpansion(block)
@@ -2762,14 +2767,6 @@ struct AgentModeChatDetailView: View {
         return false
     }
 
-    /// Stable cancel closure for the active run, captured at render time.
-    private func cancelActiveToolsAction(runInteraction: AgentRunInteractionUISnapshot) -> (() -> Void)? {
-        guard let runID = runInteraction.activeRunID else { return nil }
-        return { [weak agentModeVM] in
-            agentModeVM?.cancelActiveToolsForRun(runID: runID, reason: "tool_card_header_cancel")
-        }
-    }
-
     private func transcriptRowView(
         item: AgentChatItem,
         block: AgentTranscriptRenderBlock,
@@ -2779,44 +2776,33 @@ struct AgentModeChatDetailView: View {
         runInteraction: AgentRunInteractionUISnapshot
     ) -> some View {
         let showCancel = showRunScopedToolCancel(for: item, in: block, runInteraction: runInteraction)
-        let cancelAction = showCancel ? cancelActiveToolsAction(runInteraction: runInteraction) : nil
         let ownerTabID = transcript.presentation.tabID ?? transcript.currentTabID ?? currentTabID
         let ownerWorkspaceID = oracleViewModel.workspaceManager.activeWorkspaceID
-        return AgentMessageBubble(
-            item: item,
-            isMostRecentEditBubble: item.id == renderContext.mostRecentEditID,
-            windowID: windowID,
-            currentWorkspaceID: ownerWorkspaceID,
-            currentTabID: ownerTabID,
-            suppressAskUserTranscriptUI: renderContext.isContextBuilderQuestionActive,
-            contextBuilderContext: .init(
-                tabID: ownerTabID,
-                contextBuilderAgentVM: contextBuilderAgentVM,
-                activeContextBuilderCallItemID: renderContext.activeContextBuilderCallID,
-                activeContextBuilderResultItemID: renderContext.activeContextBuilderResultID,
-                oracleOpenContext: .init(
-                    windowID: windowID,
-                    workspaceID: ownerWorkspaceID,
-                    tabID: ownerTabID
-                ),
-                showRunScopedToolCancel: showCancel,
-                cancelActiveToolsAction: cancelAction
+        return AgentTranscriptRow(
+            inputs: .init(
+                item: item,
+                isMostRecentEditBubble: item.id == renderContext.mostRecentEditID,
+                windowID: windowID, workspaceID: ownerWorkspaceID, tabID: ownerTabID,
+                suppressAskUserTranscriptUI: renderContext.isContextBuilderQuestionActive,
+                activeContextBuilderCallID: renderContext.activeContextBuilderCallID,
+                activeContextBuilderResultID: renderContext.activeContextBuilderResultID,
+                rawToolResultPayload: agentModeVM.rawToolResultPayloadForRendering(tabID: ownerTabID, itemID: item.id),
+                rawToolResultPayloadRenderRevision: transcript.presentation.rawToolResultPayloadRenderRevisionByItemID[item.id] ?? 0,
+                cancelRunID: showCancel ? runInteraction.activeRunID : nil,
+                runInteraction: runInteraction,
+                runtimeFooter: transcript.runtimeFooterByItemID[item.id],
+                autoExpandEnabled: autoExpandEnabled,
+                liveBashExecution: transcript.activeBashLiveExecutionByItemID[item.id],
+                isRecentAssistant: renderContext.recentAssistantItemIDs.contains(item.id),
+                approvalVisible: renderContext.interactionBlockerVisible
             ),
+            agentModeVM: agentModeVM,
             promptManager: promptManager,
-            handoffConfig: runInteraction.canForkCurrentSession ? handoffConfig(for: item.id, runInteraction: runInteraction) : nil,
-            rawToolResultPayload: agentModeVM.rawToolResultPayloadForRendering(tabID: ownerTabID, itemID: item.id),
-            rawToolResultPayloadRenderRevision: transcript.presentation
-                .rawToolResultPayloadRenderRevisionByItemID[item.id] ?? 0,
-            showRunScopedToolCancel: showCancel,
-            cancelActiveToolsAction: cancelAction,
-            codexManagedLoginAction: codexManagedLoginAction
+            contextBuilderAgentVM: contextBuilderAgentVM,
+            codexManagedLoginAction: item.kind == .error && CodexManagedAuthRecoveryClassifier.preservesAsUserFacingGuidance(item.text) ? codexManagedLoginAction : nil
         )
+        .equatable()
         .id(item.id)
-        .environment(\.markdownFileLinkOpener, markdownFileLinkOpener)
-        .environment(\.agentToolCardAutoExpandEnabled, autoExpandEnabled)
-        .environment(\.agentLiveBashExecutionByItemID, transcript.activeBashLiveExecutionByItemID)
-        .environment(\.agentRecentAssistantItemIDs, renderContext.recentAssistantItemIDs)
-        .environment(\.agentApprovalVisible, renderContext.interactionBlockerVisible)
     }
 
     private func toolCardAutoExpandEnabled(for block: AgentTranscriptRenderBlock, lockTargetID: UUID?) -> Bool {
@@ -3282,38 +3268,6 @@ struct AgentModeChatDetailView: View {
         transcriptBlockDefaultExpansion = nextDefaults
     }
 
-    // MARK: - Handoff
-
-    private func handoffConfig(for itemID: UUID, runInteraction: AgentRunInteractionUISnapshot) -> AgentHandoffConfig {
-        AgentHandoffConfig(
-            itemID: itemID,
-            defaultDestinationAgent: runInteraction.selectedAgent,
-            defaultModelRaw: runInteraction.selectedModelRaw,
-            defaultReasoningEffortRaw: runInteraction.selectedReasoningEffortRaw,
-            availableAgentsProvider: { [weak agentModeVM] in
-                agentModeVM?.availableAgents ?? []
-            },
-            modelOptionsProvider: { [weak agentModeVM] agent in
-                agentModeVM?.modelOptions(for: agent) ?? []
-            },
-            windowID: windowID,
-            buildPayloadForClipboard: { [weak agentModeVM] in
-                await agentModeVM?.buildHandoffPayload(upToItemID: itemID) ?? ""
-            },
-            performHandoff: { [weak agentModeVM] selection in
-                guard let vm = agentModeVM else { return }
-                try await vm.prepareHandoffToNewTab(
-                    upToItemID: itemID,
-                    destinationAgent: selection.agent,
-                    destinationModelRaw: selection.modelRaw,
-                    destinationReasoningEffortRaw: selection.reasoningEffortRaw,
-                    missingImagePolicy: .omitMissingImagesForHumanHandoff,
-                    onImagesOmitted: { omittedHandoffImageCount.wrappedValue = $0 }
-                )
-            }
-        )
-    }
-
     private var topSentinel: some View {
         Color.clear
             .frame(height: 1)
@@ -3351,11 +3305,12 @@ struct AgentModeChatDetailView: View {
     }
 
     private var runningIndicatorSlot: some View {
-        runningIndicator
-            .frame(height: runningIndicatorReservedHeight, alignment: .leading)
-            .opacity(shouldShowRunningIndicator ? 1 : 0)
-            .allowsHitTesting(shouldShowRunningIndicator)
-            .accessibilityHidden(!shouldShowRunningIndicator)
+        AgentReservedIndicatorSlot(
+            isShown: shouldShowRunningIndicator,
+            reservedHeight: runningIndicatorReservedHeight
+        ) {
+            runningIndicator
+        }
     }
 
     private var runningIndicator: some View {

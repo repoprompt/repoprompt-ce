@@ -12,7 +12,7 @@ final class AgentRepromptGuidanceTests: XCTestCase {
         XCTAssertFalse(AgentRepromptGuidance.isWithinLimit(oversized))
         XCTAssertEqual(AgentRepromptGuidance.normalizedOverride(oversized), oversized)
         XCTAssertTrue(AgentRepromptGuidance.defaultText.contains("Markdown"))
-        XCTAssertTrue(AgentRepromptGuidance.defaultText.contains("near-identically"))
+        XCTAssertTrue(AgentRepromptGuidance.defaultText.contains("minimally edit clear messages"))
         XCTAssertFalse(AgentRepromptGuidance.defaultText.contains("Context Builder"))
         XCTAssertFalse(AgentRepromptGuidance.defaultText.contains("open questions"), "Must not invite commentary on what the message left unsaid")
         XCTAssertFalse(AgentRepromptGuidance.defaultText.contains("assumptions"))

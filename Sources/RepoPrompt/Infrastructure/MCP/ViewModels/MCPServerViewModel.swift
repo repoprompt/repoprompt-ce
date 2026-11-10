@@ -1,5 +1,7 @@
 import RepoPromptFileSystem
+import RepoPromptMCPServer
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 
 //
 //  MCPServerViewModel.swift
@@ -80,19 +82,6 @@ private actor MCPRunToolStartGate {
         for waiter in pending {
             waiter.resume()
         }
-    }
-}
-
-private final class MCPRunToolCleanupClaim: @unchecked Sendable {
-    private let lock = NSLock()
-    private var claimed = false
-
-    func claim() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !claimed else { return false }
-        claimed = true
-        return true
     }
 }
 
@@ -339,31 +328,9 @@ final class MCPServerViewModel: ObservableObject {
     // MARK: Configuration constants
 
     /// -----------------------------------------------------------------
-    struct CodeStructureRequest: Equatable {
-        let direction: WorkspaceCodemapStructureTraversalDirection?
-        let maximumDepth: Int
-        let includesSignatures: Bool
-        let size: WorkspaceCodemapGraphOutputSize
-        let budget: WorkspaceCodemapGraphQueryBudget
-
-        init(
-            direction: WorkspaceCodemapStructureTraversalDirection?,
-            maximumDepth: Int,
-            includesSignatures: Bool,
-            size: WorkspaceCodemapGraphOutputSize,
-            budget: WorkspaceCodemapGraphQueryBudget
-        ) {
-            self.direction = direction
-            self.maximumDepth = maximumDepth
-            self.includesSignatures = includesSignatures
-            self.size = size
-            self.budget = budget
-        }
-    }
-
     private static let maximumCodeStructureSeedCount = 8192
 
-    static func codeStructureSeedLimit(for _: CodeStructureRequest) -> Int {
+    static func codeStructureSeedLimit(for _: WorkspaceCodemapStructureRequest) -> Int {
         maximumCodeStructureSeedCount
     }
 
@@ -377,7 +344,7 @@ final class MCPServerViewModel: ObservableObject {
         private var codeStructureUniqueSeedCandidatesVisitedForTesting = 0
         private var codeStructureLogicalPathComputationsForTesting = 0
         private var codeStructureCoordinatorInvocationsForTesting = 0
-        private var lastCodeStructureRequestForTesting: CodeStructureRequest?
+        private var lastCodeStructureRequestForTesting: WorkspaceCodemapStructureRequest?
 
         func resetCodeStructureAdmissionWorkCountsForTesting() {
             codeStructureUniqueSeedCandidatesVisitedForTesting = 0
@@ -397,7 +364,7 @@ final class MCPServerViewModel: ObservableObject {
             lastCodeStructureRequestForTesting = nil
         }
 
-        func capturedCodeStructureRequestForTesting() -> CodeStructureRequest? {
+        func capturedCodeStructureRequestForTesting() -> WorkspaceCodemapStructureRequest? {
             lastCodeStructureRequestForTesting
         }
     #endif
@@ -554,7 +521,6 @@ final class MCPServerViewModel: ObservableObject {
             WorkspaceLookupContext?,
             ToolResultDTOs.SelectionReply
         ) -> Void)?
-        private var beforeAgentRunWaiterWakeForTesting: (@MainActor @Sendable (UUID, UUID) async -> Void)?
         private var debugBeforeDomainReadContextResolutionForTesting:
             (@MainActor @Sendable (ToolInvocationContext) async -> Void)?
 
@@ -582,7 +548,7 @@ final class MCPServerViewModel: ObservableObject {
         func setBeforeAgentRunWaiterWakeForTesting(
             _ hook: (@MainActor @Sendable (UUID, UUID) async -> Void)?
         ) {
-            beforeAgentRunWaiterWakeForTesting = hook
+            toolExecutionRuntime.beforeAgentRunWaiterWakeForTesting = hook
         }
 
         /// Explicit DEBUG-only local compatibility entry; never used by network adapters.
@@ -1118,7 +1084,7 @@ final class MCPServerViewModel: ObservableObject {
                 window.agentModeViewModel.agentSelfContextSnapshot(endpoint: endpoint, origin: origin)
             },
             scheduleCompact: { window, endpoint, origin, note, key in
-                await window.agentModeViewModel.agentSelfCompactMCPAdmission(
+                await window.agentModeViewModel.linkExecutionRuntime.agentSelfCompactMCPAdmission(
                     endpoint: endpoint, origin: origin, note: note, idempotencyKey: key
                 )
             }
@@ -2336,9 +2302,19 @@ final class MCPServerViewModel: ObservableObject {
         )
     }
 
-    /// Presentation snapshot cache. Domain routing remains the only routing authority.
+    /// Shared mapping storage. The legacy server still owns route availability until
+    /// runtime-host composition replaces it; retained maps alone never authorize dispatch.
     @MainActor
-    var tabContextByConnectionID: [UUID: TabContextSnapshot] = [:]
+    private let runRouteOwnerLifetime = MCPRunRouteBindings.OwnerLifetime()
+    @MainActor
+    lazy var runRouteBindings = MCPRunRouteBindings(ownerLifetime: runRouteOwnerLifetime)
+    @MainActor
+    var tabContextByConnectionID: [UUID: TabContextSnapshot] {
+        get { runRouteBindings.tabContextByConnectionID }
+        set { runRouteBindings.tabContextByConnectionID = newValue }
+        _modify { yield &runRouteBindings.tabContextByConnectionID }
+    }
+
     @MainActor
     var detachedContextBuilderTabContextByRunID: [UUID: DetachedContextBuilderTabContext] = [:]
     @MainActor
@@ -2356,13 +2332,33 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     var pendingRunScopedTabContexts = PendingRunScopedContextStore()
     @MainActor
-    var connectionIDByRunID: [UUID: UUID] = [:]
+    var connectionIDByRunID: [UUID: UUID] {
+        get { runRouteBindings.connectionIDByRunID }
+        set { runRouteBindings.connectionIDByRunID = newValue }
+        _modify { yield &runRouteBindings.connectionIDByRunID }
+    }
+
     @MainActor
-    var connectionIDToRunID: [UUID: UUID] = [:]
+    var connectionIDToRunID: [UUID: UUID] {
+        get { runRouteBindings.connectionIDToRunID }
+        set { runRouteBindings.connectionIDToRunID = newValue }
+        _modify { yield &runRouteBindings.connectionIDToRunID }
+    }
+
     @MainActor
-    var pendingPolicyRunIDMappingTokenIDByRunID: [UUID: UUID] = [:]
+    var pendingPolicyRunIDMappingTokenIDByRunID: [UUID: UUID] {
+        get { runRouteBindings.pendingPolicyTokenIDByRunID }
+        set { runRouteBindings.pendingPolicyTokenIDByRunID = newValue }
+        _modify { yield &runRouteBindings.pendingPolicyTokenIDByRunID }
+    }
+
     @MainActor
-    var presentationWindowByConnection: [UUID: Int] = [:]
+    var presentationWindowByConnection: [UUID: Int] {
+        get { runRouteBindings.presentationWindowByConnection }
+        set { runRouteBindings.presentationWindowByConnection = newValue }
+        _modify { yield &runRouteBindings.presentationWindowByConnection }
+    }
+
     let domainRoutingCoordinator: DomainRoutingCoordinator?
     let domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient?
     let domainReadSideEffectCoordinator: DomainReadSideEffectCoordinator
@@ -2419,7 +2415,7 @@ final class MCPServerViewModel: ObservableObject {
 
         let liveConnectionCount = dashboardLiveWindowConnections
             + (isMultiWindowModeEffectivelyActive ? 0 : dashboardLiveUnboundConnections)
-        var activeExecutionCount = max(activeToolExecutionsByID.count, dashboardWindowExecutionCount)
+        var activeExecutionCount = max(toolExecutionRuntime.activeExecutionCount, dashboardWindowExecutionCount)
         let activeTool = windowActiveToolName
         if activeExecutionCount == 0, activeTool != nil {
             activeExecutionCount = 1
@@ -2436,62 +2432,12 @@ final class MCPServerViewModel: ObservableObject {
 
     // MARK: - - Cancellation support
 
-    /// Token-primary active tool execution tracking. Run ID is a secondary index;
-    /// executions remain connection-owned and cancellable even when no run resolves.
-    @MainActor
-    private struct ActiveToolExecution {
-        let executionID: UUID
-        let runID: UUID?
-        let connectionID: UUID?
-        let toolName: String
-        let lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
-        let startedAt: Date
-        let cancel: () -> Void
-    }
-
-    @MainActor
-    private var activeToolExecutionsByID: [UUID: ActiveToolExecution] = [:]
-    @MainActor
-    private var activeToolExecutionIDsByRunID: [UUID: Set<UUID>] = [:]
-    @MainActor
-    private var activeToolExecutionIDsByConnectionID: [UUID: Set<UUID>] = [:]
-
-    @MainActor
-    private struct AgentRunWaitScope {
-        let token: UUID
-        let parentRunID: UUID
-        let childSessionIDs: Set<UUID>
-        let startedAt: Date
-        let timeoutSeconds: TimeInterval
-        let metadata: RequestMetadata
-    }
-
-    @MainActor
-    private var agentRunWaitScopesByToken: [UUID: AgentRunWaitScope] = [:]
-    @MainActor
-    private var childAgentRunWaitCountsByParentRunID: [UUID: [UUID: Int]] = [:]
-    private let agentRunWaitScopeStaleGraceSeconds: TimeInterval = 60
-
-    /// Cumulative count of tool executions that have ended (success/error/cancel) per run.
-    /// Used by the Claude steering interrupt safety gate to verify that the provider stream
-    /// has acknowledged all locally-completed tool results before sending an interrupt.
-    @MainActor
-    private var toolEndedCountByRunID: [UUID: Int] = [:]
-
-    /// Continuations parked by `awaitNoActiveToolExecutions` waiting for a runID to have zero
-    /// in-flight tool executions. Keyed by runID → waiterID → continuation.
-    @MainActor
-    private var toolIdleWaitersByRunID: [UUID: [UUID: CheckedContinuation<Void, Never>]] = [:]
-
-    @MainActor
-    private func debugActiveTools(for runID: UUID) -> String {
-        let executionIDs = activeToolExecutionIDsByRunID[runID] ?? []
-        guard !executionIDs.isEmpty else { return "none" }
-        return executionIDs.compactMap { activeToolExecutionsByID[$0] }
-            .map { "\($0.toolName)#\(String($0.executionID.uuidString.prefix(8)))" }
-            .sorted()
-            .joined(separator: ",")
-    }
+    /// Providers retain this concrete owner, never the window view model.
+    lazy var toolExecutionRuntime: MCPToolExecutionRuntime = {
+        let runtime = MCPToolExecutionRuntime()
+        runtime.didChange = { [weak self] in self?.recomputeCloseSafetyState() }
+        return runtime
+    }()
 
     @MainActor
     private var cancelCurrentTool: (() -> Void)?
@@ -2500,7 +2446,7 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     func cancelActiveTool() {
         if let token = activeToolToken,
-           activeToolExecutionsByID[token] != nil
+           toolExecutionRuntime.containsExecution(token)
         {
             cancelToolExecution(executionID: token, reason: "cancelActiveTool")
         } else {
@@ -2524,21 +2470,7 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     @discardableResult
     func cancelActiveToolsForRun(runID: UUID, reason: String? = nil) -> Int {
-        let executionIDs = activeToolExecutionIDsByRunID[runID] ?? []
-        guard !executionIDs.isEmpty else {
-            resumeAllToolIdleWaiters(forRunID: runID)
-            toolEndedCountByRunID.removeValue(forKey: runID)
-            return 0
-        }
-
-        var cancelledCount = 0
-        for executionID in executionIDs {
-            if cancelToolExecution(executionID: executionID, reason: reason) {
-                cancelledCount += 1
-            }
-        }
-        toolEndedCountByRunID.removeValue(forKey: runID)
-        return cancelledCount
+        toolExecutionRuntime.cancelActiveToolsForRun(runID: runID, reason: reason)
     }
 
     /// Cancel active tool executions owned by a specific connection.
@@ -2547,7 +2479,7 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     @discardableResult
     func cancelActiveToolsForConnection(connectionID: UUID, reason: String? = nil) -> Int {
-        let matchingExecutionIDs = activeToolExecutionIDsByConnectionID[connectionID] ?? []
+        let matchingExecutionIDs = toolExecutionRuntime.executionIDs(connectionID: connectionID)
         let activeTokenBeforeCancellation = activeToolToken
 
         var cancelledCount = 0
@@ -2590,24 +2522,7 @@ final class MCPServerViewModel: ObservableObject {
         lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
         cancel: @escaping () -> Void
     ) {
-        let execution = ActiveToolExecution(
-            executionID: executionID,
-            runID: runID,
-            connectionID: connectionID,
-            toolName: toolName,
-            lifecycleCorrelation: lifecycleCorrelation,
-            startedAt: Date(),
-            cancel: cancel
-        )
-        activeToolExecutionsByID[executionID] = execution
-        if let runID {
-            activeToolExecutionIDsByRunID[runID, default: []].insert(executionID)
-            steeringDebugLog("[AgentRunSteeringWake] MCP tool register runID=\(runID) executionID=\(executionID) tool=\(toolName) active=\(debugActiveTools(for: runID))")
-        }
-        if let connectionID {
-            activeToolExecutionIDsByConnectionID[connectionID, default: []].insert(executionID)
-        }
-        recomputeCloseSafetyState()
+        toolExecutionRuntime.registerToolExecution(executionID: executionID, runID: runID, connectionID: connectionID, toolName: toolName, lifecycleCorrelation: lifecycleCorrelation, cancel: cancel)
     }
 
     @MainActor
@@ -2615,52 +2530,20 @@ final class MCPServerViewModel: ObservableObject {
         executionID: UUID,
         countAsEnded: Bool = true
     ) {
-        guard let execution = activeToolExecutionsByID.removeValue(forKey: executionID) else {
-            steeringDebugLog("[AgentRunSteeringWake] MCP tool unregister ignored missing executionID=\(executionID)")
-            return
-        }
-
-        EditFlowPerf.lifecycleEvent(
-            EditFlowPerf.Lifecycle.MCPRunTool.unregister,
-            correlation: execution.lifecycleCorrelation,
-            EditFlowPerf.Dimensions(toolName: execution.toolName)
-        )
-
-        if let connectionID = execution.connectionID {
-            activeToolExecutionIDsByConnectionID[connectionID]?.remove(executionID)
-            if activeToolExecutionIDsByConnectionID[connectionID]?.isEmpty == true {
-                activeToolExecutionIDsByConnectionID.removeValue(forKey: connectionID)
-            }
-        }
-
-        if let runID = execution.runID {
-            activeToolExecutionIDsByRunID[runID]?.remove(executionID)
-            if countAsEnded {
-                toolEndedCountByRunID[runID, default: 0] += 1
-            }
-            if activeToolExecutionIDsByRunID[runID]?.isEmpty == true {
-                activeToolExecutionIDsByRunID.removeValue(forKey: runID)
-                steeringDebugLog("[AgentRunSteeringWake] MCP tool unregister drained runID=\(runID) executionID=\(executionID) tool=\(execution.toolName) endedCount=\(toolEndedCountByRunID[runID] ?? 0)")
-                resumeAllToolIdleWaiters(forRunID: runID, lifecycleCorrelation: execution.lifecycleCorrelation)
-            } else {
-                steeringDebugLog("[AgentRunSteeringWake] MCP tool unregister runID=\(runID) executionID=\(executionID) tool=\(execution.toolName) remaining=\(debugActiveTools(for: runID)) endedCount=\(toolEndedCountByRunID[runID] ?? 0)")
-            }
-        }
-
-        recomputeCloseSafetyState()
+        toolExecutionRuntime.unregisterToolExecution(executionID: executionID, countAsEnded: countAsEnded)
     }
 
     /// Returns the cumulative number of tool executions that have completed for the given runID.
     /// Used by the Claude steering interrupt safety gate.
     @MainActor
     func toolEndedCount(runID: UUID) -> Int {
-        toolEndedCountByRunID[runID] ?? 0
+        toolExecutionRuntime.toolEndedCount(runID: runID)
     }
 
     /// Returns whether the given run currently has any active RepoPrompt MCP tool executions.
     @MainActor
     func hasActiveToolExecutions(runID: UUID) -> Bool {
-        !(activeToolExecutionIDsByRunID[runID]?.isEmpty ?? true)
+        toolExecutionRuntime.hasActiveToolExecutions(runID: runID)
     }
 
     /// Returns whether the given parent run is currently blocked in an `agent_run` wait.
@@ -2668,14 +2551,7 @@ final class MCPServerViewModel: ObservableObject {
     /// so watchdog/liveness checks must consult this wait-scope state separately.
     @MainActor
     func hasActiveChildAgentRunWaits(runID: UUID) -> Bool {
-        purgeStaleAgentRunWaitScopes(source: "liveness-query")
-        let active = !(childAgentRunWaitCountsByParentRunID[runID]?.isEmpty ?? true)
-        if active {
-            let scopes = agentRunWaitScopesByToken.values.filter { $0.parentRunID == runID }
-            let oldestAge = scopes.map { Date().timeIntervalSince($0.startedAt) }.max() ?? 0
-            steeringDebugLog("[AgentRunSteeringWake] agent_run wait scope liveness parentRunID=\(runID) scopes=\(scopes.count) oldestAge=\(oldestAge) counts=\(debugChildAgentRunWaits(for: runID))")
-        }
-        return active
+        toolExecutionRuntime.hasActiveChildAgentRunWaits(runID: runID)
     }
 
     // MARK: - Tool Idle Waiting (Steering Safety)
@@ -2686,83 +2562,15 @@ final class MCPServerViewModel: ObservableObject {
     /// continuation is cleaned up and a `CancellationError` is thrown.
     @MainActor
     func awaitNoActiveToolExecutions(runID: UUID) async throws {
-        try Task.checkCancellation()
-        // Fast path: already idle
-        let executions = activeToolExecutionIDsByRunID[runID]
-        if executions == nil || executions!.isEmpty {
-            steeringDebugLog("[AgentRunSteeringWake] MCP idle wait fast-idle runID=\(runID)")
-            return
-        }
-        steeringDebugLog("[AgentRunSteeringWake] MCP idle wait blocking runID=\(runID) active=\(debugActiveTools(for: runID))")
-
-        let waiterID = UUID()
-
-        // Use withTaskCancellationHandler so that Task.cancel() from the
-        // outside (e.g., user cancels the run) will promptly resume us.
-        await withTaskCancellationHandler {
-            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                // Double-check under the same MainActor turn — tools may have
-                // drained between the fast-path check and here.
-                let stillActive = activeToolExecutionIDsByRunID[runID]
-                if Task.isCancelled || stillActive == nil || stillActive!.isEmpty {
-                    steeringDebugLog("[AgentRunSteeringWake] MCP idle wait drained before parking runID=\(runID) waiterID=\(waiterID)")
-                    continuation.resume()
-                    return
-                }
-                toolIdleWaitersByRunID[runID, default: [:]][waiterID] = continuation
-                steeringDebugLog("[AgentRunSteeringWake] MCP idle wait parked runID=\(runID) waiterID=\(waiterID) active=\(debugActiveTools(for: runID)) waiters=\(toolIdleWaitersByRunID[runID]?.count ?? 0)")
-            }
-        } onCancel: {
-            // Must hop to MainActor to safely remove the waiter.
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                if let continuation = toolIdleWaitersByRunID[runID]?
-                    .removeValue(forKey: waiterID)
-                {
-                    continuation.resume() // unblock so CancellationError propagates
-                }
-                if toolIdleWaitersByRunID[runID]?.isEmpty == true {
-                    toolIdleWaitersByRunID.removeValue(forKey: runID)
-                }
-            }
-        }
-
-        // After resuming, respect cooperative cancellation
-        try Task.checkCancellation()
-        steeringDebugLog("[AgentRunSteeringWake] MCP idle wait completed runID=\(runID) waiterID=\(waiterID)")
+        try await toolExecutionRuntime.awaitNoActiveToolExecutions(runID: runID)
     }
 
-    /// Resumes all parked idle-waiters for a runID (called when tools drain to zero).
-    @MainActor
-    private func resumeAllToolIdleWaiters(
-        forRunID runID: UUID,
-        lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = nil
-    ) {
-        let waiters = toolIdleWaitersByRunID.removeValue(forKey: runID)
-        EditFlowPerf.lifecycleEvent(
-            EditFlowPerf.Lifecycle.MCPRunTool.idleWaitersResumed,
-            correlation: lifecycleCorrelation,
-            EditFlowPerf.Dimensions(waiterCount: waiters?.count ?? 0)
-        )
-        guard let waiters else {
-            steeringDebugLog("[AgentRunSteeringWake] MCP idle wait resume skipped no waiters runID=\(runID)")
-            return
-        }
-        steeringDebugLog("[AgentRunSteeringWake] MCP idle wait resuming runID=\(runID) waiters=\(waiters.count)")
-        for (_, continuation) in waiters {
-            continuation.resume()
-        }
-    }
+    // Resumes all parked idle-waiters for a runID (called when tools drain to zero).
 
     @MainActor
     @discardableResult
     private func cancelToolExecution(executionID: UUID, reason: String?) -> Bool {
-        guard let execution = activeToolExecutionsByID[executionID] else {
-            return false
-        }
-        execution.cancel()
-        unregisterToolExecution(executionID: executionID)
-        return true
+        toolExecutionRuntime.cancelToolExecution(executionID: executionID, reason: reason)
     }
 
     @MainActor
@@ -2792,7 +2600,7 @@ final class MCPServerViewModel: ObservableObject {
         timeoutSeconds: TimeInterval
     ) async -> AgentRunWaitScopeRegistration? {
         guard !sessionIDs.isEmpty else { return nil }
-        purgeStaleAgentRunWaitScopes(source: "begin")
+        toolExecutionRuntime.purgeStaleAgentRunWaitScopes(source: "begin")
         let resolvedContext = try? resolveTabContextSnapshot(
             from: metadata,
             toolName: "agent_run_wait_scope"
@@ -2801,73 +2609,15 @@ final class MCPServerViewModel: ObservableObject {
             steeringDebugLog("[AgentRunSteeringWake] agent_run wait scope skipped: no parent runID childSessions=\(sessionIDs.map(\.uuidString).sorted().joined(separator: ","))")
             return nil
         }
-        let token = UUID()
-        // The caller already froze its resolved wait; stale-scope purging must age against that
-        // same value rather than a preference that can change mid-wait.
-        let scope = AgentRunWaitScope(
-            token: token,
-            parentRunID: parentRunID,
-            childSessionIDs: sessionIDs,
-            startedAt: Date(),
-            timeoutSeconds: timeoutSeconds,
-            metadata: metadata
+        return toolExecutionRuntime.beginAgentRunWaitScope(
+            parentRunID: parentRunID, metadata: metadata,
+            sessionIDs: sessionIDs, timeoutSeconds: timeoutSeconds
         )
-        agentRunWaitScopesByToken[token] = scope
-        for sessionID in sessionIDs {
-            childAgentRunWaitCountsByParentRunID[parentRunID, default: [:]][sessionID, default: 0] += 1
-        }
-        steeringDebugLog("[AgentRunSteeringWake] agent_run wait scope begin parentRunID=\(parentRunID) token=\(token) timeout=\(timeoutSeconds) childSessions=\(sessionIDs.map(\.uuidString).sorted().joined(separator: ",")) counts=\(debugChildAgentRunWaits(for: parentRunID))")
-        return AgentRunWaitScopeRegistration(token: token, parentRunID: parentRunID)
     }
 
     @MainActor
     private func endAgentRunWaitScope(_ token: UUID, completion: AgentRunWaitScopeCompletion) {
-        guard let scope = agentRunWaitScopesByToken.removeValue(forKey: token) else {
-            steeringDebugLog("[AgentRunSteeringWake] agent_run wait scope end ignored missing token=\(token) reason=\(completion.reason.rawValue)")
-            return
-        }
-        decrementAgentRunWaitScope(scope)
-        let elapsed = Date().timeIntervalSince(scope.startedAt)
-        steeringDebugLog("[AgentRunSteeringWake] agent_run wait scope end parentRunID=\(scope.parentRunID) token=\(token) elapsed=\(elapsed) reason=\(completion.reason.rawValue) result=\(completion.result ?? "none") winner=\(completion.winnerSessionID?.uuidString ?? "none") pending=\(completion.pendingSessionIDs.map(\.uuidString).sorted().joined(separator: ",")) childSessions=\(scope.childSessionIDs.map(\.uuidString).sorted().joined(separator: ",")) remaining=\(debugChildAgentRunWaits(for: scope.parentRunID))")
-    }
-
-    @MainActor
-    private func decrementAgentRunWaitScope(_ scope: AgentRunWaitScope) {
-        for sessionID in scope.childSessionIDs {
-            let existing = childAgentRunWaitCountsByParentRunID[scope.parentRunID]?[sessionID] ?? 0
-            if existing <= 1 {
-                childAgentRunWaitCountsByParentRunID[scope.parentRunID]?.removeValue(forKey: sessionID)
-            } else {
-                childAgentRunWaitCountsByParentRunID[scope.parentRunID]?[sessionID] = existing - 1
-            }
-        }
-        if childAgentRunWaitCountsByParentRunID[scope.parentRunID]?.isEmpty == true {
-            childAgentRunWaitCountsByParentRunID.removeValue(forKey: scope.parentRunID)
-        }
-    }
-
-    @MainActor
-    private func purgeStaleAgentRunWaitScopes(now: Date = Date(), source: String) {
-        let staleTokens = agentRunWaitScopesByToken.compactMap { token, scope -> UUID? in
-            let maxAge = scope.timeoutSeconds + agentRunWaitScopeStaleGraceSeconds
-            return now.timeIntervalSince(scope.startedAt) > maxAge ? token : nil
-        }
-        for token in staleTokens {
-            guard let scope = agentRunWaitScopesByToken.removeValue(forKey: token) else { continue }
-            decrementAgentRunWaitScope(scope)
-            let elapsed = now.timeIntervalSince(scope.startedAt)
-            steeringDebugLog("[AgentRunSteeringWake] agent_run wait scope stale purge source=\(source) parentRunID=\(scope.parentRunID) token=\(token) elapsed=\(elapsed) timeout=\(scope.timeoutSeconds) childSessions=\(scope.childSessionIDs.map(\.uuidString).sorted().joined(separator: ","))")
-        }
-    }
-
-    @MainActor
-    private func debugChildAgentRunWaits(for parentRunID: UUID) -> String {
-        let counts = childAgentRunWaitCountsByParentRunID[parentRunID] ?? [:]
-        guard !counts.isEmpty else { return "none" }
-        return counts
-            .map { "\($0.key.uuidString.prefix(8)):\($0.value)" }
-            .sorted()
-            .joined(separator: ",")
+        toolExecutionRuntime.endAgentRunWaitScope(token, completion: completion)
     }
 
     @MainActor
@@ -2878,33 +2628,7 @@ final class MCPServerViewModel: ObservableObject {
         steeringOriginRunID: () -> UUID? = { nil },
         publicationForSessionID: (UUID) -> (snapshot: AgentRunMCPSnapshot, cursor: AgentRunSessionStore.WaitCursor)?
     ) async {
-        let sessionIDs = Set(childAgentRunWaitCountsByParentRunID[runID]?.keys.map(\.self) ?? [])
-        guard !sessionIDs.isEmpty else {
-            steeringDebugLog("[AgentRunSteeringWake] parent wake found no child agent_run waiters source=\(source) parentRunID=\(runID) active=\(debugActiveTools(for: runID))")
-            return
-        }
-        steeringDebugLog("[AgentRunSteeringWake] parent wake child agent_run waiters source=\(source) parentRunID=\(runID) childSessions=\(sessionIDs.map(\.uuidString).sorted().joined(separator: ",")) active=\(debugActiveTools(for: runID))")
-        for sessionID in sessionIDs {
-            guard let publication = publicationForSessionID(sessionID) else {
-                steeringDebugLog("[AgentRunSteeringWake] parent wake skipped missing child snapshot source=\(source) parentRunID=\(runID) childSessionID=\(sessionID)")
-                continue
-            }
-            #if DEBUG
-                if let beforeAgentRunWaiterWakeForTesting {
-                    await beforeAgentRunWaiterWakeForTesting(runID, sessionID)
-                }
-            #endif
-            let validatedSteeringOriginRunID = steeringOriginRunID()
-            await AgentRunSessionStore.wakeCurrentWaiters(
-                publication.snapshot,
-                cursor: publication.cursor,
-                reason: .steeringRequested,
-                steeringMessage: steeringMessage,
-                steeringOriginRunID: validatedSteeringOriginRunID
-            )
-        }
-        await Task.yield()
-        steeringDebugLog("[AgentRunSteeringWake] parent wake yielded source=\(source) parentRunID=\(runID)")
+        await toolExecutionRuntime.wakeAgentRunWaitersOwnedByActiveRun(runID: runID, source: source, steeringMessage: steeringMessage, steeringOriginRunID: steeringOriginRunID, publicationForSessionID: publicationForSessionID)
     }
 
     @MainActor
@@ -2916,37 +2640,7 @@ final class MCPServerViewModel: ObservableObject {
         steeringOriginRunID: () -> UUID? = { nil },
         publicationForSessionID: (UUID) -> (snapshot: AgentRunMCPSnapshot, cursor: AgentRunSessionStore.WaitCursor)?
     ) async -> Bool {
-        guard hasActiveChildAgentRunWaits(runID: runID) else {
-            steeringDebugLog("[AgentRunSteeringWake] parent drain fast-idle source=\(source) parentRunID=\(runID)")
-            return true
-        }
-
-        let deadline = Date().addingTimeInterval(max(0, timeoutSeconds))
-        while true {
-            await wakeAgentRunWaitersOwnedByActiveRun(
-                runID: runID,
-                source: source,
-                steeringMessage: steeringMessage,
-                steeringOriginRunID: steeringOriginRunID,
-                publicationForSessionID: publicationForSessionID
-            )
-
-            guard hasActiveChildAgentRunWaits(runID: runID) else {
-                steeringDebugLog("[AgentRunSteeringWake] parent drain completed source=\(source) parentRunID=\(runID)")
-                return true
-            }
-            guard timeoutSeconds > 0, Date() < deadline else {
-                steeringDebugLog("[AgentRunSteeringWake] parent drain timed out source=\(source) parentRunID=\(runID) timeout=\(timeoutSeconds) remaining=\(debugChildAgentRunWaits(for: runID))")
-                return false
-            }
-
-            do {
-                try await Task.sleep(nanoseconds: 25_000_000)
-            } catch {
-                steeringDebugLog("[AgentRunSteeringWake] parent drain cancelled source=\(source) parentRunID=\(runID)")
-                return false
-            }
-        }
+        await toolExecutionRuntime.wakeAndDrainAgentRunWaitersOwnedByActiveRun(runID: runID, source: source, steeringMessage: steeringMessage, timeoutSeconds: timeoutSeconds, steeringOriginRunID: steeringOriginRunID, publicationForSessionID: publicationForSessionID)
     }
 
     @MainActor
@@ -3042,9 +2736,9 @@ final class MCPServerViewModel: ObservableObject {
         @MainActor
         func test_activeToolExecutionCount(connectionID: UUID? = nil) -> Int {
             if let connectionID {
-                return activeToolExecutionIDsByConnectionID[connectionID]?.count ?? 0
+                return toolExecutionRuntime.executionIDs(connectionID: connectionID).count
             }
-            return activeToolExecutionsByID.count
+            return toolExecutionRuntime.activeExecutionCount
         }
 
         @MainActor
@@ -3070,8 +2764,7 @@ final class MCPServerViewModel: ObservableObject {
 
         @MainActor
         func test_agentRunWaitScopeCount(parentRunID: UUID) -> Int {
-            purgeStaleAgentRunWaitScopes(source: "test-count")
-            return agentRunWaitScopesByToken.values.count { $0.parentRunID == parentRunID }
+            toolExecutionRuntime.waitScopeCount(parentRunID: parentRunID)
         }
 
         @MainActor
@@ -4067,36 +3760,15 @@ final class MCPServerViewModel: ObservableObject {
             EditFlowPerf.Dimensions(toolName: name)
         )
 
-        let cleanupClaim = MCPRunToolCleanupClaim()
-        let cleanupExecution: @Sendable (String) async -> Void = { [weak self] outcome in
-            guard cleanupClaim.claim(), let self else { return }
-            let cleanupState = EditFlowPerf.begin(
-                EditFlowPerf.Stage.MCPToolCall.runToolCompletionCleanup,
-                EditFlowPerf.Dimensions(toolName: name)
-            )
-            EditFlowPerf.lifecycleEvent(
-                EditFlowPerf.Lifecycle.MCPRunTool.cleanupScheduled,
-                correlation: lifecycleCorrelation,
-                EditFlowPerf.Dimensions(toolName: name, outcome: outcome)
-            )
-            await MainActor.run {
-                EditFlowPerf.lifecycleEvent(
-                    EditFlowPerf.Lifecycle.MCPRunTool.cleanupMainActorEntered,
-                    correlation: lifecycleCorrelation,
-                    EditFlowPerf.Dimensions(toolName: name, outcome: outcome)
-                )
-                self.unregisterToolExecution(executionID: toolToken)
-                if shouldTrackActiveTool, self.activeToolToken == toolToken {
-                    self.clearActiveToolSlot()
+        let cleanupExecution = toolExecutionRuntime.makeCompletionHandler(
+            executionID: toolToken, toolName: name, lifecycleCorrelation: lifecycleCorrelation,
+            didFinish: { [weak self] in
+                guard let self else { return }
+                if shouldTrackActiveTool, activeToolToken == toolToken {
+                    clearActiveToolSlot()
                 }
             }
-            EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.runToolCompletionCleanup, cleanupState)
-            EditFlowPerf.lifecycleEvent(
-                EditFlowPerf.Lifecycle.MCPRunTool.cleanupEnded,
-                correlation: lifecycleCorrelation,
-                EditFlowPerf.Dimensions(toolName: name, outcome: outcome)
-            )
-        }
+        )
 
         let cancellationEnvelopeState = EditFlowPerf.begin(
             EditFlowPerf.Stage.MCPToolCall.runToolTimeoutEnvelope,
@@ -6129,7 +5801,7 @@ final class MCPServerViewModel: ObservableObject {
 
     func buildCodeStructureDTO(
         fromRecords files: [WorkspaceFileRecord],
-        request: CodeStructureRequest,
+        request: WorkspaceCodemapStructureRequest,
         includePathNotFoundIssue: Bool,
         requestedPaths: [String] = [],
         lookupContext: WorkspaceLookupContext = .visibleWorkspace
@@ -6158,132 +5830,54 @@ final class MCPServerViewModel: ObservableObject {
             )
         }
 
-        let store = promptVM.workspaceFileContextStore
-        switch await store.rootScopeAvailability(lookupContext.rootScope) {
-        case .available:
-            break
-        case .sessionWorktreeUnavailable:
-            return Self.codeStructureUnavailableReply(
-                issue: .init(
-                    code: "git_root_unavailable",
-                    phase: "seed_resolution",
-                    path: nil,
-                    retryable: false,
-                    retryAfterMilliseconds: nil,
-                    attempted: nil,
-                    limit: nil,
-                    message: "The session-bound worktree root is unavailable."
-                ),
-                size: request.size,
-                worktreeScope: worktreeScope
-            )
-        }
-
-        let roots = await store.rootRefs(scope: lookupContext.rootScope)
-        let allowedRootIDs = Set(roots.map(\.id))
-        var uniqueFilesByStandardizedFullPath: [String: WorkspaceFileRecord] = [:]
-        for file in files where allowedRootIDs.contains(file.rootID) {
-            if uniqueFilesByStandardizedFullPath[file.standardizedFullPath] == nil {
-                uniqueFilesByStandardizedFullPath[file.standardizedFullPath] = file
-            }
-        }
-        if uniqueFilesByStandardizedFullPath.isEmpty, includePathNotFoundIssue {
-            return Self.codeStructureUnavailableReply(
-                issue: .init(
-                    code: "path_not_found",
-                    phase: "seed_resolution",
-                    path: requestedPaths.first,
-                    retryable: false,
-                    retryAfterMilliseconds: nil,
-                    attempted: nil,
-                    limit: nil,
-                    message: "No requested path resolved to a file."
-                ),
-                size: request.size,
-                worktreeScope: worktreeScope
-            )
-        }
-
-        let logicalRootNames = await lookupContext.logicalRootDisplayNamesByRootID(store: store)
-        let orderedFiles = uniqueFilesByStandardizedFullPath.values.sorted { lhs, rhs in
-            let left = Self.logicalCodeStructurePath(
-                for: lhs,
-                roots: roots,
-                lookupContext: lookupContext,
-                logicalRootDisplayNamesByRootID: logicalRootNames
-            )
-            let right = Self.logicalCodeStructurePath(
-                for: rhs,
-                roots: roots,
-                lookupContext: lookupContext,
-                logicalRootDisplayNamesByRootID: logicalRootNames
-            )
-            if left != right { return left.utf8.lexicographicallyPrecedes(right.utf8) }
-            return lhs.id.uuidString < rhs.id.uuidString
-        }
-
-        await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureGraphSnapshot)
-        let aggregate = try await store.queryCodemapStructureGraphs(
-            seedFileIDs: orderedFiles.map(\.id),
-            direction: request.direction,
-            maximumDepth: request.maximumDepth,
-            budget: request.budget,
-            rootScope: lookupContext.rootScope,
-            logicalRootDisplayNamesByRootID: logicalRootNames
+        let boundLogicalNames = Dictionary(
+            (lookupContext.bindingProjection?.boundRootsForMetadata ?? []).map {
+                ($0.physicalRoot.id, $0.logicalRoot.name)
+            },
+            uniquingKeysWith: { current, _ in current }
         )
-        try Task.checkCancellation()
-        await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureGraphTraversal)
-        await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureGraphRevalidation)
-        let initialRevalidation = await store.revalidateCodemapStructureGraphs(aggregate)
-        let renderableFileIDs = aggregate.roots.flatMap { root -> [UUID] in
-            if case .invalid? = initialRevalidation[root.rootEpoch] { return [] }
-            return root.nodes.map(\.fileID)
-        }
-
-        let presentation: WorkspaceCodemapOperationPresentation?
-        if request.includesSignatures, !renderableFileIDs.isEmpty {
-            #if DEBUG
-                codeStructureCoordinatorInvocationsForTesting += 1
-            #endif
-            presentation = try await WorkspaceCodemapPresentationCoordinator(
-                store: store,
-                policy: WorkspaceCodemapPresentationRequestPolicy(
-                    maximumReadinessRounds: 4096,
-                    initialBackoffMilliseconds: 25,
-                    maximumBackoffMilliseconds: 250,
-                    maximumTotalWait: .milliseconds(workspaceCodemapProductionDemandWaitMilliseconds),
-                    maximumCandidateDemandCount: request.budget.maximumNodeCount
-                ),
-                structurePhaseDidChange: { phase in
+        let result = try await WorkspaceCodemapStructureQueryExecutor(store: promptVM.workspaceFileContextStore)
+            .execute(
+                files: files,
+                request: request,
+                includePathNotFoundIssue: includePathNotFoundIssue,
+                rootScope: lookupContext.rootScope,
+                boundLogicalNames: boundLogicalNames,
+                presentationWillStart: {
+                    #if DEBUG
+                        self.codeStructureCoordinatorInvocationsForTesting += 1
+                    #endif
+                },
+                phaseDidChange: { phase in
                     await MCPToolExecutionHandlerPhaseContext.report(phase.mcpToolExecutionHandlerPhase)
                 }
-            ).structureSignaturePresentation(
-                fileIDs: renderableFileIDs,
-                rootScope: lookupContext.rootScope,
-                logicalRootDisplayNamesByRootID: logicalRootNames
             )
-        } else {
-            presentation = nil
+        switch result {
+        case .scopeUnavailable:
+            return Self.codeStructureUnavailableReply(
+                issue: .init(
+                    code: "git_root_unavailable", phase: "seed_resolution", path: nil,
+                    retryable: false, retryAfterMilliseconds: nil, attempted: nil, limit: nil,
+                    message: "The session-bound worktree root is unavailable."
+                ),
+                size: request.size, worktreeScope: worktreeScope
+            )
+        case .noRequestedFiles:
+            return Self.codeStructureUnavailableReply(
+                issue: .init(
+                    code: "path_not_found", phase: "seed_resolution", path: requestedPaths.first,
+                    retryable: false, retryAfterMilliseconds: nil, attempted: nil, limit: nil,
+                    message: "No requested path resolved to a file."
+                ),
+                size: request.size, worktreeScope: worktreeScope
+            )
+        case let .completed(aggregate, presentation, revalidation):
+            return Self.codeStructureReplyDTO(
+                aggregate: aggregate, presentation: presentation, revalidation: revalidation,
+                includesSignatures: request.includesSignatures, budget: request.budget,
+                size: request.size, worktreeScope: worktreeScope
+            )
         }
-        try Task.checkCancellation()
-
-        let finalRevalidation = await store.revalidateCodemapStructureGraphs(aggregate)
-        var revalidation = initialRevalidation
-        for (rootEpoch, result) in finalRevalidation {
-            if case .invalid? = revalidation[rootEpoch] { continue }
-            revalidation[rootEpoch] = result
-        }
-        try Task.checkCancellation()
-        await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureAssembly)
-        return Self.codeStructureReplyDTO(
-            aggregate: aggregate,
-            presentation: presentation,
-            revalidation: revalidation,
-            includesSignatures: request.includesSignatures,
-            budget: request.budget,
-            size: request.size,
-            worktreeScope: worktreeScope
-        )
     }
 
     static func codeStructureReplyDTO(
@@ -6661,20 +6255,6 @@ final class MCPServerViewModel: ObservableObject {
         case .missing: .missing
         case .tooCommon: .tooCommon
         }
-    }
-
-    private static func logicalCodeStructurePath(
-        for file: WorkspaceFileRecord,
-        roots: [WorkspaceRootRef],
-        lookupContext: WorkspaceLookupContext,
-        logicalRootDisplayNamesByRootID: [UUID: String]
-    ) -> String {
-        lookupContext.logicalDisplayPath(
-            for: file,
-            roots: roots,
-            rootDisplayNamesByRootID: logicalRootDisplayNamesByRootID,
-            display: .relative
-        ) ?? file.standardizedRelativePath
     }
 
     private static func codeStructureDirectionName(

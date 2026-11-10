@@ -1,9 +1,11 @@
 import RepoPromptFileSystem
+@testable import RepoPromptMCPServer
 import RepoPromptSettingsCore
 #if DEBUG
     import Darwin
     import Foundation
     import MCP
+    import RepoPromptAIContracts
     @testable import RepoPromptApp
     import XCTest
 

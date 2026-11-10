@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptSettingsCore
 
 /// V4 acknowledges one rewrite billing route, attachment names, and the optional recent-chat exposure.
@@ -94,12 +95,25 @@ extension AgentModeViewModel {
         repromptModelResolution(session: session).model
     }
 
+    /// One fresh menu projection; actions still resolve availability independently.
+    func repromptMenuModels() -> (configured: [AIModel], resolved: AIModel?) {
+        let configured = configuredRepromptModels()
+        return (configured, repromptModelResolution(configured: configured).model)
+    }
+
     /// Automatic defaults are pinned only once Re-prompt is enabled or a preparation begins, so
     /// rendering the pill while availability is still loading never freezes a worse billing route.
     func repromptModelResolution(session: TabSession? = nil, pinningDefault: Bool = false) -> AgentRepromptModelResolution {
+        repromptModelResolution(session: session, pinningDefault: pinningDefault, configured: configuredRepromptModels())
+    }
+
+    private func repromptModelResolution(
+        session: TabSession? = nil,
+        pinningDefault: Bool = false,
+        configured: [AIModel]
+    ) -> AgentRepromptModelResolution {
         let profile = modelRouterSettingsStore.effectiveAgentModelsProfile(workspaceID: workspaceManager?.activeWorkspaceID)
         let provider = (session ?? activeSession)?.selectedAgent
-        let configured = configuredRepromptModels()
         if let raw = profile.agentRepromptModelRaw, !raw.isEmpty {
             // An explicit selection is never replaced, even when it is disconnected.
             return AgentRepromptModelPolicy.resolve(selection: raw, currentProvider: provider, configured: configured)

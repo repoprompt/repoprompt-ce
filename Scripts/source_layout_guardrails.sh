@@ -27,6 +27,13 @@ print_matches() {
   fi
 }
 
+# Match tokens rather than filtering whole lines: a neutral contract type must not hide a
+# forbidden implementation beside it. Keep AgentProviderKind's prefix/suffix lookalikes banned.
+domain_runtime_implementation_matches() {
+  grep -R -n -o -E 'WindowState|ViewModel|[[:alnum:]_]*AgentProvider[[:alnum:]_]*|Claude[^[:space:]]*Provider|Codex[^[:space:]]*Provider|OpenCode[^[:space:]]*Provider|Cursor[^[:space:]]*Provider' "$1" |
+    grep -v -E ':AgentProviderKind$'
+}
+
 # 0. Required layout roots/files should exist before negative scans run.
 required_dirs=(
   "Sources/RepoPromptExecutable"
@@ -36,6 +43,9 @@ required_dirs=(
   "Sources/RepoPromptShared/MCP"
   "Sources/RepoPromptWorkspaceCore"
   "Sources/RepoPromptDomainRuntime"
+  "Sources/RepoPromptWorkspaceContext"
+  "Tests/RepoPromptWorkspaceContextTests"
+  "Tests/RepoPromptWorkspaceContextTestSupport"
   "Tests/RepoPromptTests"
   "Tests/RepoPromptWorkspaceCoreTests"
   "Tests/RepoPromptDomainRuntimeTests"
@@ -76,6 +86,20 @@ shared_mcp_required_files=(
 for file in "${shared_mcp_required_files[@]}"; do
   if [[ ! -f "$file" ]]; then
     fail "required shared MCP file missing: $file"
+  fi
+done
+
+# WorkspaceContext owns context/search/codemap orchestration, not app composition.
+print_matches \
+  "RepoPromptWorkspaceContext imports app/UI ownership" \
+  grep -R -n -E '^(@testable[[:space:]]+)?import[[:space:]]+(RepoPromptApp|AppKit|SwiftUI)([[:space:]]|$)' Sources/RepoPromptWorkspaceContext Tests/RepoPromptWorkspaceContextTests Tests/RepoPromptWorkspaceContextTestSupport --include='*.swift'
+print_matches \
+  "RepoPromptWorkspaceContext reads app-global preferences or bundle identity" \
+  grep -R -n -E 'UserDefaults[.]standard|Bundle[.]main' Sources/RepoPromptWorkspaceContext --include='*.swift'
+for retired in Sources/RepoPrompt/Infrastructure/WorkspaceContext Sources/RepoPrompt/Features/Search Sources/RepoPrompt/Features/CodeMap; do
+  if [[ -d "$retired" ]]; then
+    print_matches "WorkspaceContext implementation remains in retired app family: $retired" \
+      find "$retired" -type f -name '*.swift' -print
   fi
 done
 
@@ -286,8 +310,8 @@ else:
         for dependency in domain_runtime.get("dependencies", [])
         if "product" in dependency
     }
-    if runtime_by_name != ["RepoPromptShared", "RepoPromptWorkspaceCore", "RepoPromptC", "RepoPromptCodeMapCore"] or runtime_products != {("Logging", "swift-log"), ("MCP", "swift-sdk")} or len(domain_runtime.get("dependencies", [])) != 6:
-        errors.append("RepoPromptDomainRuntime dependencies must remain RepoPromptShared, RepoPromptWorkspaceCore, RepoPromptC, RepoPromptCodeMapCore, Logging, and pinned MCP")
+    if runtime_by_name != ["RepoPromptAIContracts", "RepoPromptShared", "RepoPromptWorkspaceCore", "RepoPromptC", "RepoPromptCodeMapCore"] or runtime_products != {("Logging", "swift-log"), ("MCP", "swift-sdk")} or len(domain_runtime.get("dependencies", [])) != 7:
+        errors.append("RepoPromptDomainRuntime dependencies must remain RepoPromptAIContracts, RepoPromptShared, RepoPromptWorkspaceCore, RepoPromptC, RepoPromptCodeMapCore, Logging, and pinned MCP")
 if domain_runtime_tests is None:
     errors.append("RepoPromptDomainRuntimeTests target missing")
 else:
@@ -299,8 +323,8 @@ else:
     }
     if domain_runtime_tests.get("type") != "test": errors.append("RepoPromptDomainRuntimeTests must remain a test target")
     if domain_runtime_tests.get("path") != "Tests/RepoPromptDomainRuntimeTests": errors.append("RepoPromptDomainRuntimeTests target path drifted")
-    if owner_by_name != ["RepoPromptDomainRuntime"] or owner_products != {("MCP", "swift-sdk")} or len(domain_runtime_tests.get("dependencies", [])) != 2:
-        errors.append("RepoPromptDomainRuntimeTests must depend only on RepoPromptDomainRuntime and MCP")
+    if owner_by_name != ["RepoPromptAIContracts", "RepoPromptDomainRuntime"] or owner_products != {("MCP", "swift-sdk")} or len(domain_runtime_tests.get("dependencies", [])) != 3:
+        errors.append("RepoPromptDomainRuntimeTests must depend only on RepoPromptAIContracts, RepoPromptDomainRuntime, and MCP")
 
 def swift_language_modes(target):
     return [
@@ -511,7 +535,7 @@ PY
   fi
   print_matches \
     "RepoPromptDomainRuntime contains app/UI/provider implementation" \
-    grep -R -n -E 'WindowState|ViewModel|AgentProvider|Claude[^[:space:]]*Provider|Codex[^[:space:]]*Provider|OpenCode[^[:space:]]*Provider|Cursor[^[:space:]]*Provider' "$domain_runtime_source_dir"
+    domain_runtime_implementation_matches "$domain_runtime_source_dir"
   print_matches \
     "RepoPromptDomainRuntime reintroduced random window incarnations" \
     grep -R -n -E 'windowGeneration.*random|UInt64\.random' "$domain_runtime_source_dir"
@@ -836,6 +860,7 @@ allowed_tracked_docs=(
   "docs/migrations/build-modularization-2026-09-28.md"
   "docs/migrations/build-modularization/completion-plan.md"
   "docs/migrations/build-modularization/ledger.md"
+  "docs/migrations/build-modularization/m6-workspace-move-manifest.tsv"
   "docs/migrations/build-modularization/ratchets.json"
   "docs/migrations/build-modularization/build-ratchets.json"
   "docs/open-source-readiness.md"
@@ -906,13 +931,28 @@ if ! python3 Scripts/swift_imports.py --forbid-ui \
   Sources/RepoPromptFoundation Sources/RepoPromptInstrumentation \
   Sources/RepoPromptProcess Sources/RepoPromptRegexCore \
   Sources/RepoPromptFileSystem Sources/RepoPromptVCS \
-  Sources/RepoPromptPersistence Sources/RepoPromptSettingsCore; then
+  Sources/RepoPromptPersistence Sources/RepoPromptSettingsCore \
+  Sources/RepoPromptAIContracts Sources/RepoPromptAgentProviderContracts \
+  Sources/RepoPromptClaudeProvider Sources/RepoPromptCodexProvider \
+  Sources/RepoPromptACPProviders Sources/RepoPromptHTTPProviders; then
   fail "UI framework import in app-free target"
 fi
 if [[ -d Sources/RepoPromptProcess ]]; then
   print_matches "ambient Bundle.main or UserDefaults.standard in RepoPromptProcess" \
     grep -R -n -E 'Bundle[.]main|UserDefaults[.]standard' Sources/RepoPromptProcess --include='*.swift'
 fi
+
+# M8 provider policy comes from app adapters, not ambient process preferences.
+print_matches "ambient UserDefaults.standard in an M8 provider or contract target" \
+  grep -R -n -E 'UserDefaults[.]standard' \
+    Sources/RepoPromptAIContracts Sources/RepoPromptAgentProviderContracts \
+    Sources/RepoPromptClaudeProvider Sources/RepoPromptCodexProvider \
+    Sources/RepoPromptACPProviders Sources/RepoPromptHTTPProviders --include='*.swift'
+# These consumers use NativeAgentRuntimeControlling; construction stays elsewhere.
+print_matches "concrete provider import in a neutral native runtime consumer" \
+  grep -n -E 'import[[:space:]]+((typealias|struct|class|enum|protocol|let|var|func)[[:space:]]+)?RepoPrompt(ClaudeProvider|ClaudeCompatibleProvider|CodexProvider|ACPProviders|HTTPProviders)([[:space:].;]|$)' \
+    Sources/RepoPrompt/Features/AgentMode/Runtime/Runners/ClaudeIntegratedAgentModeRunner.swift \
+    Sources/RepoPrompt/Features/AgentMode/Runtime/Claude/ClaudeControllerEventListener.swift
 
 # Swift class runtime names embed the module (`_TtC13RepoPromptApp...`), so these
 # APIs silently change identity when a type moves. Use explicit string identities.

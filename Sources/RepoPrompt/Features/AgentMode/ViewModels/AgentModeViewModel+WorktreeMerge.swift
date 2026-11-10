@@ -3,6 +3,7 @@ import MCP
 import RepoPromptDomainRuntime
 import RepoPromptShared
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 struct WorktreeMergeReviewScope: Hashable {
@@ -455,18 +456,31 @@ extension AgentModeViewModel {
         commitMessage: String? = nil
     ) async throws -> GitWorktreeMergeApplyResult {
         let session = try worktreeMergeSession(sessionID: sessionID)
+        guard let command = try runtimeCommand(sessionID: sessionID), command.writer.session === session else {
+            throw MCPError.invalidParams("The worktree merge owner is unavailable. No review was shown.")
+        }
         let reviewPreview = try await revalidatedAndAuthorizedWorktreeMergePreview(
             preview,
             session: session
         )
-        let decision = await requestWorktreeMergeReview(
+        guard command.isCurrent else {
+            throw MCPError.invalidParams("The worktree merge owner changed while preparing its review.")
+        }
+        let decision = try await interactionRuntime.requestWorktreeMergeReview(
+            command: command,
             preview: reviewPreview,
-            session: session,
             timeoutSeconds: timeoutSeconds
         )
         guard decision == .accept else {
             let reason = decision.cancelledReason ?? "Worktree merge review was rejected."
-            markWorktreeMergeOperationCancelled(operationID: reviewPreview.operationID, session: session, reason: reason)
+            // The originating runtime already settled cancellation, including after detachment.
+            throw MCPError.invalidParams(reason)
+        }
+        guard command.isCurrent else {
+            let reason = "The worktree merge owner changed before apply."
+            interactionRuntime.recordWorktreeMergeReviewAbandoned(
+                command: command, operationID: reviewPreview.operationID, reason: reason
+            )
             throw MCPError.invalidParams(reason)
         }
 
@@ -655,19 +669,6 @@ extension AgentModeViewModel {
         }
     }
 
-    func submitWorktreeMergeReviewDecision(
-        tabID: UUID,
-        reviewID: UUID,
-        decision: WorktreeMergeReviewDecision
-    ) {
-        guard let session = sessions[tabID],
-              session.pendingWorktreeMergeReview?.id == reviewID,
-              let continuation = session.worktreeMergeReviewContinuation
-        else { return }
-        finishPendingWorktreeMergeReview(session: session)
-        continuation.resume(returning: decision)
-    }
-
     func pendingWorktreeMergeReview(for tabID: UUID?) -> PendingWorktreeMergeReview? {
         guard let tabID, let session = sessions[tabID] else { return nil }
         return session.uiPendingWorktreeMergeReview
@@ -682,73 +683,6 @@ extension AgentModeViewModel {
         return AgentWorktreeMergeBlockerSelector.activeConflictOperation(
             in: session.worktreeMergeOperations
         )
-    }
-
-    func cancelPendingWorktreeMergeReview(for session: TabSession, reason: String) {
-        let operationID = session.pendingWorktreeMergeReview?.operationID
-        guard let continuation = session.worktreeMergeReviewContinuation else {
-            finishPendingWorktreeMergeReview(session: session)
-            if let operationID {
-                markWorktreeMergeOperationCancelled(operationID: operationID, session: session, reason: reason)
-            }
-            return
-        }
-        finishPendingWorktreeMergeReview(session: session)
-        if let operationID {
-            markWorktreeMergeOperationCancelled(operationID: operationID, session: session, reason: reason)
-        }
-        continuation.resume(returning: .cancelled(reason: reason))
-    }
-
-    private func requestWorktreeMergeReview(
-        preview: GitWorktreeMergePreview,
-        session: TabSession,
-        timeoutSeconds: TimeInterval
-    ) async -> WorktreeMergeReviewDecision {
-        cancelPendingWorktreeMergeReview(for: session, reason: "Replaced by newer worktree merge review")
-        let review = PendingWorktreeMergeReview(
-            scope: WorktreeMergeReviewScope(windowID: 0, tabID: session.tabID),
-            preview: preview
-        )
-        upsertWorktreeMergeOperation(
-            AgentWorktreeMergeCoordinator.makeOperation(preview: preview, status: .awaitingApproval),
-            in: session
-        )
-        session.pendingWorktreeMergeReview = review
-        reconcileInteractiveRunState(session)
-        requestUIRefresh(tabID: session.tabID, urgent: true)
-
-        return await withCheckedContinuation { continuation in
-            guard session.worktreeMergeReviewContinuation == nil else {
-                continuation.resume(returning: .cancelled(reason: "A worktree merge review is already pending."))
-                return
-            }
-            session.worktreeMergeReviewContinuation = continuation
-            if timeoutSeconds > 0 {
-                session.worktreeMergeReviewTimeoutTask = Task { @MainActor [weak self, weak session] in
-                    do {
-                        try await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
-                    } catch {
-                        return
-                    }
-                    guard let self, let session, session.pendingWorktreeMergeReview?.id == review.id else { return }
-                    submitWorktreeMergeReviewDecision(
-                        tabID: session.tabID,
-                        reviewID: review.id,
-                        decision: .timeout
-                    )
-                }
-            }
-        }
-    }
-
-    private func finishPendingWorktreeMergeReview(session: TabSession) {
-        session.worktreeMergeReviewTimeoutTask?.cancel()
-        session.worktreeMergeReviewTimeoutTask = nil
-        session.worktreeMergeReviewContinuation = nil
-        session.pendingWorktreeMergeReview = nil
-        reconcileInteractiveRunState(session)
-        requestUIRefresh(tabID: session.tabID, urgent: true)
     }
 
     private func worktreeMergePreview(from operation: AgentSessionWorktreeMergeOperation) async throws -> GitWorktreeMergePreview {
@@ -837,18 +771,6 @@ extension AgentModeViewModel {
         }
     }
 
-    private func markWorktreeMergeOperationCancelled(
-        operationID: String,
-        session: TabSession,
-        reason: String
-    ) {
-        try? updateWorktreeMergeOperation(operationID: operationID, in: session) { operation in
-            operation.status = .cancelled
-            operation.completedAt = Date()
-            operation.lastError = reason
-        }
-    }
-
     private func markWorktreeMergeOperationFailed(
         operationID: String,
         session: TabSession,
@@ -863,6 +785,13 @@ extension AgentModeViewModel {
 
     private func persistWorktreeMergeOperationsChange(in session: TabSession) {
         session.isDirty = true
+        publishWorktreeMergeOperationsChange(in: session)
+        publishMCPStateChange(for: session)
+        updateBindingsFromSession(session)
+        scheduleSave(for: session.tabID)
+    }
+
+    func publishWorktreeMergeOperationsChange(in session: TabSession) {
         updateWorktreeMergeSummariesInIndex(for: session)
         syncSidebarUIState(refresh: true, reason: .metadataUpdated)
         // Surface conflict/awaiting-commit attention in the blocker stack and
@@ -870,9 +799,6 @@ extension AgentModeViewModel {
         if session.tabID == currentTabID {
             syncRunInteractionUIState()
         }
-        publishMCPStateChange(for: session)
-        updateBindingsFromSession(session)
-        scheduleSave(for: session.tabID)
     }
 
     private func worktreeMergeEndpoint(from binding: AgentSessionWorktreeBinding) async throws -> GitWorktreeMergeEndpoint {

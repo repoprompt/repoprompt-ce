@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 /// A structured Grok Build model selection: base model id plus optional reasoning effort.
 ///

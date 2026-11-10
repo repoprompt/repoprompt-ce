@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptFoundation
+import RepoPromptWorkspaceContext
 
 enum AutoSliceSelection {
     typealias SliceEntry = ReadReplySelectionPolicy.SliceEntry

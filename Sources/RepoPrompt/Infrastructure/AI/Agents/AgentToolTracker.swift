@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptMCPServer
 
 /// Observes MCP tool usage for a single agent session and emits uniform events.
 /// Tool observers are registered by runID (not connectionID) to survive connection handovers.
@@ -8,12 +9,21 @@ actor AgentToolTracker {
     private var observerToken: UUID?
     private var hasUnregistered = false
 
+    #if DEBUG
+        private var beforeConnectionLookupForTesting: (@Sendable () async -> Void)?
+
+        func setBeforeConnectionLookupForTesting(_ operation: (@Sendable () async -> Void)?) {
+            beforeConnectionLookupForTesting = operation
+        }
+    #endif
+
     /// Registers an enhanced tool event observer that receives args on call and result on completion.
+    @discardableResult
     func registerEnhancedObserver(
         runID: UUID,
         onCalled: @escaping @Sendable (UUID, String, [String: Value]?) async -> Void,
         onCompleted: @escaping @Sendable (UUID, String, [String: Value]?, String, Bool) async -> Void
-    ) async {
+    ) async -> UUID {
         let manager = ServerNetworkManager.shared
 
         // Register enhanced observer with args and results before waiting for
@@ -27,22 +37,27 @@ actor AgentToolTracker {
         trackedRunID = runID
         observerToken = token
         hasUnregistered = false
+        return token
     }
 
     /// Wait for a matching MCP connection after an observer has already been registered.
     func waitForConnectionAfterRegistration(
         runID: UUID,
+        observerToken expectedToken: UUID,
         clientNameHint: String?,
         connectionTimeoutSeconds: TimeInterval = 10.0,
         fallbackTimeoutSeconds: TimeInterval = 5.0,
         keepObserversOnTimeout: Bool = true
     ) async {
         let manager = ServerNetworkManager.shared
-        guard trackedRunID == runID, !hasUnregistered else { return }
+        guard trackedRunID == runID, observerToken == expectedToken, !hasUnregistered else { return }
+        #if DEBUG
+            await beforeConnectionLookupForTesting?()
+        #endif
 
         // Wait for connection (with cancellation checks)
         guard !Task.isCancelled else {
-            await unregisterObserverOnce(for: runID, manager: manager)
+            await unregisterObserverOnce(for: runID, expectedToken: expectedToken, manager: manager)
             return
         }
 
@@ -55,9 +70,9 @@ actor AgentToolTracker {
         }
 
         if Task.isCancelled {
-            await unregisterObserverOnce(for: runID, manager: manager)
+            await unregisterObserverOnce(for: runID, expectedToken: expectedToken, manager: manager)
         } else if resolvedID == nil, !keepObserversOnTimeout {
-            await unregisterObserverOnce(for: runID, manager: manager)
+            await unregisterObserverOnce(for: runID, expectedToken: expectedToken, manager: manager)
         }
     }
 
@@ -71,13 +86,14 @@ actor AgentToolTracker {
         onCalled: @escaping @Sendable (UUID, String, [String: Value]?) async -> Void,
         onCompleted: @escaping @Sendable (UUID, String, [String: Value]?, String, Bool) async -> Void
     ) async {
-        await registerEnhancedObserver(
+        let token = await registerEnhancedObserver(
             runID: runID,
             onCalled: onCalled,
             onCompleted: onCompleted
         )
         await waitForConnectionAfterRegistration(
             runID: runID,
+            observerToken: token,
             clientNameHint: clientNameHint,
             connectionTimeoutSeconds: connectionTimeoutSeconds,
             fallbackTimeoutSeconds: fallbackTimeoutSeconds,
@@ -86,8 +102,9 @@ actor AgentToolTracker {
     }
 
     /// Unregister exactly once to avoid double-cleanup races
-    private func unregisterObserverOnce(for runID: UUID, manager: ServerNetworkManager) async {
-        guard !hasUnregistered, trackedRunID == runID else { return }
+    private func unregisterObserverOnce(for runID: UUID, expectedToken: UUID? = nil, manager: ServerNetworkManager) async {
+        guard !hasUnregistered, trackedRunID == runID,
+              expectedToken == nil || observerToken == expectedToken else { return }
         let token = observerToken
         hasUnregistered = true
         trackedRunID = nil
@@ -286,7 +303,7 @@ final class AgentToolTrackingController {
                 return trackedRunID == runID && trackingGeneration == generation
             }
             guard shouldRegister else { return }
-            await tracker.registerEnhancedObserver(
+            let token = await tracker.registerEnhancedObserver(
                 runID: runID,
                 onCalled: { [weak self, eventDeliveryMailbox] invocationID, toolName, args in
                     let invocationContext = MCPInvocationContextBridge.current
@@ -384,6 +401,14 @@ final class AgentToolTrackingController {
                     }
                 }
             )
+            guard let self, trackedRunID == runID, trackingGeneration == generation else { return }
+            // Carry the exact registration across the Task hop. A cancelled predecessor may
+            // finish its connection lookup after a new attempt has reused the same run ID.
+            trackingTask = Task { [tracker] in
+                await tracker.waitForConnectionAfterRegistration(
+                    runID: runID, observerToken: token, clientNameHint: clientNameHint
+                )
+            }
         }
         self.registrationTask = registrationTask
         registrationRunID = runID
@@ -393,13 +418,6 @@ final class AgentToolTrackingController {
         if registrationRunID == runID {
             self.registrationTask = nil
             registrationRunID = nil
-        }
-        trackingTask = Task { [weak self] in
-            guard let self else { return }
-            await tracker.waitForConnectionAfterRegistration(
-                runID: runID,
-                clientNameHint: clientNameHint
-            )
         }
     }
 

@@ -3,6 +3,43 @@ import RepoPromptInstrumentation
 import RepoPromptSettingsCore
 
 extension AgentModeViewModel {
+    /// Refresh only for registry lifecycle mutations, keeping process scans out of rendering.
+    func refreshOracleBackgroundCancelTarget(owner: OracleBackgroundInvocationRegistry.Owner) {
+        let tabID = owner.binding.tabID
+        let sessionOwnsWork = sessions[tabID].map { $0.oracleBackgroundOwner == owner && $0.persistentSessionBindingIdentity == owner.binding } ?? false
+        guard sessionOwnsWork || oracleBackgroundLiveEpochs[owner] != nil else { return }
+        let registry = oracleBackgroundRegistry
+        let epoch = !registry.admissionIsClosed(for: owner) && registry.hasLiveOwner(owner)
+            ? registry.awarenessVersion(for: owner).epoch : nil
+        guard oracleBackgroundLiveEpochs[owner] != epoch else { return }
+        oracleBackgroundLiveEpochs[owner] = epoch
+        if tabID == currentTabID { syncComposerUIState(tabID: tabID) }
+    }
+
+    func composerOracleBackgroundCancelTarget(tabID: UUID?) -> OracleBackgroundCancelTarget? {
+        guard let tabID, let session = sessions[tabID], !session.runState.isActive,
+              session.activeRunAttemptID == nil, !session.bindingTransitionInProgress,
+              freshTaskRoutingByTabID[tabID] == nil,
+              let owner = session.oracleBackgroundOwner,
+              session.persistentSessionBindingIdentity == owner.binding,
+              workspaceManager?.activeWorkspaceID == owner.workspaceID,
+              let epoch = oracleBackgroundLiveEpochs[owner],
+              !oracleBackgroundRegistry.admissionIsClosed(for: owner),
+              oracleBackgroundRegistry.awarenessVersion(for: owner).epoch == epoch
+        else { return nil }
+        return .init(owner: owner, epoch: epoch, session: session, parentTerminalCommitID: session.lastTerminalCommitRevision?.commitID)
+    }
+
+    @discardableResult
+    func cancelOracleBackground(target: OracleBackgroundCancelTarget) async -> Bool {
+        let tabID = target.owner.binding.tabID
+        guard composerOracleBackgroundCancelTarget(tabID: tabID) == target,
+              let session = sessions[tabID], let drain = closeOracleBackground(for: session)
+        else { return false }
+        _ = await OracleBackgroundInvocationRegistry.awaitDrain(drain, timeout: 30)
+        return true
+    }
+
     /// The guarded target behind the composer Stop button; `nil` when there is nothing to stop.
     func composerRunCancelTarget(tabID: UUID?) -> AgentRunCancelTarget? {
         guard let tabID,
@@ -49,6 +86,7 @@ extension AgentModeViewModel {
             ),
             runState: runState,
             cancelTarget: cancelTarget,
+            backgroundCancelTarget: composerOracleBackgroundCancelTarget(tabID: tabID),
             isAgentBusy: isAgentBusy,
             isWaitingForInstruction: isWaitingForInstruction,
             canUseLinkedAgentSession: hasLinkedAgentSession(for: tabID),
@@ -162,8 +200,12 @@ extension AgentModeViewModel {
         let expectedSourceAgentSessionID = composerSourceAgentSessionID(tabID: tabID, session: resolvedSession)
         let hasLinkedSession = hasLinkedAgentSession(for: tabID)
         let route: AgentComposerSubmitTarget.Route
+        let writerIdentity: AgentSessionRuntimeStore.WriterIdentity?
         if hasLinkedSession {
-            guard expectedSourceAgentSessionID != nil else { return nil }
+            guard let sessionID = expectedSourceAgentSessionID,
+                  let command = try? runtimeCommand(sessionID: sessionID),
+                  command.writer.session === resolvedSession else { return nil }
+            writerIdentity = command.identity
             route = .existingAgentSession
         } else {
             guard expectedSourceAgentSessionID == nil else { return nil }
@@ -171,6 +213,7 @@ extension AgentModeViewModel {
                   resolvedSession.runID == nil,
                   resolvedSession.activeRunAttemptID == nil
             else { return nil }
+            writerIdentity = nil
             route = .createAgentSessionFromSourceTab
         }
 
@@ -189,7 +232,8 @@ extension AgentModeViewModel {
             expectedRunID: expectedRunID,
             expectedRunAttemptID: expectedRunAttemptID,
             expectedSubmissionToken: resolvedSession.composerSubmissionToken,
-            expectedInitialStartLocation: expectedInitialStartLocation
+            expectedInitialStartLocation: expectedInitialStartLocation,
+            expectedWriterIdentity: writerIdentity
         )
     }
 

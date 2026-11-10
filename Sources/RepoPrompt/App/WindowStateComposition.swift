@@ -3,6 +3,7 @@ import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptPersistence
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 
 extension CodeMapArtifactRuntime {
     static let processWideProvider: CodeMapArtifactRuntimeProvider = {
@@ -277,7 +278,6 @@ enum WindowStateCompositionFactory {
             workspaceManager: workspaceManager,
             mcpServer: mcpServer,
             attachmentPersistenceIsSuppressed: { AppLaunchConfiguration.current.suppressesAgentSessionPersistence },
-            attachmentSweepViewModels: { WindowStatesManager.shared.allWindows.map(\.agentModeViewModel) },
             oracleViewModel: oracleViewModel,
             applyEditsApprovalStore: applyEditsApprovalStore,
             modelRouterSettingsStore: settingsStore,

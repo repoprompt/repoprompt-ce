@@ -1,6 +1,8 @@
 import AppKit
 import Combine
 import Foundation
+import RepoPromptACPProviders
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
@@ -3925,7 +3927,10 @@ final class AgentSessionLinkRuntimeBridge {
             // replay burst reproduces it and is correctly dropped instead of advancing
             // `change_sequence`.
             lastPublishedSnapshotBySession[targetEndpoint.sessionID] = seed
-            installObservation(for: liveTarget, initialActivity: seed.lastActivityAt)
+            let initialFrame = seedFacts?.supplementalNeedsUser == nil ? nil : TargetPublicationFrame(
+                endpoint: targetEndpoint, sourceSequence: seedSequence, snapshot: seed, runFacts: seedFacts
+            )
+            installObservation(for: liveTarget, initialActivity: seed.lastActivityAt, initialFrame: initialFrame)
         } else if chains[targetEndpoint.sessionID] == nil {
             // The authority already has a target record but this process lost its chain (for example
             // the previous installer's window closed between activations). Reinstalling keeps status
@@ -4604,7 +4609,8 @@ final class AgentSessionLinkRuntimeBridge {
 
     private func installObservation(
         for candidate: AgentSessionLinkEndpointCandidate,
-        initialActivity: Date?
+        initialActivity: Date?,
+        initialFrame: TargetPublicationFrame? = nil
     ) {
         guard let host else { return }
         let endpoint = candidate.domainEndpoint
@@ -4612,6 +4618,8 @@ final class AgentSessionLinkRuntimeBridge {
             removeChain(forTargetSession: endpoint.sessionID, matching: existing)
         }
         let chain = TargetPublicationChain(endpoint: endpoint, activityHighWater: initialActivity)
+        // The installing seed owns this frame; ignored joining seeds must remain unseeded.
+        chain.scheduledFrame = initialFrame
         chains[endpoint.sessionID] = chain
         chain.token = host.agentSessionLinkInstallObservation(for: candidate) { [weak self, weak chain] in
             guard let chain else { return }
@@ -5209,7 +5217,8 @@ final class AgentSessionLinkRuntimeBridge {
                     waitingOn: observation.waitingOn,
                     latestVisibleAssistantPreview: observation.latestVisibleAssistantPreview,
                     runFacts: envelope.runFacts,
-                    managedMetadata: item.capabilities.contains(.manage) ? .init(observation) : nil
+                    managedMetadata: item.capabilities.contains(.manage) ? .init(observation) : nil,
+                    hasPendingInteraction: observation.hasPendingInteraction
                 ))
             }
             outbound.append(AgentMonitorPillProps.Outbound(
@@ -7489,7 +7498,7 @@ final class AgentSessionLinkRuntimeBridge {
     // MARK: - Configuration-only model selection
 
     nonisolated static var invalidModelIDMessage: String {
-        AgentAdvertisedModelCatalog.AdmissionError.invalidID.message
+        AgentModelCatalogRuntime.AdmissionError.invalidID.message
     }
 
     nonisolated static func isValidModelID(_ raw: String) -> Bool {
@@ -8675,7 +8684,7 @@ final class AgentSessionLinkRuntimeBridge {
                 )
             } else {
                 // Role/default selections retain persisted-catalog warming. Explicit selections never warm.
-                await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
+                await AgentModelCatalogRuntime.shared.acpRegistry.warmStandardStoreIfNeeded()
                 selection = try AgentSessionLanePolicy.resolveRole(
                     request.role,
                     availability: host.agentSessionLinkModelAvailability(windowID: destination.windowID),
@@ -9026,7 +9035,9 @@ final class AgentSessionLinkRuntimeBridge {
             guard !host.agentSessionLinkHasActiveChildSessions(parentSessionID: targetSessionID) else {
                 return false
             }
-            let live = host.agentSessionLinkCandidates().filter { $0.sessionID == targetSessionID }
+            let live = host.agentSessionLinkCandidates(
+                forSessionIDs: [targetSessionID], includeLocation: false
+            )[targetSessionID] ?? []
             return live.count == 1 && live[0].domainEndpoint == endpoint
         }
         // Preflight performs the required-session flush, the stash cascade's claim checks, and the

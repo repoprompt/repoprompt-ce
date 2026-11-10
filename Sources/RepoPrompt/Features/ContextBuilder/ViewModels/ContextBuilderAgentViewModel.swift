@@ -1,11 +1,16 @@
 import AppKit
 import Combine
 import MCP
+import RepoPromptACPProviders
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
+import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 import SwiftUI
 
@@ -1464,7 +1469,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         guard Self.shouldAdoptDiscoveredPreferredModel(for: agent) else { return }
         guard selectedAgent == agent,
               let providerID = agent.acpProviderID,
-              let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: providerID),
+              let snapshot = AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: providerID),
               let preferredModelRaw = snapshot.preferredModelRaw
         else {
             return

@@ -1,8 +1,26 @@
 import Darwin
 import Foundation
+import RepoPromptACPProviders
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import XCTest
+
+/// Context fixtures must use the real admitted claim, including pending-restoration claims;
+/// a fabricated identity would hide precisely the routing failures these tests exercise.
+@MainActor
+func controlWriterIdentity(
+    for session: AgentTabSession, scope: AgentSessionRuntimeStore.Scope? = nil
+) throws -> AgentSessionRuntimeStore.WriterIdentity {
+    let id = try XCTUnwrap(session.activeAgentSessionID)
+    let resolution = scope?.resolveWriter(sessionID: id) ?? AgentSessionRuntimeStore.shared.resolveWriter(sessionID: id)
+    guard case let .unique(writer) = resolution, writer.session === session else {
+        throw NSError(domain: "Control fixture requires an exact runtime writer", code: 1)
+    }
+    return writer.identity
+}
 
 /// Runner-level harness for the cross-window oversight prompt supplement.
 ///
@@ -17,12 +35,18 @@ import XCTest
 @MainActor
 final class AgentSessionLinkRunnerHarness {
     let service: AgentModeRunService
+    let resources: AgentRunProviderComposition
+    let workspace: AgentRunWorkspaceInput
+    var composition: AgentModeRunComposition {
+        AgentModeRunComposition(execution: service, resources: resources, workspace: workspace)
+    }
+
     let host: AgentModeViewModel
     let claimStore = AgentSessionLinkOutboundPromptClaimStore()
     let recorder: LifecycleRecorder
     /// The exact hooks the service's runners use, so a test can also build one runner directly.
     ///
-    /// The headless runner is not reachable through `AgentModeRunService.startRun` for any shipping
+    /// The headless runner is not reachable through `AgentModeRunComposition.startRun` for any shipping
     /// agent kind (Codex, Claude-compatible, and ACP kinds each route elsewhere), so its adapter can
     /// only be exercised by constructing the runner itself.
     private(set) var hooks: AgentModeRunService.Hooks!
@@ -93,6 +117,7 @@ final class AgentSessionLinkRunnerHarness {
         testMCPServer: MCPServerViewModel? = nil
     ) {
         self.stubSystemPrompt = stubSystemPrompt
+        workspace = AgentRunWorkspaceInput(fallbackWorkspacePath: workspacePath)
         self.headlessProviderFactory = headlessProviderFactory
         let recorder = LifecycleRecorder()
         self.recorder = recorder
@@ -124,17 +149,17 @@ final class AgentSessionLinkRunnerHarness {
         )
         self.host = host
 
+        resources = AgentRunProviderComposition(
+            headless: headlessProviderFactory, acp: acpProviderFactory,
+            controller: { provider, request in
+                try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
+            }
+        )
         let dependencies = AgentModeRunService.Dependencies(
             windowID: 1,
-            headlessProviderFactory: headlessProviderFactory,
-            acpProviderFactory: acpProviderFactory,
-            acpControllerFactory: { provider, request in
-                try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
-            },
             connectionPolicyInstaller: policyInstaller,
             expectedPIDPolicyArmer: { _ in true },
             mcpServerEnabler: serverEnabler,
-            workspacePathProvider: { _ in workspacePath },
             codexCoordinator: host.test_codexCoordinator,
             claudeCoordinator: host.claudeCoordinator,
             shouldManageCodexTooling: false,
@@ -208,7 +233,7 @@ final class AgentSessionLinkRunnerHarness {
                     }
                 },
                 augmentUserMessageForProviderSend: { text, _, _, _, _ in text },
-                stageResumeRecoveryHandoffIfNeeded: { _ in },
+                stageResumeRecoveryHandoffIfNeeded: { _ in true },
                 prependPendingHandoffIfNeeded: { text, session in
                     sessionLinkHost?.prependPendingHandoffIfNeeded(text, session: session) ?? text
                 },
@@ -311,10 +336,9 @@ final class AgentSessionLinkRunnerHarness {
         harnessBox = self
     }
 
-    /// A `HeadlessAgentModeRunner` wired to the same hooks and provider factory as the service.
+    /// A factory-free runner using the same execution hooks; `resources` fulfills its requests.
     func makeHeadlessRunner() -> HeadlessAgentModeRunner {
         HeadlessAgentModeRunner(
-            headlessProviderFactory: headlessProviderFactory,
             hooks: hooks,
             terminalCommitBarrier: AgentRunTerminalCommitBarrier()
         )
@@ -433,6 +457,11 @@ final class AgentSessionLinkCapturingACPProvider: ACPAgentProvider, @unchecked S
 
     private let lock = NSLock()
     private var captured: [AgentMessage] = []
+    private var supportChecks = 0
+
+    var supportCallCount: Int {
+        lock.withLock { supportChecks }
+    }
 
     init(providerID: ACPProviderID, commandPath: String, environment: [String: String] = [:]) {
         self.providerID = providerID
@@ -455,7 +484,8 @@ final class AgentSessionLinkCapturingACPProvider: ACPAgentProvider, @unchecked S
     }
 
     func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
-        .supported
+        lock.withLock { supportChecks += 1 }
+        return .supported
     }
 
     func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {

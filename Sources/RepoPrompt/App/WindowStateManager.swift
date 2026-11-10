@@ -1,3 +1,4 @@
+import RepoPromptACPProviders
 import RepoPromptSettingsCore
 import RepoPromptShared
 
@@ -1399,6 +1400,7 @@ class WindowStatesManager: ObservableObject {
             for window in self.terminationWindowSnapshot {
                 window.freezeMCPToolsPreferenceForTermination()
             }
+            _ = OracleBackgroundInvocationRegistry.shared.beginShutdown()
             self.preparedOversightCleanupTask?.cancel()
             self.modelRouterRuntime.cancelAll()
             // Cancel any pending focus/workspace change notifications that might trigger updates
@@ -1499,6 +1501,8 @@ class WindowStatesManager: ObservableObject {
     /// Safe to call after `signalTermination()` — fences new work and joins provider/process
     /// teardown before MCP servers stop.
     func shutdownAllAgentSessions() async {
+        let oracleDrain = OracleBackgroundInvocationRegistry.shared.beginShutdown()
+        _ = await OracleBackgroundInvocationRegistry.awaitDrain(oracleDrain, timeout: 2)
         closingWindowReferences.removeAll { $0.value == nil }
         let windows = deduplicatedWindows(
             terminationWindowSnapshot + allWindows + Array(preparedOversightWindows.values) + Array(retiringPreparedOversightWindows.values) + closingWindowReferences.compactMap(\.value)

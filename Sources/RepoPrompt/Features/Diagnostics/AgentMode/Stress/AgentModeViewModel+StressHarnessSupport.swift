@@ -1,6 +1,7 @@
 #if DEBUG
     import Foundation
     import MCP
+    import RepoPromptDomainRuntime
 
     // MARK: - Stress Harness Helpers
 
@@ -63,7 +64,7 @@
             session.providerTokenUsageByTurn = []
             session.pendingNonCodexUserInputTokenQueue = []
             session.activeNonCodexTurnTokenAccumulator = nil
-            session.codexConversationID = nil
+            session.clearCodexConversationIdentity()
             session.codexRolloutPath = nil
             session.codexModel = nil
             session.codexReasoningEffort = nil

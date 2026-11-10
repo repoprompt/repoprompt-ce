@@ -216,39 +216,19 @@ enum AgentMonitorPassiveNoticeOutcome: Equatable {
 /// what this switch adds, and — load-bearing — the bound on what it can create. A user who reads
 /// "auto-wake" and imagines an autonomous background agent has been mis-sold the feature.
 enum AgentMonitorAutoWakeCopy {
-    static let label = "Auto-wake on all updates"
+    static let label = "Auto-wake on overseen lane updates"
     static let laneLabel = "Auto-wake"
     static let selectAll = "Select all"
     static let deselectAll = "Deselect all"
-    /// Says what the switch does *and* what it can lead to.
-    ///
-    /// It used to promise that “automatic turns never chain”. That was a transport guarantee, and it
-    /// no longer exists: a follow-up turn may act on the user’s standing instruction and produce
-    /// activity that is itself an update, so a chain — including two sessions the user pointed at each
-    /// other — is a real outcome of turning this on. Leaving the old sentence in place would be the
-    /// worst version of this control: a bounded-sounding promise next to unbounded behaviour. The
-    /// routine-selection controls and the hard unlink boundary are named instead of adding a new
-    /// setting.
     static let tooltip = """
-    Status updates for these sessions are always attached to this agent’s next turn. Turning this on \
-    additionally lets RepoPrompt start one follow-up turn for a routine status update or overflow \
-    summary: a busy agent finishes its current and already-accepted work first. A follow-up turn can \
-    create another update or attention request, so follow-ups can continue; one oversight link can \
-    sustain a feedback loop, and sessions that oversee each other can keep waking one another. An \
-    explicit attention request from an exactly linked session can bypass this master switch, its own \
-    lane toggle, and that lane’s status Auto-wake snooze without changing any of them. Admission for \
-    routine status and overflow remains governed by selection and snooze. To stop those routine wakes, \
-    switch off and deselect or snooze the lane. To prevent purposeful attention from that link, \
-    unlink it; revocation and all other safety and admission gates still apply. The setting applies \
-    to this session rather than to individual links. On by default, and saved with this session even \
-    when it oversees nothing.
+    When on, updates from every lane can start a turn for this agent, no more often than the limit \
+    below. When off, only lanes you select individually can; other updates wait for its next turn. \
+    A lane that asks for attention wakes it either way.
     """
-    static let accessibilityLabel = "Auto-wake on all updates"
+    static let accessibilityLabel = "Auto-wake on overseen lane updates"
     static let accessibilityHint = """
-    Controls follow-up turns for selected linked sessions’ routine status and overflow updates. \
-    Explicit attention requests can bypass this master switch, their lane toggle, and their exact \
-    lane’s snooze without changing them; status updates are attached to your own next turn either \
-    way. Unlink revokes attention, and all other safety and admission gates still apply
+    Lets updates from every lane start turns for this agent; when off, only individually selected lanes \
+    can. Attention requests wake it either way.
     """
     static let unavailableMessage = "That Agent session is no longer active."
     static let loadingReason = "This Agent session is still loading."
@@ -446,7 +426,7 @@ struct AgentMonitorPendingUpdates: Equatable {
 }
 
 enum AgentMonitorPeriodicWakeCopy {
-    static let label = "Wake when idle for"
+    static let label = "Wake after being idle for:"
     static let intervalLabel = "Periodic wake interval"
     static let tooltip = """
     While overseeing another session, wake after this much idle time, even without updates. \
@@ -460,16 +440,14 @@ enum AgentMonitorPeriodicWakeCopy {
 
 /// Pure routine-interval formatting; the coordinator decides whether a countdown is truthful.
 enum AgentMonitorRoutineWakeCopy {
-    static let limitLabel = "Routine wake-ups no more often than"
-    static let intervalLabel = "Minimum interval"
+    static let limitLabel = "No more often than:"
+    static let intervalLabel = "No more often than"
+    static let noDelayLabel = "No delay"
     static let tooltip = """
-    Applies across every session this observer oversees, and counts from the last oversight wake \
-    rather than from a fixed schedule. Explicit attention requests and Wake now bypass it without \
-    changing it. Nothing is dropped or acknowledged: deferred updates stay queued and still ride \
-    along on this agent’s own next turn.
+    Updates can start a turn at most this often, counted from the last wake and across all lanes. \
+    Updates that arrive in between join the next turn. Attention requests and Wake now skip the limit.
     """
-    static let accessibilityLabel = "Limit routine wake-ups"
-    static let intervalAccessibilityLabel = "Minimum interval between routine wake-ups"
+    static let intervalAccessibilityLabel = "Minimum delay between routine update wake-ups"
 
     static func optionLabel(seconds: Int) -> String {
         seconds < 60 ? "\(seconds) sec" : "\(seconds / 60) min"
@@ -488,8 +466,7 @@ enum AgentMonitorRoutineWakeCopy {
     }
 
     static let countdownTooltip = """
-    The earliest a routine update may start a follow-up turn, not a promised call. It still depends \
-    on the update still being pending and on every other admission gate.
+    Time until updates can start a turn again. No turn starts unless an update is waiting.
     """
 }
 
@@ -502,8 +479,8 @@ enum AgentMonitorPendingUpdatesCopy {
     static let overflowOnly = "Additional changes pending"
     static let overflowNote = "Additional changes not itemized"
     static let wakeNowTooltip = """
-    Processes the pending updates in one turn now. It bypasses the routine interval and this \
-    session’s selection and snooze choices for this one turn without changing any of them.
+    Starts one turn now with all pending updates. It ignores the limit, lane selection and snoozes \
+    for this one turn, without changing them.
     """
     static let attentionItem = "Attention requested"
 
@@ -606,9 +583,7 @@ enum AgentMonitorAutoWakeSnoozeCopy {
 
     /// The one informational — not failed — outcome a set or extension can report.
     static let currentDispatchAlreadyStarted = """
-    Current Auto-wake already started. This snooze applies only to later routine status and overflow \
-    wakes; explicit attention requests can bypass this snooze and routine selection without changing \
-    either.
+    A turn has already started, so the snooze applies to later updates. An attention request still wakes this agent.
     """
 
     static let unavailableMessage = "That oversight link is no longer active."
@@ -634,19 +609,12 @@ enum AgentMonitorAutoWakeSnoozeCopy {
     /// of every intermediate change — and a lane that ends where it started leaves nothing at all.
     /// “Collected” reads as an exhaustive history the reducer has never kept.
     static let menuTooltip = """
-    Stops this session\u{2019}s routine status and overflow updates from starting an automatic \
-    follow-up turn for a while. Status stays coalesced into the pending summary and still rides along \
-    with your next turn. An explicit attention request can bypass this snooze, the master switch, and \
-    this lane\u{2019}s toggle without changing any of them. Admission for routine status and overflow \
-    remains governed by selection and snooze. To prevent further attention from this link, unlink it. \
-    Clearing or expiry only lets RepoPrompt re-evaluate \u{2014} it never forces a turn.
+    Stops this lane’s updates from starting turns for a while. They still join this agent’s next turn, \
+    and an attention request still wakes it.
     """
 
     static let accessibilityHint = """
-    Pauses routine status and overflow wakes only. An explicit attention request can bypass this \
-    snooze, the master switch, and this lane\u{2019}s toggle without changing them. Admission for \
-    routine status and overflow remains governed by selection and snooze. Unlink prevents further \
-    attention from this link; all other safety and admission gates still apply.
+    Pauses turns started by this lane’s updates. An attention request still wakes this agent.
     """
 
     /// Who set the current deadline, phrased for the row rather than for the wire.

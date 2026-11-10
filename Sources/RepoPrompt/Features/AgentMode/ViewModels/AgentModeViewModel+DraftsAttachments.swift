@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 @MainActor
 extension AgentModeViewModel {
@@ -11,45 +12,13 @@ extension AgentModeViewModel {
         strategy: AgentModeRunService.DraftRestorationStrategy,
         operation: AgentComposerDraftRestorationOperation? = nil
     ) {
-        // Compose against the session-owned draft now. The per-tab ledger retains
-        // fragments until that tab's composer applies them or loads this snapshot.
-        let eventID = UUID()
-        let restoredText: String
-        let restoredStrategy: AgentModeRunService.DraftRestorationStrategy
-        let baseOperation: AgentComposerDraftRestorationOperation?
-        if case .prependAlways = strategy, operation == nil {
-            let existingDraft = retrieveDraftText(for: tabID)
-            restoredText = AgentComposerDraftRestorationReducer.compose(restoredText: text, above: existingDraft)
-            restoredStrategy = .replaceAlways
-            baseOperation = AgentComposerDraftRestorationOperation(
-                rejectedDraftText: text,
-                draftTextBeforeRestoration: existingDraft,
-                composedDraftText: restoredText,
-                fragments: []
-            )
-        } else {
-            restoredText = text
-            restoredStrategy = strategy
-            baseOperation = operation
+        let hadRuntime = sessions[tabID] != nil
+        let previousText = draftRuntime.text(for: tabID)
+        let event = draftRuntime.restore(tabID: tabID, text: text, message: message, strategy: strategy, operation: operation)
+        if !hadRuntime {
+            publishDraftTextChange(tabID: tabID, previousText: previousText, session: nil)
+            publishDraftRestoration(event)
         }
-        let restoredOperation = baseOperation.map { operation in
-            AgentComposerDraftRestorationOperation(
-                rejectedDraftText: operation.rejectedDraftText,
-                draftTextBeforeRestoration: operation.draftTextBeforeRestoration,
-                composedDraftText: operation.composedDraftText,
-                fragments: draftRestorationLedger.append(tabID: tabID, text: operation.rejectedDraftText)
-            )
-        }
-        writeDraftText(for: tabID, restoredText)
-        draftRestorationEvent = DraftRestorationEvent(
-            id: eventID,
-            tabID: tabID,
-            text: restoredText,
-            message: message,
-            strategy: restoredStrategy,
-            operation: restoredOperation
-        )
-        syncComposerUIState()
     }
 
     /// Restores the full composer state for a manual submission that was
@@ -146,61 +115,40 @@ extension AgentModeViewModel {
         userItemID: UUID,
         message: String
     ) -> Bool {
-        let tabID = session.tabID
-        guard sessions[tabID] === session,
-              let index = session.items.firstIndex(where: { $0.id == userItemID })
-        else { return false }
-        let item = session.items[index]
-        guard item.kind == .user,
-              session.items[(index + 1)...].allSatisfy({ $0.kind == .error }),
-              !item.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              item.attachments.isEmpty,
-              item.taggedFileAttachments.isEmpty,
-              item.workflow == nil,
-              item.crossSessionAttribution == nil,
-              retrieveDraftText(for: tabID).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else { return false }
-        guard session.removeItem(at: index) != nil else { return false }
-        session.pendingTurnRuntimeAnchors.removeAll { $0.userItemID == userItemID }
-        session.isDirty = true
-        restoreComposerDraft(tabID: tabID, text: item.text, message: message, strategy: .prependAlways)
-        requestUIRefresh(tabID: tabID, urgent: true)
-        scheduleSave(for: tabID)
-        return true
+        _ = persistenceRuntime
+        return draftRuntime.restoreRouteRefusedUnsentTurn(session: session, userItemID: userItemID, message: message)
     }
 
     /// Store an editor draft. Only the caller's applied sequence is acknowledged;
     /// still-pending fragments are composed into storage so a tab switch cannot
     /// overwrite a recovery that has not reached the editor yet.
     func storeDraftText(for tabID: UUID, _ text: String, acknowledgingThrough sequence: UInt64 = 0) {
-        draftRestorationLedger.acknowledge(tabID: tabID, through: sequence)
-        let pending = draftRestorationLedger.tabs[tabID]?.pendingFragments ?? []
-        let storedText = pending.reduce(text) { result, fragment in
-            AgentComposerDraftRestorationReducer.compose(restoredText: fragment.text, above: result)
+        let hadRuntime = sessions[tabID] != nil
+        let previousText = draftRuntime.text(for: tabID)
+        draftRuntime.store(tabID: tabID, text: text, acknowledgingThrough: sequence)
+        if !hadRuntime {
+            publishDraftTextChange(tabID: tabID, previousText: previousText, session: nil)
         }
-        let storedSequence = pending.last?.sequence ?? sequence
-        draftRestorationLedger.markStoredDraft(tabID: tabID, through: storedSequence)
-        writeDraftText(for: tabID, storedText)
     }
 
     /// Loading the stored text acknowledges exactly the fragments included in it.
     func loadDraftSnapshotForComposer(for tabID: UUID) -> AgentComposerDraftSnapshot {
-        let snapshot = AgentComposerDraftSnapshot(
-            text: retrieveDraftText(for: tabID),
-            restorationSequence: draftRestorationLedger.tabs[tabID]?.storedDraftSequence ?? 0
-        )
-        draftRestorationLedger.acknowledge(tabID: tabID, through: snapshot.restorationSequence)
-        return snapshot
+        draftRuntime.loadSnapshot(tabID: tabID)
     }
 
-    private func writeDraftText(for tabID: UUID, _ text: String) {
-        let previousStagedSlashCommand = stagedSlashCommandProps(tabID: tabID)
+    func publishDraftRestoration(_ event: AgentComposerDraftRestorationEvent) {
+        draftRestorationEvent = event
+        syncComposerUIState()
+    }
+
+    func publishDraftTextChange(tabID: UUID, previousText: String, session: TabSession?) {
+        let text = draftRuntime.text(for: tabID)
+        let previousStagedSlashCommand = stagedSlashCommandProps(tabID: tabID, draftTextOverride: previousText)
         if !repromptUIStore.hasCancelledDraft(tabID: tabID, text: text) {
             repromptUIStore.clearCancelledDraft(tabID: tabID)
         }
-        if let session = session(for: tabID, createIfNeeded: false) {
-            guard session.draftText != text else { return }
-            session.draftText = text
+        if let session {
+            guard previousText != text else { return }
             if let operation = repromptOperations[tabID] {
                 operation.noteUserMutation(text: text, generation: session.draftMutationGeneration)
             } else if var recovery = repromptUIStore.recoveries[tabID], recovery.bypassesPreparation,
@@ -211,13 +159,6 @@ extension AgentModeViewModel {
                 recovery.bypassesPreparation = false
                 recovery.requiresDecision = false
                 repromptUIStore.recoveries[tabID] = recovery
-            }
-        } else {
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty {
-                tabDraftText.removeValue(forKey: tabID)
-            } else {
-                tabDraftText[tabID] = text
             }
         }
         invalidateRepromptIfNeeded()
@@ -230,10 +171,7 @@ extension AgentModeViewModel {
 
     /// Retrieve draft text for a tab
     func retrieveDraftText(for tabID: UUID) -> String {
-        if let session = session(for: tabID, createIfNeeded: false) {
-            return session.draftText
-        }
-        return tabDraftText[tabID] ?? ""
+        draftRuntime.text(for: tabID)
     }
 
     func stagedSlashCommandProps(
@@ -590,6 +528,23 @@ extension AgentModeViewModel {
         attachmentWorkspaceDirectoryProvider()?.standardizedFileURL
     }
 
+    func attachmentLocation(for session: TabSession) -> AgentSessionAttachmentLocation? {
+        guard let directory = attachmentWorkspaceDirectoryURL() else { return nil }
+        if let sessionAttachmentsRootOverride {
+            return .init(workspaceDirectory: directory, retainedRoot: sessionAttachmentsRootOverride()?.standardizedFileURL)
+        }
+        let workspace: WorkspaceModel?
+        if let workspaceID = session.persistentSessionBindingIdentity?.workspaceID {
+            guard let bound = workspaceManager?.workspace(withID: workspaceID) else {
+                return .init(workspaceDirectory: directory, retainedRoot: nil)
+            }
+            workspace = bound
+        } else {
+            workspace = workspaceManager?.activeWorkspace
+        }
+        return .init(workspaceDirectory: directory, retainedRoot: sessionAttachmentsRootURL(for: workspace))
+    }
+
     // MARK: - Session Attachment Retention
 
     /// `<workspace>/AgentSessions/attachments` for `workspace` (the active workspace when `nil`), or
@@ -598,152 +553,22 @@ extension AgentModeViewModel {
         if let sessionAttachmentsRootOverride {
             return sessionAttachmentsRootOverride()?.standardizedFileURL
         }
-        guard !attachmentPersistenceIsSuppressed(),
-              let workspace = workspace ?? workspaceManager?.activeWorkspace
-        else { return nil }
-        let agentSessionsFolder = WorkspaceSessionSidecarMigration
-            .workspaceDirectory(for: workspace, root: AgentSessionDataService.defaultWorkspaceRootURL())
-            .appendingPathComponent("AgentSessions", isDirectory: true)
-        return AgentSessionAttachmentStore.rootURL(forAgentSessionsFolder: agentSessionsFolder)
+        return AgentSessionStorageInputs.retainedAttachmentsRoot(
+            workspace: workspace ?? workspaceManager?.activeWorkspace,
+            isSuppressed: attachmentPersistenceIsSuppressed()
+        )
     }
 
-    /// Finished turns keep their images for the life of the session: the temporary copies are
-    /// moved into `AgentSessions/attachments/<sessionID>/` off the main thread, then the user row is
-    /// rewritten to the kept copy. Providers already consumed the temporary path, so their
-    /// behaviour is unchanged.
-    ///
-    /// The destination is the root captured when the turn reserved its images, never the window's
-    /// current workspace. A session that is not persisted, has no captured root, or is no longer the
-    /// live owner of its tab (for example torn down by a workspace switch) deletes the copies as
-    /// before. A session that stops being live mid-move keeps its files; the user row's dead
-    /// temporary path is repaired from the kept copy the next time the session hydrates.
-    private func retainConsumedAttachmentFiles(_ attachments: [AgentFileAttachment], session: TabSession) {
-        guard clearConsumedAttachmentsAfterProviderConsumption else { return }
-        guard !attachments.isEmpty else { return }
-        guard let workspaceDirectory = attachmentWorkspaceDirectoryURL() else { return }
-        guard let sessionID = session.activeAgentSessionID,
-              let root = session.attachmentRetentionRoot,
-              sessions[session.tabID] === session
-        else {
-            attachmentStore.clearConsumedLocalFiles(attachments, workspaceDirectory: workspaceDirectory)
-            invalidateAttachmentPreviews(paths: attachments.compactMap(AgentImageAttachmentAvailabilityResolver.path(for:)))
-            return
-        }
-        let store = AgentSessionAttachmentStore(rootURL: root, limits: sessionAttachmentLimits)
-        let token = UUID()
-        attachmentRetentionTasks[token] = Task { @MainActor [weak self, weak session] in
-            let result = await AgentSessionDataService.shared.retainConsumedAttachments(
-                attachments, sessionID: sessionID, store: store, workspaceDirectory: workspaceDirectory
-            )
-            guard let self else { return }
-            attachmentRetentionTasks[token] = nil
-            let movedPaths = attachments
-                .filter { result.retained[$0.id] != nil }
-                .compactMap(AgentImageAttachmentAvailabilityResolver.path(for:))
-            invalidateAttachmentPreviews(paths: movedPaths + result.evictedPaths)
-            guard let session else { return }
-            applyRetainedAttachments(result.retained, to: session, sessionID: sessionID)
-        }
-    }
-
-    /// Paths whose file just moved or was evicted render as missing instead of a stale cached image.
-    private func invalidateAttachmentPreviews(paths: [String]) {
-        guard !paths.isEmpty else { return }
-        AttachmentTilePreviewCache.shared.retainedImages.invalidate(paths: paths)
-    }
-
-    /// Repairs user rows whose image path no longer exists by locating the session's kept copy
-    /// (`attachments/<sessionID>/<attachmentID>.*`) in the current workspace's storage. Covers a
-    /// rewrite lost because the session stopped being live mid-move, and storage that moved.
     func repairRetainedAttachmentPathsAfterHydration(_ session: TabSession, sessionID: UUID) {
-        guard clearConsumedAttachmentsAfterProviderConsumption,
-              let root = sessionAttachmentsRootURL()
-        else { return }
-        // Compacted requests remain canonical after they leave the working item suffix. Let the
-        // store coalesce repairs by ID after checking each path: a live working copy must not hide
-        // a dead path for the same attachment in an older canonical request.
-        let attachments = session.items.filter { $0.kind == .user }.flatMap(\.attachments)
-            + session.transcript.turns.compactMap(\.request).flatMap(\.attachments)
-        guard attachments.contains(where: {
-            if case .localFile = $0.source {
-                true
-            } else {
-                false
-            }
-        }) else { return }
-        let store = AgentSessionAttachmentStore(rootURL: root, limits: sessionAttachmentLimits)
-        let token = UUID()
-        attachmentRetentionTasks[token] = Task { @MainActor [weak self, weak session] in
-            let repaired = await Task.detached(priority: .utility) {
-                store.repairMissingPaths(attachments, sessionID: sessionID)
-            }.value
-            guard let self else { return }
-            attachmentRetentionTasks[token] = nil
-            guard let session, !repaired.isEmpty else { return }
-            applyRetainedAttachments(repaired, to: session, sessionID: sessionID)
-        }
+        attachmentRuntime.repairRetainedAttachmentPathsAfterHydration(session, sessionID: sessionID)
     }
 
-    /// Repairs canonical requests and their working copies without replacing row-owned metadata.
     func applyRetainedAttachments(_ retained: [UUID: AgentFileAttachment], to session: TabSession, sessionID: UUID) {
-        guard !retained.isEmpty, session.activeAgentSessionID == sessionID,
-              sessions[session.tabID] === session
-        else { return }
-        func repaired(_ attachments: [AgentFileAttachment]) -> [AgentFileAttachment] {
-            attachments.map { attachment in
-                guard let kept = retained[attachment.id] else { return attachment }
-                return AgentFileAttachment(
-                    id: attachment.id,
-                    source: kept.source,
-                    title: attachment.title,
-                    createdAt: attachment.createdAt,
-                    kind: attachment.kind,
-                    fileName: attachment.fileName,
-                    byteCount: attachment.byteCount
-                )
-            }
-        }
-
-        let canonicalRequestsChanged = session.transcript.turns.contains { turn in
-            guard let request = turn.request else { return false }
-            return repaired(request.attachments) != request.attachments
-        }
-        let workingRowsChanged = session.items.contains { item in
-            item.kind == .user && repaired(item.attachments) != item.attachments
-        }
-        guard workingRowsChanged || canonicalRequestsChanged else { return }
-
-        session.mutateItemsBatch(touchActivity: false) { items in
-            for index in items.indices where items[index].kind == .user {
-                items[index].attachments = repaired(items[index].attachments)
-            }
-        }
-        if !canReuseDerivedTranscriptForSave(
-            for: session,
-            projectionProtection: transcriptProjectionProtection(for: session)
-        ) {
-            // Drain pending working-row mutations before committing canonical-only repairs.
-            refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
-        }
-        var transcript = session.transcript
-        for index in transcript.turns.indices {
-            guard var request = transcript.turns[index].request else { continue }
-            request.attachments = repaired(request.attachments)
-            transcript.turns[index].request = request
-        }
-        if transcript != session.transcript {
-            applyTranscriptPresentation(transcript, to: session)
-        }
-        session.isDirty = true
-        scheduleSave(for: session)
-        requestUIRefresh(tabID: session.tabID)
+        attachmentRuntime.applyRetainedAttachments(retained, to: session, sessionID: sessionID)
     }
 
-    /// Awaits in-flight turn-end moves (tests and orderly teardown).
     func waitForAttachmentRetention() async {
-        while let task = attachmentRetentionTasks.values.first {
-            await task.value
-        }
+        await attachmentRuntime.waitForRetention()
     }
 
     /// Low-priority, once-per-process sweep of a workspace's attachment storage: session folders
@@ -774,36 +599,9 @@ extension AgentModeViewModel {
         }
     }
 
-    /// Live sessions and every attachment still pending, reserved, or in flight across windows.
+    /// Includes window-free runtime scopes and admitted retention operations after turn cleanup.
     func liveAttachmentSweepProtection() -> (sessionIDs: Set<UUID>, temporaryPaths: Set<String>) {
-        // Resolve the app-owned registry now, after the sweep delay, rather than retaining a stale
-        // window snapshot. The current runtime also participates when it is not registered.
-        var viewModels = attachmentSweepViewModels()
-        if !viewModels.contains(where: { $0 === self }) {
-            viewModels.append(self)
-        }
-        var sessionIDs: Set<UUID> = []
-        var paths: Set<String> = []
-        for viewModel in viewModels {
-            for session in viewModel.sessions.values {
-                if let sessionID = session.activeAgentSessionID {
-                    sessionIDs.insert(sessionID)
-                }
-                var attachments = session.pendingFileAttachments + session.attachmentsPendingProviderConsumptionCleanup
-                switch session.attachmentTurnState {
-                case .idle:
-                    break
-                case let .reserved(_, turnAttachments), let .consumed(_, turnAttachments):
-                    attachments.append(contentsOf: turnAttachments)
-                }
-                for attachment in attachments {
-                    if let path = AgentImageAttachmentAvailabilityResolver.path(for: attachment) {
-                        paths.insert(path)
-                    }
-                }
-            }
-        }
-        return (sessionIDs, paths)
+        AgentSessionRuntimeStore.shared.attachmentSweepProtection()
     }
 
     /// Local image files this tab's Agent session attached itself — the in-flight turn plus any
@@ -850,98 +648,23 @@ extension AgentModeViewModel {
 
     @discardableResult
     func reserveAttachmentsForTurn(_ attachments: [AgentFileAttachment], session: TabSession) -> UUID? {
-        guard !attachments.isEmpty else {
-            session.attachmentTurnState = .idle
-            return nil
-        }
-        let reservationID = UUID()
-        session.attachmentTurnState = .reserved(reservationID: reservationID, attachments: attachments)
-        session.attachmentRetentionRoot = sessionAttachmentsRootURL()
-        return reservationID
+        attachmentRuntime.reserveAttachmentsForTurn(attachments, session: session)
     }
 
     func markAttachmentsConsumed(for session: TabSession, reservationID: UUID?) {
-        switch session.attachmentTurnState {
-        case .idle:
-            return
-        case let .reserved(storedID, attachments):
-            if let reservationID, reservationID != storedID {
-                return
-            }
-            session.attachmentTurnState = .consumed(reservationID: storedID, attachments: attachments)
-        case let .consumed(storedID, _):
-            if let reservationID, reservationID != storedID {
-                return
-            }
-            return
-        }
+        attachmentRuntime.markAttachmentsConsumed(for: session, reservationID: reservationID)
     }
 
     func stageConsumedAttachmentFilesForDeferredCleanup(_ attachments: [AgentFileAttachment], session: TabSession) {
-        guard clearConsumedAttachmentsAfterProviderConsumption else { return }
-        guard !attachments.isEmpty else { return }
-        if session.attachmentsPendingProviderConsumptionCleanup.isEmpty {
-            session.attachmentsPendingProviderConsumptionCleanup = attachments
-            return
-        }
-        let existingIDs = Set(session.attachmentsPendingProviderConsumptionCleanup.map(\.id))
-        let uniqueNewAttachments = attachments.filter { !existingIDs.contains($0.id) }
-        session.attachmentsPendingProviderConsumptionCleanup.append(contentsOf: uniqueNewAttachments)
+        attachmentRuntime.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session: session)
     }
 
     func consumeDeferredAttachmentCleanup(for session: TabSession, shouldDeleteFiles: Bool) {
-        let attachments = session.attachmentsPendingProviderConsumptionCleanup
-        session.attachmentsPendingProviderConsumptionCleanup.removeAll()
-        guard shouldDeleteFiles else { return }
-        retainConsumedAttachmentFiles(attachments, session: session)
+        attachmentRuntime.consumeDeferredAttachmentCleanup(for: session, shouldDeleteFiles: shouldDeleteFiles)
     }
 
-    func finalizeAttachmentsForTurn(
-        for session: TabSession,
-        reservationID: UUID? = nil,
-        disposition: AttachmentTurnDisposition
-    ) {
-        let attachments: [AgentFileAttachment]
-        switch session.attachmentTurnState {
-        case .idle:
-            if disposition == .deleteFiles {
-                consumeDeferredAttachmentCleanup(for: session, shouldDeleteFiles: true)
-            } else {
-                consumeDeferredAttachmentCleanup(for: session, shouldDeleteFiles: false)
-            }
-            session.attachmentRetentionRoot = nil
-            return
-        case let .reserved(storedID, storedAttachments),
-             let .consumed(storedID, storedAttachments):
-            if let reservationID, reservationID != storedID {
-                return
-            }
-            attachments = storedAttachments
-        }
-
-        switch disposition {
-        case .restoreToPending:
-            let existingIDs = Set(session.pendingFileAttachments.map(\.id))
-            let unique = attachments.filter { !existingIDs.contains($0.id) }
-            if !unique.isEmpty {
-                session.pendingFileAttachments = unique + session.pendingFileAttachments
-                session.isDirty = true
-            }
-            consumeDeferredAttachmentCleanup(for: session, shouldDeleteFiles: false)
-        case .deleteFiles:
-            let hadDeferred = !session.attachmentsPendingProviderConsumptionCleanup.isEmpty
-            consumeDeferredAttachmentCleanup(for: session, shouldDeleteFiles: true)
-            if !hadDeferred {
-                retainConsumedAttachmentFiles(attachments, session: session)
-            }
-        case .keepFiles:
-            consumeDeferredAttachmentCleanup(for: session, shouldDeleteFiles: false)
-        }
-
-        session.attachmentTurnState = .idle
-        session.attachmentRetentionRoot = nil
-        session.isDirty = true
-        scheduleSave(for: session.tabID)
+    func finalizeAttachmentsForTurn(for session: TabSession, reservationID: UUID? = nil, disposition: AttachmentTurnDisposition) {
+        attachmentRuntime.finalizeAttachmentsForTurn(for: session, reservationID: reservationID, disposition: disposition)
     }
 }
 

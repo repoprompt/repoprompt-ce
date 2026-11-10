@@ -1,9 +1,86 @@
 import Foundation
 import MCP
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+@testable import RepoPromptMCPServer
 import RepoPromptSettingsCore
+@testable import RepoPromptWorkspaceContext
 import XCTest
+
+@MainActor
+final class MCPRunRouteBindingsTests: XCTestCase {
+    func testStandaloneMappingRejectsReplacementAcrossRunWindowAndTab() {
+        let lifetime = MCPRunRouteBindings.OwnerLifetime()
+        defer { withExtendedLifetime(lifetime) {} }
+        let routes = MCPRunRouteBindings(ownerLifetime: lifetime)
+        let runID = UUID(), first = UUID(), replacement = UUID(), tabID = UUID()
+        XCTAssertEqual(routes.register(connectionID: first, runID: runID, windowID: 41), .registered(displacedConnectionID: nil))
+        routes.tabContextByConnectionID[first] = context(runID: runID, tabID: tabID)
+        XCTAssertTrue(routes.hasCurrentMapping(runID: runID, connectionID: first, expectedTabID: tabID))
+        XCTAssertFalse(routes.hasCurrentMapping(runID: runID, connectionID: first, expectedTabID: UUID()))
+        XCTAssertEqual(routes.register(connectionID: replacement, runID: runID, windowID: 42), .refusedWindow(41))
+        let otherRun = UUID()
+        XCTAssertEqual(routes.register(connectionID: first, runID: otherRun, windowID: 41), .refusedBoundRun(runID))
+        XCTAssertEqual(routes.register(connectionID: replacement, runID: runID, windowID: 41), .registered(displacedConnectionID: first))
+        XCTAssertFalse(routes.hasCurrentMapping(runID: runID, connectionID: first, expectedTabID: tabID))
+        XCTAssertFalse(routes.hasCurrentMapping(runID: runID, connectionID: replacement, expectedTabID: tabID), "A mapping without its exact context is insufficient")
+        routes.tabContextByConnectionID[replacement] = context(runID: runID, tabID: tabID)
+        XCTAssertTrue(routes.hasCurrentMapping(runID: runID, connectionID: replacement, expectedTabID: tabID))
+        routes.connectionIDToRunID[replacement] = otherRun
+        XCTAssertFalse(routes.hasCurrentMapping(runID: runID, connectionID: replacement, expectedTabID: tabID), "Both mapping directions remain required")
+    }
+
+    func testPendingReplacementRestoresCommittedPredecessorButNeverPendingPredecessor() throws {
+        let lifetime = MCPRunRouteBindings.OwnerLifetime()
+        defer { withExtendedLifetime(lifetime) {} }
+        let routes = MCPRunRouteBindings(ownerLifetime: lifetime)
+        let runID = UUID(), committed = UUID(), replacement = UUID()
+        _ = routes.register(connectionID: committed, runID: runID, windowID: 41)
+        let token = try XCTUnwrap(routes.beginPendingPolicy(connectionID: replacement, runID: runID, windowID: 41))
+        XCTAssertTrue(routes.isCurrent(token))
+        XCTAssertNil(routes.connectionIDToRunID[committed])
+        XCTAssertTrue(routes.rollback(token, removingContext: {}))
+        XCTAssertTrue(routes.hasCurrentMapping(runID: runID, connectionID: committed))
+        XCTAssertNil(routes.connectionIDToRunID[replacement])
+
+        let pending = try XCTUnwrap(routes.beginPendingPolicy(connectionID: replacement, runID: runID, windowID: 41))
+        let successor = try XCTUnwrap(routes.beginPendingPolicy(connectionID: UUID(), runID: runID, windowID: 41))
+        XCTAssertFalse(routes.isCurrent(pending), "A displaced token cannot begin rollback")
+        XCTAssertTrue(routes.isCurrent(successor))
+        var staleCleanupRan = false
+        XCTAssertFalse(routes.rollback(pending) { staleCleanupRan = true })
+        XCTAssertFalse(staleCleanupRan)
+        XCTAssertTrue(routes.isCurrent(successor))
+        XCTAssertTrue(routes.rollback(successor, removingContext: {}))
+        XCTAssertFalse(routes.hasCurrentMapping(runID: runID, connectionID: replacement), "Rollback must not resurrect a displaced pending policy")
+        XCTAssertNil(routes.connectionIDByRunID[runID])
+    }
+
+    func testRuntimeRetainsSameMappingStorageWithoutPresentation() throws {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        var lifetime: MCPRunRouteBindings.OwnerLifetime? = .init()
+        var routes: MCPRunRouteBindings? = try MCPRunRouteBindings(ownerLifetime: XCTUnwrap(lifetime))
+        weak let retainedRoutes = routes
+        try scope.mcp.installRunRoute(id: 41, bindings: XCTUnwrap(routes))
+        let runID = UUID(), connectionID = UUID()
+        _ = try XCTUnwrap(routes).register(connectionID: connectionID, runID: runID, windowID: 41)
+        routes = nil
+        let retained = try XCTUnwrap(retainedRoutes, "A runtime route must not disappear with its presenter")
+        XCTAssertTrue(retained.hasCurrentMapping(runID: runID, connectionID: connectionID))
+        retained.connectionIDByRunID.removeValue(forKey: runID)
+        XCTAssertFalse(retained.hasCurrentMapping(runID: runID, connectionID: connectionID), "Transport cleanup mutates the retained storage, not a copied snapshot")
+        _ = retained.register(connectionID: connectionID, runID: runID, windowID: 41)
+        XCTAssertTrue(retained.hasCurrentMapping(runID: runID, connectionID: connectionID))
+        lifetime = nil
+        XCTAssertFalse(retained.hasCurrentMapping(runID: runID, connectionID: connectionID), "Retained maps must refuse dispatch when their routing composition has gone away")
+        XCTAssertEqual(retained.connectionIDByRunID[runID], connectionID, "Refusal does not pretend to perform domain cleanup")
+    }
+
+    private func context(runID: UUID, tabID: UUID) -> MCPTabContextSnapshot {
+        .init(tabID: tabID, windowID: 41, workspaceID: UUID(), promptText: "", selection: .init(), selectedMetaPromptIDs: [], tabName: "Runtime", runID: runID, explicitlyBound: true)
+    }
+}
 
 @MainActor
 final class ContextBuilderSelectionTransactionTests: XCTestCase {

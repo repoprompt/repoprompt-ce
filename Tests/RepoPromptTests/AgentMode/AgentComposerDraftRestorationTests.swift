@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentProviderContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import UniformTypeIdentifiers
@@ -186,6 +187,151 @@ final class AgentComposerDraftRestorationTests: XCTestCase {
         )
         XCTAssertEqual(viewModel.retrieveDraftText(for: tabID), "C\nB")
         XCTAssertTrue(viewModel.draftRestorationLedger.tabs[tabID]?.pendingFragments.isEmpty == true)
+    }
+
+    func testRuntimeRecoveryWithoutPresentationPreservesUnacknowledgedFragments() throws {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        scope.replaceSessions([session.tabID: session])
+        scope.drafts.store(tabID: session.tabID, text: "new typing")
+        let hooks = scope.drafts.makeRunHooks()
+        hooks.restoreDraftText(session, "first", "Stopped", .prependAlways)
+        hooks.restoreDraftText(session, "second", "Stopped", .prependAlways)
+        XCTAssertEqual(session.draftText, "second\nfirst\nnew typing")
+
+        // An editor that has not received either event cannot overwrite recovered work.
+        scope.drafts.store(tabID: session.tabID, text: "new typing")
+        let snapshot = scope.drafts.loadSnapshot(tabID: session.tabID)
+        XCTAssertEqual(snapshot.text, "second\nfirst\nnew typing")
+        XCTAssertEqual(snapshot.restorationSequence, 2)
+        XCTAssertTrue(try XCTUnwrap(scope.drafts.ledger.tabs[session.tabID]).pendingFragments.isEmpty)
+        scope.drafts.store(tabID: session.tabID, text: "edited", acknowledgingThrough: snapshot.restorationSequence)
+        XCTAssertEqual(session.draftText, "edited")
+    }
+
+    func testRuntimeRecoveryRejectsRecycledObjectButContinuesAfterPresentationDetaches() {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let original = AgentTabSession(tabID: UUID())
+        scope.replaceSessions([original.tabID: original])
+        var delivered = 0
+        let attachment = scope.presentation.attach(original, sink: .init(
+            activityChanged: { _, _ in }, refresh: { _, _, _ in }, turnComplete: { _ in }, turnFailed: { _, _ in },
+            draftRestored: { _, _ in delivered += 1 }
+        ))
+        let hooks = scope.drafts.makeRunHooks()
+        scope.presentation.detach(attachment)
+        hooks.restoreDraftText(original, "retained without UI", "Stopped", .prependAlways)
+        XCTAssertEqual(original.draftText, "retained without UI")
+        XCTAssertEqual(delivered, 0)
+        let sequence = scope.drafts.ledger.tabs[original.tabID]?.storedDraftSequence
+
+        let replacement = AgentTabSession(tabID: original.tabID)
+        replacement.draftText = "successor typing"
+        scope.replaceSessions([replacement.tabID: replacement])
+        hooks.restoreDraftText(original, "late old work", "Stopped", .prependAlways)
+        XCTAssertEqual(replacement.draftText, "successor typing")
+        XCTAssertEqual(original.draftText, "retained without UI")
+        XCTAssertEqual(scope.drafts.ledger.tabs[original.tabID]?.storedDraftSequence, sequence)
+    }
+
+    func testRestorationEventCannotCrossAReentrantPresentationReplacement() {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let original = AgentTabSession(tabID: UUID())
+        let replacement = AgentTabSession(tabID: original.tabID)
+        replacement.draftText = "replacement typing"
+        scope.replaceSessions([original.tabID: original])
+        var restoredEvents = 0
+        _ = scope.presentation.attach(original, sink: .init(
+            activityChanged: { _, _ in }, refresh: { _, _, _ in }, turnComplete: { _ in }, turnFailed: { _, _ in },
+            draftChanged: { [weak scope] _, _ in
+                scope?.replaceSessions([replacement.tabID: replacement])
+            },
+            draftRestored: { _, _ in restoredEvents += 1 }
+        ))
+        _ = scope.presentation.attach(replacement, sink: .init(
+            activityChanged: { _, _ in }, refresh: { _, _, _ in }, turnComplete: { _ in }, turnFailed: { _, _ in },
+            draftRestored: { _, _ in restoredEvents += 1 }
+        ))
+        scope.drafts.makeRunHooks().restoreDraftText(original, "originating work", "Stopped", .prependAlways)
+        XCTAssertEqual(original.draftText, "originating work")
+        XCTAssertEqual(replacement.draftText, "replacement typing")
+        XCTAssertEqual(restoredEvents, 0, "Neither detached nor replacement presentation receives the old event")
+    }
+
+    func testRuntimeRecoveryAfterStashDetachesTheObjectPreservesPendingTabDraft() {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        scope.replaceSessions([session.tabID: session])
+        let hooks = scope.drafts.makeRunHooks()
+        // The real compose-tab removal path detaches before joining cancellation;
+        // stash keeps the recovered pending draft for the next composer attachment.
+        scope.replaceSessions([:])
+        hooks.restoreDraftText(session, "queued before stash", "Stopped", .prependAlways)
+        XCTAssertEqual(scope.drafts.pendingTabDrafts[session.tabID], "queued before stash")
+        XCTAssertEqual(scope.drafts.loadSnapshot(tabID: session.tabID).text, "queued before stash")
+        scope.beginRetirement()
+        XCTAssertTrue(scope.releaseWriterClaimsAfterDrain())
+        hooks.restoreDraftText(session, "late after final drain", "Stopped", .prependAlways)
+        XCTAssertEqual(scope.drafts.pendingTabDrafts[session.tabID], "queued before stash")
+    }
+
+    func testUnmaterializedExplicitCarrierAdoptsPendingDraftAndAcknowledgementOnce() async throws {
+        let window = WindowState()
+        addTeardownBlock { @MainActor in await window.tearDown() }
+        await window.workspaceManager.awaitInitialized()
+        let tab = ComposeTabState(name: "Saved draft", activeAgentSessionID: UUID())
+        let workspace = WorkspaceModel(
+            name: "Draft adoption",
+            repoPaths: [],
+            ephemeralFlag: true,
+            composeTabs: [tab],
+            activeComposeTabID: tab.id
+        )
+        window.workspaceManager.workspaces = [workspace]
+        window.workspaceManager.activeWorkspace = workspace
+        window.promptManager.loadComposeTabsFromWorkspace(workspace)
+        let host = window.agentModeViewModel
+        host.test_removeSession(tabID: tab.id)
+        host.storeDraftText(for: tab.id, "typed without a runtime")
+        host.restoreComposerDraft(tabID: tab.id, text: "queued", message: "Recovered", strategy: .prependAlways)
+        XCTAssertNil(host.sessions[tab.id], "Draft reads and edits must not hydrate or elect a writer")
+        XCTAssertEqual(host.tabDraftText[tab.id], "queued\ntyped without a runtime")
+        let session = try XCTUnwrap(host.session(for: tab.id, createIfNeeded: false))
+        XCTAssertEqual(session.activeAgentSessionID, tab.activeAgentSessionID)
+        XCTAssertEqual(session.draftText, "queued\ntyped without a runtime")
+        XCTAssertNil(host.tabDraftText[tab.id], "Adoption consumes the fallback rather than leaving a stale copy")
+        let snapshot = host.loadDraftSnapshotForComposer(for: tab.id)
+        XCTAssertEqual(snapshot.restorationSequence, 1)
+        host.storeDraftText(for: tab.id, "edited", acknowledgingThrough: snapshot.restorationSequence)
+        XCTAssertEqual(host.retrieveDraftText(for: tab.id), "edited")
+        XCTAssertTrue(try XCTUnwrap(host.draftRestorationLedger.tabs[tab.id]).pendingFragments.isEmpty)
+    }
+
+    func testRuntimeRouteRefusalRestoresOnlyLosslessOriginatingUserTurnWithoutUI() {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        let user = AgentChatItem(kind: .user, text: "unsent")
+        session.items = [user, AgentChatItem(kind: .error, text: "route refused")]
+        scope.replaceSessions([session.tabID: session])
+        let hooks = scope.drafts.makeRunHooks()
+        hooks.restoreRouteRefusedUnsentTurn(session, user.id, "Restored")
+        XCTAssertEqual(session.draftText, "unsent")
+        XCTAssertEqual(session.items.map(\.kind), [.error])
+        XCTAssertTrue(session.isDirty)
+        hooks.restoreRouteRefusedUnsentTurn(session, user.id, "Duplicate refusal")
+        XCTAssertEqual(session.draftText, "unsent")
+        XCTAssertEqual(scope.drafts.ledger.tabs[session.tabID]?.storedDraftSequence, 1)
+
+        let successor = AgentTabSession(tabID: session.tabID)
+        successor.items = [user]
+        scope.replaceSessions([successor.tabID: successor])
+        hooks.restoreRouteRefusedUnsentTurn(session, user.id, "Stale refusal")
+        XCTAssertEqual(successor.items.count, 1)
+        XCTAssertTrue(successor.draftText.isEmpty)
+        successor.draftText = "new typing"
+        hooks.restoreRouteRefusedUnsentTurn(successor, user.id, "Do not displace newer typing")
+        XCTAssertEqual(successor.items.count, 1)
+        XCTAssertEqual(successor.draftText, "new typing")
     }
 
     private func makeViewModel() -> AgentModeViewModel {

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 
 /// Filter tabs above the session list. `.all` is the unfiltered sidebar; the others narrow the same

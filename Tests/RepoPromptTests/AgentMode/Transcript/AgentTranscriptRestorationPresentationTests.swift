@@ -2,6 +2,7 @@ import Combine
 import Foundation
 import os
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 /// Table-driven precedence for the pure Agent transcript pane classifier (§4.4).
@@ -3828,7 +3829,7 @@ extension AgentTranscriptRestorationLifecycleTests {
             let binding = session.persistentSessionBindingIdentity
             let transition = session.bindingTransitionGeneration
             let approval = AgentApprovalRequest(
-                requestID: .codex(.int(7)), method: "item/commandExecution/requestApproval",
+                requestID: .codex(.fixture(.int(7))), method: "item/commandExecution/requestApproval",
                 kind: .commandExecution, threadID: "thread", turnID: "turn", itemID: "pending"
             )
             session.pendingApproval = approval

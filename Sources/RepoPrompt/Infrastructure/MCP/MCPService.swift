@@ -1,3 +1,5 @@
+import RepoPromptMCPServer
+
 //
 //  MCPService.swift
 //  RepoPrompt

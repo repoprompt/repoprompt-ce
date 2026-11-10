@@ -1,4 +1,7 @@
 import AppKit
+import RepoPromptACPProviders
+import RepoPromptAIContracts
+import RepoPromptClaudeProvider
 import RepoPromptProcess
 import SwiftUI
 
@@ -88,6 +91,7 @@ struct CLIProvidersSettingsView: View {
     @State private var codexMCPImportStatus: String?
     @State private var codexMCPPendingImport: String?
     @State private var isCodexRuntimeAdvancedExpanded: Bool = false
+    @State private var codexContextWindowSelection = CodexContextWindowPreferences.selection()
     @State private var codexRuntimePendingSelection = CodexRuntimePreferences.selection()
     @State private var codexRuntimePreflight: CodexProviderHelpers.CodexRuntimeSettingsPreflight?
     @State private var isLoadingCodexRuntimePreflight = false
@@ -1990,6 +1994,23 @@ struct CLIProvidersSettingsView: View {
 
                 Divider()
                 codexRuntimeSelectionControl
+                Divider()
+                VStack(alignment: .leading, spacing: 4) {
+                    Picker("Context window", selection: Binding(
+                        get: { codexContextWindowSelection },
+                        set: { selection in
+                            codexContextWindowSelection = selection
+                            CodexContextWindowPreferences.setSelection(selection)
+                        }
+                    )) {
+                        ForEach(CodexContextWindowPreferences.Selection.allCases, id: \.self) { selection in
+                            Text(selection.label).tag(selection)
+                        }
+                    }
+                    Text("Larger windows use more of your plan’s usage per turn. Applies to new sessions.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
 
                 if viewModel.isCodexConnected {
                     Divider()
@@ -2291,7 +2312,7 @@ struct CLIProvidersSettingsView: View {
                                 let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: nil, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
                                 _ = try await AntigravityACPAgentProvider().support(for: request)
                                 let discovered = await AntigravityACPModelPollingService.shared.refreshNow(workspacePath: nil)
-                                let count = AgentACPModelRegistry.shared.resolvedSnapshot(for: .antigravity)?.options.count ?? 0
+                                let count = AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .antigravity)?.options.count ?? 0
                                 await MainActor.run {
                                     isTestingAntigravity = false
                                     alertMessage = discovered && count > 0

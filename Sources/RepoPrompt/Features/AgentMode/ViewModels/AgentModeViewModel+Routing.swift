@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
 
 extension AgentModeViewModel {
     enum GlobalModelRoutingError: LocalizedError {

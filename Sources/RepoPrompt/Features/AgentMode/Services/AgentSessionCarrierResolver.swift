@@ -34,16 +34,29 @@ enum AgentSessionCarrierResolver {
         let entry: AgentSessionIndexEntry
     }
 
+    @MainActor
     struct RuntimeOwner {
         let location: Observation
-        let session: AgentTabSession
-        let binding: AgentSessionRestorationBindingToken
+        let writer: AgentSessionRuntimeStore.Writer
+        var session: AgentTabSession {
+            writer.session
+        }
+
+        var binding: AgentSessionRestorationBindingToken {
+            writer.restoration
+        }
 
         func matches(_ other: Self) -> Bool {
-            location.window === other.location.window && session === other.session
+            writer.isCurrent && other.writer.isCurrent
+                && location.window === other.location.window && session === other.session
                 && location.workspaceID == other.location.workspaceID
                 && location.tab.id == other.location.tab.id && binding == other.binding
         }
+    }
+
+    enum RuntimeWriterRejection: Equatable {
+        case unavailable(AgentSessionRuntimeStore.Unavailable)
+        case conflicting
     }
 
     struct Snapshot {
@@ -56,6 +69,9 @@ enum AgentSessionCarrierResolver {
         var replicatedSessionIDs: Set<UUID> = []
         /// One exact bound payload owner; agreeing presentation replicas remain replicated.
         var uniqueRuntimeOwners: [UUID: RuntimeOwner] = [:]
+        /// Live claims rejected by the writer authority are not absence. A cold-mutation fallback
+        /// must not use a readable metadata location to route around these refusals.
+        var runtimeWriterRejections: [UUID: RuntimeWriterRejection] = [:]
         /// Liveness states from the same per-window binding census that proved `uniqueRuntimeOwners`,
         /// so a caller needing both never builds a second census in the same synchronous read.
         var runtimeStatesByWindow: [ObjectIdentifier: [UUID: AgentModeViewModel.AuthoritativeLiveSessionState]] = [:]
@@ -65,6 +81,9 @@ enum AgentSessionCarrierResolver {
         fileprivate var fences: [WindowFence] = []
 
         func bindingConflictDetail(for sessionID: UUID) -> String? {
+            if runtimeWriterRejections[sessionID] == .conflicting {
+                return "More than one runtime claim or a mismatched workspace prevents selecting a writer."
+            }
             guard ambiguousSessionIDs.contains(sessionID) else { return nil }
             let claims = bindingClaimDescriptions[sessionID, default: []].sorted()
             guard !claims.isEmpty else { return "More than one physical or runtime binding claims this session." }
@@ -380,7 +399,8 @@ enum AgentSessionCarrierResolver {
             let ownerIDs = requestedIDs ?? result.sessionIDs
             // One binding census per window serves both the runtime owners and liveness states.
             let censuses = owners.map { ($0, $0.agentModeViewModel.authoritativeLiveSessionCensus(for: ownerIDs)) }
-            result.uniqueRuntimeOwners = runtimeOwners(in: result, censuses: censuses)
+            let runtimeOwners = runtimeOwners(in: &result, sessionIDs: ownerIDs)
+            result.uniqueRuntimeOwners = runtimeOwners
             result.runtimeStatesByWindow = Dictionary(
                 censuses.map { (ObjectIdentifier($0.0), $0.1.states) }, uniquingKeysWith: { first, _ in first }
             )
@@ -389,42 +409,36 @@ enum AgentSessionCarrierResolver {
     }
 
     private static func runtimeOwners(
-        in snapshot: Snapshot,
-        censuses: [(window: WindowState, census: AgentModeViewModel.AuthoritativeLiveSessionCensus)]
+        in snapshot: inout Snapshot,
+        sessionIDs: Set<UUID>
     ) -> [UUID: RuntimeOwner] {
-        var candidates: [UUID: (Observation, AgentTabSession)] = [:]
-        var conflicts = snapshot.ambiguousSessionIDs
-        for (window, census) in censuses {
-            for (id, result) in census.sessions {
-                switch result {
-                case .failure:
-                    conflicts.insert(id)
-                case .success(nil):
-                    break
-                case let .success(session?):
-                    guard let row = snapshot.rows.first(where: {
-                        $0.sessionID == id && $0.window === window && $0.stashedTabID == nil
-                            && $0.tab.id == session.tabID && $0.hasCurrentMetadataOwner
-                            && $0.entry?.id == id && $0.entry?.tabID == session.tabID
-                            && window.workspaceManager.activeWorkspaceID == $0.workspaceID
-                    }) else {
-                        conflicts.insert(id)
-                        continue
-                    }
-                    if let existing = candidates[id], existing.1 !== session || existing.0.window !== window {
-                        conflicts.insert(id)
-                    } else {
-                        candidates[id] = (row, session)
-                    }
-                }
+        var owners: [UUID: RuntimeOwner] = [:]
+        for id in sessionIDs {
+            let writer: AgentSessionRuntimeStore.Writer
+            switch AgentSessionRuntimeStore.shared.resolveWriter(sessionID: id) {
+            case let .unique(resolved): writer = resolved
+            case .unavailable(.absent): continue
+            case let .unavailable(reason):
+                snapshot.runtimeWriterRejections[id] = .unavailable(reason)
+                continue
+            case .conflicting:
+                snapshot.runtimeWriterRejections[id] = .conflicting
+                continue
             }
+            guard snapshot.affectedWorkspaceIDs(for: id).allSatisfy({ $0 == writer.identity.workspaceID }) else {
+                snapshot.runtimeWriterRejections[id] = .conflicting
+                continue
+            }
+            guard !snapshot.ambiguousSessionIDs.contains(id), writer.session.permitsBoundOperationAndSave,
+                  let row = snapshot.rows.first(where: {
+                      $0.sessionID == id && $0.workspaceID == writer.identity.workspaceID
+                          && $0.tab.id == writer.session.tabID && $0.stashedTabID == nil
+                          && $0.window.agentModeViewModel.sessions[$0.tab.id] === writer.session
+                          && $0.hasCurrentMetadataOwner && $0.entry?.id == id
+                  }) else { continue }
+            // Presentation is attached after runtime selection, never used to break a tie.
+            owners[id] = RuntimeOwner(location: row, writer: writer)
         }
-        return candidates.reduce(into: [:]) { owners, candidate in
-            let (id, (row, session)) = candidate
-            guard !conflicts.contains(id), session.permitsBoundOperationAndSave,
-                  let binding = session.currentRestorationBindingToken,
-                  binding.bindingIdentity.sessionID == id, binding.bindingIdentity.tabID == row.tab.id else { return }
-            owners[id] = RuntimeOwner(location: row, session: session, binding: binding)
-        }
+        return owners
     }
 }

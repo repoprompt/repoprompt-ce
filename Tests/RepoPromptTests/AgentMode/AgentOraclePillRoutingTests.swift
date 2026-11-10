@@ -2,9 +2,12 @@ import AppKit
 import Combine
 import Foundation
 import MCP
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
+@testable import RepoPromptWorkspaceContext
 import UniformTypeIdentifiers
 import XCTest
 
@@ -512,7 +515,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         XCTAssertNil(wrongWorkspace)
     }
 
-    func testAggregateOraclePillCountAndLabelsUseConfiguredOrLatestProjectedGroup() {
+    func testAggregateOraclePillCountAndLabelsUseConfiguredOrLatestRequest() {
         let historical = ChatSession(
             oracleGroupID: UUID(),
             oracleLaneIndex: 0,
@@ -549,14 +552,14 @@ final class AgentOraclePillRoutingTests: XCTestCase {
 
         XCTAssertEqual(
             AgentOraclePillLogic.aggregateOracleCount(
-                configuredAdditionalCount: 0,
+                configuredAdditionalCount: 2,
                 sessions: [historical, latestSingle]
             ),
             1
         )
         XCTAssertEqual(
             AgentOraclePillLogic.aggregateOracleCount(
-                configuredAdditionalCount: 0,
+                configuredAdditionalCount: 4,
                 sessions: [historical, staleSiblingProjection, latestProjected]
             ),
             4
@@ -574,6 +577,20 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         XCTAssertEqual(
             (0 ... 4).map(OracleViewModel.oracleLabel(laneIndex:)),
             ["Oracle", "Oracle 2", "Oracle 3", "Oracle 4", "Oracle 5"]
+        )
+    }
+
+    func testAggregateOraclePillCountUsesPrimaryOnlyRequestInsteadOfConfiguredOracles() {
+        let primaryOnly = ChatSession(
+            oracleGroupID: UUID(),
+            oracleLaneIndex: 0,
+            oracleGroupSize: 1,
+            name: "Primary Only"
+        )
+
+        XCTAssertEqual(
+            AgentOraclePillLogic.aggregateOracleCount(configuredAdditionalCount: 2, sessions: [primaryOnly]),
+            1
         )
     }
 
@@ -2059,6 +2076,34 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
         XCTAssertEqual(viewModel.oracleAuthorizedAttachmentPaths(tabID: tabID, agentSessionID: UUID()), [])
     }
 
+    func testExplicitRetentionRootDoesNotRequireAWorkspacePresentation() async throws {
+        let viewModel = makeViewModel()
+        let root = workspaceDirectory.appendingPathComponent("Explicit/AgentSessions/attachments")
+        viewModel.sessionAttachmentsRootOverride = { root }
+        let session = viewModel.session(for: UUID())
+        let sessionID = UUID()
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: UUID()))
+        let image = try AgentFileAttachment(source: .localFile(path: writeTemporaryImage().path))
+        session.appendItem(.user("retain", attachments: [image]))
+        let reservation = viewModel.reserveAttachmentsForTurn([image], session: session)
+        let placement = try XCTUnwrap(session.attachmentRetentionPlacement)
+        XCTAssertTrue(try XCTUnwrap(placement.location.retainedRoot).hasDirectoryPath)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
+        let restoration = session.currentRestorationBindingToken
+        viewModel.finalizeAttachmentsForTurn(for: session, reservationID: reservation, disposition: .deleteFiles)
+        await viewModel.waitForAttachmentRetention()
+        XCTAssertTrue(viewModel.session(for: session.tabID, createIfNeeded: false) === session)
+        XCTAssertEqual(viewModel.attachmentLocation(for: session)?.retainedRoot, root.standardizedFileURL)
+        XCTAssertEqual(session.persistentSessionBindingIdentity, placement.binding)
+        XCTAssertEqual(session.currentRestorationBindingToken, restoration)
+        XCTAssertEqual(placement.location.retainedRoot?.path, viewModel.attachmentLocation(for: session)?.retainedRoot?.path)
+        XCTAssertEqual(viewModel.attachmentRuntime.configuration?.locationIsCurrent(placement.location, session), true)
+        let retained = AgentSessionAttachmentStore(rootURL: root).sessionFolderURL(sessionID: sessionID)
+            .appendingPathComponent("\(image.id.uuidString).png")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: retained.path))
+        XCTAssertEqual(session.items.last?.attachments.first?.source, .localFile(path: retained.path))
+    }
+
     func testAttachmentRootConsultsTheInjectedPersistencePolicyOnEachResolution() {
         var suppressed = true
         let viewModel = makeViewModel(attachmentPersistenceIsSuppressed: { suppressed })
@@ -2070,10 +2115,9 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
         XCTAssertNil(viewModel.sessionAttachmentsRootURL(for: workspace))
     }
 
-    func testSweepQueriesLiveOwnersAndProtectsItsOwnUnregisteredRuntime() throws {
+    func testSweepProtectsAllLiveRuntimeScopesWithoutWindowRegistration() throws {
         let other = makeViewModel()
-        var liveOwners: [AgentModeViewModel] = []
-        let viewModel = makeViewModel(attachmentSweepViewModels: { liveOwners })
+        let viewModel = makeViewModel()
         let localSession = viewModel.session(for: UUID())
         let localID = UUID()
         localSession.testInstallPersistentSessionBinding(sessionID: localID)
@@ -2089,16 +2133,12 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
         _ = other.reserveAttachmentsForTurn([reserved], session: otherSession)
         otherSession.attachmentsPendingProviderConsumptionCleanup = [consumed]
 
-        XCTAssertEqual(viewModel.liveAttachmentSweepProtection().sessionIDs, [localID])
-        liveOwners = [other]
         let protection = viewModel.liveAttachmentSweepProtection()
-        XCTAssertEqual(protection.sessionIDs, [localID, otherID])
-        XCTAssertEqual(protection.temporaryPaths, Set([local, pending, reserved, consumed].compactMap(AgentImageAttachmentAvailabilityResolver.path(for:))))
-        liveOwners = []
-        XCTAssertEqual(viewModel.liveAttachmentSweepProtection().sessionIDs, [localID])
+        XCTAssertTrue(protection.sessionIDs.isSuperset(of: [localID, otherID]))
+        XCTAssertTrue(protection.temporaryPaths.isSuperset(of: Set([local, pending, reserved, consumed].compactMap(AgentImageAttachmentAvailabilityResolver.path(for:)))))
     }
 
-    func testWindowCompositionSuppliesCurrentWindowOwnersAndLaunchPolicy() async {
+    func testWindowCompositionSuppliesLaunchPolicy() async {
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
         let settings = GlobalSettingsStore.shared
         let previousAutoStart = settings.mcpAutoStart()
@@ -2111,11 +2151,9 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
         let second = WindowState()
         WindowStatesManager.shared.registerWindowState(second)
         await second.workspaceManager.awaitInitialized()
-        XCTAssertTrue(first.agentModeViewModel.attachmentSweepViewModels().contains { $0 === second.agentModeViewModel })
         second.beginClose()
         await second.tearDown()
         WindowStatesManager.shared.unregisterWindowState(second)
-        XCTAssertFalse(first.agentModeViewModel.attachmentSweepViewModels().contains { $0 === second.agentModeViewModel })
         first.beginClose()
         await first.tearDown()
         WindowStatesManager.shared.unregisterWindowState(first)
@@ -2804,13 +2842,11 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
     }
 
     private func makeViewModel(
-        attachmentPersistenceIsSuppressed: @escaping () -> Bool = { false },
-        attachmentSweepViewModels: @escaping () -> [AgentModeViewModel] = { [] }
+        attachmentPersistenceIsSuppressed: @escaping () -> Bool = { false }
     ) -> AgentModeViewModel {
         AgentModeViewModel(
             testWorkspaceDirectory: workspaceDirectory,
             attachmentPersistenceIsSuppressed: attachmentPersistenceIsSuppressed,
-            attachmentSweepViewModels: attachmentSweepViewModels,
             codexControllerFactory: { _, _, _, _, _, _ in
                 preconditionFailure("Image attachment retention tests must not start Codex")
             },

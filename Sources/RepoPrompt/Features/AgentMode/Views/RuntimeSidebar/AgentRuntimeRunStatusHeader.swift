@@ -1,3 +1,4 @@
+import RepoPromptDomainRuntime
 import SwiftUI
 
 struct AgentRuntimeRunStatusHeader: View {

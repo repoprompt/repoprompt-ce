@@ -1,3 +1,4 @@
+import RepoPromptACPProviders
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import XCTest
@@ -364,22 +365,18 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
         let runner = ACPIntegratedAgentModeRunner(
             hooks: harness.hooks,
             terminalCommitBarrier: AgentRunTerminalCommitBarrier(),
-            toolTrackingHooks: .noOp,
-            providerFactory: { _, _ in provider },
-            controllerFactory: { provider, request in
-                try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
-            }
+            toolTrackingHooks: .noOp
         )
         let initialRequest = ACPRunRequest(
             agentKind: .openCode, modelString: nil, workspacePath: directory.path,
             resumeSessionID: nil, attachments: [], taskLabelKind: nil
         )
-        await runner.startRun(
-            tabID: session.tabID, session: session,
+        await harness.resources.fulfill(runner.prepareRun(
+            tabID: session.tabID, session: session, workspace: harness.workspace,
             initialUserMessage: "prime", initialMessageForRun: "prime", attachments: [],
             runRequest: initialRequest,
             makeLease: { harness.makeLease(runID: $0, tabID: session.tabID) }
-        )
+        ))
         await session.agentTask?.value
         XCTAssertEqual(provider.promptedMessages.map(\.userMessage), ["prime"])
 
@@ -395,12 +392,12 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
             resumeSessionID: nil, attachments: [], taskLabelKind: nil,
             sessionModeID: "auto_edit"
         )
-        await runner.startRun(
-            tabID: session.tabID, session: session,
+        await harness.resources.fulfill(runner.prepareRun(
+            tabID: session.tabID, session: session, workspace: harness.workspace,
             initialUserMessage: frame, initialMessageForRun: frame, attachments: [],
             runRequest: noteRequest,
             makeLease: { harness.makeLease(runID: $0, tabID: session.tabID) }
-        )
+        ))
         // The config RPC suspends after this run captured its dedicated note ID but before
         // runPromptTurn re-reads the carry. Model an ordinary local send that has accepted the note.
         try await gate.waitUntilEntered()

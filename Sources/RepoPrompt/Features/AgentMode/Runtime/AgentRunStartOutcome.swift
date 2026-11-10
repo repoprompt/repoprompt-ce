@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 // MARK: - Provider control commands
 
@@ -184,7 +185,7 @@ struct AgentDirectRunStartOptions: Equatable {
 
 /// Provider-neutral record of whether a run reached its provider pipeline.
 ///
-/// `AgentModeRunService.startRun` returns `CodexAgentModeCoordinator.NativeSendOutcome?`, where
+/// `AgentModeRunComposition.startRun` returns `CodexAgentModeCoordinator.NativeSendOutcome?`, where
 /// `nil` means "not a Codex native send" — it says nothing about success, so Claude, ACP, and
 /// headless report success and pre-start failure identically. Callers that must distinguish the two
 /// (currently only the cross-session send receipt) pass a recorder instead of changing that return

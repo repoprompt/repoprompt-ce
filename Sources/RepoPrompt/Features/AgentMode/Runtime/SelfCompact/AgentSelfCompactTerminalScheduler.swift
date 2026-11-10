@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 /// Owns only the origin turn's terminal boundary and native-command start. Completion and note
 /// delivery are deliberately separate stages. A restored attempt never constructs this worker.

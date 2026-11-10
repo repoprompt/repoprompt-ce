@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptACPProviders
+import RepoPromptAIContracts
 import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
@@ -11,8 +13,8 @@ final class AgentSessionLanePolicyTests: XCTestCase {
 
     @MainActor
     func testSharedWarmCompletionDoesNotInvalidateAlreadyAdvertisedModels() async throws {
-        let registry = AgentACPModelRegistry.shared
-        let catalogue = AgentAdvertisedModelCatalog.shared
+        let registry = AgentModelCatalogRuntime.shared.acpRegistry
+        let catalogue = AgentModelCatalogRuntime.shared
         let availability = AgentModelCatalog.AvailabilityContext(openCodeAvailable: true)
         registry.test_reset(providerID: .openCode)
         defer { registry.test_reset(providerID: .openCode) }
@@ -66,7 +68,7 @@ final class AgentSessionLanePolicyTests: XCTestCase {
         let entries = AgentModelCatalog.discoveryAgents(availability: availability)
         defer {
             for entry in entries {
-                AgentAdvertisedModelCatalog.shared.invalidate(entry.agent)
+                AgentModelCatalogRuntime.shared.invalidate(entry.agent)
             }
         }
         for entry in entries where entry.available {
@@ -90,8 +92,8 @@ final class AgentSessionLanePolicyTests: XCTestCase {
     }
 
     func testACPResetInvalidatesProducerThatReadBeforeMemoryWasCleared() throws {
-        let registry = AgentACPModelRegistry.shared
-        let catalogue = AgentAdvertisedModelCatalog.shared
+        let registry = AgentModelCatalogRuntime.shared.acpRegistry
+        let catalogue = AgentModelCatalogRuntime.shared
         let availability = AgentModelCatalog.AvailabilityContext(openCodeAvailable: true)
         registry.test_reset(providerID: .openCode)
         defer { registry.test_reset(providerID: .openCode) }
@@ -132,7 +134,7 @@ final class AgentSessionLanePolicyTests: XCTestCase {
     }
 
     func testBackendConfigurationChangeInvalidatesAdmissionAndFencesPausedProducers() throws {
-        let catalogue = AgentAdvertisedModelCatalog.shared
+        let catalogue = AgentModelCatalogRuntime.shared
         let agents: [AgentProviderKind] = [.claudeCodeGLM, .kimiCode, .customClaudeCompatible]
         let availability = AgentModelCatalog.AvailabilityContext(
             zaiConfigured: true, kimiConfigured: true, customClaudeCompatibleConfigured: true
@@ -158,17 +160,17 @@ final class AgentSessionLanePolicyTests: XCTestCase {
 
         for agent in agents {
             XCTAssertThrowsError(try catalogue.selection("\(agent.rawValue):\(option.rawValue)", availability: availability)) {
-                XCTAssertEqual($0 as? AgentAdvertisedModelCatalog.AdmissionError, .catalogueUnavailable)
+                XCTAssertEqual($0 as? AgentModelCatalogRuntime.AdmissionError, .catalogueUnavailable)
             }
             XCTAssertFalse(try catalogue.record([option], for: agent, generation: XCTUnwrap(generations[agent])))
         }
     }
 
     func testMemoryOnlyAdmissionDoesNotDiscoverOrSubstituteMissingCatalogue() throws {
-        let catalogue = AgentAdvertisedModelCatalog()
+        let catalogue = AgentModelCatalogRuntime(registerBackendChanges: { _ in })
         let availability = AgentModelCatalog.AvailabilityContext(cursorAvailable: true)
         XCTAssertThrowsError(try catalogue.selection("cursor:auto", availability: availability)) { error in
-            XCTAssertEqual(error as? AgentAdvertisedModelCatalog.AdmissionError, .catalogueUnavailable)
+            XCTAssertEqual(error as? AgentModelCatalogRuntime.AdmissionError, .catalogueUnavailable)
         }
         let dynamic = AgentModelOption(
             rawValue: "future-model-high",
@@ -185,7 +187,7 @@ final class AgentSessionLanePolicyTests: XCTestCase {
         XCTAssertThrowsError(try catalogue.selection("codexExec:future-model-high", availability: .none))
         catalogue.invalidate(.codexExec)
         XCTAssertThrowsError(try catalogue.selection("codexExec:future-model-high", availability: availability)) { error in
-            XCTAssertEqual(error as? AgentAdvertisedModelCatalog.AdmissionError, .catalogueUnavailable)
+            XCTAssertEqual(error as? AgentModelCatalogRuntime.AdmissionError, .catalogueUnavailable)
         }
         let colon = AgentModelOption(
             rawValue: "vendor:model:variant",
@@ -202,7 +204,7 @@ final class AgentSessionLanePolicyTests: XCTestCase {
     }
 
     func testNativeCataloguePreservesOnlyExplicitEffortAndInvalidatesPerAgent() throws {
-        let catalogue = AgentAdvertisedModelCatalog()
+        let catalogue = AgentModelCatalogRuntime(registerBackendChanges: { _ in })
         let availability = AgentModelCatalog.AvailabilityContext()
         let generation = catalogue.productionGeneration(for: .claudeCode)
         let options = ["claude-opus-5-5", "claude-opus-5-5:high"].map {
@@ -246,6 +248,15 @@ final class AgentSessionLanePolicyTests: XCTestCase {
         let tabID = try XCTUnwrap(activeWorkspace.activeComposeTabID)
         let viewModel = window.agentModeViewModel
         let session = await viewModel.ensureSessionReady(tabID: tabID)
+        // MCP configuration now requires an admitted writer, not an unbound composer draft.
+        let sessionID = UUID()
+        XCTAssertNil(viewModel.test_bindingRejection(sessionID: sessionID, on: session))
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, compareAndSetInWorkspaceID: activeWorkspace.id
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(viewModel.runtimeCommand(sessionID: sessionID))
+        viewModel.test_setSuppressesAgentSessionPersistence(true)
         session.isMCPOriginated = true
         for agent in AgentProviderKind.allCases where agent.usesClaudeNativeRuntime && agent != .claudeCode {
             try await viewModel.mcpConfigureSession(
@@ -293,7 +304,7 @@ final class AgentSessionLanePolicyTests: XCTestCase {
 
     @MainActor
     func testEveryRoleUsesItsEffectiveRoleDefaultAndMappedEffort() throws {
-        let registry = AgentACPModelRegistry.shared
+        let registry = AgentModelCatalogRuntime.shared.acpRegistry
         registry.test_reset(providerID: .devin)
         registry.test_reset(providerID: .cursor)
         defer {

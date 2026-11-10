@@ -38,6 +38,9 @@ struct AgentRunTerminalSessionBinding {
             AgentRunTerminalCommitRevision,
             AgentRunEpochTransitionKind?
         ) async -> AgentRunTerminalPublicationResult
+        /// Domain publication can finish after a local rebind. Its committed result is not
+        /// permission to consume or dispatch work on that different incarnation.
+        var permitsTerminalSuccessor: @MainActor (AgentRunTerminalCommitRevision, AgentRunTerminalPublicationResult) -> Bool = { _, _ in true }
         let startFollowUpRun: @MainActor (AgentRunPendingInstruction) -> Void
         /// Post-publication, post-successor terminal observation; provider work must be deferred.
         var onSelfCompactTerminalSettled: @MainActor (

@@ -24,6 +24,7 @@ struct TipHistoryAcquisitionServices {
     let run: @Sendable (String, [String], URL) async throws -> Void
     let validatesCode: @Sendable (URL, OfficialApplicationIdentity) -> Bool
     let assess: @Sendable (URL, URL) async throws -> Void
+    let availableCapacity: @Sendable (URL) throws -> Int64?
 
     static let live = Self(
         download: { source, target, size, progress in
@@ -39,6 +40,10 @@ struct TipHistoryAcquisitionServices {
         assess: { app, workingDirectory in
             let bytes = try await runChecked("/usr/sbin/spctl", args: ["--assess", "--type", "execute", "--raw", "--ignore-cache", "--no-cache", app.path], workingDirectory: workingDirectory)
             try validateAssessment(bytes)
+        },
+        availableCapacity: { destination in
+            try destination.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+                .volumeAvailableCapacityForImportantUsage
         }
     )
 
@@ -221,9 +226,8 @@ struct TipHistoryDownloader: TipHistoryArtifactDownloading {
         else { throw TipHistoryDownloadError.bundleMismatch }
         try Task.checkCancellation()
         let destination = try TipHistoryOwnedStaging.validatedDestination(destination)
-        try TipHistoryOwnedStaging.requireCapacity(at: destination, download: download)
-        let temporaryVolume = try FileManager.default.temporaryDirectory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-        guard let temporaryCapacity = temporaryVolume.volumeAvailableCapacityForImportantUsage, temporaryCapacity >= download.size + 64 * 1024 * 1024 else { throw TipHistoryDownloadError.insufficientDiskSpace }
+        try TipHistoryOwnedStaging.requireCapacity(at: destination, download: download, availableCapacity: services.availableCapacity)
+        guard let temporaryCapacity = try services.availableCapacity(FileManager.default.temporaryDirectory), temporaryCapacity >= download.size + 64 * 1024 * 1024 else { throw TipHistoryDownloadError.insufficientDiskSpace }
         let stage = try TipHistoryOwnedStaging(destination: destination, id: UUID())
         do { try await registry.register(stage.record) }
         catch {
@@ -240,7 +244,7 @@ struct TipHistoryDownloader: TipHistoryArtifactDownloading {
             try verifyArchive(stage.archiveURL, download: download, publicKey: publicKey)
             let entries = try TipHistoryArchive.validate(at: stage.archiveURL, declaredExpandedSize: download.expandedSize)
             try Task.checkCancellation()
-            try TipHistoryOwnedStaging.requireCapacity(at: destination, download: download, allocationHeadroom: Int64(entries) * 16384)
+            try TipHistoryOwnedStaging.requireCapacity(at: destination, download: download, allocationHeadroom: Int64(entries) * 16384, availableCapacity: services.availableCapacity)
             try quarantine(stage.archiveURL, origin: download.url)
             try FileManager.default.createDirectory(at: stage.payloadURL, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
             try await extract(stage: stage, download: download)
@@ -253,7 +257,7 @@ struct TipHistoryDownloader: TipHistoryArtifactDownloading {
             catch let error as CLIProcessRunnerError { throw error }
             catch { throw TipHistoryDownloadError.assessmentFailed }
             try Task.checkCancellation()
-            try TipHistoryOwnedStaging.requireCapacity(at: destination, download: download)
+            try TipHistoryOwnedStaging.requireCapacity(at: destination, download: download, availableCapacity: services.availableCapacity)
             // Store-owned MainActor closure atomically rechecks generation,
             // consent, current compatibility and context, then renames exclusively.
             let saved = try await commit(stage.payloadURL)

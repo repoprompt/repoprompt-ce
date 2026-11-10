@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptACPProviders
 import RepoPromptDomainRuntime
 
 struct AgentSanitizedToolResult: Equatable {
@@ -159,6 +160,7 @@ enum AgentToolResultPersistencePolicy {
             || normalizedToolName == "agent_explore"
             || normalizedToolName == "agent_manage"
             || normalizedToolName == "ask_oracle"
+            || normalizedToolName == "oracle_chat_log"
             || normalizedToolName == "oracle_send"
             || normalizedToolName == "context_builder"
         // Exact byte search: Foundation's `StringProtocol.contains` walks grapheme
@@ -178,6 +180,11 @@ enum AgentToolResultPersistencePolicy {
             ? BashToolResultParser.parseMetadata(raw: rawResultJSON, context: context)
             : nil
         let statusWord: String = {
+            if ["ask_oracle", "oracle_chat_log"].contains(normalizedToolName ?? ""),
+               AgentTranscriptToolStatusSemantics.isBackgroundOracleResult(rawObject), rawObject?["oracle_results"] == nil
+            {
+                return item.toolIsError == true ? "failed" : "completed"
+            }
             if normalizedToolName != "bash",
                let executionStatus = execution?.status,
                executionStatus != .unknown
@@ -1531,6 +1538,8 @@ enum AgentToolResultPersistencePolicy {
             return agentRunSummaryJSON(normalizedToolName: normalizedToolName, statusWord: statusWord, rawObject: rawObject)
         case "agent_manage":
             return agentManageSummaryJSON(statusWord: statusWord, rawObject: rawObject)
+        case "oracle_chat_log" where AgentTranscriptToolStatusSemantics.isBackgroundOracleResult(rawObject):
+            return backgroundOracleSummaryJSON(normalizedToolName: normalizedToolName, statusWord: statusWord, rawObject: rawObject)
         case "ask_oracle", "oracle_send":
             return oracleChatSummaryJSON(
                 normalizedToolName: normalizedToolName,
@@ -2271,11 +2280,37 @@ enum AgentToolResultPersistencePolicy {
         return reply
     }
 
+    private static func backgroundOracleSummaryJSON(normalizedToolName: String?, statusWord: String, rawObject: [String: Any]?) -> String? {
+        var object = genericSummaryObject(normalizedToolName: normalizedToolName, statusWord: statusWord, processID: nil, exitCode: nil)
+        guard let rawObject else { return jsonString(from: object) }
+        // Full identifiers precede optional detail. Never retain answers or a discovery manifest.
+        for key in ["oracle_group_id", "oracle_turn_id", "context_id", "agent_session_id", "agent_run_id"] {
+            if let value = rawObject[key] as? String, value.count == 36, UUID(uuidString: value) != nil { object[key] = value }
+        }
+        for key in ["chat_id", "status", "code", "mode", "backend", "scope"] {
+            if let value = smallStringValue(rawObject, keys: [key]) { object[key] = value }
+        }
+        for key in ["oracle_count", "count", "open_count", "answer_ready_count", "retention_limit"] {
+            if let value = intValue(rawObject, keys: [key]) { object[key] = value }
+        }
+        if let truncated = rawObject["history_truncated"] as? Bool { object["history_truncated"] = truncated }
+        if let lanes = rawObject["lanes"] as? [[String: Any]] ?? rawObject["oracle_results"] as? [[String: Any]], lanes.count <= 5 {
+            let summaries = lanes.map { lane in lane.filter { ["lane_index", "chat_id", "status", "answer_ready", "partial", "truncated"].contains($0.key) } }
+            var detailed = object
+            detailed["lanes"] = summaries
+            if let json = jsonString(from: detailed), !exceedsPersistedToolSummaryBudget(json) { return json }
+        }
+        return jsonString(from: object)
+    }
+
     private static func oracleChatSummaryJSON(
         normalizedToolName: String?,
         statusWord: String,
         rawObject: [String: Any]?
     ) -> String? {
+        if AgentTranscriptToolStatusSemantics.isBackgroundOracleResult(rawObject) {
+            return backgroundOracleSummaryJSON(normalizedToolName: normalizedToolName, statusWord: statusWord, rawObject: rawObject)
+        }
         var object = genericSummaryObject(
             normalizedToolName: normalizedToolName,
             statusWord: statusWord,

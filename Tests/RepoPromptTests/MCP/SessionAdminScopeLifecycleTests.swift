@@ -1,7 +1,10 @@
 import Foundation
 import MCP
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+@testable import RepoPromptMCPServer
 import RepoPromptPersistence
 import RepoPromptVCS
 import XCTest
@@ -6057,7 +6060,11 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         // A genuinely loaded duplicate is still ambiguous, even when its session ID matches.
         let duplicate = AgentModeViewModel.TabSession(tabID: fixture.tab)
         second.agentModeViewModel.test_installLiveSession(duplicate)
-        _ = try XCTUnwrap(second.agentModeViewModel.test_installPersistentSessionBinding(sessionID: fixture.overseer, on: duplicate))
+        XCTAssertEqual(second.agentModeViewModel.test_bindingRejection(sessionID: fixture.overseer, on: duplicate), .conflictingWriter)
+        XCTAssertNil(second.agentModeViewModel.test_installPersistentSessionBinding(sessionID: fixture.overseer, on: duplicate))
+        XCTAssertNil(duplicate.persistentSessionBindingIdentity)
+        // Exercise legacy corruption only after proving ordinary writer admission refuses it.
+        duplicate.testInstallPersistentSessionBinding(sessionID: fixture.overseer)
         XCTAssertNil(AgentSessionAdministrationFrontDoor.liveExplicitBinding(forTab: fixture.tab))
         await fixture.approveAndApply(cardID)
         XCTAssertEqual(cardState(), .pending)
@@ -7336,6 +7343,10 @@ final class DelegationCommitFenceTests: XCTestCase {
         await second.workspaceManager.awaitInitialized()
         let requester = UUID()
         let catalogTab = ComposeTabState(name: "Catalog-only requester", activeAgentSessionID: requester)
+        var originalWorkspace = WorkspaceModel(name: "Original requester", repoPaths: [], isSavedWorkspace: false)
+        originalWorkspace.isEphemeral = true
+        originalWorkspace.composeTabs = [catalogTab]
+        first.workspaceManager.workspaces.append(originalWorkspace)
         let tab = catalogTab.id
         let session = AgentModeViewModel.TabSession(tabID: tab)
         first.agentModeViewModel.test_installLiveSession(session)
@@ -7377,17 +7388,29 @@ final class DelegationCommitFenceTests: XCTestCase {
         XCTAssertEqual(runtime.requests[request.id]?.state, .pending)
         XCTAssertFalse(runtime.hasLiveScope(grantedTo: requester))
 
+        let originalBinding = try XCTUnwrap(first.agentModeViewModel.test_installPersistentSessionBinding(sessionID: requester, on: session))
+        guard case let .unique(originalWriter) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: requester) else {
+            return XCTFail("The original presenter must have the exact writer")
+        }
         let otherSession = AgentModeViewModel.TabSession(tabID: tab)
         second.agentModeViewModel.test_installLiveSession(otherSession)
-        _ = try XCTUnwrap(second.agentModeViewModel.test_installPersistentSessionBinding(sessionID: requester, on: otherSession))
+        XCTAssertEqual(second.agentModeViewModel.test_bindingRejection(sessionID: requester, on: otherSession), .conflictingWriter)
+        XCTAssertNil(second.agentModeViewModel.test_installPersistentSessionBinding(sessionID: requester, on: otherSession))
+        XCTAssertNil(otherSession.persistentSessionBindingIdentity)
+        XCTAssertNil(otherSession.activeAgentSessionID)
+        XCTAssertEqual(session.persistentSessionBindingIdentity, originalBinding)
+        XCTAssertTrue(originalWriter.isCurrent, "refusal cannot replace or invalidate the originating writer")
+        guard case let .unique(currentWriter) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: requester) else {
+            return XCTFail("The refused presenter must leave no claim")
+        }
+        XCTAssertEqual(currentWriter.identity, originalWriter.identity)
+        XCTAssertTrue(currentWriter.session === session)
         windows = [second]
         XCTAssertFalse(approve(in: second), "matching IDs in a different physical window are not the presented request")
-        windows = [first]
-        _ = try XCTUnwrap(first.agentModeViewModel.test_installPersistentSessionBinding(sessionID: requester, on: session))
         windows = [first, second]
-        XCTAssertFalse(approve(in: first), "ambiguous cross-window tab ownership fails closed")
-        windows = [first]
-        XCTAssertTrue(approve(in: first), "the original physical window's current explicit binding can approve")
+        XCTAssertFalse(approve(in: second), "a refused second presenter cannot approve")
+        XCTAssertEqual(runtime.requests[request.id]?.state, .pending)
+        XCTAssertTrue(approve(in: first), "the original physical window's current explicit binding can approve despite a metadata replica")
         XCTAssertTrue(runtime.hasLiveScope(grantedTo: requester))
     }
 
@@ -8823,10 +8846,16 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             let savedWorkspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
             for id in [historical, stashed] {
                 let carrier = try XCTUnwrap(fixture.indexEntries[id])
-                let url = try await AgentSessionDataService.shared.saveAgentSession(AgentSession(
+                var payload = AgentSession(
                     id: id, workspaceID: savedWorkspace.id, composeTabID: carrier.tabID,
                     name: carrier.name, agentKind: "claudeCode", agentModel: "", isMCPOriginated: false
-                ), for: savedWorkspace)
+                )
+                // The index and durable payload must describe the same provenance.
+                payload.parentSessionID = carrier.parentSessionID
+                payload.createdByOverseerSessionID = carrier.createdByOverseerSessionID
+                payload.organizationalParentID = carrier.organizationalParentID
+                payload.delegationScopeID = carrier.delegationScopeID
+                let url = try await AgentSessionDataService.shared.saveAgentSession(payload, for: savedWorkspace)
                 addTeardownBlock { try? FileManager.default.removeItem(at: url) }
             }
             let vm = fixture.window.agentModeViewModel
@@ -8839,10 +8868,20 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             let runtimeCount = vm.sessions.count
             for id in [historical, stashed] {
                 let result = await WindowStatesManager.shared.resolveSavedOversightLocation(id)
-                guard case let .success(location) = result else { return XCTFail("\(result)") }
+                guard case let .success(location) = result else { return XCTFail("\(id == historical ? "historical" : "stashed"): \(result)") }
                 XCTAssertEqual(location.entry.id, id)
                 XCTAssertTrue(location.isCurrent)
                 XCTAssertNil(WindowStatesManager.shared.preparedOversightWindows[id], "Metadata lookup must not create a runtime")
+                if id == stashed {
+                    var conflicting = location.entry
+                    conflicting.parentSessionID = UUID()
+                    let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: savedWorkspace.id, activationEpoch: 1)
+                    var entries = fixture.indexEntries
+                    entries[id] = conflicting
+                    vm.test_installSessionIndexSnapshot(entries, owner: owner, latestOwner: owner, activeWorkspace: savedWorkspace)
+                    let mismatch = await WindowStatesManager.shared.resolveSavedOversightLocation(id)
+                    guard case .failure(.changed) = mismatch else { return XCTFail("Conflicting provenance must fail closed: \(mismatch)") }
+                }
             }
             XCTAssertTrue(AgentSessionLinkRuntimeBridge.shared.delegationScopes.pendingRequests(forTab: tab.id, sessionID: current).isEmpty)
             XCTAssertEqual(vm.sessions.count, runtimeCount)
@@ -8960,6 +8999,15 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             }
             try observerFixture.installCarriers()
             try targetFixture.installCarriers()
+            // This test exercises reduced consent for a saved target, not the earlier
+            // missing-target refusal. An in-memory inventory row is not saved authority.
+            let targetTab = try XCTUnwrap(targetFixture.carriers?.composeTabs.first)
+            let targetWorkspace = try XCTUnwrap(targetFixture.window.workspaceManager.activeWorkspace)
+            let targetID = try XCTUnwrap(targetTab.activeAgentSessionID)
+            _ = try await AgentSessionDataService.shared.saveAgentSession(
+                AgentSession(id: targetID, workspaceID: targetWorkspace.id, composeTabID: targetTab.id, name: targetTab.name),
+                for: targetWorkspace
+            )
             let vm = observerFixture.window.agentModeViewModel
             let tab = try XCTUnwrap(observerFixture.carriers?.composeTabs.first)
             let sessionID = try XCTUnwrap(tab.activeAgentSessionID)
@@ -8971,13 +9019,23 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             let target = try XCTUnwrap(targetFixture.carriers?.composeTabs.first?.activeAgentSessionID)
             let bridge = AgentSessionLinkRuntimeBridge.shared
             var notices: [String] = []
+            let previousGlobal = bridge.delegationScopes.isGlobalAutoApproveEnabled
+            bridge.delegationScopes.isGlobalAutoApproveEnabled = { false }
             bridge.delegationScopes.test_scopeDecision = { _, text in notices.append(text) }
-            addTeardownBlock { @MainActor in bridge.delegationScopes.test_scopeDecision = nil }
+            addTeardownBlock { @MainActor in
+                bridge.delegationScopes.test_scopeDecision = nil
+                for scope in bridge.delegationScopes.allLiveScopes() where scope.grant.granteeSessionID == sessionID {
+                    bridge.delegationScopes.revoke(scopeID: scope.id)
+                }
+                bridge.delegationScopes.isGlobalAutoApproveEnabled = previousGlobal
+            }
             let response = await bridge.requestTargetedOversight(observer: endpoint, targetSessionID: target, message: "say hi", idempotencyKey: UUID().uuidString)
-            guard case let .string(rawID) = response.objectValue?["request_id"], let id = UUID(uuidString: rawID) else { return XCTFail("Expected one card") }
+            guard case let .string(rawID) = response.objectValue?["request_id"], let id = UUID(uuidString: rawID) else { return XCTFail("Expected one card; received \(response)") }
             _ = try bridge.delegationScopes.approve(requestID: id, capabilities: [.observe]).get()
             try await AsyncTestWait.waitUntil("precise reduced-consent notice") { notices.contains { $0.contains("missing_capabilities=control,restructure") } }
             XCTAssertFalse(notices.contains { $0.contains("task_delivered") || $0.contains("caller_changed_or_scope_revoked") })
+            let link = await bridge.delegationActiveLink(observerSessionID: sessionID, targetSessionID: target)
+            XCTAssertNil(link, "Reduced consent must not establish a management link")
         }
     }
 
@@ -9096,6 +9154,22 @@ final class SessionAdminInventoryReadTests: XCTestCase {
 
     func testPreparedSavedOwnerIsReleasedAfterLinkRetirement() async throws {
         try await assertExactTargetFlow(placement: "historical", retirement: "retire")
+    }
+
+    func testPreparedOwnerRetirementBlocksAdmissionAndResumesLatestVisitAfterDrain() async throws {
+        try await assertExactTargetFlow(placement: "historical", retirement: "retire-during-visit")
+    }
+
+    func testPreparedOwnerFailedFinalSaveRetainsWriterAndVisitUntilExplicitRetry() async throws {
+        try await assertExactTargetFlow(placement: "historical", retirement: "retire-save-failure")
+    }
+
+    func testPreparedOwnerHandoffSaveFailureRetainsWriterWithoutCleanupRetryLoop() async throws {
+        try await assertExactTargetFlow(placement: "historical", retirement: "handoff-save-failure")
+    }
+
+    func testPreparedOwnerDeletionCommitReleasesPreviouslyBlockedDrain() async throws {
+        try await assertExactTargetFlow(placement: "historical", retirement: "delete-during-drain")
     }
 
     func testPreparedSavedOwnerIsReleasedAfterTargetDeletion() async throws {
@@ -9855,6 +9929,116 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     manager.schedulePreparedOversightCleanup()
                     XCTAssertNotNil(manager.preparedOversightWindows[targetID], "UI binding changes do not withdraw live consent")
                     _ = bridge.delegationScopes.revoke(scopeID: granted.id)
+                case "retire-during-visit", "retire-save-failure":
+                    let owner = try XCTUnwrap(manager.preparedOversightWindows[targetID])
+                    let ownedSession = try XCTUnwrap(targetVM.sessions[targetTab.id])
+                    var release: CheckedContinuation<Void, Never>?
+                    var holdNextSave = true
+                    var failNextSave = retirement == "retire-save-failure"
+                    defer { release?.resume() }
+                    targetVM.test_setAgentSessionSaver { payload, borrowedWorkspace, counts in
+                        if holdNextSave {
+                            holdNextSave = false
+                            await withCheckedContinuation { release = $0 }
+                        }
+                        if failNextSave {
+                            failNextSave = false
+                            throw CocoaError(.fileWriteNoPermission)
+                        }
+                        return try await AgentSessionDataService.shared.saveAgentSession(payload, for: borrowedWorkspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: counts)
+                    }
+                    ownedSession.isDirty = true
+                    _ = bridge.delegationScopes.revoke(scopeID: granted.id)
+                    manager.schedulePreparedOversightCleanup()
+                    try await AsyncTestWait.waitUntil("retiring owner is held inside final storage") { release != nil }
+                    XCTAssertNil(manager.preparedOversightWindows[targetID])
+                    XCTAssertTrue(manager.retiringPreparedOversightWindows[targetID] === owner)
+                    XCTAssertTrue(manager.hasPreparedRuntime(targetID))
+                    let prematureVisit = await manager.releasePreparedOversightOwnerForVisit(sessionID: targetID)
+                    XCTAssertFalse(prematureVisit)
+                    let prematurePrepare = await manager.prepareSavedOversightTarget(targetID, isStillAuthorized: { true })
+                    guard case .failure(.changed) = prematurePrepare else { return XCTFail("Draining owner cannot be replaced") }
+                    var visits: [String] = []
+                    manager.queuePreparedRuntimeVisit(targetID) { visits.append("obsolete") }
+                    manager.queuePreparedRuntimeVisit(targetID) {
+                        XCTAssertFalse(manager.hasPreparedRuntime(targetID))
+                        guard case .unavailable(.absent) = AgentSessionRuntimeStore.shared.resolveWriter(workspaceID: workspace.id, sessionID: targetID) else {
+                            return XCTFail("The old exact writer must be released before a successor visit")
+                        }
+                        visits.append("latest")
+                    }
+                    XCTAssertTrue(visits.isEmpty)
+                    release?.resume()
+                    release = nil
+                    await manager.preparedOversightCleanupTask?.value
+                    if retirement == "retire-save-failure" {
+                        XCTAssertTrue(visits.isEmpty, "Failed durability must not run the queued visit")
+                        XCTAssertTrue(manager.hasPreparedRuntime(targetID))
+                        XCTAssertTrue(ownedSession.isDirty)
+                        XCTAssertTrue(manager.retiringPreparedOversightWindows[targetID] === owner)
+                        let retried = await manager.releasePreparedOversightOwnerForVisit(sessionID: targetID)
+                        XCTAssertTrue(retried, "An explicit visit retries the actual final save")
+                    }
+                    XCTAssertEqual(visits, retirement == "retire-save-failure" ? [] : ["latest"], "An explicit retry owns its activation and supersedes a queued visit")
+                    XCTAssertNil(manager.preparedOversightPendingVisits[targetID])
+                    XCTAssertFalse(ownedSession.isDirty)
+                    XCTAssertNil(manager.retiringPreparedOversightWindows[targetID])
+                    XCTAssertTrue(owner.agentModeViewModel.sessions.isEmpty, "Retained presentation cannot retain a writer claim")
+                case "handoff-save-failure":
+                    let owner = try XCTUnwrap(manager.preparedOversightWindows[targetID])
+                    let ownedSession = try XCTUnwrap(targetVM.sessions[targetTab.id])
+                    let readinessChanged = AgentSessionLinkCandidateReadinessSignal.onChange
+                    var injectDirtyClose = true
+                    AgentSessionLinkCandidateReadinessSignal.onChange = {
+                        if owner.isClosing, injectDirtyClose {
+                            injectDirtyClose = false
+                            ownedSession.isDirty = true
+                        }
+                        readinessChanged?()
+                    }
+                    defer { AgentSessionLinkCandidateReadinessSignal.onChange = readinessChanged }
+                    var failedSaves = 0
+                    targetVM.test_setAgentSessionSaver { [weak owner] payload, borrowedWorkspace, counts in
+                        if owner?.isClosing == true, failedSaves == 0 {
+                            failedSaves += 1
+                            throw CocoaError(.fileWriteNoPermission)
+                        }
+                        return try await AgentSessionDataService.shared.saveAgentSession(payload, for: borrowedWorkspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: counts)
+                    }
+                    let released = await manager.releasePreparedOversightOwnerForVisit(sessionID: targetID)
+                    XCTAssertFalse(released)
+                    XCTAssertEqual(failedSaves, 1)
+                    XCTAssertNil(manager.preparedOversightWindows[targetID])
+                    XCTAssertTrue(manager.retiringPreparedOversightWindows[targetID] === owner)
+                    XCTAssertTrue(ownedSession.isDirty)
+                    var visitRan = false
+                    manager.queuePreparedRuntimeVisit(targetID) { visitRan = true }
+                    await manager.preparedOversightCleanupTask?.value
+                    XCTAssertFalse(visitRan)
+                    XCTAssertTrue(ownedSession.isDirty, "Cleanup must not retry a failed handoff save")
+                    let retry = await manager.releasePreparedOversightOwnerForVisit(sessionID: targetID)
+                    XCTAssertTrue(retry)
+                    XCTAssertFalse(visitRan, "The explicit caller owns the new visit")
+                    XCTAssertNil(manager.preparedOversightPendingVisits[targetID])
+                case "delete-during-drain":
+                    let owner = try XCTUnwrap(manager.preparedOversightWindows[targetID])
+                    let ownedSession = try XCTUnwrap(targetVM.sessions[targetTab.id])
+                    ownedSession.isDirty = true
+                    let registry = AgentSessionDeletionRegistry.shared
+                    let token = try registry.beginDurableDeletion(sessionID: targetID)
+                    manager.schedulePreparedOversightCleanup()
+                    await manager.preparedOversightCleanupTask?.value
+                    XCTAssertTrue(manager.retiringPreparedOversightWindows[targetID] === owner)
+                    XCTAssertTrue(manager.hasPreparedRuntime(targetID))
+                    var visited = false
+                    manager.queuePreparedRuntimeVisit(targetID) { visited = true }
+                    try FileManager.default.removeItem(at: savedURL)
+                    await registry.didCommitDurableDeletion(token)
+                    await manager.preparedOversightCleanupTask?.value
+                    XCTAssertNil(manager.retiringPreparedOversightWindows[targetID])
+                    XCTAssertFalse(manager.hasPreparedRuntime(targetID))
+                    XCTAssertFalse(visited, "A deleted target must not be hydrated by a deferred visit")
+                    XCTAssertNil(manager.preparedOversightPendingVisits[targetID])
                 case "blocked-termination":
                     var release: CheckedContinuation<Void, Never>?
                     var shouldBlock = true

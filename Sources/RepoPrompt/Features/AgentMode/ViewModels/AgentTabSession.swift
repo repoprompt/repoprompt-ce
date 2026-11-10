@@ -1,8 +1,13 @@
 import Combine
 import Foundation
 import MCP
+import RepoPromptACPProviders
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
+import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
+import RepoPromptMCPServer
 import RepoPromptSettingsCore
 
 /// Shared only by the existing wake attempt and callback-capable producer wrappers. No claim/cache
@@ -238,7 +243,7 @@ final class AgentTabSession: ObservableObject {
     private var toolCorrelationIndexes = ToolCorrelationIndexes()
     private var nextEphemeralToolResultPayloadRevision: Int = 1
     var rawToolResultPayloadRenderRevisionByItemID: [UUID: Int] = [:]
-    var onSourceItemsChanged: ((AgentTabSession, AgentModeViewModel.SourceItemsMutation) -> Void)?
+    var onSourceItemsChanged: ((AgentTabSession, AgentSourceItemsMutation) -> Void)?
     var onRunStateChanged: ((AgentTabSession) -> Void)?
     /// Activation went set → cleared/replaced. Fired synchronously from `oversight.didSet`; never
     /// for nil → nil or nil → set.
@@ -535,11 +540,10 @@ final class AgentTabSession: ObservableObject {
 
     var applyEditsApprovalSubscriptionID: UUID?
     var applyEditsApprovalSubscriptionTask: Task<Void, Never>?
-    var worktreeMergeReviewContinuation: CheckedContinuation<WorktreeMergeReviewDecision, Never>?
-    var worktreeMergeReviewTimeoutTask: Task<Void, Never>?
+    var worktreeMergeReviewWait: AgentWorktreeMergeReviewWait?
     /// External MCP control attachment. Its presence and effective task label determine whether this
     /// exact session may act as an oversight observer.
-    var mcpControlContext: AgentModeViewModel.AgentMCPControlContext? {
+    var mcpControlContext: AgentMCPControlContext? {
         didSet {
             if mcpControlContext != nil { oversight.overseerActivation = nil }
             guard oldValue?.taskLabelKind != mcpControlContext?.taskLabelKind
@@ -766,231 +770,99 @@ final class AgentTabSession: ObservableObject {
         }
     }
 
-    struct CodexPendingAuthRetryTurn: Equatable {
-        /// Undecorated provider text, exactly as every other Codex buffer stores it.
-        var text: String
-        var attachments: [AgentFileAttachment]
-        var model: String?
-        var reasoningEffort: String?
-        var serviceTier: String?
-        var attachmentReservationID: UUID?
-        var expectedTurnID: String?
-        var auditTurnID: UUID?
-        var autoEffortApplied = false
-        var retryAttempted: Bool = false
-        /// Final monitoring identity composed for the original physical dispatch, if any.
-        var monitoringDispatchID: AgentSessionLinkPromptDispatchID?
-        var monitoringDispatchContext: AgentSessionLinkDispatchContext?
-        /// Accepted oversight claim from the original dispatch, retained so managed-auth replay can
-        /// attach the byte-equivalent supplement without acknowledging it twice.
-        var monitoringClaim: AgentSessionLinkOutboundPromptClaim?
+    // Source compatibility only. Turn storage and its value vocabulary live with the Codex runtime.
+    typealias CodexPendingAuthRetryTurn = CodexTurnRuntimeState.PendingAuthRetryTurn
+    typealias CodexTurnKind = CodexTurnRuntimeState.TurnKind
+    typealias CodexHookGateBindingIdentity = CodexTurnRuntimeState.HookGateBindingIdentity
+    typealias CodexAuthoritativeTurnIdentity = CodexTurnRuntimeState.AuthoritativeTurnIdentity
+    typealias CodexAnonymousTurnLiveness = CodexTurnRuntimeState.AnonymousTurnLiveness
+    typealias CodexFallbackOrigin = CodexTurnRuntimeState.FallbackOrigin
+    typealias CodexDispatchSerialGate = CodexTurnRuntimeState.DispatchSerialGate
+    typealias CodexFallbackReason = CodexTurnRuntimeState.FallbackReason
+    typealias CodexFallbackSubmissionContext = CodexTurnRuntimeState.FallbackSubmissionContext
+    typealias CodexFallbackBlockingTurn = CodexTurnRuntimeState.FallbackBlockingTurn
+    typealias CodexPendingSteerLifecycleReconciliation = CodexTurnRuntimeState.PendingSteerLifecycleReconciliation
+    typealias CodexFallbackQueueState = CodexTurnRuntimeState.FallbackQueueState
+    typealias CodexFallbackQueueEntry = CodexTurnRuntimeState.FallbackQueueEntry
+
+    let codexTurnState = CodexTurnRuntimeState()
+
+    var codexPendingTurnKind: CodexTurnKind? {
+        get { codexTurnState.pendingTurnKind }
+        set { codexTurnState.pendingTurnKind = newValue }
     }
 
-    enum CodexTurnKind: String {
-        case user
-        case compact
-        case review
-        case unknown
+    var codexPendingAuthRetryTurn: CodexPendingAuthRetryTurn? {
+        get { codexTurnState.pendingAuthRetryTurn }
+        set { codexTurnState.pendingAuthRetryTurn = newValue }
     }
 
-    struct CodexHookGateBindingIdentity: Equatable {
-        let controllerInstanceID: ObjectIdentifier
-        let controllerGeneration: UUID
+    var codexAuthoritativeActiveTurn: CodexAuthoritativeTurnIdentity? {
+        get { codexTurnState.authoritativeActiveTurn }
+        set { codexTurnState.authoritativeActiveTurn = newValue }
     }
 
-    struct CodexAuthoritativeTurnIdentity: Equatable {
-        let threadID: String
-        let turnID: String
-        let turnKind: CodexTurnKind
-        let controllerInstanceID: ObjectIdentifier
-        let controllerGeneration: UUID
-        let runID: UUID?
-        let runAttemptID: UUID
+    var codexAnonymousActiveTurn: CodexAnonymousTurnLiveness? {
+        get { codexTurnState.anonymousActiveTurn }
+        set { codexTurnState.anonymousActiveTurn = newValue }
     }
 
-    struct CodexAnonymousTurnLiveness: Equatable {
-        let threadID: String
-        let turnKind: CodexTurnKind
-        let controllerInstanceID: ObjectIdentifier
-        let controllerGeneration: UUID
-        let runID: UUID?
-        let runAttemptID: UUID
+    var codexRoutingObservedTurnID: String? {
+        get { codexTurnState.routingObservedTurnID }
+        set { codexTurnState.routingObservedTurnID = newValue }
     }
 
-    enum CodexFallbackOrigin: Equatable {
-        case manual
-        case mcp(attemptID: UUID)
-
-        var isMCP: Bool {
-            switch self {
-            case .mcp:
-                true
-            case .manual:
-                false
-            }
-        }
+    var codexPendingSteerLifecycleReconciliation: CodexPendingSteerLifecycleReconciliation? {
+        get { codexTurnState.pendingSteerLifecycleReconciliation }
+        set { codexTurnState.pendingSteerLifecycleReconciliation = newValue }
     }
 
-    @MainActor
-    final class CodexDispatchSerialGate {
-        private var nextTicket: UInt64 = 0
-        private var servingTicket: UInt64 = 0
-        private var cancelledTickets: Set<UInt64> = []
-        private var waiters: [UInt64: CheckedContinuation<Bool, Never>] = [:]
-
-        func issueTicket() -> UInt64 {
-            defer { nextTicket &+= 1 }
-            return nextTicket
-        }
-
-        func awaitTurn(_ ticket: UInt64) async -> Bool {
-            if cancelledTickets.remove(ticket) != nil {
-                advancePastCancelledTickets()
-                return false
-            }
-            if ticket == servingTicket {
-                return true
-            }
-            return await withCheckedContinuation { continuation in
-                waiters[ticket] = continuation
-            }
-        }
-
-        func finish(_ ticket: UInt64) {
-            guard ticket == servingTicket else { return }
-            servingTicket &+= 1
-            advancePastCancelledTickets()
-            waiters.removeValue(forKey: servingTicket)?.resume(returning: true)
-        }
-
-        func cancel(_ ticket: UInt64) {
-            if let waiter = waiters.removeValue(forKey: ticket) {
-                waiter.resume(returning: false)
-            }
-            cancelledTickets.insert(ticket)
-            guard ticket == servingTicket else { return }
-            advancePastCancelledTickets()
-            waiters.removeValue(forKey: servingTicket)?.resume(returning: true)
-        }
-
-        private func advancePastCancelledTickets() {
-            while cancelledTickets.remove(servingTicket) != nil {
-                servingTicket &+= 1
-            }
-        }
-    }
-
-    enum CodexFallbackReason: Equatable {
-        case activeWithoutAuthoritativeIdentity
-        case staleAuthoritativeIdentity
-        case nonSteerableTurn(kind: CodexTurnKind)
-        case noActiveTurn(failure: CodexAppServerClient.RequestFailure)
-        case expectedTurnMismatch(
-            expectedTurnID: String,
-            actualTurnID: String?,
-            failure: CodexAppServerClient.RequestFailure
-        )
-        case activeTurnNotSteerable(
-            turnKind: String?,
-            failure: CodexAppServerClient.RequestFailure
-        )
-    }
-
-    struct CodexFallbackSubmissionContext: Equatable {
-        let queueID: UUID
-        let providerText: String
-        let attachments: [AgentFileAttachment]
-        let taggedFileAttachments: [AgentTaggedFileAttachment]
-        let draftText: String
-        let optimisticUserItemID: UUID?
-        let origin: CodexFallbackOrigin
-        let dispatchTicket: UInt64?
-        var stopFence: AgentRunStartStopFence?
-        /// Explicit composer provenance; absent/internal contexts never inherit companion access.
-        var isLocalUserInput: Bool = false
-    }
-
-    struct CodexFallbackBlockingTurn: Equatable {
-        let threadID: String
-        let turnID: String
-        let controllerInstanceID: ObjectIdentifier
-        let controllerGeneration: UUID
-        let runID: UUID?
-        let runAttemptID: UUID
-    }
-
-    struct CodexPendingSteerLifecycleReconciliation: Equatable {
-        let priorIdentity: CodexAuthoritativeTurnIdentity
-        let acceptedDispatchTurnID: String
-    }
-
-    enum CodexFallbackQueueState: Equatable {
-        case queued
-        case eligibleForSuccessor(completedTurnID: String)
-        case dispatching
-        case awaitingLifecycleStart
-        case lifecycleStarted
-    }
-
-    struct CodexFallbackQueueEntry: Equatable, Identifiable {
-        let id: UUID
-        let providerText: String
-        let attachments: [AgentFileAttachment]
-        let taggedFileAttachments: [AgentTaggedFileAttachment]
-        let model: String?
-        let reasoningEffort: String?
-        let serviceTier: String?
-        var autoEffortApplied = false
-        let attachmentReservationID: UUID?
-        let optimisticUserItemID: UUID?
-        let draftText: String
-        let origin: CodexFallbackOrigin
-        let fallbackReason: CodexFallbackReason
-        let originThreadID: String
-        let originControllerInstanceID: ObjectIdentifier
-        let originControllerGeneration: UUID
-        let originRunID: UUID
-        let originRunAttemptID: UUID
-        var blockingTurn: CodexFallbackBlockingTurn?
-        var state: CodexFallbackQueueState
-        var monitoringDispatchContext: AgentSessionLinkDispatchContext?
-        var stopFence: AgentRunStartStopFence?
-    }
-
-    var codexPendingTurnKind: CodexTurnKind?
-    var codexPendingAuthRetryTurn: CodexPendingAuthRetryTurn?
-    var codexAuthoritativeActiveTurn: CodexAuthoritativeTurnIdentity?
-    var codexAnonymousActiveTurn: CodexAnonymousTurnLiveness?
-    var codexRoutingObservedTurnID: String?
-    var codexPendingSteerLifecycleReconciliation: CodexPendingSteerLifecycleReconciliation?
-    var codexFallbackQueue: [CodexFallbackQueueEntry] = [] {
-        didSet { noteMonitorObservationInputsChanged() }
+    var codexFallbackQueue: [CodexFallbackQueueEntry] {
+        get { codexTurnState.fallbackQueue }
+        set { codexTurnState.fallbackQueue = newValue }
     }
 
     var codexFallbackDispatchInFlight: CodexFallbackQueueEntry? {
-        didSet { noteMonitorObservationInputsChanged() }
+        get { codexTurnState.fallbackDispatchInFlight }
+        set { codexTurnState.fallbackDispatchInFlight = newValue }
     }
 
-    /// Bridges queued follow-ups to a hook-gate owner's turn for as long as that turn has no
-    /// settled identity of its own. Whichever of the accepted `turn/start` receipt or the
-    /// lifecycle start arrives first supplies the value — they race, and the queue has to be
-    /// bound by then either way. It is transient by design: the turn's terminal event either
-    /// upgrades it to the identity-derived blocker or resolves the queue outright.
-    var codexFallbackHookGateOwnerBlocker: CodexFallbackBlockingTurn?
+    var codexFallbackHookGateOwnerBlocker: CodexFallbackBlockingTurn? {
+        get { codexTurnState.fallbackHookGateOwnerBlocker }
+        set { codexTurnState.fallbackHookGateOwnerBlocker = newValue }
+    }
+
     var codexFallbackPumpTask: Task<Void, Never>? {
-        didSet { noteMonitorObservationInputsChanged() }
+        get { codexTurnState.fallbackPumpTask }
+        set { codexTurnState.fallbackPumpTask = newValue }
     }
 
-    var codexFallbackSuccessorRetryTask: Task<Void, Never>?
-    let codexDispatchSerialGate = CodexDispatchSerialGate()
+    var codexFallbackSuccessorRetryTask: Task<Void, Never>? {
+        get { codexTurnState.fallbackSuccessorRetryTask }
+        set { codexTurnState.fallbackSuccessorRetryTask = newValue }
+    }
+
+    var codexDispatchSerialGate: CodexDispatchSerialGate {
+        codexTurnState.dispatchSerialGate
+    }
 
     /// Instruction steering coordination state
-    var instructionContinuation: CheckedContinuation<UserInstructionResponse, Error>? {
+    var instructionWait: AgentInstructionWait? {
         didSet { noteMonitorObservationInputsChanged() }
     }
 
-    var instructionTimeoutTask: Task<Void, Never>?
-    var instructionWaitID: UUID?
+    /// Read-only projections; installation, consumption and cleanup own the exact wait record.
+    var instructionContinuation: CheckedContinuation<UserInstructionResponse, Error>? {
+        instructionWait?.continuation
+    }
+
+    var instructionTimeoutTask: Task<Void, Never>? {
+        instructionWait?.timeoutTask
+    }
+
+    var instructionWaitID: UUID? {
+        instructionWait?.id
+    }
 
     /// Agent run — transient run-attempt lifecycle/settlement state is owned by
     /// the extracted `AgentRunAttemptLifecycle` facade. Run identity is
@@ -1114,6 +986,17 @@ final class AgentTabSession: ObservableObject {
         selectedAgent.usesClaudeTooling ? selectedClaudeEffortRaw : selectedReasoningEffortRaw
     }
 
+    /// Capture provider request values at dispatch, without exporting this mutable host object.
+    var acpRunInput: AgentACPRunInput {
+        AgentACPRunInput(
+            agent: selectedAgent,
+            selectedModelRaw: selectedModelRaw,
+            providerSessionID: providerSessionID,
+            taskLabelKind: mcpControlContext?.taskLabelKind,
+            modelParameterSelections: acpModelParameterSelections
+        )
+    }
+
     private var acpModelParameterSelectionRevisionByIdentity: [ACPModelParameterIdentity: UInt64] = [:]
     private var nextACPModelParameterSelectionRevision: UInt64 = 0
     var acpModelParameterSelections: [ACPModelParameterSelection] = [] {
@@ -1181,7 +1064,10 @@ final class AgentTabSession: ObservableObject {
     var attachmentTurnState: AgentModeViewModel.AttachmentTurnState = .idle
     /// `AgentSessions/attachments` of the workspace this turn was sent from, captured when its
     /// images are reserved so a mid-turn workspace switch cannot retain them elsewhere.
-    var attachmentRetentionRoot: URL?
+    var attachmentRetentionPlacement: AgentSessionAttachmentPlacement?
+    var attachmentRetentionRoot: URL? {
+        attachmentRetentionPlacement?.location.retainedRoot
+    }
 
     /// Provider session ID for resumption (e.g., Claude CLI session_id)
     var providerSessionID: String?
@@ -1311,7 +1197,10 @@ final class AgentTabSession: ObservableObject {
     var contextCompactedAt: Date? {
         didSet {
             // A compaction invalidates the count; the window is unchanged.
-            if contextCompactedAt != oldValue { vouchedContextCount = nil }
+            if contextCompactedAt != oldValue {
+                vouchedContextCount = nil
+                oracleBackgroundAwareness.resetContext()
+            }
         }
     }
 
@@ -1571,6 +1460,20 @@ final class AgentTabSession: ObservableObject {
     ///
     /// Never persisted: it describes a live process-local controller generation.
     var codexSessionLinkCatalogRepairCycle: AgentSessionLinkCodexCatalogRepair.Cycle?
+    /// Retained across controller replacements, but not persisted across cold restoration.
+    var codexContextWindowSelection: CodexContextWindowPreferences.Selection?
+
+    func clearCodexConversationIdentity() {
+        codexConversationID = nil
+        codexContextWindowSelection = nil
+    }
+
+    func codexContextWindowForBinding(current: CodexContextWindowPreferences.Selection) -> CodexContextWindowPreferences.Selection {
+        if let selection = codexContextWindowSelection { return selection }
+        codexContextWindowSelection = current
+        return current
+    }
+
     /// The permission profile the current Codex controller was created with.
     /// Used to detect when MCP control changes require controller recycling.
     var codexControllerPermissionProfile: AgentModeViewModel.AgentPermissionProfile?
@@ -1600,6 +1503,8 @@ final class AgentTabSession: ObservableObject {
 
     var claudeController: (any NativeAgentRuntimeControlling)?
     var acpController: ACPAgentSessionController?
+    /// Retained input, not liveness: use only with its exact ownership and restoration binding.
+    var acpWorkspaceAdmission: AgentACPWorkspaceAdmission?
 
     var codexEventTask: Task<Void, Never>?
     var codexEventTaskRunID: UUID?
@@ -1643,8 +1548,10 @@ final class AgentTabSession: ObservableObject {
 
     /// Handoff payload (injected into provider-facing text on first user send).
     /// Cleared only after the provider accepts the turn.
-    var pendingHandoff: AgentModeViewModel.PendingHandoffState = .init() {
+    private(set) var pendingHandoffRevision: UInt64 = 0
+    var pendingHandoff: AgentPendingHandoffState = .init() {
         didSet {
+            if oldValue != pendingHandoff { pendingHandoffRevision &+= 1 }
             if oldValue.executionLocationFailure != pendingHandoff.executionLocationFailure
                 || oldValue.providerSwitchDelivery != pendingHandoff.providerSwitchDelivery
                 || oldValue.providerSwitchDispatch != pendingHandoff.providerSwitchDispatch
@@ -1712,9 +1619,13 @@ final class AgentTabSession: ObservableObject {
         hasSentFirstMessage && !pendingHandoff.defersProviderLockUntilSend
     }
 
-    // Persistence
-    /// Synchronous derived-index maintenance for the window owning this live object.
+    /// Persistence
+    /// Synchronous derived-index maintenance for the runtime store owning this live object.
     var persistentSessionBindingDidChange: (() -> Void)?
+    /// Process-local Oracle lifetime is independent of run attempts and parent provider teardown.
+    var oracleBackgroundOwner: OracleBackgroundInvocationRegistry.Owner?
+    var oracleBackgroundDrain: Task<Void, Never>?
+    var oracleBackgroundAwareness = OracleBackgroundAwareness()
     private(set) var persistentSessionBindingIdentity: AgentPersistentSessionBindingIdentity?
     var activeAgentSessionID: UUID? {
         persistentSessionBindingIdentity?.sessionID
@@ -1786,6 +1697,8 @@ final class AgentTabSession: ObservableObject {
     var lastUserMessageAt: Date?
     var lastCommandOutputSaveAt: Date?
     var saveDebounceTask: Task<Void, Never>?
+    /// Identifies a pending timer independently of the payload/save revision.
+    var saveDebounceRequestID: UUID?
     var isDirty: Bool = false {
         didSet {
             if isDirty {
@@ -1795,11 +1708,11 @@ final class AgentTabSession: ObservableObject {
     }
 
     var sourceItemsRevision: Int = 0
-    var pendingSourceItemsMutationSummary: AgentModeViewModel.PendingSourceItemsMutationSummary?
-    var pendingDerivedTranscriptRefreshReason: AgentModeViewModel.DerivedTranscriptRefreshReason?
+    var pendingSourceItemsMutationSummary: AgentPendingSourceItemsMutationSummary?
+    var pendingDerivedTranscriptRefreshReason: AgentDerivedTranscriptRefreshReason?
     var derivedTranscriptRefreshTask: Task<Void, Never>?
     var derivedTranscriptRefreshGeneration: UInt64 = 0
-    var derivedTranscriptSyncState: AgentModeViewModel.DerivedTranscriptSyncState?
+    var derivedTranscriptSyncState: AgentDerivedTranscriptSyncState?
     var pendingCommandRunningByKey: [String: CodexNativeSessionController.CommandExecutionRunningUpdate] = [:]
     var pendingCommandRunningFlushTask: Task<Void, Never>?
     var pendingCommandRunningFlushUsesLiveOutputDelay: Bool = false
@@ -1821,6 +1734,9 @@ final class AgentTabSession: ObservableObject {
     init(tabID: UUID, perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()) {
         self.tabID = tabID
         self.perfRecorder = perfRecorder
+        codexTurnState.onMonitorObservationInputsChanged = { [weak self] in
+            self?.noteMonitorObservationInputsChanged()
+        }
         // The lifecycle facade owns terminal-commit phase state, so bridge it into the explicit
         // oversight change channel from that authority.
         runLifecycle.onTerminalCommitPhaseChange = { [weak self] in
@@ -1909,6 +1825,7 @@ final class AgentTabSession: ObservableObject {
         guard codexHookGateDispatchOwnerToken == token else { return }
         codexHookGateDispatchOwnerToken = nil
         codexHookGateActiveBinding = nil
+        codexHookGateOrigin = nil
         let continuations = Array(codexHookGateCoalescedContinuations.values)
         codexHookGateCoalescedContinuations.removeAll()
         for continuation in continuations {
@@ -1942,10 +1859,19 @@ final class AgentTabSession: ObservableObject {
         return true
     }
 
+    struct CodexHookGateOrigin: Equatable {
+        let writer: AgentSessionRuntimeStore.WriterIdentity
+        let runID: UUID?
+        let runAttemptID: UUID?
+    }
+
+    var codexHookGateOrigin: CodexHookGateOrigin?
+
     func resetCodexHookGateBinding() {
         _ = cancelCodexHookReview()
         codexHookGateInventoryFingerprint = nil
         codexHookGateActiveBinding = nil
+        codexHookGateOrigin = nil
         codexHookGateBindingMemo = nil
         codexHookGateAudit = nil
     }
@@ -2114,7 +2040,7 @@ final class AgentTabSession: ObservableObject {
     /// The view model additionally checks runtime-map ownership and the workspace carrier.
     func restoreReadinessAfterRefusedTransition(
         _ previousReadiness: AgentSessionRestorationReadiness,
-        expectedTransition: AgentModeViewModel.PersistentBindingTransitionToken
+        expectedTransition: AgentPersistentBindingTransitionToken
     ) {
         guard !bindingTransitionInProgress,
               persistentBindingTransitionToken() == expectedTransition,
@@ -2170,8 +2096,8 @@ final class AgentTabSession: ObservableObject {
             || !queuedMCPElicitationRequests.isEmpty
     }
 
-    func persistentBindingTransitionToken() -> AgentModeViewModel.PersistentBindingTransitionToken {
-        AgentModeViewModel.PersistentBindingTransitionToken(
+    func persistentBindingTransitionToken() -> AgentPersistentBindingTransitionToken {
+        AgentPersistentBindingTransitionToken(
             tabID: tabID,
             sessionIdentity: ObjectIdentifier(self),
             binding: persistentSessionBindingIdentity,
@@ -2750,7 +2676,7 @@ final class AgentTabSession: ObservableObject {
 
     private enum SourceItemsDispatch {
         case silent
-        case notify(AgentModeViewModel.SourceItemsMutation)
+        case notify(AgentSourceItemsMutation)
     }
 
     private enum SourceItemPayloadUpdate {
@@ -3142,7 +3068,7 @@ final class AgentTabSession: ObservableObject {
     }
 
     private func finishIncrementalSourceItemsMutation(
-        _ mutation: AgentModeViewModel.SourceItemsMutation
+        _ mutation: AgentSourceItemsMutation
     ) {
         switch mutation {
         case let .replace(index, _, _), let .mutate(index, _):
@@ -3266,7 +3192,7 @@ final class AgentTabSession: ObservableObject {
 
     @discardableResult
     func mutateItemsBatch(
-        mutation: AgentModeViewModel.SourceItemsMutation = .structural,
+        mutation: AgentSourceItemsMutation = .structural,
         touchActivity: Bool = true,
         preservesQuietRange: Bool = false,
         _ body: (inout [AgentChatItem]) -> Void
