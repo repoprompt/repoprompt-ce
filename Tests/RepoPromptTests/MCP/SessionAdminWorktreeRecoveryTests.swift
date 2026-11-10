@@ -725,11 +725,14 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
                 fixture.binding(logical: repos.alpha, worktree: repos.alphaPrime),
                 fixture.binding(logical: repos.beta, worktree: repos.betaPrime)
             ]
-            // A non-previewed saved operation fails only inside the saved-endpoint apply, after the host's
-            // capture-only admission; default election would refuse earlier with an ambiguity. Both endpoints sit
-            // inside workspace roots: the host admits a linked endpoint only when its own checkout root is a
-            // workspace repository, which is separate from #1431.
-            let operation = try Self.savedMergeOperation(source: repos.gamma, target: repos.alpha, status: .cancelled)
+            // A non-previewed saved operation fails inside saved-endpoint apply, after exact endpoint
+            // admission; default election would refuse earlier with ambiguity. Use real HEADs so this
+            // fixture tests operation-state refusal rather than a fabricated stale endpoint.
+            let operation = try Self.savedMergeOperation(
+                source: repos.gamma, target: repos.alpha, status: .cancelled,
+                sourceHead: fixture.git.runGit(["rev-parse", "HEAD"], at: repos.gamma).trimmingCharacters(in: .whitespacesAndNewlines),
+                targetHead: fixture.git.runGit(["rev-parse", "HEAD"], at: repos.alpha).trimmingCharacters(in: .whitespacesAndNewlines)
+            )
             fixture.session.worktreeMergeOperations = [operation]
             let text: String
             do {
@@ -1612,7 +1615,8 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
     }
 
     private static func savedMergeOperation(
-        source: URL, target: URL, status: AgentSessionWorktreeMergeOperation.Status
+        source: URL, target: URL, status: AgentSessionWorktreeMergeOperation.Status,
+        sourceHead: String = String(repeating: "a", count: 40), targetHead: String = String(repeating: "b", count: 40)
     ) throws -> AgentSessionWorktreeMergeOperation {
         func endpoint(_ root: URL, head: String) throws -> GitWorktreeMergeEndpoint {
             let identity = try XCTUnwrap(GitWorktreeIdentityResolver.resolve(atWorkTreeRoot: root))
@@ -1623,8 +1627,8 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
             )
         }
         let operationID = "merge_\(UUID().uuidString)"
-        let sourceEndpoint = try endpoint(source, head: String(repeating: "a", count: 40))
-        let targetEndpoint = try endpoint(target, head: String(repeating: "b", count: 40))
+        let sourceEndpoint = try endpoint(source, head: sourceHead)
+        let targetEndpoint = try endpoint(target, head: targetHead)
         let now = Date()
         let inspection = GitWorktreeMergeInspection(
             source: sourceEndpoint, target: targetEndpoint,

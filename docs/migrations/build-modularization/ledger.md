@@ -6923,6 +6923,25 @@ restoration reconciliation. No assertion or timeout budget was weakened. Both-pr
 per-file warning and broader integration gates for checkpoints 5–6 remain pending. No new push,
 full-suite, live-app, hosted-CI or full M9/#1406 completion is claimed.
 
+Checkpoint 6 qualification: both products `1244a70a-5aa3-4fb2-bbbf-75367152257b` passed;
+fresh compiler-index check passed **1,267/1,360 edges, 53/66 largest component**. Exact published
+base `401b23f00` products/tests (`4dd92380…`, `602c463f…`) and head product/test compilation
+show **13 → 12** distinct line/column/message warnings across the 19 changed Swift files:
+Host 2, VM 2, GitService 3 → 2, VCSService 1, scope-lifecycle tests 5, zero elsewhere.
+The removed GitService closure no longer produces its explicit-self warning. This is an incremental
+per-file comparison, not a clean whole-repository warning ratchet.
+
+Broad `000431b3-36eb-4e66-a695-773cf741c007` executed **2,537 tests**, **19 skipped**, with
+four assertions failing in two cases, in **1,503.246 seconds**; it is **not green**. Three assertions
+are the previously observed LiveDiscovery default-workspace CAS failure. The other exposed an old
+saved-endpoint fixture using fabricated HEAD hashes, now rejected by the earlier exact-identity
+fence. That fixture now supplies real Git HEADs while preserving its operation-state/default-election
+assertions; production code is unchanged. Final isolation `7a85f3b9-80a4-4fa1-90db-441606423067`
+passed **68 tests**, **four skipped**, zero failures in **231.453 seconds** (whole LiveDiscovery
+and worktree-recovery suites). This does not establish that the broad-load CAS intermittent is fixed.
+No assertion/timeout weakening or unrelated production repair was made. Publication remains gated
+by the overseer's #1681 CI timing; no push or full M9 completion is claimed here.
+
 #### M9.2b checkpoint 9 — hook-review runtime ownership (validated locally; push frozen)
 
 The hook gate's actual discovery, waiting, response, refresh and completion bodies now live in
