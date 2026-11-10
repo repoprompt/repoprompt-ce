@@ -6868,6 +6868,27 @@ Remaining M9.2f: merge preview/apply/continue/abort runtime ownership, physical 
 required acknowledgements and honest partial receipts. This checkpoint is not completion of M9.2
 or #1406. No hosted-CI, live-app, release or full-suite qualification is claimed.
 
+#### M9.2f checkpoint 5 — final Git and preview-artifact fences
+
+Optional callbacks now reach apply/continue/abort's first physical Git command after process
+admission and the existing mutation guard. They are explicit runner parameters, not inherited
+TaskLocals; apply's later commit does not repeat the first-effect callback. Worktree creation uses
+the same explicit runner path. Fenced continue propagates refusal/uncertain errors, and an abort
+whose final HEAD read fails retains its completed-abort fact and invalidates the VCS cache.
+
+Preview publication checks its callback after async inputs/graph collection and before ID allocation
+and writes. Typed partial receipts preserve the exact artifact directory and completed-write flags;
+a false completion flag does not assert that no partial filesystem effect occurred. Sidecar failure
+also retains the completed snapshot receipt. Legacy callback-free callers retain their contracts.
+
+Validation: scoped pinned formatting, strict lint and diff checks passed. Conductor
+`b7df30d9-17b7-4347-a1a9-6259c0d26cc6` passed **43 tests**, zero failures, in 30.220 seconds,
+covering merge review state, creation preconditions, tracked checkout cloning and pipe drain.
+The initial attempt failed compilation on the new internal error type's access level; that was
+corrected before the successful run. One implementation review was addressed. This checkpoint is
+local infrastructure only: actual merge command runtime ownership, front-door provenance and
+required-save acknowledgement remain in progress. No new push/full-suite/live-app/CI claim.
+
 #### M9.2b checkpoint 9 — hook-review runtime ownership (validated locally; push frozen)
 
 The hook gate's actual discovery, waiting, response, refresh and completion bodies now live in

@@ -770,7 +770,10 @@ public extension VCSService {
         return try await gitBackend().inspectWorktreeMerge(request)
     }
 
-    func previewGitWorktreeMerge(_ request: GitWorktreeMergePreviewRequest) async throws -> GitWorktreeMergePreview {
+    func previewGitWorktreeMerge(
+        _ request: GitWorktreeMergePreviewRequest,
+        beforeWrite: (@Sendable () async throws -> Void)? = nil
+    ) async throws -> GitWorktreeMergePreview {
         let inspection = try await inspectGitWorktreeMerge(.init(
             source: request.source,
             target: request.target,
@@ -781,7 +784,8 @@ public extension VCSService {
             try await GitWorktreeMergePreviewPublisher.shared.publish(
                 request: request,
                 inspection: inspection,
-                operationID: operationID
+                operationID: operationID,
+                beforeWrite: beforeWrite
             )
         } else {
             GitWorktreeMergePreviewArtifacts?.none
@@ -789,7 +793,10 @@ public extension VCSService {
         return GitWorktreeMergePreview(operationID: operationID, inspection: inspection, artifacts: artifacts)
     }
 
-    func applyGitWorktreeMerge(_ request: GitWorktreeMergeApplyRequest) async throws -> GitWorktreeMergeApplyResult {
+    func applyGitWorktreeMerge(
+        _ request: GitWorktreeMergeApplyRequest,
+        beforeCommit: (@Sendable () async throws -> Void)? = nil
+    ) async throws -> GitWorktreeMergeApplyResult {
         let inspection = request.preview.inspection
         try await requireGitMergeEndpoints(source: inspection.source, target: inspection.target)
         guard inspection.blockers.isEmpty else {
@@ -834,7 +841,8 @@ public extension VCSService {
             source: inspection.source,
             target: inspection.target,
             sourceHead: inspection.sourceHead,
-            message: message
+            message: message,
+            beforeCommit: beforeCommit
         )
         if !applied.state.conflictFiles.isEmpty {
             return GitWorktreeMergeApplyResult(
@@ -868,7 +876,10 @@ public extension VCSService {
         )
     }
 
-    func continueGitWorktreeMerge(_ request: GitWorktreeMergeContinueRequest) async throws -> GitWorktreeMergeApplyResult {
+    func continueGitWorktreeMerge(
+        _ request: GitWorktreeMergeContinueRequest,
+        beforeCommit: (@Sendable () async throws -> Void)? = nil
+    ) async throws -> GitWorktreeMergeApplyResult {
         try await requireGitMergeEndpoints(source: request.source, target: request.target)
         let message = mergeCommitMessage(
             request.commitMessage,
@@ -880,7 +891,8 @@ public extension VCSService {
             let commit = try await gitBackend().continueWorktreeMerge(
                 source: request.source,
                 target: request.target,
-                message: message
+                message: message,
+                beforeCommit: beforeCommit
             )
             invalidateCache(for: request.target.url)
             return GitWorktreeMergeApplyResult(
@@ -893,6 +905,9 @@ public extension VCSService {
                 mergeCommit: commit
             )
         } catch {
+            // A fenced caller owns the durable preparation and physical-attempt receipt. Do not
+            // collapse its admission refusal or an uncertain post-dispatch error into `.failed`.
+            if beforeCommit != nil { throw error }
             let state = try? await gitBackend().inspectMergeState(at: request.target.url)
             return GitWorktreeMergeApplyResult(
                 status: .failed,
@@ -906,11 +921,30 @@ public extension VCSService {
         }
     }
 
-    func abortGitWorktreeMerge(_ request: GitWorktreeMergeAbortRequest) async throws -> GitWorktreeMergeAbortResult {
+    internal struct WorktreeMergeAbortCompletionFailure: LocalizedError {
+        let target: GitWorktreeMergeEndpoint
+        let aborted: Bool
+        let detail: String
+
+        var errorDescription: String? {
+            "Git abort completed at \(target.path) (aborted=\(aborted)), but its final HEAD could not be read. \(detail)"
+        }
+    }
+
+    func abortGitWorktreeMerge(
+        _ request: GitWorktreeMergeAbortRequest,
+        beforeCommit: (@Sendable () async throws -> Void)? = nil
+    ) async throws -> GitWorktreeMergeAbortResult {
         try await requireGitMergeEndpoint(request.target, operation: "abort_worktree_merge")
-        let aborted = try await gitBackend().abortWorktreeMerge(target: request.target)
-        let targetHead = try await gitBackend().getHeadID(at: request.target.url)
+        let aborted = try await gitBackend().abortWorktreeMerge(target: request.target, beforeCommit: beforeCommit)
         invalidateCache(for: request.target.url)
+        let targetHead: String
+        do {
+            targetHead = try await gitBackend().getHeadID(at: request.target.url)
+        } catch {
+            guard beforeCommit != nil else { throw error }
+            throw WorktreeMergeAbortCompletionFailure(target: request.target, aborted: aborted, detail: error.localizedDescription)
+        }
         return GitWorktreeMergeAbortResult(
             aborted: aborted,
             target: request.target,

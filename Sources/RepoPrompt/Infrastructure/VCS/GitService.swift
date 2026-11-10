@@ -772,8 +772,6 @@ actor GitService: WorkspaceGitClient {
     /// Create a Git worktree and return best-effort `.worktreeinclude` copy details.
     /// Receipt observation is additive and fail-open: creation remains successful when
     /// authority or witness evidence cannot be proven.
-    @TaskLocal private static var worktreeCreationCommitFence: (@Sendable () async throws -> Void)?
-
     func createWorktreeWithResult(
         request: GitWorktreeCreateRequest,
         at repoURL: URL,
@@ -1015,9 +1013,7 @@ actor GitService: WorkspaceGitClient {
                     args.append(mutationRequest.path.standardizedFileURL.path)
                     if let baseRef = mutationRequest.baseRef, !baseRef.isEmpty { args.append(baseRef) }
 
-                    let (_, stderr, exitCode) = try await Self.$worktreeCreationCommitFence.withValue(beforeCommit) {
-                        try await runGit(args, at: repoURL)
-                    }
+                    let (_, stderr, exitCode) = try await runGit(args, at: repoURL, beforeCommit: beforeCommit)
                     guard exitCode == 0 else {
                         throw Self.worktreeAddFailure(
                             stderr: stderr, exitCode: exitCode, request: mutationRequest, repoURL: repoURL
@@ -2593,7 +2589,8 @@ actor GitService: WorkspaceGitClient {
         sourceEndpoint: GitWorktreeMergeEndpoint,
         targetEndpoint: GitWorktreeMergeEndpoint,
         sourceHead: String,
-        message: String
+        message: String,
+        beforeCommit: (@Sendable () async throws -> Void)? = nil
     ) async throws -> (state: GitWorktreeMergeState, commit: String?) {
         try await withWorkspaceAuthorityMutation(at: targetEndpoint.url, kind: .mergeApply) {
             try await withWorktreeMergeAdvisoryLock(at: targetEndpoint.url) { [weak self] in
@@ -2604,7 +2601,8 @@ actor GitService: WorkspaceGitClient {
                 try await validateCurrentEndpoint(targetEndpoint, label: "Target")
                 let (_, stderr, exitCode) = try await runGit(
                     ["merge", "--no-ff", "--no-commit", "--no-edit", sourceHead],
-                    at: targetEndpoint.url
+                    at: targetEndpoint.url,
+                    beforeCommit: beforeCommit
                 )
                 if exitCode == 0 || exitCode == 1 {
                     let state = try await inspectMergeState(at: targetEndpoint.url)
@@ -2665,7 +2663,8 @@ actor GitService: WorkspaceGitClient {
     func continueWorktreeMerge(
         sourceEndpoint: GitWorktreeMergeEndpoint,
         targetEndpoint: GitWorktreeMergeEndpoint,
-        message: String
+        message: String,
+        beforeCommit: (@Sendable () async throws -> Void)? = nil
     ) async throws -> String {
         try await withWorkspaceAuthorityMutation(at: targetEndpoint.url, kind: .mergeContinue) {
             try await withWorktreeMergeAdvisoryLock(at: targetEndpoint.url) { [weak self] in
@@ -2678,13 +2677,17 @@ actor GitService: WorkspaceGitClient {
                     message: message,
                     at: targetEndpoint.url,
                     sourceEndpoint: sourceEndpoint,
-                    targetEndpoint: targetEndpoint
+                    targetEndpoint: targetEndpoint,
+                    beforeCommit: beforeCommit
                 )
             }
         }
     }
 
-    func abortWorktreeMerge(targetEndpoint: GitWorktreeMergeEndpoint) async throws -> Bool {
+    func abortWorktreeMerge(
+        targetEndpoint: GitWorktreeMergeEndpoint,
+        beforeCommit: (@Sendable () async throws -> Void)? = nil
+    ) async throws -> Bool {
         try await withWorkspaceAuthorityMutation(at: targetEndpoint.url, kind: .mergeAbort) {
             try await withWorktreeMergeAdvisoryLock(at: targetEndpoint.url) { [weak self] in
                 guard let self else {
@@ -2693,7 +2696,7 @@ actor GitService: WorkspaceGitClient {
                 let state = try await inspectMergeState(at: targetEndpoint.url)
                 guard state.inProgress else { return false }
                 try await validateCurrentEndpoint(targetEndpoint, label: "Target")
-                let (_, stderr, exitCode) = try await runGit(["merge", "--abort"], at: targetEndpoint.url)
+                let (_, stderr, exitCode) = try await runGit(["merge", "--abort"], at: targetEndpoint.url, beforeCommit: beforeCommit)
                 guard exitCode == 0 else {
                     throw GitError(message: "git merge --abort failed: \(stderr)")
                 }
@@ -2706,7 +2709,8 @@ actor GitService: WorkspaceGitClient {
         message: String,
         at targetRepoURL: URL,
         sourceEndpoint: GitWorktreeMergeEndpoint? = nil,
-        targetEndpoint: GitWorktreeMergeEndpoint? = nil
+        targetEndpoint: GitWorktreeMergeEndpoint? = nil,
+        beforeCommit: (@Sendable () async throws -> Void)? = nil
     ) async throws -> String {
         let state = try await inspectMergeState(at: targetRepoURL)
         guard state.inProgress else {
@@ -2723,7 +2727,8 @@ actor GitService: WorkspaceGitClient {
         }
         let (_, stderr, exitCode) = try await runGit(
             ["commit", "--no-gpg-sign", "-m", message],
-            at: targetRepoURL
+            at: targetRepoURL,
+            beforeCommit: beforeCommit
         )
         guard exitCode == 0 else {
             throw GitError(message: "git commit failed: \(stderr)")
@@ -7683,7 +7688,8 @@ actor GitService: WorkspaceGitClient {
         admissionPriority: GitProcessAdmissionPriority = .userInitiatedAuthority,
         admissionDeadline: GitProcessAdmissionDeadline? = nil,
         commandFamily: GitProcessCommandFamily? = nil,
-        commandTimeout: Duration = GitService.gitProcessTimeout
+        commandTimeout: Duration = GitService.gitProcessTimeout,
+        beforeCommit: (@Sendable () async throws -> Void)? = nil
     ) async throws -> (String, String, Int32) {
         let (stdout, stderr, exitCode) = try await runGitData(
             args,
@@ -7698,7 +7704,8 @@ actor GitService: WorkspaceGitClient {
             admissionPriority: admissionPriority,
             admissionDeadline: admissionDeadline,
             commandFamily: commandFamily,
-            commandTimeout: commandTimeout
+            commandTimeout: commandTimeout,
+            beforeCommit: beforeCommit
         )
         return (
             String(data: stdout, encoding: .utf8) ?? "",
@@ -7720,7 +7727,8 @@ actor GitService: WorkspaceGitClient {
         admissionPriority: GitProcessAdmissionPriority = .userInitiatedAuthority,
         admissionDeadline: GitProcessAdmissionDeadline? = nil,
         commandFamily: GitProcessCommandFamily? = nil,
-        commandTimeout: Duration = GitService.gitProcessTimeout
+        commandTimeout: Duration = GitService.gitProcessTimeout,
+        beforeCommit: (@Sendable () async throws -> Void)? = nil
     ) async throws -> (Data, Data, Int32) {
         var environment = await processEnvironment()
         environment["GIT_TERMINAL_PROMPT"] = "0"
@@ -7822,7 +7830,8 @@ actor GitService: WorkspaceGitClient {
                 admissionPriority: admissionPriority,
                 commandFamily: commandFamily ?? Self.commandFamily(for: args),
                 commandTimeout: commandTimeout,
-                readBinding: readBinding
+                readBinding: readBinding,
+                beforeCommit: beforeCommit
             )
             await processAdmissionController.release(lease)
             return result
@@ -8330,7 +8339,8 @@ actor GitService: WorkspaceGitClient {
         admissionPriority: GitProcessAdmissionPriority,
         commandFamily: GitProcessCommandFamily,
         commandTimeout: Duration,
-        readBinding: GitReadRepositoryBinding? = nil
+        readBinding: GitReadRepositoryBinding? = nil,
+        beforeCommit: (@Sendable () async throws -> Void)? = nil
     ) async throws -> (Data, Data, Int32) {
         let (args, environment) = try await preparePassiveGitRead(
             args, at: repoURL, environment: environment,
@@ -8353,12 +8363,10 @@ actor GitService: WorkspaceGitClient {
             let injectedDrainFailure = drainCreationFailureForTesting
         #endif
         let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
-        // Only delegated creation carries this callback. All repository resolution, mutation-lock,
-        // eligibility and process-lane waits have completed; rejection here leaves no Git worktree
-        // or branch. Once admitted, checkout and receipt completion retain ordinary semantics.
-        if args.prefix(2).elementsEqual(["worktree", "add"]) {
-            try await Self.worktreeCreationCommitFence?()
-        }
+        // Passed explicitly to exactly the first mutating process, never inherited by nested reads
+        // or child tasks. Resolution, mutation locks and process admission have completed. A later
+        // process in an admitted merge cannot repeat this fence and hide already-started effects.
+        try await beforeCommit?()
 
         return try await withTaskCancellationHandler(operation: {
             try await withCheckedThrowingContinuation {

@@ -4,6 +4,161 @@ import RepoPromptWorkspaceCore
 import XCTest
 
 final class WorktreeMergeReviewStateTests: XCTestCase {
+    private enum FenceRefusal: Error { case refused }
+
+    private actor FenceCounter {
+        private(set) var calls = 0
+        func called() {
+            calls += 1
+        }
+    }
+
+    func testPhysicalApplyFenceRefusesWithoutEffectsAndRunsOnlyBeforeFirstMutation() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        let repo = try fixture.makeRepository(named: "main", files: ["base.txt": "base\n"])
+        let linked = fixture.sandbox.appendingPathComponent("linked")
+        try fixture.runGit(["worktree", "add", "-b", "source", linked.path], at: repo)
+        try fixture.write("source\n", to: "source.txt", at: linked)
+        try fixture.stage("source.txt", at: linked)
+        try fixture.commit("Source change", at: linked)
+        let service = GitService()
+        let descriptors = try await service.listWorktrees(at: repo)
+        let source = try GitWorktreeMergeEndpoint(descriptor: XCTUnwrap(descriptors.first { !$0.isMain }))
+        let target = try GitWorktreeMergeEndpoint(descriptor: XCTUnwrap(descriptors.first { $0.isMain }))
+        do {
+            _ = try await service.applyAndCommitWorktreeMerge(
+                sourceEndpoint: source, targetEndpoint: target, sourceHead: source.head,
+                message: "Merge", beforeCommit: { throw FenceRefusal.refused }
+            )
+            XCTFail("Refused final fence must not dispatch Git merge")
+        } catch FenceRefusal.refused {}
+        let refusedState = try await service.inspectMergeState(at: repo)
+        XCTAssertFalse(refusedState.inProgress)
+        XCTAssertEqual(try fixture.runGit(["rev-parse", "HEAD"], at: repo).trimmingCharacters(in: .whitespacesAndNewlines), target.head)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: repo.appendingPathComponent("source.txt").path))
+
+        let counter = FenceCounter()
+        let applied = try await service.applyAndCommitWorktreeMerge(
+            sourceEndpoint: source, targetEndpoint: target, sourceHead: source.head,
+            message: "Merge", beforeCommit: { await counter.called() }
+        )
+        XCTAssertNotNil(applied.commit)
+        let calls = await counter.calls
+        XCTAssertEqual(calls, 1, "The commit following an admitted merge must not repeat its first-effect fence")
+        XCTAssertEqual(try fixture.runGit(["rev-list", "--parents", "-n", "1", "HEAD"], at: repo).split(whereSeparator: \.isWhitespace).count, 3)
+    }
+
+    func testPhysicalContinueFenceRetainsMergeUntilAdmitted() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        let (repo, service, source, target) = try await makeConflictedPhysicalMerge(fixture)
+        try fixture.write("resolved\n", to: "conflict.txt", at: repo)
+        try fixture.stage("conflict.txt", at: repo)
+        do {
+            _ = try await VCSService.shared.continueGitWorktreeMerge(
+                .init(source: source, target: target, sourceHead: source.head, targetHeadBefore: target.head, commitMessage: "Resolve"),
+                beforeCommit: { throw FenceRefusal.refused }
+            )
+            XCTFail("Refused continue must leave the merge in progress")
+        } catch FenceRefusal.refused {}
+        let refusedState = try await service.inspectMergeState(at: repo)
+        XCTAssertTrue(refusedState.inProgress)
+        XCTAssertEqual(try fixture.runGit(["rev-parse", "HEAD"], at: repo).trimmingCharacters(in: .whitespacesAndNewlines), target.head)
+        let counter = FenceCounter()
+        _ = try await service.continueWorktreeMerge(
+            sourceEndpoint: source, targetEndpoint: target, message: "Resolve",
+            beforeCommit: { await counter.called() }
+        )
+        let calls = await counter.calls
+        XCTAssertEqual(calls, 1)
+        let completedState = try await service.inspectMergeState(at: repo)
+        XCTAssertFalse(completedState.inProgress)
+    }
+
+    func testPhysicalAbortFenceRetainsMergeUntilAdmitted() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        let (repo, service, _, target) = try await makeConflictedPhysicalMerge(fixture)
+        do {
+            _ = try await service.abortWorktreeMerge(targetEndpoint: target, beforeCommit: { throw FenceRefusal.refused })
+            XCTFail("Refused abort must leave the merge in progress")
+        } catch FenceRefusal.refused {}
+        let refusedState = try await service.inspectMergeState(at: repo)
+        XCTAssertTrue(refusedState.inProgress)
+        let counter = FenceCounter()
+        let aborted = try await service.abortWorktreeMerge(targetEndpoint: target, beforeCommit: { await counter.called() })
+        XCTAssertTrue(aborted)
+        let calls = await counter.calls
+        XCTAssertEqual(calls, 1)
+        let completedState = try await service.inspectMergeState(at: repo)
+        XCTAssertFalse(completedState.inProgress)
+        XCTAssertEqual(try fixture.runGit(["rev-parse", "HEAD"], at: repo).trimmingCharacters(in: .whitespacesAndNewlines), target.head)
+    }
+
+    func testPreviewArtifactFenceRejectsBeforeAnyWritesAndAdmitsCompleteArtifacts() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        let repo = try fixture.makeRepository(named: "main", files: ["base.txt": "base\n"])
+        let linked = fixture.sandbox.appendingPathComponent("linked")
+        try fixture.runGit(["worktree", "add", "-b", "source", linked.path], at: repo)
+        try fixture.write("source\n", to: "source.txt", at: linked)
+        try fixture.stage("source.txt", at: linked)
+        try fixture.commit("Source change", at: linked)
+        let descriptors = try await GitService().listWorktrees(at: repo)
+        let source = try GitWorktreeMergeEndpoint(descriptor: XCTUnwrap(descriptors.first { !$0.isMain }))
+        let target = try GitWorktreeMergeEndpoint(descriptor: XCTUnwrap(descriptors.first { $0.isMain }))
+        let storage = fixture.sandbox.appendingPathComponent("artifacts")
+        let request = GitWorktreeMergePreviewRequest(source: source, target: target, workspaceDirectory: storage, publishArtifacts: true)
+        do {
+            _ = try await VCSService.shared.previewGitWorktreeMerge(request, beforeWrite: { throw FenceRefusal.refused })
+            XCTFail("The final artifact fence must precede snapshot and current-pointer writes")
+        } catch FenceRefusal.refused {}
+        XCTAssertFalse(FileManager.default.fileExists(atPath: storage.path))
+        let counter = FenceCounter()
+        let preview = try await VCSService.shared.previewGitWorktreeMerge(request, beforeWrite: { await counter.called() })
+        let artifacts = try XCTUnwrap(preview.artifacts)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: artifacts.manifestPath))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: artifacts.sidecarPath))
+        let calls = await counter.calls
+        XCTAssertEqual(calls, 1)
+
+        let unavailableStorage = fixture.sandbox.appendingPathComponent("storage-is-file")
+        try Data("not a directory".utf8).write(to: unavailableStorage)
+        let failingRequest = GitWorktreeMergePreviewRequest(
+            source: source, target: target, workspaceDirectory: unavailableStorage, publishArtifacts: true
+        )
+        do {
+            _ = try await VCSService.shared.previewGitWorktreeMerge(failingRequest, beforeWrite: { await counter.called() })
+            XCTFail("A post-admission artifact failure must retain its directory receipt")
+        } catch let partial as GitDiffSnapshotPublisher.PartialPublication {
+            XCTAssertTrue(partial.snapshotDirectory.path.hasPrefix(unavailableStorage.path + "/"))
+            XCTAssertFalse(partial.snapshotWriteCompleted)
+            XCTAssertFalse(partial.currentPointerWriteCompleted)
+        }
+        let admittedAttempts = await counter.calls
+        XCTAssertEqual(admittedAttempts, 2)
+    }
+
+    private func makeConflictedPhysicalMerge(
+        _ fixture: ReviewGitRepositoryFixture
+    ) async throws -> (URL, GitService, GitWorktreeMergeEndpoint, GitWorktreeMergeEndpoint) {
+        let repo = try fixture.makeRepository(named: "main", files: ["conflict.txt": "base\n"])
+        let linked = fixture.sandbox.appendingPathComponent("linked")
+        try fixture.runGit(["worktree", "add", "-b", "source", linked.path], at: repo)
+        try fixture.write("source\n", to: "conflict.txt", at: linked)
+        try fixture.stage("conflict.txt", at: linked)
+        try fixture.commit("Source change", at: linked)
+        try fixture.write("target\n", to: "conflict.txt", at: repo)
+        try fixture.stage("conflict.txt", at: repo)
+        try fixture.commit("Target change", at: repo)
+        let service = GitService()
+        let descriptors = try await service.listWorktrees(at: repo)
+        let source = try GitWorktreeMergeEndpoint(descriptor: XCTUnwrap(descriptors.first { !$0.isMain }))
+        let target = try GitWorktreeMergeEndpoint(descriptor: XCTUnwrap(descriptors.first { $0.isMain }))
+        let applied = try await service.applyAndCommitWorktreeMerge(
+            sourceEndpoint: source, targetEndpoint: target, sourceHead: source.head, message: "Merge"
+        )
+        XCTAssertEqual(applied.state.conflictFiles, ["conflict.txt"])
+        return (repo, service, source, target)
+    }
+
     func testSourceBindingResolutionRequiresRepoRootWhenMultipleBindingsExist() throws {
         let first = makeBinding(logicalRootName: "App", logicalRootPath: "/repo/app", worktreeID: "wt_app")
         let second = makeBinding(logicalRootName: "Lib", logicalRootPath: "/repo/lib", worktreeID: "wt_lib")
