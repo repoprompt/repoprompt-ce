@@ -8602,7 +8602,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let store = promptManager?.workspaceFileContextStore
             let paths = manager.activeWorkspace?.repoPaths
             let fallback = workspacePathProvider()
-            return .init(store: store, fallbackWorkspacePath: fallback, isCurrent: { [weak self, weak manager] in
+            return .init(store: store, fallbackWorkspacePath: fallback, declaredRepoPaths: paths ?? [], isCurrent: { [weak self, weak manager] in
                 guard let self, let manager else { return false }
                 return workspaceManager === manager
                     && manager.activeWorkspaceID == command.identity.workspaceID
@@ -8676,14 +8676,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return .applied
         }
         guard tabID == currentTabID,
-              let session = sessions[tabID],
+              let presentingSession = sessions[tabID],
               let props = executionLocationProps(tabID: tabID),
               props.isEnabled,
-              let sessionID = session.activeAgentSessionID
+              let sessionID = presentingSession.activeAgentSessionID
         else {
             return .blocked("This thread cannot change execution location right now.")
         }
-        let previousPrimary = primaryExecutionBinding(for: session)
+        guard let admission = admitWorktreeTransition(forSessionID: sessionID) else {
+            return .blocked("This thread has no available execution-location writer.")
+        }
+        let session = admission.session
+        let previousPrimary = Self.primaryExecutionBinding(in: admission.bindings, fallbackWorkspacePath: admission.resources.fallbackWorkspacePath)
         switch choice {
         case .local where previousPrimary == nil:
             return .unchanged
@@ -8699,38 +8703,60 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard !session.isChangingExecutionLocation else {
             return .blocked("An execution-location change is already in progress.")
         }
+        let gateOwner = UUID()
         session.isChangingExecutionLocation = true
+        session.executionLocationChangeOwner = gateOwner
         syncComposerUIState(tabID: tabID)
         syncStatusPillsUIState()
         defer {
-            session.isChangingExecutionLocation = false
-            if tabID == currentTabID {
+            if session.executionLocationChangeOwner == gateOwner {
+                session.isChangingExecutionLocation = false
+            }
+            if sessions[tabID] === session, tabID == currentTabID {
                 syncComposerUIState(tabID: tabID)
                 syncStatusPillsUIState()
             }
         }
+        var createdWorktree: GitWorktreeDescriptor?
         do {
-            let desiredBindings: [AgentSessionWorktreeBinding] = switch choice {
+            let desiredBindings: [AgentSessionWorktreeBinding]
+            switch choice {
             case .local:
-                session.worktreeBindings.filter { $0.id != previousPrimary?.id }
+                desiredBindings = admission.bindings.filter { $0.id != previousPrimary?.id }
             case .newWorktree, .existingWorktree:
-                try await prepareStartedExecutionLocationBinding(
-                    choice,
-                    session: session,
+                let prepared = try await prepareStartedExecutionLocationBinding(
+                    choice, admission: admission,
                     source: choice == .newWorktree ? "agent_ui.location_change_new" : "agent_ui.location_change_existing"
                 )
+                desiredBindings = prepared.bindings
+                createdWorktree = prepared.created
             }
-            _ = try await transitionWorktreeBindings(
-                desiredBindings,
-                forSessionID: sessionID,
+            _ = try await admission.command.writer.scope.worktrees.transition(
+                desiredBindings, admission: admission,
                 intent: .userExecutionLocationChange(confirmation: confirmedChange)
             )
             return .applied
         } catch let ExecutionLocationTransitionError.confirmationRequired(confirmation) {
+            if let createdWorktree {
+                return .blocked(ExecutionLocationTransitionError.retainedWorktree(path: createdWorktree.path, underlying: "The thread now requires \(confirmation) confirmation.").localizedDescription)
+            }
             return .confirmationRequired(confirmation)
         } catch {
-            return .blocked((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+            let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            if let createdWorktree {
+                if let partial = error as? AgentSessionWorktreeRuntime.PartialTransition, partial.bindingsPublished {
+                    return .blocked("\(detail) The created worktree remains at \(createdWorktree.path).")
+                }
+                return .blocked(ExecutionLocationTransitionError.retainedWorktree(path: createdWorktree.path, underlying: detail).localizedDescription)
+            }
+            return .blocked(detail)
         }
+    }
+
+    /// Capture without suspension. Callers may defer reporting admission failure until after authorization.
+    func admitWorktreeTransition(forSessionID sessionID: UUID) -> AgentSessionWorktreeRuntime.Admission? {
+        guard let command = try? runtimeCommand(sessionID: sessionID) else { return nil }
+        return try? command.writer.scope.worktrees.admit(command)
     }
 
     @discardableResult
@@ -8813,16 +8839,30 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
-    private func executionLocationContext() async throws -> ExecutionLocationContext {
-        guard let workspace = workspaceManager?.activeWorkspace,
-              !workspace.isSystemWorkspace,
-              let primaryRoot = workspace.repoPaths.first,
-              let promptManager
-        else {
-            throw ExecutionLocationTransitionError.unavailable("Execution location requires an active project workspace.")
+    private func executionLocationContext(
+        admission: AgentSessionWorktreeRuntime.Admission? = nil
+    ) async throws -> ExecutionLocationContext {
+        let primaryRoot: String
+        let store: WorkspaceFileContextStore
+        if let admission {
+            try admission.requireCurrent()
+            guard let root = admission.resources.declaredRepoPaths.first, let capturedStore = admission.resources.store else {
+                throw ExecutionLocationTransitionError.unavailable("Execution location requires an active project workspace.")
+            }
+            primaryRoot = root
+            store = capturedStore
+        } else {
+            guard let workspace = workspaceManager?.activeWorkspace, !workspace.isSystemWorkspace,
+                  let root = workspace.repoPaths.first, let promptManager
+            else {
+                throw ExecutionLocationTransitionError.unavailable("Execution location requires an active project workspace.")
+            }
+            primaryRoot = root
+            store = promptManager.workspaceFileContextStore
         }
         let primaryPath = Self.standardizedWorkspacePath((primaryRoot as NSString).expandingTildeInPath) ?? primaryRoot
-        let visibleRoots = await promptManager.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace)
+        let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
+        try admission?.requireCurrent()
         guard let logicalRoot = visibleRoots.first(where: {
             (Self.standardizedWorkspacePath($0.standardizedFullPath) ?? $0.standardizedFullPath) == primaryPath
         }) else {
@@ -8833,25 +8873,27 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         else {
             throw ExecutionLocationTransitionError.unavailable("Existing and new worktrees require a Git-backed primary workspace root.")
         }
+        try admission?.requireCurrent()
         return ExecutionLocationContext(logicalRoot: logicalRoot, repo: GitRepoDescriptor(rootURL: resolvedRepo.rootURL))
     }
 
     private func prepareStartedExecutionLocationBinding(
         _ choice: InitialStartLocation,
-        session: TabSession,
+        admission: AgentSessionWorktreeRuntime.Admission,
         source: String
-    ) async throws -> [AgentSessionWorktreeBinding] {
-        guard let sessionID = session.activeAgentSessionID else {
-            throw ExecutionLocationTransitionError.unavailable("This thread is not ready to change execution location.")
-        }
-        let previousBindings = session.worktreeBindings
-        let context = try await executionLocationContext()
+    ) async throws -> (bindings: [AgentSessionWorktreeBinding], created: GitWorktreeDescriptor?) {
+        try admission.requireCurrent()
+        let session = admission.session
+        let sessionID = admission.command.identity.sessionID
+        let previousBindings = admission.bindings
+        let context = try await executionLocationContext(admission: admission)
         let existingWorktrees = try await VCSService.shared.listGitWorktrees(at: context.repo.rootURL)
+        try admission.requireCurrent()
         var createdWorktree: GitWorktreeDescriptor?
         let worktree: GitWorktreeDescriptor
         switch choice {
         case .local:
-            return previousBindings
+            return (previousBindings, nil)
         case .newWorktree:
             let mainRootPath = existingWorktrees.first(where: \.isMain)?.path ?? context.repo.rootPath
             let plan = try GitWorktreeDefaultPathPlanner.plan(
@@ -8861,7 +8903,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     purpose: .agentStart(sessionID: sessionID.uuidString)
                 )
             )
-            worktree = try await VCSService.shared.createGitWorktree(request: plan.createRequest, at: context.repo.rootURL)
+            worktree = try await VCSService.shared.createGitWorktree(
+                request: plan.createRequest, at: context.repo.rootURL,
+                beforeCommit: { try await admission.requireCurrent() }
+            )
             createdWorktree = worktree
         case let .existingWorktree(selection):
             guard let selected = existingWorktrees.first(where: {
@@ -8872,9 +8917,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             worktree = selected
         }
         do {
-            guard sessions[session.tabID] === session, session.worktreeBindings == previousBindings else {
-                throw ExecutionLocationTransitionError.stale
-            }
+            try admission.requireCurrent()
             let fallbackLabel = GitWorktreeDisplayLabelHumanizer.seededVisualIdentityLabel(
                 sessionName: resolvedSessionDisplayName(for: session.tabID),
                 worktreeName: worktree.name,
@@ -8910,10 +8953,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 Self.standardizedWorkspacePath($0.logicalRootPath) != Self.standardizedWorkspacePath(binding.logicalRootPath)
             }
             desiredBindings.append(binding)
-            guard sessions[session.tabID] === session, session.worktreeBindings == previousBindings else {
-                throw ExecutionLocationTransitionError.stale
-            }
-            return desiredBindings
+            try admission.requireCurrent()
+            return (desiredBindings, createdWorktree)
         } catch {
             if let createdWorktree {
                 throw ExecutionLocationTransitionError.retainedWorktree(
@@ -15421,7 +15462,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private func prepareInitialExecutionLocation(
         _ choice: InitialStartLocation,
         for session: TabSession,
-        validating operationIsCurrent: () -> Bool
+        validating operationIsCurrent: @escaping @MainActor () -> Bool
     ) async throws {
         guard let sessionID = session.activeAgentSessionID,
               let workspaceManager,
@@ -15440,9 +15481,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         else {
             throw InitialNewWorktreePreparationError.unavailable(Self.staleComposerSubmitTargetMessage)
         }
+        guard let admission = admitWorktreeTransition(forSessionID: sessionID) else {
+            throw InitialNewWorktreePreparationError.unavailable(Self.staleComposerSubmitTargetMessage)
+        }
         let primaryPath = Self.standardizedWorkspacePath((primaryRoot as NSString).expandingTildeInPath) ?? primaryRoot
         let visibleRoots = await promptManager.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace)
-        guard !Task.isCancelled, operationIsCurrent() else {
+        guard !Task.isCancelled, operationIsCurrent(), admission.isCurrent else {
             throw InitialNewWorktreePreparationError.unavailable(Self.staleComposerSubmitTargetMessage)
         }
         guard let logicalRoot = visibleRoots.first(where: {
@@ -15459,7 +15503,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 "Execution location requires a Git-backed primary workspace root. Select Work locally or open a Git workspace."
             )
         }
-        guard !Task.isCancelled, operationIsCurrent() else {
+        guard !Task.isCancelled, operationIsCurrent(), admission.isCurrent else {
             throw InitialNewWorktreePreparationError.unavailable(Self.staleComposerSubmitTargetMessage)
         }
         let repo = GitRepoDescriptor(rootURL: resolvedRepo.rootURL)
@@ -15468,7 +15512,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let existingWorktrees = try await VCSService.shared.listGitWorktrees(at: repo.rootURL)
             guard !Task.isCancelled,
                   isReadyForInitialNewWorktreeCommit(session),
-                  operationIsCurrent()
+                  operationIsCurrent(), admission.isCurrent
             else {
                 throw InitialNewWorktreePreparationError.unavailable(Self.staleComposerSubmitTargetMessage)
             }
@@ -15486,7 +15530,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         purpose: .agentStart(sessionID: sessionID.uuidString)
                     )
                 )
-                worktree = try await VCSService.shared.createGitWorktree(request: plan.createRequest, at: repo.rootURL)
+                worktree = try await VCSService.shared.createGitWorktree(
+                    request: plan.createRequest, at: repo.rootURL,
+                    beforeCommit: { @MainActor in
+                        try admission.requireCurrent()
+                        guard self.isReadyForInitialNewWorktreeCommit(session), operationIsCurrent() else {
+                            throw InitialNewWorktreePreparationError.unavailable(Self.staleComposerSubmitTargetMessage)
+                        }
+                    }
+                )
                 createdWorktree = worktree
                 bindingSource = "agent_ui.initial_send"
             case let .existingWorktree(selection):
@@ -15506,7 +15558,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             guard !Task.isCancelled,
                   isReadyForInitialNewWorktreeCommit(session),
-                  operationIsCurrent()
+                  operationIsCurrent(), admission.isCurrent
             else {
                 throw locationBindingFailure(Self.staleComposerSubmitTargetMessage)
             }
@@ -15539,16 +15591,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 source: bindingSource
             )
             guard !Task.isCancelled,
-                  operationIsCurrent(),
+                  operationIsCurrent(), admission.isCurrent,
                   isReadyForInitialNewWorktreeCommit(session)
             else {
                 throw locationBindingFailure(Self.staleComposerSubmitTargetMessage)
             }
             do {
-                _ = try await transitionWorktreeBindings(
-                    [binding],
-                    forSessionID: sessionID,
-                    intent: .initialSend
+                _ = try await admission.command.writer.scope.worktrees.transition(
+                    [binding], admission: admission, intent: .initialSend,
+                    revalidateAuthority: {
+                        guard operationIsCurrent(), self.isReadyForInitialNewWorktreeCommit(session) else {
+                            throw InitialNewWorktreePreparationError.unavailable(Self.staleComposerSubmitTargetMessage)
+                        }
+                    }
                 )
             } catch {
                 throw locationBindingFailure(
