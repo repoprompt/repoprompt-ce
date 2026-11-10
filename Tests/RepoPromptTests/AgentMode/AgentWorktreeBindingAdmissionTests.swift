@@ -520,7 +520,7 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         XCTAssertNil(target.session.claudeController, "The refusal must happen after the fake teardown, not during initial admission")
     }
 
-    func testSessionAdminScopeRevokedDuringProviderTeardownPreservesTypedRefusal() async throws {
+    func testSessionAdminScopeRevokedDuringProviderTeardownReportsEffectsAndTypedCause() async throws {
         let fixture = try await durableFixture()
         defer { fixture.git.cleanup() }
         let original = fixture.session.worktreeBindings
@@ -542,8 +542,13 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
                 isStillAuthorized: { scopes.hasLiveScope(grantedTo: grantee) }
             )
             XCTFail("Revoked scope must refuse publication")
-        } catch SessionAdminHostError.authorityEnded {
-            // The handler maps this exact cause to scope_revoked, not bind_failed.
+        } catch let receipt as AgentSessionWorktreeRuntime.PartialTransition {
+            XCTAssertTrue(receipt.providerRetired)
+            XCTAssertFalse(receipt.bindingsPublished)
+            XCTAssertTrue(receipt.recoverySaved)
+            guard let cause = receipt.cause as? SessionAdminHostError, case .authorityEnded = cause else {
+                return XCTFail("Lost typed authority-ended cause")
+            }
         } catch {
             XCTFail("Lost scope-revocation cause: \(error)")
         }
@@ -1109,6 +1114,196 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         )
     }
 
+    func testTransitionRejectsReacquiredWriterAfterPreparationWithoutTouchingSuccessorGate() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let command = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
+        let previous = fixture.session.worktreeBindings
+        var published = false
+        do {
+            _ = try await command.writer.scope.worktrees.transition(
+                [], command: command, intent: .externalManagement,
+                beforeCommit: {
+                    fixture.viewModel.test_removeSession(tabID: fixture.session.tabID)
+                    fixture.viewModel.test_installLiveSession(fixture.session)
+                    fixture.session.isChangingExecutionLocation = true
+                }, afterCommit: { published = true }
+            )
+            XCTFail("An old command cannot follow a reacquired claim")
+        } catch {
+            XCTAssertFalse(error is AgentSessionWorktreeRuntime.PartialTransition)
+        }
+        XCTAssertFalse(command.isCurrent)
+        XCTAssertFalse(fixture.session.worktreeBindingTransitionInProgress, "The old transition must release its own gate despite losing its claim")
+        XCTAssertFalse(published)
+        XCTAssertEqual(fixture.session.worktreeBindings, previous)
+        XCTAssertTrue(fixture.session.isChangingExecutionLocation, "Old cleanup must not clear the successor gate")
+        XCTAssertEqual(command.writer.scope.worktrees.pendingTransitions, 0)
+    }
+
+    func testProviderRetirementCannotClearReboundWriterMetadataOrSaveItsRecovery() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let command = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
+        let replacementID = UUID()
+        let replacementController = MonitorFakeNativeController()
+        let session = fixture.session
+        let workspaceID = command.identity.workspaceID
+        let oldController = WorktreeTeardownNativeController {
+            await MainActor.run {
+                session.installPersistentSessionBinding(.init(
+                    tabID: session.tabID, sessionID: replacementID, workspaceID: workspaceID
+                ))
+                session.recordRestorationAuthoritative(.persistedPayloadApplied)
+                session.providerSessionID = "successor-provider"
+                session.claudeController = replacementController
+                session.isChangingExecutionLocation = true
+            }
+        }
+        fixture.session.claudeController = oldController
+        var saves = 0
+        fixture.viewModel.test_setAgentSessionSaver { _, _, _ in
+            saves += 1
+            return fixture.git.sandbox.appendingPathComponent("session.json")
+        }
+        do {
+            _ = try await command.writer.scope.worktrees.transition([], command: command, intent: .externalManagement)
+            XCTFail("A retired origin must return a partial receipt after rebinding")
+        } catch let receipt as AgentSessionWorktreeRuntime.PartialTransition {
+            XCTAssertEqual(receipt.writer, command.identity)
+            XCTAssertTrue(receipt.providerRetired)
+            XCTAssertFalse(receipt.bindingsPublished)
+            XCTAssertFalse(receipt.recoverySaved)
+        }
+        XCTAssertEqual(fixture.session.activeAgentSessionID, replacementID)
+        XCTAssertEqual(fixture.session.providerSessionID, "successor-provider")
+        XCTAssertTrue(fixture.session.claudeController === replacementController)
+        XCTAssertTrue(fixture.session.isChangingExecutionLocation)
+        XCTAssertEqual(saves, 0)
+        XCTAssertFalse(session.worktreeBindingTransitionInProgress)
+        let shutdowns = await replacementController.shutdownCount
+        XCTAssertEqual(shutdowns, 0)
+    }
+
+    func testPublishedBindingReportsOriginWithoutSavingAReboundSuccessor() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let command = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
+        let desired = [Self.copyBinding(fixture.session.worktreeBindings[0], visualLabel: "Committed label")]
+        var saves = 0
+        fixture.viewModel.test_setAgentSessionSaver { _, _, _ in
+            saves += 1
+            return fixture.git.sandbox.appendingPathComponent("session.json")
+        }
+        do {
+            _ = try await command.writer.scope.worktrees.transition(
+                desired, command: command, intent: .externalManagement,
+                afterCommit: {
+                    fixture.session.saveDebounceTask?.cancel()
+                    fixture.session.installPersistentSessionBinding(.init(
+                        tabID: fixture.session.tabID, sessionID: UUID(), workspaceID: command.identity.workspaceID
+                    ))
+                    fixture.session.recordRestorationAuthoritative(.persistedPayloadApplied)
+                }
+            )
+            XCTFail("Committed effects cannot acknowledge a successor's save")
+        } catch let receipt as AgentSessionWorktreeRuntime.PartialTransition {
+            XCTAssertEqual(receipt.writer, command.identity)
+            XCTAssertTrue(receipt.bindingsPublished)
+            XCTAssertFalse(receipt.recoverySaved)
+        }
+        XCTAssertEqual(saves, 0)
+        XCTAssertEqual(fixture.session.worktreeBindings, desired)
+    }
+
+    func testRuntimeUnbindAcknowledgesRealPersistenceWithoutTestFlush() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let command = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
+        let result = try await command.writer.scope.worktrees.transition([], command: command, intent: .externalManagement)
+        XCTAssertEqual(result, [])
+        let workspace = try XCTUnwrap(fixture.manager.activeWorkspace)
+        let saved = try await AgentSessionDataService.shared.loadAgentSession(id: fixture.sessionID, for: workspace)
+        XCTAssertEqual(saved?.id, fixture.sessionID)
+        XCTAssertEqual(saved?.worktreeBindings, [])
+        XCTAssertFalse(fixture.session.isDirty)
+        XCTAssertFalse(fixture.session.worktreeBindingTransitionInProgress)
+        XCTAssertFalse(fixture.session.isChangingExecutionLocation)
+    }
+
+    func testConflictingClaimStillReleasesTheOriginatingTransitionGates() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let command = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
+        let competitor = AgentSessionRuntimeStore.shared.makeScope()
+        let replica = competitor.makeSession(tabID: fixture.session.tabID)
+        replica.installPersistentSessionBinding(command.writer.binding)
+        do {
+            _ = try await command.writer.scope.worktrees.transition(
+                [], command: command, intent: .externalManagement,
+                beforeCommit: { competitor.replaceSessions([replica.tabID: replica]) }
+            )
+            XCTFail("A competing claim must refuse publication")
+        } catch {
+            XCTAssertFalse(error is AgentSessionWorktreeRuntime.PartialTransition)
+        }
+        XCTAssertFalse(command.writer.ownsPersistentClaim)
+        XCTAssertFalse(fixture.session.worktreeBindingTransitionInProgress)
+        XCTAssertFalse(fixture.session.isChangingExecutionLocation)
+        competitor.replaceSessions([:])
+        XCTAssertTrue(command.isCurrent)
+    }
+
+    func testRetirementJoinsTransitionCleanupBeforeReleasingItsWriter() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        fixture.session.isDirty = false
+        let command = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
+        let scope = command.writer.scope
+        var release: CheckedContinuation<Void, Never>?
+        let operation = Task { @MainActor in
+            try await scope.worktrees.transition([], command: command, intent: .externalManagement, beforeCommit: {
+                await withCheckedContinuation { release = $0 }
+            })
+        }
+        try await AsyncTestWait.waitUntil("transition preparation held") { release != nil }
+        scope.beginRetirement()
+        XCTAssertFalse(scope.releaseWriterClaimsAfterDrain())
+        var joined = false
+        let drain = Task { @MainActor in
+            await scope.worktrees.waitForTransitions()
+            joined = true
+        }
+        await Task.yield()
+        XCTAssertFalse(joined)
+        release?.resume()
+        _ = try? await operation.value
+        await drain.value
+        XCTAssertTrue(joined)
+        XCTAssertFalse(fixture.session.worktreeBindingTransitionInProgress)
+        XCTAssertFalse(fixture.session.isChangingExecutionLocation)
+        XCTAssertTrue(scope.releaseWriterClaimsAfterDrain(), "The drain owner, not transition completion, releases claims")
+    }
+
+    func testInitialTransitionUsesExactCreationCapabilityWithoutRestorationBypass() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let source = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
+        let scope = source.writer.scope
+        let fresh = scope.makeSession(tabID: UUID())
+        let claim = AgentSessionCreationClaim(workspaceID: source.identity.workspaceID)
+        fresh.installPersistentSessionBinding(.init(tabID: fresh.tabID, sessionID: claim.sessionID, workspaceID: claim.workspaceID))
+        let creation = try XCTUnwrap(fresh.acceptFreshCreation(claim, workspaceID: claim.workspaceID))
+        scope.replaceSessions([fixture.session.tabID: fixture.session, fresh.tabID: fresh])
+        XCTAssertThrowsError(try fixture.viewModel.runtimeCommand(sessionID: claim.sessionID))
+        let installed = try await fixture.viewModel.transitionWorktreeBindings(
+            fixture.session.worktreeBindings, forSessionID: claim.sessionID, intent: .initialSend, creationHandle: creation
+        )
+        XCTAssertEqual(installed, fixture.session.worktreeBindings)
+        XCTAssertTrue(fresh.creationHandleIsCurrent(creation), "The transition does not claim configured creation durability")
+        XCTAssertFalse(fresh.worktreeBindingTransitionInProgress)
+    }
+
     private struct DurableFixture {
         let git: ReviewGitRepositoryFixture
         let prompt: PromptViewModel
@@ -1137,7 +1332,7 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         let manager = WorkspaceManagerViewModel(
             fileManager: files, promptViewModel: prompt, performInitialWorkspaceActivation: false
         )
-        let (viewModel, session, sessionID) = fixture(workspacePath: logical.path, windowID: windowID)
+        let (viewModel, session, sessionID) = fixture(workspacePath: logical.path, windowID: windowID, scoped: false)
         let workspace = WorkspaceModel(
             name: "Worktree switch", repoPaths: [logical.path], ephemeralFlag: true,
             composeTabs: [ComposeTabState(id: session.tabID, activeAgentSessionID: sessionID)], activeComposeTabID: session.tabID
@@ -1205,7 +1400,7 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         }
     }
 
-    private func fixture(workspacePath: String = "/tmp/logical-worktree-admission", windowID: Int = -991) -> (AgentModeViewModel, AgentModeViewModel.TabSession, UUID) {
+    private func fixture(workspacePath: String = "/tmp/logical-worktree-admission", windowID: Int = -991, scoped: Bool = true) -> (AgentModeViewModel, AgentModeViewModel.TabSession, UUID) {
         let viewModel = AgentModeViewModel(
             testWindowID: windowID,
             testWorkspacePath: workspacePath,
@@ -1219,6 +1414,18 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         let sessionID = UUID()
         viewModel.test_installLiveSession(session)
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        if scoped {
+            session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: UUID()))
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: sessionID) else {
+                preconditionFailure("Admission fixture must own an exact writer")
+            }
+            // These unit cases stop before materialization. Only resources are substituted;
+            // canonical claim/restoration admission and production provider probes remain real.
+            writer.scope.worktrees.captureResources = { _ in
+                .init(store: nil, fallbackWorkspacePath: workspacePath, isCurrent: { true })
+            }
+        }
         session.worktreeBindings = [.init(
             id: "primary", repositoryID: "repo", repoKey: "repo",
             logicalRootPath: "/tmp/logical-worktree-admission", logicalRootName: "Project",

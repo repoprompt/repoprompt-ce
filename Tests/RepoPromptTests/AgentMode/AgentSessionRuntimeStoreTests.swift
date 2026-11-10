@@ -278,3 +278,113 @@ final class AgentSessionRuntimeStoreTests: XCTestCase {
         XCTAssertNil(session.persistentSessionBindingDidChange)
     }
 }
+
+@MainActor
+final class AgentSessionAdministrationRuntimeTests: XCTestCase {
+    func testForkRejectsReacquiredSourceBeforeDestinationPreparation() async throws {
+        let fixture = try Fixture()
+        var preparations = 0
+        fixture.scope.administration.prepareForkDestination = { _ in
+            preparations += 1
+            throw SessionAdminHostError.sessionUnavailable
+        }
+        fixture.scope.replaceSessions([:])
+        fixture.scope.replaceSessions([fixture.source.tabID: fixture.source])
+        XCTAssertFalse(fixture.command.isCurrent)
+        do {
+            _ = try await fixture.scope.administration.fork(command: fixture.command, upToItemID: UUID(), isStillAuthorized: { true })
+            XCTFail("An old incarnation cannot start a fork")
+        } catch {}
+        XCTAssertEqual(preparations, 0)
+    }
+
+    func testForkPreparationCarriesExactIncarnationAcrossSuspension() async throws {
+        let fixture = try Fixture()
+        fixture.scope.administration.prepareForkDestination = { request in
+            XCTAssertTrue(request.source === fixture.source)
+            XCTAssertEqual(request.workspaceID, fixture.command.identity.workspaceID)
+            XCTAssertTrue(request.isStillAuthorized())
+            await Task.yield()
+            fixture.scope.replaceSessions([:])
+            fixture.scope.replaceSessions([fixture.source.tabID: fixture.source])
+            XCTAssertFalse(request.isStillAuthorized(), "Same object and session ID cannot reacquire the old command")
+            throw SessionAdminHostError.authorityEnded
+        }
+        do {
+            _ = try await fixture.scope.administration.fork(command: fixture.command, upToItemID: UUID(), isStillAuthorized: { true })
+            XCTFail("Preparation must not commit after losing its source")
+        } catch {}
+        XCTAssertEqual(fixture.scope.sessions.count, 1)
+    }
+
+    func testCommittedDestinationReceiptSurvivesLateSourceRevocation() async throws {
+        let fixture = try Fixture()
+        var authorized = true
+        let destination = fixture.scope.makeSession(tabID: UUID())
+        let destinationID = UUID()
+        destination.installPersistentSessionBinding(.init(
+            tabID: destination.tabID, sessionID: destinationID, workspaceID: fixture.command.identity.workspaceID
+        ))
+        destination.recordRestorationAuthoritative(.persistedPayloadApplied)
+        fixture.scope.administration.prepareForkDestination = { request in
+            XCTAssertTrue(request.isStillAuthorized())
+            fixture.scope.replaceSessions([fixture.source.tabID: fixture.source, destination.tabID: destination])
+            guard case let .unique(destinationWriter) = fixture.store.resolveWriter(sessionID: destinationID) else {
+                throw SessionAdminHostError.sessionUnavailable
+            }
+            let receipt = AgentSessionAdministrationRuntime.ForkReceipt(identity: destinationWriter.identity)
+            await Task.yield()
+            authorized = false
+            XCTAssertFalse(request.isStillAuthorized())
+            // A later occupant of the same tab must never replace the acknowledged destination.
+            destination.installPersistentSessionBinding(.init(
+                tabID: destination.tabID, sessionID: UUID(), workspaceID: fixture.command.identity.workspaceID
+            ))
+            // Simulates the existing creation owner's durable receipt, not persistence itself.
+            return receipt
+        }
+        let result = try await fixture.scope.administration.fork(
+            command: fixture.command, upToItemID: UUID(), isStillAuthorized: { authorized }
+        )
+        XCTAssertEqual(result, destinationID)
+        XCTAssertTrue(fixture.scope.sessions[destination.tabID] === destination)
+        XCTAssertNotEqual(destination.activeAgentSessionID, result, "Completion must report the saved fork, not the replacement")
+    }
+
+    func testForeignDestinationReceiptReportsPartialIdentityWithoutRetargeting() async throws {
+        let fixture = try Fixture(), foreign = try Fixture()
+        fixture.scope.administration.prepareForkDestination = { _ in .init(identity: foreign.command.identity) }
+        do {
+            _ = try await fixture.scope.administration.fork(command: fixture.command, upToItemID: UUID(), isStillAuthorized: { true })
+            XCTFail("A foreign destination cannot acknowledge this fork")
+        } catch let partial as SessionAdminPartialForkError {
+            XCTAssertEqual(partial.sessionID, foreign.command.identity.sessionID)
+            XCTAssertEqual(partial.code, "target_changed")
+        }
+        XCTAssertEqual(fixture.scope.sessions.count, 1)
+        XCTAssertEqual(foreign.scope.sessions.count, 1)
+        XCTAssertTrue(foreign.command.isCurrent)
+    }
+
+    private struct Fixture {
+        let store: AgentSessionRuntimeStore
+        let scope: AgentSessionRuntimeStore.Scope
+        let source: AgentTabSession
+        let command: AgentSessionRuntimeStore.Command
+
+        @MainActor
+        init() throws {
+            store = AgentSessionRuntimeStore()
+            scope = store.makeScope()
+            source = scope.makeSession(tabID: UUID())
+            let workspaceID = UUID(), sessionID = UUID()
+            source.installPersistentSessionBinding(.init(tabID: source.tabID, sessionID: sessionID, workspaceID: workspaceID))
+            source.recordRestorationAuthoritative(.persistedPayloadApplied)
+            scope.replaceSessions([source.tabID: source])
+            guard case let .unique(writer) = store.resolveWriter(workspaceID: workspaceID, sessionID: sessionID) else {
+                throw SessionAdminHostError.sessionUnavailable
+            }
+            command = try writer.admitCommand().get()
+        }
+    }
+}
