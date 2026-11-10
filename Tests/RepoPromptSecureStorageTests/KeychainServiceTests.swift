@@ -39,6 +39,7 @@ final class KeychainServiceTests: XCTestCase {
             (errSecInteractionNotAllowed, .interactionNotAllowed),
             (errSecUserCanceled, .userInteractionCancelled),
             (errSecAuthFailed, .authenticationFailed),
+            (errSecInvalidOwnerEdit, .invalidOwnerEdit),
             (OSStatus(-12345), .unexpectedStatus(-12345))
         ]
 
@@ -106,6 +107,276 @@ final class KeychainServiceTests: XCTestCase {
         XCTAssertEqual(fake.deleteQueries.map { $0.stringValue(for: kSecAttrService) }, [canonicalService])
         let deleteQuery = try XCTUnwrap(fake.deleteQueries.first)
         XCTAssertEqual(deleteQuery.stringValue(for: kSecUseAuthenticationUI), kSecUseAuthenticationUISkip as String)
+    }
+
+    func testInteractiveDeleteRecoversInvalidOwnerUsingOnlyValidatedReference() throws {
+        let item = NSObject()
+        var lookupCount = 0
+        let fake = FakeSecItemClient(
+            copyHandler: { _, result in
+                lookupCount += 1
+                guard lookupCount == 1 else { return errSecItemNotFound }
+                result?.pointee = item
+                return errSecSuccess
+            },
+            deleteHandler: { _ in errSecInvalidOwnerEdit }
+        )
+        let validator = FakeItemAccessValidator()
+        let service = KeychainService(
+            serviceName: "test.migration.bridge",
+            secItemClient: fake,
+            itemIdentityAttributes: [kSecAttrLabel as String: "expected-label"],
+            itemAccessValidator: validator,
+            itemAccessProvider: FakeSecKeychainItemAccessProvider()
+        )
+
+        try service.delete(for: "ZAIAPI")
+
+        XCTAssertEqual(fake.deleteQueries.count, 1)
+        XCTAssertEqual(fake.classicDeleteItems.count, 1)
+        XCTAssertTrue(fake.classicDeleteItems.first === item)
+        XCTAssertEqual(validator.validationCount, 2)
+        XCTAssertEqual(fake.copyQueries.count, 2)
+        for query in fake.copyQueries {
+            XCTAssertEqual(query.stringValue(for: kSecAttrService), "test.migration.bridge")
+            XCTAssertEqual(query.stringValue(for: kSecAttrAccount), "ZAIAPI")
+            XCTAssertEqual(query.stringValue(for: kSecAttrLabel), "expected-label")
+            XCTAssertEqual(query.boolValue(for: kSecReturnRef), true)
+            XCTAssertNil(query.boolValue(for: kSecReturnData))
+        }
+        let lookup = try XCTUnwrap(fake.copyQueries.first)
+        XCTAssertEqual(lookup.stringValue(for: kSecAttrService), "test.migration.bridge")
+        XCTAssertEqual(lookup.stringValue(for: kSecAttrAccount), "ZAIAPI")
+        XCTAssertEqual(lookup.boolValue(for: kSecReturnRef), true)
+        XCTAssertNil(lookup.boolValue(for: kSecReturnData))
+        XCTAssertTrue(fake.addQueries.isEmpty)
+        XCTAssertTrue(fake.updateQueries.isEmpty)
+    }
+
+    func testInvalidOwnerRecoveryNeverRunsForNoninteractiveOrUnvalidatedDeletes() {
+        for hasValidator in [false, true] {
+            for accessMode: KeychainAccessMode in [.interactive, .nonInteractive(reason: .test)] {
+                guard !hasValidator || accessMode.isNonInteractive else { continue }
+                let fake = FakeSecItemClient(
+                    copyHandler: { _, result in
+                        result?.pointee = NSObject()
+                        return errSecSuccess
+                    },
+                    deleteHandler: { _ in errSecInvalidOwnerEdit }
+                )
+                let service = KeychainService(
+                    serviceName: "test.migration.bridge",
+                    secItemClient: fake,
+                    itemAccessValidator: hasValidator ? FakeItemAccessValidator() : nil,
+                    itemAccessProvider: FakeSecKeychainItemAccessProvider()
+                )
+
+                XCTAssertThrowsError(try service.delete(for: "ZAIAPI", accessMode: accessMode)) { error in
+                    XCTAssertEqual(error as? KeychainService.KeychainError, .invalidOwnerEdit)
+                }
+                XCTAssertEqual(fake.deleteQueries.count, 1)
+                XCTAssertTrue(fake.classicDeleteItems.isEmpty)
+            }
+        }
+    }
+
+    func testDeleteDoesNotRecoverOtherStatusesOrSuppressRecoveryFailures() throws {
+        for status in [errSecAuthFailed, errSecUserCanceled, errSecInteractionNotAllowed, OSStatus(-12345)] {
+            let fake = FakeSecItemClient(
+                copyHandler: { _, result in
+                    result?.pointee = NSObject()
+                    return errSecSuccess
+                },
+                deleteHandler: { _ in status }
+            )
+            let service = KeychainService(
+                serviceName: "test.migration.bridge",
+                secItemClient: fake,
+                itemAccessValidator: FakeItemAccessValidator(),
+                itemAccessProvider: FakeSecKeychainItemAccessProvider()
+            )
+            XCTAssertThrowsError(try service.delete(for: "ZAIAPI"))
+            XCTAssertTrue(fake.classicDeleteItems.isEmpty)
+        }
+
+        for status in [errSecSuccess, errSecItemNotFound, errSecInvalidItemRef, errSecAuthFailed, errSecUserCanceled] {
+            var lookupCount = 0
+            let fake = FakeSecItemClient(
+                copyHandler: { _, result in
+                    lookupCount += 1
+                    guard lookupCount == 1 else { return errSecItemNotFound }
+                    result?.pointee = NSObject()
+                    return errSecSuccess
+                },
+                deleteHandler: { _ in errSecInvalidOwnerEdit },
+                classicDeleteHandler: { _ in status }
+            )
+            let service = KeychainService(
+                serviceName: "test.migration.bridge",
+                secItemClient: fake,
+                itemAccessValidator: FakeItemAccessValidator(),
+                itemAccessProvider: FakeSecKeychainItemAccessProvider()
+            )
+            if status == errSecSuccess || status == errSecItemNotFound || status == errSecInvalidItemRef {
+                XCTAssertNoThrow(try service.delete(for: "ZAIAPI"))
+            } else {
+                XCTAssertThrowsError(try service.delete(for: "ZAIAPI")) { error in
+                    let expected: KeychainService.KeychainError = status == errSecAuthFailed
+                        ? .authenticationFailed : .userInteractionCancelled
+                    XCTAssertEqual(error as? KeychainService.KeychainError, expected)
+                }
+            }
+            XCTAssertEqual(fake.classicDeleteItems.count, 1)
+        }
+    }
+
+    func testRecoveryNeverDeletesReplacementOrReportsSuccessWhileMatchingItemRemains() {
+        for recoveryStatus in [errSecSuccess, errSecItemNotFound, errSecInvalidItemRef] {
+            let original = NSObject()
+            let replacement = NSObject()
+            var lookupCount = 0
+            let fake = FakeSecItemClient(
+                copyHandler: { _, result in
+                    lookupCount += 1
+                    result?.pointee = lookupCount == 1 ? original : replacement
+                    return errSecSuccess
+                },
+                deleteHandler: { _ in errSecInvalidOwnerEdit },
+                classicDeleteHandler: { _ in recoveryStatus }
+            )
+            let service = KeychainService(
+                serviceName: "test.migration.bridge",
+                secItemClient: fake,
+                itemAccessValidator: FakeItemAccessValidator(),
+                itemAccessProvider: FakeSecKeychainItemAccessProvider()
+            )
+
+            XCTAssertThrowsError(try service.delete(for: "ZAIAPI")) { error in
+                XCTAssertEqual(error as? KeychainService.KeychainError, .deletionNotConfirmed)
+            }
+            XCTAssertEqual(fake.classicDeleteItems.count, 1)
+            XCTAssertTrue(fake.classicDeleteItems.first === original)
+            XCTAssertEqual(fake.deleteQueries.count, 1)
+            XCTAssertEqual(lookupCount, 2)
+        }
+    }
+
+    func testDeleteValidationFailureNeverInvokesEitherDeleteAPI() {
+        for validationError in [KeychainACLValidationError.extraPrincipal, .wildcardPrincipal, .missingPrincipal] {
+            let fake = FakeSecItemClient(copyHandler: { _, result in
+                result?.pointee = NSObject()
+                return errSecSuccess
+            })
+            let service = KeychainService(
+                serviceName: "test.migration.bridge",
+                secItemClient: fake,
+                itemAccessValidator: FakeItemAccessValidator(error: validationError),
+                itemAccessProvider: FakeSecKeychainItemAccessProvider()
+            )
+
+            XCTAssertThrowsError(try service.delete(for: "ZAIAPI")) { error in
+                XCTAssertEqual(error as? KeychainACLValidationError, validationError)
+            }
+            XCTAssertTrue(fake.deleteQueries.isEmpty)
+            XCTAssertTrue(fake.classicDeleteItems.isEmpty)
+        }
+    }
+
+    func testValidatedNormalDeleteDoesNotInvokeRecoveryOrPostcheck() throws {
+        let fake = FakeSecItemClient(copyHandler: { _, result in
+            result?.pointee = NSObject()
+            return errSecSuccess
+        })
+        let validator = FakeItemAccessValidator()
+        let service = KeychainService(
+            serviceName: "test.migration.bridge",
+            secItemClient: fake,
+            itemAccessValidator: validator,
+            itemAccessProvider: FakeSecKeychainItemAccessProvider()
+        )
+
+        try service.delete(for: "ZAIAPI")
+
+        XCTAssertEqual(fake.copyQueries.count, 1)
+        XCTAssertEqual(fake.deleteQueries.count, 1)
+        XCTAssertEqual(validator.validationCount, 1)
+        XCTAssertTrue(fake.classicDeleteItems.isEmpty)
+    }
+
+    func testRecoveryPostcheckDenialOrMissingReferenceNeverReportsSuccess() {
+        for status in [errSecInteractionNotAllowed, errSecSuccess] {
+            var lookupCount = 0
+            let fake = FakeSecItemClient(
+                copyHandler: { _, result in
+                    lookupCount += 1
+                    guard lookupCount == 1 else { return status }
+                    result?.pointee = NSObject()
+                    return errSecSuccess
+                },
+                deleteHandler: { _ in errSecInvalidOwnerEdit }
+            )
+            let service = KeychainService(
+                serviceName: "test.migration.bridge",
+                secItemClient: fake,
+                itemAccessValidator: FakeItemAccessValidator(),
+                itemAccessProvider: FakeSecKeychainItemAccessProvider()
+            )
+
+            XCTAssertThrowsError(try service.delete(for: "ZAIAPI")) { error in
+                if status == errSecInteractionNotAllowed {
+                    XCTAssertEqual(error as? KeychainService.KeychainError, .interactionNotAllowed)
+                } else {
+                    XCTAssertEqual(error as? KeychainItemAccessProviderError, .invalidItemReference)
+                }
+            }
+            XCTAssertEqual(fake.classicDeleteItems.count, 1)
+            XCTAssertEqual(fake.copyQueries.count, 2)
+            XCTAssertEqual(fake.deleteQueries.count, 1)
+        }
+    }
+
+    func testSystemClassicDeleteRejectsNonKeychainReferences() {
+        XCTAssertEqual(SystemSecItemClient().deleteClassicItem(NSObject()), errSecParam)
+    }
+
+    func testMigrationPrincipalsDescribeAppBundleWithoutChangingSigningAuthority() throws {
+        let bundle = URL(fileURLWithPath: "/Applications/RepoPrompt CE.app")
+        let anchor = bundle.appendingPathComponent("Contents/Resources/IdentityMigration/RepoPromptIdentityAnchor")
+        let authority = try KeychainAccessAuthority.identityMigration(bundleURL: bundle, anchorURL: anchor)
+        let applications = authority.creationAttributeProvider.applications
+
+        XCTAssertEqual(applications.map(\.descriptionPath), [bundle.path, bundle.path])
+        XCTAssertEqual(applications.map(\.codeURL), [bundle, anchor])
+        XCTAssertEqual(applications.map(\.requirementSource), [
+            RuntimeCodeSigningPolicy.developerIDRequirement,
+            RuntimeCodeSigningPolicy.successorDeveloperIDRequirement
+        ])
+    }
+
+    func testDeleteRevalidatesHeldReferenceBeforeRecoveryAndFailsClosedOnACLChange() {
+        let fake = FakeSecItemClient(
+            copyHandler: { _, result in
+                result?.pointee = NSObject()
+                return errSecSuccess
+            },
+            deleteHandler: { _ in errSecInvalidOwnerEdit }
+        )
+        let validator = FakeItemAccessValidator(
+            error: KeychainACLValidationError.extraPrincipal,
+            failOnValidation: 2
+        )
+        let service = KeychainService(
+            serviceName: "test.migration.bridge",
+            secItemClient: fake,
+            itemAccessValidator: validator,
+            itemAccessProvider: FakeSecKeychainItemAccessProvider()
+        )
+
+        XCTAssertThrowsError(try service.delete(for: "ZAIAPI")) { error in
+            XCTAssertEqual(error as? KeychainACLValidationError, .extraPrincipal)
+        }
+        XCTAssertEqual(validator.validationCount, 2)
+        XCTAssertTrue(fake.classicDeleteItems.isEmpty)
     }
 
     func testSaveUpdatesCanonicalNoninteractiveItemWithoutAddingWhenPresent() throws {
@@ -396,15 +667,17 @@ private final class FakeItemCreationAttributeProvider: KeychainItemCreationAttri
 
 private final class FakeItemAccessValidator: KeychainItemAccessValidator {
     private let error: Error?
+    private let failOnValidation: Int
     private(set) var validationCount = 0
 
-    init(error: Error? = nil) {
+    init(error: Error? = nil, failOnValidation: Int = 1) {
         self.error = error
+        self.failOnValidation = failOnValidation
     }
 
     func validate(_: AnyObject) throws {
         validationCount += 1
-        if let error {
+        if let error, validationCount >= failOnValidation {
             throw error
         }
     }
@@ -451,6 +724,8 @@ private final class FakeSecItemClient: SecItemClient {
     private let addHandler: (CapturedQuery, UnsafeMutablePointer<AnyObject?>?) -> OSStatus
     private let updateHandler: (CapturedQuery, CapturedQuery) -> OSStatus
     private let deleteHandler: (CapturedQuery) -> OSStatus
+    private let classicDeleteHandler: (AnyObject) -> OSStatus
+    private(set) var classicDeleteItems: [AnyObject] = []
 
     private(set) var copyQueries: [CapturedQuery] = []
     private(set) var addQueries: [CapturedQuery] = []
@@ -463,12 +738,14 @@ private final class FakeSecItemClient: SecItemClient {
         copyHandler: @escaping CopyHandler,
         addHandler: @escaping (CapturedQuery, UnsafeMutablePointer<AnyObject?>?) -> OSStatus = { _, _ in errSecSuccess },
         updateHandler: @escaping (CapturedQuery, CapturedQuery) -> OSStatus = { _, _ in errSecItemNotFound },
-        deleteHandler: @escaping (CapturedQuery) -> OSStatus = { _ in errSecSuccess }
+        deleteHandler: @escaping (CapturedQuery) -> OSStatus = { _ in errSecSuccess },
+        classicDeleteHandler: @escaping (AnyObject) -> OSStatus = { _ in errSecSuccess }
     ) {
         self.copyHandler = copyHandler
         self.addHandler = addHandler
         self.updateHandler = updateHandler
         self.deleteHandler = deleteHandler
+        self.classicDeleteHandler = classicDeleteHandler
     }
 
     func copyMatching(_ query: CFDictionary, _ result: UnsafeMutablePointer<AnyObject?>?) -> OSStatus {
@@ -491,6 +768,11 @@ private final class FakeSecItemClient: SecItemClient {
         updateAttributes.append(capturedAttributes)
         operationLog.append("update")
         return updateHandler(capturedQuery, capturedAttributes)
+    }
+
+    func deleteClassicItem(_ item: AnyObject) -> OSStatus {
+        classicDeleteItems.append(item)
+        return classicDeleteHandler(item)
     }
 
     func delete(_ query: CFDictionary) -> OSStatus {
