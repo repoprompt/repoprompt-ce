@@ -99,6 +99,7 @@ final class AgentSessionLinkRunnerHarness {
     var forcedAutoWakeID: UUID?
     /// Fake exact-returned support at reservation and final provider handoff.
     var routineQuietCheckIn = false
+    private(set) var physicalNotAttemptedCount = 0
     var beforeProviderInputProof: (() async -> Void)?
     var providerInputReleaseOverride: (() -> AgentSessionLinkProviderInputRelease.ReleasedDispatchContext)?
     var pendingHandoffSendOutcome: ((AgentTabSession, Bool) -> Void)?
@@ -269,6 +270,7 @@ final class AgentSessionLinkRunnerHarness {
                     sessionLinkHost?.agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: dispatchID) ?? true
                 },
                 recordAgentSessionLinkPhysicalDispatchNotAttempted: { session, dispatchID in
+                    MainActor.assumeIsolated { harnessBox?.physicalNotAttemptedCount += 1 }
                     sessionLinkHost?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
                 },
                 recordAgentSessionLinkPhysicalDispatchFailure: { session, dispatchID in

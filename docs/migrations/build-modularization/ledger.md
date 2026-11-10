@@ -7785,3 +7785,39 @@ passed **402 tests, zero failures/skips** (70.078s). Full lint
 match integrated `a0c674e9`: runner 1, prompt-adapter tests 1, execution tests/harness 0.
 Fresh index passed at **1,261/1,360 wrong-way edges and 53/66 largest cycle**, unchanged.
 Local qualification only; no both-product/full-SessionLinks/live-app/hosted-CI claim and no push.
+
+### M9.2g local checkpoint — ACP pre-dispatch proof return (2026-11-11)
+
+An operation-local setup/entered/provider-dispatch phase now keeps the exact weak writer receipt
+backstop active until the call into the controller actor. It is NOT a physical-write receipt: the
+actor hop and all post-dispatch events, errors, acceptance, identity writes and terminal follow-ups
+remain OPEN. Ordinary input-proof return rejects a lost claim before any physical-not-attempted hook.
+A same-claim successor attempt also receives no old hook. Original-attempt cancellation retains its
+hook, and owned-suspended admission cancels the original fresh attempt or retains the reused warm
+controller. Entry handoff/attachment/carry mutations are not rolled back through a new owner.
+
+Control preparation, refusal classification and event acquisition now recheck the receipt. Existing
+orphan-controller cleanup is preserved: only the detached captured controller is shut down, followed
+by another claim/attempt check before terminal publication. The existing dedicated-note defer's
+attempt-only predicate is preserved rather than silently strengthening it with a run-ID condition.
+Captured gate release stays confined to setup; no duplicate route-deferred diagnostic is emitted
+for an already-entered prompt. No new session field, registry, manager, or strong Command capture.
+
+One Oracle review (`0254`, chat `6F1A83`) found an unreachable orphan cleanup path introduced by the
+new generic admission gate. That regression was repaired before qualification, with real detached
+controller cases at both control boundaries. Review also added rejected-control-preparation coverage,
+an exact positive not-attempted-hook count for cancelled proof, and explicit wake-test limits.
+The six-variant ordinary proof test holds a real continuation (fresh/reused × reacquire/retire/successor)
+and asserts no prompt/consumer or stale shared mutation, plus exact cleanup-hook behavior. Expanded
+control cases cover both awaited boundaries, rejected preparation and detached controller retirement.
+The existing Stop-retraction/finalizer test now characterizes identity preservation across same-object
+writer reacquisition without an old physical hook. It does not exercise runner cancelRun wiring or
+claim M9.4 handoff authority; these wake suboperations themselves do not resolve writer identity.
+
+Initial focused `d7df4823-5449-493b-93ac-dbc9faa99d8d` passed. Final affected
+`1162927e-a67a-4e65-87b6-2dcf6a8c6877` passed **403 tests, zero failures/skips** (73.727s),
+including the review-added cases. Full lint `7cf0c8bf-e0b5-42c2-9fbc-7ac908393ca8` passed.
+Actual compiler occurrence counts across both compiles: runner 1 (baseline 1), AutoWake tests 10
+(baseline 11), execution tests/harness 0 (baseline 0); no positive deltas. Fresh index passed at
+**1,261/1,360 wrong-way edges and 53/66 largest cycle**, unchanged. Local qualification only;
+no both-product/full-SessionLinks/live-app/hosted-CI claim. No push to #1679.

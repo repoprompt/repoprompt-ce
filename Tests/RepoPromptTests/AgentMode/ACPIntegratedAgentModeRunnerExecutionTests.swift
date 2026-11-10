@@ -547,6 +547,7 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
             await barrier.awaitTerminalTeardown(for: finishedOwner, lifecycle: session.runLifecycle)
             let refused = cancelDuringProof || refuseRelease
             XCTAssertEqual(releases, refuseRelease ? 1 : 0)
+            XCTAssertEqual(harness.physicalNotAttemptedCount, cancelDuringProof ? 1 : 0)
             XCTAssertEqual(consumers, refused ? 0 : 1)
             XCTAssertEqual(session.runState, refused ? .cancelled : .completed)
             if refused {
@@ -560,9 +561,108 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
         }
     }
 
+    func testACPInputProofCannotDispatchOrCleanUpThroughAnotherWriterOrAttempt() async throws {
+        enum Drift { case reacquire, retire, successor }
+        for reused in [false, true] {
+            for drift in [Drift.reacquire, .retire, .successor] {
+                let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                defer { try? FileManager.default.removeItem(at: directory) }
+                let script = try AgentSessionLinkACPServerScript.write(to: directory)
+                let promptLog = directory.appendingPathComponent("prompts.jsonl")
+                let provider = AgentSessionLinkCapturingACPProvider(providerID: .antigravity, commandPath: script.path, environment: ["ACP_PROMPT_LOG": promptLog.path])
+                let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: directory.path, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
+                let controller = try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
+                addTeardownBlock { await controller.shutdown() }
+                let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+                let session = try harness.makeBoundSession(agent: .antigravity)
+                if reused {
+                    _ = try await controller.bootstrap()
+                    session.acpController = controller
+                    _ = AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
+                }
+                let origin = try harness.startCommand(for: session)
+                let scope = origin.writer.scope
+                let barrier = AgentRunTerminalCommitBarrier()
+                let runner = ACPIntegratedAgentModeRunner(hooks: harness.hooks, terminalCommitBarrier: barrier, toolTrackingHooks: .noOp)
+                var consumers = 0
+                runner.testPromptConsumerCreated = { consumers += 1 }
+                let entered = expectation(description: "ACP input proof held")
+                var release: CheckedContinuation<Void, Never>?
+                defer { release?.resume() }
+                harness.beforeProviderInputProof = {
+                    await withCheckedContinuation { continuation in
+                        release = continuation
+                        entered.fulfill()
+                    }
+                }
+                let prepared = await runner.prepareRun(
+                    tabID: session.tabID, session: session, origin: origin, workspace: harness.workspace,
+                    initialUserMessage: "turn", initialMessageForRun: "turn", attachments: [], runRequest: request,
+                    makeLease: { harness.makeLease(runID: $0, tabID: session.tabID) }
+                )
+                let resources = AgentRunProviderComposition(
+                    headless: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
+                    acp: { _, _ in provider }, controller: { _, _ in controller }
+                )
+                await resources.fulfill(prepared)
+                await fulfillment(of: [entered], timeout: 3)
+                let task = try XCTUnwrap(session.agentTask)
+                let originalOwner = try XCTUnwrap(session.activeRunOwnership)
+                var previousTeardown: AgentRunAttemptTerminalResources.Teardown?
+                switch drift {
+                case .reacquire:
+                    var members = scope.sessions
+                    members.removeValue(forKey: session.tabID)
+                    scope.replaceSessions(members)
+                    members[session.tabID] = session
+                    scope.replaceSessions(members)
+                    XCTAssertFalse(origin.isCurrent)
+                case .retire:
+                    scope.beginRetirement()
+                case .successor:
+                    previousTeardown = session.claimRunAttemptTerminalTeardown(ownership: originalOwner, terminalState: .cancelled)
+                    _ = session.beginRunAttempt(source: "successor during ACP input proof")
+                    XCTAssertTrue(origin.isCurrent)
+                }
+                let owner = session.activeRunOwnership
+                let saves = session.saveRequestGeneration
+                let dirty = session.isDirty
+                release?.resume()
+                release = nil
+                await task.value
+                XCTAssertEqual(consumers, 0)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: promptLog.path))
+                XCTAssertEqual(harness.physicalNotAttemptedCount, drift == .retire ? 1 : 0)
+                if drift == .retire {
+                    await barrier.awaitTerminalTeardown(for: originalOwner, lifecycle: session.runLifecycle)
+                    XCTAssertEqual(session.runState, .cancelled)
+                    XCTAssertEqual(session.acpController === controller, reused)
+                } else {
+                    XCTAssertEqual(session.activeRunOwnership, owner)
+                    XCTAssertEqual(session.saveRequestGeneration, saves)
+                    XCTAssertEqual(session.isDirty, dirty)
+                    XCTAssertNil(session.lastTerminalCommitRevision)
+                    XCTAssertTrue(session.acpController === controller)
+                    let reusable = await controller.hasReusableSession
+                    XCTAssertTrue(reusable, "An old proof cannot retire the installed controller")
+                    if let previousTeardown { await previousTeardown() }
+                    await harness.service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+                    XCTAssertEqual(session.runState, .cancelled)
+                }
+                await controller.shutdown()
+                session.saveDebounceTask?.cancel()
+            }
+        }
+    }
+
     func testACPControlCommandDoesNotConsumeEventsBeforeAdmission() async throws {
-        enum Refusal { case none, conversationChanged, cancelled }
-        for refusal in [Refusal.none, .conversationChanged, .cancelled] {
+        enum Refusal { case none, conversationChanged, cancelled, reacquire, retire, detached }
+        typealias Boundary = ACPIntegratedAgentModeRunner.StartupBoundary
+        let cases: [(Refusal, Boundary)] = [(.none, .controlPromptAdmission), (.conversationChanged, .controlPromptAdmission), (.cancelled, .controlPromptAdmission), (.reacquire, .controlPromptPrepared), (.retire, .controlPromptPrepared), (.reacquire, .controlPromptAdmission), (.retire, .controlPromptAdmission)]
+        let preparationCases = cases.map { ($0.0, $0.1, false) }
+            + [(.none, .controlPromptPrepared, true), (.reacquire, .controlPromptPrepared, true), (.retire, .controlPromptPrepared, true), (.detached, .controlPromptPrepared, false), (.detached, .controlPromptAdmission, false)]
+        for (refusal, boundary, rejectPreparation) in preparationCases {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: directory) }
@@ -575,42 +675,83 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
             let controller = try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
             addTeardownBlock { await controller.shutdown() }
             let bootstrap = try await controller.bootstrap()
+            if rejectPreparation { await controller.test_rejectNextTurnPreparation() }
             let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
             let session = try harness.makeBoundSession(agent: .antigravity)
             session.acpController = controller
             session.providerSessionID = bootstrap.providerSessionIdentity.loadSessionID ?? bootstrap.providerSessionIdentity.runtimeSessionID
             _ = AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
             let command = try AgentProviderControlCommand.compact(expectedBinding: XCTUnwrap(session.persistentSessionBindingIdentity), expectedProviderConversation: XCTUnwrap(session.providerSessionID))
-            let runner = ACPIntegratedAgentModeRunner(hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(), toolTrackingHooks: .noOp)
+            let origin = try harness.startCommand(for: session)
+            let scope = origin.writer.scope
+            let barrier = AgentRunTerminalCommitBarrier()
+            let runner = ACPIntegratedAgentModeRunner(hooks: harness.hooks, terminalCommitBarrier: barrier, toolTrackingHooks: .noOp)
             var consumers = 0
             var task: Task<Void, Never>?
             runner.testPromptConsumerCreated = { consumers += 1 }
-            runner.testAtStartupBoundary = { boundary in
-                guard boundary == .controlPromptAdmission else { return }
+            var owner: AgentRunOwnership?
+            var saves: UInt64 = 0
+            var dirty = false
+            runner.testAtStartupBoundary = { point in
+                guard point == boundary else { return }
                 task = session.agentTask
+                owner = session.activeRunOwnership
+                saves = session.saveRequestGeneration
+                dirty = session.isDirty
                 XCTAssertEqual(consumers, 0)
                 switch refusal {
                 case .none: break
                 case .conversationChanged: session.providerSessionID = "replacement-conversation"
                 case .cancelled: session.agentTask?.cancel()
+                case .reacquire:
+                    var members = scope.sessions
+                    members.removeValue(forKey: session.tabID)
+                    scope.replaceSessions(members)
+                    members[session.tabID] = session
+                    scope.replaceSessions(members)
+                case .retire: scope.beginRetirement()
+                case .detached: session.acpController = nil
                 }
             }
-            _ = try await runner.prepareRun(
-                tabID: session.tabID, session: session, origin: harness.startCommand(for: session), workspace: harness.workspace,
+            _ = await runner.prepareRun(
+                tabID: session.tabID, session: session, origin: origin, workspace: harness.workspace,
                 initialUserMessage: command.providerText, initialMessageForRun: command.providerText, attachments: [], runRequest: request,
                 providerControlCommand: command, makeLease: { harness.makeLease(runID: $0, tabID: session.tabID) }
             )
             try await AsyncTestWait.waitUntil("control command admission") { task != nil }
             await task?.value
-            XCTAssertEqual(consumers, refusal == .none ? 1 : 0)
+            let sent = refusal == .none && !rejectPreparation
+            XCTAssertEqual(consumers, sent ? 1 : 0)
             let rpcText = try String(contentsOf: rpcLog, encoding: .utf8)
-            XCTAssertEqual(rpcText.contains("session/prompt"), refusal == .none)
-            if refusal == .none { XCTAssertEqual(session.runState, .completed) }
+            XCTAssertEqual(rpcText.contains("session/prompt"), sent)
+            if refusal == .none {
+                XCTAssertEqual(session.runState, rejectPreparation ? .failed : .completed)
+                if rejectPreparation { XCTAssertTrue(session.acpController === controller) }
+            }
+            if refusal == .detached {
+                try await barrier.awaitTerminalTeardown(for: XCTUnwrap(owner), lifecycle: session.runLifecycle)
+                XCTAssertEqual(session.runState, .failed)
+                let retired = await controller.isRetired
+                XCTAssertTrue(retired)
+            }
             if refusal == .conversationChanged {
                 XCTAssertEqual(session.runState, .failed)
                 XCTAssertTrue(session.acpController === controller)
             }
             if refusal == .cancelled { XCTAssertEqual(session.runState, .cancelled) }
+            if refusal == .retire {
+                try await barrier.awaitTerminalTeardown(for: XCTUnwrap(owner), lifecycle: session.runLifecycle)
+                XCTAssertEqual(session.runState, .cancelled)
+                XCTAssertTrue(session.acpController === controller)
+            }
+            if refusal == .reacquire {
+                XCTAssertEqual(session.activeRunOwnership, owner)
+                XCTAssertEqual(session.saveRequestGeneration, saves)
+                XCTAssertEqual(session.isDirty, dirty)
+                XCTAssertNil(session.lastTerminalCommitRevision)
+                XCTAssertTrue(session.acpController === controller)
+                await harness.service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+            }
             await controller.shutdown()
             session.saveDebounceTask?.cancel()
         }
