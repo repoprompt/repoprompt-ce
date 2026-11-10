@@ -86,7 +86,6 @@ final class CodexIntegratedAgentModeRunner {
             // An actual Stop owns terminal settlement. Do not end its still-active attempt while
             // its barrier may be suspended. Retiring admission alone is a local startup refusal.
             guard !Task.isCancelled, stopFence?.permitsStart(of: session) ?? true else { return .cancelled }
-            let suspended = receipt.disposition(for: session) == .ownedSuspended
             var coordinatorEntered = false
             let execution = await CodexIntegratedRunExecutionAdapter.execute {
                 // The adapter preserves MainActor isolation. Recheck at the actual coordinator entry;
@@ -100,6 +99,8 @@ final class CodexIntegratedAgentModeRunner {
                 coordinatorEntered = true
                 let outcome = await self.codexCoordinator.sendCodexNativeMessage(
                     session: session,
+                    writerReceipt: receipt,
+                    ownership: ownership,
                     text: initialMessageForRun,
                     attachments: attachments,
                     fallbackContext: fallbackContext,
@@ -153,7 +154,7 @@ final class CodexIntegratedAgentModeRunner {
                 }
                 guard receipt.disposition(for: session) != .claimLost,
                       session.activeRunOwnership == ownership else { return outcome }
-                let source = suspended ? "codex.startSuspended" : (mcpServerReady ? "codex.sendRejected" : "codex.mcpBootstrapRejected")
+                let source = receipt.disposition(for: session) == .ownedSuspended ? "codex.startSuspended" : (mcpServerReady ? "codex.sendRejected" : "codex.mcpBootstrapRejected")
                 session.endRunAttempt(ifCurrent: ownership, source: source)
             }
             return outcome

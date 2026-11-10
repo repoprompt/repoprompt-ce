@@ -7834,8 +7834,9 @@ still match. Busy/idle readers may observe the slot through that final join rath
 defer; the caller still returns only after its own slot cleanup.
 
 Wrapper-owned MCP failure or suspended admission restores ONLY its still-reserved exact attachment ID
-before ending a locally-created attempt. This fixes the former pre-coordinator reservation leak without
-consuming unrelated deferred cleanup. Real Stop retains its terminal ownership: cancellation/fence
+before ending a locally-created attempt. This fixes the former pre-coordinator reservation leak while
+avoiding an extra finalization of idle/already-consumed state. For a matching reservation, the existing
+attachment owner's restore policy still clears deferred-cleanup bookkeeping without deleting files. Real Stop retains its terminal ownership: cancellation/fence
 refusal bypasses local terminal cleanup, and exact original cancelled-terminal return remains
 .cancelled rather than .stale. Dedicated-note re-parking occurs before local endRunAttempt because that
 operation does not create a terminal receipt. Coordinator-entered outcomes remain truthful, but their
@@ -7862,3 +7863,45 @@ largest cycle**; the baseline was not raised. The added wrong-way file edge is t
 `.reserved` match into `AgentModeViewModel+Types.swift` (existing attachment DTO placement); the
 WriterReceipt/Command edge into RuntimeStore is not wrong-way. No M10 extraction is claimed. Local qualification only, not both-product/full-SessionLinks,
 live-app, sanitizer or hosted-CI qualification. Nothing pushed to #1679.
+
+### M9.2g local checkpoint — Codex observer-wait and active-child-wait send admission
+
+The actual native send entry now requires the originating weak WriterReceipt and exact run ownership;
+its sole production caller supplies the originals. Before send-frame running-state writes, entry,
+observer-wait success/catch and active-child-wait completion refuse lost claims or successor attempts
+without restoring attachments, adding errors, saving or dispatching. Original suspended/terminal
+ownership permits only exact still-reserved attachment restoration and returns cancellation. The
+runner re-reads suspended admission for its cleanup label after the coordinator returns. This is
+strictly the early wait slice: ensure/controller construction, computer-use validation, post-ensure
+unsent settlement, physical provider writes and post-dispatch work remain OPEN. In particular,
+endRunAttempt does not clear runState, and the existing general Codex terminal finalizer deletes
+unsent attachments for cancellation; neither was repurposed as a new cleanup policy. The active
+wait drain can still deliver steering to child waits internally before its post-await writer check.
+
+One Oracle review (`0411`, chat `6F1A83`) caught the misplaced discardableResult attribute and asked
+for explicit test attempt setup, original-Stop/attachment coverage and production-path reachability.
+All 77 direct test sends now explicitly supply their existing/new attempt at the call site and use a
+test-only real restored-writer admission helper; no implicit attempt construction or production
+compatibility bypass remains. Only the eight wedge tests that directly send opt into restored
+binding. Other wedge tests retain their deliberately unbound/fresh-creation contracts. The held
+observer/drain matrix covers 12 variants using real suspension, a real attachment, and actual Stop;
+Stop's already-idle reservation must not consume later deferred-cleanup bookkeeping. A separate
+runner-level witness proves an existing active attempt reaches the drain and is preserved on its
+current-owner refusal. Entry suspension now returns cancellation; the ordinary production runner
+already requires current admission at entry. No assertions, budgets or timeouts were weakened.
+
+Initial `41c476b8-a375-494f-b1c8-2afce0dbcd12` compiled successfully but used the file name instead of
+the XCTest class and ran no tests: build evidence only. Corrected focus
+`4ba21310-ac5c-4919-a775-c78d4a50dc0c` passed the 12-variant method (0.578s). First affected
+`a3e0dd28-7b5a-4dbe-99cb-ddca4ddc1b6f` ran 592 tests/4 skips with 98 assertions across two failing
+wedge cases: making the shared fixture bound changed the fresh-composer and deliberately-unbound
+malformed-event contracts. Narrow explicit restored opt-in fixes the fixture, preserving both
+original assertions. Final affected `07691c0a-c470-4417-bb3c-bff976d61d1b` passed **593 tests,
+4 skips, zero failures** (212.356s), including both new witnesses (0.319s/0.030s). Final full lint
+`efc88669-68fb-4bcb-aba3-ed67dd7a0b46` passed, as did scoped pinned formatting/strict lint.
+Actual compiler occurrence counts (initial complete compile plus final test recompile, maximum per
+file) match integrated `a0c674e9`: coordinator/runner/helper 0, wedge 17, AutoWake 11, catalog
+integration 2, prompt-adapter tests 6. No new warning occurrences; this is not a zero-total-warning
+claim. Fresh index passed at **1,262/1,360 wrong-way edges and 53/66 largest cycle**, unchanged
+baseline. Local qualification only; no both-product/full-SessionLinks, live-app, release, sanitizer
+or hosted-CI qualification for this checkpoint. Nothing pushed to #1679.

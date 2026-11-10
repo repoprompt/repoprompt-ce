@@ -22,6 +22,46 @@ func controlWriterIdentity(
     return writer.identity
 }
 
+/// Direct coordinator tests bypass the runner, so supply its real restored admission and
+/// attempt setup explicitly. Invalid fixtures fail rather than gaining an unfenced send path.
+@MainActor
+extension CodexAgentModeCoordinator {
+    @discardableResult
+    func test_sendCodexNativeMessage(
+        session: AgentTabSession,
+        ownership: AgentRunOwnership,
+        text: String,
+        attachments: [AgentFileAttachment],
+        fallbackContext: AgentTabSession.CodexFallbackSubmissionContext? = nil,
+        stopFence: AgentRunStartStopFence? = nil,
+        attachmentReservationID: UUID? = nil,
+        policyAlreadyInstalled: Bool = false,
+        terminalizeRejectedSend: Bool = true,
+        autoEffortSelection: AutoEffortTurnSelection? = nil,
+        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async -> NativeSendOutcome {
+        guard let sessionID = session.activeAgentSessionID,
+              case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: sessionID),
+              writer.session === session,
+              case let .success(command) = writer.admitCommand(.restored),
+              let receipt = AgentSessionRuntimeStore.WriterReceipt(command)
+        else {
+            XCTFail("Direct Codex send requires an exact restored writer", file: file, line: line)
+            return .preDispatchRejected(message: "Invalid Codex test fixture admission")
+        }
+        XCTAssertEqual(session.activeRunOwnership, ownership, file: file, line: line)
+        return await sendCodexNativeMessage(
+            session: session, writerReceipt: receipt, ownership: ownership, text: text,
+            attachments: attachments, fallbackContext: fallbackContext, stopFence: stopFence,
+            attachmentReservationID: attachmentReservationID, policyAlreadyInstalled: policyAlreadyInstalled,
+            terminalizeRejectedSend: terminalizeRejectedSend, autoEffortSelection: autoEffortSelection,
+            selfCompactDispatchID: selfCompactDispatchID
+        )
+    }
+}
+
 /// Runner-level harness for the cross-window oversight prompt supplement.
 ///
 /// Builds the real `HeadlessAgentModeRunner` / `ACPIntegratedAgentModeRunner` (through

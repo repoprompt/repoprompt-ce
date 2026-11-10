@@ -7210,9 +7210,44 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         return .steer(identity)
     }
 
+    #if DEBUG
+        var testCodexSendObserverWaitEntered: (() -> Void)?
+    #endif
+
+    /// Refusal before this send frame has changed runtime state. Exact terminal ownership
+    /// permits cleanup only; a reacquired writer or successor attempt permits no mutation.
+    private func codexEarlySendRefusal(
+        session: AgentTabSession,
+        writerReceipt: AgentSessionRuntimeStore.WriterReceipt,
+        ownership: AgentRunOwnership,
+        attachmentReservationID: UUID?
+    ) -> NativeSendOutcome? {
+        let disposition = writerReceipt.disposition(for: session)
+        guard disposition != .claimLost else {
+            return .stale(reason: "The originating Codex writer changed while preparing the send.")
+        }
+        let ownsActive = session.activeRunOwnership == ownership
+        let ownsTerminal = session.activeRunOwnership == nil && session.lastTerminalCommitRevision?.ownership == ownership
+        guard ownsActive || ownsTerminal else {
+            return .stale(reason: "The originating Codex attempt changed while preparing the send.")
+        }
+        if ownsActive, disposition == .current { return nil }
+        if let attachmentReservationID,
+           case let .reserved(storedID, _) = session.attachmentTurnState,
+           storedID == attachmentReservationID
+        {
+            attachmentRuntime?.finalizeAttachmentsForTurn(
+                for: session, reservationID: attachmentReservationID, disposition: .restoreToPending
+            )
+        }
+        return .cancelled
+    }
+
     @discardableResult
     func sendCodexNativeMessage(
         session: AgentTabSession,
+        writerReceipt: AgentSessionRuntimeStore.WriterReceipt,
+        ownership: AgentRunOwnership,
         text: String,
         attachments: [AgentFileAttachment],
         fallbackContext: AgentTabSession.CodexFallbackSubmissionContext? = nil,
@@ -7223,6 +7258,10 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil
     ) async -> NativeSendOutcome {
+        if let refusal = codexEarlySendRefusal(
+            session: session, writerReceipt: writerReceipt, ownership: ownership,
+            attachmentReservationID: attachmentReservationID
+        ) { return refusal }
         if let message = session.operationAdmissionFailureMessage {
             return .preDispatchRejected(message: message)
         }
@@ -7271,16 +7310,27 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         let activeSendRunAttemptID = wasRunAlreadyActive ? session.activeRunAttemptID : nil
         let shouldDrainActiveAgentRunWaits = fallbackContext?.origin.isMCP != true
         if let activeSendRunID, shouldDrainActiveAgentRunWaits {
+            #if DEBUG
+                testCodexSendObserverWaitEntered?()
+            #endif
             do {
                 try await session.awaitObserverWaitRelease(
                     runID: activeSendRunID, runAttemptID: activeSendRunAttemptID
                 )
             } catch {
+                if let refusal = codexEarlySendRefusal(
+                    session: session, writerReceipt: writerReceipt, ownership: ownership,
+                    attachmentReservationID: attachmentReservationID
+                ) { return refusal }
                 attachmentRuntime?.finalizeAttachmentsForTurn(
                     for: session, reservationID: attachmentReservationID, disposition: .restoreToPending
                 )
                 return .cancelled
             }
+            if let refusal = codexEarlySendRefusal(
+                session: session, writerReceipt: writerReceipt, ownership: ownership,
+                attachmentReservationID: attachmentReservationID
+            ) { return refusal }
             let normalizedDraftText = fallbackContext?.draftText.trimmingCharacters(in: .whitespacesAndNewlines)
             let steeringMessage = normalizedDraftText?.isEmpty == false ? normalizedDraftText : nil
             let drained = await activeAgentRunWaitDrain(
@@ -7289,6 +7339,10 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 "codex-native-active-send",
                 steeringMessage
             )
+            if let refusal = codexEarlySendRefusal(
+                session: session, writerReceipt: writerReceipt, ownership: ownership,
+                attachmentReservationID: attachmentReservationID
+            ) { return refusal }
             if Task.isCancelled {
                 attachmentRuntime?.finalizeAttachmentsForTurn(
                     for: session,

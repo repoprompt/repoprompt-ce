@@ -8380,7 +8380,7 @@ extension AgentSessionLinkAutoWakeTests {
                         // The real Codex error path owns failed terminalization; do not insert a
                         // final row or mint a second completion on behalf of the fake provider.
                         fixture.session.runState = .completed
-                        let outcome = await fixture.viewModel.test_codexCoordinator.sendCodexNativeMessage(session: fixture.session, text: "", attachments: [])
+                        let outcome = await fixture.viewModel.test_codexCoordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "", attachments: [])
                         guard case .failed = outcome else { return XCTFail("Expected physical Codex failure, got \(outcome)") }
                     }
                     XCTAssertEqual(calls.count, callCount + 1, "Exactly one physical fake call per failed producer in this no-retry scenario")

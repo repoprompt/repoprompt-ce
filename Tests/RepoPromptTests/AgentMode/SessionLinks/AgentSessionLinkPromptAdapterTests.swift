@@ -408,6 +408,145 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         )
     }
 
+    func testCodexRunnerPreservesActiveAttemptWhenChildWaitsRefuseToDrain() async throws {
+        let fixture = try makeFixture()
+        let session = fixture.session
+        let command = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
+        let ownership = session.beginRunAttempt(source: "test.codex.activeSend")
+        session.installRunID(UUID())
+        session.runState = .running
+        let harness = AgentSessionLinkRunnerHarness(
+            headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }
+        )
+        var drainCalls = 0
+        fixture.coordinator.setActiveAgentRunWaitDrain { runID, attemptID, _, _ in
+            XCTAssertEqual(runID, session.runID)
+            XCTAssertEqual(attemptID, ownership.attemptID)
+            drainCalls += 1
+            return false
+        }
+        let runner = CodexIntegratedAgentModeRunner(
+            mcpServerEnabler: { true }, codexCoordinator: fixture.coordinator, hooks: harness.hooks
+        )
+        let outcome = await runner.startRun(
+            tabID: session.tabID, session: session, origin: command,
+            initialMessageForRun: "active send", attachments: [], fallbackContext: nil
+        )
+        guard case let .preDispatchRejected(message) = outcome else { return XCTFail("Expected child-wait refusal") }
+        XCTAssertTrue(message.contains("did not drain"))
+        XCTAssertEqual(drainCalls, 1)
+        XCTAssertEqual(session.activeRunOwnership, ownership)
+        XCTAssertNil(session.codexController)
+        XCTAssertNil(session.agentTask)
+    }
+
+    func testCodexEarlyWaitsCannotPublishThroughAReplacementWriterOrAttempt() async throws {
+        for boundary in ["observer", "drain"] {
+            for drift in ["none", "reacquire", "retire", "successor", "cancelReacquired", "stop"] {
+                let fixture = try makeFixture()
+                let session = fixture.session
+                let command = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
+                let scope = command.writer.scope
+                let receipt = try XCTUnwrap(AgentSessionRuntimeStore.WriterReceipt(command))
+                let ownership = session.beginRunAttempt(source: "test.codex.earlyWait")
+                session.installRunID(UUID())
+                session.runState = .running
+                let attachment = AgentFileAttachment(source: .localFile(path: "/nonexistent-early-codex-send.png"))
+                let reservation = try XCTUnwrap(scope.attachments.reserveAttachmentsForTurn([attachment], session: session))
+                let harness = AgentSessionLinkRunnerHarness(
+                    headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
+                    attachmentHooks: scope.attachments.makeRunHooks()
+                )
+                var observerEntered = false
+                var releaseObserver: CheckedContinuation<Void, Never>?
+                var releaseDrain: CheckedContinuation<Bool, Never>?
+                var drainCalls = 0
+                fixture.coordinator.testCodexSendObserverWaitEntered = { observerEntered = true }
+                if boundary == "observer" {
+                    let barrier = Task { await withCheckedContinuation { releaseObserver = $0 } }
+                    session.observerWaitRelease = (session.runID, ownership.attemptID, barrier)
+                    try await AsyncTestWait.waitUntil("observer barrier installed") { releaseObserver != nil }
+                }
+                fixture.coordinator.setActiveAgentRunWaitDrain { _, _, _, _ in
+                    drainCalls += 1
+                    if boundary == "drain" {
+                        return await withCheckedContinuation { releaseDrain = $0 }
+                    }
+                    return false
+                }
+                let task = Task {
+                    await fixture.coordinator.sendCodexNativeMessage(
+                        session: session, writerReceipt: receipt, ownership: ownership,
+                        text: "held send", attachments: [], attachmentReservationID: reservation
+                    )
+                }
+                try await AsyncTestWait.waitUntil("Codex early wait held") {
+                    boundary == "observer" ? observerEntered : releaseDrain != nil
+                }
+                if drift == "reacquire" || drift == "cancelReacquired" {
+                    var members = scope.sessions
+                    members.removeValue(forKey: session.tabID)
+                    scope.replaceSessions(members)
+                    members[session.tabID] = session
+                    scope.replaceSessions(members)
+                    XCTAssertFalse(command.isCurrent)
+                } else if drift == "retire" {
+                    scope.beginRetirement()
+                } else if drift == "successor" {
+                    _ = session.beginRunAttempt(source: "successor")
+                } else if drift == "stop" {
+                    await harness.service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+                    XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, ownership)
+                    XCTAssertEqual(session.attachmentTurnState, .idle)
+                    session.attachmentsPendingProviderConsumptionCleanup = [attachment]
+                }
+                if drift == "cancelReacquired" { task.cancel() }
+                let originalItems = session.items
+                let originalDirty = session.isDirty
+                let originalSave = session.saveRequestGeneration
+                let originalOwnership = session.activeRunOwnership
+                releaseObserver?.resume()
+                releaseObserver = nil
+                releaseDrain?.resume(returning: false)
+                releaseDrain = nil
+                let outcome = await task.value
+                XCTAssertFalse(outcome.didSend)
+                XCTAssertNil(session.codexController)
+                XCTAssertEqual(session.activeRunOwnership, originalOwnership)
+                XCTAssertNil(session.codexPendingAuthRetryTurn)
+                if drift == "none" {
+                    guard case let .preDispatchRejected(message) = outcome else { return XCTFail("Expected drain refusal") }
+                    XCTAssertTrue(message.contains("did not drain"))
+                    XCTAssertEqual(session.items.count, originalItems.count + 1)
+                    XCTAssertEqual(drainCalls, 1)
+                    XCTAssertEqual(session.attachmentTurnState, .idle)
+                } else {
+                    XCTAssertEqual(session.items, originalItems)
+                    if drift == "retire" || drift == "stop" {
+                        guard case .cancelled = outcome else { return XCTFail("Expected original-owner cancellation") }
+                        XCTAssertEqual(session.attachmentTurnState, .idle)
+                        XCTAssertTrue(session.pendingFileAttachments.contains(where: { $0.id == attachment.id }))
+                        if drift == "stop" {
+                            XCTAssertEqual(session.attachmentsPendingProviderConsumptionCleanup.map(\.id), [attachment.id])
+                            XCTAssertEqual(session.isDirty, originalDirty)
+                            XCTAssertEqual(session.saveRequestGeneration, originalSave)
+                        }
+                    } else {
+                        guard case .stale = outcome else { return XCTFail("Expected stale origin refusal") }
+                        XCTAssertEqual(session.attachmentTurnState, .reserved(reservationID: reservation, attachments: [attachment]))
+                        XCTAssertEqual(session.isDirty, originalDirty)
+                        XCTAssertEqual(session.saveRequestGeneration, originalSave)
+                    }
+                    XCTAssertEqual(drainCalls, boundary == "observer" ? 0 : 1)
+                }
+                session.observerWaitRelease = nil
+                fixture.coordinator.testCodexSendObserverWaitEntered = nil
+                session.saveDebounceTask?.cancel()
+                session.saveDebounceTask = nil
+            }
+        }
+    }
+
     private func assertReplayUsedFreshController(
         _ fixture: Fixture,
         file: StaticString = #filePath,
@@ -834,8 +973,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
     func testCodexDedicatedContinuationNoteUsesDirectTurnAndExactProviderBytes() async throws {
         let fixture = try makeFixture()
         fixture.session.beginRunAttempt(source: "test.codex.prime")
-        _ = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session, text: "prime", attachments: []
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "prime", attachments: []
         )
         fixture.session.runState = .idle
         fixture.session.beginRunAttempt(source: "test.codex.selfNote")
@@ -879,8 +1018,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         fixture.session.pendingFileAttachments = [attachment]
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
 
-        let outcome = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session,
+        let outcome = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"),
             text: AgentSelfCompactNoteEnvelope.frame(note),
             attachments: [],
             selfCompactDispatchID: dispatchID
@@ -914,7 +1053,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
                 return false
             }
             let send = Task { @MainActor in
-                await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "existing task", attachments: [])
+                await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "existing task", attachments: [])
             }
             defer { gate.release()
                 send.cancel()
@@ -952,7 +1091,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             let fixture = try makeFixture()
             await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
             fixture.session.beginRunAttempt(source: "test.localInput.parked.prime")
-            _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "prime", attachments: [])
+            _ = await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "prime", attachments: [])
             if steer {
                 fixture.controller.markActiveTurn(id: "turn-1")
                 await fixture.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "turn-1"), session: fixture.session, sourceController: fixture.controller)
@@ -986,7 +1125,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
                 return await input.bridge.proveLocalInputRead(decoration, observer: input.observer)
             }
             let send = Task { @MainActor in
-                await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "ordinary task", attachments: [])
+                await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "ordinary task", attachments: [])
             }
             defer { gate.release()
                 send.cancel()
@@ -1014,7 +1153,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
                 fixture.session.runState = .idle
                 fixture.session.beginRunAttempt(source: "test.localInput.parked.retryStart")
             }
-            let retried = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "later valid task", attachments: [])
+            let retried = await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "later valid task", attachments: [])
             XCTAssertEqual(retried, .sent)
             let text = try XCTUnwrap(steer ? fixture.controller.steeredTurns.last : fixture.startedTurns.last)
             XCTAssertTrue(text.hasPrefix(parked.frame + "\n\n"))
@@ -1034,13 +1173,13 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         addTeardownBlock { @MainActor in await input.cleanup() }
         await input.correction("CODEX-START-CORRECTION")
         fixture.session.beginRunAttempt(source: "test.localInput.codex.start")
-        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "existing task", attachments: [])
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "existing task", attachments: [])
         XCTAssertTrue(try XCTUnwrap(fixture.startedTurns.last).contains("CODEX-START-CORRECTION"))
         try input.assertConsumed()
         fixture.controller.markActiveTurn(id: "turn-1")
         await fixture.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "turn-1"), session: fixture.session, sourceController: fixture.controller)
         await input.correction("CODEX-STEER-CORRECTION")
-        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "existing steering", attachments: [])
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "existing steering", attachments: [])
         let steered = try XCTUnwrap(fixture.controller.steeredTurns.last)
         XCTAssertTrue(steered.contains("<user_input at="))
         XCTAssertTrue(steered.contains("CODEX-STEER-CORRECTION"))
@@ -1079,7 +1218,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
                 return valid
             }
             let send = Task { @MainActor in
-                await fixture.coordinator.sendCodexNativeMessage(session: session, text: text, attachments: [])
+                await fixture.coordinator.test_sendCodexNativeMessage(session: session, ownership: session.activeRunOwnership ?? session.beginRunAttempt(source: "test.codex.send"), text: text, attachments: [])
             }
             defer { gate.release()
                 send.cancel()
@@ -1127,7 +1266,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         let fixture = try makeFixture()
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
         fixture.session.beginRunAttempt(source: "test.codex.mismatch.prime")
-        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "prime", attachments: [])
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "prime", attachments: [])
         fixture.controller.markActiveTurn(id: "turn-1")
         await fixture.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "turn-1"), session: fixture.session, sourceController: fixture.controller)
         let input = try await AgentSessionLinkTransportLocalInputFixture.install(on: fixture.viewModel, session: fixture.session)
@@ -1156,7 +1295,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             }
             return CodexTurnSteerReceipt(acceptedTurnID: expectedTurnID)
         }
-        let outcome = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "existing steering", attachments: [])
+        let outcome = await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "existing steering", attachments: [])
         XCTAssertEqual(outcome, .sent)
         XCTAssertEqual(attempts.count, 2)
         XCTAssertTrue(try XCTUnwrap(attempts.first).contains("FIRST-HANDOFF-CORRECTION"))
@@ -1169,7 +1308,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         fixture.viewModel.test_agentSessionLinkLocalInputDecoration = nil
         fixture.session.runState = .idle
         fixture.session.beginRunAttempt(source: "test.codex.mismatch.fresh")
-        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "independently permitted fresh turn", attachments: [])
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "independently permitted fresh turn", attachments: [])
         let fresh = try XCTUnwrap(fixture.startedTurns.last)
         XCTAssertTrue(fresh.contains("NEW-DURING-RETRY-CORRECTION"))
         XCTAssertFalse(fresh.contains("FIRST-HANDOFF-CORRECTION"))
@@ -1183,11 +1322,11 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         let input = try await AgentSessionLinkTransportLocalInputFixture.install(on: fixture.viewModel, session: fixture.session)
         addTeardownBlock { @MainActor in await input.cleanup() }
         fixture.session.beginRunAttempt(source: "test.localInput.codex.fallback")
-        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "seed task", attachments: [])
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "seed task", attachments: [])
         await fixture.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "turn-1"), session: fixture.session, sourceController: fixture.controller)
         fixture.controller.threadRuntimeStatus = .active(activeFlags: ["turn"])
         fixture.controller.steerFailure = .noActiveTurn(.init(method: "turn/steer", code: nil, message: "no active turn", data: nil))
-        let queued = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "queued existing task", attachments: [])
+        let queued = await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "queued existing task", attachments: [])
         guard case .queuedFallback = queued else { return XCTFail("expected fallback queue") }
         await input.correction("CODEX-DRAIN-CORRECTION")
         fixture.controller.steerFailure = nil
@@ -1207,8 +1346,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         await fixture.inventory.publishCodex(revision: 1, targetCount: 2)
         fixture.session.beginRunAttempt(source: "test.codex.start")
 
-        _ = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session,
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"),
             text: "first turn",
             attachments: []
         )
@@ -1222,8 +1361,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
 
         fixture.session.runState = .idle
         fixture.session.beginRunAttempt(source: "test.codex.start.second")
-        _ = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session,
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"),
             text: "second turn",
             attachments: []
         )
@@ -1237,8 +1376,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         let fixture = try makeFixture()
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
         fixture.session.beginRunAttempt(source: "test.codex.rev1")
-        _ = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session,
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"),
             text: "turn one",
             attachments: []
         )
@@ -1246,8 +1385,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         await fixture.inventory.publishCodex(revision: 2, targetCount: 2)
         fixture.session.runState = .idle
         fixture.session.beginRunAttempt(source: "test.codex.rev2")
-        _ = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session,
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"),
             text: "turn two",
             attachments: []
         )
@@ -1261,8 +1400,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         let fixture = try makeFixture()
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
         fixture.session.beginRunAttempt(source: "test.codex.linked")
-        _ = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session,
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"),
             text: "linked turn",
             attachments: []
         )
@@ -1270,8 +1409,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         await fixture.inventory.publishCodex(revision: 2, targetCount: 0)
         fixture.session.runState = .idle
         fixture.session.beginRunAttempt(source: "test.codex.revoked")
-        _ = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session,
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"),
             text: "after revoke",
             attachments: []
         )
@@ -1281,8 +1420,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
 
         fixture.session.runState = .idle
         fixture.session.beginRunAttempt(source: "test.codex.after-revoked")
-        _ = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session,
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"),
             text: "silent turn",
             attachments: []
         )
@@ -1297,8 +1436,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         let fixture = try makeFixture()
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
         fixture.session.beginRunAttempt(source: "test.codex.steer.seed")
-        _ = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session,
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"),
             text: "seed turn",
             attachments: []
         )
@@ -1320,8 +1459,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         )
         XCTAssertTrue(fixture.session.runState.isActive)
 
-        _ = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session,
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"),
             text: "steered instruction",
             attachments: []
         )
@@ -1340,8 +1479,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         let fixture = try makeFixture()
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
         fixture.session.beginRunAttempt(source: "test.codex.fallback.seed")
-        _ = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session,
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"),
             text: "seed turn",
             attachments: []
         )
@@ -1368,8 +1507,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
                 data: nil
             )
         )
-        let outcome = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session,
+        let outcome = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"),
             text: "queued instruction",
             attachments: []
         )
@@ -1432,11 +1571,11 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
                 let fixture = try makeFixture()
                 await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
                 fixture.session.beginRunAttempt(source: "test.codex.fallback.managed-proof")
-                _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "seed turn", attachments: [])
+                _ = await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "seed turn", attachments: [])
                 await fixture.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "turn-1"), session: fixture.session, sourceController: fixture.controller)
                 fixture.controller.threadRuntimeStatus = .active(activeFlags: ["turn"])
                 fixture.controller.steerFailure = .noActiveTurn(.init(method: "turn/steer", code: nil, message: "no active turn", data: nil))
-                let outcome = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "managed queued instruction", attachments: [])
+                let outcome = await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "managed queued instruction", attachments: [])
                 guard case .queuedFallback = outcome else { return XCTFail("expected fallback, got \(outcome)") }
                 fixture.controller.steerFailure = nil
                 let observer = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
@@ -1507,8 +1646,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             let fixture = try makeFixture()
             await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
             fixture.session.beginRunAttempt(source: "test.codex.fallback.route-refusal")
-            _ = await fixture.coordinator.sendCodexNativeMessage(
-                session: fixture.session, text: "seed turn", attachments: []
+            _ = await fixture.coordinator.test_sendCodexNativeMessage(
+                session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "seed turn", attachments: []
             )
             await fixture.coordinator.test_handleCodexNativeEvent(
                 .turnStarted(turnID: "turn-1"), session: fixture.session, sourceController: fixture.controller
@@ -1517,8 +1656,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             fixture.controller.steerFailure = .noActiveTurn(
                 CodexAppServerClient.RequestFailure(method: "turn/steer", code: nil, message: "no active turn", data: nil)
             )
-            let outcome = await fixture.coordinator.sendCodexNativeMessage(
-                session: fixture.session, text: "queued route refusal", attachments: []
+            let outcome = await fixture.coordinator.test_sendCodexNativeMessage(
+                session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "queued route refusal", attachments: []
             )
             guard case .queuedFallback = outcome else { return XCTFail("expected fallback, got \(outcome)") }
             fixture.controller.steerFailure = nil
@@ -1679,7 +1818,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         XCTAssertFalse(session.items.contains { $0.recoveryDiagnostic?.outcome == "sent" })
         session.beginRunAttempt(source: "test.providerSwitch.auth.firstStartRejected")
 
-        let outcome = await fixture.coordinator.sendCodexNativeMessage(session: session, text: text, attachments: [])
+        let outcome = await fixture.coordinator.test_sendCodexNativeMessage(session: session, ownership: session.activeRunOwnership ?? session.beginRunAttempt(source: "test.codex.send"), text: text, attachments: [])
 
         guard case .sent = outcome else { return XCTFail("Existing managed-auth recovery must accept the replay: \(outcome)") }
         let didRefresh = await fixture.authRecovery.didRefresh
@@ -1713,8 +1852,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
         let wakeID = try prepareAutoWake(fixture)
         fixture.session.beginRunAttempt(source: "test.codex.auth.autowake")
-        _ = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session,
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"),
             text: "",
             attachments: []
         )
@@ -1756,7 +1895,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
         _ = try prepareAutoWake(fixture)
         fixture.session.beginRunAttempt(source: "test.codex.auth.managed-metadata")
-        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "", attachments: [])
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "", attachments: [])
         XCTAssertEqual(fixture.startedTurns.count, 1)
         var retry = try XCTUnwrap(fixture.session.codexPendingAuthRetryTurn)
         var claim = try XCTUnwrap(retry.monitoringClaim)
@@ -1780,8 +1919,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
         _ = try prepareAutoWake(fixture)
         fixture.session.beginRunAttempt(source: "test.codex.auth.autowake.withheld")
-        _ = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session,
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"),
             text: "",
             attachments: []
         )
@@ -1826,7 +1965,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             return await input.bridge.proveLocalInputRead(decoration, observer: input.observer)
         }
         fixture.session.beginRunAttempt(source: "test.auth.acceptedBaseline")
-        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "BASELINE-ONLY", attachments: [])
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "BASELINE-ONLY", attachments: [])
         let original = try XCTUnwrap(fixture.startedTurns.last)
         XCTAssertFalse(original.contains("<user_input"))
         XCTAssertNil(fixture.session.codexPendingAuthRetryTurn?.monitoringClaim?.localInput)
@@ -1860,14 +1999,14 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
 
         fixture.session.runState = .idle
         fixture.session.beginRunAttempt(source: "test.auth.independentFreshTurn")
-        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "independently permitted fresh turn", attachments: [])
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "independently permitted fresh turn", attachments: [])
         let fresh = try XCTUnwrap(fixture.startedTurns.last)
         XCTAssertTrue(fresh.contains("FRESH-OWED-CORRECTION"))
         XCTAssertEqual(proofCalls, acceptedProofCalls + 1)
         try input.assertConsumed()
         fixture.session.runState = .idle
         fixture.session.beginRunAttempt(source: "test.auth.afterFreshTurn")
-        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "later permitted turn", attachments: [])
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "later permitted turn", attachments: [])
         XCTAssertFalse(try XCTUnwrap(fixture.startedTurns.last).contains("FRESH-OWED-CORRECTION"))
         XCTAssertEqual(proofCalls, acceptedProofCalls + 1)
     }
@@ -1884,7 +2023,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         }
         await input.correction("ORIGINAL-ACCEPTED-CORRECTION")
         fixture.session.beginRunAttempt(source: "test.codex.auth.freshLocalInput")
-        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "auth turn", attachments: [])
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "auth turn", attachments: [])
         let original = try XCTUnwrap(fixture.startedTurns.last)
         XCTAssertEqual(fixture.startedTurns.count, 1)
         XCTAssertTrue(original.contains("ORIGINAL-ACCEPTED-CORRECTION"))
@@ -1930,8 +2069,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             proofCalls += 1
             return false
         }
-        _ = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session,
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"),
             text: "auth turn",
             attachments: []
         )
@@ -1971,8 +2110,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         let fixture = try makeFixture()
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
         fixture.session.beginRunAttempt(source: "test.codex.auth.withheld")
-        _ = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session,
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"),
             text: "withheld turn",
             attachments: []
         )
@@ -2016,8 +2155,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         )
         fixture.session.runState = .idle
         fixture.session.beginRunAttempt(source: "test.codex.auth.withheld.after")
-        _ = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session,
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"),
             text: "later turn",
             attachments: []
         )
@@ -2030,8 +2169,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         let fixture = try makeFixture()
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
         fixture.session.beginRunAttempt(source: "test.codex.auth.issue")
-        _ = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session,
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"),
             text: "issue turn",
             attachments: []
         )
@@ -2063,8 +2202,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         let fixture = try makeFixture()
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
         fixture.session.beginRunAttempt(source: "test.codex.auth.churn")
-        _ = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session,
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"),
             text: "churn turn",
             attachments: []
         )
@@ -2095,8 +2234,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         // Recovery cannot acknowledge a new revision; a separately permitted fresh turn owns it.
         fixture.session.runState = .idle
         fixture.session.beginRunAttempt(source: "test.codex.auth.after")
-        _ = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session,
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"),
             text: "later turn",
             attachments: []
         )
@@ -2122,8 +2261,8 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
         let wakeID = try prepareAutoWake(fixture)
         fixture.session.beginRunAttempt(source: "test.codex.auth.autowake.malformed")
-        _ = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session,
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"),
             text: "",
             attachments: []
         )
@@ -4724,7 +4863,7 @@ extension AgentSessionLinkCodexPromptAdapterTests {
             // Finish first-controller setup before freezing the source revision for this
             // producer-lifetime unit; registered tests own cold catalog qualification.
             let seedOwner = fixture.session.beginRunAttempt(source: "test.seed.hook-gate")
-            _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "seed", attachments: [])
+            _ = await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "seed", attachments: [])
             XCTAssertTrue(fixture.session.endRunAttempt(ifCurrent: seedOwner, source: "test.seed.complete"))
             fixture.session.runState = .completed
             seedCodexMarkerLifetimeBaseline(fixture)
@@ -4738,7 +4877,7 @@ extension AgentSessionLinkCodexPromptAdapterTests {
             fixture.controller.setStartGate(gate, fail: fails)
             addTeardownBlock { await gate.open() }
             let producer = Task { @MainActor in
-                await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "", attachments: [])
+                await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "", attachments: [])
             }
             await gate.waitUntilEntered()
             // Typed body/canonical execution precedes the real Tab seal and clear, while acceptance is suspended.
@@ -4775,7 +4914,7 @@ extension AgentSessionLinkCodexPromptAdapterTests {
         // A warm controller has already completed first-turn hook discovery. That existing gate
         // serializes its FIRST physical call, not all later sends on this binding.
         let seedOwner = fixture.session.beginRunAttempt(source: "test.seed.hook-gate")
-        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "seed", attachments: [])
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "seed", attachments: [])
         XCTAssertTrue(fixture.session.endRunAttempt(ifCurrent: seedOwner, source: "test.seed.complete"))
         fixture.session.runState = .completed
         seedCodexMarkerLifetimeBaseline(fixture)
@@ -4787,7 +4926,7 @@ extension AgentSessionLinkCodexPromptAdapterTests {
         fixture.controller.setStartGate(originalGate, fail: false)
         addTeardownBlock { await originalGate.open() }
         let original = Task { @MainActor in
-            await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "", attachments: [])
+            await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "", attachments: [])
         }
         await originalGate.waitUntilEntered()
         try sealCodexMarkerLifetimeDeclaration(fixture, owner: owner, wakeID: wakeID)
@@ -4801,7 +4940,7 @@ extension AgentSessionLinkCodexPromptAdapterTests {
         fixture.controller.setStartGate(replayGate, fail: true)
         // A real native send on a new owner while the first return is still suspended. The existing
         // effective-ID substitution reuses the dispatching wake; this is NOT managed auth replay.
-        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "successor", attachments: [])
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "successor", attachments: [])
         XCTAssertEqual(fixture.startedTurns.count, 3, "seed and both racing physical calls must actually be reached")
         XCTAssertTrue(try XCTUnwrap(fixture.startedTurns.last).contains(claim.fragment))
         XCTAssertNil(fixture.session.quietLedger.candidateStartKey(owner: successor), "new-owner replay is ordinary")
@@ -4818,7 +4957,7 @@ extension AgentSessionLinkCodexPromptAdapterTests {
         let fixture = try makeFixture()
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
         let seed = fixture.session.beginRunAttempt(source: "test.seed.hook")
-        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "seed", attachments: [])
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "seed", attachments: [])
         XCTAssertTrue(fixture.session.endRunAttempt(ifCurrent: seed, source: "test.seed.end"))
         fixture.session.runState = .completed
         seedCodexMarkerLifetimeBaseline(fixture)
@@ -4830,7 +4969,7 @@ extension AgentSessionLinkCodexPromptAdapterTests {
         fixture.controller.setStartGate(originalGate, fail: true)
         addTeardownBlock { await originalGate.open() }
         let original = Task { @MainActor in
-            await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "", attachments: [])
+            await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "", attachments: [])
         }
         await originalGate.waitUntilEntered()
         try sealCodexMarkerLifetimeDeclaration(fixture, owner: owner, wakeID: wakeID)
@@ -4841,7 +4980,7 @@ extension AgentSessionLinkCodexPromptAdapterTests {
         fixture.controller.setStartGate(otherGate, fail: false)
         addTeardownBlock { await otherGate.open() }
         let other = Task { @MainActor in
-            await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "successor", attachments: [], terminalizeRejectedSend: false)
+            await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "successor", attachments: [], terminalizeRejectedSend: false)
         }
         await otherGate.waitUntilEntered()
         XCTAssertEqual(fixture.startedTurns.count, 3)
@@ -4870,7 +5009,7 @@ extension AgentSessionLinkCodexPromptAdapterTests {
                 let fixture = try makeFixture()
                 await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
                 let seed = fixture.session.beginRunAttempt(source: "test.quiet.rerender.seed")
-                _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "seed", attachments: [])
+                _ = await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "seed", attachments: [])
                 XCTAssertTrue(fixture.session.endRunAttempt(ifCurrent: seed, source: "test.seed.end"))
                 fixture.session.runState = .completed
                 seedCodexMarkerLifetimeBaseline(fixture)
@@ -4882,7 +5021,7 @@ extension AgentSessionLinkCodexPromptAdapterTests {
                 fixture.controller.setStartGate(originalGate, fail: true)
                 addTeardownBlock { await originalGate.open() }
                 let original = Task { @MainActor in
-                    await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "", attachments: [])
+                    await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "", attachments: [])
                 }
                 await originalGate.waitUntilEntered()
                 weak var cohort = fixture.session.oversight.pendingAutoWake?.quietMarkerProducerLifetime
@@ -4929,7 +5068,7 @@ extension AgentSessionLinkCodexPromptAdapterTests {
                 fixture.controller.setStartGate(secondGate, fail: false)
                 addTeardownBlock { await secondGate.open() }
                 let second = Task { @MainActor in
-                    await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "ordinary successor", attachments: [], terminalizeRejectedSend: false)
+                    await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "ordinary successor", attachments: [], terminalizeRejectedSend: false)
                 }
                 await secondGate.waitUntilEntered()
                 XCTAssertEqual(fixture.startedTurns.count, 3)
@@ -4973,7 +5112,7 @@ extension AgentSessionLinkCodexPromptAdapterTests {
         addTeardownBlock { await replayGate.open() }
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
         let seed = fixture.session.beginRunAttempt(source: "test.auth.ordinary.seed")
-        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "ordinary auth turn", attachments: [])
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "ordinary auth turn", attachments: [])
         let acceptedText = try XCTUnwrap(fixture.startedTurns.last)
         XCTAssertFalse(try XCTUnwrap(fixture.session.codexPendingAuthRetryTurn?.monitoringDispatchID).isAutoWakeFamily)
         XCTAssertTrue(fixture.session.endRunAttempt(ifCurrent: seed, source: "test.auth.seed.end"))
@@ -5014,7 +5153,7 @@ extension AgentSessionLinkCodexPromptAdapterTests {
         addTeardownBlock { await wakeGate.open() }
         let owner = try beginCodexMarkerLifetimeOwner(fixture, wakeID: wakeID, source: "test.auth.fresh-wake")
         let producer = Task { @MainActor in
-            await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "", attachments: [])
+            await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "", attachments: [])
         }
         try await wakeGate.waitUntilEntered(timeout: 3)
         XCTAssertEqual(replacement.startedTurns, [acceptedText, AgentSessionLinkPromptComposer.decorated("", with: claim)])
@@ -5096,7 +5235,7 @@ extension AgentSessionLinkCodexPromptAdapterTests {
         let fixture = try makeFixture()
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
         let seed = fixture.session.beginRunAttempt(source: "test.fallback.seed")
-        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "seed", attachments: [])
+        _ = await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "seed", attachments: [])
         XCTAssertTrue(fixture.session.endRunAttempt(ifCurrent: seed, source: "test.fallback.seed.end"))
         fixture.session.runState = .completed
         seedCodexMarkerLifetimeBaseline(fixture)
@@ -5108,7 +5247,7 @@ extension AgentSessionLinkCodexPromptAdapterTests {
         fixture.controller.setStartGate(originalGate, fail: true)
         addTeardownBlock { await originalGate.open() }
         let original = Task { @MainActor in
-            await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "", attachments: [])
+            await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "", attachments: [])
         }
         await originalGate.waitUntilEntered()
         try sealCodexMarkerLifetimeDeclaration(fixture, owner: owner, wakeID: wakeID)
@@ -5120,7 +5259,7 @@ extension AgentSessionLinkCodexPromptAdapterTests {
         // as ambiguous and cannot be used to pretend that the later fallback still owns it.
         fixture.session.runState = .running
         fixture.controller.threadRuntimeStatus = .active(activeFlags: ["turn"])
-        let queued = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "physical fallback", attachments: [])
+        let queued = await fixture.coordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "physical fallback", attachments: [])
         guard case .queuedFallback = queued else { return XCTFail("expected an actual queued fallback, got \(queued)") }
         XCTAssertFalse(fixture.startedTurns.contains { $0.hasPrefix("physical fallback") }, "queue-only state cannot accept a marker")
         XCTAssertTrue(fixture.controller.steeredTurns.isEmpty)

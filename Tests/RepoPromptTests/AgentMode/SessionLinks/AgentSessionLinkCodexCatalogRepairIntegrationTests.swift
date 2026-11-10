@@ -3306,7 +3306,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                             reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled, memoriesEnabled: CodexMemories.isEnabled,
                             capabilities: vm.providerBindingService.codexCapabilitiesForLaunch(isMCPRelated: session.isMCPRelated)
                         )
-                        let outcome = await vm.test_codexCoordinator.sendCodexNativeMessage(session: session, text: "", attachments: [])
+                        let outcome = await vm.test_codexCoordinator.test_sendCodexNativeMessage(session: session, ownership: session.activeRunOwnership ?? session.beginRunAttempt(source: "test.codex.send"), text: "", attachments: [])
                         guard outcome == .sent else {
                             XCTFail("W3 fixture Codex physical call refused: \(outcome)")
                             throw DiscoveryFailure.overseeRefused
