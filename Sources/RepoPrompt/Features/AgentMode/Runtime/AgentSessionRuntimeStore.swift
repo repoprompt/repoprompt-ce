@@ -363,6 +363,8 @@ final class AgentSessionRuntimeStore {
         lazy var persistence = AgentSessionPersistenceRuntime(scope: self)
         lazy var attachments = AgentSessionAttachmentRuntime(scope: self)
         lazy var handoff = AgentSessionHandoffRuntime(scope: self)
+        lazy var administration = AgentSessionAdministrationRuntime(scope: self)
+        lazy var worktrees = AgentSessionWorktreeRuntime(scope: self)
         lazy var drafts = AgentSessionDraftRuntime(scope: self)
         var saveQueue: AgentSessionSaveQueue {
             persistence.queue
@@ -381,6 +383,7 @@ final class AgentSessionRuntimeStore {
         @discardableResult
         func releaseWriterClaimsAfterDrain() -> Bool {
             guard isRetiring, saveQueue.inFlightSessionIDs.isEmpty, !attachments.hasPendingRetention,
+                  worktrees.pendingTransitions == 0,
                   !continuation.hasPendingStarts,
                   linkExecution?.pendingSendEffects.isEmpty != false,
                   linkExecution?.pendingStopEffects.isEmpty != false,

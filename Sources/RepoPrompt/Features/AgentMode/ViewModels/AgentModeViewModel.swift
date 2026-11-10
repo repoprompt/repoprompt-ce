@@ -3018,6 +3018,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
             )
         }
+        installAdministrationComposition(runtimeSessionStore.administration)
+        installWorktreeComposition(runtimeSessionStore.worktrees)
         configureCodexRuntime(codexCoordinator)
         observeCodexComputerUseSetting()
         claudeCoordinator.installHostCapabilities(
@@ -3257,6 +3259,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 claudeCoordinator: claudeCoordinator
             )
             providerBindingService = AgentModeProviderBindingService()
+            installAdministrationComposition(runtimeSessionStore.administration)
+            installWorktreeComposition(runtimeSessionStore.worktrees)
             configureCodexRuntime(codexCoordinator)
             observeCodexComputerUseSetting()
             claudeCoordinator.installHostCapabilities(
@@ -3340,7 +3344,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 )
             },
             settleSelfCompact: { [weak self] session in self?.agentSelfCompactSettleStaleParkedNote(session) },
-            selfCompactBlocksWake: { [weak self] session in self?.agentSelfCompactBlocksNotificationWake(session) ?? true }
+            selfCompactBlocksWake: { [weak self] session in self?.agentSelfCompactBlocksNotificationWake(session) ?? true },
+            selfCompactHoldsWakeAcquisition: { [weak self] session in self?.agentSelfCompactHoldsWakeAcquisition(session) ?? true }
         ), diagnostics: catalogDiagnosticsSink)
         runtime.codexCoordinator = codexCoordinator
         runtime.perfRecorder = perfRecorder
@@ -5713,6 +5718,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     func finishPreparedOversightRuntime() async -> Bool {
         guard workspaceManager?.isSessionRuntimeProjection == true else { return false }
         runtimeSessionStore.beginRetirement()
+        // Join this runtime's already-admitted effects before teardown/final save. The host remains
+        // the sole drain/release owner; transition completion must not release claims itself.
+        await runtimeSessionStore.worktrees.waitForTransitions()
         for session in sessions.values {
             session.saveDebounceTask?.cancel()
             session.saveDebounceTask = nil
@@ -8559,35 +8567,66 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         from previousLocation: AgentSessionLinkLocationProjection?
     ) {
         session.isDirty = true
+        scheduleSave(for: session.tabID)
+        presentWorktreeBindingChange(to: session, from: previousLocation)
+    }
+
+    private func presentWorktreeBindingChange(
+        to session: TabSession, from previousLocation: AgentSessionLinkLocationProjection?
+    ) {
         updateWorktreeBindingSummariesInIndex(for: session)
         syncComposerUIState(tabID: session.tabID)
         syncSidebarUIState(refresh: true, reason: .metadataUpdated)
         syncStatusPillsUIState()
-        scheduleSave(for: session.tabID)
         notifyAgentSessionLinkLocationChange(forTabID: session.tabID, from: previousLocation)
     }
 
-    private enum ExecutionLocationTransitionError: LocalizedError {
-        case unavailable(String)
-        case stale
-        case confirmationRequired(ExecutionLocationChangeConfirmation)
-        case retainedWorktree(path: String, underlying: String)
-
-        var errorDescription: String? {
-            switch self {
-            case let .unavailable(message):
-                message
-            case .stale:
-                "The thread changed while its execution location was being prepared. Try again."
-            case .confirmationRequired(.startedThreadRestart):
-                "Changing execution location restarts the agent context and requires confirmation."
-            case .confirmationRequired(.activeRunStop):
-                "Changing execution location stops the active run and requires confirmation."
-            case let .retainedWorktree(path, underlying):
-                "The new worktree was created at \(path), but the thread could not be switched. It was not removed. Error: \(underlying)"
-            }
+    private func installWorktreeComposition(_ runtime: AgentSessionWorktreeRuntime) {
+        runtime.captureResources = { [weak self] command in
+            guard let self, workspaceManager?.activeWorkspaceID == command.identity.workspaceID,
+                  let manager = workspaceManager else { return nil }
+            let store = promptManager?.workspaceFileContextStore
+            let paths = manager.activeWorkspace?.repoPaths
+            let fallback = workspacePathProvider()
+            return .init(store: store, fallbackWorkspacePath: fallback, isCurrent: { [weak self, weak manager] in
+                guard let self, let manager else { return false }
+                return workspaceManager === manager
+                    && manager.activeWorkspaceID == command.identity.workspaceID
+                    && manager.activeWorkspace?.repoPaths == paths
+                    && promptManager?.workspaceFileContextStore === store
+                    && workspacePathProvider() == fallback
+            })
         }
+        runtime.effects = .init(
+            drainOracle: { [weak self] session in
+                guard let self else { return false }
+                return await awaitOracleBackgroundDrain(for: session)
+            },
+            cancelRun: { [weak self] session in
+                guard let self else { return }
+                AgentSessionInteractionRuntime.cancelPendingInstruction(for: session)
+                await runService.cancelRun(tabID: session.tabID, session: session, intent: .executionLocationChange, completion: .terminalPublished)
+            },
+            stageRecovery: { [weak self] session in
+                guard let self else { return .refused }
+                return await prepareResumeRecoveryHandoff(for: session)
+            },
+            retireProvider: { [weak self] session in
+                await self?.invalidateProviderContextForExecutionLocationChange(session)
+            }
+        )
+        runtime.presentation = .init(
+            gateChanged: { [weak self] session in
+                self?.syncComposerUIState(tabID: session.tabID)
+                self?.syncStatusPillsUIState()
+            },
+            location: { [weak self] session in self?.agentSessionLinkLocationProjection(forTabID: session.tabID) },
+            bindingsChanged: { [weak self] session, previous in self?.presentWorktreeBindingChange(to: session, from: previous) },
+            recoveryChanged: { [weak self] _ in self?.syncTranscriptUIState() }
+        )
     }
+
+    private typealias ExecutionLocationTransitionError = AgentSessionWorktreeRuntime.TransitionError
 
     private struct ExecutionLocationContext {
         let logicalRoot: WorkspaceRootRef
@@ -8686,6 +8725,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         forSessionID sessionID: UUID,
         intent: WorktreeBindingTransitionIntent,
         invocation: WorktreeBindingMutationInvocationIdentity? = nil,
+        creationHandle: AgentSessionCreationHandle? = nil,
         startupContext: WorktreeStartupContext? = nil,
         initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint] = [:],
         beforeCommit: (@MainActor () async throws -> Void)? = nil,
@@ -8693,291 +8733,21 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         commitAuthority: (@MainActor (@MainActor () throws -> Void) throws -> Void)? = nil,
         afterCommit: (@MainActor () -> Void)? = nil
     ) async throws -> [AgentSessionWorktreeBinding] {
-        guard let session = try authoritativeLiveSession(for: sessionID) else {
-            throw MCPError.invalidParams("The requested agent session is not currently available.")
-        }
-        // Exact no-ops do not mutate presentation, ownership, persistence, or provider state.
-        if session.worktreeBindings == desiredBindings {
-            return session.worktreeBindings
-        }
-        if !desiredBindings.isEmpty {
-            do {
-                try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(desiredBindings)
-            } catch {
-                throw ExecutionLocationTransitionError.unavailable(error.localizedDescription)
-            }
-        }
-        guard !session.worktreeBindingTransitionInProgress else {
-            throw ExecutionLocationTransitionError.stale
-        }
-        session.worktreeBindingTransitionInProgress = true
-        var ownsExecutionLocationGate = false
-        defer {
-            session.worktreeBindingTransitionInProgress = false
-            if ownsExecutionLocationGate {
-                session.isChangingExecutionLocation = false
-                syncComposerUIState(tabID: session.tabID)
-                syncStatusPillsUIState()
-            }
-        }
-        if let startupContext {
-            WorktreeStartupInstrumentation.record(.bindingTransitionStarted, context: startupContext)
-        }
-        let previousBindings = session.worktreeBindings
-        let executionRootsChanged = worktreeBindingsChangeExecutionRoots(from: previousBindings, to: desiredBindings)
-        let changedDuringActiveRun = session.runState.isActive
-
-        if changedDuringActiveRun, executionRootsChanged {
-            switch intent {
-            case .userExecutionLocationChange(confirmation: .activeRunStop):
-                break
-            case .userExecutionLocationChange:
-                throw ExecutionLocationTransitionError.confirmationRequired(.activeRunStop)
-            case .externalManagement:
-                throw MCPError.invalidParams(
-                    "Stop the active Agent run before changing its execution worktree. The in-flight prompt will not be migrated or replayed automatically."
-                )
-            case .initialSend:
-                throw MCPError.invalidParams("A running Agent thread cannot apply an initial execution location.")
-            }
-        }
-
-        if executionRootsChanged {
-            guard await awaitOracleBackgroundDrain(for: session) else { throw ExecutionLocationTransitionError.stale }
-        }
-        if executionRootsChanged, case .externalManagement = intent {
-            try requireIdleWorktreeBindingTransition(session)
-            // Reuse the existing execution-location gate so composer, managed sends, and
-            // automatic follow-ups cannot reserve the next turn while preparation awaits.
-            session.isChangingExecutionLocation = true
-            ownsExecutionLocationGate = true
-            syncComposerUIState(tabID: session.tabID)
-            syncStatusPillsUIState()
-            try await requireIdleProviderForWorktreeBindingTransition(session)
-            guard sessions[session.tabID] === session,
-                  session.activeAgentSessionID == sessionID,
-                  session.worktreeBindings == previousBindings
-            else { throw ExecutionLocationTransitionError.stale }
-            try requireIdleWorktreeBindingTransition(session, ownsExecutionLocationGate: ownsExecutionLocationGate)
-        }
-
-        let materializer = promptManager.map {
-            WorkspaceRootBindingProjectionMaterializer(store: $0.workspaceFileContextStore)
-        }
-        let preparation: WorkspaceRootBindingProjectionPreparation?
-        if let materializer {
-            do {
-                preparation = try await materializer.prepare(
-                    sessionID: sessionID,
-                    bindings: desiredBindings,
-                    startupContext: startupContext,
-                    initializationHintsByBindingID: initializationHintsByBindingID
-                )
-            } catch {
-                throw ExecutionLocationTransitionError.unavailable(error.localizedDescription)
-            }
-        } else if desiredBindings.isEmpty {
-            preparation = nil
-        } else {
-            throw ExecutionLocationTransitionError.unavailable("The selected worktree roots could not be prepared for this thread.")
-        }
-
-        var ownershipCommitted = preparation == nil
-        var providerContextInvalidated = false
-        var bindingsPublished = false
-        // Rollback owns only a handoff staged by this transition, never a send's or
-        // cancellation's changes to a pre-existing handoff.
-        var handoffRollback: (previous: PendingHandoffState, staged: PendingHandoffState)?
+        let command: AgentSessionRuntimeStore.Command
         do {
-            guard sessions[session.tabID] === session,
-                  session.activeAgentSessionID == sessionID,
-                  session.worktreeBindings == previousBindings,
-                  !executionRootsChanged || session.runState.isActive == changedDuringActiveRun
-            else {
-                throw ExecutionLocationTransitionError.stale
-            }
-
-            try Task.checkCancellation()
-            if executionRootsChanged, case .externalManagement = intent {
-                try requireIdleWorktreeBindingTransition(session, ownsExecutionLocationGate: ownsExecutionLocationGate)
-                try await requireIdleProviderForWorktreeBindingTransition(session)
-                guard sessions[session.tabID] === session,
-                      session.activeAgentSessionID == sessionID,
-                      session.worktreeBindings == previousBindings
-                else { throw ExecutionLocationTransitionError.stale }
-                try requireIdleWorktreeBindingTransition(session, ownsExecutionLocationGate: ownsExecutionLocationGate)
-            }
-            try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(desiredBindings)
-            // Provisional root preparation is abortable. Only now may the caller mark the
-            // protected mutation committed and persist visual identity; ordinary rejection
-            // above must remain a pre-commit, actionable error.
-            try await revalidateAuthority?()
-            try await beforeCommit?()
-            try await revalidateAuthority?()
-            try Task.checkCancellation()
-            try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(desiredBindings)
-            guard sessions[session.tabID] === session,
-                  session.activeAgentSessionID == sessionID,
-                  session.worktreeBindings == previousBindings,
-                  !executionRootsChanged || session.runState.isActive == changedDuringActiveRun
-            else { throw ExecutionLocationTransitionError.stale }
-            if executionRootsChanged, case .externalManagement = intent {
-                try requireIdleWorktreeBindingTransition(session, ownsExecutionLocationGate: ownsExecutionLocationGate)
-            }
-
-            if executionRootsChanged {
-                if changedDuringActiveRun {
-                    switch intent {
-                    case .userExecutionLocationChange(confirmation: .activeRunStop):
-                        AgentSessionInteractionRuntime.cancelPendingInstruction(for: session)
-                        // Terminal publication synchronously detaches the old provider/controller,
-                        // so rebinding does not wait on potentially non-cooperative teardown.
-                        await runService.cancelRun(
-                            tabID: session.tabID,
-                            session: session,
-                            intent: .executionLocationChange,
-                            completion: .terminalPublished
-                        )
-                    case .userExecutionLocationChange, .externalManagement, .initialSend:
-                        throw ExecutionLocationTransitionError.stale
-                    }
-                }
-                guard sessions[session.tabID] === session,
-                      session.activeAgentSessionID == sessionID,
-                      session.worktreeBindings == previousBindings,
-                      !session.runState.isActive
-                else {
-                    throw ExecutionLocationTransitionError.stale
-                }
-                if !changedDuringActiveRun {
-                    try commitAuthority? {}
-                    let previousHandoff = session.pendingHandoff
-                    switch await prepareResumeRecoveryHandoff(for: session) {
-                    case let .staged(stagedHandoff): handoffRollback = (previousHandoff, stagedHandoff)
-                    case .unchanged: break
-                    case .refused: throw ExecutionLocationTransitionError.stale
-                    }
-                    try await revalidateAuthority?()
-                }
-                try commitAuthority? {}
-                providerContextInvalidated = true
-                await invalidateProviderContextForExecutionLocationChange(session)
-                guard sessions[session.tabID] === session,
-                      session.activeAgentSessionID == sessionID,
-                      session.worktreeBindings == previousBindings,
-                      !session.runState.isActive
-                else {
-                    throw ExecutionLocationTransitionError.stale
-                }
-            }
-
-            // Native teardown and handoff may await. Neither a revoked grant nor a path reused
-            // for a different Git identity may become the new execution authority.
-            try await revalidateAuthority?()
-            try Task.checkCancellation()
-            try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(desiredBindings)
-            if let materializer, let preparation {
-                _ = try await materializer.commit(preparation)
-                ownershipCommitted = true
-            }
-            // Root ownership installation also suspends. This is the final authority fence;
-            // there is no await between its return and publishing the binding.
-            try await revalidateAuthority?()
-            try Task.checkCancellation()
-            guard sessions[session.tabID] === session,
-                  session.activeAgentSessionID == sessionID,
-                  session.worktreeBindings == previousBindings,
-                  !executionRootsChanged || !session.runState.isActive
-            else { throw ExecutionLocationTransitionError.stale }
-            let previousLocation = agentSessionLinkLocationProjection(forTabID: session.tabID)
-            let publish: @MainActor () throws -> Void = {
-                // Authorization itself may have suspended since the last availability check.
-                try Task.checkCancellation()
-                try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(desiredBindings)
-                session.worktreeBindings = desiredBindings
-            }
-            if let commitAuthority {
-                try commitAuthority(publish)
-            } else {
-                try publish()
-            }
-            bindingsPublished = true
-            publishWorktreeBindingChange(to: session, from: previousLocation)
-            // Delegated ownership follows the actual in-memory publication even when its required
-            // disk flush later fails. No callback runs for a rejected provisional transition.
-            afterCommit?()
-            if previousBindings != desiredBindings, case .externalManagement = intent {
-                guard let workspaceID = workspaceManager?.activeWorkspace?.id else {
-                    throw ExecutionLocationTransitionError.unavailable(
-                        "The worktree binding changed, but its owning workspace is unavailable for required persistence. Inspect the session before retrying."
-                    )
-                }
-                if case let .failure(failure) = await flushSaveRequired(for: session.tabID, workspaceID: workspaceID) {
-                    throw ExecutionLocationTransitionError.unavailable(failure.message)
-                }
-                guard sessions[session.tabID] === session,
-                      session.activeAgentSessionID == sessionID,
-                      session.worktreeBindings == desiredBindings
-                else { throw ExecutionLocationTransitionError.stale }
-            }
-            return session.worktreeBindings
+            guard let admitted = try runtimeCommand(
+                sessionID: sessionID, requirement: creationHandle.map { .creation($0) } ?? .restored
+            ) else { throw MCPError.invalidParams("The requested agent session is not currently available.") }
+            command = admitted
         } catch {
-            if !providerContextInvalidated, let handoffRollback,
-               session.pendingHandoff == handoffRollback.staged
-            {
-                session.pendingHandoff = handoffRollback.previous
-                session.isDirty = true
-                if let workspaceID = workspaceManager?.activeWorkspace?.id {
-                    _ = await Task { @MainActor in
-                        await self.flushSaveRequired(for: session.tabID, workspaceID: workspaceID)
-                    }.value
-                }
-                scheduleSave(for: session)
-            }
-            if !ownershipCommitted, let materializer, let preparation {
-                await materializer.abort(preparation)
-            } else if executionRootsChanged, ownershipCommitted, !bindingsPublished, let materializer, let preparation,
-                      !preparation.ownership.reusesInstalledOwnership,
-                      sessions[session.tabID] === session,
-                      session.activeAgentSessionID == sessionID,
-                      session.worktreeBindings == previousBindings
-            {
-                // A refused post-install publication must not leave the unbound destination
-                // installed as session-owned roots. The old binding rematerializes on demand.
-                await materializer.release(ifOwnedBy: preparation.ownership.token)
-            }
-            if providerContextInvalidated, !bindingsPublished,
-               sessions[session.tabID] === session,
-               session.activeAgentSessionID == sessionID,
-               session.worktreeBindings == previousBindings
-            {
-                // Native retirement cannot be undone. Keep the old execution binding and
-                // staged handoff, and make its fresh-runtime recovery explicit and durable.
-                let message = "The worktree switch did not apply. The previous execution binding is unchanged, but its provider runtime was retired. The next user message will restart at the previous location using the retained handoff; no turn was replayed. Cause: \(error.localizedDescription)"
-                session.appendItem(.system(message, sequenceIndex: session.nextSequenceIndex))
-                session.isDirty = true
-                syncTranscriptUIState()
-                let recoverySave: Result<Void, AgentSessionPersistenceFailure> = if let workspaceID = workspaceManager?.activeWorkspace?.id {
-                    // Cancellation of the switch must not suppress saving its recovery state.
-                    await Task { @MainActor in
-                        await self.flushSaveRequired(for: session.tabID, workspaceID: workspaceID)
-                    }.value
-                } else {
-                    .failure(.init(operation: .save, tabID: session.tabID, message: "The owning workspace is unavailable."))
-                }
-                if case let .failure(failure) = recoverySave {
-                    scheduleSave(for: session)
-                    if error is SessionAdminHostError { throw error }
-                    throw ExecutionLocationTransitionError.unavailable("\(message) Recovery persistence failed: \(failure.message). Inspect the session before retrying.")
-                }
-                if error is SessionAdminHostError { throw error }
-                throw ExecutionLocationTransitionError.unavailable(message)
-            }
-            if !providerContextInvalidated, !bindingsPublished, MCPDomainMutationCommitContext.controller != nil, error is MCPError {
-                throw DomainMutationRefusedBeforeEffects(error)
-            }
-            throw error
+            throw MCPError.invalidParams("The requested agent session has no available restored or creation writer. \(error.localizedDescription)")
         }
+        return try await command.writer.scope.worktrees.transition(
+            desiredBindings, command: command, intent: intent,
+            startupContext: startupContext, initializationHintsByBindingID: initializationHintsByBindingID,
+            beforeCommit: beforeCommit, revalidateAuthority: revalidateAuthority,
+            commitAuthority: commitAuthority, afterCommit: afterCommit
+        )
     }
 
     /// Whether replacing `previous` with `desired` changes where the provider or MCP tools execute.
@@ -8987,8 +8757,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         from previous: [AgentSessionWorktreeBinding],
         to desired: [AgentSessionWorktreeBinding]
     ) -> Bool {
-        executionDestinationIdentity(in: previous) != executionDestinationIdentity(in: desired)
-            || Self.executionRootMappings(previous) != Self.executionRootMappings(desired)
+        AgentSessionWorktreeRuntime.changesExecutionRoots(from: previous, to: desired, fallbackWorkspacePath: workspacePathProvider())
     }
 
     private static func executionRootMappings(_ bindings: [AgentSessionWorktreeBinding]) -> [String: ExecutionDestinationIdentity] {
@@ -9005,68 +8774,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Internal (not private) so delegated `worktree_bind apply: next_boundary` can wait for exactly
     /// the boundary this transition admits; it never relaxes the gate.
     func requireIdleWorktreeBindingTransition(
-        _ session: TabSession,
-        ownsExecutionLocationGate: Bool = false
+        _ session: TabSession, ownsExecutionLocationGate: Bool = false
     ) throws {
-        guard !session.runState.isActive,
-              session.activeRunLiveness == nil,
-              session.agentTask == nil,
-              !session.terminalCommitInProgress,
-              !session.bindingTransitionInProgress,
-              !session.isComposerSubmissionInFlight,
-              !session.isPreparingInitialWorktree,
-              ownsExecutionLocationGate || !session.isChangingExecutionLocation,
-              !session.mcpFollowUpRunPending,
-              session.pendingSupersedingTurnCompletions == 0,
-              session.pendingInstructions.isEmpty,
-              session.pendingClaudeSteeringInstructions.isEmpty,
-              session.pendingACPSteeringInstructions.isEmpty,
-              session.claudeSteeringFlushTask == nil,
-              session.acpSteeringFlushTask == nil,
-              session.codexNativeToolLiveness.inFlight.isEmpty,
-              session.oversight.pendingAutoWake == nil,
-              !session.selfCompactState.blocksOverseerDelivery,
-              !session.stopState.isStopping(binding: session.persistentSessionBindingIdentity),
-              !session.isSettlingACPBackgroundCompaction,
-              !session.hasBindingBlockingInteraction
-        else {
-            throw MCPError.invalidParams(
-                "Wait until this Agent session is idle with no queued work or pending interactions before changing its execution worktree. The current turn is not migrated or replayed."
-            )
-        }
+        try AgentSessionWorktreeRuntime.requireIdle(session, ownsExecutionLocationGate: ownsExecutionLocationGate)
     }
 
     func requireIdleProviderForWorktreeBindingTransition(_ session: TabSession) async throws {
-        let claudeController = session.claudeController
-        let acpController = session.acpController
-        let codexController = session.codexController
-        if let controller = claudeController, await controller.hasTurnInFlight {
-            throw MCPError.invalidParams("The Claude runtime still has a turn in flight. Wait for it to settle before switching worktrees.")
-        }
-        if let controller = acpController, await controller.hasExecutionInFlight {
-            throw MCPError.invalidParams("The ACP runtime still has execution in flight. Wait for it to settle before switching worktrees.")
-        }
-        if let controller = codexController {
-            let snapshot: CodexNativeSessionController.ThreadSnapshot
-            do {
-                // Match the existing queued-fallback idle probe, not the transport's much
-                // longer ordinary request deadline, while next-turn admission is gated.
-                snapshot = try await controller.readThreadSnapshot(includeTurns: false, timeout: 2)
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                throw MCPError.invalidParams("Could not verify that the Codex runtime is idle. Its execution binding and runtime were not changed. Wait for it to settle and inspect the session before retrying. \(error.localizedDescription)")
-            }
-            let outstandingTools = await controller.outstandingBlockingNativeToolCallNames()
-            guard snapshot.runtimeStatus == .idle, !snapshot.hasActiveTurn, outstandingTools.isEmpty else {
-                throw MCPError.invalidParams("The Codex runtime still has a turn or native tool in flight. Wait for it to settle before switching worktrees.")
-            }
-        }
-        guard session.claudeController === claudeController,
-              session.acpController === acpController,
-              session.codexController === codexController
-        else { throw ExecutionLocationTransitionError.stale }
-        try Task.checkCancellation()
+        try await AgentSessionWorktreeRuntime.requireIdleProvider(session)
     }
 
     private struct ExecutionDestinationIdentity: Equatable {
@@ -9247,24 +8961,31 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func invalidateProviderContextForExecutionLocationChange(_ session: TabSession) async {
-        await session.disposeProviderIfPresent()
-        if let controller = session.acpController {
-            session.acpController = nil
-            AgentModeProcessRunIdentity.clearProcessRunID(for: session)
-            await controller.cancelPrompt()
-            await controller.shutdown()
-        }
+        // The runtime checked its command immediately before this call. Detach every instance
+        // and clear old-context metadata in this synchronous region, never after teardown awaits.
+        let provider = session.provider
+        session.provider = nil
+        let acp = session.acpController
+        session.acpController = nil
+        let codex: CodexAgentModeCoordinator.DetachedCodexController?
         if session.codexController != nil || session.codexConversationID != nil || session.codexRolloutPath != nil || session.selectedAgent == .codexExec {
-            await codexCoordinator.shutdownCodexSession(session)
+            codex = codexCoordinator.detachForWorkspaceSwitchFinalizeSync(session, runIDs: session.runID.map { [$0] } ?? [])
             codexCoordinator.clearCodexSessionState(session)
+        } else {
+            codex = nil
         }
-        await claudeCoordinator.shutdownClaudeSessionIfNeeded(session)
+        let claude = claudeCoordinator.detachForWorkspaceSwitchFinalizeSync(session)
         session.providerSessionID = nil
         session.providerCleanupHandle = nil
         session.contextUsageSnapshot = nil
         session.activeNonCodexTurnTokenAccumulator = nil
         AgentModeProcessRunIdentity.clearProcessRunID(for: session)
         session.isDirty = true
+        await provider?.dispose()
+        await acp?.cancelPrompt()
+        await acp?.shutdown()
+        if let codex { await codexCoordinator.retireDetachedControllerForWorkspaceSwitch(codex) }
+        if let claude { await claudeCoordinator.retireDetachedControllerForWorkspaceSwitch(claude, discardedSession: session) }
     }
 
     func updateWorktreeBindingSummariesInIndex(for session: TabSession) {
@@ -20218,7 +19939,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         inheritOversightLinks: Bool = true,
         missingImagePolicy: AgentSessionAttachmentStore.HandoffMissingImagePolicy = .strict,
         onImagesOmitted: (@MainActor (Int) -> Void)? = nil,
-        isStillAuthorized: (@MainActor () -> Bool)? = nil
+        isStillAuthorized: (@MainActor () -> Bool)? = nil,
+        onConfiguredDestination: (@MainActor (AgentSessionRuntimeStore.WriterIdentity) -> Void)? = nil
     ) async throws -> UUID {
         guard let promptManager,
               let workspaceManager,
@@ -20499,7 +20221,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     sourceTabID: sourceTabID,
                     sourceSession: sourceSession,
                     destinationTabID: destTabID,
-                    destinationSession: destSession
+                    destinationSession: destSession,
+                    creationHandle: destinationCreation
                 )
             } catch {
                 throw SessionAdminPartialForkError(
@@ -20544,6 +20267,21 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 sessionID: destinationClaim.sessionID, code: "target_changed",
                 detail: "The fork was saved, but its destination changed during its first save."
             )
+        }
+        if let onConfiguredDestination {
+            // Return the exact creation receipt, not a tab ID that an awaiting administrator
+            // could later resolve to a replacement. Query the writer without admitting new work:
+            // retirement or late cancellation cannot undo an acknowledged configured save.
+            guard let writer = try? runtimeWriter(sessionID: destinationClaim.sessionID),
+                  writer.scope === runtimeSessionStore, writer.session === destSession,
+                  writer.restoration == expectedChildBindingToken
+            else {
+                throw SessionAdminPartialForkError(
+                    sessionID: destinationClaim.sessionID, code: "target_changed",
+                    detail: "The fork was saved, but its exact destination writer changed before acknowledgement."
+                )
+            }
+            onConfiguredDestination(writer.identity)
         }
         // Acknowledged configured durability cannot be undone by late cancellation. Keep the
         // saved session and omit optional inheritance/focus changes when its caller has ended.
@@ -20689,7 +20427,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sourceTabID: UUID,
         sourceSession: TabSession,
         destinationTabID: UUID,
-        destinationSession: TabSession
+        destinationSession: TabSession,
+        creationHandle: AgentSessionCreationHandle
     ) async throws {
         #if DEBUG
             if let hook = test_beforeHandoffDestinationWorktreeInstall {
@@ -20714,7 +20453,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ = try await transitionWorktreeBindings(
             installBindings,
             forSessionID: destinationSessionID,
-            intent: .initialSend
+            intent: .initialSend,
+            creationHandle: creationHandle
         )
         guard sessions[destinationTabID] === destinationSession,
               destinationSession.currentRestorationBindingToken == destinationBindingToken,

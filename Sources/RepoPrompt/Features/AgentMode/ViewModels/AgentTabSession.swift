@@ -389,8 +389,11 @@ final class AgentTabSession: ObservableObject {
         }
     }
 
+    /// A direct setter takes over the gate; an old runtime lease may only clear its own token.
+    var executionLocationChangeOwner: UUID?
     var isChangingExecutionLocation: Bool = false {
         didSet {
+            executionLocationChangeOwner = nil
             if oldValue != isChangingExecutionLocation {
                 noteMonitorObservationInputsChanged()
             }
@@ -402,7 +405,10 @@ final class AgentTabSession: ObservableObject {
     /// unbound state; Handoff performs the destination's first save explicitly afterwards.
     var isInstallingHandoffWorktreeBindings = false
 
-    var worktreeBindingTransitionInProgress: Bool = false
+    var worktreeBindingTransitionOwner: UUID?
+    var worktreeBindingTransitionInProgress: Bool = false {
+        didSet { worktreeBindingTransitionOwner = nil }
+    }
 
     /// Runtime-only: an execution-worktree change this session requested for itself from its own
     /// live turn, applied at that turn's completed terminal boundary and then continued
@@ -1570,10 +1576,21 @@ final class AgentTabSession: ObservableObject {
     var selfCompactState = AgentSelfCompactState() {
         didSet {
             if oldValue != selfCompactState { isDirty = true }
+            // Only correlated native/ACP completion enters the verified note boundary.
+            if let active = selfCompactState.active, active.phase == .awaitingNoteBoundary,
+               active.compactTurnSucceeded == true, active.acpCompletionUnverified != true
+            {
+                selfCompactVerifiedWakeRequestID = active.id
+            }
+            if selfCompactState.active?.id != selfCompactVerifiedWakeRequestID {
+                selfCompactVerifiedWakeRequestID = nil
+            }
             noteMonitorObservationInputsChanged()
         }
     }
 
+    /// Runtime evidence from the correlated completion coordinator, never restored as authority.
+    var selfCompactVerifiedWakeRequestID: UUID?
     var selfCompactPersistenceWarning = false
 
     /// Runtime-only fence: a same-key MCP retry cannot claim a scheduled receipt until the
@@ -1583,10 +1600,12 @@ final class AgentTabSession: ObservableObject {
     /// Runtime-only owner/exclusivity fence, rechecked at provider-bound send seams after startup awaits.
     /// A restored attempt has no executable fence and cannot resume dispatch.
     var selfCompactDispatchIsCurrent: (@MainActor () -> Bool)?
+    /// Notes need the same ownership proof, but not the expired compact-start deadline.
+    var selfCompactNoteOwnerIsCurrent: (@MainActor () -> Bool)?
 
     @MainActor
     func selfCompactNoteDispatchIsCurrent(_ dispatchID: AgentSelfCompactionDispatchID) -> Bool {
-        guard selfCompactDispatchIsCurrent?() != false else {
+        guard (selfCompactNoteOwnerIsCurrent ?? selfCompactDispatchIsCurrent)?() != false else {
             selfCompactNativeCompletion?.cancelUnattemptedNoteIfOwnerLost(dispatchID)
             return false
         }
