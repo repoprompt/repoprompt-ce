@@ -721,9 +721,10 @@ public extension VCSService {
     /// Create a Git worktree for a repository.
     func createGitWorktree(
         request: GitWorktreeCreateRequest,
-        at repoURL: URL
+        at repoURL: URL,
+        beforeCommit: (@Sendable () async throws -> Void)? = nil
     ) async throws -> GitWorktreeDescriptor {
-        let result = try await createGitWorktreeWithResult(request: request, at: repoURL)
+        let result = try await createGitWorktreeWithResult(request: request, at: repoURL, beforeCommit: beforeCommit)
         if let warning = result.includeCopyResult?.warningText {
             NSLog("RepoPrompt .worktreeinclude copy warning for worktree %@: %@", result.descriptor.path, warning)
         }
