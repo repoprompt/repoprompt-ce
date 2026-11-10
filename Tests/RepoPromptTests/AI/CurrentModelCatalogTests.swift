@@ -165,8 +165,7 @@ final class CurrentModelCatalogTests: XCTestCase {
 
     func testFable52CatalogsPreservePinnedSelectionsAndEfforts() throws {
         for model: AIModel in [.claudeFable52, .claudeFable51, .openrouterClaudeFable52, .openrouterClaudeFable51] {
-            let encoded = try JSONEncoder().encode(model)
-            XCTAssertEqual(try JSONDecoder().decode(AIModel.self, from: encoded), model)
+            XCTAssertEqual(AIModel.fromModelName(model.rawValue), model)
         }
         XCTAssertEqual(AIModel.claudeFable52.displayName, "Claude Fable 5.2")
         let agents = AgentModel.modelsForAgent(.claudeCode)
