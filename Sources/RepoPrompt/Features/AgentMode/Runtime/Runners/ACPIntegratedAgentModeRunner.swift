@@ -176,6 +176,15 @@ final class ACPIntegratedAgentModeRunner {
         self.toolTrackingHooks = toolTrackingHooks
     }
 
+    enum ExistingControllerProbe {
+        case compatibility, reusability, replacementShutdown, controlCommand
+    }
+
+    #if DEBUG
+        // Synchronous: tests invalidate ownership at a real post-await admission boundary.
+        var testAfterExistingControllerProbe: ((ExistingControllerProbe) -> Void)?
+    #endif
+
     func prepareRun(
         tabID: UUID,
         session: AgentTabSession,
@@ -230,6 +239,25 @@ final class ACPIntegratedAgentModeRunner {
             }
         }
         let freshRunRequest = runRequest
+        let admitExistingController: (ExistingControllerProbe, ACPAgentSessionController?) async -> Bool = { [self] probe, controller in
+            #if DEBUG
+                testAfterExistingControllerProbe?(probe)
+            #endif
+            guard isStartupStillCurrent(session: session, runAttemptID: runAttemptID) else {
+                startOutcome?.recordStartFailure(message: nil)
+                return false
+            }
+            if origin.isCurrent, session.acpController === controller { return true }
+            startOutcome?.recordStartFailure(message: nil)
+            // A lost claim cannot retire a controller or settle attachments now shared with a
+            // successor. The still-exclusive original claim can cancel this unsent attempt.
+            if origin.writer.ownsPersistentClaim, session.currentRestorationBindingToken == binding {
+                await cancelExistingControllerStartupBeforeSend(
+                    session: session, ownership: ownership, attachmentReservationID: attachmentReservationID
+                )
+            }
+            return false
+        }
         // A provider control command acts only on the live session that advertised it. It never
         // replaces, starts, or shuts down a controller, so it cannot fall through to a fresh one.
         if let providerControlCommand {
@@ -240,6 +268,7 @@ final class ACPIntegratedAgentModeRunner {
                 command: providerControlCommand,
                 runRequest: runRequest,
                 attachmentReservationID: attachmentReservationID,
+                admitExistingController: admitExistingController,
                 makeLease: makeLease
             )
             return nil
@@ -255,9 +284,9 @@ final class ACPIntegratedAgentModeRunner {
         }
         if let existingController = session.acpController {
             let isCompatible = await existingController.isCompatibleWith(request: runRequest)
-            guard isStartupStillCurrent(session: session, runAttemptID: runAttemptID) else { return nil }
+            guard await admitExistingController(.compatibility, existingController) else { return nil }
             let hasReusableSession = isCompatible ? await existingController.hasReusableSession : false
-            guard isStartupStillCurrent(session: session, runAttemptID: runAttemptID) else { return nil }
+            guard await admitExistingController(.reusability, existingController) else { return nil }
             if dedicatedNoteID != nil, !isCompatible || !hasReusableSession
                 || AgentModeProcessRunIdentity.existingProcessRunID(for: session) == nil
             {
@@ -297,7 +326,7 @@ final class ACPIntegratedAgentModeRunner {
             session.acpController = nil
             AgentModeProcessRunIdentity.clearProcessRunID(for: session)
             await existingController.shutdown()
-            guard isStartupStillCurrent(session: session, runAttemptID: runAttemptID) else { return nil }
+            guard await admitExistingController(.replacementShutdown, nil) else { return nil }
         }
         guard origin.writer.ownsPersistentClaim else {
             startOutcome?.recordStartFailure(message: nil)
@@ -539,6 +568,7 @@ final class ACPIntegratedAgentModeRunner {
         command: AgentProviderControlCommand,
         runRequest: ACPRunRequest,
         attachmentReservationID: UUID?,
+        admitExistingController: (ExistingControllerProbe, ACPAgentSessionController?) async -> Bool,
         makeLease: @escaping (_ runID: UUID) -> MCPBootstrapLease
     ) async {
         let runAttemptID = ownership.attemptID
@@ -556,10 +586,10 @@ final class ACPIntegratedAgentModeRunner {
             return
         }
         let isCompatible = await controller.isCompatibleWith(request: runRequest)
-        guard isStartupStillCurrent(session: session, runAttemptID: runAttemptID) else { return }
+        guard await admitExistingController(.compatibility, controller) else { return }
         let hasReusableSession = await controller.hasReusableSession
         let isRetired = hasReusableSession ? false : await controller.isRetired
-        guard isStartupStillCurrent(session: session, runAttemptID: runAttemptID) else { return }
+        guard await admitExistingController(.controlCommand, controller) else { return }
         guard hasReusableSession else {
             // A controller that can never run another turn is retired as after any failed turn; one
             // that is merely busy is left alone.
@@ -885,6 +915,26 @@ final class ACPIntegratedAgentModeRunner {
                 AgentModeProcessRunIdentity.clearProcessRunID(for: session)
                 return nil
             }
+        ))
+    }
+
+    /// No provider work was admitted. Keep the warm controller and process identity: cancelling
+    /// this attempt is not permission to retire a controller installed by another operation.
+    private func cancelExistingControllerStartupBeforeSend(
+        session: AgentTabSession,
+        ownership: AgentRunOwnership,
+        attachmentReservationID: UUID?
+    ) async {
+        guard isStartupStillCurrent(session: session, runAttemptID: ownership.attemptID),
+              session.activeRunOwnership == ownership else { return }
+        hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
+        await terminalCommitBarrier.commit(.init(
+            binding: hooks.bindTerminalSession(session), ownership: ownership,
+            expectedRunID: session.runID, terminalState: .cancelled,
+            source: "acp.existingControllerStartupCancelled",
+            attachmentReservationID: attachmentReservationID, attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true, supportsFollowUp: false, notifyTurnComplete: false,
+            prepareProviderState: { nil }
         ))
     }
 

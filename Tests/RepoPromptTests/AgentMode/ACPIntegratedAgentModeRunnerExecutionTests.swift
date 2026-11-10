@@ -494,6 +494,137 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
         }
     }
 
+    func testExistingACPControllerProbesCannotAdoptAReacquiredWriter() async throws {
+        typealias Probe = ACPIntegratedAgentModeRunner.ExistingControllerProbe
+        let cases: [(Probe, Bool, Bool, Bool)] = [
+            (.compatibility, false, false, false), (.reusability, false, false, false),
+            (.replacementShutdown, false, false, false), (.controlCommand, false, false, false),
+            (.compatibility, true, false, false), (.reusability, true, false, false),
+            (.replacementShutdown, true, false, false), (.controlCommand, true, false, false),
+            (.replacementShutdown, false, true, false), (.compatibility, false, false, true)
+        ]
+        for (probe, retire, unchanged, successorAttempt) in cases {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let script = try AgentSessionLinkACPServerScript.write(to: directory)
+            let provider = AgentSessionLinkCapturingACPProvider(providerID: .antigravity, commandPath: script.path)
+            let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: directory.path, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
+            let controller = try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
+            _ = try await controller.bootstrap()
+            addTeardownBlock { await controller.shutdown() }
+            let initiallyReusable = await controller.hasReusableSession
+            XCTAssertTrue(initiallyReusable)
+            let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+            let session = try harness.makeBoundSession(agent: .antigravity)
+            session.acpController = controller
+            _ = AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
+            let origin = try harness.startCommand(for: session)
+            let scope = origin.writer.scope
+            harness.pendingHandoffSendOutcome = { session, sent in scope.handoff.recordSendOutcome(for: session, didSend: sent) }
+            session.pendingHandoff.payload = "retained handoff"
+            session.pendingHandoff.isStagedForSend = true
+            let runner = ACPIntegratedAgentModeRunner(hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(), toolTrackingHooks: .noOp)
+            var reached = false
+            var owner: AgentRunOwnership?
+            var runID: UUID?
+            var dirty = false
+            var saveGeneration: UInt64 = 0
+            runner.testAfterExistingControllerProbe = { point in
+                guard point == probe else { return }
+                reached = true
+                owner = session.activeRunOwnership
+                runID = session.runID
+                dirty = session.isDirty
+                saveGeneration = session.saveRequestGeneration
+                if successorAttempt {
+                    _ = session.beginRunAttempt(source: "successor during controller probe")
+                    owner = session.activeRunOwnership
+                } else if retire {
+                    scope.beginRetirement()
+                } else if !unchanged {
+                    var sessions = scope.sessions
+                    sessions.removeValue(forKey: session.tabID)
+                    scope.replaceSessions(sessions)
+                    sessions[session.tabID] = session
+                    scope.replaceSessions(sessions)
+                }
+            }
+            var leases: [MCPBootstrapLease] = []
+            let outcome = AgentRunStartOutcomeRecorder()
+            // A changed logical workspace takes the replacement path after the same real actor probes.
+            let nextRequest = probe == .replacementShutdown
+                ? ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: directory.appendingPathComponent("other").path, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
+                : request
+            let control: AgentProviderControlCommand? = probe == .controlCommand
+                ? .compact(expectedBinding: origin.writer.binding, expectedProviderConversation: "fixture") : nil
+            let prepared: AgentRunResourceRequest?
+            if successorAttempt {
+                harness.service.testAfterACPExistingControllerProbe = runner.testAfterExistingControllerProbe
+                let result = await harness.service.prepareRun(
+                    tabID: session.tabID, session: session, origin: origin, workspace: harness.workspace,
+                    initialUserMessage: "turn", initialMessageForRun: "turn", attachments: [], startOutcome: outcome
+                )
+                if case .completed = result { prepared = nil } else {
+                    XCTFail("A superseded probe cannot return resource construction")
+                    prepared = nil
+                }
+            } else {
+                prepared = await runner.prepareRun(
+                    tabID: session.tabID, session: session, origin: origin, workspace: harness.workspace,
+                    initialUserMessage: "turn", initialMessageForRun: "turn", attachments: [], runRequest: nextRequest,
+                    startOutcome: outcome, providerControlCommand: control,
+                    makeLease: { runID in
+                        let lease = harness.makeLease(runID: runID, tabID: session.tabID)
+                        leases.append(lease)
+                        return lease
+                    }
+                )
+            }
+            XCTAssertTrue(reached)
+            XCTAssertNil(session.agentTask)
+            if unchanged {
+                XCTAssertNotNil(prepared, "An unchanged writer may prepare replacement resources")
+                XCTAssertEqual(leases.count, 1)
+            } else {
+                XCTAssertNil(prepared)
+                XCTAssertTrue(leases.isEmpty, "Refused probes cannot mint a fresh routing lease")
+                XCTAssertTrue(outcome.hasRecordedOutcome)
+                XCTAssertFalse(outcome.outcome.didStart)
+                if retire {
+                    XCTAssertEqual(session.runState, .cancelled)
+                    XCTAssertEqual(AgentModeProcessRunIdentity.existingProcessRunID(for: session), runID)
+                    XCTAssertEqual(session.pendingHandoff.payload, "retained handoff")
+                    XCTAssertFalse(session.pendingHandoff.isStagedForSend, "An owned refusal reparks the unsent handoff")
+                } else {
+                    XCTAssertEqual(session.activeRunOwnership, owner)
+                    XCTAssertEqual(session.runID, runID)
+                    XCTAssertEqual(session.isDirty, dirty)
+                    XCTAssertEqual(session.saveRequestGeneration, saveGeneration)
+                    XCTAssertNil(session.lastTerminalCommitRevision)
+                }
+            }
+            let reusable = await controller.hasReusableSession
+            if probe == .replacementShutdown {
+                XCTAssertNil(session.acpController)
+                XCTAssertFalse(reusable, "Only the controller detached before the await is retired")
+            } else {
+                XCTAssertTrue(session.acpController === controller)
+                XCTAssertTrue(reusable, "Claim loss or suspended admission cannot retire the shared controller")
+            }
+            if !retire {
+                await harness.service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+                XCTAssertEqual(session.runState, .cancelled)
+            }
+            await harness.resources.fulfill(prepared) // Cancelled preparation settles without constructing.
+            for lease in leases {
+                await lease.cancelAndCleanup()
+            }
+            await controller.shutdown()
+            session.saveDebounceTask?.cancel()
+        }
+    }
+
     func testWorkspaceAdmissionRetainsLogicalRootAndRevalidatesWorktreeAndBinding() throws {
         let session = AgentTabSession(tabID: UUID())
         let sessionID = UUID()

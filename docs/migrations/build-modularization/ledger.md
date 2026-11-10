@@ -7367,3 +7367,38 @@ The overseer subsequently confirmed fully green CI on #1679's `c10f85830`, inclu
 cases; its PR note was updated without pushing code. #1679 must stay scoped to the published binding/
 hydration work. This startup follow-up remains local for M9.2g, pending #1679's merge and separately
 instructed squash integration/publication.
+
+#### M9.2g — existing ACP controller probe admission (local follow-up)
+
+Existing-controller compatibility/reusability probes and the detached replacement shutdown now
+revalidate the operation-local restored command, original attempt and exact controller before reuse,
+replacement or provider-control launch. A lost claim records refusal without retiring its shared
+controller, clearing process identity, settling attachments or publishing terminal state. An exclusive
+original claim whose admission is suspended cancels its unsent attempt through the existing barrier,
+reparks the staged handoff and retains its warm controller. Replacement still detaches synchronously
+under current authority before shutting down that captured controller. No persistent task captures
+the strong command. The service also preserves an explicitly recorded refusal instead of inferring
+acceptance from a successor's still-active run state; headless records acceptance only at its existing
+successful installation point, not as a provisional fallback.
+
+Oracle review `2026-11-10/2307-2` requested the missing unsent-handoff notification, service-level
+outcome witness and additional owned-suspended checks; these are applied. One causal test method
+uses real bootstrapped script controllers and a synchronous DEBUG hook at the actual post-await
+checks. Its ten variants cover reacquisition at all probe boundaries, retirement with warm controller
+and process identity preservation, current-owner Stop, unchanged replacement, and a successor attempt
+through the real run service. The returned positive preparation is explicitly settled after Stop.
+The hook adds no suspension or alternate admission path. Controller shutdown remains idempotent;
+test teardown keeps a fallback shutdown for throwing fixture setup and also drains before removing
+its temporary script directory.
+
+The initial focused ticket `02d1f888-6a24-4160-ba11-0d17cb54fc42` was cancelled before heavy admission
+to apply review fixes. Focused ticket `30a604d4-4aac-47d7-ab3a-628ae666a716` passed the ten-variant
+method (one executed test, zero failures, 4.214s). Affected-suite ticket
+`103c86ad-4b3a-4bdc-9b5b-8a1f0933d642` passed **369 tests, zero failures or skips**; full lint
+`ff2cfd0c-38d5-4d37-8322-14148d9be342` passed. Initial scoped lint hit an unwritable sandbox cache;
+non-caching strict scoped lint passed without changing rules. Actual compilation across five touched
+Swift files has no positive warning-occurrence deltas: ACP runner 1→1, other four 0→0.
+The fresh post-test index check passed at **1,254/1,360 wrong-way edges and 53/66 largest cycle**,
+with the baseline unchanged. Persistent task/lease/bootstrap/configuration and
+physical actor-write fences, event-consumer exits and the terminal barrier's own post-await authority
+remain OPEN. This is not a complete ACP execution or publication qualification.

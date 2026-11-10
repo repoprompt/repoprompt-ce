@@ -91,6 +91,10 @@ final class AgentModeRunService {
 
     #if DEBUG
         var testBeforeCancellationCommit: (@MainActor (AgentTabSession) async -> Void)?
+        var testAfterACPExistingControllerProbe: ((ACPIntegratedAgentModeRunner.ExistingControllerProbe) -> Void)? {
+            get { acpRunner.testAfterExistingControllerProbe }
+            set { acpRunner.testAfterExistingControllerProbe = newValue }
+        }
 
         func test_consumeClaudeTerminalEvents(
             _ events: AsyncStream<NativeAgentRuntimeEvent>, session: AgentTabSession,
@@ -467,14 +471,16 @@ final class AgentModeRunService {
     ///
     /// Every non-Codex runner performs the same synchronous prologue — begin an attempt, set
     /// `runState = .running`, then hand the provider work to `session.agentTask`. Any path that
-    /// refuses before that handoff commits a terminal state first, so an inactive run state on
-    /// return is exactly "never reached the provider pipeline". Checking the state rather than
-    /// `agentTask` avoids mistaking a previous attempt's retained task for this one's acceptance.
+    /// refuses explicitly keeps its recorded outcome, even if a successor run remains active.
+    /// For legacy paths without a receipt, checking state rather than `agentTask` avoids
+    /// mistaking a previous attempt's retained task for this one's acceptance.
     private func recordNonCodexStartOutcome(
         _ startOutcome: AgentRunStartOutcomeRecorder?,
         session: AgentTabSession
     ) {
-        guard let startOutcome else { return }
+        // A stale startup may leave a successor's run active. An explicit refusal must not
+        // be overwritten by inferring acceptance from that shared run state.
+        guard let startOutcome, !startOutcome.hasRecordedOutcome else { return }
         if session.runState.isActive {
             startOutcome.recordAccepted()
         } else {

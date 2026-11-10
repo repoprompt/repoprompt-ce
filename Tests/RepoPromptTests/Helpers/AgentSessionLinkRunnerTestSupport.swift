@@ -101,6 +101,7 @@ final class AgentSessionLinkRunnerHarness {
     /// Fake exact-returned support at reservation and final provider handoff.
     var routineQuietCheckIn = false
     var beforeProviderInputProof: (() async -> Void)?
+    var pendingHandoffSendOutcome: ((AgentTabSession, Bool) -> Void)?
     var localInputFixture: AgentSessionLinkTransportLocalInputFixture?
     private var workspaces: [WorkspaceManagerViewModel] = []
 
@@ -237,7 +238,7 @@ final class AgentSessionLinkRunnerHarness {
                 prependPendingHandoffIfNeeded: { text, session in
                     sessionLinkHost?.prependPendingHandoffIfNeeded(text, session: session) ?? text
                 },
-                recordPendingHandoffSendOutcome: { _, _ in },
+                recordPendingHandoffSendOutcome: { session, sent in harnessBox?.pendingHandoffSendOutcome?(session, sent) },
                 claimAgentSessionLinkPrompt: { session, dispatchID in
                     MainActor.assumeIsolated {
                         if let sessionLinkHost = harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost {
