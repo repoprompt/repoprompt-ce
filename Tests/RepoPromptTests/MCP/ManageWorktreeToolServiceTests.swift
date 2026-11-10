@@ -820,6 +820,49 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
             }
         }
 
+        func testCreateRetainsPhysicalReceiptWithoutObservingOrAnnotatingReplacementWriter() async throws {
+            try await withProvider { fixture in
+                struct SaveFailure: Error {}
+                let viewModel = fixture.driver.window.agentModeViewModel
+                let original = try XCTUnwrap(viewModel.runtimeCommand(sessionID: fixture.sessionID))
+                var replaced = false
+                var successorItemCount = 0
+                viewModel.test_setAgentSessionSaver { _, _, _ in
+                    if !replaced {
+                        replaced = true
+                        viewModel.test_removeSession(tabID: fixture.session.tabID)
+                        viewModel.test_installLiveSession(fixture.session)
+                        fixture.session.worktreeBindings = []
+                        successorItemCount = fixture.session.items.count
+                    }
+                    throw SaveFailure()
+                }
+                try FileManager.default.createDirectory(
+                    at: GitWorktreeDefaultPathPlanner.defaultContainer(forMainWorktreeRoot: fixture.logical),
+                    withIntermediateDirectories: true
+                )
+                let reply = try await fixture.call([
+                    "op": .string("create"), "branch": .string("origin-replaced-after-create"), "bind": .bool(true)
+                ], includeWorktree: false)
+                let created = try XCTUnwrap(reply.objectValue?["created_worktree"]?.objectValue)
+                let path = try XCTUnwrap(created["path"]?.stringValue)
+                let worktreeID = try XCTUnwrap(created["worktree_id"]?.stringValue)
+                XCTAssertTrue(replaced)
+                XCTAssertFalse(original.isCurrent)
+                XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+                XCTAssertTrue(fixture.session.worktreeBindings.isEmpty)
+                XCTAssertEqual(fixture.session.items.count, successorItemCount, "No old-operation audit row on a successor")
+                XCTAssertNil(reply.objectValue?["binding"])
+                let warning = try XCTUnwrap(reply.objectValue?["warning"]?.stringValue)
+                XCTAssertTrue(warning.contains("current state could not be confirmed"), warning)
+                XCTAssertTrue(warning.contains(path), warning)
+                XCTAssertNil(
+                    AgentSessionLinkRuntimeBridge.shared.worktreeOwnership.records[worktreeID]?.releasedAt,
+                    "Unknown successor state is not evidence of an unbound orphan"
+                )
+            }
+        }
+
         func testCreateKeepsDescriptorAndWorktreeWhenBindingIsRefused() async throws {
             try await withProvider { fixture in
                 _ = try await fixture.call(["op": .string("bind")])

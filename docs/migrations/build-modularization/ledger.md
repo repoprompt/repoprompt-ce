@@ -6829,6 +6829,45 @@ Remaining M9.2d: outer UI/MCP creation and binding provenance, deferred self-rel
 and merge preview/apply/continue/abort runtime ownership, physical fences and acknowledgements.
 This is not completion of M9.2 or #1406; no live-app or hosted-CI qualification is claimed here.
 
+#### M9.2f checkpoint 4 — UI/MCP worktree and deferred-relocation provenance
+
+Follow-up to M9.2d/#1677: outer UI and MCP commands capture a call-scoped runtime admission
+(command, workspace resources and full bindings) before authorization, discovery or Git creation
+suspends. The ordinary command-level no-op remains resource-free; callers with outer awaits validate
+the captured admission even for no-ops. Started UI changes now acknowledge the originating writer's
+required save. Initial-send preparation retains its configured first-save owner and explicit startup
+creation capabilities are unchanged. Git creation checks the admission at the existing physical
+commit fence, and later failures retain the created path rather than implying nothing happened.
+
+MCP composes the captured writer witness with the existing target authorization and domain-mutation
+fences. Unauthorized callers do not receive liveness results before authorization. Post-create failure
+handling observes only the original writer; it never reads or annotates a replacement writer to infer
+whether the old request applied. Physical descriptors remain in the reply when later binding or
+presentation fails. Presentation callbacks are not writer-selection authority.
+
+Deferred self-relocation stores a writer identity value, not a retaining command/admission. Scheduling
+and terminal application refuse a replacement incarnation, including reuse of the same tab object.
+Application holds one admission across its idle loop. Resource loss under the original writer gets
+an explanatory transcript row; writer replacement settles quietly. A token-owned continuation hold
+is released after post-publication failure only if it still belongs to this relocation. Direct setters
+invalidate the token, so cleanup cannot clear a successor's follow-up reservation. The UI location
+gate follows the same ownership discipline. No provider continuation or terminal owner was replaced.
+
+Coverage exercises changed bindings/resources, synchronous no-op admission, same-object writer
+replacement at scheduling/terminal/save boundaries, unavailable resources, post-create receipts,
+required-save failure and successor gate/reservation preservation. Scoped pinned formatting, strict
+lint and whitespace checks passed. Conductor `83d3a61c-d465-4f4a-a559-eafcd58c6f30` passed
+**164 tests**, four skipped, zero failures in 279.998 seconds. This includes LiveDiscovery in
+isolation. The preceding run found a new test hook firing again on a later background save; the hook
+now replaces the writer once, without weakening assertions. Checkpoint 3's broad selection executed
+2,480 tests with 19 skipped and three assertions failing in one LiveDiscovery workspace-CAS case;
+that run is not green. The same family previously passed isolated head/base runs, and the current
+isolated suite also passes. Both-product/full-lint/index/warning follow-up gates are not yet claimed.
+
+Remaining M9.2f: merge preview/apply/continue/abort runtime ownership, physical mutation fences,
+required acknowledgements and honest partial receipts. This checkpoint is not completion of M9.2
+or #1406. No hosted-CI, live-app, release or full-suite qualification is claimed.
+
 #### M9.2b checkpoint 9 — hook-review runtime ownership (validated locally; push frozen)
 
 The hook gate's actual discovery, waiting, response, refresh and completion bodies now live in
