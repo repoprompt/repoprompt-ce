@@ -494,6 +494,72 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
         }
     }
 
+    func testACPUnsentPromptDoesNotCreateAnEventConsumer() async throws {
+        for (cancelDuringProof, refuseRelease) in [(false, false), (true, false), (false, true)] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let script = try AgentSessionLinkACPServerScript.write(to: directory)
+            let promptLog = directory.appendingPathComponent("prompts.jsonl")
+            let provider = AgentSessionLinkCapturingACPProvider(providerID: .antigravity, commandPath: script.path, environment: ["ACP_PROMPT_LOG": promptLog.path])
+            let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: directory.path, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
+            let controller = try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
+            addTeardownBlock { await controller.shutdown() }
+            let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+            let session = try harness.makeBoundSession(agent: .antigravity)
+            let origin = try harness.startCommand(for: session)
+            let barrier = AgentRunTerminalCommitBarrier()
+            let runner = ACPIntegratedAgentModeRunner(hooks: harness.hooks, terminalCommitBarrier: barrier, toolTrackingHooks: .noOp)
+            var consumers = 0
+            runner.testPromptConsumerCreated = { consumers += 1 }
+            var task: Task<Void, Never>?
+            var ownership: AgentRunOwnership?
+            harness.beforeProviderInputProof = {
+                task = session.agentTask
+                ownership = session.activeRunOwnership
+                await Task.yield()
+                XCTAssertEqual(consumers, 0, "Input proof must not race a consumer that can mutate the session")
+                XCTAssertEqual(session.runLifecycle.liveness?.stage, .preparingRuntime)
+                if cancelDuringProof { task?.cancel() }
+            }
+            var releases = 0
+            if refuseRelease {
+                harness.providerInputReleaseOverride = {
+                    releases += 1
+                    XCTAssertEqual(consumers, 0)
+                    XCTAssertEqual(session.runLifecycle.liveness?.stage, .preparingRuntime)
+                    return AgentSessionLinkProviderInputRelease.handoffAcceptedReplay(nil, proof: nil, isCurrent: false, requiresLaneBatch: true)
+                }
+            }
+            let prepared = await runner.prepareRun(
+                tabID: session.tabID, session: session, origin: origin, workspace: harness.workspace,
+                initialUserMessage: "turn", initialMessageForRun: "turn", attachments: [], runRequest: request,
+                makeLease: { harness.makeLease(runID: $0, tabID: session.tabID) }
+            )
+            let resources = AgentRunProviderComposition(
+                headless: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
+                acp: { _, _ in provider }, controller: { _, _ in controller }
+            )
+            await resources.fulfill(prepared)
+            try await AsyncTestWait.waitUntil("ACP input proof") { task != nil }
+            await task?.value
+            let finishedOwner = try XCTUnwrap(ownership)
+            await barrier.awaitTerminalTeardown(for: finishedOwner, lifecycle: session.runLifecycle)
+            let refused = cancelDuringProof || refuseRelease
+            XCTAssertEqual(releases, refuseRelease ? 1 : 0)
+            XCTAssertEqual(consumers, refused ? 0 : 1)
+            XCTAssertEqual(session.runState, refused ? .cancelled : .completed)
+            if refused {
+                XCTAssertFalse(FileManager.default.fileExists(atPath: promptLog.path))
+            } else {
+                let prompts = try String(contentsOf: promptLog, encoding: .utf8).split(separator: "\n")
+                XCTAssertEqual(prompts.count, 1, "The dispatched turn must still consume its terminal event")
+            }
+            await controller.shutdown()
+            session.saveDebounceTask?.cancel()
+        }
+    }
+
     func testACPTaskEntryAndLeaseCompletionKeepTheirOriginalWriter() async throws {
         typealias Boundary = ACPIntegratedAgentModeRunner.StartupBoundary
         @MainActor final class Counters {

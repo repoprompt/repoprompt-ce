@@ -101,6 +101,7 @@ final class AgentSessionLinkRunnerHarness {
     /// Fake exact-returned support at reservation and final provider handoff.
     var routineQuietCheckIn = false
     var beforeProviderInputProof: (() async -> Void)?
+    var providerInputReleaseOverride: (() -> AgentSessionLinkProviderInputRelease.ReleasedDispatchContext)?
     var pendingHandoffSendOutcome: ((AgentTabSession, Bool) -> Void)?
     var localInputFixture: AgentSessionLinkTransportLocalInputFixture?
     private var workspaces: [WorkspaceManagerViewModel] = []
@@ -291,6 +292,7 @@ final class AgentSessionLinkRunnerHarness {
                     return await AgentSessionLinkProviderInputRelease.prove(claim) { _ in false }
                 },
                 handoffAgentSessionLinkProviderInput: { session, dispatchID, claim, proof in
+                    if let release = harnessBox?.providerInputReleaseOverride { return release() }
                     if let host = harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost {
                         return host.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatchID, claim: claim, proof: proof)
                     }

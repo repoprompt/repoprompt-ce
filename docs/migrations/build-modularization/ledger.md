@@ -7600,3 +7600,42 @@ awaits remain open. Claim loss before a reused dedicated note starts deliberatel
 successor state; recovery belongs to the current owner. Gate-only release currently uses the existing
 `route_wait_deferred` diagnostic, not a new policy-cleanup operation. No shared lease manager,
 strong-command task cycle, physical actor-write fence, lifecycle-handoff change or push is claimed.
+
+Local process deviation: `e68e94fe31dc8e9487e82019ce699deba11279c8` was committed while its mandatory
+preflight was still running, rather than after the terminal result. The preflight had already scanned
+those staged blobs; `/tmp/m92g-task-receipt-preflight.log` subsequently completed successfully with
+repository guardrails and 55 target placements. No push or history rewrite followed. This does not
+retroactively satisfy the required before-commit sequencing; subsequent commits must wait for the
+preflight process's terminal exit before invoking Git commit.
+
+### M9.2g local prerequisite — no ordinary ACP consumer before dispatch admission
+
+The ordinary ACP prompt path now acquires its buffered stream as before but creates its consumer only
+following all five synchronous/async pre-dispatch refusal checks. The release helper is nonthrowing;
+the prompt exception handler and oracle-reservation lifetime remain unchanged. This removes the
+orphaned consumer on an unsent turn rather than adding a cancellation task owner. The control-command
+path already cancels/joins its consumer and is unchanged. Post-dispatch ownership remains open.
+
+One Oracle review (`0055`, chat `6F1A83`) requested an actual progress-stage witness and a release-time
+refusal case; the real-controller test now covers success, cancellation during proof and an explicit
+handoff refusal, checking consumer creation, `.preparingRuntime` during proof/release, terminal state
+and actual prompt log. The test harness injects only the release result using the existing production
+release constructor; there is no production permission bypass. The proof yields but is not a claim
+that executor scheduling deterministically runs every earlier task; the creation counter remains the
+causal witness, with progress as the additional observable assertion.
+
+Ordering audit: `AgentSessionLinkProviderInputRelease` uses immutable claim/proof data and current
+claim/authorization/consumption checks, and `ReleasedDispatchContext.message` only decorates text;
+it does not read transcript or usage replay. The runtime handoff's extra effect is quiet-ledger
+qualification removal. Production searches found no ACP watchdog branching on `.preparingRuntime`
+versus `.running`; liveness remains available for diagnostics. Buffered replay and the `.running`
+progress transition intentionally occur after input admission, not opportunistically during proof.
+The stored AsyncStream retains events until consumption; this does not claim all post-dispatch
+consumer mutations or provider actor writes have an exact writer fence.
+
+Validation: focused ticket `cec50820-8b09-4c30-b220-bd31c7e9674a` passed the new three-variant method;
+affected ticket `9c5efa51-8c56-4318-afc0-fc59ded0c6c5` passed **398 tests, zero failures/skips**.
+Full lint `6f390d01-e29f-4270-914a-79045f6f32e4` and scoped pinned formatting/strict lint passed.
+Actual compiler warnings on the three touched Swift files: runner 1 (existing), tests/harness 0;
+no positive per-file occurrence delta. Fresh index remained **1,261/1,360 and 53/66**. These are local
+checkpoint receipts, not both-product/full-SessionLinks/live-app or hosted-CI qualification. No push.

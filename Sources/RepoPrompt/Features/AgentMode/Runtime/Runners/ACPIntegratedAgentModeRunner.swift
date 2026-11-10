@@ -186,6 +186,7 @@ final class ACPIntegratedAgentModeRunner {
 
     #if DEBUG
         var testAtStartupBoundary: ((StartupBoundary) -> Void)?
+        var testPromptConsumerCreated: (() -> Void)?
         // Synchronous: tests invalidate ownership at a real post-await admission boundary.
         var testAfterExistingControllerProbe: ((ExistingControllerProbe) -> Void)?
     #endif
@@ -1372,17 +1373,6 @@ final class ACPIntegratedAgentModeRunner {
             }
         }
         let events = await controller.events
-        let consumeTask = Task { @MainActor [weak self, weak session] in
-            guard let self, let session else {
-                return TransientOperationResult.failed(errorText: "ACP event consumer deallocated.")
-            }
-            return await consumeEvents(
-                events,
-                session: session,
-                runID: runID,
-                runAttemptID: runAttemptID
-            )
-        }
 
         // Composed here, not next to `buildHeadlessAgentMessage`: `prepareForNextTurn()` and the
         // event-stream acquisition above both suspend, and an oversight link can be added or revoked while
@@ -1447,10 +1437,21 @@ final class ACPIntegratedAgentModeRunner {
             hooks.persistence.scheduleSave(session)
         }
 
+        log("controller.prompt begin", runID: runID)
+        let released = inputProof.map { hooks.providerInput.handoffAgentSessionLinkProviderInput(session, oversightDispatch, monitoring?.claim, $0) }
+        guard released?.mustAbortDispatch != true else { return .cancelled }
+        // The stream buffers bootstrap/preparation events. Start its consumer only after every
+        // pre-dispatch refusal, so an unsent turn cannot leave a task awaiting a terminal event.
+        #if DEBUG
+            testPromptConsumerCreated?()
+        #endif
+        let consumeTask = Task { @MainActor [weak self, weak session] in
+            guard let self, let session else {
+                return TransientOperationResult.failed(errorText: "ACP event consumer deallocated.")
+            }
+            return await consumeEvents(events, session: session, runID: runID, runAttemptID: runAttemptID)
+        }
         do {
-            log("controller.prompt begin", runID: runID)
-            let released = inputProof.map { hooks.providerInput.handoffAgentSessionLinkProviderInput(session, oversightDispatch, monitoring?.claim, $0) }
-            guard released?.mustAbortDispatch != true else { return .cancelled }
             let oracle = carry.exactNote ? nil : session.oracleBackgroundAwareness.reserve(session: session, providerID: ObjectIdentifier(controller))
             defer { session.oracleBackgroundAwareness.release(oracle) }
             let outbound = released?.message(agentMessage) ?? agentMessage
