@@ -3334,7 +3334,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 )
             },
             settleSelfCompact: { [weak self] session in self?.agentSelfCompactSettleStaleParkedNote(session) },
-            selfCompactBlocksWake: { [weak self] session in self?.agentSelfCompactBlocksNotificationWake(session) ?? true }
+            selfCompactBlocksWake: { [weak self] session in self?.agentSelfCompactBlocksNotificationWake(session) ?? true },
+            selfCompactHoldsWakeAcquisition: { [weak self] session in self?.agentSelfCompactHoldsWakeAcquisition(session) ?? true }
         ), diagnostics: catalogDiagnosticsSink)
         runtime.codexCoordinator = codexCoordinator
         runtime.perfRecorder = perfRecorder

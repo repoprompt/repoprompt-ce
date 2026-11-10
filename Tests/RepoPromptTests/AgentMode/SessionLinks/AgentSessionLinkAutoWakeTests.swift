@@ -581,7 +581,11 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
                 return nil
             },
             settleSelfCompact: { session in XCTAssertNil(session.selfCompactState.active) },
-            selfCompactBlocksWake: { $0.selfCompactState.blocksAutomaticWake }
+            selfCompactBlocksWake: { $0.selfCompactState.blocksAutomaticWake },
+            selfCompactHoldsWakeAcquisition: { session in
+                XCTAssertNil(session.selfCompactState.active)
+                return false
+            }
         ), diagnostics: NoopAgentSessionLinkCatalogEventSink())
         runtime.test_endpointRead = onEndpointRead
         if let workspace {
@@ -1234,6 +1238,214 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         XCTAssertNotNil(fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID])
     }
 
+    func testSelfCompactFencesFirstAcquisitionButNotAnAcquiredWake() throws {
+        for basis in ["routine", "attention", "manual"] {
+            let fixture = try makeFixture(fenceProviderLaunch: true)
+            try publishInventory(fixture, revision: 1)
+            fixture.session.oversight.autoWakeOnUpdates = true
+            fixture.session.runState = .running
+            try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+            var wake = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+            wake.task?.cancel()
+            if basis == "attention" {
+                wake.admissionBasis = .purposefulAttention(Self.attentionRequest(0).occurrence)
+            } else if basis == "manual" {
+                wake.admissionBasis = .manual
+            }
+            wake.phase = .preparingDispatch
+            fixture.session.oversight.pendingAutoWake = wake
+            _ = try installVerifiedParkedNote(fixture)
+            fixture.session.selfCompactState.active?.phase = .awaitingCompactTurn
+            fixture.session.selfCompactVerifiedWakeRequestID = nil
+            // Codex success can arrive before the terminal: it must not open the gate.
+            fixture.session.selfCompactState.active?.compactTurnSucceeded = true
+            let dispatchID = AgentSessionLinkPromptDispatchID.autoWake(wakeID: wake.wakeID)
+            XCTAssertFalse(fixture.viewModel.agentSessionLinkAcquireAutoWakePhysicalDispatch(
+                for: fixture.session, dispatchID: dispatchID
+            ), basis)
+            XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .cancelledBeforeDispatch)
+            XCTAssertEqual(fixture.session.oversight.autoWakeReevaluationOwed, basis != "manual")
+            wake.phase = .dispatching
+            wake.physicalOutcome = .ambiguous
+            fixture.session.oversight.pendingAutoWake = wake
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquireAutoWakePhysicalDispatch(
+                for: fixture.session, dispatchID: dispatchID
+            ), "already acquired: \(basis)")
+        }
+    }
+
+    func testHeldWakeAbandonsRealClaimAndReevaluatesAfterNoCall() throws {
+        let fixture = try makeFixture(fenceProviderLaunch: true)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        fixture.session.runState = .running
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        let wake = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        wake.task?.cancel()
+        fixture.session.runState = .idle
+        let dispatchID = AgentSessionLinkPromptDispatchID.autoWake(wakeID: wake.wakeID)
+        let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(for: fixture.session, dispatchID: dispatchID))
+        XCTAssertNotNil(claim.passive)
+        XCTAssertNotNil(fixture.viewModel.agentSessionLinkPrepareAutoWakeDispatch(wakeID: wake.wakeID, endpoint: wake.observerEndpoint))
+        _ = try installVerifiedParkedNote(fixture)
+        fixture.session.selfCompactVerifiedWakeRequestID = nil
+        fixture.session.selfCompactState.active?.phase = .compactDispatchPending
+        XCTAssertFalse(fixture.viewModel.agentSessionLinkAcquireAutoWakePhysicalDispatch(for: fixture.session, dispatchID: dispatchID))
+        XCTAssertNil(fixture.viewModel.agentSessionLinkPromptClaimStore.pendingClaim(dispatchID: dispatchID, observerSessionID: fixture.sessionID))
+        fixture.viewModel.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: fixture.session, dispatchID: dispatchID)
+        let replacement = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        XCTAssertNotEqual(replacement.wakeID, wake.wakeID)
+        XCTAssertFalse(fixture.session.oversight.autoWakeReevaluationOwed)
+        XCTAssertNotNil(fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID])
+    }
+
+    func testOnlyNonTransportOwningWakeCanYieldToAcceptedSelfCompact() throws {
+        let fixture = try makeFixture(fenceProviderLaunch: true)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        fixture.session.runState = .running
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        var wake = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        wake.task?.cancel()
+        for phase: AgentSessionLinkAutoWakeAttempt.Phase in [.scheduled, .awaitingSettlement] {
+            wake.phase = phase
+            fixture.session.oversight.pendingAutoWake = wake
+            XCTAssertTrue(fixture.viewModel.agentSelfCompactCanIgnoreParkedWake(fixture.session))
+        }
+        for phase: AgentSessionLinkAutoWakeAttempt.Phase in [.preparingDispatch, .cancelledBeforeDispatch, .dispatching] {
+            wake.phase = phase
+            fixture.session.oversight.pendingAutoWake = wake
+            XCTAssertFalse(fixture.viewModel.agentSelfCompactCanIgnoreParkedWake(fixture.session))
+        }
+    }
+
+    func testOnlyCorrelatedTerminalVerifiesWakeAfterEarlyCodexSuccess() throws {
+        let fixture = try makeFixture(fenceProviderLaunch: true)
+        let noteID = try installVerifiedParkedNote(fixture)
+        let session = fixture.session
+        session.selfCompactVerifiedWakeRequestID = nil
+        session.selfCompactState.active?.phase = .awaitingCompactTurn
+        session.selfCompactState.active?.admittedSupport = .codex
+        session.selfCompactState.active?.compactTurnSucceeded = true
+        let runID = try XCTUnwrap(session.runID)
+        let attemptID = UUID()
+        let completion = AgentSelfCompactNativeCompletionCoordinator(
+            load: { session.selfCompactState }, store: { session.selfCompactState = $0 },
+            isCurrentOwner: { _ in true }, dispatchNote: { _, _ in false }
+        )
+        defer { completion.cancelRuntimeWork() }
+        XCTAssertTrue(completion.bindCompact(.init(requestID: noteID.requestID, stage: .compact), runID: runID, runAttemptID: attemptID))
+        XCTAssertTrue(fixture.viewModel.agentSelfCompactHoldsWakeAcquisition(session))
+        // Check the pre-terminal park, then exercise the alternate terminal-first path from
+        // the same bound state. A teardown-park without an unverified flag cannot confirm late.
+        let bound = session.selfCompactState
+        var parked = bound
+        XCTAssertTrue(parked.releaseForRuntimeTeardown())
+        session.selfCompactState = parked
+        XCTAssertTrue(fixture.viewModel.agentSelfCompactHoldsWakeAcquisition(session))
+        session.selfCompactState = bound
+        let revision = AgentRunTerminalCommitRevision(
+            commitID: UUID(), ownership: .init(attemptID: attemptID, binding: .init(tabID: fixture.tabID, persistentSessionID: fixture.sessionID)),
+            terminalState: .completed, failureReason: nil, expectedRunID: runID,
+            sourceItemsRevision: 0, assistantDeltaFlushGeneration: 0, providerDrainGeneration: 0,
+            mcpPublicationEnvelope: nil, successorKind: nil, providerSuccessorID: nil
+        )
+        completion.compactTurnSettled(revision: revision, publication: .accepted(successorEpoch: nil), teardownSettled: { true })
+        XCTAssertEqual(session.selfCompactVerifiedWakeRequestID, noteID.requestID)
+        XCTAssertFalse(fixture.viewModel.agentSelfCompactHoldsWakeAcquisition(session))
+    }
+
+    func testUnverifiedParkedSuccessDoesNotSpinWakeReplay() async throws {
+        let fixture = try makeFixture(fenceProviderLaunch: true)
+        try publishInventory(fixture, revision: 1)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        _ = try installVerifiedParkedNote(fixture)
+        fixture.session.selfCompactVerifiedWakeRequestID = nil
+        XCTAssertTrue(fixture.viewModel.agentSelfCompactBlocksNotificationWake(fixture.session))
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        try await AsyncTestWait.waitUntil("unverified wake stays parked") {
+            fixture.session.oversight.pendingAutoWake?.phase == .awaitingSettlement
+        }
+        let wakeID = try XCTUnwrap(fixture.session.oversight.pendingAutoWake?.wakeID)
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.wakeID, wakeID)
+        XCTAssertFalse(fixture.session.oversight.autoWakeReevaluationOwed)
+        XCTAssertEqual(fixture.session.items.count(where: { $0.id == wakeID }), 0)
+    }
+
+    func testHeldAttentionWakesAndCarriesVerifiedParkedNote() async throws {
+        let fixture = try makeFixture(fenceProviderLaunch: true)
+        try publishInventory(fixture, revision: 1)
+        let waiting = Task { @MainActor in
+            try await fixture.viewModel.waitForNextUserInstruction(
+                tabID: fixture.tabID, prompt: "What next?", timeoutSeconds: 5
+            )
+        }
+        try await AsyncTestWait.waitUntil("instruction continuation installed") {
+            fixture.session.instructionContinuation != nil
+        }
+        let noteID = try installVerifiedParkedNote(fixture)
+        fixture.session.selfCompactState.active?.phase = .awaitingCompactTurn
+        fixture.session.selfCompactState.active?.compactTurnSucceeded = nil
+        fixture.session.selfCompactVerifiedWakeRequestID = nil
+        try publishLane(
+            fixture,
+            linkSetRevision: 1,
+            queueRevision: 1,
+            targetIndices: [],
+            laneIndices: [0],
+            attentionRequests: [Self.attentionRequest(0)]
+        )
+        try await AsyncTestWait.waitUntil("attention parked during compact") {
+            fixture.session.oversight.pendingAutoWake?.phase == .awaitingSettlement
+        }
+        XCTAssertNotNil(fixture.session.instructionContinuation)
+        fixture.session.selfCompactState.active?.compactTurnSucceeded = true
+        fixture.session.selfCompactVerifiedWakeRequestID = noteID.requestID
+        fixture.session.selfCompactState.active?.phase = .parked
+        let response = try await waiting.value
+        XCTAssertTrue(try XCTUnwrap(response.text).hasPrefix(AgentSelfCompactNoteEnvelope.frame("continue safely")))
+        XCTAssertEqual(fixture.session.selfCompactState.latest?.requestID, noteID.requestID)
+        XCTAssertEqual(fixture.session.selfCompactState.latest?.noteDelivery, .prepended)
+    }
+
+    func testPeriodicFirstAcquisitionIsBlockedDuringSelfCompact() throws {
+        let (fixture, clock, endpoint) = try periodicFixture()
+        _ = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
+        var wake = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        let dispatchID = AgentSessionLinkPromptDispatchID.headlessRun(runID: UUID())
+        wake.periodicProducerDispatchID = dispatchID
+        wake.phase = .preparingDispatch
+        fixture.session.oversight.pendingAutoWake = wake
+        _ = try installVerifiedParkedNote(fixture)
+        fixture.session.selfCompactState.active?.phase = .compactDispatchPending
+        fixture.session.selfCompactState.active?.compactTurnSucceeded = nil
+        XCTAssertFalse(fixture.viewModel.agentSessionLinkAcquireAutoWakePhysicalDispatch(
+            for: fixture.session, dispatchID: dispatchID
+        ))
+        wake.phase = .dispatching
+        wake.physicalOutcome = .ambiguous
+        fixture.session.oversight.pendingAutoWake = wake
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquireAutoWakePhysicalDispatch(
+            for: fixture.session, dispatchID: dispatchID
+        ))
+    }
+
+    func testWakeNowRemainsOneShotDuringSelfCompact() throws {
+        let fixture = try makeFixture()
+        try publishInventory(fixture, revision: 1)
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1, selectedTargetIndices: [])
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        _ = try installVerifiedParkedNote(fixture)
+        fixture.session.selfCompactState.active?.phase = .compactDispatchPending
+        fixture.session.selfCompactState.active?.compactTurnSucceeded = nil
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkRequestManualWakeNow(for: endpoint), .refused(.sessionBusy))
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+    }
+
     func testRoutineAndAttentionWakeCarryVerifiedParkedNoteBeforeUpdatesOnce() async throws {
         for basis in ["routine", "attention", "manual"] {
             let fixture = try makeFixture(fenceProviderLaunch: true)
@@ -1515,6 +1727,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             attempt.compactTurnSucceeded = true
             attempt.noteDispatchStarted = loss == "attemptedForeign"
             fixture.session.selfCompactState = AgentSelfCompactState(active: attempt)
+            fixture.session.selfCompactVerifiedWakeRequestID = attempt.id
             let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
             let competingWriter = loss == "competingWriter" ? fixture.viewModel.session(for: UUID()) : nil
             // Deliberately bypass normal binding admission to exercise corrupted competing claims.
@@ -1570,6 +1783,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         state.active?.compactTurnSucceeded = true
         state.active?.phase = .parked
         fixture.session.selfCompactState = state
+        fixture.session.selfCompactVerifiedWakeRequestID = state.active?.id
         return try AgentSelfCompactionDispatchID(requestID: XCTUnwrap(state.active?.id), stage: .note)
     }
 
