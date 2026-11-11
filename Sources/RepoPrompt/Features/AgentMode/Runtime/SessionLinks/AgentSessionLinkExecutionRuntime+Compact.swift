@@ -126,7 +126,7 @@ extension AgentSessionLinkExecutionRuntime {
         // 2. Pure readiness admission, then provider support. Readiness first, so a busy or waiting
         //    target reads `target_not_idle` regardless of its provider.
         let admission = AgentSessionLinkDeliveryReadiness.evaluate(
-            snapshot: AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
+            snapshot: AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
                 session: session,
                 endpointMatchesGrant: admissionLiveness.targetEndpointIsLive,
                 isClosing: admissionLiveness.targetWindowIsClosing
@@ -182,7 +182,7 @@ extension AgentSessionLinkExecutionRuntime {
             return .blocked(.endpointInvalidated)
         }
         let postCommitAdmission = AgentSessionLinkDeliveryReadiness.evaluate(
-            snapshot: AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
+            snapshot: AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
                 session: liveSession,
                 endpointMatchesGrant: postCommitLiveness.targetEndpointIsLive,
                 isClosing: postCommitLiveness.targetWindowIsClosing,
@@ -257,7 +257,7 @@ extension AgentSessionLinkExecutionRuntime {
             return .delivered(persistedOnly)
         }
         let dispatchAdmission = AgentSessionLinkDeliveryReadiness.evaluate(
-            snapshot: AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
+            snapshot: AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
                 session: liveSession,
                 endpointMatchesGrant: dispatchLiveness.targetEndpointIsLive,
                 isClosing: dispatchLiveness.targetWindowIsClosing,
@@ -290,7 +290,7 @@ extension AgentSessionLinkExecutionRuntime {
                       composerSubmitClaimIsCurrent(claim)
                 else { return false }
                 return AgentSessionLinkDeliveryReadiness.evaluate(
-                    snapshot: AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
+                    snapshot: AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
                         session: liveSession,
                         endpointMatchesGrant: current.targetEndpointIsLive,
                         isClosing: current.targetWindowIsClosing,

@@ -75,7 +75,7 @@ extension AgentModeViewModel {
         case let .workspace(id): modelRouterSettingsStore.setWorkspaceAgentModelsProfile(workspaceID: id, profile: profile)
         }
         invalidateRepromptIfNeeded()
-        syncStatusPillsUIState()
+        ui.statusPills.update(makeStatusPillsSnapshot())
     }
 
     func configuredRepromptModels() -> [AIModel] {
@@ -189,13 +189,13 @@ extension AgentModeViewModel {
         } else if repromptOperations.isEmpty {
             repromptDefaultModel = nil
         }
-        syncStatusPillsUIState()
+        ui.statusPills.update(makeStatusPillsSnapshot())
     }
 
     /// Resolve an invalidated edited draft explicitly; keeping it bypasses preparation on the next Return.
     func keepRepromptRewrite(tabID: UUID) {
         guard currentTabID == tabID, var recovery = repromptUIStore.recoveries[tabID],
-              recovery.draftAtInvalidation == retrieveDraftText(for: tabID) else { return }
+              recovery.draftAtInvalidation == draftRuntime.text(for: tabID) else { return }
         recovery.requiresDecision = false
         recovery.bypassesPreparation = true
         repromptUIStore.recoveries[tabID] = recovery
@@ -204,7 +204,7 @@ extension AgentModeViewModel {
     @discardableResult
     func restoreRepromptOriginal(tabID: UUID, confirmedReplacement: Bool = false) -> Bool {
         guard currentTabID == tabID, var recovery = repromptUIStore.recoveries[tabID],
-              confirmedReplacement || retrieveDraftText(for: tabID) == recovery.draftAtInvalidation else { return false }
+              confirmedReplacement || draftRuntime.text(for: tabID) == recovery.draftAtInvalidation else { return false }
         repromptOperation?.cancel(restoreOriginal: false, recover: false)
         _ = draftRuntime.loadSnapshot(tabID: tabID)
         restoreComposerDraft(tabID: tabID, text: recovery.originalDraft, message: "Restored original draft.", strategy: .replaceAlways)
@@ -218,7 +218,7 @@ extension AgentModeViewModel {
     @discardableResult
     func restoreRepromptRecovery(tabID: UUID, confirmedReplacement: Bool = false) -> Bool {
         guard currentTabID == tabID, let recovery = repromptUIStore.recoveries[tabID] else { return false }
-        guard confirmedReplacement || retrieveDraftText(for: tabID) == recovery.draftAtInvalidation else { return false }
+        guard confirmedReplacement || draftRuntime.text(for: tabID) == recovery.draftAtInvalidation else { return false }
         repromptOperation?.cancel(restoreOriginal: false, recover: false)
         _ = draftRuntime.loadSnapshot(tabID: tabID)
         restoreComposerDraft(tabID: tabID, text: recovery.text, message: "Restored Re-prompt draft.", strategy: .replaceAlways)

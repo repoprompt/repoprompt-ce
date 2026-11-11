@@ -119,7 +119,7 @@ extension AgentSessionLinkExecutionRuntime {
         case .noProviderSession: return .blocked(reason: "no_provider_session")
         case .codex, .claudeCode, .acpAdvertisedCommand: break
         }
-        var readiness = AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
+        var readiness = AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
             session: session, endpointMatchesGrant: true, isClosing: false
         )
         readiness.runStateIsActive = false // The caller's own still-running turn is expected.

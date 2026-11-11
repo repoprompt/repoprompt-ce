@@ -2651,7 +2651,7 @@ final class AgentSessionPointReadScalingTests: XCTestCase {
             XCTAssertNil(organizer.state(of: fixture.newerID), "A live rebind does not erase the other physical claimants")
             XCTAssertEqual(viewModel.boundSessionID(for: fixture.targetID), fixture.olderID)
             // Archived fallback keeps its own metadata preference; active shadowing is separate.
-            XCTAssertEqual(viewModel.preferredSidebarEntry(for: fixture.targetID)?.id, fixture.newerID)
+            XCTAssertEqual(AgentModeSidebarSessionBuilder.preferredSidebarEntry(for: fixture.targetID, tabName: nil, entries: viewModel.sessionIndexStore.ownerValidatedEntries(forTabID: fixture.targetID))?.id, fixture.newerID)
 
             other.testInstallPersistentSessionBinding(sessionID: nil)
             XCTAssertEqual(viewModel.preferredActiveSidebarEntry(for: fixture.targetID, workspaceID: fixture.workspaceID)?.id, fixture.olderID)

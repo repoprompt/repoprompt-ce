@@ -183,7 +183,7 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         let fixture = try makeFixture()
         for agent: AgentProviderKind in [.claudeCodeGLM, .kimiCode, .customClaudeCompatible] {
             fixture.session.selectedAgent = agent
-            let candidate = try XCTUnwrap(fixture.viewModel.agentSessionLinkModelCandidate(for: fixture.candidate.domainEndpoint))
+            let candidate = try XCTUnwrap(fixture.viewModel.linkExecutionRuntime.agentSessionLinkModelCandidate(for: fixture.candidate.domainEndpoint))
             XCTAssertEqual(candidate.providerDisplayName, agent.rawValue, "Model admission must not load a compatible backend's configured display name")
             XCTAssertNil(candidate.locationLabel)
             XCTAssertEqual(candidate.domainEndpoint, fixture.candidate.domainEndpoint)
@@ -661,7 +661,7 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
                 return XCTFail("Expected direct-host claim")
             }
             // Same persistence/start seam used by managed-host submissions, without fabricated link authority.
-            let outcome = await f.viewModel.persistAndStartNoncomposerTurn(
+            let outcome = await f.viewModel.linkExecutionRuntime.persistAndStartNoncomposerTurn(
                 session: f.session, tabID: f.tabID, workspaceID: f.workspaceID, claim: claim,
                 displayText: "programmatic task", providerMessage: "programmatic task", workflow: nil,
                 attribution: nil, stopFence: AgentRunStartStopFence(session: f.session), dispatchIsCurrent: { true }

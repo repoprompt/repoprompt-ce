@@ -6053,14 +6053,14 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         _ = try XCTUnwrap(fixture.window.agentModeViewModel.test_installPersistentSessionBinding(
             sessionID: fixture.overseer, on: presenter
         ))
-        let endpoint = try XCTUnwrap(fixture.window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tab))
+        let endpoint = try XCTUnwrap(fixture.window.agentModeViewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: fixture.tab))
         XCTAssertTrue(endpoint.hasResolvedPersistentBinding)
         XCTAssertEqual(endpoint.sessionID, fixture.overseer)
         XCTAssertEqual(endpoint.workspaceID, presentingWorkspace.id)
         XCTAssertEqual(endpoint.windowID, fixture.window.windowID)
         let physicalTab = fixture.tab
         fixture.physicalObserverEndpoint = { [weak window = fixture.window] in
-            window?.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: physicalTab)
+            window?.agentModeViewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: physicalTab)
         }
         var catalog = WorkspaceModel(name: "Non-presenting batch catalog", repoPaths: [], isSavedWorkspace: false)
         catalog.isEphemeral = true
@@ -9362,7 +9362,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     if !realCatalog {
                         let connectionID = UUID()
                         vm.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { [weak vm] runID, _, tabID in
-                            guard let vm, let endpoint = vm.agentSessionLinkObserverEndpoint(tabID: tabID) else { return nil }
+                            guard let vm, let endpoint = vm.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID) else { return nil }
                             let token = AgentSessionLinkRunCatalogRouteToken(
                                 runID: runID, observerEndpoint: endpoint, connectionID: connectionID,
                                 routingAuthorityGeneration: 1, connectionLifecycleGeneration: 1
@@ -9376,7 +9376,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                         vm.test_agentSessionLinkCurrentRunCatalogRouteToken = { [weak vm] token, tabID in
                             // The synchronous fence receives the tab ID, not the run ID.
                             vm?.sessions[tabID]?.runID == token.runID
-                                && vm?.agentSessionLinkObserverEndpoint(tabID: tabID) == token.observerEndpoint
+                                && vm?.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID) == token.observerEndpoint
                         }
                     }
                     return vm
@@ -9928,8 +9928,8 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 }
             } catch {
                 let resumed = await observerController.sentMessages
-                let readiness = AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(session: observer, endpointMatchesGrant: true, isClosing: false)
-                return XCTFail("Requester delivery did not settle: messages=\(resumed), state=\(observer.runState), readiness=\(String(describing: AgentSessionLinkDeliveryReadiness.evaluate(snapshot: readiness))), items=\(observer.items.map(\.text)), terminating=\(WindowStatesManager.shared.isTerminating), admission=\(String(describing: observer.operationAdmissionFailureMessage)), endpoint=\(String(describing: observerVM.agentSessionLinkObserverEndpoint(tabID: observerTab.id))), presentation=\(String(describing: DelegationScopeRuntime.loadedPresentation(forTab: observerTab.id, in: WindowStatesManager.shared.allWindows)?.sessionID)), sameSession=\(observerVM.sessions[observerTab.id] === observer), closing=\(observerFixture.window.isClosing), authority=\(bridge.delegationScopes.availability)")
+                let readiness = AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(session: observer, endpointMatchesGrant: true, isClosing: false)
+                return XCTFail("Requester delivery did not settle: messages=\(resumed), state=\(observer.runState), readiness=\(String(describing: AgentSessionLinkDeliveryReadiness.evaluate(snapshot: readiness))), items=\(observer.items.map(\.text)), terminating=\(WindowStatesManager.shared.isTerminating), admission=\(String(describing: observer.operationAdmissionFailureMessage)), endpoint=\(String(describing: observerVM.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: observerTab.id))), presentation=\(String(describing: DelegationScopeRuntime.loadedPresentation(forTab: observerTab.id, in: WindowStatesManager.shared.allWindows)?.sessionID)), sameSession=\(observerVM.sessions[observerTab.id] === observer), closing=\(observerFixture.window.isClosing), authority=\(bridge.delegationScopes.availability)")
             }
             let resumed = await observerController.sentMessages
             XCTAssertEqual(resumed.count(where: { $0.contains(terminalNotice) }), 1, "One final result across all watch re-arms")
@@ -10396,7 +10396,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 XCTAssertEqual(owner.workspaceID, workspace.id)
                 XCTAssertTrue(viewModel.sessionIndexStore.isOwnerCurrent(owner))
                 XCTAssertEqual(Set(viewModel.test_ownerValidatedSessionIndex.keys), Set(entries.keys))
-                let preferred = try XCTUnwrap(viewModel.preferredSidebarEntry(for: archived.id, tabName: archived.name))
+                let preferred = try XCTUnwrap(AgentModeSidebarSessionBuilder.preferredSidebarEntry(for: archived.id, tabName: archived.name, entries: viewModel.sessionIndexStore.ownerValidatedEntries(forTabID: archived.id)))
                 XCTAssertEqual(preferred.id, newer)
 
                 let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [window] }, links: { ([], []) })

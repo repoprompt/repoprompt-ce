@@ -76,7 +76,7 @@ extension AgentModeViewModel {
             updateBindingsFromSession(session)
             persistenceRuntime.scheduleSave(for: tabID)
         }
-        let existingDraft = retrieveDraftText(for: tabID)
+        let existingDraft = draftRuntime.text(for: tabID)
         let composedDraft = AgentComposerDraftRestorationReducer.compose(
             restoredText: draftText,
             above: existingDraft
@@ -97,7 +97,7 @@ extension AgentModeViewModel {
         if let repromptedText {
             repromptUIStore.recoveries[tabID] = .init(
                 text: repromptedText, originalDraft: draftText, reason: message,
-                draftAtInvalidation: retrieveDraftText(for: tabID)
+                draftAtInvalidation: draftRuntime.text(for: tabID)
             )
         }
     }
@@ -160,13 +160,8 @@ extension AgentModeViewModel {
         let nextStagedSlashCommand = stagedSlashCommandProps(tabID: tabID)
         if tabID == currentTabID, previousStagedSlashCommand != nextStagedSlashCommand {
             syncComposerUIState(tabID: tabID)
-            syncStatusPillsUIState()
+            ui.statusPills.update(makeStatusPillsSnapshot())
         }
-    }
-
-    /// Retrieve draft text for a tab
-    func retrieveDraftText(for tabID: UUID) -> String {
-        draftRuntime.text(for: tabID)
     }
 
     func stagedSlashCommandProps(

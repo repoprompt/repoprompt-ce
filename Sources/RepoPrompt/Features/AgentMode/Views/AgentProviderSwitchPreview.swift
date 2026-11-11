@@ -67,7 +67,7 @@ private struct AgentProviderSwitchBanner: View {
         }
         if session.pendingHandoff.providerSwitchDelivery != nil {
             VStack(alignment: .leading, spacing: 6) {
-                if AgentModeViewModel.providerSwitchUnconfirmed(session) {
+                if AgentSessionLinkExecutionRuntime.providerSwitchUnconfirmed(session) {
                     Text("Switch not confirmed").font(.headline)
                     Text("\(session.selectedAgent.displayName) may already have the handover.")
                     Text("Your last message may be included in the handover history, and the new provider may act on it.")

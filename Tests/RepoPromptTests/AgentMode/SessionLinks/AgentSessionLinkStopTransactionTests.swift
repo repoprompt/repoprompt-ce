@@ -275,7 +275,7 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         XCTAssertEqual(receipt.result, .notRunning)
         XCTAssertFalse(heldFence.permitsStart(of: fixture.session))
         XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .cancelledBeforeDispatch)
-        XCTAssertFalse(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(
+        XCTAssertFalse(fixture.viewModel.linkExecutionRuntime.agentSessionLinkAcquirePhysicalDispatch(
             for: fixture.session, dispatchID: .autoWake(wakeID: wakeID)
         ), "the held wake must never reach a provider call")
     }
@@ -427,8 +427,8 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         let outcome = await stop(fixture)
         guard case let .settled(receipt) = outcome else { return XCTFail("expected receipt") }
         XCTAssertEqual(receipt.result, .stopped)
-        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.tabID), "the user's own draft")
-        XCTAssertFalse(fixture.viewModel.retrieveDraftText(for: fixture.tabID).contains("overseer-only"))
+        XCTAssertEqual(fixture.viewModel.draftRuntime.text(for: fixture.tabID), "the user's own draft")
+        XCTAssertFalse(fixture.viewModel.draftRuntime.text(for: fixture.tabID).contains("overseer-only"))
         XCTAssertTrue(fixture.session.pendingClaudeSteeringInstructions.isEmpty)
     }
 
@@ -988,7 +988,7 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         fixture.viewModel.storeDraftText(for: fixture.tabID, "replacement draft")
         releaseRestart.finish(())
         await finishedRestart.value()
-        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.tabID), "replacement draft")
+        XCTAssertEqual(fixture.viewModel.draftRuntime.text(for: fixture.tabID), "replacement draft")
         XCTAssertNotEqual(fixture.session.runState, .running)
     }
 
@@ -1008,7 +1008,7 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
             attachmentsToSend: [], taggedFilesToSend: [], activeWorkflow: nil,
             stopFence: heldFence
         )
-        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.tabID), "replacement draft")
+        XCTAssertEqual(fixture.viewModel.draftRuntime.text(for: fixture.tabID), "replacement draft")
         XCTAssertTrue(replacement.pendingFileAttachments.isEmpty)
         XCTAssertTrue(replacement.pendingTaggedFileAttachments.isEmpty)
     }

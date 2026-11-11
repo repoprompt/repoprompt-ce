@@ -756,7 +756,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             session.createdByOverseerSessionID = nil
             viewModel.test_setCurrentTabIDOverride(tabID)
             defer { viewModel.test_setCurrentTabIDOverride(nil) }
-            let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: tabID))
+            let endpoint = try XCTUnwrap(viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID))
             let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(
                 runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()
             ))
@@ -773,7 +773,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 XCTAssertNotNil(viewModel.ui.statusPills.snapshot.monitor.overseerBootstrapState?.activation)
                 invalidated.sessionIDs.removeAll()
             } else {
-                viewModel.syncStatusPillsUIState()
+                viewModel.ui.statusPills.update(viewModel.makeStatusPillsSnapshot())
                 XCTAssertEqual(viewModel.ui.statusPills.snapshot.monitor.endpoint, endpoint)
             }
             // Counted for this session only: the fresh authority holds no links, so no revocation or
@@ -792,7 +792,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             if activated {
                 try await AsyncTestWait.waitUntil("retired advertisement", timeout: 10) { retirements() == 1 }
             }
-            let currentEndpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: tabID))
+            let currentEndpoint = try XCTUnwrap(viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID))
             XCTAssertNotEqual(currentEndpoint, endpoint)
             let settledBootstrapState = AgentSessionOverseerBootstrapState(
                 sessionIdentity: ObjectIdentifier(session), provider: session.selectedAgent, activation: nil
@@ -2060,7 +2060,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                     guard case let .created(parentID, parentTabID, _) = parent else {
                         return XCTFail("parent binding was not created")
                     }
-                    let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: parentTabID))
+                    let endpoint = try XCTUnwrap(viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: parentTabID))
                     var sessions: Set<UUID> = []
                     for index in 0 ..< 20 {
                         let target = try await viewModel.mcpResolveOrCreateSessionTarget(
@@ -2120,7 +2120,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 return XCTFail("fresh lane did not establish its binding")
             }
             let viewModel = fixture.window.agentModeViewModel
-            let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: tabID))
+            let endpoint = try XCTUnwrap(viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID))
             let uniquelyBound = { WindowStatesManager.shared.agentSessionLinkBindingCount(sessionID: sessionID) == 1 }
             XCTAssertTrue(uniquelyBound())
             try await withSecondRegisteredWindow { second in
@@ -2179,7 +2179,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             guard case let .created(_, tabID, _) = outcome else {
                 return XCTFail("fresh lane did not establish its binding")
             }
-            let endpoint = try XCTUnwrap(fixture.window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: tabID))
+            let endpoint = try XCTUnwrap(fixture.window.agentModeViewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID))
             try await withSecondRegisteredWindow { second in
                 let originalWorkspace = try XCTUnwrap(second.workspaceManager.activeWorkspace)
                 let copy = try XCTUnwrap(second.workspaceManager.workspace(withID: fixture.workspaceID))
@@ -2305,7 +2305,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             XCTAssertTrue(committedChildTarget, "The descendant fixture must finish its real first payload save.")
             let child = try XCTUnwrap(viewModel.sessions[childTarget.tabID])
             let childID = try XCTUnwrap(child.activeAgentSessionID)
-            let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: parentTabID))
+            let endpoint = try XCTUnwrap(viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: parentTabID))
             let childrenSettled = {
                 !WindowStatesManager.shared.agentSessionLinkHasActiveChildSessions(parentSessionID: parentID)
             }
@@ -2382,7 +2382,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             grandchild.isDirty = true
             await viewModel.persistenceRuntime.flushSave(for: target.tabID)
             XCTAssertNil(viewModel.test_ownerValidatedSessionIndex[diskOnlyChild.id])
-            let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: parentTabID))
+            let endpoint = try XCTUnwrap(viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: parentTabID))
             grandchild.runState = .running // Disk still says completed.
             let blocked = await WindowStatesManager.shared.agentSessionLinkHasPersistedActiveChildSessions(
                 parentSessionID: parentID
@@ -2424,7 +2424,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             _ = await fixture.window.workspaceManager.pollAndSaveStateWithOutcomeAsync(
                 workspaceID: fixture.workspaceID, source: WorkspaceSaveSource("retireChildTest")
             )
-            let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: parentTabID))
+            let endpoint = try XCTUnwrap(viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: parentTabID))
             try await withSecondRegisteredWindow { peer in
                 let copy = try XCTUnwrap(peer.workspaceManager.workspace(withID: fixture.workspaceID))
                 _ = await peer.workspaceManager.switchWorkspace(to: copy, saveState: false, reason: "retireChildTest")

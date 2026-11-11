@@ -104,7 +104,7 @@ struct AgentModeDetailWithSidebarView: View {
         agentModeVM.syncComposerUIState(tabID: tabID)
         agentModeVM.syncTranscriptUIState()
         agentModeVM.syncRunInteractionUIState()
-        agentModeVM.syncStatusPillsUIState()
+        agentModeVM.ui.statusPills.update(agentModeVM.makeStatusPillsSnapshot())
         syncRuntimeMetricsSelectionCount()
         #if DEBUG
             stressHarness?.bootstrapIfNeeded(currentTabID: tabID)

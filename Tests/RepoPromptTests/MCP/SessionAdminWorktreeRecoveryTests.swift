@@ -1528,7 +1528,7 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
             var service = SessionAdminMCPToolService(
                 captureRequestMetadata: { .init(connectionID: UUID(), clientName: "worktree-recovery-test", windowID: window.windowID) },
                 requireTargetWindow: { window },
-                resolveObserverEndpoint: { _, _ in viewModel.agentSessionLinkObserverEndpoint(tabID: foregroundTabID) },
+                resolveObserverEndpoint: { _, _ in viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: foregroundTabID) },
                 scopes: { scopes }, administration: { door }
             )
             service.isToolEnabled = { true }

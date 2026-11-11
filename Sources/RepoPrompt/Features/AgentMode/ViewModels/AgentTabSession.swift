@@ -2389,7 +2389,7 @@ final class AgentTabSession: ObservableObject {
     }
 
     var hasOwnPendingQuietInteraction: Bool {
-        let snapshot = AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
+        let snapshot = AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
             session: self, endpointMatchesGrant: true, isClosing: false
         )
         return snapshot.hasWaitingPrompt || snapshot.hasPendingAskUser || snapshot.hasPendingUserInputRequest

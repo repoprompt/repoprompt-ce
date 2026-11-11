@@ -77,13 +77,13 @@ extension AgentModeViewModel {
     private func restorePendingComposerRepromptMetadata(_ pending: AgentComposerPendingSubmission, message: String) {
         repromptUIStore.restoreCancelledDraft(
             pending.repromptDraft.cancelledDraft, tabID: pending.sourceTabID,
-            currentDraft: retrieveDraftText(for: pending.sourceTabID)
+            currentDraft: draftRuntime.text(for: pending.sourceTabID)
         )
         if repromptUIStore.recoveries[pending.sourceTabID] == nil {
             if let original = pending.originalDraft, pending.text != original {
                 repromptUIStore.recover(
                     tabID: pending.sourceTabID, text: pending.text, originalDraft: original,
-                    reason: message, currentDraft: retrieveDraftText(for: pending.sourceTabID), requiresDecision: true
+                    reason: message, currentDraft: draftRuntime.text(for: pending.sourceTabID), requiresDecision: true
                 )
             } else {
                 repromptUIStore.recoveries[pending.sourceTabID] = pending.repromptDraft.recovery

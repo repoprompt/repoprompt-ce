@@ -265,18 +265,18 @@ final class AgentSessionLinkRunnerHarness {
                     }
                 },
                 acquireAgentSessionLinkPhysicalDispatch: { session, dispatchID in
-                    sessionLinkHost?.agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: dispatchID) ?? true
+                    sessionLinkHost?.linkExecutionRuntime.agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: dispatchID) ?? true
                 },
                 recordAgentSessionLinkPhysicalDispatchNotAttempted: { session, dispatchID in
-                    sessionLinkHost?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
+                    sessionLinkHost?.linkExecutionRuntime.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
                 },
                 recordAgentSessionLinkPhysicalDispatchFailure: { session, dispatchID in
-                    sessionLinkHost?.agentSessionLinkRecordPhysicalDispatchFailure(for: session, dispatchID: dispatchID)
+                    sessionLinkHost?.linkExecutionRuntime.agentSessionLinkRecordPhysicalDispatchFailure(for: session, dispatchID: dispatchID)
                 },
                 acceptAgentSessionLinkPrompt: { session, context, claim in
                     MainActor.assumeIsolated {
                         harnessBox?.acceptedDispatchCount += 1
-                        (harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost)?.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
+                        (harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost)?.linkExecutionRuntime.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
                         guard let claim else { return }
                         harnessBox?.claimStore.accept(claim)
                         harnessBox?.acceptedClaims.append(claim)
@@ -285,13 +285,13 @@ final class AgentSessionLinkRunnerHarness {
                 proveAgentSessionLinkProviderInput: { session, claim in
                     await harnessBox?.beforeProviderInputProof?()
                     if let host = harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost {
-                        return await host.agentSessionLinkProveProviderInput(for: session, claim: claim)
+                        return await host.linkExecutionRuntime.agentSessionLinkProveProviderInput(for: session, claim: claim)
                     }
                     return await AgentSessionLinkProviderInputRelease.prove(claim) { _ in false }
                 },
                 handoffAgentSessionLinkProviderInput: { session, dispatchID, claim, proof in
                     if let host = harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost {
-                        return host.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatchID, claim: claim, proof: proof)
+                        return host.linkExecutionRuntime.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatchID, claim: claim, proof: proof)
                     }
                     return AgentSessionLinkProviderInputRelease.handoff(
                         original: claim,

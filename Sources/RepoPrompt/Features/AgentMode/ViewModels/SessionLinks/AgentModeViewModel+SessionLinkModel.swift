@@ -16,12 +16,6 @@ extension AgentModeViewModel {
         )
     }
 
-    func agentSessionLinkModelCandidate(
-        for endpoint: DomainAgentSessionLinkEndpointIdentity
-    ) -> AgentSessionLinkEndpointCandidate? {
-        linkExecutionRuntime.agentSessionLinkModelCandidate(for: endpoint)
-    }
-
     /// Optional projection only. The writer has already committed the session configuration.
     func publishSessionLinkModelConfiguration(_ session: TabSession, selection: AgentModelCatalogRuntime.Selection) {
         guard sessions[session.tabID] === session, session.tabID == currentTabID else { return }

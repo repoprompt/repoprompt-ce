@@ -31,7 +31,7 @@ extension AgentModeViewModel {
             throw MCPError.invalidParams(session.restorationAdmissionFailureMessage ?? Self.mcpResidentTargetError)
         }
         if requiringLoadedState, !session.permitsBoundOperationAndSave { return nil }
-        guard let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID),
+        guard let endpoint = linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: session.tabID),
               endpoint.sessionID == sessionID, !session.bindingTransitionInProgress,
               !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID),
               !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID),
@@ -70,7 +70,7 @@ extension AgentModeViewModel {
             && current.permitsBoundOperationAndSave
             && !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: target.endpoint.sessionID)
             && !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: target.endpoint.sessionID)
-            && agentSessionLinkObserverEndpoint(tabID: current.tabID) == target.endpoint
+            && linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: current.tabID) == target.endpoint
             && workspaceManager?.activeWorkspaceID == target.endpoint.workspaceID
     }
 
@@ -87,7 +87,7 @@ extension AgentModeViewModel {
         guard let resolved = try mcpResidentTarget(sessionID: sessionID),
               resolved.session.permitsBoundOperationAndSave else { return nil }
         let target = MCPResidentTarget(session: resolved.session, endpoint: resolved.endpoint, window: admittedWindow)
-        let hasLinks = await agentSessionLinkHasActiveOutboundLink(target.endpoint)
+        let hasLinks = await linkExecutionRuntime.agentSessionLinkHasActiveOutboundLink(target.endpoint)
         try mcpRequireResidentActivationFence(target, authoritativeHasLinks: hasLinks)
         return target
     }
@@ -205,7 +205,7 @@ extension AgentModeViewModel {
             || mcpRuntime.mcpPendingInteraction(for: session).map { $0.kind != .instruction } == true
         guard !protectedPrompt else { throw MCPError.invalidParams(Self.mcpResidentProtectedError) }
         let admission = AgentSessionLinkSteerAdmission.evaluate(
-            readiness: Self.agentSessionLinkDeliveryReadinessSnapshot(
+            readiness: AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
                 session: session, endpointMatchesGrant: true, isClosing: false
             ),
             runStateIsActive: session.runState.isActive, pendingPromptExists: protectedPrompt,
@@ -257,14 +257,14 @@ extension AgentModeViewModel {
                 envelope: frame, workflow: workflow,
                 includeBuiltInSessionCleanupGuidance: GlobalSettingsStore.shared.showBuiltInWorkflowCleanupGuidance()
             )
-            let outcome = await persistAndStartNoncomposerTurn(
+            let outcome = await linkExecutionRuntime.persistAndStartNoncomposerTurn(
                 session: session, tabID: session.tabID, workspaceID: target.endpoint.workspaceID,
                 claim: claim, displayText: frame, providerMessage: payload, workflow: workflow,
                 attribution: nil, stopFence: stopFence
             ) {
                 windowIsAvailable() && self.mcpResidentTargetIsCurrent(target)
                     && self.composerSubmitRuntime.isCurrent(claim) && stopFence.permitsStart(of: session)
-                    && AgentSessionLinkDeliveryReadiness.failure(snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
+                    && AgentSessionLinkDeliveryReadiness.failure(snapshot: AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
                         session: session, endpointMatchesGrant: true, isClosing: false,
                         ignoresComposerSubmissionInFlight: true,
                         ignoresProviderSwitchStalenessAfterAcceptance: true

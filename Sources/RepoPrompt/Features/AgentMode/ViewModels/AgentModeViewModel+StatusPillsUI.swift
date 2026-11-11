@@ -24,17 +24,13 @@ extension AgentModeViewModel {
         )
     }
 
-    func syncStatusPillsUIState() {
-        ui.statusPills.update(makeStatusPillsSnapshot())
-    }
-
     /// Preserve notify-time monitor freshness without rebuilding for unrelated endpoint updates.
     /// The link-projection publisher calls this on every mutation, and most mutations leave the
     /// pills untouched.
     func syncStatusPillsUIStateIfMonitorStale() {
         let published = ui.statusPills.snapshot
         if published.currentTabID != currentTabID || published.monitor != currentMonitorPillProps() {
-            syncStatusPillsUIState()
+            ui.statusPills.update(makeStatusPillsSnapshot())
         }
     }
 
@@ -151,13 +147,13 @@ extension AgentModeViewModel {
         }
         session.pendingInitialStartLocation = selection
         syncComposerUIState(tabID: tabID)
-        syncStatusPillsUIState()
+        ui.statusPills.update(makeStatusPillsSnapshot())
     }
 
     func setInterviewFirst(_ enabled: Bool) {
         guard interviewFirst != enabled else { return }
         interviewFirst = enabled
-        syncStatusPillsUIState()
+        ui.statusPills.update(makeStatusPillsSnapshot())
     }
 
     func toggleInterviewFirst() {

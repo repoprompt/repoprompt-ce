@@ -2864,7 +2864,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
         session.createdByOverseerSessionID = sessionID
-        let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: tabID))
+        let endpoint = try XCTUnwrap(viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID))
         let creator = makeCandidate(
             windowID: endpoint.windowID,
             sessionID: sessionID,
@@ -9531,7 +9531,7 @@ final class AgentSessionLinkTransportLocalInputFixture {
         // Explicit fixture state prevents a saved default from launching a competing fake run.
         session.oversight.autoWakeOnUpdates = false
         session.oversight.retirePeriodicScheduling()
-        let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: session.tabID))
+        let endpoint = try XCTUnwrap(viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: session.tabID))
         let fixture = AgentSessionLinkTransportLocalInputFixture(viewModel: viewModel, observer: endpoint)
         fixture.bridge.attach(host: fixture.host)
         guard case .added = await fixture.bridge.addMonitorLink(observerSessionID: endpoint.sessionID, rawTargetSessionID: fixture.target.sessionID.uuidString) else {

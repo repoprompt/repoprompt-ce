@@ -60,7 +60,7 @@ extension AgentModeViewModel {
             guard autoEditPermissionGuidance != nil else { return false }
             autoEditPermissionGuidance = nil
             if syncUI {
-                syncStatusPillsUIState()
+                ui.statusPills.update(makeStatusPillsSnapshot())
             }
             return true
         }
@@ -75,7 +75,7 @@ extension AgentModeViewModel {
         guard autoEditPermissionGuidance != nextGuidance else { return false }
         autoEditPermissionGuidance = nextGuidance
         if syncUI {
-            syncStatusPillsUIState()
+            ui.statusPills.update(makeStatusPillsSnapshot())
         }
         return true
     }

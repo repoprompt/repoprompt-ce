@@ -238,25 +238,4 @@ extension AgentSessionLinkWakeAdmissionDecision.Basis {
 @MainActor
 extension AgentModeViewModel {
     typealias AutoWakeRoute = AgentSessionLinkExecutionRuntime.AutoWakeRoute
-
-    func cancelAgentSessionLinkAutoWake(
-        for endpoint: DomainAgentSessionLinkEndpointIdentity,
-        reason: AgentSessionLinkAutoWakeCancellationReason
-    ) {
-        linkExecutionRuntime.cancelAgentSessionLinkAutoWake(for: endpoint, reason: reason)
-    }
-
-    func agentSessionLinkRecordPhysicalDispatchNotAttempted(
-        for session: TabSession,
-        dispatchID: AgentSessionLinkPromptDispatchID
-    ) {
-        linkExecutionRuntime.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
-    }
-
-    func agentSessionLinkRecordPhysicalDispatchFailure(
-        for session: TabSession,
-        dispatchID: AgentSessionLinkPromptDispatchID
-    ) {
-        linkExecutionRuntime.agentSessionLinkRecordPhysicalDispatchFailure(for: session, dispatchID: dispatchID)
-    }
 }

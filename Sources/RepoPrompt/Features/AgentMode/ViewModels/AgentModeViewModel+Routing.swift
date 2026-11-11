@@ -110,7 +110,7 @@ extension AgentModeViewModel {
         let enabled = configuration.enabled
         guard enabled || configuration.selectedBackendID.map({ modelRouterRuntime?.isBackendReady($0) == true }) == true else { return }
         modelRouterSettingsStore.setAutoEffortEnabled(!enabled)
-        syncStatusPillsUIState()
+        ui.statusPills.update(makeStatusPillsSnapshot())
     }
 
     func handleModelRouterRuntimeChanged() {
@@ -233,7 +233,7 @@ extension AgentModeViewModel {
             freshTaskRoutingByTabID[ownership.sourceTabID] = ownership
             freshTaskRoutingByTabID[ownership.destinationTabID] = ownership
             syncComposerUIState()
-            syncStatusPillsUIState()
+            ui.statusPills.update(makeStatusPillsSnapshot())
             stagedResult = await routeTask.value
             guard ownsFreshTaskRouting(ownership) else {
                 return .blocked(message: "Model routing was cancelled.")
@@ -310,7 +310,7 @@ extension AgentModeViewModel {
                 session.isDirty = true
                 persistenceRuntime.scheduleSave(for: session.tabID)
                 if currentTabID == session.tabID {
-                    syncStatusPillsUIState()
+                    ui.statusPills.update(makeStatusPillsSnapshot())
                 }
             }
             return result
@@ -471,13 +471,13 @@ extension AgentModeViewModel {
             session.autoEffortJudgmentID = judgmentID
         }
         if !isSpeculative, currentTabID == session.tabID {
-            syncStatusPillsUIState()
+            ui.statusPills.update(makeStatusPillsSnapshot())
         }
         defer {
             if !isSpeculative, session.autoEffortJudgmentID == judgmentID {
                 session.autoEffortJudgmentID = nil
                 if currentTabID == session.tabID {
-                    syncStatusPillsUIState()
+                    ui.statusPills.update(makeStatusPillsSnapshot())
                 }
             }
         }
@@ -550,7 +550,7 @@ extension AgentModeViewModel {
             previous: session.autoEffortFeedback
         )
         if currentTabID == session.tabID {
-            syncStatusPillsUIState()
+            ui.statusPills.update(makeStatusPillsSnapshot())
         }
     }
 
@@ -870,7 +870,7 @@ extension AgentModeViewModel {
             freshTaskRoutingByTabID.removeValue(forKey: ownership.destinationTabID)
         }
         syncComposerUIState()
-        syncStatusPillsUIState()
+        ui.statusPills.update(makeStatusPillsSnapshot())
         requestUIRefresh(tabID: ownership.sourceTabID, urgent: true)
         if ownership.destinationTabID != ownership.sourceTabID {
             requestUIRefresh(tabID: ownership.destinationTabID, urgent: true)

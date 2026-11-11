@@ -1338,7 +1338,7 @@ struct AgentRunMCPToolService {
         _ target: MCPResidentTarget, targetWindow: WindowState,
         agentModeVM: AgentModeViewModel, metadata: RequestMetadata
     ) async throws -> (AgentRunMCPSnapshot, Value) {
-        let hasLinks = await agentModeVM.agentSessionLinkHasActiveOutboundLink(target.endpoint)
+        let hasLinks = await agentModeVM.linkExecutionRuntime.agentSessionLinkHasActiveOutboundLink(target.endpoint)
         try await authorizeControlTargets(
             operation: .runPoll, sessionIDs: [target.endpoint.sessionID], reference: nil,
             targetWindow: targetWindow, agentModeVM: agentModeVM, metadata: metadata

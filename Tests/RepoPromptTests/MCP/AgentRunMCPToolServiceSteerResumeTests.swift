@@ -49,7 +49,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         }
         try await resumed.value
         XCTAssertTrue(deliveredText?.contains("RepoPrompt delegation decision: granted") == true)
-        XCTAssertEqual(viewModel.retrieveDraftText(for: session.tabID), "Keep my draft")
+        XCTAssertEqual(viewModel.draftRuntime.text(for: session.tabID), "Keep my draft")
         XCTAssertNil(session.mcpControlContext)
     }
 
@@ -104,7 +104,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         try await AsyncTestWait.waitUntil("settlement releases the queued decision") { deliveredText != nil }
         try await resumed.value
         XCTAssertTrue(deliveredText?.contains("RepoPrompt delegation decision: granted") == true)
-        XCTAssertEqual(viewModel.retrieveDraftText(for: session.tabID), "Keep my draft")
+        XCTAssertEqual(viewModel.draftRuntime.text(for: session.tabID), "Keep my draft")
         XCTAssertNil(session.mcpControlContext)
     }
 
@@ -211,8 +211,8 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         let createdLaneTab = await window.promptManager.createBackgroundComposeTab(strategy: .blank)
         let laneTab = try XCTUnwrap(createdLaneTab)
         let lane = try await makeWorkspaceOwnedSession(in: window, sessionID: UUID(), tabID: laneTab.id)
-        let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: session.tabID))
-        let laneEndpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: lane.tabID))
+        let endpoint = try XCTUnwrap(viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: session.tabID))
+        let laneEndpoint = try XCTUnwrap(viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: lane.tabID))
         let bridge = AgentSessionLinkRuntimeBridge.shared
         guard case .added = await bridge.addMonitorLink(observerEndpoint: endpoint, targetEndpoint: laneEndpoint) else {
             return XCTFail("real oversight grant was not admitted")
@@ -236,7 +236,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         XCTAssertTrue(response.text?.contains(frame) == true)
         XCTAssertEqual(session.items.last { $0.kind == .user }?.text, frame)
         XCTAssertNil(session.items.last { $0.kind == .user }?.crossSessionAttribution)
-        XCTAssertEqual(viewModel.retrieveDraftText(for: session.tabID), "local draft")
+        XCTAssertEqual(viewModel.draftRuntime.text(for: session.tabID), "local draft")
         XCTAssertNil(session.mcpControlContext)
         XCTAssertFalse(session.isMCPOriginated)
         XCTAssertNil(value.objectValue?["overseer"], "rich state is poll-only")
@@ -653,7 +653,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         XCTAssertTrue(session.claudeSupersedingProtectedTurnIDs.isEmpty)
         XCTAssertEqual(session.composerSubmissionToken, composerToken)
         XCTAssertFalse(session.isComposerSubmissionInFlight)
-        XCTAssertEqual(viewModel.retrieveDraftText(for: session.tabID), "local draft")
+        XCTAssertEqual(viewModel.draftRuntime.text(for: session.tabID), "local draft")
         XCTAssertTrue(viewModel.interviewFirst)
         XCTAssertEqual(session.mcpControlActivationGeneration, controlGeneration)
         XCTAssertNil(session.mcpControlContext)
@@ -1448,8 +1448,8 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         let createdLaneTab = await window.promptManager.createBackgroundComposeTab(strategy: .blank)
         let laneTab = try XCTUnwrap(createdLaneTab)
         let lane = try await makeWorkspaceOwnedSession(in: window, sessionID: UUID(), tabID: laneTab.id)
-        let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: session.tabID))
-        let laneEndpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: lane.tabID))
+        let endpoint = try XCTUnwrap(viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: session.tabID))
+        let laneEndpoint = try XCTUnwrap(viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: lane.tabID))
         let bridge = AgentSessionLinkRuntimeBridge.shared
         viewModel.test_afterMCPControlRegistration = { _ in
             guard case .added = await bridge.addMonitorLink(observerEndpoint: endpoint, targetEndpoint: laneEndpoint) else {
@@ -1476,7 +1476,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         let viewModel = window.agentModeViewModel
         let sessionID = UUID()
         let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
-        let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: session.tabID))
+        let endpoint = try XCTUnwrap(viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: session.tabID))
         let hold = viewModel.linkExecutionRuntime.agentSessionLinkWithholdPromptInventory(for: endpoint)
         do {
             _ = try await viewModel.mcpActivateControlContext(forTabID: session.tabID, sessionID: sessionID, originatingConnectionID: nil)
@@ -1522,7 +1522,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
                 await MainActor.run { !session.autoEditEnabled }
             }
             let previousPermission = session.permissionProfile
-            let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: session.tabID))
+            let endpoint = try XCTUnwrap(viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: session.tabID))
             var hold: UInt64?
             var setupAwaitCount = 0
             var installedContext: AgentModeViewModel.AgentMCPControlContext?

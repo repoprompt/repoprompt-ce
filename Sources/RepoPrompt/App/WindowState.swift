@@ -429,7 +429,7 @@ class WindowState: ObservableObject {
         // Role facts count only from the runtime currently owning this workspace.
         let isOverseer = selectedTab.map { tab in
             agentModeViewModel.currentPaneOwner?.workspaceID == workspaceID
-                && agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: tab.id)?.workspaceID == workspaceID
+                && agentModeViewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tab.id)?.workspaceID == workspaceID
                 && agentModeViewModel.agentSessionLinkIsOverseer(tabID: tab.id)
         } ?? false
         return CoherentWindowTitlePresentation(

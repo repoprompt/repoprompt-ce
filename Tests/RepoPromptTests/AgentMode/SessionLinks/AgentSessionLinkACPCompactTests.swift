@@ -501,7 +501,7 @@ final class AgentSessionLinkACPCompactRunnerTests: XCTestCase {
         )
         XCTAssertEqual(
             AgentSessionLinkDeliveryReadiness.evaluate(
-                snapshot: AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
+                snapshot: AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
                     session: fixture.session,
                     endpointMatchesGrant: true,
                     isClosing: false
@@ -1112,7 +1112,7 @@ final class AgentSessionLinkACPBackgroundCompactionSettleTests: XCTestCase {
 
     private func admission(_ session: AgentModeViewModel.TabSession) -> AgentSessionLinkDeliveryReadiness.Decision {
         AgentSessionLinkDeliveryReadiness.evaluate(
-            snapshot: AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
+            snapshot: AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
                 session: session,
                 endpointMatchesGrant: true,
                 isClosing: false

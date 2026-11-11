@@ -10,7 +10,7 @@ extension AgentModeViewModel {
     ) -> AgentSelfContextSnapshot? {
         guard let session = origin.matchingSession(
             endpoint: endpoint, lookup: { sessions[$0] },
-            observerEndpoint: { agentSessionLinkObserverEndpoint(tabID: $0) }
+            observerEndpoint: { linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: $0) }
         )
         else { return nil }
         return AgentSelfContextSnapshot(
@@ -28,7 +28,7 @@ extension AgentModeViewModel {
         session: TabSession,
         requestID: UUID
     ) -> AgentSessionLinkDeliveryReadiness.Snapshot {
-        var snapshot = agentSessionLinkDeliveryReadinessSnapshot(
+        var snapshot = AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
             session: session,
             endpointMatchesGrant: true,
             isClosing: false,
@@ -136,7 +136,7 @@ extension AgentModeViewModel {
         session: TabSession
     ) -> Bool {
         guard sessions[owner.tabID] === session,
-              let endpoint = agentSessionLinkObserverEndpoint(tabID: owner.tabID)
+              let endpoint = linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: owner.tabID)
         else { return false }
         return endpoint.windowID == owner.windowID
             && endpoint.workspaceID == owner.workspaceID
@@ -183,7 +183,7 @@ extension AgentModeViewModel {
               attempt.phase == .scheduled || attempt.phase == .awaitingSettlement,
               attempt.physicalOutcome == .notAttempted,
               attempt.periodicProducerDispatchID == nil, attempt.periodicProducerTask == nil,
-              agentSessionLinkObserverEndpoint(tabID: session.tabID) == attempt.observerEndpoint,
+              linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: session.tabID) == attempt.observerEndpoint,
               agentSessionLinkPromptClaimStore.pendingClaim(
                   dispatchID: .autoWake(wakeID: attempt.wakeID),
                   observerSessionID: attempt.observerEndpoint.sessionID
@@ -238,7 +238,7 @@ extension AgentModeViewModel {
             guard let self, selfCompactClaimIsReady(claim, session: session, stillAdmissible: stillAdmissible),
                   workspaceManager?.activeWorkspace?.id == owner.workspaceID
             else { return false }
-            var snapshot = Self.agentSessionLinkDeliveryReadinessSnapshot(
+            var snapshot = AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
                 session: session,
                 endpointMatchesGrant: agentSelfCompactOwnerIsCurrent(owner, session: session),
                 isClosing: false,

@@ -1396,7 +1396,7 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
             (
                 viewModel.agentSessionLinkIsOverseer(tabID: observerTab.id),
                 viewModel.currentPaneOwner?.workspaceID,
-                viewModel.agentSessionLinkObserverEndpoint(tabID: observerTab.id)?.workspaceID
+                viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: observerTab.id)?.workspaceID
             )
         }
 

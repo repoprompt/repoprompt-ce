@@ -305,7 +305,7 @@ enum AgentSessionCarrierResolver {
                         if let liveID = vm.sessions[tab.id]?.activeAgentSessionID { claims.insert(liveID) }
                     } else {
                         effectiveID = tab.activeAgentSessionID
-                            ?? (capture.hasCurrentOwner ? vm.preferredSidebarEntry(for: tab.id, tabName: tab.name)?.id : nil)
+                            ?? (capture.hasCurrentOwner ? AgentModeSidebarSessionBuilder.preferredSidebarEntry(for: tab.id, tabName: tab.name, entries: vm.sessionIndexStore.ownerValidatedEntries(forTabID: tab.id))?.id : nil)
                     }
                     if let effectiveID { claims.insert(effectiveID) }
                 } else {

@@ -78,10 +78,10 @@ final class AgentRepromptSessionLinkIsolationTests: XCTestCase {
         let fixture = try await AgentRepromptTestFixture()
         defer { fixture.cleanUp() }
         let claim = try fixture.claim(text: "Local draft")
-        let held = AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(session: fixture.session, endpointMatchesGrant: true, isClosing: false)
+        let held = AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(session: fixture.session, endpointMatchesGrant: true, isClosing: false)
         XCTAssertTrue(held.isComposerSubmissionInFlight)
         fixture.viewModel.releaseComposerSubmitClaim(claim)
-        let released = AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(session: fixture.session, endpointMatchesGrant: true, isClosing: false)
+        let released = AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(session: fixture.session, endpointMatchesGrant: true, isClosing: false)
         XCTAssertFalse(released.isComposerSubmissionInFlight)
     }
 }

@@ -900,7 +900,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         let viewModel = window.agentModeViewModel
         // Full incarnation match, not `(tabID, sessionID)`: an in-place rebind keeps both while
         // advancing the binding generations.
-        guard viewModel.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint else {
+        guard viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint else {
             return nil
         }
         return viewModel

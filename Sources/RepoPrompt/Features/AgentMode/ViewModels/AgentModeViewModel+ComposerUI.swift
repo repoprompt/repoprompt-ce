@@ -255,7 +255,7 @@ extension AgentModeViewModel {
             perfRecorder.event("ui.syncAllActiveUIState", tabID: tabID)
         #endif
         syncComposerUIState(tabID: tabID)
-        syncStatusPillsUIState()
+        ui.statusPills.update(makeStatusPillsSnapshot())
         syncRuntimeMetricsUIState()
         // Sidebar revision should publish only on sidebar-relevant changes (session
         // list, sort, search, visible count). `syncSidebarUIState()` still republishes
@@ -287,7 +287,7 @@ extension AgentModeViewModel {
             syncComposerUIState(tabID: tabID)
         }
         if invalidation.contains(.statusPills) {
-            syncStatusPillsUIState()
+            ui.statusPills.update(makeStatusPillsSnapshot())
         }
         if invalidation.contains(.runtimeMetrics) {
             syncRuntimeMetricsUIState()

@@ -70,7 +70,7 @@ enum AgentSessionLinkEndpointTestSupport {
         line: UInt = #line
     ) throws -> DomainAgentSessionLinkEndpointIdentity {
         try XCTUnwrap(
-            viewModel.agentSessionLinkObserverEndpoint(tabID: tabID),
+            viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID),
             "expected a resolvable oversight endpoint",
             file: file,
             line: line

@@ -71,7 +71,7 @@ extension AgentModeViewModel {
         if session.pendingSelfWorktreeRelocation != nil {
             return .hard(SendBlocker.changingExecutionLocation.rawValue)
         }
-        var snapshot = Self.agentSessionLinkDeliveryReadinessSnapshot(
+        var snapshot = AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
             session: session, endpointMatchesGrant: sessions[session.tabID] === session, isClosing: false,
             ignoresComposerSubmissionInFlight: ownsComposerClaim
         )
@@ -1040,7 +1040,7 @@ extension AgentModeViewModel {
             if let index = providerSwitchPreview?.choices.firstIndex(where: { $0.mode == .summary }) {
                 providerSwitchPreview?.choices[index].unavailable = AgentSessionLinkSendFailure.targetNotIdle.message
             }
-        } else { agentSessionLinkClearWaitingOnAfterAcceptedTurn(session) }
+        } else { session.clearAgentSessionLinkWaitingOnAfterAcceptedTurn() }
     }
 
     func providerSwitchGenerationSettled(_ session: TabSession) {

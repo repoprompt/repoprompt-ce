@@ -286,13 +286,13 @@ final class AgentSessionLinkAutonomousPipelineTests: XCTestCase {
         preparing.phase = .preparingDispatch
         node.session.oversight.pendingAutoWake = preparing
         XCTAssertTrue(
-            node.viewModel.agentSessionLinkAcquirePhysicalDispatch(
+            node.viewModel.linkExecutionRuntime.agentSessionLinkAcquirePhysicalDispatch(
                 for: node.session,
                 dispatchID: claim.dispatchID
             ),
             "the idle follow-up must cross the shared immutable-claim acquisition fence"
         )
-        node.viewModel.acceptAgentSessionLinkPromptClaim(claim)
+        node.viewModel.linkExecutionRuntime.acceptAgentSessionLinkPromptClaim(claim)
         XCTAssertNil(node.session.oversight.pendingAutoWake, "an accepted wake settles")
     }
 
@@ -855,7 +855,7 @@ final class LiveWindowEndpointHost: AgentSessionLinkEndpointHost {
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> AgentModeViewModel? {
         guard let viewModel = viewModelsByWindowID[endpoint.windowID],
-              viewModel.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint
+              viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint
         else {
             return nil
         }

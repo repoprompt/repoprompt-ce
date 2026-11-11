@@ -185,7 +185,7 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         XCTAssertEqual(fixture.session.selectedWorkflow, workflow, file: file, line: line)
         XCTAssertTrue(fixture.viewModel.interviewFirst, file: file, line: line)
         XCTAssertEqual(
-            fixture.viewModel.retrieveDraftText(for: fixture.tabID),
+            fixture.viewModel.draftRuntime.text(for: fixture.tabID),
             "the user's own half-typed draft",
             "an overseer's words must never enter or replace the target user's composer",
             file: file,

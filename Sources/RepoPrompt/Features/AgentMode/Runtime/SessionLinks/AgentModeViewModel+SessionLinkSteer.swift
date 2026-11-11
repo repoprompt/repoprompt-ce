@@ -28,7 +28,7 @@ extension AgentModeViewModel {
         let pendingPromptExists = session.pendingApplyEditsReview != nil
             || mcpRuntime.mcpPendingInteraction(for: session).map { $0.kind != .instruction } == true
         return AgentSessionLinkSteerAdmission.evaluate(
-            readiness: Self.agentSessionLinkDeliveryReadinessSnapshot(
+            readiness: AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
                 session: session,
                 endpointMatchesGrant: liveness.targetEndpointIsLive,
                 isClosing: liveness.targetWindowIsClosing

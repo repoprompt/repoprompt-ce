@@ -11,7 +11,7 @@ extension AgentModeViewModel {
             if let lastUserMessageAt = session.lastUserMessageAt {
                 return lastUserMessageAt
             }
-            if let computed = computeLastUserMessageDate(in: session.items) {
+            if let computed = AgentTranscriptIO.lastUserInteractionDate(in: session.items) {
                 return computed
             }
         }
@@ -93,14 +93,6 @@ extension AgentModeViewModel {
         )
         // Archived tabs keep their pin and group, so `is:pinned` / `group:` match them too.
         .withFacets(isPinned: stashedTab.tab.isPinned, group: stashedTab.tab.sidebarGroup)
-    }
-
-    func preferredSidebarEntry(for tabID: UUID, tabName: String? = nil) -> AgentSessionIndexEntry? {
-        AgentModeSidebarSessionBuilder.preferredSidebarEntry(
-            for: tabID,
-            tabName: tabName,
-            entries: sessionIndexStore.ownerValidatedEntries(forTabID: tabID)
-        )
     }
 
     /// Matches active-sidebar fallback identity without visiting unrelated tabs or metadata.
@@ -1474,29 +1466,18 @@ extension AgentModeViewModel {
         }
         return nil
     }
-
-    func computeLastUserMessageDate(in items: [AgentChatItem]) -> Date? {
-        AgentTranscriptIO.lastUserInteractionDate(in: items)
-    }
 }
 
 // MARK: - Worktree visual indicators
 
 @MainActor
 extension AgentModeViewModel {
-    /// Worktree visual indicators for the Agent session bound to `tabID`, in
-    /// binding order. Reads live-session bindings when available, otherwise the
-    /// persisted session index entry so restored sessions still resolve.
-    func worktreeIndicators(forTabID tabID: UUID) -> [AgentWorktreeIndicator] {
-        AgentWorktreeIndicatorResolver.indicators(for: worktreeBindingSummaries(forTabID: tabID))
-    }
-
     /// Worktree indicators for `tabID` keyed by logical workspace-root path.
     /// Both the raw and standardized path forms are inserted so callers can
     /// match a workspace root row regardless of how its path was recorded.
     func worktreeIndicatorsByLogicalRootPath(forTabID tabID: UUID) -> [String: AgentWorktreeIndicator] {
         var map: [String: AgentWorktreeIndicator] = [:]
-        for indicator in worktreeIndicators(forTabID: tabID) {
+        for indicator in AgentWorktreeIndicatorResolver.indicators(for: worktreeBindingSummaries(forTabID: tabID)) {
             let raw = indicator.logicalRootPath.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !raw.isEmpty else { continue }
             map[raw] = indicator
@@ -1505,7 +1486,8 @@ extension AgentModeViewModel {
         return map
     }
 
-    private func worktreeBindingSummaries(forTabID tabID: UUID) -> [AgentSessionWorktreeBindingSummary] {
+    /// Reads the exact live binding or its owner-validated persisted fallback, in binding order.
+    func worktreeBindingSummaries(forTabID tabID: UUID) -> [AgentSessionWorktreeBindingSummary] {
         guard let sessionID = boundSessionID(for: tabID) else { return [] }
         if let liveSession = sessions[tabID],
            liveSession.activeAgentSessionID == sessionID,
@@ -1513,7 +1495,7 @@ extension AgentModeViewModel {
         {
             return liveSession.worktreeBindings.worktreeBindingSummaries
         }
-        guard let entry = preferredSidebarEntry(for: tabID), entry.id == sessionID else { return [] }
+        guard let entry = AgentModeSidebarSessionBuilder.preferredSidebarEntry(for: tabID, tabName: nil, entries: sessionIndexStore.ownerValidatedEntries(forTabID: tabID)), entry.id == sessionID else { return [] }
         return entry.worktreeBindingSummaries
     }
 

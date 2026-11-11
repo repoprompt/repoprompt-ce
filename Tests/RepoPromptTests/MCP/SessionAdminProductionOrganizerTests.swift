@@ -2075,7 +2075,7 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
                 },
                 requireTargetWindow: { self.window },
                 resolveObserverEndpoint: { _, _ in
-                    self.window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: self.callerTab.id)
+                    self.window.agentModeViewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: self.callerTab.id)
                 },
                 scopes: { self.scopes }, administration: { self.frontDoor }, isToolEnabled: { true }
             )

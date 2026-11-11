@@ -797,7 +797,7 @@ extension AgentComposerSubmissionAttemptTests {
         // Claude keeps its manual effort separately from the Codex-oriented selection field.
         session.selectedReasoningEffortRaw = nil
         session.selectedClaudeEffortRaw = ClaudeCodeEffortLevel.high.rawValue
-        viewModel.syncStatusPillsUIState()
+        viewModel.ui.statusPills.update(viewModel.makeStatusPillsSnapshot())
         XCTAssertEqual(
             viewModel.ui.statusPills.snapshot.modelRouter.routedModelDisplayName,
             "\(viewModel.selectedModelDisplayName) High"
@@ -820,7 +820,7 @@ extension AgentComposerSubmissionAttemptTests {
             acceptedModelRaw: session.selectedModelRaw,
             acceptedEffortRaw: session.selectedReasoningEffortRaw
         ))
-        viewModel.syncStatusPillsUIState()
+        viewModel.ui.statusPills.update(viewModel.makeStatusPillsSnapshot())
         XCTAssertNil(viewModel.ui.statusPills.snapshot.modelRouter.routedModelDisplayName)
     }
 
@@ -845,7 +845,7 @@ extension AgentComposerSubmissionAttemptTests {
             acceptedModelRaw: session.selectedModelRaw,
             acceptedEffortRaw: "high"
         ))
-        viewModel.syncStatusPillsUIState()
+        viewModel.ui.statusPills.update(viewModel.makeStatusPillsSnapshot())
         XCTAssertEqual(
             viewModel.ui.statusPills.snapshot.modelRouter.routedModelDisplayName,
             "\(viewModel.selectedModelDisplayName) High"
@@ -2284,7 +2284,7 @@ final class AutoWorkflowSubmissionTests: XCTestCase {
         let selection = await choosing.value
         XCTAssertNil(selection)
         XCTAssertFalse(fixture.viewModel.composerSubmitRuntime.isCurrent(fixture.claim))
-        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.session.tabID), Self.text)
+        XCTAssertEqual(fixture.viewModel.draftRuntime.text(for: fixture.session.tabID), Self.text)
         XCTAssertTrue(fixture.session.items.isEmpty)
         await fixture.backend.release()
         XCTAssertTrue(fixture.viewModel.autoWorkflowJudgments.isEmpty)

@@ -29,7 +29,7 @@ final class AgentRepromptRoutingIntegrationTests: XCTestCase {
             return result
         }
         try await AsyncTestWait.waitUntil("routing suspended", timeout: 5) { await !fixture.backend.requests.isEmpty }
-        XCTAssertEqual(vm.retrieveDraftText(for: tabID), "")
+        XCTAssertEqual(vm.draftRuntime.text(for: tabID), "")
         XCTAssertEqual(vm.ui.composer.pendingSubmissions[attempt.id]?.text, "Send this task")
         XCTAssertFalse(fixture.session.items.contains { $0.kind == .user })
         vm.storeDraftText(for: tabID, "Next draft")
@@ -38,7 +38,7 @@ final class AgentRepromptRoutingIntegrationTests: XCTestCase {
         XCTAssertEqual(result, .submitted)
         XCTAssertTrue(vm.ui.composer.pendingSubmissions.isEmpty)
         XCTAssertEqual(fixture.session.items.count(where: { $0.kind == .user }), 1)
-        XCTAssertEqual(vm.retrieveDraftText(for: tabID), "Next draft")
+        XCTAssertEqual(vm.draftRuntime.text(for: tabID), "Next draft")
     }
 
     func testUsagePeerReconciliationDoesNotInvalidatePreparedSpeculation() async throws {

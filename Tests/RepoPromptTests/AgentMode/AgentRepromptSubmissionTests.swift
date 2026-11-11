@@ -66,7 +66,7 @@ final class AgentRepromptSubmissionTests: XCTestCase {
         guard case let .claimed(claim) = vm.claimComposerSubmitForImmediatePresentation(attempt) else {
             return XCTFail("Expected admitted local send")
         }
-        XCTAssertEqual(vm.retrieveDraftText(for: tabID), "", "Clear synchronously, before routing or session preparation")
+        XCTAssertEqual(vm.draftRuntime.text(for: tabID), "", "Clear synchronously, before routing or session preparation")
         XCTAssertEqual(vm.ui.composer.pendingSubmissions[attempt.id]?.text, "Ready to send")
         XCTAssertNil(vm.repromptUIStore.recoveries[tabID], "Recovery moves into the pending send, not a stale composer banner")
         XCTAssertEqual(vm.ui.composer.pendingSubmissions[attempt.id]?.repromptDraft.recovery?.originalDraft, "Original typed request")
@@ -75,11 +75,11 @@ final class AgentRepromptSubmissionTests: XCTestCase {
         vm.releaseComposerSubmitClaim(claim)
         let result = await vm.executePresentedComposerSubmitAttempt(text: "Ready to send", claim: claim)
         guard case .blocked = result else { return XCTFail("Released claim must reject") }
-        XCTAssertEqual(vm.retrieveDraftText(for: tabID), "Ready to send\nNew typing")
+        XCTAssertEqual(vm.draftRuntime.text(for: tabID), "Ready to send\nNew typing")
         XCTAssertTrue(vm.ui.composer.pendingSubmissions.isEmpty)
         XCTAssertEqual(vm.repromptUIStore.recoveries[tabID]?.originalDraft, "Original typed request")
         vm.finishPresentedComposerSubmitAttempt(claim, result: result)
-        XCTAssertEqual(vm.retrieveDraftText(for: tabID), "Ready to send\nNew typing", "Recovery must be exactly once")
+        XCTAssertEqual(vm.draftRuntime.text(for: tabID), "Ready to send\nNew typing", "Recovery must be exactly once")
     }
 
     func testCancelledPreparedSendRetainsOriginalAndCleansTransferredWorkBeforeExecution() async throws {
@@ -103,7 +103,7 @@ final class AgentRepromptSubmissionTests: XCTestCase {
         XCTAssertNil(vm.repromptAudits[attempt.id])
         XCTAssertNil(vm.repromptSpeculations[attempt.id])
         XCTAssertEqual(vm.repromptUIStore.recoveries[tabID]?.originalDraft, "Original typed request")
-        XCTAssertEqual(vm.repromptUIStore.recoveries[tabID]?.draftAtInvalidation, vm.retrieveDraftText(for: tabID))
+        XCTAssertEqual(vm.repromptUIStore.recoveries[tabID]?.draftAtInvalidation, vm.draftRuntime.text(for: tabID))
         XCTAssertTrue(vm.repromptUIStore.hasPreparedDraft(tabID: tabID, text: rewritten))
         vm.repromptUIStore.recover(tabID: tabID, text: "New rewrite", originalDraft: "New original", reason: "new", currentDraft: "New draft")
         let newer = vm.repromptUIStore.recoveries[tabID]
@@ -127,7 +127,7 @@ final class AgentRepromptSubmissionTests: XCTestCase {
         await vm.cancelPresentedComposerSubmission(id: attempt.id)
         XCTAssertFalse(vm.composerSubmitRuntime.isCurrent(claim))
         XCTAssertFalse(vm.ui.composer.hasPendingSubmission(tabID: tabID))
-        XCTAssertEqual(vm.retrieveDraftText(for: tabID), "Pending message\nNext draft")
+        XCTAssertEqual(vm.draftRuntime.text(for: tabID), "Pending message\nNext draft")
         // Loading the restored text acknowledges its ledger fragment, as the real editor does
         // before retrying that visible draft. Without this, the ledger deliberately retains it.
         let restoredSnapshot = vm.draftRuntime.loadSnapshot(tabID: tabID)
@@ -141,7 +141,7 @@ final class AgentRepromptSubmissionTests: XCTestCase {
         let result = await vm.executePresentedComposerSubmitAttempt(text: "Pending message", claim: claim)
         guard case .blocked = result else { return XCTFail("Cancelled claim must not dispatch") }
         XCTAssertTrue(vm.composerSubmitRuntime.isCurrent(retryClaim), "Late cleanup must not release the retry's claim")
-        XCTAssertEqual(vm.retrieveDraftText(for: tabID), "")
+        XCTAssertEqual(vm.draftRuntime.text(for: tabID), "")
         XCTAssertEqual(vm.ui.composer.pendingSubmissions[retryAttempt.id]?.text, "Pending message\nNext draft")
         XCTAssertTrue(fixture.session.items.isEmpty)
         fixture.store.setAutoEffortEnabled(false)
@@ -178,7 +178,7 @@ final class AgentRepromptSubmissionTests: XCTestCase {
         // cannot itself acknowledge a producer that might still be suspended.
         vm.releaseComposerSubmitClaim(claim)
         vm.finishPresentedComposerSubmitAttempt(claim, result: .submitted)
-        XCTAssertEqual(vm.retrieveDraftText(for: tabID), "Next message")
+        XCTAssertEqual(vm.draftRuntime.text(for: tabID), "Next message")
         XCTAssertNil(fixture.session.activeComposerSubmitAttempt)
         XCTAssertTrue(vm.ui.composer.pendingSubmissions.isEmpty)
     }
@@ -611,9 +611,9 @@ final class AgentRepromptSubmissionTests: XCTestCase {
         guard case .claimed = vm.claimComposerSubmitForImmediatePresentation(attempt) else {
             return XCTFail("Expected an admitted original send")
         }
-        XCTAssertTrue(vm.retrieveDraftText(for: tabID).isEmpty)
+        XCTAssertTrue(vm.draftRuntime.text(for: tabID).isEmpty)
         await vm.cancelPresentedComposerSubmission(id: attempt.id)
-        XCTAssertEqual(vm.retrieveDraftText(for: tabID), "Original")
+        XCTAssertEqual(vm.draftRuntime.text(for: tabID), "Original")
         XCTAssertEqual(vm.repromptUIStore.recoveries[tabID]?.text, "Partial rewrite")
         XCTAssertTrue(vm.repromptUIStore.hasCancelledDraft(tabID: tabID, text: "Original"))
         let retryTarget = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: fixture.session))
@@ -795,13 +795,13 @@ final class AgentRepromptSubmissionTests: XCTestCase {
         XCTAssertFalse(vm.repromptUIStore.hasPreparedDraft(tabID: other, text: "Unrelated"))
         XCTAssertFalse(vm.repromptUIStore.allowsAttachmentMutation(tabID: tabID, currentTabID: tabID), "Its attachments stay locked while it runs")
         XCTAssertTrue(vm.repromptUIStore.allowsAttachmentMutation(tabID: other, currentTabID: other))
-        vm.syncStatusPillsUIState()
+        vm.ui.statusPills.update(vm.makeStatusPillsSnapshot())
         XCTAssertFalse(vm.ui.statusPills.snapshot.reprompt.isPreparing, "The other session's pill must not spin")
 
         await gate.release()
         try await AsyncTestWait.waitUntil("background completion", timeout: 5) { operation.phase == .completed }
         XCTAssertEqual(fixture.session.draftText, "Partial rewrite", "The rewrite streams into its own session")
-        XCTAssertEqual(vm.retrieveDraftText(for: other), "")
+        XCTAssertEqual(vm.draftRuntime.text(for: other), "")
 
         vm.test_setCurrentTabIDOverride(tabID)
         XCTAssertTrue(vm.repromptOperation === operation)

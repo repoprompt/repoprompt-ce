@@ -252,7 +252,7 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             XCTAssertNotNil(viewModel.linkExecutionRuntime.agentSessionLinkPromptContext(for: session), "prompt gate")
             XCTAssertTrue(
                 AgentSessionLinkExecutionRuntime.agentSessionLinkPeriodicWakeSessionIsIdle(session),
-                "idle: \(AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(session: session, endpointMatchesGrant: true, isClosing: false))"
+                "idle: \(AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(session: session, endpointMatchesGrant: true, isClosing: false))"
             )
             XCTAssertTrue(viewModel.linkExecutionRuntime.agentSessionLinkPeriodicWakeIsEligible(session, endpoint: observer.endpoint), "periodic eligibility")
             viewModel.linkExecutionRuntime.agentSessionLinkReconcilePeriodicWake(for: observer.endpoint)
@@ -276,7 +276,7 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             XCTAssertNotEqual(reserved?.phase, .cancelledBeforeDispatch)
             XCTAssertEqual(reserved?.admissionBasis, .routineStatusOrOverflow)
             if let reserved {
-                viewModel.cancelAgentSessionLinkAutoWake(for: reserved.observerEndpoint, reason: .settingDisabled)
+                viewModel.linkExecutionRuntime.cancelAgentSessionLinkAutoWake(for: reserved.observerEndpoint, reason: .settingDisabled)
             }
         #else
             throw XCTSkip("Requires DEBUG MCP routing fixtures.")

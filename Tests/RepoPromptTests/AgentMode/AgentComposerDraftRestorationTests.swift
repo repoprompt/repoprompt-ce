@@ -32,7 +32,7 @@ final class AgentComposerDraftRestorationTests: XCTestCase {
 
         let finalEvent = try XCTUnwrap(viewModel.draftRestorationEvent)
         let operation = try XCTUnwrap(finalEvent.operation)
-        XCTAssertEqual(viewModel.retrieveDraftText(for: tabID), "C\nB\nD")
+        XCTAssertEqual(viewModel.draftRuntime.text(for: tabID), "C\nB\nD")
         XCTAssertEqual(
             AgentComposerDraftRestorationReducer.apply(
                 operation,
@@ -132,7 +132,7 @@ final class AgentComposerDraftRestorationTests: XCTestCase {
             editorText,
             acknowledgingThrough: operation.fragments.last?.sequence ?? 0
         )
-        XCTAssertEqual(viewModel.retrieveDraftText(for: tabID), "B\nA\nD")
+        XCTAssertEqual(viewModel.draftRuntime.text(for: tabID), "B\nA\nD")
         XCTAssertTrue(viewModel.draftRestorationLedger.tabs[tabID]?.pendingFragments.isEmpty == true)
         XCTAssertEqual(viewModel.draftRestorationLedger.tabs[otherTabID]?.pendingFragments.map(\.text), ["X"])
     }
@@ -145,7 +145,7 @@ final class AgentComposerDraftRestorationTests: XCTestCase {
 
         // The old editor value is stored as the tab changes before it sees A.
         viewModel.storeDraftText(for: tabID, "D", acknowledgingThrough: 0)
-        XCTAssertEqual(viewModel.retrieveDraftText(for: tabID), "A\nD")
+        XCTAssertEqual(viewModel.draftRuntime.text(for: tabID), "A\nD")
         let snapshot = viewModel.draftRuntime.loadSnapshot(tabID: tabID)
         XCTAssertEqual(snapshot.text, "A\nD")
         XCTAssertTrue(viewModel.draftRestorationLedger.tabs[tabID]?.pendingFragments.isEmpty == true)
@@ -185,7 +185,7 @@ final class AgentComposerDraftRestorationTests: XCTestCase {
             editorText,
             acknowledgingThrough: operation.fragments.last?.sequence ?? 0
         )
-        XCTAssertEqual(viewModel.retrieveDraftText(for: tabID), "C\nB")
+        XCTAssertEqual(viewModel.draftRuntime.text(for: tabID), "C\nB")
         XCTAssertTrue(viewModel.draftRestorationLedger.tabs[tabID]?.pendingFragments.isEmpty == true)
     }
 
@@ -303,7 +303,7 @@ final class AgentComposerDraftRestorationTests: XCTestCase {
         let snapshot = host.draftRuntime.loadSnapshot(tabID: tab.id)
         XCTAssertEqual(snapshot.restorationSequence, 1)
         host.storeDraftText(for: tab.id, "edited", acknowledgingThrough: snapshot.restorationSequence)
-        XCTAssertEqual(host.retrieveDraftText(for: tab.id), "edited")
+        XCTAssertEqual(host.draftRuntime.text(for: tab.id), "edited")
         XCTAssertTrue(try XCTUnwrap(host.draftRestorationLedger.tabs[tab.id]).pendingFragments.isEmpty)
     }
 

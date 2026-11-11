@@ -1344,7 +1344,7 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
 
         // A completed payload retains the execution-location blocker. Incomplete creation and
         // failed restoration must additionally remain blocked when that presentation flag is off.
-        var readiness = AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
+        var readiness = AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
             session: session, endpointMatchesGrant: true, isClosing: false
         )
         if session.qualifiedRestorationReadiness.isAuthoritative {

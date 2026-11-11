@@ -3284,7 +3284,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                             mcpStrictMode: runtime.mcpStrictMode
                         ), for: session)
                         session.runState = .running
-                        XCTAssertTrue(vm.agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: claim.dispatchID))
+                        XCTAssertTrue(vm.linkExecutionRuntime.agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: claim.dispatchID))
                         let intent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: owner, runID: XCTUnwrap(session.runID))
                         let outcome = await vm.test_claudeCoordinator.sendClaudeNativeMessage(session: session, text: "", attachments: [], intent: intent, allowsCatalogRouteControllerRecovery: false)
                         guard outcome == .sent else {
@@ -3452,13 +3452,13 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             let vm = window.agentModeViewModel
             let (owner, dispatch, original) = try w2RoutineClaim(window: window, session: session, endpoint: endpoint, localRead: false)
             defer { session.oversight.pendingAutoWake = nil }
-            let proof = await vm.agentSessionLinkProveProviderInput(for: session, claim: original)
+            let proof = await vm.linkExecutionRuntime.agentSessionLinkProveProviderInput(for: session, claim: original)
             XCTAssertFalse(session.quietLedger.hasOrdinaryOccurrence(owner: owner))
             let previous = try XCTUnwrap(vm.agentSessionLinkPassiveNoticesBySessionID[endpoint.sessionID])
             let inventory = try XCTUnwrap(vm.agentSessionLinkPromptInventoryBySessionID[endpoint.sessionID])
             let item = try XCTUnwrap(inventory.inventory.items.first)
             let reference = try XCTUnwrap(item.reference)
-            let targetEndpoint = try XCTUnwrap(vm.agentSessionLinkObserverEndpoint(tabID: target.tabID))
+            let targetEndpoint = try XCTUnwrap(vm.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: target.tabID))
             let attention = AgentSessionLinkPassiveStatusNotices.PendingAttentionRequest(
                 occurrence: .init(queueEpoch: previous.queueEpoch, reference: reference, attentionSequence: 1),
                 targetEndpoint: targetEndpoint, targetSessionID: targetEndpoint.sessionID,
@@ -3470,7 +3470,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 entries: previous.entries, attentionRequests: [attention],
                 unacknowledgedOverflowCount: previous.unacknowledgedOverflowCount, overflowProduced: previous.overflowProduced
             ), to: endpoint)
-            let released = vm.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatch, claim: original, proof: proof)
+            let released = vm.linkExecutionRuntime.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatch, claim: original, proof: proof)
             XCTAssertFalse(released.mustAbortDispatch)
             XCTAssertFalse(try XCTUnwrap(released.claim).routineQuietCheckIn)
             XCTAssertEqual(released.claim?.passive?.receipt.deliveredAttentionOccurrences, [attention.occurrence])
@@ -3494,7 +3494,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             vm.test_agentSessionLinkLocalInputReadProof = { _ in await gate.enterAndWait()
                 return false
             }
-            let proofTask = Task { await vm.agentSessionLinkProveProviderInput(for: session, claim: original) }
+            let proofTask = Task { await vm.linkExecutionRuntime.agentSessionLinkProveProviderInput(for: session, claim: original) }
             var catalogTask: Task<Set<String>, Error>?
             func cleanup() async {
                 gate.release()
@@ -3540,7 +3540,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 }
                 gate.release()
                 let proof = await proofTask.value
-                let released = vm.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatch, claim: original, proof: proof)
+                let released = vm.linkExecutionRuntime.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatch, claim: original, proof: proof)
                 XCTAssertFalse(released.mustAbortDispatch, "Missing optional noop support never blocks ordinary delivery")
                 let capturing = AgentSessionLinkCapturingHeadlessProvider()
                 _ = try await capturing.streamAgentMessage(released.message(AgentMessage(systemPrompt: "fixture", userMessage: "routine")), runID: runID)
@@ -3622,9 +3622,9 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     let start = clock.now
                     let outcome = vm.linkExecutionRuntime.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatch)
                     let claimedAt = clock.now
-                    let proof = await vm.agentSessionLinkProveProviderInput(for: session, claim: outcome.claim)
+                    let proof = await vm.linkExecutionRuntime.agentSessionLinkProveProviderInput(for: session, claim: outcome.claim)
                     let provedAt = clock.now
-                    let released = vm.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatch, claim: outcome.claim, proof: proof)
+                    let released = vm.linkExecutionRuntime.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatch, claim: outcome.claim, proof: proof)
                     let finished = clock.now
                     XCTAssertFalse(released.mustAbortDispatch)
                     XCTAssertEqual(released.claim, original)
@@ -3714,7 +3714,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                       ToolAvailabilityStore.shared.isEnabled(Self.w0fTool().name),
                       sample.hasActiveOutboundLink == true, observer.runID == runID,
                       observer.isCurrentRunAttemptForCurrentBinding(capturedOwner),
-                      window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+                      window.agentModeViewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
                       window.agentModeViewModel.agentSessionLinkRunCatalogProjectionByEndpoint[endpoint]?.projectionRevision == sample.projectionRevision,
                       manager.hasLiveProviderInputConnection(token)
                 else { return nil }
@@ -3756,7 +3756,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 XCTAssertEqual(current.expectedSurface, positive.expectedSurface, label)
                 XCTAssertEqual(current.returnedSurface, positive.returnedSurface, label)
                 XCTAssertTrue(current.isReady, "Quiet support cannot gate ordinary delivery: \(label)")
-                let delivery = await window.agentModeViewModel.qualifyProviderInputRoute(for: observer)
+                let delivery = await window.agentModeViewModel.linkExecutionRuntime.qualifyProviderInputRoute(for: observer)
                 XCTAssertEqual(delivery, .ready(route), "Ordinary route qualification never waits on quiet support")
                 let absentHint = await hint(current, owner: successor)
                 let staleHint = await hint(positive, owner: successor)
