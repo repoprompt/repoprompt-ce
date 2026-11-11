@@ -57,6 +57,8 @@ extension ToolCardContainer where Content == ToolMarkdownExpandedContent {
         subtitle: String?,
         status: ToolCardStatus,
         item: AgentChatItem,
+        headerTrailingView: AnyView? = nil,
+        isExpandable: Bool? = nil,
         isExpanded: Binding<Bool>
     ) {
         self.init(
@@ -67,7 +69,8 @@ extension ToolCardContainer where Content == ToolMarkdownExpandedContent {
             subtitle: subtitle,
             status: status,
             timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            headerTrailingView: headerTrailingView,
+            isExpandable: isExpandable ?? toolResultHasPayload(item),
             isExpanded: isExpanded
         ) {
             ToolMarkdownExpandedContent(item: item)

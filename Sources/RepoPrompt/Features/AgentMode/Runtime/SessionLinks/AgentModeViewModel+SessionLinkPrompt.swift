@@ -71,10 +71,6 @@ struct AgentSessionLinkPromptContext: Equatable {
 extension AgentModeViewModel {
     typealias ProviderInputRouteReadiness = AgentSessionLinkExecutionRuntime.ProviderInputRouteReadiness
     typealias ProviderInputRouteWait = AgentSessionLinkExecutionRuntime.ProviderInputRouteWait
-    static var selfNoopCatalogDefinition: MCP.Tool {
-        AgentSessionLinkExecutionRuntime.selfNoopCatalogDefinition
-    }
-
     func qualifyProviderInputRoute(
         for session: TabSession,
         routeWait: ProviderInputRouteWait? = nil

@@ -2523,7 +2523,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             let route = try XCTUnwrap(observedRoute)
             let observedProjection = await manager.debugRunCatalogProjection(for: run)
             let projection = try XCTUnwrap(observedProjection)
-            let positive = await manager.hasCurrentReturnedTool(AgentModeViewModel.selfNoopCatalogDefinition, routeToken: route, projectionRevision: projection.projectionRevision)
+            let positive = await manager.hasCurrentReturnedTool(AgentSessionLinkExecutionRuntime.selfNoopCatalogDefinition, routeToken: route, projectionRevision: projection.projectionRevision)
             guard positive, projection.routeToken == route,
                   vm.agentSessionLinkRunCatalogProjectionByEndpoint[route.observerEndpoint] == projection,
                   vm.linkExecutionRuntime.selfNoopHintIsCurrent(for: session)
@@ -2776,7 +2776,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 if label == "initial-restoration" {
                     let observed = try await ServerNetworkManager.shared.debugRunCatalogProjection(for: XCTUnwrap(session.runID))
                     let prior = try XCTUnwrap(observed)
-                    let oldSupport = try await ServerNetworkManager.shared.hasCurrentReturnedTool(AgentModeViewModel.selfNoopCatalogDefinition, routeToken: XCTUnwrap(prior.routeToken), projectionRevision: prior.projectionRevision)
+                    let oldSupport = try await ServerNetworkManager.shared.hasCurrentReturnedTool(AgentSessionLinkExecutionRuntime.selfNoopCatalogDefinition, routeToken: XCTUnwrap(prior.routeToken), projectionRevision: prior.projectionRevision)
                     XCTAssertFalse(oldSupport, "An offer predating restored chats and new links must be invalidated")
                 }
                 // Material setup changes invalidate the earlier offer. Obtain one real list after

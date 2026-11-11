@@ -190,48 +190,25 @@ struct AgentPaginatedWorkflowsView: View {
     }
 
     private var paginationControls: some View {
-        HStack(spacing: 8) {
-            Button {
+        agentPaginationControls(
+            count: pages.count,
+            selectedIndex: activePageIndex,
+            previous: {
                 withAnimation(.easeInOut(duration: 0.25)) {
                     selectedPageIndex = (activePageIndex - 1 + pages.count) % pages.count
                 }
-            } label: {
-                Image(systemName: "chevron.left")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 16, height: 16)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-
-            HStack(spacing: 6) {
-                ForEach(Array(pages.indices), id: \.self) { index in
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            selectedPageIndex = index
-                        }
-                    } label: {
-                        Circle()
-                            .fill(index == activePageIndex ? Color.accentColor : Color.secondary.opacity(0.25))
-                            .frame(width: 6, height: 6)
-                    }
-                    .buttonStyle(.plain)
+            },
+            select: { index in
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    selectedPageIndex = index
                 }
-            }
-
-            Button {
+            },
+            next: {
                 withAnimation(.easeInOut(duration: 0.25)) {
                     selectedPageIndex = (activePageIndex + 1) % pages.count
                 }
-            } label: {
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 16, height: 16)
-                    .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-        }
+        )
     }
 
     private func workflowGrid(for items: [AgentEmptyStateWorkflowItem]) -> some View {
@@ -251,6 +228,46 @@ struct AgentPaginatedWorkflowsView: View {
                 }
             }
         }
+    }
+}
+
+@MainActor
+private func agentPaginationControls(
+    count: Int,
+    selectedIndex: Int,
+    previous: @escaping () -> Void,
+    select: @escaping (Int) -> Void,
+    next: @escaping () -> Void
+) -> some View {
+    HStack(spacing: 8) {
+        Button(action: previous) {
+            Image(systemName: "chevron.left")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 16, height: 16)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+
+        HStack(spacing: 6) {
+            ForEach(Array(0 ..< count), id: \.self) { index in
+                Button { select(index) } label: {
+                    Circle()
+                        .fill(index == selectedIndex ? Color.accentColor : Color.secondary.opacity(0.25))
+                        .frame(width: 6, height: 6)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+
+        Button(action: next) {
+            Image(systemName: "chevron.right")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 16, height: 16)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -286,51 +303,28 @@ struct AgentRotatingTipsView: View {
                     Spacer()
 
                     if tips.count > 1 {
-                        HStack(spacing: 8) {
-                            Button {
+                        agentPaginationControls(
+                            count: tips.count,
+                            selectedIndex: activeTipIndex,
+                            previous: {
                                 withAnimation(.easeInOut(duration: 0.25)) {
                                     selectedTipIndex = (activeTipIndex - 1 + tips.count) % tips.count
                                     rotationRestartToken = UUID()
                                 }
-                            } label: {
-                                Image(systemName: "chevron.left")
-                                    .font(.system(size: 9, weight: .semibold))
-                                    .foregroundStyle(.secondary)
-                                    .frame(width: 16, height: 16)
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-
-                            HStack(spacing: 6) {
-                                ForEach(Array(tips.indices), id: \.self) { index in
-                                    Button {
-                                        withAnimation(.easeInOut(duration: 0.2)) {
-                                            selectedTipIndex = index
-                                            rotationRestartToken = UUID()
-                                        }
-                                    } label: {
-                                        Circle()
-                                            .fill(index == activeTipIndex ? Color.accentColor : Color.secondary.opacity(0.25))
-                                            .frame(width: 6, height: 6)
-                                    }
-                                    .buttonStyle(.plain)
+                            },
+                            select: { index in
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    selectedTipIndex = index
+                                    rotationRestartToken = UUID()
                                 }
-                            }
-
-                            Button {
+                            },
+                            next: {
                                 withAnimation(.easeInOut(duration: 0.25)) {
                                     selectedTipIndex = (activeTipIndex + 1) % tips.count
                                     rotationRestartToken = UUID()
                                 }
-                            } label: {
-                                Image(systemName: "chevron.right")
-                                    .font(.system(size: 9, weight: .semibold))
-                                    .foregroundStyle(.secondary)
-                                    .frame(width: 16, height: 16)
-                                    .contentShape(Rectangle())
                             }
-                            .buttonStyle(.plain)
-                        }
+                        )
                     }
                 }
 

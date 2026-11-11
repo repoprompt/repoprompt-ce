@@ -867,7 +867,7 @@ class WindowState: ObservableObject {
         if isPreparedSessionOwner { return }
 
         // Set up additional actions
-        setupSendPromptAction()
+        oracleViewModel.setupSendPromptAction()
         #if DEBUG
             if AppLaunchConfiguration.current.forcesMCPAutoStart {
                 setupMCPAutoStart()
@@ -1025,10 +1025,6 @@ class WindowState: ObservableObject {
         Task { [weak self] in
             await self?.mcpServer.startServer()
         }
-    }
-
-    private func setupSendPromptAction() {
-        oracleViewModel.setupSendPromptAction()
     }
 
     // MARK: - Window Management
