@@ -1107,8 +1107,8 @@ extension AgentModeViewModel {
                 ? max(0, subtreeAttentionCounts[index] - selfAttention)
                 : 0
 
-            displayedRows.append(sidebarRow(
-                rows[index],
+            displayedRows.append(rows[index].withThreadPresentation(
+                depth: rows[index].depth,
                 threadKey: key,
                 hasThreadChildren: hasChildren[index],
                 isThreadCollapsed: shouldCollapse,
@@ -1200,41 +1200,6 @@ extension AgentModeViewModel {
 
     private func sidebarThreadActivityDate(for row: SidebarSession) -> Date {
         row.lastUserMessageAt ?? row.activityDate
-    }
-
-    private func sidebarRow(
-        _ row: SidebarSession,
-        threadKey: AgentSidebarThreadKey,
-        hasThreadChildren: Bool,
-        isThreadCollapsed: Bool,
-        hiddenThreadDescendantCount: Int,
-        hiddenThreadDescendantAttentionCount: Int,
-        threadActivityDate: Date
-    ) -> SidebarSession {
-        SidebarSession(
-            id: row.id,
-            tabID: row.tabID,
-            title: row.title,
-            lastUserMessageAt: row.lastUserMessageAt,
-            activityDate: row.activityDate,
-            isPinned: row.isPinned,
-            sessionID: row.sessionID,
-            canStash: row.canStash,
-            parentSessionID: row.parentSessionID,
-            createdByOverseerSessionID: row.createdByOverseerSessionID,
-            depth: row.depth,
-            isMCPControlled: row.isMCPControlled,
-            worktree: row.worktree,
-            worktreeMergeAttention: row.worktreeMergeAttention,
-            threadKey: threadKey,
-            hasThreadChildren: hasThreadChildren,
-            isThreadCollapsed: isThreadCollapsed,
-            hiddenThreadDescendantCount: hiddenThreadDescendantCount,
-            hiddenThreadDescendantAttentionCount: hiddenThreadDescendantAttentionCount,
-            threadActivityDate: threadActivityDate,
-            restorationDateBucket: row.restorationDateBucket,
-            searchFieldSource: row.searchFieldSource
-        )
     }
 
     func effectiveSidebarVisibleSessionCount(

@@ -144,16 +144,7 @@ extension AgentModeViewModel {
     }
 
     func setRepromptModelRaw(_ raw: String) {
-        let workspaceID = workspaceManager?.activeWorkspaceID
-        var profile = modelRouterSettingsStore.effectiveAgentModelsProfile(workspaceID: workspaceID)
-        profile.agentRepromptModelRaw = raw.isEmpty ? nil : raw
-        let mode = workspaceID.map { modelRouterSettingsStore.workspaceAgentModelsSettings(for: $0).inheritanceMode } ?? .useGlobalSettings
-        switch AgentModelsEditingScope.resolve(workspaceID: workspaceID, inheritanceMode: mode) {
-        case .global: modelRouterSettingsStore.setGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: .preserveExistingOwnership)
-        case let .workspace(id): modelRouterSettingsStore.setWorkspaceAgentModelsProfile(workspaceID: id, profile: profile)
-        }
-        invalidateRepromptIfNeeded()
-        syncStatusPillsUIState()
+        updateRepromptPreferences { $0.agentRepromptModelRaw = raw.isEmpty ? nil : raw }
     }
 
     func setRepromptIncludesRecentChat(_ enabled: Bool) {

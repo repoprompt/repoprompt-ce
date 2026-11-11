@@ -1167,19 +1167,10 @@ extension AgentModeViewModel {
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         targetEndpoint: DomainAgentSessionLinkEndpointIdentity
     ) async -> AgentSidebarOversightActionOutcome {
-        switch await AgentSessionLinkRuntimeBridge.shared.addSidebarMonitorLink(
+        await AgentSessionLinkRuntimeBridge.shared.addSidebarMonitorLink(
             observerEndpoint: observerEndpoint,
             targetEndpoint: targetEndpoint
-        ) {
-        case .added:
-            .changed
-        case .alreadyLinked:
-            .alreadyInRequestedState
-        case let .failed(failure):
-            .failed(message: failure.uiMessage)
-        case let .rejected(message):
-            .failed(message: message)
-        }
+        ).sidebarActionOutcome
     }
 
     /// Removes only the captured generation-qualified observer-target relationship.
@@ -1210,19 +1201,10 @@ extension AgentModeViewModel {
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         targetEndpoint: DomainAgentSessionLinkEndpointIdentity
     ) async -> AgentSidebarOversightActionOutcome {
-        switch await AgentSessionLinkRuntimeBridge.shared.addMonitorLink(
+        await AgentSessionLinkRuntimeBridge.shared.addMonitorLink(
             observerEndpoint: observerEndpoint,
             targetEndpoint: targetEndpoint
-        ) {
-        case .added:
-            .changed
-        case .alreadyLinked:
-            .alreadyInRequestedState
-        case let .failed(failure):
-            .failed(message: failure.uiMessage)
-        case let .rejected(message):
-            .failed(message: message)
-        }
+        ).sidebarActionOutcome
     }
 
     /// Pasted-ID resolution for the sidebar's outbound `Session ID…` sheet (choose a prospective

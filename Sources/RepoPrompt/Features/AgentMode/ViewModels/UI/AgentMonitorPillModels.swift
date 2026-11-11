@@ -1881,6 +1881,19 @@ enum AgentMonitorAddOutcome: Equatable {
     /// The authority refused the reservation or activation for a non-resolution reason.
     case rejected(message: String)
 
+    var sidebarActionOutcome: AgentSidebarOversightActionOutcome {
+        switch self {
+        case .added:
+            .changed
+        case .alreadyLinked:
+            .alreadyInRequestedState
+        case let .failed(failure):
+            .failed(message: failure.uiMessage)
+        case let .rejected(message):
+            .failed(message: message)
+        }
+    }
+
     var failureMessage: String? {
         switch self {
         case .added, .alreadyLinked:
