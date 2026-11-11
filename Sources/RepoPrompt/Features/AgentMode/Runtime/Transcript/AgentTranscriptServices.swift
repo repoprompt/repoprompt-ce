@@ -1825,7 +1825,7 @@ enum AgentTranscriptToolNormalizer {
         resultObject: [String: Any]?
     ) -> [String] {
         let object = argsObject ?? resultObject
-        guard let object else { return [] }
+        guard let object, !object.isEmpty else { return [] }
         var collected: [String] = []
         for key in ["path", "file_path", "filePath", "new_path", "newPath"] {
             if let value = stringValue(object, keys: [key]), !value.isEmpty {
@@ -1951,9 +1951,10 @@ private func mergedToolExecutionMetadata(
     if merged.summaryText?.isEmpty ?? true {
         merged.summaryText = fallback.summaryText
     }
-    let mergedKeyPaths = Array(NSOrderedSet(array: fallback.keyPaths + merged.keyPaths)) as? [String]
-        ?? (fallback.keyPaths + merged.keyPaths)
-    merged.keyPaths = mergedKeyPaths
+    if !fallback.keyPaths.isEmpty || !merged.keyPaths.isEmpty {
+        merged.keyPaths = Array(NSOrderedSet(array: fallback.keyPaths + merged.keyPaths)) as? [String]
+            ?? (fallback.keyPaths + merged.keyPaths)
+    }
     merged.summaryOnly = merged.summaryOnly || fallback.summaryOnly
     return merged
 }
@@ -7409,12 +7410,7 @@ enum AgentTranscriptProjectionBuilder {
     private static func isEligibleForDetailedTailBoost(in turn: AgentTranscriptTurn) -> Bool {
         var previousSpanExceededBaseThreshold = false
         for span in turn.responseSpans {
-            let orderedActivities = span.activities.sorted { lhs, rhs in
-                if lhs.sequenceIndex == rhs.sequenceIndex {
-                    return lhs.timestamp < rhs.timestamp
-                }
-                return lhs.sequenceIndex < rhs.sequenceIndex
-            }
+            let orderedActivities = activitiesInRenderOrder(span.activities)
             var seenStandaloneToolBlockCount = 0
             var hasOpenStandaloneToolBlock = false
             var openToolExecutionID: String?
@@ -7501,14 +7497,11 @@ enum AgentTranscriptProjectionBuilder {
             }
         }
         if context.replyPresentation, turn.retentionTier != .full, !protectDetachedFocus { return unsortedBlocks }
-        return unsortedBlocks.enumerated().sorted { lhs, rhs in
-            let lhsSequence = blockSequenceIndex(lhs.element)
-            let rhsSequence = blockSequenceIndex(rhs.element)
-            if lhsSequence == rhsSequence {
-                return lhs.offset < rhs.offset
-            }
-            return lhsSequence < rhsSequence
-        }.map(\.element)
+        guard unsortedBlocks.count > 1 else { return unsortedBlocks }
+        let sequences = unsortedBlocks.map(blockSequenceIndex)
+        return unsortedBlocks.indices.sorted { lhs, rhs in
+            sequences[lhs] == sequences[rhs] ? lhs < rhs : sequences[lhs] < sequences[rhs]
+        }.map { unsortedBlocks[$0] }
     }
 
     private static func blockSequenceIndex(_ block: AgentTranscriptRenderBlock) -> Int {
@@ -7727,6 +7720,26 @@ enum AgentTranscriptProjectionBuilder {
         return collapsedBlockCount(for: leafDescriptors, detailedToolTailLimit: detailedToolTailLimit)
     }
 
+    private static func activitiesInRenderOrder(_ activities: [AgentTranscriptActivity]) -> [AgentTranscriptActivity] {
+        guard !activities.isEmpty else { return activities }
+        var previousSequence = activities[0].sequenceIndex
+        var previousTimestamp = activities[0].timestamp
+        for index in activities.indices.dropFirst() {
+            let sequence = activities[index].sequenceIndex, timestamp = activities[index].timestamp
+            if sequence < previousSequence || (sequence == previousSequence && timestamp < previousTimestamp) {
+                let keys = activities.indices.map { (index: $0, sequence: activities[$0].sequenceIndex, timestamp: activities[$0].timestamp) }
+                return keys.sorted { lhs, rhs in
+                    if lhs.sequence != rhs.sequence { return lhs.sequence < rhs.sequence }
+                    if lhs.timestamp != rhs.timestamp { return lhs.timestamp < rhs.timestamp }
+                    return lhs.index < rhs.index
+                }.map { activities[$0.index] }
+            }
+            previousSequence = sequence
+            previousTimestamp = timestamp
+        }
+        return activities
+    }
+
     /// Internal for tests; production callers stay inside this enum.
     static func fullSpanLeafBlockKinds(
         for span: AgentTranscriptProviderResponseSpan,
@@ -7734,12 +7747,7 @@ enum AgentTranscriptProjectionBuilder {
         emittedConclusionActivityIDs: inout Set<UUID>,
         excludingQuiet: Bool = false
     ) -> [AgentTranscriptRenderBlockKind] {
-        let orderedActivities = span.activities.sorted { lhs, rhs in
-            if lhs.sequenceIndex == rhs.sequenceIndex {
-                return lhs.timestamp < rhs.timestamp
-            }
-            return lhs.sequenceIndex < rhs.sequenceIndex
-        }
+        let orderedActivities = activitiesInRenderOrder(span.activities)
         var kinds: [AgentTranscriptRenderBlockKind] = []
         var leafIsCompanion: [Bool] = []
         var currentToolExecutionID: String?
@@ -7791,12 +7799,7 @@ enum AgentTranscriptProjectionBuilder {
         toolSlots: [UUID: Int] = [:],
         preorderedActivities: [AgentTranscriptActivity]? = nil
     ) -> [CollapsibleLeafDescriptor] {
-        let orderedActivities = preorderedActivities ?? span.activities.sorted { lhs, rhs in
-            if lhs.sequenceIndex == rhs.sequenceIndex {
-                return lhs.timestamp < rhs.timestamp
-            }
-            return lhs.sequenceIndex < rhs.sequenceIndex
-        }
+        let orderedActivities = preorderedActivities ?? activitiesInRenderOrder(span.activities)
         var descriptors: [CollapsibleLeafDescriptor] = []
         var leafIsCompanion: [Bool] = []
         var currentToolExecutionID: String?
@@ -8618,12 +8621,7 @@ enum AgentTranscriptProjectionBuilder {
         repliesPreclassified: Bool = false,
         preorderedActivities: [AgentTranscriptActivity]? = nil
     ) -> [AgentTranscriptRenderBlock] {
-        let orderedActivities = preorderedActivities ?? span.activities.sorted { lhs, rhs in
-            if lhs.sequenceIndex == rhs.sequenceIndex {
-                return lhs.timestamp < rhs.timestamp
-            }
-            return lhs.sequenceIndex < rhs.sequenceIndex
-        }
+        let orderedActivities = preorderedActivities ?? activitiesInRenderOrder(span.activities)
         var blocks: [AgentTranscriptRenderBlock] = []
         var leafIsCompanion: [Bool] = []
         var standaloneToolActivities: [AgentTranscriptActivity] = []
@@ -9138,20 +9136,18 @@ enum AgentTranscriptProjectionBuilder {
         summarySourceBlocks: [AgentTranscriptRenderBlock]? = nil,
         context: AgentTranscriptProjectionBuildContext
     ) -> AgentTranscriptGroupedHistorySummary {
-        let hiddenAssistantCount = childBlocks.reduce(0) { partial, block in
-            partial + block.rows.filter(\.hasDisplayableAssistantBody).count
-        }
-        let hiddenProgressCount = childBlocks.reduce(0) { partial, block in
-            partial + block.rows.count(where: { $0.kind == .thinking })
-        }
-        let hiddenNoteCount = childBlocks.reduce(0) { partial, block in
-            partial + block.rows.count(where: { $0.kind == .system || $0.kind == .error })
+        var hiddenAssistantCount = 0, hiddenProgressCount = 0, hiddenNoteCount = 0, hiddenToolCardCount = 0
+        for block in childBlocks {
+            if block.kind == .standaloneTool || block.kind == .activityCluster { hiddenToolCardCount += 1 }
+            for row in block.rows {
+                if row.hasDisplayableAssistantBody { hiddenAssistantCount += 1 }
+                if row.kind == .thinking { hiddenProgressCount += 1 }
+                if row.kind == .system || row.kind == .error { hiddenNoteCount += 1 }
+            }
         }
         let summaryRows = (summarySourceBlocks ?? childBlocks).flatMap(\.rows)
         let summary = AgentTranscriptGroupedHistorySummary(
-            hiddenToolCardCount: childBlocks.count(where: {
-                $0.kind == .standaloneTool || $0.kind == .activityCluster
-            }),
+            hiddenToolCardCount: hiddenToolCardCount,
             hiddenAssistantCount: hiddenAssistantCount,
             hiddenProgressCount: hiddenProgressCount,
             hiddenNoteCount: hiddenNoteCount,
@@ -9306,7 +9302,10 @@ enum AgentTranscriptProjectionBuilder {
         // Only tool rows and displayed narration affect this aggregate, so share it
         // across those views instead of normalizing/grouping the same tools twice.
         let cacheKey = ClusterSummaryCacheKey(
-            rowIDs: rows.compactMap { $0.kind == .toolCall || $0.kind == .toolResult ? $0.id : nil },
+            rowIDs: rows.indices.compactMap { index in
+                let kind = rows[index].kind
+                return kind == .toolCall || kind == .toolResult ? rows[index].id : nil
+            },
             isComputerUseCompanionRun: isComputerUseCompanionRun,
             narrationUTF8: shortNarration.map { Array($0.utf8) }
         )
@@ -9321,7 +9320,7 @@ enum AgentTranscriptProjectionBuilder {
         // of that row's payload and attribution fields on every comparison.
         var rowOrders: [(sequenceIndex: Int, timestamp: Date, id: UUID)] = []
         var executions: [AgentTranscriptToolExecution] = []
-        func appendExecution(for row: AgentChatItem) -> Int? {
+        func appendExecution(for row: borrowing AgentChatItem) -> Int? {
             guard let execution = AgentTranscriptToolNormalizer.toolExecution(
                 for: row, context: context.processingContext
             ) else { return nil }
@@ -9332,11 +9331,11 @@ enum AgentTranscriptProjectionBuilder {
         }
         var groups: [[Int]]
         if let logicalRowGroups {
-            groups = logicalRowGroups.map { $0.compactMap { appendExecution(for: $0) } }
+            groups = logicalRowGroups.map { rows in rows.indices.compactMap { appendExecution(for: rows[$0]) } }
         } else {
             var byExecutionID: [String: [Int]] = [:]
-            for row in rows {
-                guard let index = appendExecution(for: row) else { continue }
+            for rowIndex in rows.indices {
+                guard let index = appendExecution(for: rows[rowIndex]) else { continue }
                 byExecutionID[executions[index].stableExecutionID, default: []].append(index)
             }
             groups = Array(byExecutionID.values)

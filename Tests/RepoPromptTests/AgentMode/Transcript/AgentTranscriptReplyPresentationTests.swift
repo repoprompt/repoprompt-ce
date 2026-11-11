@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
@@ -202,6 +203,29 @@ final class AgentTranscriptReplyPresentationTests: XCTestCase {
             XCTAssertNil(sectionSummary.shortNarration)
             XCTAssertEqual(groupSummary.toolCount, sectionSummary.toolCount)
             XCTAssertEqual(groupSummary.toolNameCounts, sectionSummary.toolNameCounts)
+        }
+    }
+
+    func testActivityOrderingKeepsSequenceTimestampAndStableTies() {
+        var transcript = AgentTranscriptIO.importLegacyItems([
+            .user("question", sequenceIndex: 0),
+            .assistant("a", sequenceIndex: 1), .assistant("b", sequenceIndex: 2),
+            .assistant("c", sequenceIndex: 3), .assistant("d", sequenceIndex: 4)
+        ])
+        var activities = transcript.turns[0].responseSpans[0].activities
+        for index in activities.indices {
+            activities[index].sequenceIndex = index == 0 ? 3 : 2
+            activities[index].timestamp = Date(timeIntervalSince1970: index == 3 ? 0 : 1)
+        }
+        let expected = [activities[3], activities[1], activities[2], activities[0]]
+        transcript.turns[0].conclusionActivityID = nil
+        transcript.turns[0].summary = nil
+        for input in [activities, expected] {
+            transcript.turns[0].responseSpans[0].activities = input
+            for replyPresentation in [false, true] {
+                let projection = AgentTranscriptProjectionBuilder.buildWithCaches(from: transcript, turnCaches: [:], replyPresentation: replyPresentation).projection
+                XCTAssertEqual(Array(projection.workingRows.dropFirst().map(\.id)), expected.map(\.id))
+            }
         }
     }
 
@@ -613,19 +637,22 @@ final class AgentTranscriptReplyPresentationTests: XCTestCase {
             return transcript
         }
         func elapsed(_ transcript: AgentTranscript) -> TimeInterval {
-            let start = Date.timeIntervalSinceReferenceDate
+            var start = timespec(), end = timespec()
+            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &start)
             _ = AgentTranscriptProjectionBuilder.buildWithCaches(from: transcript, turnCaches: [:], replyPresentation: true)
-            return Date.timeIntervalSinceReferenceDate - start
+            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &end)
+            return Double(end.tv_sec - start.tv_sec) + Double(end.tv_nsec - start.tv_nsec) / 1e9
         }
-        let small = make(150), large = make(600)
+        let small = make(150), large = make(300)
         _ = elapsed(small)
         _ = elapsed(large)
-        // Best of three warmed builds limits shared-runner interruptions. A 4x
-        // workload gets 6x time, not the 16x a quadratic implementation needs.
+        // Projection work is synchronous on this thread. CPU time excludes
+        // descheduling; best of three warmed builds reduces residual noise.
+        // A 2x workload gets 2.6x time, not quadratic's 4x.
         let t1 = (0 ..< 3).map { _ in elapsed(small) }.min()!
         let t2 = (0 ..< 3).map { _ in elapsed(large) }.min()!
-        print("MULTISPAN_GROWTH_SECONDS=\(t1),\(t2)")
-        XCTAssertLessThan(t2, t1 * 6)
+        print("MULTISPAN_GROWTH_CPU_SECONDS=\(t1),\(t2)")
+        XCTAssertLessThan(t2, t1 * 2.6)
     }
 
     func testRequestlessBufferedAssistantSurvivesCrossSpanConclusionSplit() throws {
