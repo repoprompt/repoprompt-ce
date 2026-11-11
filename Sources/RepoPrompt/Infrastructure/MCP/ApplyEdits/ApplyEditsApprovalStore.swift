@@ -180,6 +180,11 @@ actor ApplyEditsApprovalStore: Sendable {
     #if DEBUG
         private var test_beforeRequestCancellation: (@Sendable () async -> Void)?
         private var test_afterRequestCancellation: (@Sendable () -> Void)?
+        private var test_onAutoEditOverridePrepared: (@Sendable (ApplyEditsApprovalScope) -> Void)?
+
+        func test_setAutoEditOverridePreparedHook(_ hook: (@Sendable (ApplyEditsApprovalScope) -> Void)?) {
+            test_onAutoEditOverridePrepared = hook
+        }
 
         func test_setRequestCancellationHooks(
             before: (@Sendable () async -> Void)?, after: (@Sendable () -> Void)?
@@ -210,11 +215,15 @@ actor ApplyEditsApprovalStore: Sendable {
     func prepareAutoEditOverride(for scope: ApplyEditsApprovalScope) -> AutoEditOverride {
         let entry = autoEditOverridesByScope[scope] ?? AutoEditEntry()
         autoEditOverridesByScope[scope] = entry
-        return AutoEditOverride(
+        let receipt = AutoEditOverride(
             scope: scope, revision: entry.revision,
             expectedValue: autoEditEnabled(for: scope),
             restoreValue: entry.restoreValue ?? autoEditEnabled(for: scope)
         )
+        #if DEBUG
+            test_onAutoEditOverridePrepared?(scope)
+        #endif
+        return receipt
     }
 
     /// No suspension between comparison and mutation. A cancelled, cleaned-up, or superseded

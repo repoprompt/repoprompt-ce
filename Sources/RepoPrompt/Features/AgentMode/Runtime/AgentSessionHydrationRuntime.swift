@@ -129,7 +129,7 @@ enum AgentSessionHydrationRuntime {
             session.recordRestorationAuthoritative(.persistedPayloadApplied)
             guard session.qualifiedRestorationReadiness.isAuthoritative else { return false }
             session.hasLoadedPersistedState = true
-            attempt.writer.scope.installedInteractions?.adoptHydratedApprovalPayload(for: session)
+            attempt.writer.scope.installedInteractions?.adoptReadyApprovalPayload(for: session)
             return true
         }
     }

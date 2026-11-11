@@ -97,6 +97,7 @@ final class AgentSessionInteractionRuntime {
     #if DEBUG
         var test_beforeApprovalCancellation: (@MainActor () async -> Void)?
         var test_beforeApprovalSyncCommit: (@MainActor () async -> Void)?
+        var test_onApprovalEffectEnqueued: (@MainActor (AgentTabSession) -> Void)?
         var test_onApprovalListenerJoin: (@MainActor () -> Void)?
         var test_beforeApprovalSyncCleanup: (@MainActor () async -> Void)?
         var test_beforeApprovalSnapshot: (@MainActor () async -> Void)?
@@ -144,12 +145,15 @@ final class AgentSessionInteractionRuntime {
             if approvalTails[address]?.id == id { approvalTails.removeValue(forKey: address) }
         }
         approvalTails[address] = (id, task)
+        #if DEBUG
+            test_onApprovalEffectEnqueued?(session)
+        #endif
         return task
     }
 
     /// The projection fence is reference-free; the listener cannot retain its owning scope.
     /// Store preparation followed by membership revalidation and CAS also fences late seeds.
-    func adoptHydratedApprovalPayload(for session: AgentTabSession) {
+    func adoptReadyApprovalPayload(for session: AgentTabSession) {
         ensureApprovalSync(for: session, adoptPayload: true)
     }
 
@@ -231,6 +235,26 @@ final class AgentSessionInteractionRuntime {
             }
         }
         session.applyEditsApprovalSubscriptionTask = begin
+    }
+
+    /// Ensure the admitted session's payload is syncing, then capture its underlying
+    /// preference after already-admitted seed, cleanup and manual-write transactions settle.
+    /// This may start sync for a newly ready session. The override's apply/release CAS remains the
+    /// authority for changes that arrive after this finite preparation transaction.
+    func prepareControlAutoEditOverride(
+        command: AgentSessionRuntimeStore.Command
+    ) async -> ApplyEditsApprovalStore.AutoEditOverride? {
+        guard let scope, command.writer.scope === scope, command.isCurrent else { return nil }
+        let session = command.writer.session
+        ensureApprovalSync(for: session)
+        let address = approvalScope(for: session)
+        var receipt: ApplyEditsApprovalStore.AutoEditOverride?
+        let preparation = enqueueApprovalEffect(for: session) { [approvalStore] in
+            guard command.isCurrent else { return }
+            receipt = await approvalStore.prepareAutoEditOverride(for: address)
+        }
+        await preparation.value
+        return receipt
     }
 
     /// Manual UI commands use the canonical writer; only genuine unbound drafts use

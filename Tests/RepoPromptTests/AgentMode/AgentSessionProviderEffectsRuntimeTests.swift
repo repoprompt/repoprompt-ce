@@ -2063,7 +2063,7 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
             }
             session.autoEditEnabled = false
             session.hasLoadedPersistedState = true
-            runtime.adoptHydratedApprovalPayload(for: session)
+            runtime.adoptReadyApprovalPayload(for: session)
             await runtime.drainPendingEffects(for: session)
             let value = await store.autoEditEnabled(for: runtime.approvalScope(for: session))
             XCTAssertEqual(value, manualChoice, "Payload adoption may replace an initial seed, not an intervening manual choice")
@@ -2126,7 +2126,7 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         session.hasLoadedPersistedState = true
         session.isDirty = false
         runtime.test_beforeApprovalSyncCommit = nil
-        runtime.adoptHydratedApprovalPayload(for: session)
+        runtime.adoptReadyApprovalPayload(for: session)
         gate.release()
         await runtime.drainPendingEffects(for: session)
         let value = await approvals.autoEditEnabled(for: runtime.approvalScope(for: session))

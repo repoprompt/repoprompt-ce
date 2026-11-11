@@ -7571,3 +7571,30 @@ Final focused `5357d288-9be4-4fb9-8d3a-03d886ba446f` passed **76 tests**, zero f
 (29 interaction, 29 restoration-admission, 18 runtime-store), including the listener-join witness.
 Scoped pinned formatting, strict lint and whitespace checks passed. Other lanes' MCP host,
 provider startup/adoption/event installation, persistence and close/handoff owners are unchanged.
+
+#### M9.2i checkpoint 3 follow-up — readiness adoption and ordered activation preparation
+
+Configured creation now renews approval sync after the existing durable acknowledgment and binding
+check, just as hydration does after its authoritative readiness commit. Ordinary or unacknowledged
+saves do not earn that renewal. Real persistence witnesses cover draft and already-bound seeds,
+observe the actual projection, and preserve the exact subscription when acknowledgment is refused.
+The save and hydration bodies remain with their existing owners; this is an interaction-adoption seam.
+
+The actual MCP activation regression first reproduced an approval-revision refusal: preparation read
+the store before an already-admitted readiness seed committed. Matching interaction composition now
+queues finite override preparation behind seed, cleanup and manual writes, checking the original
+command after joining the predecessor. Existing override apply/release CAS is unchanged. Explicit
+resources without matching interaction composition retain their existing path. A held-seed witness
+checks the underlying preference restored after deactivation; writer reacquisition during predecessor
+completion refuses preparation and cleans the exact registration without transferring activation.
+
+Two fixture repairs preserve their original expectations: manually bound sessions join real approval
+sync before use, and rejected-rebind coverage introduces its pending approval at the actual prepared
+hydration boundary rather than allowing early refusal before its gate. The latter gate is bounded.
+No assertion, timeout or production authority was weakened.
+
+Initial fixed focused `8f6e8855-5388-4bae-a2f9-290947d89323` passed **187 tests**, zero failures.
+Post-review `35bf50f6-f92f-4ffe-ba2c-65b1b236280a` also executed **187 tests**, zero failures,
+including the stronger predecessor-reacquisition witness. Scoped pinned format and strict lint passed. Native
+provider approval receipts and forced-switch interaction forwarding remain local follow-up work;
+MCP routing/registration, provider execution, and general lifecycle ownership are not migrated here.
