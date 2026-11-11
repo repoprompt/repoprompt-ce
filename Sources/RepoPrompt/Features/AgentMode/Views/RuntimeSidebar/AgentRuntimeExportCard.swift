@@ -44,6 +44,45 @@ private protocol AgentSelectedFilesManaging: AgentContextExportSourceView {
 }
 
 private extension AgentSelectedFilesManaging {
+    func selectedFilesPopover(placeholderFileCount: Int, activeTab: Binding<AgentSelectedFilesTab>) -> some View {
+        AgentSelectedFilesPopover(
+            model: modelCoordinator.model,
+            rowSplit: modelCoordinator.rowSplit,
+            isLoading: modelCoordinator.isLoading,
+            canMutateDisplayedModel: modelCoordinator.canMutateDisplayedModel,
+            placeholderFileCount: placeholderFileCount,
+            activeTab: activeTab,
+            canMutate: selectionCoordinator != nil,
+            onLoadContent: { row, purpose in
+                guard let model = modelCoordinator.model else { return nil }
+                return await loadRowContent(row, model: model, purpose: purpose)
+            },
+            onRemove: { row, model in remove(row, from: model) },
+            onClear: { model in clearSelection(for: model) }
+        )
+    }
+
+    func acceptSelectionChange(
+        _ change: WorkspaceSelectionCoordinator.Change,
+        isPresented: @autoclosure () -> Bool? = nil
+    ) -> Bool {
+        let tabID = currentTabID ?? selectionCoordinator?.activeTabID() ?? promptManager.activeComposeTabID
+        var fields = AgentSelectedFilesDiagnostics.selectionFields(change.selection)
+        fields["component"] = exportComponent
+        fields["changeTabID"] = AgentSelectedFilesDiagnostics.shortID(change.tabID)
+        fields["targetTabID"] = AgentSelectedFilesDiagnostics.shortID(tabID)
+        if let isPresented = isPresented() {
+            fields["isPresented"] = String(isPresented)
+        }
+        guard change.tabID == tabID else {
+            fields["ignored"] = "tabMismatch"
+            AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event("view.selectionChange", fields: fields)
+            return false
+        }
+        AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event("view.selectionChange", fields: fields, includeStack: true)
+        return true
+    }
+
     var selectionChangesPublisher: AnyPublisher<WorkspaceSelectionCoordinator.Change, Never> {
         selectionCoordinator?.changes ?? Empty<WorkspaceSelectionCoordinator.Change, Never>(completeImmediately: false).eraseToAnyPublisher()
     }
@@ -381,27 +420,13 @@ struct AgentSelectedFilesPopoverTrigger<Label: View>: View, AgentSelectedFilesMa
         .accessibilityLabel("View selected files: \(summary.compactText)")
         .accessibilityHint("Opens details for selected files and codemaps")
         .popover(isPresented: $showSelectedFilesPopover) {
-            AgentSelectedFilesPopover(
-                model: modelCoordinator.model,
-                rowSplit: modelCoordinator.rowSplit,
-                isLoading: modelCoordinator.isLoading,
-                canMutateDisplayedModel: modelCoordinator.canMutateDisplayedModel,
-                placeholderFileCount: selectionCount,
-                activeTab: $activePopoverTab,
-                canMutate: selectionCoordinator != nil,
-                onLoadContent: { row, purpose in
-                    guard let model = modelCoordinator.model else { return nil }
-                    return await loadRowContent(row, model: model, purpose: purpose)
-                },
-                onRemove: { row, model in remove(row, from: model) },
-                onClear: { model in clearSelection(for: model) }
-            )
-            .frame(width: 420)
-            .frame(
-                minHeight: 124,
-                idealHeight: selectedFilesPopoverHeight(rowCount: modelCoordinator.model?.fileCount ?? selectionCount),
-                maxHeight: 440
-            )
+            selectedFilesPopover(placeholderFileCount: selectionCount, activeTab: $activePopoverTab)
+                .frame(width: 420)
+                .frame(
+                    minHeight: 124,
+                    idealHeight: selectedFilesPopoverHeight(rowCount: modelCoordinator.model?.fileCount ?? selectionCount),
+                    maxHeight: 440
+                )
         }
         .onChange(of: activePopoverTab) { _, _ in
             guard showSelectedFilesPopover else { return }
@@ -465,18 +490,7 @@ struct AgentSelectedFilesPopoverTrigger<Label: View>: View, AgentSelectedFilesMa
     }
 
     private func handleSelectionChange(_ change: WorkspaceSelectionCoordinator.Change) {
-        let tabID = currentTabID ?? selectionCoordinator?.activeTabID() ?? promptManager.activeComposeTabID
-        var fields = AgentSelectedFilesDiagnostics.selectionFields(change.selection)
-        fields["component"] = "trigger"
-        fields["changeTabID"] = AgentSelectedFilesDiagnostics.shortID(change.tabID)
-        fields["targetTabID"] = AgentSelectedFilesDiagnostics.shortID(tabID)
-        fields["isPresented"] = String(showSelectedFilesPopover)
-        guard change.tabID == tabID else {
-            fields["ignored"] = "tabMismatch"
-            AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event("view.selectionChange", fields: fields)
-            return
-        }
-        AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event("view.selectionChange", fields: fields, includeStack: true)
+        guard acceptSelectionChange(change, isPresented: showSelectedFilesPopover) else { return }
         if showSelectedFilesPopover {
             refreshExportModel(preserveDisplayedModel: true)
         } else {
@@ -502,58 +516,44 @@ struct AgentSelectedFilesInlineManager: View, AgentSelectedFilesManaging {
     @State fileprivate var activePopoverTab: AgentSelectedFilesTab = .files
 
     var body: some View {
-        AgentSelectedFilesPopover(
-            model: modelCoordinator.model,
-            rowSplit: modelCoordinator.rowSplit,
-            isLoading: modelCoordinator.isLoading,
-            canMutateDisplayedModel: modelCoordinator.canMutateDisplayedModel,
-            placeholderFileCount: summary.totalExplicitFileCount,
-            activeTab: $activePopoverTab,
-            canMutate: selectionCoordinator != nil,
-            onLoadContent: { row, purpose in
-                guard let model = modelCoordinator.model else { return nil }
-                return await loadRowContent(row, model: model, purpose: purpose)
-            },
-            onRemove: { row, model in remove(row, from: model) },
-            onClear: { model in clearSelection(for: model) }
-        )
-        .onAppear {
-            modelCoordinator.perfRecorder = perfRecorder
-            AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event("inline.onAppear", includeStack: true)
-            refreshExportModel()
-        }
-        .onChange(of: activePopoverTab) { _, _ in
-            refreshExportModel(preserveDisplayedModel: true)
-        }
-        .onDisappear {
-            AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event("inline.onDisappear", includeStack: true)
-            modelCoordinator.cancelLoading(keepLoadedModel: true)
-        }
-        .onChange(of: currentTabID) { oldValue, newValue in
-            AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event(
-                "inline.currentTab.changed",
-                fields: [
-                    "old": AgentSelectedFilesDiagnostics.shortID(oldValue),
-                    "new": AgentSelectedFilesDiagnostics.shortID(newValue)
-                ],
-                includeStack: true
-            )
-            resetAndRefreshExportModelForContextChange()
-        }
-        .onChange(of: activeAgentSessionID) { oldValue, newValue in
-            AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event(
-                "inline.activeSession.changed",
-                fields: [
-                    "old": AgentSelectedFilesDiagnostics.shortID(oldValue),
-                    "new": AgentSelectedFilesDiagnostics.shortID(newValue)
-                ],
-                includeStack: true
-            )
-            resetAndRefreshExportModelForContextChange()
-        }
-        .onReceive(selectionChangesPublisher) { change in
-            handleSelectionChange(change)
-        }
+        selectedFilesPopover(placeholderFileCount: summary.totalExplicitFileCount, activeTab: $activePopoverTab)
+            .onAppear {
+                modelCoordinator.perfRecorder = perfRecorder
+                AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event("inline.onAppear", includeStack: true)
+                refreshExportModel()
+            }
+            .onChange(of: activePopoverTab) { _, _ in
+                refreshExportModel(preserveDisplayedModel: true)
+            }
+            .onDisappear {
+                AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event("inline.onDisappear", includeStack: true)
+                modelCoordinator.cancelLoading(keepLoadedModel: true)
+            }
+            .onChange(of: currentTabID) { oldValue, newValue in
+                AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event(
+                    "inline.currentTab.changed",
+                    fields: [
+                        "old": AgentSelectedFilesDiagnostics.shortID(oldValue),
+                        "new": AgentSelectedFilesDiagnostics.shortID(newValue)
+                    ],
+                    includeStack: true
+                )
+                resetAndRefreshExportModelForContextChange()
+            }
+            .onChange(of: activeAgentSessionID) { oldValue, newValue in
+                AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event(
+                    "inline.activeSession.changed",
+                    fields: [
+                        "old": AgentSelectedFilesDiagnostics.shortID(oldValue),
+                        "new": AgentSelectedFilesDiagnostics.shortID(newValue)
+                    ],
+                    includeStack: true
+                )
+                resetAndRefreshExportModelForContextChange()
+            }
+            .onReceive(selectionChangesPublisher) { change in
+                handleSelectionChange(change)
+            }
     }
 
     private func resetAndRefreshExportModelForContextChange() {
@@ -563,17 +563,7 @@ struct AgentSelectedFilesInlineManager: View, AgentSelectedFilesManaging {
     }
 
     private func handleSelectionChange(_ change: WorkspaceSelectionCoordinator.Change) {
-        let tabID = currentTabID ?? selectionCoordinator?.activeTabID() ?? promptManager.activeComposeTabID
-        var fields = AgentSelectedFilesDiagnostics.selectionFields(change.selection)
-        fields["component"] = "inline"
-        fields["changeTabID"] = AgentSelectedFilesDiagnostics.shortID(change.tabID)
-        fields["targetTabID"] = AgentSelectedFilesDiagnostics.shortID(tabID)
-        guard change.tabID == tabID else {
-            fields["ignored"] = "tabMismatch"
-            AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event("view.selectionChange", fields: fields)
-            return
-        }
-        AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event("view.selectionChange", fields: fields, includeStack: true)
+        guard acceptSelectionChange(change) else { return }
         refreshExportModel(preserveDisplayedModel: true)
     }
 }
@@ -841,13 +831,7 @@ private struct AgentSelectedFileRow: View, AgentSelectedFilePresenting {
     @ViewBuilder
     private var removeControl: some View {
         if let disabledRemoveExplanation {
-            Image(systemName: "info.circle")
-                .font(.system(size: 13, weight: .regular))
-                .imageScale(.medium)
-                .foregroundColor(.secondary.opacity(isHovered ? 1 : 0.55))
-                .frame(width: 26, height: 26)
-                .hoverTooltip(disabledRemoveExplanation)
-                .accessibilityLabel(disabledRemoveExplanation)
+            agentDisabledFileRemovalHint(fontSize: 13, isHovered: isHovered, explanation: disabledRemoveExplanation)
         } else {
             AgentFileRowActionButton(
                 systemName: "minus.circle",

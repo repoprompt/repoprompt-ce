@@ -490,12 +490,6 @@ struct AgentApplyEditsReviewCard: View {
                 .hoverTooltip("Accept edits (⌘⏎)")
             }
         }
-        .padding(12)
-        .background(Color.orange.opacity(0.06))
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(Color.orange.opacity(0.28), lineWidth: 1)
-        )
+        .agentApprovalSurface(strokeOpacity: 0.28)
     }
 }

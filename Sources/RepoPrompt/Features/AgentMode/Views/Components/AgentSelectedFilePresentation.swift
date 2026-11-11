@@ -1,6 +1,17 @@
 import SwiftUI
 
 @MainActor
+func agentDisabledFileRemovalHint(fontSize: CGFloat, isHovered: Bool, explanation: String) -> some View {
+    Image(systemName: "info.circle")
+        .font(.system(size: fontSize, weight: .regular))
+        .imageScale(.medium)
+        .foregroundColor(.secondary.opacity(isHovered ? 1 : 0.55))
+        .frame(width: 26, height: 26)
+        .hoverTooltip(explanation)
+        .accessibilityLabel(explanation)
+}
+
+@MainActor
 protocol AgentSelectedFilePresenting: View {
     var row: AgentContextExportRow { get }
     var previewCoordinator: AgentSelectedFilePreviewLoadCoordinator { get }

@@ -1671,9 +1671,7 @@ struct AgentComposerView: View, Equatable {
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                 Spacer()
                 if isSelected {
-                    Image(systemName: "checkmark")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
-                        .foregroundStyle(Color.accentColor)
+                    agentSelectionCheckmark(fontPreset: fontPreset)
                 }
             }
             .padding(.horizontal, 8)

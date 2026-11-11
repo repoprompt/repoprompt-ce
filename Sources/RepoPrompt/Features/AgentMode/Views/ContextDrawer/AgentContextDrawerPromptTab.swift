@@ -542,9 +542,7 @@ struct AgentContextDrawerPromptTab: View, AgentContextDrawerModelRefreshing {
                 Spacer(minLength: 8)
 
                 if isSelected {
-                    Image(systemName: "checkmark")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
-                        .foregroundStyle(Color.accentColor)
+                    agentSelectionCheckmark(fontPreset: fontPreset)
                 }
             }
             .padding(.horizontal, 8)

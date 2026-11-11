@@ -339,13 +339,7 @@ struct AgentContextSelectedFileCard: View, AgentSelectedFilePresenting {
     @ViewBuilder
     private var removeControl: some View {
         if let disabledRemoveExplanation {
-            Image(systemName: "info.circle")
-                .font(.system(size: 12, weight: .regular))
-                .imageScale(.medium)
-                .foregroundColor(.secondary.opacity(isHovered ? 1 : 0.55))
-                .frame(width: 26, height: 26)
-                .hoverTooltip(disabledRemoveExplanation)
-                .accessibilityLabel(disabledRemoveExplanation)
+            agentDisabledFileRemovalHint(fontSize: 12, isHovered: isHovered, explanation: disabledRemoveExplanation)
         } else {
             AgentContextFileActionButton(
                 systemName: "minus.circle",
