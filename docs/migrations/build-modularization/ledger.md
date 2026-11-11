@@ -7544,3 +7544,31 @@ no persistence obligation from acknowledged persistence while preserving legitim
 close behavior. No new compatibility acknowledgement enum, parallel manager, default-true
 admission or legacy-unbound implementation was introduced by this checkpoint. Runtime exact-save
 acknowledgment hardening and remaining caller/forwarder retirement are still open.
+
+#### M9.2j — exact required-save no-op acknowledgment
+
+The exact-writer required-save path no longer treats a suppressed dirty `.notRequired` as a
+successful acknowledgment. Its no-write result requires the same writer to remain current, the
+session to be clean, and restoration to be authoritative/admissible. A clean restored no-op still
+succeeds, and the originating writer can still perform its final retirement save. The legacy
+`.currentOwner` tab ingress is deliberately unchanged in this slice, including its suppressed
+bound-tab acknowledgment gap; absent/unbound close obligations and caller capture need a separate
+migration rather than an invented compatibility acknowledgment enum.
+
+One causal runtime test first performs a real write, then proves clean suppressed no-op success,
+dirty suppressed refusal with the exact error and no durable phase/additional write, and a real
+unsuppressed save after retirement. The normal launch configuration suppresses persistence only
+for deterministic UI-test launches without the stress persistence opt-in; VM test savers can
+explicitly bypass suppression. Exact session-link send failure paths already block dispatch and
+require durable compensation; this checkpoint intentionally refuses suppression rather than
+pretending those obligations were saved. No suppression configuration or caller policy changed.
+
+Oracle review `untitled-chat-DF9731`, snapshot `2026-11-11/1205`, approved with bounded test-message
+and comment-precision fixes, both applied. Synchronous callbacks can still reenter, so absence of
+an `await` is not claimed as atomicity. Focused Conductor `3d2d9a5a-6aad-476c-a021-e054aad332c9`
+passed **213 tests, zero failures** (101.300s), covering persistence/save runtime, send/compact/stop
+transactions, attribution persistence, restoration admission and lane first-save. Pinned scoped
+formatting and strict lint passed; both changed Swift files emitted zero warning occurrences in
+this actual compile, matching exact-main `c791cd13a` compile `1b23f00d`. Full publication gates,
+products and live-app/release validation are not claimed for this local checkpoint. Fresh index
+passed **1,263/1,360 wrong-way edges, 53/66 largest cycle**, baseline unchanged.

@@ -672,6 +672,22 @@ final class AgentSessionPersistenceRuntime {
             }
             return .success(())
         case .notRequired:
+            // Suppression can skip a dirty save. An exact-writer caller requires an
+            // acknowledgment, not merely the absence of an attempted write. The legacy
+            // currentOwner ingress still accepts all notRequired outcomes, including dirty
+            // suppression, until callers classify no-persistence obligations explicitly.
+            if case .exact = expectation {
+                guard !capturedSession.isDirty,
+                      capturedSession.qualifiedRestorationReadiness.isAuthoritative,
+                      capturedSession.restorationAdmissionFailureMessage == nil
+                else {
+                    return .failure(.init(
+                        operation: .save,
+                        tabID: tabID,
+                        message: "Required persistence was skipped without a clean, restored session."
+                    ))
+                }
+            }
             return .success(())
         case let .deferred(message):
             return .failure(.init(operation: .save, tabID: tabID, message: message))

@@ -204,6 +204,43 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
         XCTAssertFalse(f.session.isDirty)
     }
 
+    func testExactRequiredSaveCannotAcknowledgeSuppressedDirtyState() async throws {
+        let f = try Fixture()
+        defer { f.cleanUp() }
+        guard case let .unique(writer) = try f.scope.resolveWriter(
+            workspaceID: f.placement.workspace.id, sessionID: XCTUnwrap(f.session.activeAgentSessionID)
+        ) else { return XCTFail("The restored fixture must have one canonical writer") }
+        var writes = 0
+        f.scope.persistence.saver = { payload, workspace, count in
+            writes += 1
+            return try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count)
+        }
+        try await f.scope.persistence.flushSaveRequired(writer: writer).get()
+        XCTAssertEqual(writes, 1)
+        XCTAssertFalse(f.session.isDirty)
+
+        f.placement.suppressed = true
+        var phases: [AgentSessionRequiredSavePhase] = []
+        try await f.scope.persistence.flushSaveRequired(writer: writer, observingSavePhase: { phases.append($0) }).get()
+        XCTAssertEqual(writes, 1, "An already clean, restored writer needs no additional write")
+        XCTAssertEqual(phases, [.beforeWrite])
+
+        f.session.isDirty = true
+        phases.removeAll()
+        let skipped = await f.scope.persistence.flushSaveRequired(writer: writer, observingSavePhase: { phases.append($0) })
+        guard case let .failure(failure) = skipped else { return XCTFail("Suppression is not a required-save acknowledgment") }
+        XCTAssertEqual(failure.message, "Required persistence was skipped without a clean, restored session.")
+        XCTAssertEqual(writes, 1)
+        XCTAssertTrue(f.session.isDirty, "A refusal preserves the outstanding save obligation")
+        XCTAssertEqual(phases, [.beforeWrite], "A skipped write must not publish a durable-save phase")
+
+        f.placement.suppressed = false
+        f.scope.beginRetirement()
+        try await f.scope.persistence.flushSaveRequired(writer: writer).get()
+        XCTAssertEqual(writes, 2, "The originating writer may still commit its final retirement save")
+        XCTAssertFalse(f.session.isDirty)
+    }
+
     func testHeldRequiredSaveDoesNotAcknowledgeMovedStorageOrReboundIncarnation() async throws {
         for rebind in [false, true] {
             let f = try Fixture()
@@ -258,6 +295,7 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
     private final class Placement {
         var workspace: WorkspaceModel
         var refusal: String?
+        var suppressed = false
         init(_ workspace: WorkspaceModel) {
             self.workspace = workspace
         }
@@ -294,7 +332,7 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
             let storage = AgentSessionStorageInputs(
                 workspaceID: workspace.id,
                 workspaceWithID: { $0 == placement.workspace.id ? placement.workspace : nil },
-                displayName: { _ in "Headless persistence" }, isSuppressed: { false },
+                displayName: { _ in "Headless persistence" }, isSuppressed: { placement.suppressed },
                 attachmentWorkspaceDirectory: { FileManager.default.temporaryDirectory }
             )
             scope.persistence.composition = storage.persistenceComposition(scope: scope, saveAdmission: { _ in placement.refusal })
