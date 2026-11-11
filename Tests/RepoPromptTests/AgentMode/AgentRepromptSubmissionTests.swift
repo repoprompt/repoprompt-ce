@@ -130,7 +130,7 @@ final class AgentRepromptSubmissionTests: XCTestCase {
         XCTAssertEqual(vm.retrieveDraftText(for: tabID), "Pending message\nNext draft")
         // Loading the restored text acknowledges its ledger fragment, as the real editor does
         // before retrying that visible draft. Without this, the ledger deliberately retains it.
-        let restoredSnapshot = vm.loadDraftSnapshotForComposer(for: tabID)
+        let restoredSnapshot = vm.draftRuntime.loadSnapshot(tabID: tabID)
         XCTAssertEqual(restoredSnapshot.text, "Pending message\nNext draft")
         let retryTarget = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: fixture.session))
         let retryAttempt = AgentComposerSubmitAttempt(id: UUID(), target: retryTarget, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "Pending message\nNext draft")

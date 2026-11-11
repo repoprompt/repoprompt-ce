@@ -206,7 +206,7 @@ import XCTest
                 transports.append(initial)
                 await provider.attach(initial)
                 _ = try await provider.listTools()
-                XCTAssertEqual(vm.selfNoopHintIsCurrent(for: observer), reusesConnection)
+                XCTAssertEqual(vm.linkExecutionRuntime.selfNoopHintIsCurrent(for: observer), reusesConnection)
                 let initialOffer = await manager.debugRunCatalogProjection(for: runID)
                 observer.isPreparingInitialWorktree = true
                 observer.oversight.autoWakeOnUpdates = true
@@ -221,15 +221,15 @@ import XCTest
                 attempt.task?.cancel()
                 await attempt.task?.value
                 let dispatchID = AgentSessionLinkPromptDispatchID.autoWake(wakeID: attempt.wakeID)
-                let early = try XCTUnwrap(vm.agentSessionLinkPromptClaim(for: observer, dispatchID: dispatchID))
+                let early = try XCTUnwrap(vm.linkExecutionRuntime.agentSessionLinkPromptClaim(for: observer, dispatchID: dispatchID))
                 XCTAssertFalse(early.routineQuietCheckIn)
                 observer.isPreparingInitialWorktree = false
-                XCTAssertNotNil(vm.agentSessionLinkPrepareAutoWakeDispatch(wakeID: attempt.wakeID, endpoint: endpoint))
+                XCTAssertNotNil(vm.linkExecutionRuntime.agentSessionLinkPrepareAutoWakeDispatch(wakeID: attempt.wakeID, endpoint: endpoint))
                 if retainedOffer == .committedDeletion {
                     let prior = try XCTUnwrap(initialOffer)
                     let route = try XCTUnwrap(prior.routeToken)
                     XCTAssertNotNil(prior.returnedCatalog?[MCPWindowToolName.becomeOverseer])
-                    let before = await manager.hasCurrentReturnedTool(AgentModeViewModel.selfNoopCatalogDefinition, routeToken: route, projectionRevision: prior.projectionRevision)
+                    let before = await manager.hasCurrentReturnedTool(AgentSessionLinkExecutionRuntime.selfNoopCatalogDefinition, routeToken: route, projectionRevision: prior.projectionRevision)
                     XCTAssertTrue(before)
                     XCTAssertNotNil(vm.agentSessionLinkBootstrapState(for: endpoint))
                     let registry = AgentSessionDeletionRegistry.shared
@@ -253,9 +253,9 @@ import XCTest
                     let beforeCommitProjection = await manager.debugRunCatalogProjection(for: runID)
                     let beforeCommit = try XCTUnwrap(beforeCommitProjection)
                     let beforeCommitRoute = try XCTUnwrap(beforeCommit.routeToken)
-                    let supportBeforeCommit = await manager.hasCurrentReturnedTool(AgentModeViewModel.selfNoopCatalogDefinition, routeToken: beforeCommitRoute, projectionRevision: beforeCommit.projectionRevision)
+                    let supportBeforeCommit = await manager.hasCurrentReturnedTool(AgentSessionLinkExecutionRuntime.selfNoopCatalogDefinition, routeToken: beforeCommitRoute, projectionRevision: beforeCommit.projectionRevision)
                     XCTAssertTrue(supportBeforeCommit)
-                    XCTAssertTrue(vm.selfNoopHintIsCurrent(for: observer))
+                    XCTAssertTrue(vm.linkExecutionRuntime.selfNoopHintIsCurrent(for: observer))
                     let deletion = Task { @MainActor in await registry.didCommitDurableDeletion(token) }
                     guard await gate.waitUntilEntered() else {
                         gate.release()
@@ -266,12 +266,12 @@ import XCTest
                         XCTAssertTrue(registry.isPermanentlyDeleted(sessionID: endpoint.sessionID))
                         XCTAssertNil(vm.agentSessionLinkBootstrapState(for: endpoint))
                         let currentInputs = await manager.debugCurrentRunCatalogOfferInputs(for: runID)
-                        let retained = await manager.hasCurrentReturnedTool(AgentModeViewModel.selfNoopCatalogDefinition, routeToken: beforeCommitRoute, projectionRevision: beforeCommit.projectionRevision)
+                        let retained = await manager.hasCurrentReturnedTool(AgentSessionLinkExecutionRuntime.selfNoopCatalogDefinition, routeToken: beforeCommitRoute, projectionRevision: beforeCommit.projectionRevision)
                         // Sample the independent physical fence before a fresh list can replace
                         // the observation. Acquisition admits ordinary owed work, not quiet permission.
                         let reserved = try XCTUnwrap(vm.agentSessionLinkPromptClaimStore.pendingClaim(dispatchID: dispatchID, observerSessionID: endpoint.sessionID))
                         XCTAssertFalse(reserved.routineQuietCheckIn)
-                        let hintCurrent = vm.selfNoopHintIsCurrent(for: observer)
+                        let hintCurrent = vm.linkExecutionRuntime.selfNoopHintIsCurrent(for: observer)
                         let acquired = vm.agentSessionLinkAcquirePhysicalDispatch(for: observer, dispatchID: dispatchID)
                         vm.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: observer, dispatchID: dispatchID)
                         print("DELETION_RETAINED_OFFER inputsUnchanged=\(currentInputs == beforeCommit.offerInputs) serverProof=\(retained) mirrorHint=\(hintCurrent) physicalAcquisition=\(acquired)")
@@ -301,30 +301,30 @@ import XCTest
                     let registry = AgentSessionDeletionRegistry.shared
                     let prior = try XCTUnwrap(initialOffer)
                     let route = try XCTUnwrap(prior.routeToken)
-                    let supportBeforeBegin = await manager.hasCurrentReturnedTool(AgentModeViewModel.selfNoopCatalogDefinition, routeToken: route, projectionRevision: prior.projectionRevision)
+                    let supportBeforeBegin = await manager.hasCurrentReturnedTool(AgentSessionLinkExecutionRuntime.selfNoopCatalogDefinition, routeToken: route, projectionRevision: prior.projectionRevision)
                     XCTAssertTrue(supportBeforeBegin)
                     let before = ServerNetworkManager.catalogAdvertisementRevision
                     let token = try registry.beginDurableDeletion(sessionID: endpoint.sessionID)
                     defer { registry.didFailDurableDeletion(token) }
                     XCTAssertNotEqual(ServerNetworkManager.catalogAdvertisementRevision, before)
-                    let oldSupport = await manager.hasCurrentReturnedTool(AgentModeViewModel.selfNoopCatalogDefinition, routeToken: route, projectionRevision: prior.projectionRevision)
+                    let oldSupport = await manager.hasCurrentReturnedTool(AgentSessionLinkExecutionRuntime.selfNoopCatalogDefinition, routeToken: route, projectionRevision: prior.projectionRevision)
                     XCTAssertFalse(oldSupport, "Beginning deletion changes bootstrap eligibility before cleanup")
-                    XCTAssertFalse(vm.selfNoopHintIsCurrent(for: observer))
+                    XCTAssertFalse(vm.linkExecutionRuntime.selfNoopHintIsCurrent(for: observer))
                     _ = try await provider.listTools()
                     let duringProjection = await manager.debugRunCatalogProjection(for: runID)
                     let during = try XCTUnwrap(duringProjection)
                     let duringRoute = try XCTUnwrap(during.routeToken)
-                    let currentSupport = await manager.hasCurrentReturnedTool(AgentModeViewModel.selfNoopCatalogDefinition, routeToken: duringRoute, projectionRevision: during.projectionRevision)
+                    let currentSupport = await manager.hasCurrentReturnedTool(AgentSessionLinkExecutionRuntime.selfNoopCatalogDefinition, routeToken: duringRoute, projectionRevision: during.projectionRevision)
                     XCTAssertTrue(currentSupport)
                     let inProgress = ServerNetworkManager.catalogAdvertisementRevision
                     registry.didFailDurableDeletion(token)
                     XCTAssertNil(registry.state(forSessionID: endpoint.sessionID))
                     XCTAssertNotEqual(ServerNetworkManager.catalogAdvertisementRevision, inProgress)
-                    let afterFailure = await manager.hasCurrentReturnedTool(AgentModeViewModel.selfNoopCatalogDefinition, routeToken: duringRoute, projectionRevision: during.projectionRevision)
+                    let afterFailure = await manager.hasCurrentReturnedTool(AgentSessionLinkExecutionRuntime.selfNoopCatalogDefinition, routeToken: duringRoute, projectionRevision: during.projectionRevision)
                     XCTAssertFalse(afterFailure, "Failure restores eligibility but cannot resurrect an earlier offer")
-                    XCTAssertFalse(vm.selfNoopHintIsCurrent(for: observer))
+                    XCTAssertFalse(vm.linkExecutionRuntime.selfNoopHintIsCurrent(for: observer))
                     _ = try await provider.listTools()
-                    XCTAssertTrue(vm.selfNoopHintIsCurrent(for: observer))
+                    XCTAssertTrue(vm.linkExecutionRuntime.selfNoopHintIsCurrent(for: observer))
                     XCTAssertTrue(frames.userMessages.isEmpty)
                     XCTAssertTrue(codex.startedTurns.isEmpty)
                     await cleanup()
@@ -388,7 +388,7 @@ import XCTest
                                 XCTAssertNil(captured?.returnedCatalog, "A list must not associate another binding's barriers or expiry with its shaped response")
                             }
                             if let prior, let token = prior.routeToken, retainedOffer != .benign, retainedOffer != .expiry {
-                                let oldSupport = await manager.hasCurrentReturnedTool(AgentModeViewModel.selfNoopCatalogDefinition, routeToken: token, projectionRevision: prior.projectionRevision)
+                                let oldSupport = await manager.hasCurrentReturnedTool(AgentSessionLinkExecutionRuntime.selfNoopCatalogDefinition, routeToken: token, projectionRevision: prior.projectionRevision)
                                 XCTAssertFalse(oldSupport, "A later absent/ambiguous list, reconnect or producer ABA cannot reuse a positive predecessor")
                             }
                             if retainedOffer == .absentThenFresh {
@@ -396,7 +396,7 @@ import XCTest
                                 let absentProjection = await manager.debugRunCatalogProjection(for: runID)
                                 let absent = try XCTUnwrap(absentProjection)
                                 let token = try XCTUnwrap(absent.routeToken)
-                                let restoredWithoutList = await manager.hasCurrentReturnedTool(AgentModeViewModel.selfNoopCatalogDefinition, routeToken: token, projectionRevision: absent.projectionRevision)
+                                let restoredWithoutList = await manager.hasCurrentReturnedTool(AgentSessionLinkExecutionRuntime.selfNoopCatalogDefinition, routeToken: token, projectionRevision: absent.projectionRevision)
                                 XCTAssertFalse(restoredWithoutList, "Restored expected presence is not a returned offer")
                                 _ = try await provider.listTools()
                             }
@@ -508,7 +508,7 @@ import XCTest
             let observed = await manager.debugRunCatalogProjection(for: runID)
             let projection = try XCTUnwrap(observed)
             let route = try XCTUnwrap(projection.routeToken)
-            let returned = await manager.hasCurrentReturnedTool(AgentModeViewModel.selfNoopCatalogDefinition, routeToken: route, projectionRevision: projection.projectionRevision)
+            let returned = await manager.hasCurrentReturnedTool(AgentSessionLinkExecutionRuntime.selfNoopCatalogDefinition, routeToken: route, projectionRevision: projection.projectionRevision)
             XCTAssertEqual(returned, expected, "The real startup socket, not a supplied readiness result, establishes support")
         }
 

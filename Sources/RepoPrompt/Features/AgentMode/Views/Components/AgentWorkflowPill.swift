@@ -79,16 +79,10 @@ struct AgentWorkflowPill: View {
                 .hoverTooltip("Clear workflow", .top)
             }
         }
-        .background(.ultraThinMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                .stroke(
-                    selection != nil
-                        ? selection!.accentColor.opacity(0.4)
-                        : Color.secondary.opacity(0.15),
-                    lineWidth: selection != nil ? 1 : 0.5
-                )
+        .agentPillSurface(
+            cornerRadius: cornerRadius,
+            strokeColor: selection != nil ? selection!.accentColor.opacity(0.4) : Color.secondary.opacity(0.15),
+            lineWidth: selection != nil ? 1 : 0.5
         )
         .hoverTooltip("Wrap your message with a workflow template", .top)
         .popover(isPresented: $showPopover, arrowEdge: .bottom) {

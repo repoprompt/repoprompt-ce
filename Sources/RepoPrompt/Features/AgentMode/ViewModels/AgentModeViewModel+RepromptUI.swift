@@ -144,16 +144,7 @@ extension AgentModeViewModel {
     }
 
     func setRepromptModelRaw(_ raw: String) {
-        let workspaceID = workspaceManager?.activeWorkspaceID
-        var profile = modelRouterSettingsStore.effectiveAgentModelsProfile(workspaceID: workspaceID)
-        profile.agentRepromptModelRaw = raw.isEmpty ? nil : raw
-        let mode = workspaceID.map { modelRouterSettingsStore.workspaceAgentModelsSettings(for: $0).inheritanceMode } ?? .useGlobalSettings
-        switch AgentModelsEditingScope.resolve(workspaceID: workspaceID, inheritanceMode: mode) {
-        case .global: modelRouterSettingsStore.setGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: .preserveExistingOwnership)
-        case let .workspace(id): modelRouterSettingsStore.setWorkspaceAgentModelsProfile(workspaceID: id, profile: profile)
-        }
-        invalidateRepromptIfNeeded()
-        syncStatusPillsUIState()
+        updateRepromptPreferences { $0.agentRepromptModelRaw = raw.isEmpty ? nil : raw }
     }
 
     func setRepromptIncludesRecentChat(_ enabled: Bool) {
@@ -215,7 +206,7 @@ extension AgentModeViewModel {
         guard currentTabID == tabID, var recovery = repromptUIStore.recoveries[tabID],
               confirmedReplacement || retrieveDraftText(for: tabID) == recovery.draftAtInvalidation else { return false }
         repromptOperation?.cancel(restoreOriginal: false, recover: false)
-        _ = loadDraftSnapshotForComposer(for: tabID)
+        _ = draftRuntime.loadSnapshot(tabID: tabID)
         restoreComposerDraft(tabID: tabID, text: recovery.originalDraft, message: "Restored original draft.", strategy: .replaceAlways)
         recovery.requiresDecision = false
         recovery.bypassesPreparation = false
@@ -229,7 +220,7 @@ extension AgentModeViewModel {
         guard currentTabID == tabID, let recovery = repromptUIStore.recoveries[tabID] else { return false }
         guard confirmedReplacement || retrieveDraftText(for: tabID) == recovery.draftAtInvalidation else { return false }
         repromptOperation?.cancel(restoreOriginal: false, recover: false)
-        _ = loadDraftSnapshotForComposer(for: tabID)
+        _ = draftRuntime.loadSnapshot(tabID: tabID)
         restoreComposerDraft(tabID: tabID, text: recovery.text, message: "Restored Re-prompt draft.", strategy: .replaceAlways)
         var kept = recovery
         kept.requiresDecision = false

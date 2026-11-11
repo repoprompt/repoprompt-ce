@@ -473,15 +473,14 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
                 }
                 await MainActor.run { [weak self] in
                     guard let self else { return }
-                    guard self.refreshID == refreshID, loadingIdentity == request.identity else {
-                        debugStats.staleResultsIgnored += 1
-                        AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event(
-                            "coordinator.resolve.fileRowsStaleIgnored",
-                            fields: refreshFields.merging(AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).elapsedFields(since: fileRowsStartMS)) { _, new in new },
-                            includeStack: true
-                        )
-                        return
-                    }
+                    guard acceptRefreshResult(
+                        refreshID: refreshID,
+                        identity: request.identity,
+                        staleEvent: "coordinator.resolve.fileRowsStaleIgnored",
+                        fields: refreshFields,
+                        startMS: fileRowsStartMS,
+                        perfRecorder: perfRecorder
+                    ) else { return }
                     var fileRowsFields = refreshFields.merging(AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).elapsedFields(since: fileRowsStartMS)) { _, new in new }
                     fileRowsFields["rowCount"] = String(fileRowsModel.rows.count)
                     fileRowsFields["missingPaths"] = String(fileRowsModel.missingPaths.count)
@@ -547,15 +546,14 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
             }
             await MainActor.run { [weak self] in
                 guard let self else { return }
-                guard self.refreshID == refreshID, loadingIdentity == request.identity else {
-                    debugStats.staleResultsIgnored += 1
-                    AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event(
-                        "coordinator.resolve.staleIgnored",
-                        fields: refreshFields.merging(AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).elapsedFields(since: resolveStartMS)) { _, new in new },
-                        includeStack: true
-                    )
-                    return
-                }
+                guard acceptRefreshResult(
+                    refreshID: refreshID,
+                    identity: request.identity,
+                    staleEvent: "coordinator.resolve.staleIgnored",
+                    fields: refreshFields,
+                    startMS: resolveStartMS,
+                    perfRecorder: perfRecorder
+                ) else { return }
                 var completionFields = refreshFields.merging(AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).elapsedFields(since: resolveStartMS)) { _, new in new }
                 completionFields["rowCount"] = String(resolvedModel.rows.count)
                 completionFields["missingPaths"] = String(resolvedModel.missingPaths.count)
@@ -587,6 +585,26 @@ final class AgentSelectedFilesModelCoordinator: ObservableObject {
         }
 
         return .started
+    }
+
+    private func acceptRefreshResult(
+        refreshID: UUID,
+        identity: AgentSelectedFilesModelIdentity,
+        staleEvent: String,
+        fields: [String: String],
+        startMS: Double?,
+        perfRecorder: any AgentModePerfRecording
+    ) -> Bool {
+        guard self.refreshID == refreshID, loadingIdentity == identity else {
+            debugStats.staleResultsIgnored += 1
+            AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event(
+                staleEvent,
+                fields: fields.merging(AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).elapsedFields(since: startMS)) { _, new in new },
+                includeStack: true
+            )
+            return false
+        }
+        return true
     }
 
     func cancelLoading(keepLoadedModel: Bool) {

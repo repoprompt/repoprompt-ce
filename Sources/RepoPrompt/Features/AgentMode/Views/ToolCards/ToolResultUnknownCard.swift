@@ -31,11 +31,8 @@ struct UnknownToolResultCard: View {
             title: title,
             subtitle: subtitle,
             status: status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }

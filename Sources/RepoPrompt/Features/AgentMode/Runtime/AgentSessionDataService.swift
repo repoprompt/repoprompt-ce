@@ -1525,20 +1525,6 @@ actor AgentSessionDataService {
         return try await loadAgentSession(id: sessionID, for: workspace)
     }
 
-    /// Find an agent session by its ID for a workspace.
-    func findAgentSession(id: UUID, for workspace: WorkspaceModel) async throws -> AgentSession? {
-        let files = try await listAgentSessions(for: workspace)
-
-        for fileURL in files {
-            let filename = fileURL.lastPathComponent
-            if filename == "AgentSession-\(id.uuidString).json" {
-                return try await loadAgentSession(from: fileURL)
-            }
-        }
-
-        return nil
-    }
-
     /// Load an agent session by ID without scanning the session directory.
     func loadAgentSession(id: UUID, for workspace: WorkspaceModel) async throws -> AgentSession? {
         let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
@@ -1550,37 +1536,6 @@ actor AgentSessionDataService {
         }
 
         return try await loadAgentSession(from: fileURL)
-    }
-
-    /// Find an agent session by compose tab ID.
-    func findAgentSessionForTab(_ tabID: UUID, for workspace: WorkspaceModel) async throws -> AgentSession? {
-        if let records = try? await metadataRecords(for: workspace),
-           let best = records
-           .filter({ $0.composeTabID == tabID })
-           .sortedForAgentSessionMetadataIndex()
-           .first
-        {
-            if let session = try await loadAgentSession(id: best.id, for: workspace) {
-                return session
-            }
-            let folder = try ensureAgentSessionsFolder(for: workspace)
-            await removeMetadataRecords(matching: { $0.id == best.id }, folder: folder)
-        }
-
-        let files = try await listAgentSessions(for: workspace)
-
-        for fileURL in files {
-            do {
-                let stub = try await loadAgentSessionStub(from: fileURL, recoverMissingMetadata: false)
-                if stub.composeTabID == tabID {
-                    return try await loadAgentSession(from: fileURL)
-                }
-            } catch {
-                continue
-            }
-        }
-
-        return nil
     }
 
     /// Delete a particular agent session file.

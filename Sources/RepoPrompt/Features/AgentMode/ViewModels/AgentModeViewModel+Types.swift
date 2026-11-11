@@ -605,18 +605,12 @@ extension AgentModeViewModel {
         }
     }
 
-    typealias SourceItemsMutation = AgentSourceItemsMutation
-
     enum AgentTranscriptAutoFollowArmingState: String, Codable, Equatable {
         case armed
         case disarmedAfterManualDetach
     }
 
-    typealias PendingSourceItemsMutationSummary = AgentPendingSourceItemsMutationSummary
-
     typealias DerivedTranscriptSyncState = AgentDerivedTranscriptSyncState
-
-    typealias PersistableTranscriptSnapshot = AgentPersistableTranscriptSnapshot
 
     struct ActiveTranscriptFollowBindingState: Equatable {
         var tabID: UUID?
@@ -723,6 +717,42 @@ extension AgentModeViewModel {
             self.threadActivityDate = threadActivityDate
             self.restorationDateBucket = restorationDateBucket
             self.searchFieldSource = searchFieldSource
+        }
+
+        /// Copies session data unchanged while supplying the thread's presentation fields.
+        func withThreadPresentation(
+            depth: Int,
+            threadKey: AgentSidebarThreadKey?,
+            hasThreadChildren: Bool,
+            isThreadCollapsed: Bool,
+            hiddenThreadDescendantCount: Int,
+            hiddenThreadDescendantAttentionCount: Int,
+            threadActivityDate: Date
+        ) -> Self {
+            Self(
+                id: id,
+                tabID: tabID,
+                title: title,
+                lastUserMessageAt: lastUserMessageAt,
+                activityDate: activityDate,
+                isPinned: isPinned,
+                sessionID: sessionID,
+                canStash: canStash,
+                parentSessionID: parentSessionID,
+                createdByOverseerSessionID: createdByOverseerSessionID,
+                depth: depth,
+                isMCPControlled: isMCPControlled,
+                worktree: worktree,
+                worktreeMergeAttention: worktreeMergeAttention,
+                threadKey: threadKey,
+                hasThreadChildren: hasThreadChildren,
+                isThreadCollapsed: isThreadCollapsed,
+                hiddenThreadDescendantCount: hiddenThreadDescendantCount,
+                hiddenThreadDescendantAttentionCount: hiddenThreadDescendantAttentionCount,
+                threadActivityDate: threadActivityDate,
+                restorationDateBucket: restorationDateBucket,
+                searchFieldSource: searchFieldSource
+            )
         }
 
         /// Materializes normalized search fields for this row.

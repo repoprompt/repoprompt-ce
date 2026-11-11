@@ -65,24 +65,8 @@ extension AgentModeViewModel {
         }
     }
 
-    private func sessionIndexEntryHasConversationContent(_ entry: AgentSessionIndexEntry) -> Bool {
-        AgentModeSidebarSessionBuilder.sessionIndexEntryHasConversationContent(entry)
-    }
-
     private func archivedSidebarSessionLookup() -> ArchivedSidebarSessionLookup {
         ArchivedSidebarSessionLookup(sessionIndex: ownerValidatedSessionIndex)
-    }
-
-    private func preferredArchivedSidebarEntry(
-        for tabID: UUID,
-        tabName: String?,
-        lookup: ArchivedSidebarSessionLookup
-    ) -> AgentSessionIndexEntry? {
-        AgentModeSidebarSessionBuilder.preferredSidebarEntry(
-            for: tabID,
-            tabName: tabName,
-            entries: lookup.entries(for: tabID)
-        )
     }
 
     private func archivedSidebarEntry(
@@ -90,7 +74,7 @@ extension AgentModeViewModel {
         lookup: ArchivedSidebarSessionLookup
     ) -> AgentSessionIndexEntry? {
         lookup.explicitEntry(for: stashedTab.tab.activeAgentSessionID)
-            ?? preferredArchivedSidebarEntry(for: stashedTab.tab.id, tabName: stashedTab.tab.name, lookup: lookup)
+            ?? AgentModeSidebarSessionBuilder.preferredSidebarEntry(for: stashedTab.tab.id, tabName: stashedTab.tab.name, entries: lookup.entries(for: stashedTab.tab.id))
     }
 
     private func archivedSidebarSearchFields(
@@ -160,15 +144,15 @@ extension AgentModeViewModel {
         lookup: ArchivedSidebarSessionLookup
     ) -> Bool {
         if let explicitEntry = lookup.explicitEntry(for: stashedTab.tab.activeAgentSessionID) {
-            return sessionIndexEntryHasConversationContent(explicitEntry)
+            return AgentModeSidebarSessionBuilder.sessionIndexEntryHasConversationContent(explicitEntry)
         }
         guard stashedTab.tab.activeAgentSessionID != nil || lookup.hasEntries(for: stashedTab.tab.id) else {
             return false
         }
-        guard let entry = preferredArchivedSidebarEntry(for: stashedTab.tab.id, tabName: stashedTab.tab.name, lookup: lookup) else {
+        guard let entry = AgentModeSidebarSessionBuilder.preferredSidebarEntry(for: stashedTab.tab.id, tabName: stashedTab.tab.name, entries: lookup.entries(for: stashedTab.tab.id)) else {
             return false
         }
-        return sessionIndexEntryHasConversationContent(entry)
+        return AgentModeSidebarSessionBuilder.sessionIndexEntryHasConversationContent(entry)
     }
 
     func archivedSessionDateInfo(for stashedTab: StashedTab) -> SidebarSessionDateInfo {
@@ -781,10 +765,6 @@ extension AgentModeViewModel {
         )
     }
 
-    func seedDefaultCollapsedSidebarThreads(_ eligibleKeys: [AgentSidebarThreadKey]) {
-        ui.sessionSidebar.seedDefaultCollapsedThreads(eligibleKeys: eligibleKeys)
-    }
-
     func filteredSidebarSessions(
         for tabs: [ComposeTabState],
         currentTabID: UUID?,
@@ -891,15 +871,6 @@ extension AgentModeViewModel {
             )
         #endif
         return result
-    }
-
-    func setSidebarTab(_ tab: AgentSidebarTab) {
-        ui.sessionSidebar.setSidebarTab(tab)
-    }
-
-    /// Folds or unfolds one overseer's group in the Overseers tab (its own key namespace).
-    func toggleSidebarOverseerGroup(_ overseerTabID: UUID) {
-        ui.sessionSidebar.toggleThreadCollapse(.overseerGroup(overseerTabID))
     }
 
     /// Live oversight pairs in this window, flattened to session IDs. O(links).
@@ -1136,8 +1107,8 @@ extension AgentModeViewModel {
                 ? max(0, subtreeAttentionCounts[index] - selfAttention)
                 : 0
 
-            displayedRows.append(sidebarRow(
-                rows[index],
+            displayedRows.append(rows[index].withThreadPresentation(
+                depth: rows[index].depth,
                 threadKey: key,
                 hasThreadChildren: hasChildren[index],
                 isThreadCollapsed: shouldCollapse,
@@ -1229,41 +1200,6 @@ extension AgentModeViewModel {
 
     private func sidebarThreadActivityDate(for row: SidebarSession) -> Date {
         row.lastUserMessageAt ?? row.activityDate
-    }
-
-    private func sidebarRow(
-        _ row: SidebarSession,
-        threadKey: AgentSidebarThreadKey,
-        hasThreadChildren: Bool,
-        isThreadCollapsed: Bool,
-        hiddenThreadDescendantCount: Int,
-        hiddenThreadDescendantAttentionCount: Int,
-        threadActivityDate: Date
-    ) -> SidebarSession {
-        SidebarSession(
-            id: row.id,
-            tabID: row.tabID,
-            title: row.title,
-            lastUserMessageAt: row.lastUserMessageAt,
-            activityDate: row.activityDate,
-            isPinned: row.isPinned,
-            sessionID: row.sessionID,
-            canStash: row.canStash,
-            parentSessionID: row.parentSessionID,
-            createdByOverseerSessionID: row.createdByOverseerSessionID,
-            depth: row.depth,
-            isMCPControlled: row.isMCPControlled,
-            worktree: row.worktree,
-            worktreeMergeAttention: row.worktreeMergeAttention,
-            threadKey: threadKey,
-            hasThreadChildren: hasThreadChildren,
-            isThreadCollapsed: isThreadCollapsed,
-            hiddenThreadDescendantCount: hiddenThreadDescendantCount,
-            hiddenThreadDescendantAttentionCount: hiddenThreadDescendantAttentionCount,
-            threadActivityDate: threadActivityDate,
-            restorationDateBucket: row.restorationDateBucket,
-            searchFieldSource: row.searchFieldSource
-        )
     }
 
     func effectiveSidebarVisibleSessionCount(
@@ -1482,18 +1418,6 @@ extension AgentModeViewModel {
         ui.sessionSidebar.toggleGroupCollapsed(group)
     }
 
-    func adjacentParentSidebarSessionTabID(
-        from activeTabID: UUID?,
-        forward: Bool,
-        in tabs: [ComposeTabState]
-    ) -> UUID? {
-        Self.adjacentParentSidebarSessionTabID(
-            from: activeTabID,
-            forward: forward,
-            rows: sidebarSessions(for: tabs)
-        )
-    }
-
     static func adjacentParentSidebarSessionTabID(
         from activeTabID: UUID?,
         forward: Bool,
@@ -1552,10 +1476,6 @@ extension AgentModeViewModel {
     }
 
     func computeLastUserMessageDate(in items: [AgentChatItem]) -> Date? {
-        Self.computeLastUserMessageDateNonisolated(in: items)
-    }
-
-    private nonisolated static func computeLastUserMessageDateNonisolated(in items: [AgentChatItem]) -> Date? {
         AgentTranscriptIO.lastUserInteractionDate(in: items)
     }
 }

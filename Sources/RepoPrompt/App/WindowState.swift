@@ -867,7 +867,7 @@ class WindowState: ObservableObject {
         if isPreparedSessionOwner { return }
 
         // Set up additional actions
-        setupSendPromptAction()
+        oracleViewModel.setupSendPromptAction()
         #if DEBUG
             if AppLaunchConfiguration.current.forcesMCPAutoStart {
                 setupMCPAutoStart()
@@ -988,12 +988,7 @@ class WindowState: ObservableObject {
         NotificationCenter.default.publisher(for: .composeTabNameChanged)
             .receive(on: RunLoop.main)
             .sink { [weak self] notification in
-                guard let self,
-                      let notifiedWindowID = notification.userInfo?["windowID"] as? Int,
-                      notifiedWindowID == windowID,
-                      let tabID = notification.userInfo?["tabID"] as? UUID,
-                      tabID == promptManager.activeComposeTabID
-                else { return }
+                guard let self, notificationTargetsActiveComposeTab(notification) else { return }
                 requestWindowTitleUpdate(reason: .agentSessionNameChanged)
             }
             .store(in: &cancellables)
@@ -1011,25 +1006,25 @@ class WindowState: ObservableObject {
         NotificationCenter.default.publisher(for: .agentSessionBindingDidChange)
             .receive(on: RunLoop.main)
             .sink { [weak self] notification in
-                guard let self,
-                      let notifiedWindowID = notification.userInfo?["windowID"] as? Int,
-                      notifiedWindowID == windowID,
-                      let tabID = notification.userInfo?["tabID"] as? UUID,
-                      tabID == promptManager.activeComposeTabID
-                else { return }
+                guard let self, notificationTargetsActiveComposeTab(notification) else { return }
                 refreshAgentChatTitleCluster()
             }
             .store(in: &cancellables)
+    }
+
+    private func notificationTargetsActiveComposeTab(_ notification: Notification) -> Bool {
+        guard let notifiedWindowID = notification.userInfo?["windowID"] as? Int,
+              notifiedWindowID == windowID,
+              let tabID = notification.userInfo?["tabID"] as? UUID,
+              tabID == promptManager.activeComposeTabID
+        else { return false }
+        return true
     }
 
     private func setupMCPAutoStart() {
         Task { [weak self] in
             await self?.mcpServer.startServer()
         }
-    }
-
-    private func setupSendPromptAction() {
-        oracleViewModel.setupSendPromptAction()
     }
 
     // MARK: - Window Management
@@ -2352,7 +2347,7 @@ class WindowState: ObservableObject {
             focusWindowIfPossible()
         }
         if route.interactionID != nil {
-            agentModeViewModel.revealPendingNotificationInteraction(tabID: route.tabID)
+            agentModeViewModel.notificationAttention.revealRequests.send(route.tabID)
         }
         return .routed
     }

@@ -241,7 +241,7 @@ final class AgentSessionLinkRunnerHarness {
                 claimAgentSessionLinkPrompt: { session, dispatchID in
                     MainActor.assumeIsolated {
                         if let sessionLinkHost = harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost {
-                            return sessionLinkHost.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatchID)
+                            return sessionLinkHost.linkExecutionRuntime.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatchID)
                         }
                         guard let harnessBox else {
                             // Family-first, exactly like the production fence: a reserved-family

@@ -1477,12 +1477,12 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         let sessionID = UUID()
         let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
         let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: session.tabID))
-        let hold = viewModel.agentSessionLinkWithholdPromptInventory(for: endpoint)
+        let hold = viewModel.linkExecutionRuntime.agentSessionLinkWithholdPromptInventory(for: endpoint)
         do {
             _ = try await viewModel.mcpActivateControlContext(forTabID: session.tabID, sessionID: sessionID, originatingConnectionID: nil)
             XCTFail("membership hold must refuse")
         } catch { XCTAssertTrue(String(describing: error).contains(AgentModeViewModel.mcpResidentTargetError)) }
-        viewModel.agentSessionLinkReleasePromptInventoryHold(hold, for: endpoint, publishing: nil)
+        viewModel.linkExecutionRuntime.agentSessionLinkReleasePromptInventoryHold(hold, for: endpoint, publishing: nil)
         var transitionGeneration: UInt64 = 0
         viewModel.test_agentSessionLinkHasActiveOutboundLink = { _ in
             transitionGeneration = session.beginPersistentBindingTransition()
@@ -1549,7 +1549,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
                         XCTFail("Activation override was not projected: \(error)")
                     }
                     XCTAssertTrue(current.autoEditEnabled)
-                    hold = viewModel.agentSessionLinkWithholdPromptInventory(for: endpoint)
+                    hold = viewModel.linkExecutionRuntime.agentSessionLinkWithholdPromptInventory(for: endpoint)
                 case .successorEpoch:
                     var successor = context
                     successor.pendingEpochTransition = .init(token: UUID(), kind: .steering, expectedCurrentEpoch: nil)
@@ -1592,7 +1592,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
                     await MainActor.run { !session.autoEditEnabled }
                 }
                 XCTAssertFalse(session.autoEditEnabled)
-                if let hold { viewModel.agentSessionLinkReleasePromptInventoryHold(hold, for: endpoint, publishing: nil) }
+                if let hold { viewModel.linkExecutionRuntime.agentSessionLinkReleasePromptInventoryHold(hold, for: endpoint, publishing: nil) }
             }
             await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
         }

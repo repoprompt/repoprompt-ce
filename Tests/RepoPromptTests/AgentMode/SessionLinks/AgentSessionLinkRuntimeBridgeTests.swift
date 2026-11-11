@@ -608,7 +608,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             guard promptInventoryHoldsByEndpoint[endpoint] == nil else { return }
             publishedInventoriesByEndpoint[endpoint] = inventory
             publishedPromptInventories[endpoint.sessionID] = inventory
-            promptViewModel?.agentSessionLinkPublishPromptInventory(inventory, to: endpoint)
+            promptViewModel?.linkExecutionRuntime.agentSessionLinkPublishPromptInventory(inventory, to: endpoint)
         }
 
         /// Passive queues recorded per exact endpoint, with a publication counter: a test has to be
@@ -624,7 +624,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         ) {
             passiveNoticePublicationCount += 1
             publishedPassiveNoticesByEndpoint[endpoint] = snapshot
-            promptViewModel?.agentSessionLinkPublishPassiveStatusNotices(snapshot, to: endpoint)
+            promptViewModel?.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(snapshot, to: endpoint)
         }
 
         /// Mirrors the real store's fence, because the bridge's contract is that a publication

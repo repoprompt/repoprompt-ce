@@ -8853,10 +8853,10 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     return false
                 }
                 defer { vm.test_beforeRoutineIdleFollowUpStart = nil }
-                vm.agentSessionLinkPublishPromptInventory(
+                vm.linkExecutionRuntime.agentSessionLinkPublishPromptInventory(
                     AgentSessionLinkAutoWakeTests.inventory(observerSessionID: targetID, revision: 1), to: endpoint
                 )
-                vm.agentSessionLinkPublishPassiveStatusNotices(
+                vm.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(
                     AgentSessionLinkAutoWakeTests.laneSnapshot(observerEndpoint: endpoint), to: endpoint
                 )
                 await fulfillment(of: [observed], timeout: 5)
@@ -9367,7 +9367,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                                 runID: runID, observerEndpoint: endpoint, connectionID: connectionID,
                                 routingAuthorityGeneration: 1, connectionLifecycleGeneration: 1
                             )
-                            vm.agentSessionLinkPublishRunCatalogProjection(.init(
+                            vm.linkExecutionRuntime.agentSessionLinkPublishRunCatalogProjection(.init(
                                 runID: runID, routeToken: token, projectionRevision: 1,
                                 hasAgentSessionLink: true, hasAnyActiveLink: true
                             ), to: endpoint)

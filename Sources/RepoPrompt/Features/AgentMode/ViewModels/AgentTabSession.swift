@@ -590,7 +590,7 @@ final class AgentTabSession: ObservableObject {
 
     func invalidatePeriodicIdleSpanIfLocallyBlocked() {
         guard oversight.periodicIdleSince != nil,
-              !AgentModeViewModel.agentSessionLinkPeriodicWakeSessionIsIdle(self) else { return }
+              !AgentSessionLinkExecutionRuntime.agentSessionLinkPeriodicWakeSessionIsIdle(self) else { return }
         oversight.invalidatePeriodicIdleSpan()
     }
 
@@ -2251,7 +2251,7 @@ final class AgentTabSession: ObservableObject {
         {
             if pendingHandoff.isStagedForSend, proof.binding == currentRestorationBindingToken,
                proof.stopFence.permitsStart(of: self),
-               !AgentModeViewModel.providerSwitchNeedsReview(self, excluding: proof.acceptedInputID),
+               !AgentSessionLinkExecutionRuntime.providerSwitchNeedsReview(self, excluding: proof.acceptedInputID),
                let associated = proof.associatingRun(ownership)
             {
                 // Association borrows existing value identities; it owns no runtime lifetime.
@@ -3568,11 +3568,27 @@ final class AgentTabSession: ObservableObject {
     func replaceItem(at index: Int, with updatedItem: AgentChatItem) {
         guard items.indices.contains(index) else { return }
         let previousItem = items[index]
-        let updatedItem = invalidatingQuietCertificate(in: updatedItem, previous: previousItem)
+        commitUpdatedItem(
+            at: index,
+            previous: previousItem,
+            updated: updatedItem,
+            mutation: .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind),
+            diagnosticContext: "replaceItem"
+        )
+    }
+
+    private func commitUpdatedItem(
+        at index: Int,
+        previous previousItem: AgentChatItem,
+        updated proposedItem: AgentChatItem,
+        mutation: AgentSourceItemsMutation,
+        diagnosticContext: String
+    ) {
+        let updatedItem = invalidatingQuietCertificate(in: proposedItem, previous: previousItem)
         guard updatedItem != previousItem else { return }
         var candidateItems = items
         candidateItems[index] = updatedItem
-        if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "replaceItem") {
+        if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: diagnosticContext) {
             lastActivityAt = Date()
             isDirty = true
             return
@@ -3590,10 +3606,7 @@ final class AgentTabSession: ObservableObject {
         nextSequenceIndex = max(nextSequenceIndex, updatedItem.sequenceIndex + 1)
         reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
         updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
-        finishIncrementalSourceItemsMutation(
-            previousItem.id == updatedItem.id
-                ? .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind) : .structural
-        )
+        finishIncrementalSourceItemsMutation(previousItem.id == updatedItem.id ? mutation : .structural)
         lastActivityAt = Date()
         isDirty = true
     }
@@ -3603,34 +3616,13 @@ final class AgentTabSession: ObservableObject {
         let previousItem = items[index]
         var updatedItem = previousItem
         mutate(&updatedItem)
-        updatedItem = invalidatingQuietCertificate(in: updatedItem, previous: previousItem)
-        guard updatedItem != previousItem else { return }
-        var candidateItems = items
-        candidateItems[index] = updatedItem
-        if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "mutateItem") {
-            lastActivityAt = Date()
-            isDirty = true
-            return
-        }
-        if let owner = activeRunOwnership, let start = quietLedger.startKey(owner: owner),
-           previousItem.sequenceIndex >= start || updatedItem.sequenceIndex >= start,
-           previousItem.id != updatedItem.id || previousItem.sequenceIndex != updatedItem.sequenceIndex
-           || (previousItem.kind != updatedItem.kind && !(previousItem.kind == .toolCall && updatedItem.kind == .toolResult))
-        {
-            quietLedger.invalidateRange(owner: owner)
-        }
-        suppressSourceItemsChanged = true
-        items[index] = updatedItem
-        suppressSourceItemsChanged = false
-        nextSequenceIndex = max(nextSequenceIndex, updatedItem.sequenceIndex + 1)
-        reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
-        updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
-        finishIncrementalSourceItemsMutation(
-            previousItem.id == updatedItem.id
-                ? .mutate(index: index, itemKind: updatedItem.kind) : .structural
+        commitUpdatedItem(
+            at: index,
+            previous: previousItem,
+            updated: updatedItem,
+            mutation: .mutate(index: index, itemKind: updatedItem.kind),
+            diagnosticContext: "mutateItem"
         )
-        lastActivityAt = Date()
-        isDirty = true
     }
 
     @discardableResult
@@ -3670,34 +3662,13 @@ final class AgentTabSession: ObservableObject {
         let previousItem = items[index]
         var updatedItem = previousItem
         mutate(&updatedItem)
-        updatedItem = invalidatingQuietCertificate(in: updatedItem, previous: previousItem)
-        guard updatedItem != previousItem else { return }
-        var candidateItems = items
-        candidateItems[index] = updatedItem
-        if commitRepairedSourceItemsIfNeeded(candidateItems, diagnosticContext: "updateLastItem") {
-            lastActivityAt = Date()
-            isDirty = true
-            return
-        }
-        if let owner = activeRunOwnership, let start = quietLedger.startKey(owner: owner),
-           previousItem.sequenceIndex >= start || updatedItem.sequenceIndex >= start,
-           previousItem.id != updatedItem.id || previousItem.sequenceIndex != updatedItem.sequenceIndex
-           || (previousItem.kind != updatedItem.kind && !(previousItem.kind == .toolCall && updatedItem.kind == .toolResult))
-        {
-            quietLedger.invalidateRange(owner: owner)
-        }
-        suppressSourceItemsChanged = true
-        items[index] = updatedItem
-        suppressSourceItemsChanged = false
-        nextSequenceIndex = max(nextSequenceIndex, updatedItem.sequenceIndex + 1)
-        reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
-        updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
-        finishIncrementalSourceItemsMutation(
-            previousItem.id == updatedItem.id
-                ? .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind) : .structural
+        commitUpdatedItem(
+            at: index,
+            previous: previousItem,
+            updated: updatedItem,
+            mutation: .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind),
+            diagnosticContext: "updateLastItem"
         )
-        lastActivityAt = Date()
-        isDirty = true
     }
 
     func bashLiveExecution(for transcriptItemID: UUID) -> AgentModeViewModel.BashLiveExecutionState? {

@@ -313,6 +313,15 @@ struct AgentWorkflowsPopoverView: View {
         .buttonStyle(.plain)
     }
 
+    private func footerIcon(_ systemName: String) -> some View {
+        Image(systemName: systemName)
+            .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, footerControlHorizontalPadding)
+            .padding(.vertical, footerControlVerticalPadding)
+            .contentShape(Rectangle())
+    }
+
     // MARK: - Footer (configure + Finder)
 
     private var footerRow: some View {
@@ -338,12 +347,7 @@ struct AgentWorkflowsPopoverView: View {
             Button {
                 workflowStore.refresh()
             } label: {
-                Image(systemName: "arrow.clockwise")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, footerControlHorizontalPadding)
-                    .padding(.vertical, footerControlVerticalPadding)
-                    .contentShape(Rectangle())
+                footerIcon("arrow.clockwise")
             }
             .buttonStyle(.plain)
             .hoverTooltip("Reload workflows from disk", .top)
@@ -352,12 +356,7 @@ struct AgentWorkflowsPopoverView: View {
                 Button {
                     workflowStore.openInFinder()
                 } label: {
-                    Image(systemName: "folder")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, footerControlHorizontalPadding)
-                        .padding(.vertical, footerControlVerticalPadding)
-                        .contentShape(Rectangle())
+                    footerIcon("folder")
                 }
                 .buttonStyle(.plain)
                 .hoverTooltip("Open Workflows folder in Finder", .top)

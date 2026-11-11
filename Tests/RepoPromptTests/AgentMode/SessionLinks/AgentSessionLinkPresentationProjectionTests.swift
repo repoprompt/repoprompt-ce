@@ -993,7 +993,7 @@ final class AgentSessionLinkStatusPillSyncScopeTests: XCTestCase {
         viewModel.test_flushPendingUIRefresh()
         let pendingBefore = viewModel.ui.statusPills.snapshot.monitor.pendingUpdates
 
-        viewModel.agentSessionLinkPublishPassiveStatusNotices(
+        viewModel.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(
             passiveSnapshot(observer: fixture.endpoint, row: row),
             to: fixture.endpoint
         )
@@ -1015,7 +1015,7 @@ final class AgentSessionLinkStatusPillSyncScopeTests: XCTestCase {
         let row = try XCTUnwrap(published.outbound.first)
         viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
 
-        viewModel.agentSessionLinkPublishPassiveStatusNotices(
+        viewModel.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(
             passiveSnapshot(observer: fixture.endpoint, row: row),
             to: fixture.endpoint
         )
@@ -1039,7 +1039,7 @@ final class AgentSessionLinkStatusPillSyncScopeTests: XCTestCase {
         let row = try XCTUnwrap(published.outbound.first)
         viewModel.agentSessionLinkPublishProjection(published, to: fixture.endpoint)
         viewModel.test_flushPendingUIRefresh()
-        viewModel.agentSessionLinkPublishPassiveStatusNotices(
+        viewModel.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(
             passiveSnapshot(observer: fixture.endpoint, row: row),
             to: fixture.endpoint
         )

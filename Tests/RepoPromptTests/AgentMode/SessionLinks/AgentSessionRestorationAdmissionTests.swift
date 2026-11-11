@@ -1640,14 +1640,14 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
         let candidate = try XCTUnwrap(fixture.vm.agentSessionLinkCandidate(
             tabID: session.tabID, sessionID: sessionID, tabName: "Unavailable", isWindowClosing: false
         ), file: file, line: line)
-        XCTAssertTrue(fixture.vm.agentSessionLinkLiveSession(matching: candidate) === session, file: file, line: line)
+        XCTAssertTrue(fixture.vm.linkExecutionRuntime.agentSessionLinkLiveSession(matching: candidate) === session, file: file, line: line)
         let request = AgentSessionLinkSendRequest(
             linkID: UUID(), linkGeneration: 1,
             observerEndpoint: AgentSessionLinkIdentityTestSupport.endpoint(sessionID: UUID(), windowID: 2),
             observerDisplayName: "Observer", message: "Do not append attributed history", workflow: nil
         )
         var authorizationCommits = 0
-        let delivery = await fixture.vm.agentSessionLinkPerformSend(
+        let delivery = await fixture.vm.linkExecutionRuntime.agentSessionLinkPerformSend(
             to: candidate, request: request,
             liveness: { .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false) },
             commitAuthorization: { authorizationCommits += 1

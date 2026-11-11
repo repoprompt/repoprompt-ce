@@ -54,7 +54,7 @@ func agentContextFileBrowseShouldTerminateForTargetChange(
     isBrowseActive && (!hasMutationTarget || !sessionMatchesTarget)
 }
 
-struct AgentContextDrawerFilesTab: View {
+struct AgentContextDrawerFilesTab: View, AgentContextDrawerModelRefreshing {
     @ObservedObject var detailStore: AgentContextDrawerDetailStore
     @ObservedObject var modelCoordinator: AgentSelectedFilesModelCoordinator
     let exportContext: AgentContextExportViewContext
@@ -363,12 +363,7 @@ struct AgentContextDrawerFilesTab: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity)
-        .background(Color(NSColor.textBackgroundColor).opacity(0.65))
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(Color.secondary.opacity(0.18), lineWidth: 0.5)
-        )
+        .agentContextDrawerTextInputSurface()
     }
 
     private var sortControl: some View {
@@ -486,7 +481,8 @@ struct AgentContextDrawerFilesTab: View {
             ProgressView()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if rows.isEmpty {
-            emptyState(
+            agentContextDrawerEmptyState(
+                fontPreset: fontPreset,
                 icon: "doc.text.magnifyingglass",
                 title: "No selected context",
                 subtitle: "Selections appear here when the agent or workspace selection adds files."
@@ -495,13 +491,15 @@ struct AgentContextDrawerFilesTab: View {
             ProgressView()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if filteredRows.isEmpty {
-            emptyState(
+            agentContextDrawerEmptyState(
+                fontPreset: fontPreset,
                 icon: "line.3.horizontal.decrease.circle",
                 title: "No matches",
                 subtitle: "No selected files match this filter."
             )
         } else if activeRows.isEmpty {
-            emptyState(
+            agentContextDrawerEmptyState(
+                fontPreset: fontPreset,
                 icon: detailStore.filesSubtab == .files ? "doc.text" : "square.grid.2x2",
                 title: detailStore.filesSubtab == .files ? "No files" : "No codemaps",
                 subtitle: detailStore.filesSubtab == .files
@@ -584,32 +582,8 @@ struct AgentContextDrawerFilesTab: View {
         }
     }
 
-    private func refreshIfNeeded(force: Bool = false, preserveDisplayedModel: Bool = false) {
-        guard !isSwitchBlankingRows else { return }
-        guard !exportContext.promptManager.isSwitchingComposeTab else { return }
-        modelCoordinator.refreshIfNeeded(
-            exportContext.makeModelRequest(flushPendingUI: true),
-            force: force,
-            preserveDisplayedModel: preserveDisplayedModel
-        )
-    }
-
-    private func resetOrRefresh(isVisible: Bool) {
-        guard !isSwitchBlankingRows else { return }
-        guard !exportContext.promptManager.isSwitchingComposeTab else { return }
-        modelCoordinator.invalidate()
-        if isVisible {
-            refreshIfNeeded()
-        }
-    }
-
-    private func handleSelectionChange(_ change: WorkspaceSelectionCoordinator.Change, isVisible: Bool) {
-        guard exportContext.tabMatchesSelectionChange(change) else { return }
-        if isVisible {
-            refreshIfNeeded(force: true, preserveDisplayedModel: true)
-        } else {
-            modelCoordinator.invalidate()
-        }
+    var isContextModelRefreshBlanked: Bool {
+        isSwitchBlankingRows
     }
 
     private func clearSelection(for model: AgentContextExportModel) {
@@ -694,23 +668,6 @@ struct AgentContextDrawerFilesTab: View {
             await operation(selectionCoordinator, path, model.lookupContext, target)
             await MainActor.run { refreshIfNeeded(force: true) }
         }
-    }
-
-    private func emptyState(icon: String, title: String, subtitle: String) -> some View {
-        VStack(spacing: 10) {
-            Image(systemName: icon)
-                .font(.system(size: 34))
-                .foregroundStyle(.secondary.opacity(0.45))
-            Text(title)
-                .font(fontPreset.standardFont.weight(.semibold))
-                .foregroundStyle(.secondary)
-            Text(subtitle)
-                .font(fontPreset.captionFont)
-                .foregroundStyle(.tertiary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 320)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func adjustActiveSubtab() {

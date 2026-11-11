@@ -39,16 +39,6 @@ extension AgentModeViewModel {
         await linkExecutionRuntime.providerSwitchSendAdmission(session: session, input: input, attachments: attachments, taggedFiles: taggedFiles, skipsAugmentation: skipsAugmentation, skipsSlashExpansion: skipsSlashExpansion, inputAlreadyIncludesSupplement: inputAlreadyIncludesSupplement, supplementalInput: supplementalInput, autoWakeID: autoWakeID, isCurrent: isCurrent)
     }
 
-    func providerSwitchCatalogWindow(agent: AgentProviderKind, model: String) -> Int? {
-        linkExecutionRuntime.providerSwitchCatalogWindow(agent: agent, model: model)
-    }
-
-    /// Existing prompt owners author all these strings. Rendering current inventory in full is
-    /// conservative for a pending fresh context and neither reserves nor acknowledges a claim.
-    func providerSwitchInstructionStrings(_ session: TabSession, includeSupplement: Bool = true, destination: AgentProviderKind? = nil, includeOwedContent: Bool = true) -> [String] {
-        linkExecutionRuntime.providerSwitchInstructionStrings(session, includeSupplement: includeSupplement, destination: destination, includeOwedContent: includeOwedContent)
-    }
-
     static func providerSwitchStartRefusal(_ session: TabSession) -> AgentSessionLinkSendFailure {
         AgentSessionLinkExecutionRuntime.providerSwitchStartRefusal(session)
     }
@@ -61,35 +51,8 @@ extension AgentModeViewModel {
         AgentSessionLinkExecutionRuntime.providerSwitchUnconfirmed(session)
     }
 
-    /// Accepted input after the saved cutoff invalidates the ready seed. The exact input currently
-    /// being started is excluded, never arbitrary equal text. Missing retained cutoff fails closed.
-    static func providerSwitchNeedsReview(_ session: TabSession, excluding inputID: UUID? = nil) -> Bool {
-        AgentSessionLinkExecutionRuntime.providerSwitchNeedsReview(session, excluding: inputID)
-    }
-
-    /// Sole M1 insertion point. Required-save sending before invoking any runner. Currency failure
-    /// after acceptance withholds start; it is not a second fit/admission decision.
-    func prepareProviderSwitchHandoverForSend(
-        _ preparation: ProviderSwitchSendPreparation?, session: TabSession,
-        stopFence: AgentRunStartStopFence
-    ) async -> (user: String, initial: String)? {
-        await linkExecutionRuntime.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: stopFence)
-    }
-
     func providerSwitchPreparationIsCurrent(_ preparation: ProviderSwitchSendPreparation, session: TabSession) -> Bool {
         linkExecutionRuntime.providerSwitchPreparationIsCurrent(preparation, session: session)
-    }
-
-    func providerSwitchHistoryToolAllowed(_ session: TabSession, destination: AgentProviderKind? = nil) -> Bool {
-        linkExecutionRuntime.providerSwitchHistoryToolAllowed(session, destination: destination)
-    }
-
-    func providerSwitchReadReferenceIsCurrent(_ descriptor: ProviderSwitchCarrierDescriptor, session: TabSession, destination: AgentProviderKind? = nil) -> Bool {
-        linkExecutionRuntime.providerSwitchReadReferenceIsCurrent(descriptor, session: session, destination: destination)
-    }
-
-    static func providerSwitchIsInFlightOnActiveRun(_ session: TabSession) -> Bool {
-        AgentSessionLinkExecutionRuntime.providerSwitchIsInFlightOnActiveRun(session)
     }
 
     /// Assembles the pure readiness snapshot from live target state.
@@ -109,38 +72,6 @@ extension AgentModeViewModel {
         ignoresProviderSwitchStalenessAfterAcceptance: Bool = false
     ) -> AgentSessionLinkDeliveryReadiness.Snapshot {
         AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(session: session, endpointMatchesGrant: endpointMatchesGrant, isClosing: isClosing, ignoresComposerSubmissionInFlight: ignoresComposerSubmissionInFlight, ignoresSelfCompactRequestID: ignoresSelfCompactRequestID, ignoresProviderSwitchStalenessAfterAcceptance: ignoresProviderSwitchStalenessAfterAcceptance)
-    }
-
-    /// Runs the whole cross-session send transaction for one exact live endpoint.
-    ///
-    /// The ordering is the security contract and is not rearrangeable:
-    ///
-    /// 1. exact endpoint identity of **both** incarnations plus the target window's real closing
-    ///    state,
-    /// 2. pure readiness admission (no mutation on refusal),
-    /// 3. local composer claim through the ordinary admission machinery,
-    /// 4. authorization commit fence **before any row exists**,
-    /// 5. post-hop revalidation of both identities, closing state, claim, and readiness,
-    /// 6. attributed row + durable persistence as the delivery linearization point,
-    /// 7. post-persistence revalidation of both identities, closing state, workspace, and claim,
-    /// 8. provider-only envelope and a direct turn start.
-    ///
-    /// Steps 1–5 mutate nothing, so every refusal before step 6 leaves the target byte-identical.
-    /// Step 6 awaits, so step 7 exists for the same reason step 5 does; unlike step 5 it can no
-    /// longer refuse, because the row is already durably the target's. It withholds the provider
-    /// start and reports `persisted` instead.
-    ///
-    /// - Parameter liveness: host-backed probe for the facts this view model cannot see — the
-    ///   observer incarnation, which usually lives in another window, and the target window's own
-    ///   teardown state. It is re-read at every fence and never consults link liveness, because
-    ///   manual revocation is intentionally allowed to lose once the commit fence has been won.
-    func agentSessionLinkPerformSend(
-        to candidate: AgentSessionLinkEndpointCandidate,
-        request: AgentSessionLinkSendRequest,
-        liveness: @escaping AgentSessionLinkSendLivenessProbe,
-        commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
-    ) async -> AgentSessionLinkSendTransactionOutcome {
-        await linkExecutionRuntime.agentSessionLinkPerformSend(to: candidate, request: request, liveness: liveness, commitAuthorization: commitAuthorization)
     }
 
     /// Persistence and direct start only. The caller owns authority, readiness and the empty
@@ -171,13 +102,5 @@ extension AgentModeViewModel {
         dispatchIsCurrent: @MainActor () -> Bool
     ) async -> AgentSessionLinkSendTransactionOutcome {
         await linkExecutionRuntime.startPersistedNoncomposerTurn(session: liveSession, tabID: tabID, claim: claim, savedItemID: savedItemID, acceptedAt: acceptedAt, providerMessage: providerMessage, stopFence: stopFence, providerSwitchPreparation: providerSwitchPreparation, dispatchIsCurrent: dispatchIsCurrent)
-    }
-
-    /// The live session for an endpoint, or `nil` unless every identity field still matches
-    /// byte-for-byte and generation-for-generation.
-    func agentSessionLinkLiveSession(
-        matching candidate: AgentSessionLinkEndpointCandidate
-    ) -> TabSession? {
-        linkExecutionRuntime.agentSessionLinkLiveSession(matching: candidate)
     }
 }

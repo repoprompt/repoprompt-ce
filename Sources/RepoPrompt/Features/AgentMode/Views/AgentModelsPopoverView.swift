@@ -2,6 +2,26 @@ import RepoPromptAIContracts
 import RepoPromptSettingsCore
 import SwiftUI
 
+extension AgentModelCatalog.TaskLabelKind {
+    var presentationIconName: String {
+        switch self {
+        case .explore: "magnifyingglass"
+        case .engineer: "hammer.fill"
+        case .pair: "person.2.fill"
+        case .design: "paintbrush.fill"
+        }
+    }
+
+    var presentationColor: Color {
+        switch self {
+        case .explore: .teal
+        case .engineer: .blue
+        case .pair: .purple
+        case .design: .orange
+        }
+    }
+}
+
 /// Popover for picking every sub-agent / role model choice in Agent Mode:
 ///
 /// - Oracle / Plan model
@@ -360,9 +380,9 @@ struct AgentModelsPopoverView: View {
     ) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 8) {
-                Image(systemName: iconForRole(resolution.role))
+                Image(systemName: resolution.role.presentationIconName)
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .semibold))
-                    .foregroundColor(colorForRole(resolution.role))
+                    .foregroundColor(resolution.role.presentationColor)
                     .frame(width: fontPreset.scaledClamped(14, max: 20))
 
                 Text(resolution.roleLabel)
@@ -483,7 +503,6 @@ struct AgentModelsPopoverView: View {
         for resolution: MCPAgentRoleDefaultsService.RoleDefaultResolution
     ) -> [StableMenuItem] {
         let expectedScope = editingScope
-        let expected = resolution.effective
         let pins = GlobalSettingsStore.shared.mcpAgentRoleModelParameters(scope: expectedScope)?[resolution.role.rawValue] ?? []
         var items = AgentModelCatalog.selectableAgents(availability: availability).map { agent in
             AgentModelStableMenuItems.agentSubmenu(
@@ -495,26 +514,14 @@ struct AgentModelsPopoverView: View {
                 flattenSingleCodexGroups: true,
                 cursorSelections: pins,
                 onSelectCursorParameter: { option, parameter in
-                    guard editingScope == expectedScope,
-                          let live = roleResolutions.first(where: { $0.role == resolution.role }),
-                          live.effective.agent == expected.agent, live.effective.modelRaw == expected.modelRaw else { return }
-                    let existing = GlobalSettingsStore.shared.mcpAgentRoleModelParameters(scope: expectedScope)?[resolution.role.rawValue] ?? []
-                    MCPAgentRoleDefaultsService.setModelParameter(
-                        ACPModelParameterSelection.normalized(existing + [parameter]), for: resolution.role,
-                        displayed: .init(agent: .cursor, modelRaw: option.rawValue), scope: expectedScope
-                    )
-                    bumpRoleDefaults()
+                    updateRoleModelParameters(resolution, modelRaw: option.rawValue, expectedScope: expectedScope) { existing in
+                        ACPModelParameterSelection.normalized(existing + [parameter])
+                    }
                 },
                 onClearCursorParameter: { option, identity in
-                    guard editingScope == expectedScope,
-                          let live = roleResolutions.first(where: { $0.role == resolution.role }),
-                          live.effective.agent == expected.agent, live.effective.modelRaw == expected.modelRaw else { return }
-                    let existing = GlobalSettingsStore.shared.mcpAgentRoleModelParameters(scope: expectedScope)?[resolution.role.rawValue] ?? []
-                    MCPAgentRoleDefaultsService.setModelParameter(
-                        existing.filter { $0.identity != identity }, for: resolution.role,
-                        displayed: .init(agent: .cursor, modelRaw: option.rawValue), scope: expectedScope
-                    )
-                    bumpRoleDefaults()
+                    updateRoleModelParameters(resolution, modelRaw: option.rawValue, expectedScope: expectedScope) { existing in
+                        existing.filter { $0.identity != identity }
+                    }
                 }
             ) { selectedAgent, selectedOption in
                 guard editingScope == expectedScope else { return }
@@ -544,6 +551,24 @@ struct AgentModelsPopoverView: View {
         return items
     }
 
+    private func updateRoleModelParameters(
+        _ resolution: MCPAgentRoleDefaultsService.RoleDefaultResolution,
+        modelRaw: String,
+        expectedScope: AgentModelsEditingScope,
+        transform: ([ACPModelParameterSelection]) -> [ACPModelParameterSelection]
+    ) {
+        let expected = resolution.effective
+        guard editingScope == expectedScope,
+              let live = roleResolutions.first(where: { $0.role == resolution.role }),
+              live.effective.agent == expected.agent, live.effective.modelRaw == expected.modelRaw else { return }
+        let existing = GlobalSettingsStore.shared.mcpAgentRoleModelParameters(scope: expectedScope)?[resolution.role.rawValue] ?? []
+        MCPAgentRoleDefaultsService.setModelParameter(
+            transform(existing), for: resolution.role,
+            displayed: .init(agent: .cursor, modelRaw: modelRaw), scope: expectedScope
+        )
+        bumpRoleDefaults()
+    }
+
     private func bumpRoleDefaults() {
         roleDefaultsRevision &+= 1
         DispatchQueue.main.async {
@@ -558,24 +583,6 @@ struct AgentModelsPopoverView: View {
                 object: nil,
                 userInfo: userInfo
             )
-        }
-    }
-
-    private func iconForRole(_ role: AgentModelCatalog.TaskLabelKind) -> String {
-        switch role {
-        case .explore: "magnifyingglass"
-        case .engineer: "hammer.fill"
-        case .pair: "person.2.fill"
-        case .design: "paintbrush.fill"
-        }
-    }
-
-    private func colorForRole(_ role: AgentModelCatalog.TaskLabelKind) -> Color {
-        switch role {
-        case .explore: .teal
-        case .engineer: .blue
-        case .pair: .purple
-        case .design: .orange
         }
     }
 

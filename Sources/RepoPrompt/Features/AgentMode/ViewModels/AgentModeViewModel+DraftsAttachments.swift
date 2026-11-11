@@ -131,11 +131,6 @@ extension AgentModeViewModel {
         }
     }
 
-    /// Loading the stored text acknowledges exactly the fragments included in it.
-    func loadDraftSnapshotForComposer(for tabID: UUID) -> AgentComposerDraftSnapshot {
-        draftRuntime.loadSnapshot(tabID: tabID)
-    }
-
     func publishDraftRestoration(_ event: AgentComposerDraftRestorationEvent) {
         draftRestorationEvent = event
         syncComposerUIState()
@@ -559,18 +554,6 @@ extension AgentModeViewModel {
         )
     }
 
-    func repairRetainedAttachmentPathsAfterHydration(_ session: TabSession, sessionID: UUID) {
-        attachmentRuntime.repairRetainedAttachmentPathsAfterHydration(session, sessionID: sessionID)
-    }
-
-    func applyRetainedAttachments(_ retained: [UUID: AgentFileAttachment], to session: TabSession, sessionID: UUID) {
-        attachmentRuntime.applyRetainedAttachments(retained, to: session, sessionID: sessionID)
-    }
-
-    func waitForAttachmentRetention() async {
-        await attachmentRuntime.waitForRetention()
-    }
-
     /// Low-priority, once-per-process sweep of a workspace's attachment storage: session folders
     /// whose transcript is gone, and temporary copies older than seven days not pending anywhere.
     /// Called from the live workspace-switch path once the activation owns the session index.
@@ -587,7 +570,9 @@ extension AgentModeViewModel {
                 try? await Task.sleep(nanoseconds: delayNanoseconds)
             }
             guard let self else { return nil }
-            let protection = liveAttachmentSweepProtection()
+            let protection = withExtendedLifetime(self) {
+                AgentSessionRuntimeStore.shared.attachmentSweepProtection()
+            }
             return await Task.detached(priority: .background) {
                 AgentSessionAttachmentStore.sweep(
                     agentSessionsFolder: agentSessionsFolder,
@@ -597,11 +582,6 @@ extension AgentModeViewModel {
                 )
             }.value
         }
-    }
-
-    /// Includes window-free runtime scopes and admitted retention operations after turn cleanup.
-    func liveAttachmentSweepProtection() -> (sessionIDs: Set<UUID>, temporaryPaths: Set<String>) {
-        AgentSessionRuntimeStore.shared.attachmentSweepProtection()
     }
 
     /// Local image files this tab's Agent session attached itself — the in-flight turn plus any
@@ -644,27 +624,6 @@ extension AgentModeViewModel {
             paths.append(standardized)
         }
         return paths
-    }
-
-    @discardableResult
-    func reserveAttachmentsForTurn(_ attachments: [AgentFileAttachment], session: TabSession) -> UUID? {
-        attachmentRuntime.reserveAttachmentsForTurn(attachments, session: session)
-    }
-
-    func markAttachmentsConsumed(for session: TabSession, reservationID: UUID?) {
-        attachmentRuntime.markAttachmentsConsumed(for: session, reservationID: reservationID)
-    }
-
-    func stageConsumedAttachmentFilesForDeferredCleanup(_ attachments: [AgentFileAttachment], session: TabSession) {
-        attachmentRuntime.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session: session)
-    }
-
-    func consumeDeferredAttachmentCleanup(for session: TabSession, shouldDeleteFiles: Bool) {
-        attachmentRuntime.consumeDeferredAttachmentCleanup(for: session, shouldDeleteFiles: shouldDeleteFiles)
-    }
-
-    func finalizeAttachmentsForTurn(for session: TabSession, reservationID: UUID? = nil, disposition: AttachmentTurnDisposition) {
-        attachmentRuntime.finalizeAttachmentsForTurn(for: session, reservationID: reservationID, disposition: disposition)
     }
 }
 

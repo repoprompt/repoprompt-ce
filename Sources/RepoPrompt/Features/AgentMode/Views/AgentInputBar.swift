@@ -155,7 +155,7 @@ struct AgentInputBar: View {
             storeDraft: { tabID, text, sequence in
                 agentModeVM.storeDraftText(for: tabID, text, acknowledgingThrough: sequence)
             },
-            loadDraft: { tabID in agentModeVM.loadDraftSnapshotForComposer(for: tabID) },
+            loadDraft: { tabID in agentModeVM.draftRuntime.loadSnapshot(tabID: tabID) },
             claimSubmit: { attempt in agentModeVM.claimComposerSubmitForImmediatePresentation(attempt) },
             executeSubmit: { claim, text in
                 await agentModeVM.executePresentedComposerSubmitAttempt(text: text, claim: claim)
@@ -1056,17 +1056,11 @@ struct AgentComposerView: View, Equatable {
         return Button {
             openAgentDecisionsSettings(section: .modelRouter)
         } label: {
-            HStack(spacing: 5) {
-                Image(systemName: "arrow.triangle.branch")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-                Text(serviceName.map { "Model Router · \($0)" } ?? "Model Router")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-            }
-            .foregroundColor(.accentColor)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(Color.accentColor.opacity(0.10))
-            .cornerRadius(6)
+            accentChipLabel(
+                icon: "arrow.triangle.branch",
+                title: serviceName.map { "Model Router · \($0)" } ?? "Model Router",
+                iconWeight: .medium
+            )
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Model Router")
@@ -1079,17 +1073,7 @@ struct AgentComposerView: View, Equatable {
         Button {
             openAgentDecisionsSettings(section: .autoEffort)
         } label: {
-            HStack(spacing: 5) {
-                Image(systemName: "gauge.open.with.lines.needle.33percent")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .regular))
-                Text("Auto Effort · \(serviceName)")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-            }
-            .foregroundColor(.accentColor)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(Color.accentColor.opacity(0.10))
-            .cornerRadius(6)
+            accentChipLabel(icon: "gauge.open.with.lines.needle.33percent", title: "Auto Effort · \(serviceName)")
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Auto Effort")
@@ -1134,7 +1118,7 @@ struct AgentComposerView: View, Equatable {
     }
 
     private var providerChipTitle: String {
-        let modelDisplayName = inputBarSelectedModelDisplayName
+        let modelDisplayName = props.selectedModelDisplayName
         let truncatedModelName = String.truncateModelName(
             modelDisplayName,
             maxLength: 28
@@ -1161,31 +1145,27 @@ struct AgentComposerView: View, Equatable {
         return "\(baseTooltip)\n\(AgentModelSelectionWarningVisuals.tooltip(agent: props.selectedAgent, rawModel: props.selectedModelRaw))"
     }
 
-    private var inputBarSelectedModelDisplayName: String {
-        props.selectedModelDisplayName
-    }
-
     private var connectAgentProvidersButton: some View {
-        Button(action: openCLIProvidersSettings) {
-            HStack(spacing: 5) {
-                Image(systemName: "terminal")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                Text("Connect CLI Providers")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-            }
-            .foregroundColor(.accentColor)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(Color.accentColor.opacity(0.10))
-            .cornerRadius(6)
+        Button(action: actions.openCLIProvidersSettings) {
+            accentChipLabel(icon: "terminal", title: "Connect CLI Providers")
         }
         .buttonStyle(.plain)
         .hoverTooltip("Open Settings to connect Claude Code, Codex, OpenCode, or Cursor for Agent Mode")
         .fixedSize(horizontal: true, vertical: false)
     }
 
-    private func openCLIProvidersSettings() {
-        actions.openCLIProvidersSettings()
+    private func accentChipLabel(icon: String, title: String, iconWeight: Font.Weight = .regular) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: icon)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: iconWeight))
+            Text(title)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+        }
+        .foregroundColor(.accentColor)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color.accentColor.opacity(0.10))
+        .cornerRadius(6)
     }
 
     private func openAgentDecisionsSettings(section: SettingsWindowCoordinator.AgentDecisionsSection) {
@@ -1494,57 +1474,50 @@ struct AgentComposerView: View, Equatable {
         }
     }
 
+    private var toolsButtonLabel: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "slider.horizontal.3")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+            Text("Tools")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+            Image(systemName: "chevron.down")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .semibold))
+        }
+        .foregroundColor(.primary)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .contentShape(Rectangle())
+    }
+
     @ViewBuilder
     private var codexToolsButton: some View {
         if props.selectedAgent == .codexExec {
-            HStack(spacing: 4) {
-                Image(systemName: "slider.horizontal.3")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                Text("Tools")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                Image(systemName: "chevron.down")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .semibold))
-            }
-            .foregroundColor(.primary)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .contentShape(Rectangle())
-            .onTapGesture {
-                guard !isCodexRunActive else { return }
-                showCodexToolsPopover.toggle()
-            }
-            .popover(isPresented: $showCodexToolsPopover, arrowEdge: .bottom) {
-                codexToolsPopoverContent
-            }
-            .opacity(isCodexRunActive ? 0.4 : 1.0)
-            .hoverTooltip(isCodexRunActive ? "Tool controls locked during active run" : "Configure Codex tools & MCP servers")
-            .fixedSize()
+            toolsButtonLabel
+                .onTapGesture {
+                    guard !isCodexRunActive else { return }
+                    showCodexToolsPopover.toggle()
+                }
+                .popover(isPresented: $showCodexToolsPopover, arrowEdge: .bottom) {
+                    codexToolsPopoverContent
+                }
+                .opacity(isCodexRunActive ? 0.4 : 1.0)
+                .hoverTooltip(isCodexRunActive ? "Tool controls locked during active run" : "Configure Codex tools & MCP servers")
+                .fixedSize()
         }
     }
 
     @ViewBuilder
     private var claudeToolsButton: some View {
         if props.selectedAgent.usesClaudeTooling {
-            HStack(spacing: 4) {
-                Image(systemName: "slider.horizontal.3")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                Text("Tools")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                Image(systemName: "chevron.down")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .semibold))
-            }
-            .foregroundColor(.primary)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .contentShape(Rectangle())
-            .onTapGesture {
-                showClaudeToolsPopover.toggle()
-            }
-            .popover(isPresented: $showClaudeToolsPopover, arrowEdge: .bottom) {
-                claudeToolsPopoverContent
-            }
-            .hoverTooltip("Configure Claude tools")
-            .fixedSize()
+            toolsButtonLabel
+                .onTapGesture {
+                    showClaudeToolsPopover.toggle()
+                }
+                .popover(isPresented: $showClaudeToolsPopover, arrowEdge: .bottom) {
+                    claudeToolsPopoverContent
+                }
+                .hoverTooltip("Configure Claude tools")
+                .fixedSize()
         }
     }
 
@@ -1684,9 +1657,7 @@ struct AgentComposerView: View, Equatable {
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                 Spacer()
                 if isSelected {
-                    Image(systemName: "checkmark")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
-                        .foregroundStyle(Color.accentColor)
+                    agentSelectionCheckmark(fontPreset: fontPreset)
                 }
             }
             .padding(.horizontal, 8)
@@ -1948,7 +1919,7 @@ struct AgentComposerView: View, Equatable {
             if props.hasAvailableAgentProviders {
                 showSteeringUnsupportedNotice(props.unavailableSelectedAgentMessage ?? "Connect this agent provider in Settings before sending.")
             } else {
-                openCLIProvidersSettings()
+                actions.openCLIProvidersSettings()
             }
             return
         }

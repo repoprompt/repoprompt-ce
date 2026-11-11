@@ -467,7 +467,7 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
 final class ClaudeContextWindowResolutionTests: XCTestCase {
     private func makeEstimator() -> ClaudeContextUsageEstimator {
         ClaudeContextUsageEstimator(tokenEstimator: { _ in 0 }, contextUsageBuilder: { usage, window in
-            AgentModeViewModel.contextUsageFromClaudeProviderTokens(usage, modelContextWindow: window)
+            AgentSessionUsageRuntime.contextUsageFromClaudeProviderTokens(usage, modelContextWindow: window)
         })
     }
 
@@ -513,12 +513,12 @@ final class ClaudeContextWindowResolutionTests: XCTestCase {
 
     func testRestoredRowsAboveTwoHundredThousandSurviveAnUnknownWindow() {
         let rows = [AgentTokenUsagePersist(runID: nil, turnID: nil, promptTokens: 0, completionTokens: 0, contextUsedTokens: 350_000)]
-        let restored = AgentModeViewModel.contextUsageFromClaudeProviderTokens(rows, modelContextWindow: nil)
+        let restored = AgentSessionUsageRuntime.contextUsageFromClaudeProviderTokens(rows, modelContextWindow: nil)
         XCTAssertEqual(restored?.lastTotalTokens, 350_000)
         XCTAssertNil(restored?.modelContextWindow)
 
         XCTAssertNil(
-            AgentModeViewModel.contextUsageFromClaudeProviderTokens(rows, modelContextWindow: 200_000)?.lastTotalTokens,
+            AgentSessionUsageRuntime.contextUsageFromClaudeProviderTokens(rows, modelContextWindow: 200_000)?.lastTotalTokens,
             "A known window still bounds restored rows"
         )
     }
@@ -582,7 +582,7 @@ final class ClaudeContextWindowResolutionTests: XCTestCase {
     func testCappedReportedWindowKeepsTheWindowVouch() {
         let viewModel = makeViewModel()
         let session = makeSession(autoCompactWindow: 400_000)
-        XCTAssertTrue(viewModel.ingestNonCodexUsageReport(
+        XCTAssertTrue(viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 150_000,
             modelContextWindow: 1_000_000, session: session
         ))
@@ -631,7 +631,7 @@ final class ClaudeContextWindowResolutionTests: XCTestCase {
 final class ClaudeContextWindowCapLifecycleTests: XCTestCase {
     private func makeEstimator() -> ClaudeContextUsageEstimator {
         ClaudeContextUsageEstimator(tokenEstimator: { _ in 0 }, contextUsageBuilder: { usage, window in
-            AgentModeViewModel.contextUsageFromClaudeProviderTokens(usage, modelContextWindow: window)
+            AgentSessionUsageRuntime.contextUsageFromClaudeProviderTokens(usage, modelContextWindow: window)
         })
     }
 
@@ -912,7 +912,7 @@ final class ClaudeContextWindowCapLifecycleTests: XCTestCase {
             codexControllerFactory: { _, _, _, _, _, _ in preconditionFailure("Context-window tests must not start a Codex session") }
         )
         let session = makeSession(cap: nil)
-        let estimator = viewModel.claudeContextUsageEstimator
+        let estimator = viewModel.usageRuntime.claudeContextUsageEstimator
         _ = estimator.ingestTurnFinalizationSignal(contextUsedTokens: 90000, modelContextWindow: 1_000_000, session: session)
         estimator.ingestSystemSignal("Context compacted", session: session)
         let before = session.contextUsageSnapshot

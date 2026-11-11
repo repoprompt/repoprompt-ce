@@ -33,6 +33,17 @@ struct AgentProviderSwitchPresentation<Content: View>: View {
     }
 }
 
+private extension View {
+    func providerSwitchBannerStyle() -> some View {
+        font(.callout)
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+            .padding(.horizontal, 24)
+            .padding(.bottom, 8)
+    }
+}
+
 private struct AgentProviderSwitchBanner: View {
     @ObservedObject var viewModel: AgentModeViewModel
     @ObservedObject var session: AgentTabSession
@@ -43,12 +54,7 @@ private struct AgentProviderSwitchBanner: View {
                 ProgressView().controlSize(.small)
                 Text("Finishing change…")
             }
-            .font(.callout)
-            .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
-            .padding(.horizontal, 24)
-            .padding(.bottom, 8)
+            .providerSwitchBannerStyle()
         }
         if let outcome = viewModel.providerSwitchBackgroundOutcome,
            outcome.session === session, outcome.binding == session.currentRestorationBindingToken
@@ -57,12 +63,7 @@ private struct AgentProviderSwitchBanner: View {
                 Text("Change didn't finish. Check this chat before trying again.")
                 Button("OK") { viewModel.providerSwitchBackgroundOutcome = nil }
             }
-            .font(.callout)
-            .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
-            .padding(.horizontal, 24)
-            .padding(.bottom, 8)
+            .providerSwitchBannerStyle()
         }
         if session.pendingHandoff.providerSwitchDelivery != nil {
             VStack(alignment: .leading, spacing: 6) {
@@ -82,12 +83,7 @@ private struct AgentProviderSwitchBanner: View {
                 }
                 .disabled(viewModel.providerSwitchMutation != nil)
             }
-            .font(.callout)
-            .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
-            .padding(.horizontal, 24)
-            .padding(.bottom, 8)
+            .providerSwitchBannerStyle()
         }
     }
 }

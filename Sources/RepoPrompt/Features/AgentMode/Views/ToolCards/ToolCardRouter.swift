@@ -831,16 +831,6 @@ struct ToolCallCard: View {
             && MCPIntegrationHelper.isRepoPromptToolNameAfterNormalization(item.toolName)
     }
 
-    private var onTap: (() -> Void)? {
-        guard let userInfo = oracleToolCallPopoverUserInfo(
-            item: item,
-            openContext: oracleOpenContext
-        ) else { return nil }
-        return {
-            NotificationCenter.default.post(name: .showAgentOraclePopover, object: nil, userInfo: userInfo)
-        }
-    }
-
     var body: some View {
         StaticToolCardContainer(
             iconName: toolIcon(for: item.toolName),
@@ -851,7 +841,7 @@ struct ToolCallCard: View {
             timestamp: item.timestamp,
             showsTimestamp: !showsCancelButton,
             headerTrailingView: showsCancelButton ? AnyView(ToolCardCancelButton(action: cancelActiveToolsAction!)) : nil,
-            onTap: onTap
+            onTap: agentOraclePopoverAction(userInfo: oracleToolCallPopoverUserInfo(item: item, openContext: oracleOpenContext))
         ) {
             // Tool calls in progress don't show args by default
             EmptyView()

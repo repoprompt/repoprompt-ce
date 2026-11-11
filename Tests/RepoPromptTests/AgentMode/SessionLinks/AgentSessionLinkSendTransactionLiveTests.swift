@@ -636,7 +636,7 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         liveness: @escaping AgentSessionLinkSendLivenessProbe = { liveLiveness },
         commit: @escaping @MainActor () async -> AgentSessionLinkSendCommitOutcome = { .committed }
     ) async -> AgentSessionLinkSendTransactionOutcome {
-        await fixture.viewModel.agentSessionLinkPerformSend(
+        await fixture.viewModel.linkExecutionRuntime.agentSessionLinkPerformSend(
             to: fixture.candidate,
             request: request ?? makeRequest(),
             liveness: liveness,
