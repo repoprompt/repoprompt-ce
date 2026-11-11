@@ -8302,3 +8302,83 @@ RepromptAutomation two, Routing and routing-integration tests zero. Fresh index 
 focused/affected/style/index gates, not full publication/products/live-app/release qualification.
 The overseer subsequently authorized publication after #1679 merged as `99d4e718d`; integrate that
 exact tree-identical squash and revalidate the publication tree before opening M9.2g.
+
+#### M9.2g merged publication gates — isolation and accepted under-watch results
+
+Merged head `1fed775646ad48f19f2580115cabc728fddf40cd` failed focused ticket
+`02997ccf-b3d4-4605-98e2-264a7b828864`: 1,118 executed, four skipped, five assertions in
+`AgentSessionLinkHandoffInheritanceTests.testRestoredPendingSwitchRefusalIsAwaitedAndPreservesLocalOrMCPInputState`
+(lines 4180–4187). The deferred local submission returned `.submitted` instead of the expected
+refusal, omitted draft-restoration feedback, and consumed input/workflow/pending handover state.
+Initially this was treated as a likely M9.2g regression, not classified as the historical
+broad-only intermittent, pending isolation on head and `origin/main` (`c791cd13a`). Publication
+was blocked at that point; the test expectations were retained. Focused test execution took 1,444.026s; other publication
+tickets remained queued/running. Context was compacted before investigation resumed.
+
+Exact-test isolation passed unchanged on head `1fed77564` (ticket
+`d89d6730-e91f-4eb5-9534-98c522451d3b`, 4.785s) and exact main `c791cd13a` (ticket
+`7b0af4d0-d336-4910-983d-4a3390f4a595`, 5.383s). Main's complete HandoffInheritance suite
+also passed 104 tests (ticket `e60b9a19-673f-4aef-bfd6-2186e64177cd`, 127.741s; target case
+4.794s). No source or assertion changes were made. Original unstarted broad/handoff/product
+jobs were cancelled before heavy execution to prioritize isolation; their cancellations are not
+qualification. Restored the feature branch and the exact ledger-only comparison stash, then
+queued head handoff, focused rerun, broad, and products. The original focused failure is still
+unexplained, not classified as inherited or fixed.
+
+The head HandoffInheritance suite subsequently passed **105 tests** (ticket
+`5ca2db1d-32f6-4374-a243-78ef72fceeb6`, 109.521s). Focused rerun
+`842bf038-3d25-4c97-84c1-586217f1b333` ran **1,118 tests, four skipped**, with the pending-switch
+case and all 105 handoff tests passing; it failed one different case:
+`SessionAdminWorktreeRecoveryTests.testUnscopedLiveBindingRequiresExplicitWorkspaceQualificationAndFreshHydration`
+(line 1495), a three-second `foreground drafts published` fixture timeout. Rerun test execution
+was 747.596s. The overseer explicitly authorized publication: pending-switch is “intermittent
+under local load, did not reproduce in rerun or isolation, under watch”; the admin fixture wait
+was independently seen by M9.2h/#1684 and passed suite reruns there. These are accepted under-watch
+results, not a green focused gate or root-cause fix. CI recurrence of either belongs to this lane
+to investigate in production code. The now-unneeded queued admin isolation ticket was cancelled
+before execution after that classification.
+
+Integration was completed before these gates: `fb19813cb` and exact squash `99d4e718d` both have
+tree `754886815bacdb8c80ebf1956e3708c51a7a2ffb`; their diff is empty. Ours merge `2ac8635a4`
+targeted **99d4e718d only**. Normal merge `1fed77564` then brought main `c791cd13a` (#1681/M9.2f)
+without conflicts or dropping incoming changes. Both merges used `--no-commit`, passed staged
+contribution preflight, and were committed only after terminal success. Main-relative delta is
+36 files (35 Swift plus this ledger); `git merge-tree --write-tree HEAD origin/main` was clean,
+tree `7e253a05dcdef14cc20e815ecb0c33f86afc6e18`. Publication uses the new branch
+`runtime/20261111-m9-2g-startup-execution`, not the closed #1679 branch.
+
+Broad ticket `953b6e30-84e3-4d22-8090-573d0867c33e` completed with **2,779 executed, 22 skipped,
+seven assertions/errors across three cases** (app 2,726; Settings 1, SecureStorage 27, Domain 7,
+Providers 18). App execution took 1,802.074s. Five assertions in
+`ConcurrentSameWorkspaceAgentRunAdmissionTests.testTypedAdmissionRejectionLeavesNoIdentityAcrossRestartAndDispatchesNoProvider`
+(lines 1568/1573) reported one extra identity. The other cases were
+`SessionAdminWorktreeRecoveryTests.testCompetingBoundWritersCannotMutateConfigurationOrCreateWorktree`
+(`ambiguousGitTopology`) and `testExistingBranchWithoutCheckoutDoesNotInventBindRecovery`
+(the same three-second foreground-drafts fixture wait). The overseer classified the worktree
+fixture failures as known load intermittents independently observed in M9.2h/#1684.
+
+The requested single identity-isolation pair passed unchanged: head `1fed77564`, ticket
+`f8202139-4dd1-4599-8cd6-eec588d6fcbd`, **0.844s**; exact main `c791cd13a`, ticket
+`1b23f00d-1610-4c6f-8c9c-ee301f8a0797`, **0.818s**. Per the overseer's explicit decision rule,
+classify that case as broad-only intermittent, not root-caused, under watch, and publish.
+Neither the tests nor production code were changed to obtain the isolation passes. CI recurrence
+of any under-watch case belongs to this lane. Both temporary main comparisons preserved only the
+ledger in exact-path stashes, restored the feature branch and reapplied those stashes once; no
+history rewrite or protected-artifact mutation occurred.
+
+Both products `8d4f1c2f-8c86-46a2-864c-ff651cdda0d3` and full lint
+`6fab2162-0383-42e5-8470-c8eeead9e082` passed. Warning occurrence maxima across all 35 changed Swift
+files versus retained integrated compile `a0c674e9` have no positive delta (49 existing total:
+ACP runner 1, Claude runner 3, VM RepromptAutomation 2, VM 4, Claude approval tests 1, Codex wedge
+17, ACP compact tests 1, AutoWake 11, catalog integration 2, prompt adapter 6, runner adapter 1;
+other 24 files zero). This is not a zero-warning claim or an exact-main cold-build comparison.
+An index attempt overlapping the next isolation build refused freshness (zero stale/unindexed);
+it is not a pass. Final restored-head both-product build
+`896ab51f-ab5f-4ed0-83e5-86c38fd1b6c2` passed. The subsequent non-overlapping index check passed
+**1,264/1,360 wrong-way edges and 53/66 largest cycle**, with unchanged ratchet baselines. The
+wrong-way count is two above the last pre-main-merge local receipt (1,262); exact attribution of
+those two integration edges was not audited. Re-auditing warning counts including that final
+product compile still shows no positive per-file delta. All coordinated tickets are terminal
+and collected. No live-app/smoke, release, sanitizer or hosted-CI success is claimed for this
+publication head. The draft PR includes an explicit M9.3b handoff distinguishing runtime-owned
+admission/runner seams from remaining VM orchestration and provider/coordinator internals.
