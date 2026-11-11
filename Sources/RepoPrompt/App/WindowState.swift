@@ -223,11 +223,12 @@ class WindowState: ObservableObject {
 
     private static let mainWindowTabbingIdentifier: NSWindow.TabbingIdentifier = "com.repoprompt.main"
 
-    private(set) static var windowCounter = 0
+    static var windowCounter: Int {
+        MCPRouteIdentityAllocator.latestWindowID
+    }
 
     private static func allocateWindowID() -> Int {
-        windowCounter += 1
-        return windowCounter
+        MCPRouteIdentityAllocator.allocateWindowID()
     }
 
     #if DEBUG
@@ -275,6 +276,7 @@ class WindowState: ObservableObject {
 
     // MARK: - Per-Window View Models
 
+    let workspaceResources: AgentHostWorkspaceResources
     let workspaceFileContextStore: WorkspaceFileContextStore
     let workspaceSearchService: WorkspaceSearchService
     let selectionCoordinator: WorkspaceSelectionCoordinator
@@ -739,19 +741,23 @@ class WindowState: ObservableObject {
         borrowing source: WindowState,
         agentModeViewModelFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil
     ) -> WindowState {
-        source.apiSettingsViewModel.retainForManagedRuntime()
+        guard let settingsLease = APISettingsRuntimeLease.acquire(from: source.apiSettingsViewModel) else {
+            preconditionFailure("Prepared owner requires live settings")
+        }
         return WindowState(
             contextBuilderProviderFactory: nil, loadStoredAPISettingsDataOnInit: false,
             codexModelPollingService: .shared, domainRuntimeOverride: source.compositionDomainRuntime,
             keyManager: source.keyManager,
             agentModeViewModelFactory: agentModeViewModelFactory, sessionRuntimeWorkspace: workspace,
-            borrowedAPISettingsViewModel: source.apiSettingsViewModel
+            borrowedAPISettingsViewModel: source.apiSettingsViewModel,
+            managedSettingsLease: settingsLease
         )
     }
 
     let isPreparedSessionOwner: Bool
     private let compositionDomainRuntime: MCPDomainRuntime?
     private var didReleaseManagedSettings = false
+    private let managedSettingsLease: APISettingsRuntimeLease?
     private var preparedSessionTeardownTask: Task<Bool, Never>?
     var isPreparedSessionTeardownInFlight: Bool {
         preparedSessionTeardownTask != nil
@@ -775,7 +781,7 @@ class WindowState: ObservableObject {
             guard self.agentModeViewModel.releasePreparedOversightWriterAfterDrain() else { return false }
             if !self.didReleaseManagedSettings {
                 self.didReleaseManagedSettings = true
-                self.apiSettingsViewModel.releaseManagedRuntime()
+                self.managedSettingsLease?.release()
             }
             return true
         }
@@ -796,8 +802,10 @@ class WindowState: ObservableObject {
         keyManager injectedKeyManager: KeyManager? = nil,
         agentModeViewModelFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil,
         sessionRuntimeWorkspace: WorkspaceModel? = nil,
-        borrowedAPISettingsViewModel: APISettingsViewModel? = nil
+        borrowedAPISettingsViewModel: APISettingsViewModel? = nil,
+        managedSettingsLease: APISettingsRuntimeLease? = nil
     ) {
+        self.managedSettingsLease = managedSettingsLease
         isPreparedSessionOwner = sessionRuntimeWorkspace != nil
         compositionDomainRuntime = domainRuntimeOverride
         // Assign a unique window ID
@@ -831,6 +839,7 @@ class WindowState: ObservableObject {
         )
         compositionSpan.end()
 
+        workspaceResources = composition.workspaceResources
         workspaceFileContextStore = composition.workspaceFileContextStore
         workspaceSearchService = composition.workspaceSearchService
         selectionCoordinator = composition.selectionCoordinator

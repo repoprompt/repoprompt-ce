@@ -575,10 +575,17 @@ PY
   if grep -q -E 'registerWindow|publishDomainRoutingBinding' <<<"$m3_read_resolver"; then
     fail "M3 read resolution mutates shared presentation routing"
   fi
+  m3_host_routes="Sources/RepoPrompt/Infrastructure/MCP/AppShared/MCPHostRouteResources.swift"
   if ! grep -q 'domainReadAppExecutionContexts\[invocation.invocationID\]' "$m3_app_read_routing" \
     || ! grep -q 'releaseDomainReadAppExecutionContext' "$m3_app_read_routing" \
     || ! grep -q 'registerFallbackDomainReadContext' "$m3_app_read_routing" \
-    || ! grep -q 'domainRoutingConnectionIDs' "$m3_app_read_routing"; then
+    || ! grep -Fq 'routeResources.retainConnection(registration)' "$m3_app_read_routing" \
+    || ! grep -Fq 'resources.releaseDisconnectedConnection(connectionID)' "$m3_app_read_routing" \
+    || ! grep -Fq 'routeResources.closeDomainRoute()' "$m3_app_read_routing" \
+    || ! grep -Fq '[UUID: DomainConnectionRegistration]' "$m3_host_routes" \
+    || ! grep -Fq 'connections.removeValue(forKey: connectionID)' "$m3_host_routes" \
+    || ! grep -Fq 'coordinator.unregisterConnection(registration' "$m3_host_routes" \
+    || ! grep -Fq 'domainRuntime.domainHost.releaseConnection(' "$m3_host_routes"; then
     fail "M3 invocation snapshot, fallback authority, or connection-lifecycle seam missing"
   fi
   if ! grep -q 'context.handle == nil' "$m3_domain_provider"; then

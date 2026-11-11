@@ -7434,3 +7434,124 @@ including the corrected prepared-owner visit case (one), runtime store (16), pre
 notification coordinator (15) and notification planner (12). Full lint
 `fdb3ba6e-3fcd-4566-ad9d-8ea4dba50a45` passed. These tickets survived the host-app restart;
 their terminal state and exact selected cases were reconciled before more work was submitted.
+
+### M9.3b PR1 — shared host route and resource ownership (refs #1406)
+
+Base `99d4e718d` (#1679). This is the first resource extraction in the expanded visible-and-saved
+host plan, **not executable host cutover**. Prepared-window execution, visible scope/coordinator
+composition and explicit close/switch cancellation remain unchanged. No M9.2f/g/h command,
+worktree or provider-execution body is moved in this slice.
+
+- `MCPRouteIdentityAllocator` supplies one non-reusing integer namespace for presentation windows
+  and independently allocated host routes. Host allocation does not change the latest presentation
+  window selector. `MCPHostRouteIdentity` adds exact resource identity; the explicit `legacyWindow`
+  adapter preserves existing transport IDs until visible composition changes atomically.
+- `MCPHostRouteResources` now owns the existing run-route bindings/lifetime, tool-execution runtime,
+  domain route registration, exact connection receipts and catalog handle. The legacy MCP server
+  forwards to that same owner. Catalog transitions serialize independently of a presenter and use
+  the captured domain runtime, including the existing protected-mutation/long-running wrappers;
+  no second router, tool registry or lifecycle manager is introduced. Domain protocol route slots
+  still use the wire name `window`; constructing one does not construct or register a UI window.
+- Domain admission close is deliberately separate from full owner withdrawal: legacy window
+  teardown unregisters its domain route **before** its existing explicit run drain, so mappings
+  retain their prior lifetime through that drain. Transport disconnect retains its existing
+  cross-server resolution behavior; owner teardown consumes only previously retained exact
+  connection generations and cannot retract a successor. Resource close does not cancel tools
+  or assert provider/session settlement. The M3 source-layout guard now checks that retained
+  connection receipt storage and exact cleanup live in this owner, plus server retain/disconnect/close
+  delegation, instead of requiring the removed VM-owned UUID set.
+- `AgentHostWorkspaceResources` builds the same production file store used by windows, reads the
+  existing domain context authority and acquires exact root-lifetime retention with post-await
+  validation. Requested roots must cover canonical workspace paths; an empty workspace may have
+  an empty set. Retained roots defer unload before any teardown effect. Last release joins deferred
+  unload, a newer load cancels old unload intent, and stale tokens cannot unload replacement roots.
+  This is read/resource currency, **not** writer, mutation, consent or worktree admission.
+- `APISettingsRuntimeLease` retains an explicitly supplied existing live settings owner, never a
+  first-window election, credentials snapshot or second settings catalog. The prepared adapter uses
+  it at the existing acquire/drained-release boundaries. Both settings and workspace resources can
+  be acquired with no window construction; presentation invalidation remains later work.
+
+Tests exercise zero-window identity/domain/catalog/settings/context acquisition, registration
+failure, runtime affinity, exact connection replacement and cross-owner disconnect, unchanged legacy
+mapping lifetime, settings close deferral/idempotence, root unload/last-release and replacement
+fences, and refusal without partial root retention. Root-store cases use the existing app composition
+test suite because its production convenience initializer lives in the app module; no new app-import
+file or lower-module test-only factory was added. The single review found the premature lifetime
+withdrawal and cross-owner disconnect regressions; both were corrected before publication.
+
+**Next cutovers, in order:** PR2 composes every visible session through one executable host before
+creation, keyed by `(window, workspace activation epoch)`, not workspace UUID alone. It installs the
+host's route/link endpoints, real MCP capabilities, settings/context leases and coordinators, while
+leaving a presentation lease and explicit legacy stop adapter on the window. This requires the
+M9.2g startup/provider completion and an explicit inventory/ownership agreement for the M9.2f/h
+admin/worktree bodies (`SessionAdminWindowsHosts`, `AgentSessionWorktreeRuntime`,
+`AgentModeViewModel+SelfWorktreeRelocation`, `MCPWorktreeToolProvider`, `VCSService`). Retain their
+exact admission across IO; do not wrap VM-only effects as a hidden host. This PR does not touch them.
+
+PR3 then reuses that same executable factory plus phase-A `loadRuntime`/storage composition for
+saved-only targets, resolves the canonical writer, settles required saves and retires the prepared
+branches **together**: `WindowStatesManager+AgentSessionLinks` preparation/window-catalog adapter,
+`WindowState` prepared constructor/teardown, `WindowStateManager` prepared/retiring maps and
+logout/shutdown enumeration, and `AgentSessionCarrierResolver` weak prepared-owner augmentation.
+Visit, deletion, consent revocation and links must use the actual writer's host, with no fake window
+or fallback to the latest window. All-run survival, last-window background mode and presentation
+handoff/drain policy remain M9.4. PR1 does not complete M9.3b or #1406.
+
+Validation receipts (all local, no CI logs or visible app lifecycle actions):
+
+- Base `99d4e718d` ticket `5734f137-3b92-4df1-9706-a141f473a18f`: 15 tests passed and the
+  pre-edit compiler warning occurrence baseline was captured.
+- Final resource/route/close/prepared-target/root-catalog selection
+  `9e9b7938-1e21-4dff-9a74-fafaf353787f`: **270 tests passed**, zero failures. This includes
+  existing 200,001-file root fixtures, not only the new small lease cases. Catalog coverage uses a
+  deterministic canonical binding through the actual registry and app binder; it is not provider
+  execution or saved-host activation qualification.
+- Additional link/admission ticket `af706df9-a729-4636-83b5-ff5356707012` executed **393 tests**:
+  236 runtime-bridge and 98 tool-service cases passed; admission passed 58/59. The one failing
+  `testCanonicalDirtyAdmissionErrorIncludesEvidenceAndDoesNotMaskLaterFailure` had three assertions:
+  its setup `replaceWorking` returned `.conflict` instead of `.applied`, so the intended dirty state
+  was not installed and the later refusal assertions also failed. Isolated head ticket
+  `15720872-7b85-41c3-8629-1b31eb6d19a8` passed that one case. This is **broad-run-only observed,
+  not root-caused**, not a green batch or proof of inheritance; an exact-base execution of this case
+  was not performed. No assertion, retry or admission implementation was changed to obtain green.
+  The fixture separately drains scheduled saves but does not join its working-document publisher;
+  that is a source-grounded race hypothesis, not a demonstrated cause. The draft remains unqualified
+  for merge pending resolution/acceptance of this evidence gap.
+- Fresh compiler-index check after all jobs settled passed: **1,261/1,360 wrong-way file edges,
+  53/66 largest cycle components**. No ratchet baseline was changed. No full-suite, live-app,
+  real-provider, release or hosted-CI qualification is claimed.
+- Both products (`RepoPrompt`, `repoprompt-mcp`):
+  `524ade5c-ac01-4bc1-8855-1c4e8c26404e` passed. Final full-tree lint
+  `b277a521-77fd-42b6-87ce-63317dbc396a` passed (0/2,161 Swift files needed formatting).
+- Earlier iterations are not green receipts: `4b1df425-edf4-4238-a308-c3b8e020ff4a` exposed the
+  module fixture's missing app factory, and `ad2d43e4-8b13-4a81-bcad-26ac5f985e24` compiled but
+  passed 53/54 cases because the real registry rejected the empty catalog fixture. Both were fixed;
+  no production guard or assertion was weakened. Queued product ticket `a5f470f9-5995-41ea-a3b7-3b7b129c1d07`
+  was cancelled before execution to include the final readiness correction.
+
+Touched-file compiler warning **occurrences**, not deduplicated diagnostics, are below. B is the
+pre-edit base compile; H is the completed app/test compilation in `ad2d43e4`; F is the final
+incremental compilation in `9e9b7938`. Zero emissions in an incremental run do not mean an existing
+warning was fixed or that every file recompiled. The product gate emitted no file-qualified Swift
+warnings. The F increase in `MCPServerViewModel` is explicitly retained: its unchanged `workspaceSearch`
+function-value conversion at line 1732 emitted ten times versus nine at base; its unchanged implicit
+`self` at line 1032 emitted once in each. There are **no new diagnostic sites**, but this is not a
+claim that every raw occurrence count decreased. No warning or architecture baseline was raised.
+
+| File | B | H | F |
+| --- | ---: | ---: | ---: |
+| `AppDomainRuntimeRegistration.swift` | 1 | 1 | 0 |
+| `WindowState.swift` | 1 | 1 | 0 |
+| `WindowStateComposition.swift` | 2 | 2 | 2 |
+| `APISettingsViewModel.swift` | 9 | 9 | 2 |
+| `MCPRunRouteBindings.swift` | 0 | 0 | 0 |
+| `MCPServerViewModel+DomainRouting.swift` | 2 | 2 | 2 |
+| `MCPServerViewModel+TabContext.swift` | 3 | 3 | 3 |
+| `MCPServerViewModel.swift` | 10 | 7 | 11 |
+| `WorkspaceFileContextStore.swift` | 0 | 0 | 0 |
+| `ContextBuilderSelectionTransactionTests.swift` | 0 | 0 | 0 |
+| `WorkspaceRootCatalogAdmissibilityTests.swift` | 1 | 1 | 0 |
+| `AgentHostWorkspaceResources.swift` (new) | 0 | 0 | 0 |
+| `APISettingsRuntimeLease.swift` (new) | 0 | 0 | 0 |
+| `MCPHostRouteResources.swift` (new) | 0 | 0 | 0 |
+| `MCPRouteIdentity.swift` (new) | 0 | 0 | 0 |
