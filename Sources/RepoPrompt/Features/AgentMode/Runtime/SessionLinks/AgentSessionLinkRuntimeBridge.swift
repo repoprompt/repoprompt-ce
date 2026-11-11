@@ -956,8 +956,11 @@ final class AgentSessionLinkDelegatedAddAuthorization: Hashable {
 /// - Refetch and publish both endpoints' UI projections from authority change events.
 @MainActor
 final class AgentSessionLinkRuntimeBridge {
+    /// The same immutable authority reference used to construct `shared`. Pure membership
+    /// queries can reach its actor directly without a presentation/MainActor forwarding hop.
+    nonisolated static let sharedLinkAuthority = AppDomainRuntimeComposition.shared.runtime.agentSessionLinkAuthority
     static let shared = AgentSessionLinkRuntimeBridge(
-        authority: AppDomainRuntimeComposition.shared.runtime.agentSessionLinkAuthority
+        authority: sharedLinkAuthority
     )
 
     /// Explicit UI-only opt-in, exact-incarnation scoped and intentionally not persisted.

@@ -3,6 +3,7 @@ import Foundation
 import JSONSchema
 import MCP
 import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptClaudeProvider
 import RepoPromptCodexProvider
@@ -1198,6 +1199,7 @@ import XCTest
             let runID: UUID
             let sessionID: UUID
             let originalName: String
+            let fileURL: URL
         }
 
         private func assertQueuedSessionAdminPolicy(
@@ -1237,6 +1239,9 @@ import XCTest
                         await manager.cleanupRunRoutingState(for: agent.runID, windowID: agent.context.window.windowID)
                     }
                     await fixture.cleanup()
+                    for agent in agents {
+                        try await AgentSessionDataService.shared.deleteAgentSessionFile(agent.fileURL)
+                    }
                     try await fixture.assertCleanedUp()
                 }
 
@@ -1447,13 +1452,21 @@ import XCTest
             _ fixture: PersistentMCPTestFixture, context: PersistentMCPTestContext
         ) async throws -> QueuedSessionAdminAgent {
             try await fixture.registerDomainWorkspace(context)
-            try await activateWorkspace(for: context)
             let window = context.window
+            let configuredWorkspace = try XCTUnwrap(window.workspaceManager.workspaces.first { $0.id == context.workspaceID })
+            let configuredTab = try XCTUnwrap(configuredWorkspace.composeTabs.first { $0.id == context.tabID })
+            let sessionID = UUID()
+            // This is restored history, not a transient index injection. Workspace activation may
+            // finish its real index refresh after socket setup; it must find the same durable row.
+            let fileURL = try await AgentSessionDataService.shared.saveAgentSession(AgentSession(
+                id: sessionID, workspaceID: configuredWorkspace.id, composeTabID: context.tabID,
+                name: configuredTab.name, agentKind: AgentProviderKind.claudeCode.rawValue, autoEditEnabled: false
+            ), for: configuredWorkspace)
+            try await activateWorkspace(for: context)
             let vm = window.agentModeViewModel
             let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
             let tab = try XCTUnwrap(workspace.composeTabs.first { $0.id == context.tabID })
             let session = vm.session(for: context.tabID)
-            let sessionID = UUID()
             // Install runtime and carrier together. Prewriting the carrier would conflict
             // with a runtime already materialized by workspace activation.
             _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(
@@ -1463,13 +1476,6 @@ import XCTest
             XCTAssertEqual(boundWorkspace.composeTabs.first { $0.id == context.tabID }?.activeAgentSessionID, sessionID)
             window.promptManager.loadComposeTabsFromWorkspace(boundWorkspace, syncPromptText: true)
             let name = tab.name
-            let entry = AgentSessionIndexEntry(
-                id: sessionID, tabID: context.tabID, name: name, savedAt: Date(timeIntervalSince1970: 0),
-                itemCount: 0, autoEditEnabled: false, hasUnknownConversationContent: false,
-                isMCPOriginated: false, worktreeBindingSummaries: [], activeWorktreeMergeSummaries: []
-            )
-            let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: 1)
-            vm.test_installSessionIndexSnapshot([sessionID: entry], owner: owner, latestOwner: owner, activeWorkspace: boundWorkspace)
             session.selectedAgent = .claudeCode
             session.hasLoadedPersistedState = true
             session.oversight.autoWakeOnUpdates = false
@@ -1495,7 +1501,12 @@ import XCTest
             XCTAssertEqual(window.mcpServer.connectionIDByRunID[runID], endpoint.connectionID)
             let resolved = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: context.tabID)
             XCTAssertEqual(resolved.sessionID, sessionID)
-            return QueuedSessionAdminAgent(context: context, endpoint: endpoint, runID: runID, sessionID: sessionID, originalName: name)
+            // Scope admission needs owner-valid placement, not the sidebar's UI restore join.
+            let placementReady = await waitUntil {
+                OpenWindowsDelegationProvenanceSource().placement(for: sessionID)?.workspaceID == context.workspaceID
+            }
+            XCTAssertTrue(placementReady, "Restored fixture placement must be published by the real workspace index")
+            return QueuedSessionAdminAgent(context: context, endpoint: endpoint, runID: runID, sessionID: sessionID, originalName: name, fileURL: fileURL)
         }
 
         func testExpiredClientEnvelopeRejectsBeforeProviderAndJournalForBothPublicTools() async throws {
@@ -5925,7 +5936,7 @@ import XCTest
         }
 
         private func readerLoop() {
-            var buffer = Data()
+            var buffer = MCPNewlineFrameBuffer()
             while true {
                 let activeFD = withStateLock { isClosed ? -1 : fd }
                 guard activeFD >= 0 else { return }
@@ -5954,9 +5965,7 @@ import XCTest
                 }
                 if readCount > 0 {
                     buffer.append(contentsOf: bytes.prefix(readCount))
-                    while let newline = buffer.firstIndex(of: 0x0A) {
-                        let line = Data(buffer[..<newline])
-                        buffer.removeSubrange(buffer.startIndex ... newline)
+                    while let line = buffer.nextFrame() {
                         guard handle(line) else { return }
                     }
                     continue
