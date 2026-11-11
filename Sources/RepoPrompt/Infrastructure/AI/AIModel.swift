@@ -191,6 +191,7 @@ extension AIModel {
         ModelInfo(model: .claudeSonnet5, rawValue: "claude-sonnet-5", actualName: nil, displayName: "Claude Sonnet 5", provider: ProviderIndex.anthropic),
         ModelInfo(model: .claudeOpus55, rawValue: "claude-opus-5-5", actualName: nil, displayName: "Claude Opus 5.5", provider: ProviderIndex.anthropic),
         ModelInfo(model: .claudeOpus5, rawValue: "claude-opus-5", actualName: nil, displayName: "Claude Opus 5", provider: ProviderIndex.anthropic),
+        ModelInfo(model: .claudeFable52, rawValue: "claude-fable-5-2", actualName: nil, displayName: "Claude Fable 5.2", provider: ProviderIndex.anthropic),
         ModelInfo(model: .claudeFable51, rawValue: "claude-fable-5-1", actualName: nil, displayName: "Claude Fable 5.1", provider: ProviderIndex.anthropic),
         // Restricted-access tier: listed for entitled accounts, never used as a default.
         ModelInfo(model: .claudeMythos51, rawValue: "claude-mythos-5-1", actualName: nil, displayName: "Claude Mythos 5.1 (Restricted)", provider: ProviderIndex.anthropic),
@@ -226,6 +227,7 @@ extension AIModel {
         ModelInfo(model: .openrouterGpt6Luna, rawValue: "openai/gpt-6-luna", actualName: nil, displayName: "oRouter/GPT-6 Luna", provider: ProviderIndex.openRouter),
         ModelInfo(model: .openrouterClaudeSonnet55, rawValue: "anthropic/claude-sonnet-5.5", actualName: nil, displayName: "oRouter/Claude Sonnet 5.5", provider: ProviderIndex.openRouter),
         ModelInfo(model: .openrouterClaudeOpus55, rawValue: "anthropic/claude-opus-5.5", actualName: nil, displayName: "oRouter/Claude Opus 5.5", provider: ProviderIndex.openRouter),
+        ModelInfo(model: .openrouterClaudeFable52, rawValue: "anthropic/claude-fable-5.2", actualName: nil, displayName: "oRouter/Claude Fable 5.2", provider: ProviderIndex.openRouter),
         ModelInfo(model: .openrouterClaudeFable51, rawValue: "anthropic/claude-fable-5.1", actualName: nil, displayName: "oRouter/Claude Fable 5.1", provider: ProviderIndex.openRouter),
 
         // **New DeepSeek Models**

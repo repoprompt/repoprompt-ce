@@ -8,6 +8,7 @@ import RepoPromptDomainRuntime
 import RepoPromptProviderQuota
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
+import RepoPromptShared
 import XCTest
 
 @MainActor
@@ -26,6 +27,262 @@ final class AgentSessionComposerSubmitRuntimeTests: XCTestCase {
 
     private func attempt(_ target: AgentComposerSubmitTarget) -> AgentComposerSubmitAttempt {
         .init(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "")
+    }
+
+    func testPendingCapabilityPrecedesPublicationAndNeverManufacturesAnAttempt() throws {
+        let (scope, session, command) = boundFixture()
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        var published = false
+        let attachment = scope.presentation.attach(session, sink: .init(
+            activityChanged: { _, _ in }, refresh: { _, _, _ in }, turnComplete: { _ in }, turnFailed: { _, _ in },
+            composerClaim: { candidate in
+                guard candidate.activeComposerSubmitAttempt != nil else { return }
+                published = true
+                XCTAssertNotNil(candidate.composerStartCancellation)
+                XCTAssertEqual(AgentSessionLinkStopAdmission.classify(AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
+                    session: candidate, endpointMatchesGrant: true, isClosing: false
+                )), .pendingStart)
+            }
+        ))
+        defer { scope.presentation.detach(attachment) }
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command, awaitsExecutor: true) else { return XCTFail("Expected claim") }
+        XCTAssertTrue(published)
+        let fence = try XCTUnwrap(claim.cancellation.pendingStartFence(for: session))
+        XCTAssertTrue(claim.cancellation.withdraw(on: session))
+        XCTAssertFalse(fence.permitsStart(of: session))
+        XCTAssertFalse(claim.cancellation.beginExecution(), "A late executor cannot acquire cancelled work")
+        XCTAssertNil(session.activeRunOwnership)
+        XCTAssertNil(session.activeRunAttemptID)
+        XCTAssertNil(session.lastTerminalCommitRevision)
+        XCTAssertNil(session.activeComposerSubmitAttempt)
+        XCTAssertNil(session.composerStartCancellation)
+    }
+
+    func testLifecycleMutationClaimIsNotAnAdvertisedPendingInput() throws {
+        let (scope, session, command) = boundFixture()
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command, allowsPendingStartWithdrawal: false) else { return XCTFail("Expected mutation claim") }
+        XCTAssertEqual(AgentSessionLinkStopAdmission.classify(AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
+            session: session, endpointMatchesGrant: true, isClosing: false
+        )), .blocked(.targetBusy))
+        XCTAssertFalse(claim.cancellation.withdraw(on: session), "Quiescing queued work must not withdraw the owning lifecycle mutation")
+        session.stopState.invalidateScheduledStarts()
+        XCTAssertTrue(scope.submissions.isCurrent(claim))
+        XCTAssertTrue(scope.submissions.release(claim))
+        XCTAssertTrue(claim.cancellation.isFinalized)
+        XCTAssertNil(session.composerStartCancellation)
+    }
+
+    func testWithdrawRestoresOnceAboveNewTypingButJoinsTheRealProducer() async throws {
+        let (scope, session, command) = boundFixture()
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        let submission = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "original")
+        guard case let .claimed(claim) = scope.submissions.claim(submission, command: command) else { return XCTFail("Expected claim") }
+        claim.cancellation.oweDraftRestoration("original")
+        session.draftText = "newer typing"
+        let gate = AgentSessionLinkStopSignal<Void>()
+        let fence = try XCTUnwrap(claim.cancellation.pendingStartFence(for: session))
+        var reachedPrologue = false
+        claim.cancellation.retainProducer()
+        let producer = Task {
+            await gate.value()
+            if fence.permitsStart(of: session) { reachedPrologue = true }
+            claim.cancellation.releaseProducer()
+        }
+        XCTAssertTrue(scope.submissions.release(claim))
+        XCTAssertTrue(claim.cancellation.withdraw(on: session))
+        XCTAssertFalse(claim.cancellation.withdraw(on: session))
+        claim.cancellation.restoreOwedDraftIfNeeded()
+        XCTAssertEqual(session.draftText, "original\nnewer typing")
+        XCTAssertNil(session.activeComposerSubmitAttempt)
+        XCTAssertFalse(claim.cancellation.isFinalized)
+        XCTAssertTrue(session.isComposerSubmissionInFlight, "Hiding a claim is not a producer-drain receipt")
+        XCTAssertTrue(scope.settlement(for: session).blockers.contains(.pendingStart))
+        gate.finish(())
+        await producer.value
+        await claim.cancellation.finalized.value()
+        XCTAssertFalse(reachedPrologue)
+        XCTAssertTrue(claim.cancellation.isFinalized)
+        XCTAssertFalse(session.isComposerSubmissionInFlight)
+        XCTAssertNil(session.activeRunAttemptID)
+    }
+
+    func testInitialPreparationCapabilityDoesNotAuthorizeGenericLocationChanges() throws {
+        let (scope, session, command) = boundFixture()
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command) else { return XCTFail("Expected claim") }
+        defer { scope.submissions.release(claim) }
+        session.isPreparingInitialWorktree = true
+        XCTAssertFalse(claim.cancellation.canWithdraw(on: session))
+        claim.cancellation.ownsInitialPreparation(on: session)
+        XCTAssertTrue(claim.cancellation.canWithdraw(on: session))
+        session.isChangingExecutionLocation = true
+        XCTAssertFalse(claim.cancellation.canWithdraw(on: session))
+        XCTAssertEqual(AgentSessionLinkStopAdmission.classify(AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
+            session: session, endpointMatchesGrant: true, isClosing: false
+        )), .blocked(.targetBusy))
+        session.isChangingExecutionLocation = false
+        session.isPreparingInitialWorktree = false
+    }
+
+    func testRunPrologueUpgradesComposerStopWithoutRestoringSentInput() throws {
+        let (scope, session, command) = boundFixture()
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command) else { return XCTFail("Expected claim") }
+        defer { scope.submissions.release(claim) }
+        claim.cancellation.oweDraftRestoration("sent")
+        claim.cancellation.retainProducer()
+        XCTAssertTrue(scope.submissions.release(claim))
+        _ = session.beginRunAttempt(source: "pending-start-test")
+        session.installRunID(UUID())
+        session.runState = .running
+        XCTAssertTrue(claim.cancellation.didLaunch)
+        XCTAssertFalse(claim.cancellation.withdraw(on: session))
+        XCTAssertEqual(AgentSessionLinkStopAdmission.classify(AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
+            session: session, endpointMatchesGrant: true, isClosing: false
+        )), .activeRun)
+        XCTAssertFalse(session.isComposerSubmissionInFlight)
+        let nextTarget = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(next) = scope.submissions.claim(attempt(nextTarget), command: command) else { return XCTFail("Launched input retained the composer") }
+        XCTAssertTrue(scope.submissions.release(next))
+        claim.cancellation.releaseProducer()
+        XCTAssertEqual(session.draftText, "")
+        session.runState = .cancelled
+    }
+
+    func testDestinationAliasWithdrawsSourceAndRebindingFailsClosed() throws {
+        let (scope, source, command) = boundFixture()
+        let destination = AgentTabSession(tabID: UUID())
+        scope.replaceSessions([source.tabID: source, destination.tabID: destination])
+        destination.installPersistentSessionBinding(.init(tabID: destination.tabID, sessionID: UUID(), workspaceID: UUID()))
+        destination.hasLoadedPersistedState = true
+        destination.recordRestorationAuthoritative(.persistedPayloadApplied)
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command) else { return XCTFail("Expected claim") }
+        defer { scope.submissions.release(claim) }
+        XCTAssertTrue(scope.submissions.alias(claim, to: destination))
+        claim.cancellation.oweDraftRestoration("source draft")
+        destination.draftText = "destination draft"
+        let fence = try XCTUnwrap(claim.cancellation.pendingStartFence(for: destination))
+        XCTAssertTrue(claim.cancellation.withdraw(on: destination))
+        XCTAssertFalse(fence.permitsStart(of: destination))
+        XCTAssertEqual(source.draftText, "source draft")
+        XCTAssertEqual(destination.draftText, "destination draft")
+        XCTAssertFalse(scope.submissions.isCurrent(claim))
+        XCTAssertTrue(scope.submissions.release(claim))
+        XCTAssertNil(destination.composerStartCancellation)
+
+        let nextTarget = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(next) = scope.submissions.claim(attempt(nextTarget), command: command) else { return XCTFail("Expected successor") }
+        defer { scope.submissions.release(next) }
+        source.installPersistentSessionBinding(.init(tabID: source.tabID, sessionID: UUID(), workspaceID: UUID()))
+        XCTAssertFalse(next.cancellation.canWithdraw(on: source))
+        XCTAssertFalse(next.cancellation.withdraw(on: source))
+    }
+
+    func testOldPendingAdmissionCannotWithdrawSuccessorClaim() throws {
+        let (scope, session, command) = boundFixture()
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(first) = scope.submissions.claim(attempt(target), command: command) else { return XCTFail("Expected claim") }
+        let admission = AgentRunCancellationAdmission(
+            scope: .pendingStart, session: session, binding: command.writer.binding,
+            expectedOwnership: nil, expectedRunID: nil, cancellationGeneration: session.stopState.cancellationGeneration,
+            pendingStartFence: nil, expectedComposerAttemptID: first.attempt.id, validateAndClaim: { command.isCurrent }
+        )
+        XCTAssertTrue(scope.submissions.release(first))
+        let nextTarget = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(next) = scope.submissions.claim(attempt(nextTarget), command: command) else { return XCTFail("Expected successor") }
+        defer { scope.submissions.release(next) }
+        XCTAssertFalse(admission.claim(for: session))
+        XCTAssertFalse(first.cancellation.withdraw(on: session))
+        XCTAssertTrue(scope.submissions.isCurrent(next))
+    }
+
+    func testBlockedSteerRecoveryIsNotGatedByStopAdmissionOrWriterRetirement() throws {
+        let (scope, session, command) = boundFixture()
+        _ = session.beginRunAttempt(source: "existing-run")
+        session.installRunID(UUID())
+        session.runState = .running
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command) else { return XCTFail("Expected steer claim") }
+        defer { scope.submissions.release(claim) }
+        claim.cancellation.oweDraftRestoration("blocked steer")
+        session.draftText = "new text"
+        scope.beginRetirement()
+        XCTAssertFalse(claim.cancellation.withdraw(on: session))
+        claim.cancellation.restoreOwedDraftIfNeeded(message: "Steer was refused.")
+        claim.cancellation.restoreOwedDraftIfNeeded(message: "Late duplicate")
+        XCTAssertEqual(session.draftText, "blocked steer\nnew text")
+        session.runState = .cancelled
+    }
+
+    func testUnrelatedPrologueCannotDiscardBlockedComposerRecovery() throws {
+        let (scope, session, command) = boundFixture()
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command) else { return XCTFail("Expected claim") }
+        defer { scope.submissions.release(claim) }
+        claim.cancellation.oweDraftRestoration("not sent")
+        _ = session.beginRunAttempt(source: "unrelated-follow-up")
+        claim.cancellation.restoreOwedDraftIfNeeded(message: "The composer target changed.")
+        XCTAssertEqual(session.draftText, "not sent")
+    }
+
+    func testTerminalOnlyBookkeepingCannotUpgradeOrReleaseAPendingProducer() throws {
+        let (scope, session, command) = boundFixture()
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command) else { return XCTFail("Expected claim") }
+        claim.cancellation.retainProducer()
+        XCTAssertTrue(scope.submissions.release(claim))
+        _ = session.beginRunAttempt(source: "terminal-only-test", beginsProviderRun: false)
+        XCTAssertFalse(claim.cancellation.didLaunch)
+        XCTAssertFalse(claim.cancellation.isFinalized)
+        XCTAssertTrue(session.isComposerSubmissionInFlight)
+        claim.cancellation.releaseProducer()
+        XCTAssertTrue(claim.cancellation.isFinalized)
+    }
+
+    func testInternalPreparationCancellationDoesNotPoisonTheFinalStartFence() throws {
+        let (scope, session, command) = boundFixture()
+        let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+        guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command) else { return XCTFail("Expected claim") }
+        defer { scope.submissions.release(claim) }
+        let advertised = try XCTUnwrap(claim.cancellation.pendingStartFence(for: session))
+        session.stopState.invalidateScheduledStarts() // Internal location/start preparation, not Stop.
+        XCTAssertFalse(advertised.permitsStart(of: session))
+        XCTAssertTrue(scope.submissions.isCurrent(claim))
+        let handedOff = try XCTUnwrap(claim.cancellation.pendingStartFence(for: session))
+        XCTAssertTrue(handedOff.permitsStart(of: session))
+        XCTAssertTrue(claim.cancellation.withdraw(on: session))
+        XCTAssertFalse(handedOff.permitsStart(of: session))
+        XCTAssertNil(claim.cancellation.pendingStartFence(for: session), "Stop may not refresh a deferred producer's fence")
+    }
+
+    func testDestinationCapabilitySurvivesSourceRemovalThenCleansUpIndependently() throws {
+        func prepare() throws -> (AgentSessionRuntimeStore.Scope, AgentTabSession, AgentComposerStartCancellation) {
+            let (scope, source, command) = boundFixture()
+            let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+            guard case let .claimed(claim) = scope.submissions.claim(attempt(target), command: command) else { throw NSError(domain: "pending", code: 1) }
+            let destination = AgentTabSession(tabID: UUID())
+            scope.replaceSessions([source.tabID: source, destination.tabID: destination])
+            destination.installPersistentSessionBinding(.init(tabID: destination.tabID, sessionID: UUID(), workspaceID: UUID()))
+            destination.hasLoadedPersistedState = true
+            destination.recordRestorationAuthoritative(.persistedPayloadApplied)
+            XCTAssertTrue(scope.submissions.alias(claim, to: destination))
+            claim.cancellation.retainProducer()
+            scope.submissions.release(claim)
+            scope.replaceSessions([destination.tabID: destination])
+            return (scope, destination, claim.cancellation)
+        }
+        let (scope, destination, start) = try prepare()
+        XCTAssertNil(start.source)
+        XCTAssertTrue(start.canWithdraw(on: destination), "The exact admitted destination remains stoppable")
+        XCTAssertTrue(start.withdraw(on: destination))
+        XCTAssertFalse(start.isFinalized)
+        start.releaseProducer()
+        XCTAssertTrue(start.isFinalized)
+        XCTAssertNil(destination.composerStartCancellation)
+        XCTAssertFalse(destination.isComposerSubmissionInFlight)
+        withExtendedLifetime(scope) {}
     }
 
     func testProgrammaticClaimWithoutPresentationRotatesTokenAndNeverTouchesDraft() throws {
@@ -823,30 +1080,33 @@ extension AgentComposerSubmissionAttemptTests {
     func testNewDestinationOwnsVisibleCancelAndRejectsSecondSubmit() async throws {
         let backend = SuspendedComposerRoutingBackend()
         let (viewModel, _) = try await makeRoutingViewModel(backend: backend)
+        addTeardownBlock { await backend.completeLateSelection() }
         let sourceTabID = UUID()
         let destinationTabID = UUID()
         viewModel.test_setCurrentTabIDOverride(sourceTabID)
         let sourceSession = viewModel.session(for: sourceTabID)
         let claim = try routingClaim(viewModel: viewModel, session: sourceSession, text: "Route this task")
+        // Production creation returns an already-bound destination. Keep this routing-only fake
+        // on that contract rather than waiting forever for a request its unbound writer refuses.
+        let destinationSession = viewModel.session(for: destinationTabID)
+        try installRestoredRoutingWriter(viewModel: viewModel, session: destinationSession)
+        let secondTarget = try XCTUnwrap(viewModel.makeComposerSubmitTarget(tabID: destinationTabID, session: destinationSession))
 
         let execution = Task { @MainActor in
             await viewModel.executeComposerSubmitAttempt(
                 text: "Route this task",
                 claim: claim,
                 createAndActivateSessionTab: {
-                    _ = viewModel.session(for: destinationTabID)
                     viewModel.test_setCurrentTabIDOverride(destinationTabID)
                     return destinationTabID
                 }
             )
         }
-        await backend.waitUntilStarted()
+        try await AsyncTestWait.waitUntil("bound destination routing started") { await backend.hasStarted }
 
         XCTAssertTrue(viewModel.makeComposerProps(tabID: destinationTabID).isRoutingFreshTask)
-        let destinationSession = viewModel.session(for: destinationTabID)
-        let secondTarget = try XCTUnwrap(
-            viewModel.makeComposerSubmitTarget(tabID: destinationTabID, session: destinationSession)
-        )
+        XCTAssertNil(viewModel.makeComposerSubmitTarget(tabID: destinationTabID, session: destinationSession))
+        // A render-time target captured before the alias must also fail at authoritative claim.
         let secondAttempt = AgentComposerSubmitAttempt(
             id: UUID(),
             target: secondTarget,
@@ -1515,6 +1775,9 @@ private actor SuspendedComposerRoutingBackend: DecisionService {
     private var request: FiniteChoiceDecisionRequest?
     private var startedWaiters: [CheckedContinuation<Void, Never>] = []
     private var completion: CheckedContinuation<DecisionOutcome, Never>?
+    var hasStarted: Bool {
+        request != nil
+    }
 
     func readinessSnapshot() -> DecisionReadiness {
         .ready(generation: 1, policyVersion: "fake-v1")
@@ -1853,20 +2116,44 @@ private actor SlashSuggestionRuntime: NativeAgentRuntimeControlling {
 final class AutoWorkflowSubmissionTests: XCTestCase {
     func testRealComposerNewDestinationPathJudgesExactlyOnce() async throws {
         let fixture = try await makeFixture()
+        let vm = fixture.viewModel
+        // Use configured creation, not a restored empty transcript posing as a fresh destination.
+        let manager = AgentSessionLinkEndpointTestSupport.installWorkspace(on: vm, tabID: fixture.session.tabID, name: "Workflow creation")
+        await manager.awaitInitialized()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("WorkflowFirstSend-\(UUID())")
+        let root = AppProfileLocations.current.customWorkspaceDirectory(selectedDirectory: directory)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        var workspace = try XCTUnwrap(manager.activeWorkspace)
+        workspace.ephemeralFlag = false
+        workspace.customStoragePath = root
+        manager.workspaces = [workspace]
+        manager.activeWorkspace = workspace
+        manager.promptViewModel.loadComposeTabsFromWorkspace(workspace)
+        vm.promptManager = manager.promptViewModel
+        let api = try XCTUnwrap(manager.promptViewModel.apiSettingsViewModel)
+        api.isClaudeCodeConnected = true
+        addTeardownBlock { @MainActor in
+            await vm.test_retireAndCancelFixture()
+            manager.prepareForWindowClose()
+            try? FileManager.default.removeItem(at: directory)
+        }
         var destination: AgentModeViewModel.TabSession?
-        let result = await fixture.viewModel.executeComposerSubmitAttempt(text: Self.text, claim: fixture.claim) {
-            let id = UUID()
-            let session = fixture.viewModel.session(for: id)
-            fixture.viewModel.test_setCurrentTabIDOverride(id)
-            destination = session
+        let result = await vm.executeComposerSubmitAttempt(text: Self.text, claim: fixture.claim) {
+            guard let id = await vm.createAndActivateSessionTab() else { return nil }
+            api.isClaudeCodeConnected = true
+            XCTAssertTrue(vm.agentAvailabilityContext.claudeCodeAvailable)
+            vm.test_setCurrentTabIDOverride(id)
+            destination = vm.sessions[id]
             return id
         }
         XCTAssertEqual(result, .submitted)
         let requests = await fixture.backend.requests
         XCTAssertEqual(requests.count(where: { $0.consumerID == .autoWorkflow }), 1)
-        let item = try XCTUnwrap(destination?.items.first { $0.kind == .user })
+        let created = try XCTUnwrap(destination)
+        XCTAssertNotNil(created.persistentSessionBindingIdentity)
+        let item = try XCTUnwrap(created.items.first { $0.kind == .user })
         XCTAssertEqual(item.workflow?.builtInWorkflow, .review)
-        XCTAssertNil(destination?.selectedWorkflow)
+        XCTAssertNil(created.selectedWorkflow)
     }
 
     func testChosenWorkflowReachesSubmissionWithoutChangingManualSelection() async throws {

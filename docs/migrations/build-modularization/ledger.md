@@ -7572,8 +7572,9 @@ remain OPEN. This is not a complete ACP execution or publication qualification.
 
 Base `534e2c759`. This slice does **not** implement close-preserves-run, host leases,
 workspace-switch detach, handoff UI or pending-start cancellation capability. Legacy close and
-workspace switch still cancel. The pending-start capability waits for M9.2c and explicit lane
-coordination; visible/no-window host composition remains a separate prerequisite.
+workspace switch still cancel. At the initial groundwork checkpoint, the pending-start capability
+waited for M9.2c and explicit lane coordination; it is implemented in the follow-up below.
+Visible/no-window host composition remains a separate prerequisite.
 
 - Characterization pins the two legacy cancelling paths in `AgentSessionRuntimeStoreTests` and
   strengthens `SessionAdminInventoryReadTests/testVisitDuringManagedRunAutomaticallyHandsOffAfterCompletion`:
@@ -8382,3 +8383,258 @@ product compile still shows no positive per-file delta. All coordinated tickets 
 and collected. No live-app/smoke, release, sanitizer or hosted-CI success is claimed for this
 publication head. The draft PR includes an explicit M9.3b handoff distinguishing runtime-owned
 admission/runner seams from remaining VM orchestration and provider/coordinator internals.
+
+### M9.3b PR1 — shared host route and resource ownership (refs #1406)
+
+Base `99d4e718d` (#1679). This is the first resource extraction in the expanded visible-and-saved
+host plan, **not executable host cutover**. Prepared-window execution, visible scope/coordinator
+composition and explicit close/switch cancellation remain unchanged. No M9.2f/g/h command,
+worktree or provider-execution body is moved in this slice.
+
+- `MCPRouteIdentityAllocator` supplies one non-reusing integer namespace for presentation windows
+  and independently allocated host routes. Host allocation does not change the latest presentation
+  window selector. `MCPHostRouteIdentity` adds exact resource identity; the explicit `legacyWindow`
+  adapter preserves existing transport IDs until visible composition changes atomically.
+- `MCPHostRouteResources` now owns the existing run-route bindings/lifetime, tool-execution runtime,
+  domain route registration, exact connection receipts and catalog handle. The legacy MCP server
+  forwards to that same owner. Catalog transitions serialize independently of a presenter and use
+  the captured domain runtime, including the existing protected-mutation/long-running wrappers;
+  no second router, tool registry or lifecycle manager is introduced. Domain protocol route slots
+  still use the wire name `window`; constructing one does not construct or register a UI window.
+- Domain admission close is deliberately separate from full owner withdrawal: legacy window
+  teardown unregisters its domain route **before** its existing explicit run drain, so mappings
+  retain their prior lifetime through that drain. Transport disconnect retains its existing
+  cross-server resolution behavior; owner teardown consumes only previously retained exact
+  connection generations and cannot retract a successor. Resource close does not cancel tools
+  or assert provider/session settlement. The M3 source-layout guard now checks that retained
+  connection receipt storage and exact cleanup live in this owner, plus server retain/disconnect/close
+  delegation, instead of requiring the removed VM-owned UUID set.
+- `AgentHostWorkspaceResources` builds the same production file store used by windows, reads the
+  existing domain context authority and acquires exact root-lifetime retention with post-await
+  validation. Requested roots must cover canonical workspace paths; an empty workspace may have
+  an empty set. Retained roots defer unload before any teardown effect. Last release joins deferred
+  unload, a newer load cancels old unload intent, and stale tokens cannot unload replacement roots.
+  This is read/resource currency, **not** writer, mutation, consent or worktree admission.
+- `APISettingsRuntimeLease` retains an explicitly supplied existing live settings owner, never a
+  first-window election, credentials snapshot or second settings catalog. The prepared adapter uses
+  it at the existing acquire/drained-release boundaries. Both settings and workspace resources can
+  be acquired with no window construction; presentation invalidation remains later work.
+
+Tests exercise zero-window identity/domain/catalog/settings/context acquisition, registration
+failure, runtime affinity, exact connection replacement and cross-owner disconnect, unchanged legacy
+mapping lifetime, settings close deferral/idempotence, root unload/last-release and replacement
+fences, and refusal without partial root retention. Root-store cases use the existing app composition
+test suite because its production convenience initializer lives in the app module; no new app-import
+file or lower-module test-only factory was added. The single review found the premature lifetime
+withdrawal and cross-owner disconnect regressions; both were corrected before publication.
+
+**Next cutovers, in order:** PR2 composes every visible session through one executable host before
+creation, keyed by `(window, workspace activation epoch)`, not workspace UUID alone. It installs the
+host's route/link endpoints, real MCP capabilities, settings/context leases and coordinators, while
+leaving a presentation lease and explicit legacy stop adapter on the window. This requires the
+M9.2g startup/provider completion and an explicit inventory/ownership agreement for the M9.2f/h
+admin/worktree bodies (`SessionAdminWindowsHosts`, `AgentSessionWorktreeRuntime`,
+`AgentModeViewModel+SelfWorktreeRelocation`, `MCPWorktreeToolProvider`, `VCSService`). Retain their
+exact admission across IO; do not wrap VM-only effects as a hidden host. This PR does not touch them.
+
+PR3 then reuses that same executable factory plus phase-A `loadRuntime`/storage composition for
+saved-only targets, resolves the canonical writer, settles required saves and retires the prepared
+branches **together**: `WindowStatesManager+AgentSessionLinks` preparation/window-catalog adapter,
+`WindowState` prepared constructor/teardown, `WindowStateManager` prepared/retiring maps and
+logout/shutdown enumeration, and `AgentSessionCarrierResolver` weak prepared-owner augmentation.
+Visit, deletion, consent revocation and links must use the actual writer's host, with no fake window
+or fallback to the latest window. All-run survival, last-window background mode and presentation
+handoff/drain policy remain M9.4. PR1 does not complete M9.3b or #1406.
+
+Validation receipts (all local, no CI logs or visible app lifecycle actions):
+
+- Base `99d4e718d` ticket `5734f137-3b92-4df1-9706-a141f473a18f`: 15 tests passed and the
+  pre-edit compiler warning occurrence baseline was captured.
+- Final resource/route/close/prepared-target/root-catalog selection
+  `9e9b7938-1e21-4dff-9a74-fafaf353787f`: **270 tests passed**, zero failures. This includes
+  existing 200,001-file root fixtures, not only the new small lease cases. Catalog coverage uses a
+  deterministic canonical binding through the actual registry and app binder; it is not provider
+  execution or saved-host activation qualification.
+- Additional link/admission ticket `af706df9-a729-4636-83b5-ff5356707012` executed **393 tests**:
+  236 runtime-bridge and 98 tool-service cases passed; admission passed 58/59. The one failing
+  `testCanonicalDirtyAdmissionErrorIncludesEvidenceAndDoesNotMaskLaterFailure` had three assertions:
+  its setup `replaceWorking` returned `.conflict` instead of `.applied`, so the intended dirty state
+  was not installed and the later refusal assertions also failed. Isolated head ticket
+  `15720872-7b85-41c3-8629-1b31eb6d19a8` passed that one case. This is **broad-run-only observed,
+  not root-caused**, not a green batch or proof of inheritance; an exact-base execution of this case
+  was not performed. No assertion, retry or admission implementation was changed to obtain green.
+  The fixture separately drains scheduled saves but does not join its working-document publisher;
+  that is a source-grounded race hypothesis, not a demonstrated cause. The draft remains unqualified
+  for merge pending resolution/acceptance of this evidence gap.
+- Fresh compiler-index check after all jobs settled passed: **1,261/1,360 wrong-way file edges,
+  53/66 largest cycle components**. No ratchet baseline was changed. No full-suite, live-app,
+  real-provider, release or hosted-CI qualification is claimed.
+- Both products (`RepoPrompt`, `repoprompt-mcp`):
+  `524ade5c-ac01-4bc1-8855-1c4e8c26404e` passed. Final full-tree lint
+  `b277a521-77fd-42b6-87ce-63317dbc396a` passed (0/2,161 Swift files needed formatting).
+- Earlier iterations are not green receipts: `4b1df425-edf4-4238-a308-c3b8e020ff4a` exposed the
+  module fixture's missing app factory, and `ad2d43e4-8b13-4a81-bcad-26ac5f985e24` compiled but
+  passed 53/54 cases because the real registry rejected the empty catalog fixture. Both were fixed;
+  no production guard or assertion was weakened. Queued product ticket `a5f470f9-5995-41ea-a3b7-3b7b129c1d07`
+  was cancelled before execution to include the final readiness correction.
+
+Touched-file compiler warning **occurrences**, not deduplicated diagnostics, are below. B is the
+pre-edit base compile; H is the completed app/test compilation in `ad2d43e4`; F is the final
+incremental compilation in `9e9b7938`. Zero emissions in an incremental run do not mean an existing
+warning was fixed or that every file recompiled. The product gate emitted no file-qualified Swift
+warnings. The F increase in `MCPServerViewModel` is explicitly retained: its unchanged `workspaceSearch`
+function-value conversion at line 1732 emitted ten times versus nine at base; its unchanged implicit
+`self` at line 1032 emitted once in each. There are **no new diagnostic sites**, but this is not a
+claim that every raw occurrence count decreased. No warning or architecture baseline was raised.
+
+| File | B | H | F |
+| --- | ---: | ---: | ---: |
+| `AppDomainRuntimeRegistration.swift` | 1 | 1 | 0 |
+| `WindowState.swift` | 1 | 1 | 0 |
+| `WindowStateComposition.swift` | 2 | 2 | 2 |
+| `APISettingsViewModel.swift` | 9 | 9 | 2 |
+| `MCPRunRouteBindings.swift` | 0 | 0 | 0 |
+| `MCPServerViewModel+DomainRouting.swift` | 2 | 2 | 2 |
+| `MCPServerViewModel+TabContext.swift` | 3 | 3 | 3 |
+| `MCPServerViewModel.swift` | 10 | 7 | 11 |
+| `WorkspaceFileContextStore.swift` | 0 | 0 | 0 |
+| `ContextBuilderSelectionTransactionTests.swift` | 0 | 0 | 0 |
+| `WorkspaceRootCatalogAdmissibilityTests.swift` | 1 | 1 | 0 |
+| `AgentHostWorkspaceResources.swift` (new) | 0 | 0 | 0 |
+| `APISettingsRuntimeLease.swift` (new) | 0 | 0 | 0 |
+| `MCPHostRouteResources.swift` (new) | 0 | 0 | 0 |
+| `MCPRouteIdentity.swift` (new) | 0 | 0 | 0 |
+
+Groundwork was published in draft PR #1678 at normal merge `aaef76bc3`, integrating M9.2c's
+main `e8e49c5d4` without rewriting the lane commits. Both products
+`ebcfd66a-4fe5-4291-999d-0e32b668d42a` and full lint
+`32ab653a-6d4a-46d9-92ff-5a8727d4fa81` passed. Broad selection
+`8ad8b943-e0a2-4ecb-a698-09740ddbb60e` passed **1,936 tests, 18 skipped, zero failures**;
+isolated handoff `d6ae4342-b777-41ac-9574-a2126981da83` passed **104**. Fresh index check was
+**1,256/1,360 wrong-way file edges, 53/66 largest-cycle components**. Actual compilation
+occurrences across the 25 touched Swift files were VM **4→4**, auto-wake tests **11→11**,
+admin lifecycle tests **5→5**, and zero in the other 22 files; normalized diagnostic signatures
+had no positive delta. That retained baseline is the original lane compilation with only
+characterization/helper changes, not a fresh exact-clean-main build. Mandatory push preflight
+passed after the nested SwiftPM sandbox restriction was resolved through approved execution;
+local investigation copies and Oracle exports were preserved outside the clean push boundary
+and restored afterward, never staged.
+
+### M9.4 phase 0 follow-up: pending-start capability (refs #1406)
+
+After #1676 merged and the lane was unblocked, the existing composer claim gained one exact
+pre-prologue cancellation receipt. The session stores it before publishing its claim; a newly
+created, already-bound destination aliases that same receipt before showing preparation. It
+uses weak session/runtime back references and existing writer identities, not a second session
+registry or lifecycle manager. Creation, hydration and provider runner ownership remain unchanged.
+
+- A pending Stop withdraws only that exact source/destination claim, invalidates its deferred start
+  generations, removes its owned optimistic input and restores the owed source draft once, above
+  newer typing. A stale writer, recycled object or successor attempt cannot be withdrawn through
+  an old target. Unrelated execution-location changes and the existing native self-compact
+  busy-until-dispatch policy remain fail-closed.
+- Suspended executors and child producers retain the receipt before awaiting or scheduling. UI
+  withdrawal is not drain acknowledgment: settlement and managed Stop keep the real effect until
+  its finalizer runs. A managed deadline returns an honest incomplete-teardown result while that
+  effect remains installed. Local teardown uses the existing bounded deadline as well.
+- The narrow `beginRunAttempt` hook observes installed provider-run ownership before running is
+  published. Active-run cancellation then takes precedence, and the composer claim can unlock
+  without waiting for the provider transport to return. Synthetic cancellation/startup-failure
+  bookkeeping does not upgrade a pending input into an actual provider start. Deferred producers
+  capture a fresh fence at the final synchronous claim handoff, never after suspension; an explicit
+  Stop prevents that handoff, while internal preparation invalidation does not lose an input.
+- Cancelling an unsent prospective steer is row-only cancellation, not Stop on the existing run;
+  it preserves that run's continuation generations. Blocked-executor draft recovery is cleanup,
+  not new-command admission, and therefore survives writer retirement/rebinding on the original
+  object without restoring into a replacement. Optional metadata recovery stays in a presentation
+  sink, never a VM capture in the runtime command.
+- Existing typed ACP/plain continuation tasks retain their session-keyed producer/fence ownership.
+  Self-compact admission remains owned by its existing active run; no new generic startup owner
+  was introduced. Prepared-owner busy/handoff projections remain compatible. The legacy drain
+  projection additionally sees a newly withdrawn composer producer until its real release.
+
+The bounded step-4 review identified blocked-steer draft loss, row-only Cancel regressions,
+post-prologue claim retention, premature fence capture, orphan destination cleanup and bounded
+local-wait/UI ordering issues. These were corrected before qualification, without weakening
+existing assertions or increasing timeout budgets. Added cases live in existing test files;
+there is no new app-importing test file or ratchet-baseline change.
+
+The first three step-4 attempts were cancelled rather than credited: the first exposed an old
+routing fixture's unbound fake destination and unbounded backend wait; the second was stopped
+while correcting the stale-target setup; the third was still waiting for heavy admission when
+the terminal-only attempt hook correction was included. The routing fixture now binds its fake
+destination before routing, captures the stale target before alias publication and uses a bounded
+wait plus teardown release. The production first-send Computer Use case instead exercises the real
+configured creation transaction and asserts its binding. Focused attempt
+`008937de-df30-4ef0-b778-f233f819d1b3` failed compilation because the new startup-gate fixture
+returned `nil` from a string-valued provider-switch refusal callback. That fixture type mismatch
+was corrected; it is not an assertion failure or a completed test qualification.
+Focused `2af5df0e-6c90-457a-8ed2-9c9cec63c5f2` then executed **274 tests with 15 failures**.
+Those exposed fixture expectations, not a passing qualification: draft joins use the existing
+single newline, a pending Stop must join Stop effects rather than Send effects, a UI-only test
+must model the executor's release explicitly, fake destinations must satisfy configured creation's
+bound-writer contract, and real foreground creation needs the prompt/carrier plus isolated durable
+storage that the endpoint-only fixture intentionally omitted. These setups were corrected while
+retaining dispatch, exactly-once recovery, stale-target and real-producer-drain assertions.
+The creation-only reruns additionally exposed the fixture's missing `RepoPromptShared` import,
+restored-versus-fresh provenance and availability updates completing across creation's awaits.
+Both creation cases now use real configured creation with isolated durable storage; fake-provider
+availability is published at its returned boundary. Creation-path ticket
+`e9fe365a-6e62-40fb-abb3-adfbb0068ce6` passed **two tests**, including actual first-provider
+Computer Use approval command admission without post-creation binding repair.
+
+Local step-4 products `86daf60a-4123-4a75-b82d-b724deecfb8f` and full lint
+`d5cd72c4-85c1-4ca8-87cb-9a396898ca54` passed. The fresh index check remains
+**1,256/1,360 wrong-way file edges, 53/66 largest-cycle components**. Expanded actual-compilation
+warning audit across **41 owned Swift files** is VM **4→4**, Codex resume tests **17→17**,
+auto-wake tests **11→11**, admin lifecycle tests **5→5**, and zero in the other 37 files.
+Counts use retained compilation receipts rather than empty incremental product logs; repeated
+compilations are not summed. Complete later diagnostics confirm the same count where an earlier
+log truncated a diagnostic suffix. There is no positive per-file or normalized-signature delta.
+
+The first broad step-4 ticket `76b5af49-1e22-44c0-825d-664427c7905f` executed **2,121 tests,
+18 skipped, three assertion failures in one case**: forced provider switch with queued work but
+no active run. Its internal mutation claim was incorrectly withdrawn by its own quiescence's
+explicit-Stop queue cleanup. Claim installation now distinguishes that lifecycle mutation from
+cancellable pending input before publication; the forced-switch queue/auto-wake withdrawal stays
+unchanged, and an exact mutation claim remains busy to managed Stop. A runtime case pins this
+policy alongside the existing full forced-switch regression. The handoff-model/worktree selection
+`98c3171c-88ef-477c-8a33-f01a70e033dc` passed **26**, but its filter was not the isolated
+`AgentSessionLinkHandoffInheritanceTests` suite and is not credited as that gate.
+
+Correction-focused `93e075a8-539f-4654-a8d3-11a6efbf6577` passed **120 tests**: composer
+runtime **16** and the actual handoff-inheritance suite **104**, including the forced-switch
+regression. Full lint `bf35d8f8-05b9-47f2-98ec-0a53fea4ff52` and corrected-tree products
+`4eb420cf-8b93-4655-af94-602bca4accaa` passed. The expanded audit now includes the provider-switch
+adapter: **42 owned Swift files**, the same four nonzero counts above, and zero in the other
+38 files; no positive count or normalized-signature delta. At local checkpoint `3bed4d24b`, this
+work was withheld from #1678 by lane instruction for a separate phase-0b PR after groundwork merged. No CI logs were
+read; no full-suite, live-app, release or sanitizer qualification is claimed.
+
+Final corrected-tree broad selection `6c13992a-4462-455f-a952-9df921472d35` passed
+**2,122 tests, 18 skipped, zero failures**, including the new pending-start cases, real creation
+paths, SessionLinks, self-compaction, restoration/admission, handoff, sidebar, runtime store and
+the actual prepared-owner visit. The post-product fresh index check remains **1,256/1,360 edges,
+53/66 largest-cycle components**; no baseline changed. All owned validation tickets were terminal
+before the local checkpoint. Publication then waited for #1678's merge and the instructed squash
+integration into a separate phase-0b draft PR.
+
+After #1678 merged as `ac8a6f3a9`, integration used normal merge `d50e898a0` of checkpoint
+`884fda621`. The actual tree from `merge-tree(aaef76bc3, 884fda621)` was
+`df5c3f9c53dcbad8675902c233e68d21828238f6`, identical to the exact #1678 squash. Only after
+that empty-diff proof, ancestry-only merge `3a6418aee` adopted that squash commit alone, with
+no tree changes. Normal `merge origin/main` was then already up to date. Main is an ancestor;
+merge-tree with main is clean and equals HEAD's tree. The main-relative diff contains only
+step 4 and its tests/ledger, on new branch `runtime/20261111-m9-4-phase0b`. No published
+history was rewritten and no additional work was pushed to #1678.
+
+Merged runtime tree `3a6418aee` then passed **385 focused tests** in ticket
+`14b7c115-0853-430e-8e04-7e37d0253e02`, covering composer, pending Stop/drain, first-send
+creation, self-compaction, runtime store and all 104 handoff-inheritance cases. All 22 changed
+Swift files passed scoped pinned formatting and strict SwiftLint; the latter used an explicit
+`/tmp` cache after the default cache directory refused a sandboxed write. Fresh merged-tree
+compilation retained VM **4**, Codex resume tests **17**, auto-wake tests **11** and admin
+lifecycle tests **5**, with no positive count/signature delta across the 42 audited Swift files.
+The 2,122-case broad, both-product and full-lint receipts above qualify the pre-integration
+step-4 checkpoint; they are not misrepresented as a new merged-tree full-suite run. No source
+changed after merged-tree execution; this final addition records its integration receipts.

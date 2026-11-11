@@ -166,6 +166,7 @@ struct AgentRunCancellationAdmission {
     let expectedRunID: UUID?
     let cancellationGeneration: UUID
     let pendingStartFence: AgentRunStartStopFence?
+    var expectedComposerAttemptID: UUID?
     let validateAndClaim: @MainActor () -> Bool
 
     func claim(for candidate: AgentTabSession) -> Bool {
@@ -188,9 +189,14 @@ struct AgentRunCancellationAdmission {
                   candidate.runID == expectedRunID else { return false }
         case .pendingStart:
             guard candidate.activeRunOwnership == nil,
-                  candidate.mcpFollowUpRunPending || !candidate.pendingInstructions.isEmpty,
-                  pendingStartFence?.permitsStart(of: candidate) ?? true
-            else { return false }
+                  pendingStartFence?.permitsStart(of: candidate) ?? true else { return false }
+            if let expectedComposerAttemptID {
+                guard let start = candidate.composerStartCancellation,
+                      start.attemptID == expectedComposerAttemptID, start.canWithdraw(on: candidate) else { return false }
+            } else {
+                guard candidate.composerStartCancellation == nil,
+                      candidate.mcpFollowUpRunPending || !candidate.pendingInstructions.isEmpty else { return false }
+            }
         }
         return validateAndClaim()
     }

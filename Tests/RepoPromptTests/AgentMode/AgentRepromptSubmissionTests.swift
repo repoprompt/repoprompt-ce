@@ -174,6 +174,9 @@ final class AgentRepromptSubmissionTests: XCTestCase {
             return XCTFail("A first-send destination must not accept another send while its source claim is preparing")
         }
         vm.storeDraftText(for: tabID, "Next message")
+        // This UI-only test stands in for the executor's real completion. Presentation cleanup
+        // cannot itself acknowledge a producer that might still be suspended.
+        vm.releaseComposerSubmitClaim(claim)
         vm.finishPresentedComposerSubmitAttempt(claim, result: .submitted)
         XCTAssertEqual(vm.retrieveDraftText(for: tabID), "Next message")
         XCTAssertNil(fixture.session.activeComposerSubmitAttempt)

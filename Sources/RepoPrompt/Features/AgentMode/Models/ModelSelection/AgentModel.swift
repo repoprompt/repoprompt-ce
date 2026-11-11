@@ -105,6 +105,7 @@ enum AgentModel: String, CaseIterable, Codable {
     case claudeOpus1m = "opus[1m]"
 
     // Claude Code full model IDs (static known versions; no dynamic probing)
+    case claudeFable52 = "claude-fable-5-2"
     case claudeFable51 = "claude-fable-5-1"
     case claudeFable5 = "claude-fable-5"
     case claudeMythos51 = "claude-mythos-5-1"
@@ -204,6 +205,7 @@ enum AgentModel: String, CaseIterable, Codable {
         case .claudeOpus: "Opus Latest"
         case .claudeHaiku: "Haiku Latest"
         case .claudeOpus1m: "Opus Latest (1M)"
+        case .claudeFable52: "Fable 5.2"
         case .claudeFable51: "Fable 5.1"
         case .claudeFable5: "Fable 5"
         case .claudeMythos51: "Mythos 5.1 (Restricted)"
@@ -297,6 +299,7 @@ enum AgentModel: String, CaseIterable, Codable {
         case .claudeOpus: "Most capable Opus-tier model. Best for open-ended tasks, architecture, and complex reasoning."
         case .claudeHaiku: "Fast and lightweight. Good for exploration, quick edits, and mapping codebases."
         case .claudeOpus1m: "Claude Opus with 1M token context. Best for large codebases and tasks requiring extensive context."
+        case .claudeFable52: "Pinned Claude Fable 5.2 with 1M context for demanding reasoning and long-horizon agentic work."
         case .claudeFable51: "Pinned Claude Fable 5.1 with 1M context for demanding reasoning and long-horizon agentic work. Requires Claude Code 2.1.255 or newer."
         case .claudeFable5: "Pinned Claude Fable 5 with 1M context for demanding reasoning and long-horizon agentic work."
         case .claudeMythos51: "Pinned Claude Mythos 5.1 with 1M context. Restricted-access tier; only works for entitled accounts and is never used as a default."
@@ -392,7 +395,7 @@ enum AgentModel: String, CaseIterable, Codable {
             // latest aliases come first, then pinned full IDs by descending version.
             [
                 .defaultModel,
-                .claudeFable, .claudeFable51, .claudeFable5, .claudeMythos51,
+                .claudeFable, .claudeFable52, .claudeFable51, .claudeFable5, .claudeMythos51,
                 .claudeOpus1m,
                 .claudeOpus, .claudeOpus55, .claudeOpus5, .claudeOpus48, .claudeOpus47, .claudeOpus46, .claudeOpus45,
                 .claudeSonnet, .claudeSonnet55, .claudeSonnet5, .claudeSonnet46, .claudeSonnet45,
@@ -730,7 +733,7 @@ enum AgentModel: String, CaseIterable, Codable {
             [.fast, .exploration, .engineering]
         case .gpt56SolHigh:
             [.complex, .engineering, .pair]
-        case .claudeFable, .claudeFable51, .claudeFable5, .claudeOpus55, .claudeOpus5:
+        case .claudeFable, .claudeFable52, .claudeFable51, .claudeFable5, .claudeOpus55, .claudeOpus5:
             [.complex, .engineering, .pair, .extendedContext]
         case .claudeSonnet55:
             [.balanced, .engineering, .extendedContext]
@@ -750,7 +753,7 @@ enum AgentModel: String, CaseIterable, Codable {
              .gpt6SolLow, .gpt6SolMedium, .gpt6SolHigh, .gpt6SolXHigh, .gpt6SolMax,
              .gpt6LunaLow, .gpt6LunaMedium, .gpt6LunaHigh, .gpt6LunaXHigh, .gpt6LunaMax:
             1_050_000
-        case .claudeFable, .claudeFable51, .claudeFable5, .claudeMythos51, .claudeSonnet55, .claudeSonnet5, .claudeOpus55, .claudeOpus5, .claudeOpus48, .claudeOpus1m, .glm52_1m:
+        case .claudeFable, .claudeFable52, .claudeFable51, .claudeFable5, .claudeMythos51, .claudeSonnet55, .claudeSonnet5, .claudeOpus55, .claudeOpus5, .claudeOpus48, .claudeOpus1m, .glm52_1m:
             1_000_000
         case .claudeSonnet, .claudeOpus, .claudeHaiku,
              .claudeSonnet46, .claudeSonnet45,
