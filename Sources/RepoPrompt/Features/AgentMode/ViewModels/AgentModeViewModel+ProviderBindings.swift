@@ -16,14 +16,9 @@ extension AgentModeViewModel {
             syncAllActiveUIState()
             return
         }
-        _ = session(for: tabID)
-        let scope = applyEditsScope(for: tabID)
-        Task { [applyEditsApprovalStore] in
-            await applyEditsApprovalStore.setAutoEditEnabled(
-                enabled,
-                for: scope,
-                updateGlobalDefault: true
-            )
+        // Saved sessions must finish restoration before accepting a manual mutation.
+        if interactionRuntime.setAutoEditEnabled(enabled, for: session(for: tabID)) == nil {
+            syncAllActiveUIState()
         }
     }
 

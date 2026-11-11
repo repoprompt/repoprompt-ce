@@ -18834,22 +18834,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return try await interactionRuntime.askUser(command: command, interaction: interaction)
     }
 
-    /// Forced provider switch declines every pending interaction exactly once through the same
-    /// private paths the run-cancel hooks use. Called before the ordinary stop inside the switch
-    /// mutation; each helper is idempotent, so anything `cancelRun` already cleared is a no-op.
-    func providerSwitchDeclinePendingInteractions(for session: TabSession) {
-        // A Codex user-input request dies with the controller retirement that follows; it has no
-        // user-level decline response, only the cleared field the coordinator uses on turn end.
-        // Clear it before the cancels below so their reconcile/publish sees the final state.
-        session.pendingUserInputRequest = nil
-        session.queuedUserInputRequests.removeAll()
-        AgentSessionInteractionRuntime.cancelPendingInstruction(for: session)
-        cancelPendingQuestion(for: session)
-        cancelPendingApproval(for: session)
-        cancelPendingApplyEditsReview(for: session, reason: "Provider switch")
-        interactionRuntime.cancelPendingWorktreeMergeReview(for: session, reason: "Provider switch")
-    }
-
     private func cancelPendingQuestion(for session: TabSession) {
         interactionRuntime.cancelPendingQuestion(for: session)
     }

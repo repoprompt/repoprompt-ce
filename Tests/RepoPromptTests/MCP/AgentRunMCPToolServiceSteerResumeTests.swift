@@ -877,6 +877,179 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         await store.cleanupScope(address)
     }
 
+    func testControlOverridePreparationJoinsAdmittedReadinessSeed() async throws {
+        let window = try await makeWindow()
+        let viewModel = window.agentModeViewModel
+        let session = try await makeWorkspaceOwnedSession(in: window, sessionID: UUID())
+        let command = try XCTUnwrap(try viewModel.runtimeCommand(sessionID: XCTUnwrap(session.activeAgentSessionID)))
+        let scope = command.writer.scope
+        let interactions = try XCTUnwrap(scope.installedInteractions)
+        let runtime = scope.mcp
+        let approvals = viewModel.applyEditsApprovalStore
+        let address = viewModel.applyEditsScope(for: session.tabID)
+        session.autoEditEnabled = true
+        interactions.adoptReadyApprovalPayload(for: session)
+        await interactions.drainPendingEffects(for: session)
+        let originalValue = await approvals.autoEditEnabled(for: address)
+        XCTAssertTrue(originalValue)
+
+        let seedGate = TestReleaseFence(name: "readiness seed")
+        addTeardownBlock { @MainActor in
+            seedGate.release()
+            interactions.test_beforeApprovalSyncCommit = nil
+            interactions.test_onApprovalEffectEnqueued = nil
+            runtime.test_afterMCPControlSetupAwait = nil
+            await approvals.test_setAutoEditOverridePreparedHook(nil)
+            await interactions.drainPendingEffects(for: session)
+        }
+        interactions.test_beforeApprovalSyncCommit = { await seedGate.enterAndWait() }
+        session.autoEditEnabled = false
+        session.isDirty = false
+        interactions.adoptReadyApprovalPayload(for: session)
+        guard await seedGate.waitUntilEntered(timeout: 3) else { return }
+        let begin = try XCTUnwrap(session.applyEditsApprovalSubscriptionTask)
+        var trigger: String?
+        interactions.test_onApprovalEffectEnqueued = { candidate in
+            guard candidate === session else { return }
+            if trigger == nil { trigger = "queued" }
+            seedGate.release()
+        }
+        await approvals.test_setAutoEditOverridePreparedHook { candidate in
+            guard candidate == address else { return }
+            Task { @MainActor in
+                if trigger == nil { trigger = "store" }
+                seedGate.release()
+            }
+        }
+        // Old direct preparation opens the gate from the store, then must wait for the
+        // seed before apply. Ordered preparation opens it when queued behind that seed.
+        // Thus both implementations settle, but only the ordered one captures its revision.
+        runtime.test_afterMCPControlSetupAwait = { _ in await begin.value }
+        let resources = AgentSessionMCPRuntime.ControlActivationResources(
+            approvalStore: approvals, approvalScope: address,
+            providerBindings: viewModel.providerBindingService, perfRecorder: viewModel.perfRecorder
+        )
+        let finished = expectation(description: "Activation settled after readiness seed")
+        let task = Task { @MainActor () -> Result<AgentMCPControlContext, Error> in
+            defer { finished.fulfill() }
+            do {
+                return try await .success(runtime.activateControlContext(
+                    command: command, activationID: UUID(), originatingConnectionID: nil,
+                    taskLabelKind: nil, startPending: false, markSessionAsMCPOriginated: true,
+                    requireInactiveRunState: true, resources: resources, revalidateAdmission: { _ in }
+                ))
+            } catch { return .failure(error) }
+        }
+        addTeardownBlock { @MainActor in
+            seedGate.release()
+            task.cancel()
+            _ = await task.value
+            interactions.test_beforeApprovalSyncCommit = nil
+            interactions.test_onApprovalEffectEnqueued = nil
+            runtime.test_afterMCPControlSetupAwait = nil
+            await approvals.test_setAutoEditOverridePreparedHook(nil)
+            if let context = session.mcpControlContext {
+                _ = await runtime.deactivateControlContext(
+                    session: session, expectedContext: context, approvalStore: approvals, cleanupRegistration: true
+                )
+            }
+        }
+        await fulfillment(of: [finished], timeout: 5)
+        let context: AgentMCPControlContext
+        switch await task.value {
+        case let .success(value): context = value
+        case let .failure(error): return XCTFail("Readiness seed must settle before override preparation: \(error)")
+        }
+        XCTAssertEqual(trigger, "queued")
+        XCTAssertFalse(context.autoEditEnabledBeforeOverride)
+        let controlledValue = await approvals.autoEditEnabled(for: address)
+        XCTAssertTrue(controlledValue)
+        _ = await runtime.deactivateControlContext(
+            session: session, expectedContext: context, approvalStore: approvals, cleanupRegistration: true
+        )
+        let restoredValue = await approvals.autoEditEnabled(for: address)
+        XCTAssertFalse(restoredValue)
+        try await AsyncTestWait.waitUntil("underlying approval preference restored") {
+            await MainActor.run { !session.autoEditEnabled }
+        }
+    }
+
+    func testQueuedControlOverridePreparationRefusesReacquiredWriter() async throws {
+        let window = try await makeWindow()
+        let viewModel = window.agentModeViewModel
+        let sessionID = UUID()
+        let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+        let command = try XCTUnwrap(viewModel.runtimeCommand(sessionID: sessionID))
+        let scope = command.writer.scope
+        let interactions = try XCTUnwrap(scope.installedInteractions)
+        let runtime = scope.mcp
+        let approvals = viewModel.applyEditsApprovalStore
+        let address = viewModel.applyEditsScope(for: session.tabID)
+        let originalValue = await approvals.autoEditEnabled(for: address)
+        let seedGate = TestReleaseFence(name: "readiness seed before writer reacquisition")
+        addTeardownBlock { @MainActor in
+            seedGate.release()
+            interactions.test_beforeApprovalSyncCommit = nil
+            interactions.test_onApprovalEffectEnqueued = nil
+            await approvals.test_setAutoEditOverridePreparedHook(nil)
+            await interactions.drainPendingEffects(for: session)
+        }
+        var reacquireAfterRelease = false
+        var reacquired = false
+        interactions.test_beforeApprovalSyncCommit = {
+            await seedGate.enterAndWait()
+            guard reacquireAfterRelease else { return }
+            // Invalidate while the predecessor resumes, not synchronously at enqueue.
+            // Only revalidation after joining that predecessor can catch this change.
+            reacquired = true
+            let sessions = scope.sessions
+            scope.replaceSessions(sessions.filter { $0.key != session.tabID })
+            scope.replaceSessions(sessions)
+            XCTAssertFalse(command.isCurrent)
+        }
+        interactions.adoptReadyApprovalPayload(for: session)
+        guard await seedGate.waitUntilEntered(timeout: 3) else { return }
+        interactions.test_onApprovalEffectEnqueued = { candidate in
+            guard candidate === session else { return }
+            reacquireAfterRelease = true
+            seedGate.release()
+        }
+        await approvals.test_setAutoEditOverridePreparedHook { candidate in
+            if candidate == address { XCTFail("The stale queued command must not prepare an override") }
+        }
+        let resources = AgentSessionMCPRuntime.ControlActivationResources(
+            approvalStore: approvals, approvalScope: address,
+            providerBindings: viewModel.providerBindingService, perfRecorder: viewModel.perfRecorder
+        )
+        let finished = expectation(description: "Reacquired writer refused before override preparation")
+        let task = Task { @MainActor in
+            defer { finished.fulfill() }
+            do {
+                _ = try await runtime.activateControlContext(
+                    command: command, activationID: UUID(), originatingConnectionID: nil,
+                    taskLabelKind: nil, startPending: false, markSessionAsMCPOriginated: true,
+                    requireInactiveRunState: true, resources: resources, revalidateAdmission: { _ in }
+                )
+                XCTFail("Activation must not transfer to the reacquired writer")
+            } catch let MCPError.invalidParams(message) {
+                XCTAssertEqual(message, "The requested agent session writer changed during MCP control activation.")
+            } catch { XCTFail("Unexpected refusal: \(error)") }
+        }
+        addTeardownBlock { @MainActor in
+            seedGate.release()
+            task.cancel()
+            await task.value
+        }
+        await fulfillment(of: [finished], timeout: 5)
+        await task.value
+        XCTAssertTrue(reacquired)
+        XCTAssertNil(session.mcpControlContext)
+        let registration = await AgentRunSessionStore.currentRegistration(for: sessionID)
+        XCTAssertNil(registration)
+        let value = await approvals.autoEditEnabled(for: address)
+        XCTAssertEqual(value, originalValue)
+    }
+
     func testRuntimeControlDetachCannotRestoreOverSuccessorActivation() async throws {
         let window = try await makeWindow()
         let viewModel = window.agentModeViewModel
@@ -1867,6 +2040,12 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         _ = try XCTUnwrap(binding)
         if restored {
             establishRestoredFixture(session)
+            // This fixture installs its final binding after the original draft lookup. Renew
+            // production interaction composition, then join its seed before callers write.
+            XCTAssertTrue(window.agentModeViewModel.session(for: tabID) === session)
+            try await AsyncTestWait.waitUntil("approval sync renewed for fixture binding") {
+                await MainActor.run { session.applyEditsApprovalSubscriptionID != nil }
+            }
         } else {
             session.hasLoadedPersistedState = false
         }
