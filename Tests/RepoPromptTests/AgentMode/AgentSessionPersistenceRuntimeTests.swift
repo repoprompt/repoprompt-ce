@@ -184,6 +184,107 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
         XCTAssertTrue(session.isDirty)
     }
 
+    func testConfiguredCreationRenewsDraftApprovalSyncWithoutViewModelLookup() async throws {
+        for scenario in ["draft", "bound-seed", "unacknowledged"] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("CreationApproval-\(UUID())")
+            let workspace = WorkspaceModel(name: "Creation approval", repoPaths: [], customStoragePath: root)
+            let scope = AgentSessionRuntimeStore().makeScope()
+            let session = AgentTabSession(tabID: UUID())
+            session.autoEditEnabled = true
+            scope.replaceSessions([session.tabID: session])
+            let approvals = ApplyEditsApprovalStore()
+            let interactions = scope.interactions(routeID: 42, approvalStore: approvals)
+            addTeardownBlock { @MainActor in
+                await interactions.teardownApprovalSync(for: session, cleanupScope: true)
+                session.saveDebounceTask?.cancel()
+                try? FileManager.default.removeItem(at: root)
+                withExtendedLifetime(scope) {}
+            }
+            interactions.ensureApprovalSync(for: session)
+            await interactions.drainPendingEffects(for: session)
+            let address = interactions.approvalScope(for: session)
+            let draftValue = await approvals.autoEditEnabled(for: address)
+            XCTAssertTrue(draftValue)
+
+            let claim = AgentSessionCreationClaim(workspaceID: workspace.id)
+            session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: claim.sessionID, workspaceID: workspace.id))
+            let handle = try XCTUnwrap(session.acceptFreshCreation(claim, workspaceID: workspace.id))
+            // A refused save must preserve a current binding's subscription, not a draft
+            // subscription whose membership was already invalidated by binding installation.
+            if scenario != "draft" {
+                let seeded = expectation(description: "Bound seed projected before configuring the payload")
+                var didSeed = false
+                let attachment = scope.presentation.attach(session, sink: .init(
+                    activityChanged: { _, _ in }, refresh: { _, _, _ in },
+                    turnComplete: { _ in }, turnFailed: { _, _ in },
+                    permissions: { _ in
+                        if !didSeed {
+                            didSeed = true
+                            seeded.fulfill()
+                        }
+                    }
+                ))
+                interactions.ensureApprovalSync(for: session)
+                await interactions.drainPendingEffects(for: session)
+                await fulfillment(of: [seeded], timeout: 3)
+                scope.presentation.detach(attachment)
+            }
+            let beforeSaveSubscription = try XCTUnwrap(session.applyEditsApprovalSubscriptionID)
+            let projected = XCTestExpectation(description: "Configured approval snapshot projected: \(scenario)")
+            projected.isInverted = scenario == "unacknowledged"
+            var didProject = false
+            // Observation only: no VM or command callback is needed to earn readiness.
+            // This callback runs after auto-edit projection, unlike joining the finite seed task.
+            _ = scope.presentation.attach(session, sink: .init(
+                activityChanged: { _, _ in }, refresh: { _, _, _ in },
+                turnComplete: { _ in }, turnFailed: { _, _ in },
+                permissions: { current in
+                    if !didProject, current.applyEditsApprovalSubscriptionID != beforeSaveSubscription {
+                        didProject = true
+                        projected.fulfill()
+                    }
+                }
+            ))
+            session.autoEditEnabled = false
+            session.isDirty = true
+            let storage = AgentSessionStorageInputs(
+                workspaceID: workspace.id,
+                workspaceWithID: { $0 == workspace.id ? workspace : nil },
+                displayName: { _ in "Creation approval" }, isSuppressed: { false },
+                attachmentWorkspaceDirectory: { root }
+            )
+            scope.persistence.composition = storage.persistenceComposition(scope: scope, saveAdmission: { _ in nil })
+            if scenario == "unacknowledged" {
+                scope.persistence.saver = { payload, workspace, count in
+                    let url = try await AgentSessionDataService.shared.saveAgentSession(
+                        payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count
+                    )
+                    session.autoEditEnabled = true
+                    return url
+                }
+            }
+            let result = await scope.persistence.saveSessionCore(for: session.tabID, creationSave: .configured(handle))
+            await interactions.drainPendingEffects(for: session)
+            let configuredValue = await approvals.autoEditEnabled(for: address)
+            if scenario == "unacknowledged" {
+                guard case .deferred = result else { return XCTFail("Configuration drift must not earn readiness") }
+                XCTAssertEqual(session.applyEditsApprovalSubscriptionID, beforeSaveSubscription)
+                XCTAssertTrue(configuredValue)
+                await fulfillment(of: [projected], timeout: 0.05)
+                continue
+            }
+            guard case .durablySaved = result else { return XCTFail("The actual configured payload must earn readiness (\(scenario)): \(result)") }
+            await fulfillment(of: [projected], timeout: 3)
+            XCTAssertFalse(configuredValue, "The draft resource must adopt the configured value without a VM lookup")
+            XCTAssertNotEqual(session.applyEditsApprovalSubscriptionID, beforeSaveSubscription)
+            XCTAssertNotNil(session.applyEditsApprovalSubscriptionID)
+            XCTAssertFalse(session.autoEditEnabled)
+            XCTAssertFalse(session.isDirty, "Renewal must not overwrite and resave the newly configured payload")
+            let saved = try await AgentSessionDataService.shared.loadAgentSession(id: claim.sessionID, for: workspace)
+            XCTAssertFalse(try XCTUnwrap(saved).autoEditEnabled)
+        }
+    }
+
     func testConfiguredCreationAndRequiredFlushUseSameRuntimeTransaction() async throws {
         let f = try Fixture(fresh: true)
         defer { f.cleanUp() }

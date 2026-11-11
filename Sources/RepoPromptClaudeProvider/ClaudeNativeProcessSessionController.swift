@@ -89,7 +89,9 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
     private var nextControlRequestID = 1
     private var pendingControlRequests: [String: CheckedContinuation<[String: Any], Error>] = [:]
     private var pendingControlRequestTimeoutTasks: [String: Task<Void, Never>] = [:]
+    // App response receipts are incarnation-specific; native request IDs may be reused.
     private var pendingPermissionRequests: [String: PendingPermissionRequest] = [:]
+    private var permissionReceiptByNativeID: [String: String] = [:]
     private var translator: ClaudeSDKNDJSONTranslator
     private var sessionID: String?
     private var turnInFlight: Bool {
@@ -598,13 +600,17 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
 
     private func sendPermissionResponse(id: String, decision: AgentApprovalDecision) throws {
         guard let pending = pendingPermissionRequests.removeValue(forKey: id) else { return }
+        if permissionReceiptByNativeID[pending.requestID] == id {
+            permissionReceiptByNativeID.removeValue(forKey: pending.requestID)
+        }
         let response = permissionResponsePayload(decision: decision, pendingRequest: pending.request)
         writeRawEventLogRecord(kind: "approval.response.sent", payload: [
-            "requestID": id,
+            "requestID": pending.requestID,
+            "responseReceipt": id,
             "decision": String(describing: decision),
             "response": response
         ] as [String: Any])
-        let encoded = try ClaudeSDKProtocolCodec.encodeControlResponseSuccess(requestID: id, response: response)
+        let encoded = try ClaudeSDKProtocolCodec.encodeControlResponseSuccess(requestID: pending.requestID, response: response)
         try sendLine(encoded, shutdownOnFailure: false)
     }
 
@@ -638,6 +644,7 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
         }
         await clearExpectedAgentPIDIfNeeded()
         pendingPermissionRequests.removeAll()
+        permissionReceiptByNativeID.removeAll()
         process = nil
         activeLaunchEnvironmentSignature = nil
         isInitialized = false
@@ -675,6 +682,7 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
         try ProviderProcessLaunchPolicy.check()
 
         pendingPermissionRequests.removeAll()
+        permissionReceiptByNativeID.removeAll()
         configurationLifetime = UUID()
         appliedConfigurationProof = nil
         latestFlagSettingsIntentGeneration = 0
@@ -1966,6 +1974,7 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
             isShuttingDown = false
             configurationTestInputClosed = false
             pendingPermissionRequests.removeAll()
+            permissionReceiptByNativeID.removeAll()
             clearTurnIDQueue()
             isInitialized = initialized
             hasCompletedInitialFlagSettings = initialized
@@ -2060,10 +2069,6 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
             beginTurnTracking()
         }
 
-        package func test_storePendingPermissionRequest(id: String, request: [String: Any]) {
-            pendingPermissionRequests[id] = PendingPermissionRequest(requestID: id, request: request)
-        }
-
         package func test_handleControlRequest(
             requestID: String,
             subtype: String,
@@ -2127,6 +2132,23 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
                 emit(.providerTurnStarted(turnID: providerID))
             }
             let payload = request.request
+            if let receipt = permissionReceiptByNativeID[request.requestID] {
+                // Control-error recovery may replay the same still-pending permission.
+                // Preserve that receipt, but never authorize changed content with it.
+                if let pending = pendingPermissionRequests[receipt],
+                   let original = try? JSONSerialization.data(withJSONObject: pending.request, options: [.sortedKeys]),
+                   let incoming = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+                   original == incoming,
+                   let approval = buildApprovalRequest(from: request, responseReceipt: receipt)
+                {
+                    emit(.approvalRequest(approval))
+                    return
+                }
+                permissionReceiptByNativeID.removeValue(forKey: request.requestID)
+                if pendingPermissionRequests.removeValue(forKey: receipt) != nil {
+                    emit(.approvalCancelled(requestID: receipt))
+                }
+            }
             let toolName = (payload["tool_name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let input = payload["input"] as? [String: Any] ?? [:]
             if let repoPromptMatch = host.repoPromptPermissionMatch(toolName: toolName, requestPayload: payload) {
@@ -2155,13 +2177,16 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
                 }
                 return
             }
-            if let approval = buildApprovalRequest(from: request) {
-                pendingPermissionRequests[request.requestID] = PendingPermissionRequest(
+            let receipt = UUID().uuidString
+            if let approval = buildApprovalRequest(from: request, responseReceipt: receipt) {
+                permissionReceiptByNativeID[request.requestID] = receipt
+                pendingPermissionRequests[receipt] = PendingPermissionRequest(
                     requestID: request.requestID,
                     request: payload
                 )
                 writeRawEventLogRecord(kind: "approval.request.emitted", payload: [
                     "requestID": request.requestID,
+                    "responseReceipt": receipt,
                     "toolName": toolName,
                     "kind": String(describing: approval.kind)
                 ] as [String: Any])
@@ -2205,8 +2230,10 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
 
     private func handleControlCancelRequest(requestID: String) {
         writeRawEventLogRecord(kind: "control.request.cancelled", payload: ["requestID": requestID])
-        if pendingPermissionRequests.removeValue(forKey: requestID) != nil {
-            emit(.approvalCancelled(requestID: requestID))
+        if let receipt = permissionReceiptByNativeID.removeValue(forKey: requestID),
+           pendingPermissionRequests.removeValue(forKey: receipt) != nil
+        {
+            emit(.approvalCancelled(requestID: receipt))
         }
     }
 
@@ -2250,6 +2277,7 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
     private func handleStdoutEOF() async {
         guard !isShuttingDown else { return }
         pendingPermissionRequests.removeAll()
+        permissionReceiptByNativeID.removeAll()
         writeRawEventLogRecord(kind: "process.stdoutEOF")
         var remainingLines: [Data] = []
         stdoutFramer.flush { line in
@@ -2360,7 +2388,7 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
         return args
     }
 
-    private func buildApprovalRequest(from request: ClaudeSDKProtocolCodec.ControlRequest) -> AgentApprovalRequest? {
+    private func buildApprovalRequest(from request: ClaudeSDKProtocolCodec.ControlRequest, responseReceipt: String) -> AgentApprovalRequest? {
         let payload = request.request
         let toolName = (payload["tool_name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "tool"
         let input = payload["input"] as? [String: Any] ?? [:]
@@ -2380,7 +2408,7 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
         let itemID = (toolUseID?.isEmpty == false ? toolUseID! : request.requestID)
 
         let approvalID = AgentApprovalRequest.stableID(
-            requestID: .claudeControl(request.requestID),
+            requestID: .claudeControl(responseReceipt),
             method: "control/can_use_tool",
             kind: kind,
             threadID: threadID,
@@ -2423,7 +2451,7 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
 
         return AgentApprovalRequest(
             id: approvalID,
-            requestID: .claudeControl(request.requestID),
+            requestID: .claudeControl(responseReceipt),
             method: "control/can_use_tool",
             kind: kind,
             threadID: threadID,
