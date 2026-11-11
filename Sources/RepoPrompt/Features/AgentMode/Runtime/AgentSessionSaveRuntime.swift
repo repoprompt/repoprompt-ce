@@ -138,6 +138,12 @@ enum AgentSessionSaveRuntime {
         }
         session.isDirty = false
         session.lastUserMessageAt = payload.lastUserMessageAt
+        if acknowledgedCreation {
+            // Like hydration, the configured durable acknowledgment earns readiness for
+            // this payload. Renew after clearing dirty state so projection compares with
+            // the clean saved payload, without requiring a UI lookup.
+            writer.scope.installedInteractions?.adoptReadyApprovalPayload(for: session)
+        }
         // The caller can publish index/presentation effects before reporting the terminal
         // durable phase. The receipt is exact; a returned file URL by itself is insufficient.
         return .committed(Receipt(writerIdentity: writer.identity, payload: payload, binding: binding, acknowledgedCreation: acknowledgedCreation))

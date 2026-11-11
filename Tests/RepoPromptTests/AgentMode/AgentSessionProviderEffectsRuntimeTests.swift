@@ -1191,6 +1191,81 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         ))
     }
 
+    func testProviderSwitchDeclineUsesOnlyItsOriginalLifecycleClaim() async throws {
+        for drift in ["none", "released", "reacquired", "replacement", "other-scope"] {
+            let scope = AgentSessionRuntimeStore().makeScope()
+            let session = questionSession(in: scope)
+            let runtime = scope.interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
+            let command = try questionCommand(in: scope, for: session)
+            let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+            let attempt = AgentComposerSubmitAttempt(
+                id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: ""
+            )
+            guard case let .claimed(claim) = scope.submissions.claim(
+                attempt, command: command, allowsPendingStartWithdrawal: false
+            ) else { return XCTFail("Expected lifecycle claim") }
+            let question = runtimeQuestion()
+            let installed = expectation(description: "Original question installed: \(drift)")
+            let attachment = observeQuestionInstallation(scope: scope, session: session, installed: installed)
+            let task = Task { try await runtime.askUser(command: command, interaction: question) }
+            addTeardownBlock { @MainActor in
+                task.cancel()
+                _ = await task.result
+                scope.submissions.release(claim)
+                await runtime.drainPendingEffects(for: session)
+            }
+            await fulfillment(of: [installed], timeout: 3)
+            scope.presentation.detach(attachment)
+            var successorQuestionID: UUID?
+            switch drift {
+            case "released": scope.submissions.release(claim)
+            case "reacquired":
+                scope.replaceSessions([:])
+                scope.replaceSessions([session.tabID: session])
+            case "replacement":
+                let successor = questionSession(in: scope, tabID: session.tabID)
+                let successorCommand = try questionCommand(in: scope, for: successor)
+                let successorQuestion = runtimeQuestion()
+                successorQuestionID = successorQuestion.id
+                let successorInstalled = expectation(description: "Successor question installed")
+                let successorAttachment = observeQuestionInstallation(scope: scope, session: successor, installed: successorInstalled)
+                let successorTask = Task { try await runtime.askUser(command: successorCommand, interaction: successorQuestion) }
+                addTeardownBlock { @MainActor in
+                    successorTask.cancel()
+                    _ = await successorTask.result
+                    await runtime.drainPendingEffects(for: successor)
+                }
+                await fulfillment(of: [successorInstalled], timeout: 3)
+                scope.presentation.detach(successorAttachment)
+            default: break
+            }
+            let otherScope = AgentSessionRuntimeStore().makeScope()
+            let selectedRuntime = drift == "other-scope"
+                ? otherScope.interactions(routeID: 43, approvalStore: ApplyEditsApprovalStore()) : runtime
+            let accepted = selectedRuntime.declinePendingInteractionsForProviderSwitch(claim: claim)
+            XCTAssertEqual(accepted, drift == "none", drift)
+            if accepted {
+                XCTAssertNil(session.pendingAskUser)
+                XCTAssertNil(session.askUserContinuation)
+                do { _ = try await task.value
+                    XCTFail("Declined question must cancel")
+                } catch { XCTAssertTrue(error is CancellationError) }
+                XCTAssertTrue(scope.submissions.isCurrent(claim), "Interaction cleanup must not consume the lifecycle claim")
+            } else {
+                XCTAssertEqual(session.pendingAskUser?.interaction.id, question.id, drift)
+                XCTAssertNotNil(session.askUserContinuation, drift)
+                if drift == "replacement" {
+                    XCTAssertEqual(scope.sessions[session.tabID]?.pendingAskUser?.interaction.id, successorQuestionID)
+                    XCTAssertNotNil(scope.sessions[session.tabID]?.askUserContinuation)
+                }
+            }
+            task.cancel()
+            _ = await task.result
+            scope.submissions.release(claim)
+            await runtime.drainPendingEffects(for: session)
+        }
+    }
+
     func testMCPQuestionCancellationOwnsInvocationBeforeAndAfterInstallation() async throws {
         let coordinator = MCPAskUserPresentationCoordinator()
         let scope = AgentSessionRuntimeStore().makeScope()
@@ -2014,6 +2089,312 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
             let decision = await caller.value
             XCTAssertEqual(decision, occupiedAtAdmission ? .cancelled(reason: "Late terminal") : .accept)
         }
+    }
+
+    func testApprovalSyncStoreCASPreservesSuccessorAndConcurrentOverride() async throws {
+        let store = ApplyEditsApprovalStore()
+        let address = ApplyEditsApprovalScope(windowID: 42, tabID: UUID())
+        let stale = await store.prepareSync(scope: address)
+        let fresh = await store.prepareSync(scope: address)
+        let installed = await store.commitSync(fresh, initialValue: false, replacePayload: true)
+        let original = try XCTUnwrap(installed)
+        let refused = await store.commitSync(stale, initialValue: true, replacePayload: true)
+        XCTAssertNil(refused, "A preparation cannot overwrite a newer committed lease")
+        let preparation = await store.prepareSync(scope: address)
+        let override = await store.prepareAutoEditOverride(for: address)
+        let applied = await store.applyAutoEditOverride(override)
+        XCTAssertTrue(applied)
+        let renewed = await store.commitSync(preparation, initialValue: false, replacePayload: true)
+        let successor = try XCTUnwrap(renewed)
+        await store.cleanupSync(scope: address, lease: original.lease, admittedAtOrBefore: .now)
+        let oldWrite = await store.setAutoEditEnabled(false, for: address, lease: original.lease, updateGlobalDefault: false)
+        XCTAssertFalse(oldWrite)
+        let overridden = await store.autoEditEnabled(for: address)
+        XCTAssertTrue(overridden, "Initialization and old cleanup must preserve an intervening MCP override")
+        await store.releaseAutoEditOverride(override)
+        let restored = await store.autoEditEnabled(for: address)
+        XCTAssertFalse(restored)
+        let beforeCleanup = await store.prepareSync(scope: address)
+        await store.cleanupSync(scope: address, lease: successor.lease, admittedAtOrBefore: .now)
+        let afterCleanup = await store.commitSync(beforeCleanup, initialValue: true, replacePayload: true)
+        XCTAssertNil(afterCleanup, "Returning to an absent entry must not revive a preparation")
+        await store.unsubscribe(scope: address, id: original.id)
+        await store.unsubscribe(scope: address, id: successor.id)
+    }
+
+    func testHydrationRefreshReplacesOnlyItsOwnInitialSeed() async {
+        for manualChoice in [false, true] {
+            let scope = AgentSessionRuntimeStore().makeScope()
+            let session = AgentTabSession(tabID: UUID())
+            session.autoEditEnabled = true
+            session.hasLoadedPersistedState = false
+            scope.replaceSessions([session.tabID: session])
+            let store = ApplyEditsApprovalStore()
+            let runtime = scope.interactions(routeID: 42, approvalStore: store)
+            runtime.ensureApprovalSync(for: session)
+            await runtime.drainPendingEffects(for: session)
+            if manualChoice {
+                await store.setAutoEditEnabled(true, for: runtime.approvalScope(for: session), updateGlobalDefault: false)
+            }
+            session.autoEditEnabled = false
+            session.hasLoadedPersistedState = true
+            runtime.adoptReadyApprovalPayload(for: session)
+            await runtime.drainPendingEffects(for: session)
+            let value = await store.autoEditEnabled(for: runtime.approvalScope(for: session))
+            XCTAssertEqual(value, manualChoice, "Payload adoption may replace an initial seed, not an intervening manual choice")
+            await runtime.teardownApprovalSync(for: session, cleanupScope: true)
+        }
+    }
+
+    func testApprovalBeginRecoversAfterTemporaryConflictingMembership() async {
+        let store = AgentSessionRuntimeStore()
+        let scope = store.makeScope()
+        let other = store.makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        scope.replaceSessions([session.tabID: session])
+        let approvals = ApplyEditsApprovalStore()
+        let runtime = scope.interactions(routeID: 42, approvalStore: approvals)
+        let gate = TestReleaseFence()
+        runtime.test_beforeApprovalSyncCommit = { await gate.enterAndWait() }
+        addTeardownBlock { @MainActor in
+            gate.release()
+            other.replaceSessions([:])
+            runtime.test_beforeApprovalSyncCommit = nil
+            await runtime.teardownApprovalSync(for: session, cleanupScope: true)
+        }
+        runtime.ensureApprovalSync(for: session)
+        guard await gate.waitUntilEntered() else { return XCTFail("Begin was not held") }
+        other.replaceSessions([session.tabID: session])
+        gate.release()
+        await runtime.drainPendingEffects(for: session)
+        XCTAssertNil(session.applyEditsApprovalSubscriptionTask, "Refused begin cannot leave a false listening latch")
+        XCTAssertNil(runtime.setAutoEditEnabled(false, for: session), "Conflicting membership is not draft command authority")
+        other.replaceSessions([:])
+        runtime.test_beforeApprovalSyncCommit = nil
+        runtime.ensureApprovalSync(for: session)
+        await runtime.drainPendingEffects(for: session)
+        XCTAssertNotNil(session.applyEditsApprovalSubscriptionID)
+    }
+
+    func testHydrationAdoptionSurvivesAnIntermediateBeginThatNeverCommits() async {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        session.autoEditEnabled = true
+        session.hasLoadedPersistedState = false
+        scope.replaceSessions([session.tabID: session])
+        let approvals = ApplyEditsApprovalStore()
+        let runtime = scope.interactions(routeID: 42, approvalStore: approvals)
+        runtime.ensureApprovalSync(for: session)
+        await runtime.drainPendingEffects(for: session)
+        let gate = TestReleaseFence()
+        runtime.test_beforeApprovalSyncCommit = { await gate.enterAndWait() }
+        addTeardownBlock { @MainActor in
+            gate.release()
+            runtime.test_beforeApprovalSyncCommit = nil
+            await runtime.teardownApprovalSync(for: session, cleanupScope: true)
+        }
+        scope.replaceSessions([:])
+        scope.replaceSessions([session.tabID: session])
+        runtime.ensureApprovalSync(for: session)
+        guard await gate.waitUntilEntered() else { return XCTFail("Intermediate begin was not held") }
+        session.autoEditEnabled = false
+        session.hasLoadedPersistedState = true
+        session.isDirty = false
+        runtime.test_beforeApprovalSyncCommit = nil
+        runtime.adoptReadyApprovalPayload(for: session)
+        gate.release()
+        await runtime.drainPendingEffects(for: session)
+        let value = await approvals.autoEditEnabled(for: runtime.approvalScope(for: session))
+        XCTAssertFalse(value, "An uncommitted intermediate record must not hide the store's original seed ownership")
+        XCTAssertFalse(session.isDirty)
+    }
+
+    func testHeldApprovalSeedCannotAdoptReacquiredMembership() async {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        session.autoEditEnabled = true
+        scope.replaceSessions([session.tabID: session])
+        let store = ApplyEditsApprovalStore()
+        let runtime = scope.interactions(routeID: 42, approvalStore: store)
+        let gate = TestReleaseFence()
+        runtime.test_beforeApprovalSyncCommit = { await gate.enterAndWait() }
+        addTeardownBlock { @MainActor in
+            gate.release()
+            runtime.test_beforeApprovalSyncCommit = nil
+            await runtime.teardownApprovalSync(for: session, cleanupScope: true)
+        }
+        runtime.ensureApprovalSync(for: session)
+        guard await gate.waitUntilEntered() else { return XCTFail("Seed did not reach admission fence") }
+        scope.replaceSessions([:])
+        scope.replaceSessions([session.tabID: session])
+        session.autoEditEnabled = false
+        runtime.test_beforeApprovalSyncCommit = nil
+        runtime.ensureApprovalSync(for: session)
+        gate.release()
+        await runtime.drainPendingEffects(for: session)
+        let value = await store.autoEditEnabled(for: runtime.approvalScope(for: session))
+        XCTAssertFalse(value, "The old true seed must not land on the reacquired draft")
+        XCTAssertNotNil(session.applyEditsApprovalSubscriptionID)
+    }
+
+    func testBufferedApprovalProjectionCannotDirtyReacquiredObject() async throws {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        session.autoEditEnabled = true
+        scope.replaceSessions([session.tabID: session])
+        let store = ApplyEditsApprovalStore()
+        let runtime = scope.interactions(routeID: 42, approvalStore: store)
+        let gate = TestReleaseFence()
+        runtime.test_beforeApprovalSnapshot = { await gate.enterAndWait() }
+        addTeardownBlock { @MainActor in
+            gate.release()
+            runtime.test_beforeApprovalSnapshot = nil
+            await runtime.teardownApprovalSync(for: session, cleanupScope: true)
+            await store.cleanupScope(runtime.approvalScope(for: session))
+        }
+        runtime.ensureApprovalSync(for: session)
+        guard await gate.waitUntilEntered() else { return XCTFail("Snapshot was not held") }
+        let listener = try XCTUnwrap(session.applyEditsApprovalSubscriptionTask)
+        scope.replaceSessions([:])
+        scope.replaceSessions([session.tabID: session])
+        session.autoEditEnabled = false
+        session.isDirty = false
+        gate.release()
+        await listener.value
+        XCTAssertFalse(session.autoEditEnabled)
+        XCTAssertFalse(session.isDirty, "A stale snapshot cannot schedule a successor save")
+    }
+
+    func testManualAutoEditCommandCannotFollowWriterReacquisition() async throws {
+        let defaultBefore = ApplyEditsApprovalStore.globalDefaultAutoEditEnabled()
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = questionSession(in: scope)
+        session.autoEditEnabled = false
+        let store = ApplyEditsApprovalStore()
+        let runtime = scope.interactions(routeID: 42, approvalStore: store)
+        runtime.ensureApprovalSync(for: session)
+        await runtime.drainPendingEffects(for: session)
+        let gate = TestReleaseFence()
+        runtime.test_beforeAutoEditWrite = { await gate.enterAndWait() }
+        addTeardownBlock { @MainActor in
+            gate.release()
+            runtime.test_beforeAutoEditWrite = nil
+            await runtime.teardownApprovalSync(for: session, cleanupScope: true)
+            await store.cleanupScope(runtime.approvalScope(for: session))
+            ApplyEditsApprovalStore.setGlobalDefaultAutoEditEnabled(defaultBefore)
+        }
+        let write = try XCTUnwrap(runtime.setAutoEditEnabled(true, for: session))
+        guard await gate.waitUntilEntered() else { return XCTFail("Manual command was not held") }
+        scope.replaceSessions([:])
+        scope.replaceSessions([session.tabID: session])
+        gate.release()
+        await write.value
+        let value = await store.autoEditEnabled(for: runtime.approvalScope(for: session))
+        XCTAssertFalse(value)
+        XCTAssertEqual(ApplyEditsApprovalStore.globalDefaultAutoEditEnabled(), defaultBefore)
+        runtime.test_beforeAutoEditWrite = nil
+        let currentWrite = try XCTUnwrap(runtime.setAutoEditEnabled(true, for: session))
+        await currentWrite.value
+        let currentValue = await store.autoEditEnabled(for: runtime.approvalScope(for: session))
+        XCTAssertTrue(currentValue, "The new exact writer retains the real manual action")
+    }
+
+    func testApprovalTeardownOrdersBeforeSuccessorBeginWithoutDrainingItsListener() async {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let original = AgentTabSession(tabID: UUID())
+        original.autoEditEnabled = true
+        scope.replaceSessions([original.tabID: original])
+        let store = ApplyEditsApprovalStore()
+        let runtime = scope.interactions(routeID: 42, approvalStore: store)
+        runtime.ensureApprovalSync(for: original)
+        await runtime.drainPendingEffects(for: original)
+        let gate = TestReleaseFence()
+        runtime.test_beforeApprovalSyncCleanup = { await gate.enterAndWait() }
+        let teardownDone = expectation(description: "Original cleanup joined finite effects")
+        let teardown = Task {
+            await runtime.teardownApprovalSync(for: original, cleanupScope: true)
+            teardownDone.fulfill()
+        }
+        let successor = AgentTabSession(tabID: original.tabID)
+        successor.autoEditEnabled = false
+        addTeardownBlock { @MainActor in
+            gate.release()
+            runtime.test_beforeApprovalSyncCleanup = nil
+            await teardown.value
+            await runtime.teardownApprovalSync(for: successor, cleanupScope: true)
+        }
+        guard await gate.waitUntilEntered() else { return XCTFail("Cleanup was not held") }
+        scope.replaceSessions([successor.tabID: successor])
+        var successorBegan = false
+        runtime.test_beforeApprovalSyncCommit = { successorBegan = true }
+        runtime.ensureApprovalSync(for: successor)
+        // The begin is queued, but cannot enter the store transaction before cleanup.
+        let tailProbe = expectation(description: "Main actor yielded to queued begin")
+        Task { tailProbe.fulfill() }
+        await fulfillment(of: [tailProbe], timeout: 3)
+        XCTAssertFalse(successorBegan)
+        gate.release()
+        await fulfillment(of: [teardownDone], timeout: 5)
+        await runtime.drainPendingEffects(for: successor)
+        XCTAssertTrue(successorBegan)
+        runtime.test_beforeApprovalSyncCommit = nil
+        let value = await store.autoEditEnabled(for: runtime.approvalScope(for: successor))
+        XCTAssertFalse(value)
+        XCTAssertNotNil(successor.applyEditsApprovalSubscriptionID)
+    }
+
+    func testApprovalCleanupJoinsListenerAfterEphemeralStateClearsTaskField() async {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        scope.replaceSessions([session.tabID: session])
+        let store = ApplyEditsApprovalStore()
+        let runtime = scope.interactions(routeID: 42, approvalStore: store)
+        let listening = expectation(description: "Listener held across cancellation")
+        let joining = expectation(description: "Teardown entered listener join")
+        var releaseListener: CheckedContinuation<Void, Never>?
+        var listenerReleased = false
+        var cleanupEntered = false
+        runtime.test_beforeApprovalSnapshot = {
+            await withCheckedContinuation { releaseListener = $0
+                listening.fulfill()
+            }
+            listenerReleased = true
+        }
+        runtime.test_onApprovalListenerJoin = { joining.fulfill() }
+        runtime.test_beforeApprovalSyncCleanup = {
+            cleanupEntered = true
+            XCTAssertTrue(listenerReleased, "Resource cleanup must join the runtime-owned listener, not the cleared session alias")
+        }
+        runtime.ensureApprovalSync(for: session)
+        await fulfillment(of: [listening], timeout: 5)
+        session.cancelEphemeralRuntimeState()
+        XCTAssertNil(session.applyEditsApprovalSubscriptionTask)
+        let teardown = Task { await runtime.teardownApprovalSync(for: session, cleanupScope: true) }
+        addTeardownBlock { @MainActor in
+            releaseListener?.resume()
+            releaseListener = nil
+            await teardown.value
+        }
+        await fulfillment(of: [joining], timeout: 5)
+        XCTAssertFalse(cleanupEntered)
+        releaseListener?.resume()
+        releaseListener = nil
+        await teardown.value
+        let remaining = await store.test_subscriptionCount()
+        XCTAssertEqual(remaining, 0)
+        XCTAssertTrue(cleanupEntered)
+    }
+
+    func testNonoccupantTerminalCutoffCannotHideLaterOwnersBufferedReview() async {
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let session = AgentTabSession(tabID: UUID())
+        let runtime = scope.interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
+        let review = PendingApplyEditsReview(scope: runtime.approvalScope(for: session), path: "a", unifiedDiff: "diff")
+        runtime.cancelPendingApplyEditsReview(for: session, reason: "Detached terminal")
+        scope.replaceSessions([session.tabID: session])
+        await runtime.drainPendingEffects(for: session)
+        runtime.applyApprovalSnapshot(.init(scope: review.scope, autoEditEnabled: false, pendingReview: review), to: session)
+        XCTAssertEqual(session.pendingApplyEditsReview?.id, review.id)
     }
 
     func testApprovalSubscriptionRejectsRecycledTabAndJoinsBeforeTeardown() async throws {

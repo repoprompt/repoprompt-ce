@@ -148,12 +148,23 @@ final class AgentSessionRuntimeStore {
     /// Provenance for binding preparation, including an unbound local draft. This is not a
     /// restored command or permission to save. Keeping it across an await cannot adopt a
     /// remove/re-add of the same object, even when its persistent binding is unchanged.
+    /// Reference-free provenance for long-lived projections. This is not command authority.
+    struct MembershipIdentity: Equatable {
+        fileprivate let scopeID: UUID
+        fileprivate let incarnationID: UUID
+        fileprivate let binding: AgentPersistentSessionBindingIdentity?
+    }
+
     @MainActor
     struct Membership {
         fileprivate let scope: Scope
         fileprivate let session: AgentTabSession
         fileprivate let incarnationID: UUID
         fileprivate let binding: AgentPersistentSessionBindingIdentity?
+
+        var identity: MembershipIdentity {
+            .init(scopeID: scope.id, incarnationID: incarnationID, binding: binding)
+        }
 
         var isCurrent: Bool {
             scope.holdsSlot(session: session, incarnationID: incarnationID, binding: binding)
@@ -489,6 +500,10 @@ final class AgentSessionRuntimeStore {
             !hasReleasedWriterClaims && sessions[session.tabID] === session
                 && liveClaimByTabID[session.tabID]?.incarnationID == incarnationID
                 && session.persistentSessionBindingIdentity == binding
+        }
+
+        func holds(_ identity: MembershipIdentity, for session: AgentTabSession) -> Bool {
+            identity.scopeID == id && holdsSlot(session: session, incarnationID: identity.incarnationID, binding: identity.binding)
         }
 
         func membership(of session: AgentTabSession) -> Membership? {

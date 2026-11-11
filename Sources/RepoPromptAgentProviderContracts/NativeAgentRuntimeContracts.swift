@@ -50,6 +50,8 @@ package protocol NativeAgentRuntimeControlling: Actor {
     func interruptTurn(reason: String) async -> NativeAgentRuntimeInterruptOutcome
     func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> RepoPromptDomainRuntime.ProviderConversationCleanupOutcome
     func shutdown() async
+    /// Echo the opaque response ID from the emitted approval; never reconstruct it from a
+    /// provider wire request ID. Controllers may invalidate it when that request is withdrawn.
     func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) async
 }
 

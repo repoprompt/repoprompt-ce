@@ -3879,20 +3879,27 @@ extension AgentTranscriptRestorationLifecycleTests {
                 requestID: .codex(.fixture(.int(7))), method: "item/commandExecution/requestApproval",
                 kind: .commandExecution, threadID: "thread", turnID: "turn", itemID: "pending"
             )
-            session.pendingApproval = approval
-            vm.syncTranscriptUIState()
             let incomingID = UUID()
             var incoming = AgentSession(id: incomingID, name: "Incoming", savedAt: Date())
             incoming.composeTabID = fixture.tabID
             _ = try await AgentSessionDataService.shared.saveAgentSession(incoming, for: workspace)
             let rebindGate = PrepareGate()
+            let prepared = expectation(description: "Routed rebind reaches payload preparation")
             await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook { id in
-                if id == incomingID { try await rebindGate.hold() }
+                if id == incomingID {
+                    prepared.fulfill()
+                    try await rebindGate.hold()
+                }
             }
-            // Real MCP routed activation suspends at payload preparation. The run starts waiting
-            // while suspended, so the post-prepare rebind rejects ownership after advancing currency.
+            // Introduce the approval only after preparation is held. A pending approval before
+            // admission legitimately makes the run active when approval sync projects a snapshot,
+            // so that setup could refuse before the gate and leave this test waiting forever.
             let routed = Task { await vm.activateRoutedAgentSession(tabID: fixture.tabID, sessionID: incomingID, workspace: workspace) }
-            await rebindGate.waitUntilEntered()
+            // PrepareGate.open is sticky, including when this expectation resumes before
+            // the actor registers hold(); do not reintroduce an unbounded entry wait here.
+            await fulfillment(of: [prepared], timeout: 3)
+            session.pendingApproval = approval
+            vm.syncTranscriptUIState()
             session.runState = .waitingForApproval
             await rebindGate.open()
             let result = await routed.value

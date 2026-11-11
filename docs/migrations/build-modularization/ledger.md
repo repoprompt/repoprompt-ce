@@ -8493,6 +8493,106 @@ Shared approval subscription/seed/teardown provenance, manual auto-edit command 
 remaining provider-native/VM-forwarding inventory are still open; other lanes' provider execution,
 MCP host composition, persistence/payload, Steer and self-compaction ownership is unchanged.
 
+#### M9.2i checkpoint 3 — approval resource ownership and manual commands
+
+Shared approval sync now retains reference-free scope/incarnation/binding provenance rather than
+only object identity. Its finite per-address begin/write/cleanup effects explicitly join predecessors;
+the long-lived listener is outside that queue. Store preparation is non-destructive, runtime admission
+is revalidated, and an actor-local compare-and-commit issues the lease used by writes, snapshots and
+cleanup. A competing begin or cleanup invalidates the prepared revision, including a return to an
+absent resource. Cleanup without a captured lease has no destructive authority.
+
+The runtime owns the original listener through unsubscribe even when ephemeral session cleanup has
+already cleared the compatibility task field. Reacquisition cannot project an old snapshot or dirty
+and save the new writer. Nonoccupant terminal cutoffs no longer hide another owner's buffered review.
+Abandoned begin tasks clear their listening latch so a temporary conflicting claim cannot permanently
+disable approval UI. Store-side seed ownership survives skipped intermediate begins while preserving
+intervening manual writes and active MCP overrides.
+
+The tab auto-edit action now captures a canonical command before its queued effect; only genuinely
+unbound drafts use membership admission. The no-tab global preference remains unchanged. The only
+hydration seam is renewal after the existing authoritative payload/readiness commit; payload loading,
+provider repair, and save authority stay with their existing owners. Explicit renewal avoids inferring
+payload adoption solely from a compatibility boolean.
+
+Final focused `5357d288-9be4-4fb9-8d3a-03d886ba446f` passed **76 tests**, zero failures
+(29 interaction, 29 restoration-admission, 18 runtime-store), including the listener-join witness.
+Scoped pinned formatting, strict lint and whitespace checks passed. Other lanes' MCP host,
+provider startup/adoption/event installation, persistence and close/handoff owners are unchanged.
+
+#### M9.2i checkpoint 3 follow-up — readiness adoption and ordered activation preparation
+
+Configured creation now renews approval sync after the existing durable acknowledgment and binding
+check, just as hydration does after its authoritative readiness commit. Ordinary or unacknowledged
+saves do not earn that renewal. Real persistence witnesses cover draft and already-bound seeds,
+observe the actual projection, and preserve the exact subscription when acknowledgment is refused.
+The save and hydration bodies remain with their existing owners; this is an interaction-adoption seam.
+
+The actual MCP activation regression first reproduced an approval-revision refusal: preparation read
+the store before an already-admitted readiness seed committed. Matching interaction composition now
+queues finite override preparation behind seed, cleanup and manual writes, checking the original
+command after joining the predecessor. Existing override apply/release CAS is unchanged. Explicit
+resources without matching interaction composition retain their existing path. A held-seed witness
+checks the underlying preference restored after deactivation; writer reacquisition during predecessor
+completion refuses preparation and cleans the exact registration without transferring activation.
+
+Two fixture repairs preserve their original expectations: manually bound sessions join real approval
+sync before use, and rejected-rebind coverage introduces its pending approval at the actual prepared
+hydration boundary rather than allowing early refusal before its gate. The latter gate is bounded.
+No assertion, timeout or production authority was weakened.
+
+Initial fixed focused `8f6e8855-5388-4bae-a2f9-290947d89323` passed **187 tests**, zero failures.
+Post-review `35bf50f6-f92f-4ffe-ba2c-65b1b236280a` also executed **187 tests**, zero failures,
+including the stronger predecessor-reacquisition witness. Scoped pinned format and strict lint passed. Native
+provider approval receipts and forced-switch interaction forwarding remain local follow-up work;
+MCP routing/registration, provider execution, and general lifecycle ownership are not migrated here.
+
+#### M9.2i checkpoint 4 — forced-switch interaction command ownership
+
+Forced-provider-switch interaction decline now runs in `AgentSessionInteractionRuntime` with the
+switch's original composer lifecycle claim. It checks the exact scope and live claim before clearing
+questions, approvals, input projections and review waits. A stale or foreign claim refuses before
+self-compaction cancellation or Stop. The claim remains available to the existing switch transaction;
+provider teardown, Stop and pending-start withdrawal retain their original owners and semantics.
+This is command ownership extraction, not a claim of a new race in the formerly synchronous VM body.
+
+Real-question witnesses cover admitted, released, reacquired, replaced and foreign-scope claims;
+the replacement has its own pending question and continuation. Both the initial focused selection
+`6e91f1aa-8448-4e4f-9aba-3d3ae0e5689e` and final reviewed selection
+`b3da81ff-0ad3-483c-9050-ad1e0140230b` passed **124 tests**, zero failures. Final review refinements
+use distinct question identities and drain the successor's effects at teardown. Scoped pinned
+formatting, strict lint and whitespace checks passed.
+
+Integration before this slice executed **281 tests with one failure** in
+`testHydrationDriftCannotSettleAReplacedPresentationAttempt` (presentation attempt identity mismatch).
+The unchanged full transcript-restoration lifecycle suite then passed **65 tests**, zero failures,
+with `a96fa24d-8a6d-49bd-972a-f7da5cbccdd7`. This is an isolated pass, not proof that the integration
+failure is fixed. No expectation or timeout was weakened.
+
+#### M9.2i checkpoint 5 — native approval response receipts
+
+Claude permission prompts now carry opaque, incarnation-specific response receipts. The provider
+controller maps each native request ID to its current receipt and retains the native ID only for
+wire encoding. Native cancellation withdraws that receipt; a reused native ID cannot consume a late
+answer to an earlier prompt. Identical pending redelivery retains its receipt and prompt identity,
+while changed content revokes the previous receipt before either manual or automatic approval.
+Existing shutdown, EOF, process-start and test-transport reset boundaries clear both maps. This is
+approval ownership only: provider execution, event installation and terminal follow-up owners stay
+unchanged. Callers echo emitted IDs; semantic tool-use IDs and native wire response IDs are preserved.
+
+A real protocol red witness showed the old answer writing the successor request. Final owning-provider
+`ecca773f-c594-4f9c-8fa8-3bc5f22b1195` passed **29 tests**, zero failures, including cancellation/reuse,
+identical replay, changed content, automatic replacement, shutdown and EOF settlement. Initial app
+integration executed **265 tests with two assertions failing in one case** that still expected a raw
+native ID in the reserved approval inbox. Its assertions now require an opaque receipt and retain the
+exact native wire denial and teardown checks. Final `7a59e80e-d37d-4041-8036-806ac5241255` passed
+**265 tests**, zero failures. Scoped pinned formatting, strict lint and whitespace checks passed.
+
+The assigned interaction-command and residual-cleanup slices are locally implemented; this is not
+completion of M9. Provider adoption/event hooks, general lifecycle cleanup, MCP host routing and
+persistence/payload/Steer ownership remain with their respective lanes. Broader integrated gates and
+follow-up publication remain separate receipts.
+
 ### M9.3b PR1 — shared host route and resource ownership (refs #1406)
 
 Base `99d4e718d` (#1679). This is the first resource extraction in the expanded visible-and-saved
