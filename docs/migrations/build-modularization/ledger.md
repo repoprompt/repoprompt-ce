@@ -7522,3 +7522,25 @@ bounded and teardown joins both callers and the snapshot consumer.
 Focused `a11e4e67-66d3-4e60-adcd-6ff2a5acb7e7` passed **18 interaction-runtime tests**, zero failures.
 Scoped pinned formatting, strict lint and whitespace checks passed. This is the first bounded slice,
 not completion of interaction/provider command routing or residual projection/terminal cleanup.
+
+#### M9.2i checkpoint 2 — originating terminal cleanup and VM readiness witnesses
+
+Terminal apply-edits cancellation captures whether the caller held its runtime slot **at Stop**.
+A detached caller cannot gain namespace cancellation authority by being re-added before its deferred
+effect executes. An originally admitted cleanup still settles undisplayed pre-Stop work after claim
+rotation; requiring the old membership to remain current would leave that review pending but hidden
+by the projection cutoff. The existing actor-side admission cutoff protects all post-Stop reviews;
+a caller without original namespace authority may settle only its known review UUID.
+
+A direct VM `askUser` test suspends actual persisted hydration through the existing data-service hook.
+The unchanged owner earns restoration authority and can skip its installed question. Same-object
+reacquisition rejects the obsolete hydration/readiness result; replacement and rebind reject the
+captured target identity. Specific refusal messages are checked, no provider starts, and no question
+or continuation reaches a successor. This is readiness-wrapper coverage, not a claim that the pending
+reacquisition case reaches the later `writer.admitCommand()` check.
+
+Final focused `bc89e0ad-a2a0-474c-8841-5c703d62c678` passed **48 tests**, zero failures (19 interaction,
+29 restoration-admission). Scoped pinned formatting, strict lint and whitespace checks passed.
+Shared approval subscription/seed/teardown provenance, manual auto-edit command routing, and the
+remaining provider-native/VM-forwarding inventory are still open; other lanes' provider execution,
+MCP host composition, persistence/payload, Steer and self-compaction ownership is unchanged.

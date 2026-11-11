@@ -1966,6 +1966,56 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         await store.unsubscribe(scope: address, id: subscription)
     }
 
+    func testTerminalCancellationRetainsOnlyItsOriginalCutoffAuthorityAcrossReacquisition() async throws {
+        for occupiedAtAdmission in [false, true] {
+            let scope = AgentSessionRuntimeStore().makeScope()
+            let original = AgentTabSession(tabID: UUID())
+            let replacement = AgentTabSession(tabID: original.tabID)
+            scope.replaceSessions([original.tabID: occupiedAtAdmission ? original : replacement])
+            let store = ApplyEditsApprovalStore()
+            let runtime = scope.interactions(routeID: 42, approvalStore: store)
+            let address = runtime.approvalScope(for: original)
+            let (subscription, stream) = await store.subscribe(scope: address)
+            let installed = expectation(description: "review admitted before terminal cutoff")
+            var review: PendingApplyEditsReview?
+            let observer = Task {
+                for await snapshot in stream {
+                    if let pending = snapshot.pendingReview {
+                        review = pending
+                        installed.fulfill()
+                        break
+                    }
+                }
+            }
+            let caller = Task { await store.requestReview(scope: address, path: "undisplayed", unifiedDiff: "diff", timeoutSeconds: 60) }
+            let gate = TestReleaseFence(name: "terminal cancellation before same-object reacquisition")
+            runtime.test_beforeApprovalCancellation = { await gate.enterAndWait() }
+            addTeardownBlock {
+                gate.release()
+                await runtime.drainPendingEffects()
+                await store.cleanupScope(address)
+                await store.unsubscribe(scope: address, id: subscription)
+                observer.cancel()
+                await observer.value
+                _ = await caller.value
+            }
+            await fulfillment(of: [installed], timeout: 5)
+            let pending = try XCTUnwrap(review)
+            XCTAssertNil(original.pendingApplyEditsReview, "No exact review receipt has reached this terminal caller")
+            runtime.cancelPendingApplyEditsReview(for: original, reason: "Late terminal")
+            guard await gate.waitUntilEntered() else { return XCTFail("Terminal cancellation never reached the held effect") }
+            scope.replaceSessions([:])
+            scope.replaceSessions([original.tabID: original])
+            gate.release()
+            await runtime.drainPendingEffects(for: original)
+            let accepted = await store.resolveReview(scope: address, reviewID: pending.id, decision: .accept)
+            XCTAssertEqual(accepted, !occupiedAtAdmission, "Only the original occupant may cancel its undisplayed pre-Stop review")
+            if !accepted { await store.cleanupScope(address) }
+            let decision = await caller.value
+            XCTAssertEqual(decision, occupiedAtAdmission ? .cancelled(reason: "Late terminal") : .accept)
+        }
+    }
+
     func testApprovalSubscriptionRejectsRecycledTabAndJoinsBeforeTeardown() async throws {
         let scope = AgentSessionRuntimeStore().makeScope()
         let session = AgentTabSession(tabID: UUID())
