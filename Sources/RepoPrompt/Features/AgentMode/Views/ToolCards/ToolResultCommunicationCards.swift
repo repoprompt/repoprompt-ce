@@ -13,6 +13,14 @@ func oracleToolResultPopoverUserInfo(
     )
 }
 
+@MainActor
+func agentOraclePopoverAction(userInfo: [AnyHashable: Any]?) -> (() -> Void)? {
+    guard let userInfo else { return nil }
+    return {
+        NotificationCenter.default.post(name: .showAgentOraclePopover, object: nil, userInfo: userInfo)
+    }
+}
+
 struct ChatSendResultCard: View {
     let item: AgentChatItem
     let oracleOpenContext: AgentOracleOpenContext?
@@ -68,16 +76,6 @@ struct ChatSendResultCard: View {
         return ToolResultStatusResolver.resolve(toolIsError: item.toolIsError, raw: item.toolResultJSON, fallback: .neutral)
     }
 
-    private var onTap: (() -> Void)? {
-        guard let userInfo = oracleToolResultPopoverUserInfo(
-            item: item,
-            openContext: oracleOpenContext
-        ) else { return nil }
-        return {
-            NotificationCenter.default.post(name: .showAgentOraclePopover, object: nil, userInfo: userInfo)
-        }
-    }
-
     var body: some View {
         StaticToolCardContainer(
             iconName: toolIcon(for: item.toolName),
@@ -86,7 +84,7 @@ struct ChatSendResultCard: View {
             subtitle: summary,
             status: status,
             timestamp: item.timestamp,
-            onTap: onTap
+            onTap: agentOraclePopoverAction(userInfo: oracleToolResultPopoverUserInfo(item: item, openContext: oracleOpenContext))
         ) {
             EmptyView()
         }

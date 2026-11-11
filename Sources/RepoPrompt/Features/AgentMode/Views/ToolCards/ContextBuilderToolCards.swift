@@ -374,14 +374,6 @@ private struct ContextBuilderPlanProgressView: View {
         contextBuilderAgentVM.currentFollowUpOracleChatID(for: tabID)
     }
 
-    private func openOraclePreview() {
-        guard let userInfo = contextBuilderOraclePopoverUserInfo(
-            openContext: oracleOpenContext,
-            chatID: followUpChatID
-        ) else { return }
-        NotificationCenter.default.post(name: .showAgentOraclePopover, object: nil, userInfo: userInfo)
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
@@ -402,7 +394,9 @@ private struct ContextBuilderPlanProgressView: View {
             }
 
             HStack(spacing: 8) {
-                Button(action: openOraclePreview) {
+                Button {
+                    agentOraclePopoverAction(userInfo: contextBuilderOraclePopoverUserInfo(openContext: oracleOpenContext, chatID: followUpChatID))?()
+                } label: {
                     HStack(spacing: 4) {
                         Image(systemName: "doc.text.magnifyingglass")
                             .font(.system(size: 11))
@@ -460,14 +454,6 @@ private struct ContextBuilderCompletedSummaryView: View {
         contextBuilderOracleLaneSummaries(for: dto)
     }
 
-    private func openOraclePreview() {
-        guard let userInfo = contextBuilderOraclePopoverUserInfo(
-            openContext: oracleOpenContext,
-            chatID: followUpChatID
-        ) else { return }
-        NotificationCenter.default.post(name: .showAgentOraclePopover, object: nil, userInfo: userInfo)
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Context builder run completed.")
@@ -495,13 +481,15 @@ private struct ContextBuilderCompletedSummaryView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Button("Open Oracle", action: openOraclePreview)
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(contextBuilderOraclePopoverUserInfo(
-                    openContext: oracleOpenContext,
-                    chatID: followUpChatID
-                ) == nil)
+            Button("Open Oracle") {
+                agentOraclePopoverAction(userInfo: contextBuilderOraclePopoverUserInfo(openContext: oracleOpenContext, chatID: followUpChatID))?()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(contextBuilderOraclePopoverUserInfo(
+                openContext: oracleOpenContext,
+                chatID: followUpChatID
+            ) == nil)
         }
     }
 }

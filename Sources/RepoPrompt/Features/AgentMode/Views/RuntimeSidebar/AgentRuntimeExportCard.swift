@@ -4,11 +4,6 @@ import RepoPromptSettingsCore
 import RepoPromptWorkspaceContext
 import SwiftUI
 
-private enum AgentSelectedFilesPopoverTab {
-    case files
-    case codemaps
-}
-
 @MainActor
 private protocol AgentContextExportSourceView: View {
     var promptManager: PromptViewModel { get }
@@ -44,7 +39,7 @@ private extension AgentContextExportSourceView {
 private protocol AgentSelectedFilesManaging: AgentContextExportSourceView {
     var perfRecorder: any AgentModePerfRecording { get }
     var modelCoordinator: AgentSelectedFilesModelCoordinator { get }
-    var activePopoverTab: AgentSelectedFilesPopoverTab { get }
+    var activePopoverTab: AgentSelectedFilesTab { get }
     var exportComponent: String { get }
 }
 
@@ -86,7 +81,7 @@ private extension AgentSelectedFilesManaging {
     }
 
     func effectiveCodeMapUsage(
-        for activeTab: AgentSelectedFilesPopoverTab,
+        for activeTab: AgentSelectedFilesTab,
         configuredUsage: CodeMapUsage
     ) -> CodeMapUsage {
         activeTab == .codemaps ? configuredUsage : .none
@@ -361,7 +356,7 @@ struct AgentSelectedFilesPopoverTrigger<Label: View>: View, AgentSelectedFilesMa
     @Environment(\.agentModePerfRecorder) fileprivate var perfRecorder
     @StateObject fileprivate var modelCoordinator = AgentSelectedFilesModelCoordinator()
     @State private var showSelectedFilesPopover = false
-    @State fileprivate var activePopoverTab: AgentSelectedFilesPopoverTab = .files
+    @State fileprivate var activePopoverTab: AgentSelectedFilesTab = .files
 
     private var selectionSummary: AgentContextSelectionSummary {
         if let summaryOverride {
@@ -504,7 +499,7 @@ struct AgentSelectedFilesInlineManager: View, AgentSelectedFilesManaging {
 
     @Environment(\.agentModePerfRecorder) fileprivate var perfRecorder
     @StateObject fileprivate var modelCoordinator = AgentSelectedFilesModelCoordinator()
-    @State fileprivate var activePopoverTab: AgentSelectedFilesPopoverTab = .files
+    @State fileprivate var activePopoverTab: AgentSelectedFilesTab = .files
 
     var body: some View {
         AgentSelectedFilesPopover(
@@ -589,7 +584,7 @@ private struct AgentSelectedFilesPopover: View {
     let isLoading: Bool
     let canMutateDisplayedModel: Bool
     let placeholderFileCount: Int
-    @Binding var activeTab: AgentSelectedFilesPopoverTab
+    @Binding var activeTab: AgentSelectedFilesTab
     let canMutate: Bool
     let onLoadContent: (AgentContextExportRow, AgentContextExportRow.ContentPurpose) async -> String?
     let onRemove: (AgentContextExportRow, AgentContextExportModel) -> Void
@@ -609,13 +604,13 @@ private struct AgentSelectedFilesPopover: View {
             if isLoading, model == nil {
                 loadingSkeletonRows(count: placeholderFileCount)
             } else if rowSplit.rows.isEmpty {
-                emptyState(title: "No files selected")
+                agentSelectedFilesEmptyState(title: "No files selected", fontPreset: fontPreset)
             } else {
-                let activeRows = rows(for: activeTab)
+                let activeRows = rowSplit.rows(for: activeTab)
                 if isLoading, activeTab == .codemaps, rowSplit.codemapRows.isEmpty {
                     loadingSkeletonRows(count: 2)
                 } else if activeRows.isEmpty {
-                    emptyState(title: activeTab == .files ? "No files in Agent context" : "No codemaps in Agent context")
+                    agentSelectedFilesEmptyState(title: activeTab == .files ? "No files in Agent context" : "No codemaps in Agent context", fontPreset: fontPreset)
                 } else {
                     ScrollView(.vertical, showsIndicators: true) {
                         LazyVStack(alignment: .leading, spacing: 4) {
@@ -642,36 +637,29 @@ private struct AgentSelectedFilesPopover: View {
         .padding(.top, 2)
         .padding(.bottom, 8)
         .onAppear {
-            adjustActiveTab(fileCount: rowSplit.fileRows.count, codemapCount: rowSplit.codemapRows.count)
+            adjustAgentSelectedFilesTab($activeTab, fileCount: rowSplit.fileRows.count, codemapCount: rowSplit.codemapRows.count)
         }
         .onChange(of: rowSplit.fileRows.count) { _, _ in
-            adjustActiveTab(fileCount: rowSplit.fileRows.count, codemapCount: rowSplit.codemapRows.count)
+            adjustAgentSelectedFilesTab($activeTab, fileCount: rowSplit.fileRows.count, codemapCount: rowSplit.codemapRows.count)
         }
         .onChange(of: rowSplit.codemapRows.count) { _, _ in
-            adjustActiveTab(fileCount: rowSplit.fileRows.count, codemapCount: rowSplit.codemapRows.count)
+            adjustAgentSelectedFilesTab($activeTab, fileCount: rowSplit.fileRows.count, codemapCount: rowSplit.codemapRows.count)
         }
         .onChange(of: activeTab) { _, _ in
-            previewCoordinator.reconcileVisibleRows(rows(for: activeTab))
+            previewCoordinator.reconcileVisibleRows(rowSplit.rows(for: activeTab))
         }
         .onChange(of: rowSplit.rows.map(\.id)) { _, _ in
-            previewCoordinator.reconcileVisibleRows(rows(for: activeTab))
-        }
-    }
-
-    private func rows(for tab: AgentSelectedFilesPopoverTab) -> [AgentContextExportRow] {
-        switch tab {
-        case .files: rowSplit.fileRows
-        case .codemaps: rowSplit.codemapRows
+            previewCoordinator.reconcileVisibleRows(rowSplit.rows(for: activeTab))
         }
     }
 
     private func tabSwitcher(split: AgentSelectedFilesRowSplit) -> some View {
         HStack(alignment: .center, spacing: 10) {
             HStack(spacing: 0) {
-                tabButton(icon: "doc.text", label: "Files", count: displayFileCount(split: split), tab: .files) {
+                agentSelectedFilesTabButton(icon: "doc.text", label: "Files", count: displayFileCount(split: split), isActive: activeTab == .files, fontPreset: fontPreset, padding: CGSize(width: 12, height: 7), minHeight: 32, inactiveLineOpacity: 0.18) {
                     activeTab = .files
                 }
-                tabButton(icon: "square.grid.2x2", label: "Codemaps", count: split.codemapRows.count, tab: .codemaps) {
+                agentSelectedFilesTabButton(icon: "square.grid.2x2", label: "Codemaps", count: split.codemapRows.count, isActive: activeTab == .codemaps, fontPreset: fontPreset, padding: CGSize(width: 12, height: 7), minHeight: 32, inactiveLineOpacity: 0.18) {
                     activeTab = .codemaps
                 }
             }
@@ -699,38 +687,6 @@ private struct AgentSelectedFilesPopover: View {
 
     private var canMutateDisplayedRows: Bool {
         canMutate && canMutateDisplayedModel && model != nil
-    }
-
-    private func tabButton(
-        icon: String,
-        label: String,
-        count: Int,
-        tab: AgentSelectedFilesPopoverTab,
-        action: @escaping () -> Void
-    ) -> some View {
-        let isActive = activeTab == tab
-        return Button(action: action) {
-            HStack(spacing: 6) {
-                Image(systemName: icon)
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-                Text(label)
-                    .font(fontPreset.captionFont.weight(.semibold))
-                Text("\(count)")
-                    .font(fontPreset.captionFont.weight(.medium))
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 7)
-            .frame(maxWidth: .infinity, minHeight: 32)
-            .foregroundColor(isActive ? Color.accentColor : Color.secondary)
-            .overlay(alignment: .bottom) {
-                Rectangle()
-                    .fill(isActive ? Color.accentColor : Color.secondary.opacity(0.18))
-                    .frame(height: isActive ? 2 : 1)
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .disabled(isActive)
     }
 
     private func displayFileCount(split: AgentSelectedFilesRowSplit) -> Int {
@@ -767,26 +723,6 @@ private struct AgentSelectedFilesPopover: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .accessibilityLabel("Loading selected files")
-    }
-
-    private func emptyState(title: String) -> some View {
-        VStack(spacing: 12) {
-            Image(systemName: "doc.text")
-                .font(.system(size: 34))
-                .foregroundColor(.secondary.opacity(0.4))
-            Text(title)
-                .font(fontPreset.standardFont)
-                .foregroundColor(.secondary)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private func adjustActiveTab(fileCount: Int, codemapCount: Int) {
-        if activeTab == .files, fileCount == 0, codemapCount > 0 {
-            activeTab = .codemaps
-        } else if activeTab == .codemaps, codemapCount == 0, fileCount > 0 {
-            activeTab = .files
-        }
     }
 }
 
