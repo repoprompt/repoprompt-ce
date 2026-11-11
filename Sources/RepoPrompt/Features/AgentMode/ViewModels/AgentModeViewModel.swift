@@ -2178,6 +2178,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     guard let self, sessions[session.tabID] === session, currentTabID == session.tabID else { return }
                     syncComposerUIState(tabID: session.tabID)
                 },
+                composerStartWithdrawal: { [weak self] session, attemptID in
+                    guard let self, sessions[session.tabID] === session else { return }
+                    finishWithdrawnComposerSubmission(session: session, attemptID: attemptID)
+                },
                 binding: { [weak self] session in
                     guard let self, sessions[session.tabID] === session else { return }
                     updateBindingsFromSession(session)
@@ -8594,12 +8598,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                   let manager = workspaceManager else { return nil }
             let store = promptManager?.workspaceFileContextStore
             let paths = manager.activeWorkspace?.repoPaths
+            let storageDirectory = manager.activeWorkspace?.customStoragePath
             let fallback = workspacePathProvider()
-            return .init(store: store, fallbackWorkspacePath: fallback, declaredRepoPaths: paths ?? [], isCurrent: { [weak self, weak manager] in
+            return .init(store: store, fallbackWorkspacePath: fallback, declaredRepoPaths: paths ?? [], storageDirectory: storageDirectory, isCurrent: { [weak self, weak manager] in
                 guard let self, let manager else { return false }
                 return workspaceManager === manager
                     && manager.activeWorkspaceID == command.identity.workspaceID
                     && manager.activeWorkspace?.repoPaths == paths
+                    && manager.activeWorkspace?.customStoragePath == storageDirectory
                     && promptManager?.workspaceFileContextStore === store
                     && workspacePathProvider() == fallback
             })
@@ -14919,7 +14925,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let presentedHandoffOwnsRecovery = ui.composer.pendingSubmissions[claim.attempt.id] != nil
         var approvedBriefForRecovery: String?
         var submittedApprovedBrief = false
-        guard composerSubmitClaimIsCurrent(claim) else {
+        // Even a late, already-withdrawn executor must acknowledge its original producer.
+        defer { releaseComposerSubmitClaim(claim) }
+        guard claim.cancellation.beginExecution(), composerSubmitClaimIsCurrent(claim) else {
             clearRepromptSubmissionState(claimID: claim.attempt.id)
             return .blocked(message: Self.staleComposerSubmitTargetMessage)
         }
@@ -14936,7 +14944,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 repromptUIStore.recoveries[target.tabID]?.bypassesPreparation = false
             }
             clearRepromptSubmissionState(claimID: claim.attempt.id)
-            releaseComposerSubmitClaim(claim)
         }
 
         switch target.route {
@@ -14989,6 +14996,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 fallbackSelectedReasoningEffortRaw: selectedReasoningEffortRaw,
                 fallbackAutoEditEnabled: autoEditEnabled
             )
+            claim.cancellation.ownsInitialPreparation(on: preparedSession)
             preparedSession.isPreparingInitialWorktree = true
             syncComposerUIState(tabID: target.tabID)
             syncStatusPillsUIState()
@@ -15068,6 +15076,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let pendingState = Self.pendingUserTurnState(from: sourceSession)
             let preparesExecutionLocation = pendingState.initialStartLocation != .local
             if preparesExecutionLocation {
+                claim.cancellation.ownsInitialPreparation(on: sourceSession)
                 sourceSession.isPreparingInitialWorktree = true
                 syncComposerUIState(tabID: target.tabID)
                 syncStatusPillsUIState()
@@ -15119,14 +15128,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 return .blocked(message: "Failed to create a new agent session.")
             }
             let destinationSession = session(for: destinationTabID)
-            movePendingComposerSubmission(claim, to: destinationTabID)
-            guard isFreshFirstSendDestination(destinationSession) else {
+            guard isFreshFirstSendDestination(destinationSession),
+                  composerSubmitRuntime.alias(claim, to: destinationSession)
+            else {
                 logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "invalid_first_send_destination")
                 resyncAfterRejectedSubmitTarget(target)
                 await discardFreshFirstSendDestinationIfPossible(destinationTabID, reactivateSourceTabID: target.tabID)
                 return .blocked(message: "Failed to create a new agent session.")
             }
+            movePendingComposerSubmission(claim, to: destinationTabID)
             if preparesExecutionLocation {
+                claim.cancellation.ownsInitialPreparation(on: destinationSession)
                 destinationSession.isPreparingInitialWorktree = true
                 syncComposerUIState(tabID: destinationTabID)
             }
@@ -15553,7 +15565,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 _ = try await admission.command.writer.scope.worktrees.transition(
                     [binding], admission: admission, intent: .initialSend,
                     revalidateAuthority: {
-                        guard operationIsCurrent(), self.isReadyForInitialNewWorktreeCommit(session) else {
+                        guard !Task.isCancelled, operationIsCurrent(), self.isReadyForInitialNewWorktreeCommit(session) else {
                             throw InitialNewWorktreePreparationError.unavailable(Self.staleComposerSubmitTargetMessage)
                         }
                     }
@@ -16668,7 +16680,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             let capturedHandoff = session.pendingHandoff
             let capturedBinding = session.currentRestorationBindingToken
-            let capturedStop = stopFence ?? AgentRunStartStopFence(session: session)
+            let capturedStop = stopFence ?? claim.cancellation.pendingStartFence(for: session)
+                ?? AgentRunStartStopFence(session: session)
             let task = Task<UserTurnSubmissionResult, Never> { @MainActor [self] in
                 defer { if ownsClaim { releaseComposerSubmitClaim(claim) } }
                 #if DEBUG
@@ -16766,6 +16779,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let acceptedSwitchPreparation = providerSwitchPreparation?.accepting(userItem.id, session: session)
         let turnRuntimeAnchorRollback = recordAgentTurnUserAnchor(for: session, userItem: userItem)
         session.appendItem(userItem)
+        if isLocalComposerInput, managedTurn == nil, codexAttemptID == nil {
+            session.composerStartCancellation?.recordOptimisticInput(userItem.id, on: session)
+        }
         // Only the validated composer ingress supplies this positive token. Shared MCP/API
         // defaults and attachment-only synthetic bubble labels never qualify.
         let localComposerCandidate = composerOrigin == .localComposer && isLocalComposerInput
@@ -16887,7 +16903,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         if session.selectedAgent == .codexExec {
             let dispatchTicket = session.codexDispatchSerialGate.issueTicket()
-            let producerStopFence = stopFence ?? AgentRunStartStopFence(session: session)
+            let producerStopFence = stopFence ?? session.composerStartCancellation?.pendingStartFence(for: session)
+                ?? AgentRunStartStopFence(session: session)
             let fallbackContext = TabSession.CodexFallbackSubmissionContext(
                 queueID: UUID(),
                 providerText: wrappedText,
@@ -16904,7 +16921,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             // the steer is withdrawn rather than becoming a new turn outside the durable idle path.
             let managedSteerRunID = session.runID
             let managedSteerAttemptID = session.activeRunAttemptID
+            let composerStart = isLocalComposerInput && managedTurn == nil && codexAttemptID == nil
+                ? session.composerStartCancellation : nil
+            composerStart?.retainProducer()
             Task {
+                defer { composerStart?.releaseProducer() }
                 // This producer owns every rollback decision. Close only after those decisions,
                 // including serial-gate cancellation that deliberately retains the row.
                 defer { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
@@ -17000,7 +17021,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                             repromptedText: repromptedText,
                             tabID: tabID,
                             session: authoritativeSession,
-                            draftText: fallbackContext.draftText,
+                            draftText: composerStart?.didRestoreDraft == true ? "" : fallbackContext.draftText,
                             attachments: attachmentsToSend,
                             taggedFiles: taggedFilesToSend,
                             selectedWorkflow: restorationSelectedWorkflow,
@@ -17052,7 +17073,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // otherwise attachment references are not forwarded reliably.
         if session.runState == .waitingForUser {
             if session.selectedAgent.usesClaudeNativeRuntime, !attachmentsToSend.isEmpty {
-                let producerStopFence = stopFence ?? AgentRunStartStopFence(session: session)
+                let producerStopFence = stopFence ?? session.composerStartCancellation?.pendingStartFence(for: session)
+                    ?? AgentRunStartStopFence(session: session)
                 Task { [weak self, weak session] in
                     guard let self, let session else { return }
                     defer { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
@@ -17149,8 +17171,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         // If agent is not running, start it
         if !session.runState.isActive {
-            let producerStopFence = stopFence ?? AgentRunStartStopFence(session: session)
+            let producerStopFence = stopFence ?? session.composerStartCancellation?.pendingStartFence(for: session)
+                ?? AgentRunStartStopFence(session: session)
+            let composerStart = isLocalComposerInput && managedTurn == nil && codexAttemptID == nil
+                ? session.composerStartCancellation : nil
+            composerStart?.retainProducer()
             Task {
+                defer { composerStart?.releaseProducer() }
                 await startAgentRun(
                     tabID: tabID,
                     initialMessage: wrappedText,
@@ -18120,7 +18147,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             expectedRunID: session.runID,
             expectedActiveAgentSessionID: session.activeAgentSessionID,
             expectedRunAttemptID: session.activeRunAttemptID,
-            expectedPendingUserInputReceipt: expectedPendingUserInputReceipt
+            expectedPendingUserInputReceipt: expectedPendingUserInputReceipt,
+            expectedPendingComposerAttemptID: session.composerStartCancellation?.canWithdraw(on: session) == true
+                ? session.composerStartCancellation?.attemptID : nil,
+            expectedPendingComposerSession: session.composerStartCancellation?.canWithdraw(on: session) == true
+                ? ObjectIdentifier(session) : nil
         )
     }
 
@@ -18134,6 +18165,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         origin: AgentModeRunService.CancellationOrigin = .explicitStop
     ) async {
         guard let session = sessions[tabID] else { return }
+        if origin == .explicitStop, let start = session.composerStartCancellation, start.canWithdraw(on: session) {
+            prepareAgentRunCancellation(session: session, intent: .userStop, origin: origin)
+            runService.withdrawQueuedWorkForManagedStop(tabID: tabID, session: session)
+            if completion == .terminalTeardownCompleted { _ = await start.awaitFinalization() }
+            _ = await awaitOracleBackgroundDrain(for: session)
+            return
+        }
         if let operation = repromptOperations[tabID] {
             operation.invalidate(reason: "The run was stopped.")
             if !session.runState.isActive {
@@ -18173,6 +18211,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             logRejectedCancelTarget(target, session: nil, reason: "missing_session")
             resyncAfterRejectedCancelTarget(target)
             return false
+        }
+        if let attemptID = target.expectedPendingComposerAttemptID {
+            guard ObjectIdentifier(session) == target.expectedPendingComposerSession,
+                  target.expectedActiveAgentSessionID == session.activeAgentSessionID,
+                  let start = session.composerStartCancellation, start.attemptID == attemptID,
+                  start.canWithdraw(on: session)
+            else {
+                resyncAfterRejectedCancelTarget(target)
+                return false
+            }
+            await cancelAgentRun(tabID: target.tabID, completion: completion, origin: .explicitStop)
+            return true
         }
         retireTimedOutManagedStopIfEligible(session)
         if !session.runState.isActive,
@@ -18261,7 +18311,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// only supported way to do that; nothing else about the admission machinery is relaxed.
     func claimComposerSubmitAttempt(
         _ attempt: AgentComposerSubmitAttempt,
-        requireActiveTabOwnership: Bool
+        requireActiveTabOwnership: Bool,
+        awaitsExecutor: Bool = false,
+        allowsPendingStartWithdrawal: Bool = true
     ) -> AgentComposerSubmitClaimResult {
         let target = attempt.target
         if requireActiveTabOwnership, let operation = repromptOperations[target.tabID],
@@ -18283,7 +18335,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let result = composerSubmitRuntime.claim(
             attempt,
             presentationRejection: submitTargetRejectionReason(target, session: sessions[target.tabID]),
-            publishesPresentation: false
+            publishesPresentation: false,
+            awaitsExecutor: awaitsExecutor,
+            allowsPendingStartWithdrawal: allowsPendingStartWithdrawal
         )
         switch result {
         case let .claimed(claim):
@@ -18317,6 +18371,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
               session.draftMutationGeneration == claim.draftMutationGeneration,
               session.draftText == attempt.rawDraftSnapshot
         else { return }
+        claim.cancellation.oweDraftRestoration(attempt.rawDraftSnapshot)
         storeDraftText(for: attempt.sourceTabID, "")
     }
 

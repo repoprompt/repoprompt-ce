@@ -307,6 +307,84 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         XCTAssertTrue(snapshot().board.sendBlockers.isEmpty)
     }
 
+    func testCancellingPresentedSteerPreservesExistingRunAndRestoresOnlyOnce() async throws {
+        let fixture = try makeFixture()
+        let vm = fixture.viewModel
+        fixture.session.installRunID(UUID())
+        let ownership = fixture.session.beginRunAttempt(source: "existing-steer-target")
+        fixture.session.runState = .running
+        vm.storeDraftText(for: fixture.tabID, "unsent steer")
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: fixture.tabID, session: fixture.session))
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "unsent steer")
+        guard case let .claimed(claim) = vm.claimComposerSubmitForImmediatePresentation(attempt) else { return XCTFail("Expected presented steer") }
+        let stopGeneration = fixture.session.stopState.cancellationGeneration
+        vm.storeDraftText(for: fixture.tabID, "new typing")
+        await vm.cancelPresentedComposerSubmission(id: attempt.id)
+        XCTAssertTrue(claim.cancellation.isWithdrawn)
+        XCTAssertEqual(fixture.session.stopState.cancellationGeneration, stopGeneration)
+        XCTAssertEqual(fixture.session.activeRunOwnership, ownership)
+        XCTAssertEqual(fixture.session.runState, .running)
+        XCTAssertEqual(fixture.session.draftText, "unsent steer\nnew typing")
+        guard case .blocked = await vm.executePresentedComposerSubmitAttempt(text: "unsent steer", claim: claim) else { return XCTFail("Cancelled steer dispatched") }
+        XCTAssertEqual(fixture.session.draftText, "unsent steer\nnew typing")
+        XCTAssertTrue(fixture.session.items.isEmpty)
+        fixture.session.runState = .cancelled
+    }
+
+    func testManagedStopWithdrawsPresentedComposerButWaitsForItsProducer() async throws {
+        let fixture = try makeFixture()
+        let vm = fixture.viewModel
+        vm.storeDraftText(for: fixture.tabID, "unsent draft")
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: fixture.tabID, session: fixture.session))
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "unsent draft")
+        guard case let .claimed(claim) = vm.claimComposerSubmitForImmediatePresentation(attempt) else { return XCTFail("Expected presented claim") }
+        XCTAssertTrue(claim.cancellation.beginExecution())
+        XCTAssertEqual(vm.composerRunCancelTarget(tabID: fixture.tabID)?.expectedPendingComposerAttemptID, attempt.id)
+        vm.storeDraftText(for: fixture.tabID, "new typing")
+        let producerGate = AgentSessionLinkStopSignal<Void>()
+        let producer = Task {
+            await producerGate.value()
+            vm.releaseComposerSubmitClaim(claim)
+        }
+        let stopping = Task { await stop(fixture, teardownDeadlineSeconds: 60) }
+        try await AsyncTestWait.waitUntil("composer withdrawn by managed Stop") { claim.cancellation.isWithdrawn }
+        XCTAssertEqual(fixture.session.draftText, "unsent draft\nnew typing")
+        XCTAssertNil(vm.ui.composer.pendingSubmissions[attempt.id])
+        XCTAssertNil(fixture.session.activeRunOwnership)
+        XCTAssertNil(fixture.session.lastTerminalCommitRevision)
+        XCTAssertFalse(claim.cancellation.isFinalized)
+        XCTAssertFalse(vm.linkExecutionRuntime.pendingStopEffects.isEmpty)
+        producerGate.finish(())
+        await producer.value
+        guard case let .settled(receipt) = await stopping.value else { return XCTFail("Expected Stop receipt") }
+        XCTAssertEqual(receipt.result, .stopped)
+        XCTAssertEqual(receipt.teardownCompleted, true)
+        XCTAssertEqual(receipt.resultingRunState, "pending_start_withdrawn")
+        XCTAssertEqual(fixture.session.draftText, "unsent draft\nnew typing")
+        XCTAssertTrue(vm.linkExecutionRuntime.pendingStopEffects.isEmpty)
+    }
+
+    func testPendingComposerStopTimeoutDoesNotAcknowledgeProducerDrain() async throws {
+        let fixture = try makeFixture()
+        let vm = fixture.viewModel
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: fixture.tabID, session: fixture.session))
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "")
+        guard case let .claimed(claim) = vm.claimComposerSubmitAttempt(attempt) else { return XCTFail("Expected claim") }
+        let deadline = AgentSessionLinkStopSignal<Void>()
+        let stopping = Task { await stop(fixture, deadlineSleep: { _ in await deadline.value() }) }
+        try await AsyncTestWait.waitUntil("composer withdrawn before deadline") { claim.cancellation.isWithdrawn }
+        deadline.finish(())
+        guard case let .settled(receipt) = await stopping.value else { return XCTFail("Expected timed-out receipt") }
+        XCTAssertEqual(receipt.result, .stopFailed)
+        XCTAssertEqual(receipt.teardownCompleted, false)
+        XCTAssertFalse(claim.cancellation.isFinalized)
+        XCTAssertFalse(vm.linkExecutionRuntime.pendingStopEffects.isEmpty)
+        vm.releaseComposerSubmitClaim(claim)
+        await vm.linkExecutionRuntime.drainPendingStopEffects()
+        XCTAssertTrue(vm.linkExecutionRuntime.pendingStopEffects.isEmpty)
+        XCTAssertNil(fixture.session.activeRunAttemptID)
+    }
+
     func testPendingStartWithdrawsWithoutSyntheticTerminalRun() async throws {
         let fixture = try makeFixture()
         fixture.session.runState = .completed

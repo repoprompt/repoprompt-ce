@@ -35,7 +35,7 @@ extension AgentSessionRuntimeStore.Scope {
         {
             blockers.insert(.run)
         }
-        if session.activeComposerSubmitAttempt != nil || continuation.hasPendingStarts(for: session)
+        if session.isComposerSubmissionInFlight || continuation.hasPendingStarts(for: session)
             || session.mcpFollowUpRunPending || session.scheduledACPFollowUp != nil
             || !session.pendingInstructions.isEmpty || session.selfCompactAdmissionPendingID != nil
         {
@@ -63,7 +63,7 @@ extension AgentSessionRuntimeStore.Scope {
             blockers: blockers,
             legacyPreparedOwnerIsIdle: !session.runState.isActive,
             legacyPreparedHandoffIsSettled: !session.runState.isActive && !session.isDirty,
-            legacyDrainCanRelease: !session.runState.isActive && session.activeComposerSubmitAttempt == nil
+            legacyDrainCanRelease: !session.runState.isActive && !session.isComposerSubmissionInFlight
                 && !session.terminalCommitInProgress && (!session.isDirty || deleted)
         )
     }

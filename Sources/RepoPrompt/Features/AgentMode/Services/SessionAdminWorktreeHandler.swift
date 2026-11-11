@@ -891,15 +891,41 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         guard let lease = batch.leases.first else { throw SessionAdminMCPToolService.unavailableError }
         let repoRoot = try SessionAdminArguments.string(batch.request.arguments, "repo_root", op: "merge_preview")
         let mergeTarget = try SessionAdminArguments.string(batch.request.arguments, "merge_target", op: "merge_preview")
-        let preview = try await host.previewMerge(sessionID: lease.targetSessionID, repoRoot: repoRoot, mergeTarget: mergeTarget)
-        try Task.checkCancellation()
-        guard context.isStillAuthorized(lease, scope: batch.scope, requiresMutationOwner: batch.request.operation.mutatesTarget) else {
+        let preview: Value
+        do {
+            preview = try await host.previewMerge(
+                sessionID: lease.targetSessionID, repoRoot: repoRoot, mergeTarget: mergeTarget,
+                isStillAuthorized: { [context] in
+                    context.isStillAuthorized(lease, scope: batch.scope, requiresMutationOwner: batch.request.operation.mutatesTarget)
+                }
+            )
+        } catch let partial as AgentSessionWorktreeRuntime.PartialMerge {
+            return try mergePartialReply(partial, op: "merge_preview")
+        } catch SessionAdminHostError.authorityEnded {
             throw SessionAdminMCPToolService.unavailableError
         }
+        // The host acknowledges committed artifacts/operation persistence. Late revocation or
+        // cancellation cannot turn that acknowledgement into a no-effect refusal.
         return .object([
             "result": .string("previewed"), "op": .string("merge_preview"),
             "session_id": .string(lease.targetSessionID.uuidString), "merge": preview
         ])
+    }
+
+    private func mergePartialReply(_ partial: AgentSessionWorktreeRuntime.PartialMerge, op: String) throws -> Value {
+        var fields: [String: Value] = [
+            "result": .string("committed_incomplete"), "op": .string(op),
+            "session_id": .string(partial.writer.sessionID.uuidString), "retryable": .bool(false),
+            "physical_attempt_admitted": .bool(partial.physicalAttemptAdmitted),
+            "operation_recorded": .bool(partial.operationRecorded),
+            "required_save_acknowledged": .bool(partial.requiredSaveAcknowledged),
+            "detail": .string(partial.localizedDescription)
+        ]
+        if let id = partial.operationID { fields["operation_id"] = .string(id) }
+        if let directory = partial.artifactDirectory { fields["artifact_directory"] = .string(directory.path) }
+        if let result = partial.applyResult { fields["merge"] = try SessionAdminReply.encoded(result) }
+        else if let preview = partial.preview { fields["merge"] = try SessionAdminReply.encoded(preview) }
+        return .object(fields)
     }
 
     private func mergeApply(_ batch: AgentSessionAdministrationAuthorizedBatch) async throws -> Value {
@@ -912,7 +938,16 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
             return .object(["result": .string("preview"), "op": .string("merge_apply"), "operation_id": .string(operationID)])
         }
         // The user decides in the existing review prompt; scope authority only lets the overseer ask.
-        let result = try await host.applyMerge(sessionID: lease.targetSessionID, operationID: operationID)
+        let result: Value
+        do {
+            result = try await host.applyMerge(sessionID: lease.targetSessionID, operationID: operationID, isStillAuthorized: { [context] in
+                context.isStillAuthorized(lease, scope: batch.scope, requiresMutationOwner: batch.request.operation.mutatesTarget)
+            })
+        } catch let partial as AgentSessionWorktreeRuntime.PartialMerge {
+            return try mergePartialReply(partial, op: "merge_apply")
+        } catch SessionAdminHostError.authorityEnded {
+            throw SessionAdminMCPToolService.unavailableError
+        }
         return .object([
             "result": .string("reviewed"), "op": .string("merge_apply"),
             "session_id": .string(lease.targetSessionID.uuidString), "merge": result,

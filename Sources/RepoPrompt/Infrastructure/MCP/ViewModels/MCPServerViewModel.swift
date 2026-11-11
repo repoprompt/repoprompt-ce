@@ -1345,7 +1345,7 @@ final class MCPServerViewModel: ObservableObject {
 
     private var toolRegistrationIntentGeneration: UInt64 = 0
     private var windowToolTransitionTail: Task<Bool, Never>?
-    private var activeWindowToolRegistrationHandle: MCPDomainToolRegistrationHandle?
+
     #if DEBUG
         private var afterWindowToolRegistrationBeforeRetentionForTesting: (@MainActor @Sendable () async -> Void)?
         private var windowToolRegistrationFailureForTesting: (any Error)?
@@ -2302,12 +2302,14 @@ final class MCPServerViewModel: ObservableObject {
         )
     }
 
-    /// Shared mapping storage. The legacy server still owns route availability until
-    /// runtime-host composition replaces it; retained maps alone never authorize dispatch.
+    /// The legacy presentation delegates resource ownership to the same window-free route owner.
     @MainActor
-    private let runRouteOwnerLifetime = MCPRunRouteBindings.OwnerLifetime()
+    let routeResources: MCPHostRouteResources
     @MainActor
-    lazy var runRouteBindings = MCPRunRouteBindings(ownerLifetime: runRouteOwnerLifetime)
+    var runRouteBindings: MCPRunRouteBindings {
+        routeResources.runRouteBindings
+    }
+
     @MainActor
     var tabContextByConnectionID: [UUID: TabContextSnapshot] {
         get { runRouteBindings.tabContextByConnectionID }
@@ -2364,11 +2366,16 @@ final class MCPServerViewModel: ObservableObject {
     let domainReadSideEffectCoordinator: DomainReadSideEffectCoordinator
     let domainReadFallbackRuntimeIdentity: DomainRuntimeIdentity?
     var domainReadAppExecutionContexts: [UUID: DomainReadAppExecutionContext] = [:]
-    var domainRoutingConnectionIDs: Set<UUID> = []
-    var domainWindowDescriptor: DomainWindowDescriptor?
-    var domainWindowRegistrationTask: Task<DomainWindowDescriptor?, Never>?
+    var domainWindowDescriptor: DomainWindowDescriptor? {
+        get { routeResources.descriptor }
+        set { routeResources.descriptor = newValue }
+    }
+
     var domainWindowPresentationRevision: UInt64 = 0
-    var domainRoutingWindowIsClosing = false
+    var domainRoutingWindowIsClosing: Bool {
+        routeResources.isClosing
+    }
+
     /// Serializes routing publications (bind/release) so rapid tab transitions cannot
     /// commit bindings out of order and teardown can drain in-flight publications.
     var domainRoutingPublishTask: Task<Void, Never>?
@@ -2433,11 +2440,9 @@ final class MCPServerViewModel: ObservableObject {
     // MARK: - - Cancellation support
 
     /// Providers retain this concrete owner, never the window view model.
-    lazy var toolExecutionRuntime: MCPToolExecutionRuntime = {
-        let runtime = MCPToolExecutionRuntime()
-        runtime.didChange = { [weak self] in self?.recomputeCloseSafetyState() }
-        return runtime
-    }()
+    var toolExecutionRuntime: MCPToolExecutionRuntime {
+        routeResources.toolExecutionRuntime
+    }
 
     @MainActor
     private var cancelCurrentTool: (() -> Void)?
@@ -2843,6 +2848,7 @@ final class MCPServerViewModel: ObservableObject {
             WorkspaceManagerViewModel
         ) async throws -> WorkspaceRootRef,
         domainRoutingCoordinator: DomainRoutingCoordinator? = nil,
+        routeResources: MCPHostRouteResources? = nil,
         domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient? = nil,
         domainReadSideEffectCoordinator: DomainReadSideEffectCoordinator? = nil,
         domainReadRuntimeIdentity: DomainRuntimeIdentity? = nil,
@@ -2865,6 +2871,11 @@ final class MCPServerViewModel: ObservableObject {
         self.workspaceSearch = workspaceSearch
         self.ensureGitDataRootLoaded = ensureGitDataRootLoaded
         self.domainRoutingCoordinator = domainRoutingCoordinator
+        self.routeResources = routeResources ?? MCPHostRouteResources(
+            identity: .legacyWindow(windowID), coordinator: domainRoutingCoordinator
+        )
+        precondition(self.routeResources.identity.routeID == windowID)
+        precondition(self.routeResources.coordinator === domainRoutingCoordinator)
         self.domainWorkspaceAuthorityClient = domainWorkspaceAuthorityClient
         if let domainReadSideEffectCoordinator {
             self.domainReadSideEffectCoordinator = domainReadSideEffectCoordinator
@@ -2882,6 +2893,7 @@ final class MCPServerViewModel: ObservableObject {
         }
         self.applyEditsApprovalStore = applyEditsApprovalStore
         self.validateInvocation = validateInvocation
+        self.routeResources.toolExecutionRuntime.didChange = { [weak self] in self?.recomputeCloseSafetyState() }
 
         scheduleDomainWindowRegistration(
             activeWorkspaceID: workspaceManager.activeWorkspaceID,
@@ -3063,7 +3075,7 @@ final class MCPServerViewModel: ObservableObject {
     /// Ensures tools are registered before this window becomes eligible for routing.
     @discardableResult
     func ensureServerReadyForAgentBootstrap() async -> Bool {
-        let catalogIsRegistered = await AppDomainRuntimeComposition.shared.isRegistered(windowToolCatalogService)
+        let catalogIsRegistered = await routeResources.hasActiveCatalog()
         let invalidateCatalogBeforeUpdate = !windowToolsEnabled || !catalogIsRegistered
         #if DEBUG || EDIT_FLOW_PERF
             let registrationUpdateAgentBootstrapState = EditFlowPerf.begin(
@@ -3150,7 +3162,7 @@ final class MCPServerViewModel: ObservableObject {
         guard enabled else {
             // Registration teardown is generation-fenced. Without a retained handle this view model
             // has no authority to remove a registration owned outside its transition lifecycle.
-            if let handle = activeWindowToolRegistrationHandle {
+            if let handle = routeResources.catalogHandle {
                 await unregisterWindowToolRegistration(handle)
             }
             await service.leave(windowID: windowID)
@@ -3194,16 +3206,15 @@ final class MCPServerViewModel: ObservableObject {
                     throw windowToolRegistrationFailureForTesting
                 }
             #endif
-            let registration = try await AppDomainRuntimeComposition.shared.register(windowToolCatalogService)
+            let handle = try await routeResources.registerCatalog(windowToolCatalogService)
             #if DEBUG
                 await afterWindowToolRegistrationBeforeRetentionForTesting?()
             #endif
             // Retain every successful generation before checking for supersession. A queued disable
             // can then reclaim it by exact handle, while stale handles remain registry-fenced.
-            activeWindowToolRegistrationHandle = registration.handle
             guard intentGeneration == toolRegistrationIntentGeneration else {
                 if !windowToolsRequested {
-                    await unregisterWindowToolRegistration(registration.handle)
+                    await unregisterWindowToolRegistration(handle)
                 }
                 return false
             }
@@ -3211,7 +3222,7 @@ final class MCPServerViewModel: ObservableObject {
             guard intentGeneration == toolRegistrationIntentGeneration else {
                 if !windowToolsRequested {
                     windowToolsEnabled = false
-                    await unregisterWindowToolRegistration(registration.handle)
+                    await unregisterWindowToolRegistration(handle)
                     await service.leave(windowID: windowID)
                 }
                 return false
@@ -3223,7 +3234,7 @@ final class MCPServerViewModel: ObservableObject {
             guard intentGeneration == toolRegistrationIntentGeneration else {
                 if !windowToolsRequested {
                     windowToolsEnabled = false
-                    await unregisterWindowToolRegistration(registration.handle)
+                    await unregisterWindowToolRegistration(handle)
                     await service.leave(windowID: windowID)
                 }
                 return false
@@ -3256,10 +3267,7 @@ final class MCPServerViewModel: ObservableObject {
     private func unregisterWindowToolRegistration(
         _ handle: MCPDomainToolRegistrationHandle
     ) async {
-        await AppDomainRuntimeComposition.shared.unregister(handle)
-        if activeWindowToolRegistrationHandle == handle {
-            activeWindowToolRegistrationHandle = nil
-        }
+        await routeResources.unregisterCatalog(handle)
     }
 
     @MainActor

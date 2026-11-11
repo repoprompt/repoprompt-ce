@@ -428,7 +428,7 @@ struct AgentTaskRoutingCandidateBuilder {
         ),
         .init(
             provider: .claudeCode,
-            baseModelAliases: ["claude-fable-5-1", "fable"],
+            baseModelAliases: ["claude-fable-5-2", "fable", "claude-fable-5-1"],
             modelClass: "claude-fable",
             rubric: "Fable is Anthropic's most capable premium tier. Choose it for the hardest, highest-risk, or longest-horizon work where its extra capability justifies premium price."
         ),

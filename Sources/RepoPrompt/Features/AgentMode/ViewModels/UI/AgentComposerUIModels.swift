@@ -147,6 +147,8 @@ struct AgentRunCancelTarget: Equatable {
     let expectedActiveAgentSessionID: UUID?
     let expectedRunAttemptID: UUID?
     let expectedPendingUserInputReceipt: CodexServerRequestReceipt?
+    var expectedPendingComposerAttemptID: UUID?
+    var expectedPendingComposerSession: ObjectIdentifier?
 }
 
 struct AgentComposerSubmitTarget: Equatable {
