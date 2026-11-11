@@ -83,17 +83,6 @@ enum ClaudeCompatibleModelCatalogAdapter {
         pluginOptions.map { modelOption(from: $0, for: agentKind) }
     }
 
-    static func pluginModelOption(from option: AgentModelOption) -> ClaudeCompatiblePluginModelOption {
-        ClaudeCompatiblePluginModelOption(
-            rawValue: option.rawValue,
-            displayName: option.displayName,
-            description: option.description,
-            isPlaceholderDefault: option.isPlaceholderDefault,
-            isProviderDefault: option.isProviderDefault,
-            supportedEffortLevels: []
-        )
-    }
-
     static func compatibleBackendModelBehavior(
         for agentKind: AgentProviderKind
     ) -> ClaudeCodeCompatibleBackendConfig.ModelBehavior? {
