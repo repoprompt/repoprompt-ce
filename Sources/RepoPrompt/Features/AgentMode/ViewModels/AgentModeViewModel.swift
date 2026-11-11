@@ -8598,12 +8598,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                   let manager = workspaceManager else { return nil }
             let store = promptManager?.workspaceFileContextStore
             let paths = manager.activeWorkspace?.repoPaths
+            let storageDirectory = manager.activeWorkspace?.customStoragePath
             let fallback = workspacePathProvider()
-            return .init(store: store, fallbackWorkspacePath: fallback, declaredRepoPaths: paths ?? [], isCurrent: { [weak self, weak manager] in
+            return .init(store: store, fallbackWorkspacePath: fallback, declaredRepoPaths: paths ?? [], storageDirectory: storageDirectory, isCurrent: { [weak self, weak manager] in
                 guard let self, let manager else { return false }
                 return workspaceManager === manager
                     && manager.activeWorkspaceID == command.identity.workspaceID
                     && manager.activeWorkspace?.repoPaths == paths
+                    && manager.activeWorkspace?.customStoragePath == storageDirectory
                     && promptManager?.workspaceFileContextStore === store
                     && workspacePathProvider() == fallback
             })

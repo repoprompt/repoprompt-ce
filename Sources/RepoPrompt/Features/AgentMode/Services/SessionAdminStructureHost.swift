@@ -188,9 +188,9 @@ protocol SessionAdminWorktreeHost: AnyObject {
     func waitForIdleBoundary(sessionID: UUID) async
     /// Git's own prunable status for the worktree at `path` in `repoRoot` (the `list` logic).
     func isWorktreePrunable(path: String, repoRoot: String?) async -> Bool
-    func previewMerge(sessionID: UUID, repoRoot: String?, mergeTarget: String?) async throws -> Value
+    func previewMerge(sessionID: UUID, repoRoot: String?, mergeTarget: String?, isStillAuthorized: @escaping @MainActor () -> Bool) async throws -> Value
     /// Routes through the existing user merge-review prompt in the target's tab.
-    func applyMerge(sessionID: UUID, operationID: String) async throws -> Value
+    func applyMerge(sessionID: UUID, operationID: String, isStillAuthorized: @escaping @MainActor () -> Bool) async throws -> Value
 }
 
 enum SessionAdminHostError: LocalizedError, Equatable {

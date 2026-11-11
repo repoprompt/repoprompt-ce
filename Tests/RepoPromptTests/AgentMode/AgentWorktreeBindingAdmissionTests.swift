@@ -1519,6 +1519,309 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         XCTAssertFalse(fresh.worktreeBindingTransitionInProgress)
     }
 
+    func testMergePreviewAndApplyAcknowledgeActualOriginSaves() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let source = URL(fileURLWithPath: fixture.session.worktreeBindings[0].worktreeRootPath)
+        try fixture.git.write("merge payload\n", to: "merged.txt", at: source)
+        try fixture.git.stage("merged.txt", at: source)
+        try fixture.git.commit("Source payload", at: source)
+        let dataService = AgentSessionDataService()
+        await dataService.test_setWorkspaceRootOverride(fixture.git.sandbox.appendingPathComponent("sessions"))
+        var savedStates: [AgentSessionWorktreeMergeOperation.Status] = []
+        var savedURL: URL?
+        fixture.viewModel.test_setAgentSessionSaver { payload, workspace, count in
+            let url = try await dataService.saveAgentSession(payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count)
+            savedURL = url
+            savedStates += payload.worktreeMergeOperations.map(\.status)
+            return url
+        }
+        let preview = try await fixture.viewModel.previewWorktreeMerge(sessionID: fixture.sessionID, publishArtifacts: false)
+        XCTAssertEqual(savedStates.last, .previewed)
+        XCTAssertTrue(try FileManager.default.fileExists(atPath: XCTUnwrap(savedURL).path))
+        let result = try await fixture.viewModel.applyConfirmedWorktreeMerge(sessionID: fixture.sessionID, operationID: preview.operationID)
+        XCTAssertEqual(result.status, .completed)
+        XCTAssertTrue(savedStates.contains(.applying), "Intent must be acknowledged before Git")
+        XCTAssertEqual(savedStates.last, .completed)
+        XCTAssertNotNil(result.mergeCommit)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: URL(fileURLWithPath: fixture.session.worktreeBindings[0].logicalRootPath).appendingPathComponent("merged.txt").path))
+        let command = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
+        XCTAssertEqual(command.writer.scope.worktrees.pendingTransitions, 0)
+        XCTAssertTrue(command.writer.scope.worktrees.mergeOwners.isEmpty)
+    }
+
+    func testMergeIntentSaveFailurePreventsGitAndRetainsPreparationReceipt() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let source = URL(fileURLWithPath: fixture.session.worktreeBindings[0].worktreeRootPath)
+        let target = URL(fileURLWithPath: fixture.session.worktreeBindings[0].logicalRootPath)
+        try fixture.git.write("merge payload\n", to: "merged.txt", at: source)
+        try fixture.git.stage("merged.txt", at: source)
+        try fixture.git.commit("Source payload", at: source)
+        let dataService = AgentSessionDataService()
+        await dataService.test_setWorkspaceRootOverride(fixture.git.sandbox.appendingPathComponent("sessions"))
+        fixture.viewModel.test_setAgentSessionSaver { payload, workspace, count in
+            try await dataService.saveAgentSession(payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count)
+        }
+        let preview = try await fixture.viewModel.previewWorktreeMerge(sessionID: fixture.sessionID, publishArtifacts: false)
+        let head = try fixture.git.runGit(["rev-parse", "HEAD"], at: target)
+        struct SaveFailure: Error {}
+        fixture.viewModel.test_setAgentSessionSaver { _, _, _ in throw SaveFailure() }
+        do {
+            _ = try await fixture.viewModel.applyConfirmedWorktreeMerge(sessionID: fixture.sessionID, operationID: preview.operationID)
+            XCTFail("Required intent persistence must precede physical Git")
+        } catch let partial as AgentSessionWorktreeRuntime.PartialMerge {
+            XCTAssertTrue(partial.operationRecorded)
+            XCTAssertFalse(partial.requiredSaveAcknowledged)
+            XCTAssertFalse(partial.physicalAttemptAdmitted)
+            XCTAssertNil(partial.applyResult)
+        }
+        XCTAssertEqual(try fixture.git.runGit(["rev-parse", "HEAD"], at: target), head)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.appendingPathComponent("merged.txt").path))
+        XCTAssertEqual(fixture.session.worktreeMergeOperations.first?.status, .previewed)
+    }
+
+    func testMergePreviewAuthorizationCannotFollowReacquiredWriter() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let command = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
+        let runtime = command.writer.scope.worktrees
+        let admission = try runtime.admit(command)
+        var changed = false
+        do {
+            _ = try await runtime.previewMerge(admission: admission, publishArtifacts: true, revalidateAuthority: {
+                guard !changed else { return }
+                changed = true
+                fixture.viewModel.test_removeSession(tabID: fixture.session.tabID)
+                fixture.viewModel.test_installLiveSession(fixture.session)
+            })
+            XCTFail("Discovery cannot grant a successor writer the old command")
+        } catch {
+            XCTAssertFalse(error is AgentSessionWorktreeRuntime.PartialMerge)
+        }
+        XCTAssertTrue(changed)
+        XCTAssertFalse(command.isCurrent)
+        XCTAssertTrue(fixture.session.worktreeMergeOperations.isEmpty)
+        XCTAssertEqual(runtime.pendingTransitions, 0)
+        XCTAssertTrue(runtime.mergeOwners.isEmpty)
+    }
+
+    func testMergePostGitSaveFailureRetainsCommitAndDurableIntent() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let source = URL(fileURLWithPath: fixture.session.worktreeBindings[0].worktreeRootPath)
+        try fixture.git.write("merge payload\n", to: "merged.txt", at: source)
+        try fixture.git.stage("merged.txt", at: source)
+        try fixture.git.commit("Source payload", at: source)
+        let dataService = AgentSessionDataService()
+        await dataService.test_setWorkspaceRootOverride(fixture.git.sandbox.appendingPathComponent("sessions"))
+        struct SaveFailure: Error {}
+        var lastSavedURL: URL?
+        fixture.viewModel.test_setAgentSessionSaver { payload, workspace, count in
+            if payload.worktreeMergeOperations.contains(where: { $0.status == .completed }) { throw SaveFailure() }
+            let url = try await dataService.saveAgentSession(payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count)
+            lastSavedURL = url
+            return url
+        }
+        let preview = try await fixture.viewModel.previewWorktreeMerge(sessionID: fixture.sessionID, publishArtifacts: false)
+        do {
+            _ = try await fixture.viewModel.applyConfirmedWorktreeMerge(sessionID: fixture.sessionID, operationID: preview.operationID)
+            XCTFail("Completion cannot acknowledge a failed required save")
+        } catch let partial as AgentSessionWorktreeRuntime.PartialMerge {
+            XCTAssertTrue(partial.physicalAttemptAdmitted)
+            XCTAssertTrue(partial.operationRecorded)
+            XCTAssertFalse(partial.requiredSaveAcknowledged)
+            XCTAssertEqual(partial.applyResult?.status, .completed)
+            XCTAssertNotNil(partial.applyResult?.mergeCommit)
+        }
+        // The restoration loader reconciles Git state and may rewrite the operation. Inspect the
+        // actual acknowledged bytes here, before invoking that separate recovery owner.
+        let bytes = try Data(contentsOf: XCTUnwrap(lastSavedURL))
+        let durable = try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
+        let operations = try XCTUnwrap(durable["worktreeMergeOperations"] as? [[String: Any]])
+        XCTAssertEqual(operations.first?["status"] as? String, "applying")
+        XCTAssertEqual(fixture.session.worktreeMergeOperations.first?.status, .completed)
+    }
+
+    func testMergeReviewDoesNotHoldDrainAndBindingDriftPreventsApply() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let dataService = AgentSessionDataService()
+        await dataService.test_setWorkspaceRootOverride(fixture.git.sandbox.appendingPathComponent("sessions"))
+        fixture.viewModel.test_setAgentSessionSaver { payload, workspace, count in
+            try await dataService.saveAgentSession(payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count)
+        }
+        let preview = try await fixture.viewModel.previewWorktreeMerge(sessionID: fixture.sessionID, publishArtifacts: false)
+        let command = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
+        let runtime = command.writer.scope.worktrees
+        let admission = try runtime.admit(command)
+        let applying = Task { @MainActor in
+            try await runtime.applyMerge(admission: admission, operationID: preview.operationID, review: true, timeoutSeconds: 5)
+        }
+        defer { applying.cancel() }
+        try await AsyncTestWait.waitUntil("merge review shown") { fixture.session.pendingWorktreeMergeReview != nil }
+        XCTAssertEqual(runtime.pendingTransitions, 0, "Human review is not a drain dependency")
+        await runtime.waitForTransitions()
+        do {
+            _ = try await runtime.transition([], admission: admission, intent: .externalManagement)
+            XCTFail("A concurrent binding transition must not race the pending review")
+        } catch {}
+        fixture.session.worktreeBindings = []
+        let review = try XCTUnwrap(fixture.session.pendingWorktreeMergeReview)
+        XCTAssertTrue(try XCTUnwrap(command.writer.scope.installedInteractions).submitWorktreeMergeReviewDecision(
+            command: command, reviewID: review.id, decision: .accept
+        ))
+        do {
+            _ = try await applying.value
+            XCTFail("The accepted review cannot follow changed bindings")
+        } catch {}
+        XCTAssertEqual(fixture.session.worktreeMergeOperations.first?.status, .cancelled)
+        XCTAssertTrue(runtime.mergeOwners.isEmpty)
+    }
+
+    func testMergeContinueRefusalPreservesConflictAndCanContinueOrAbort() async throws {
+        for abort in [false, true] {
+            let fixture = try await durableFixture()
+            defer { fixture.git.cleanup() }
+            let source = URL(fileURLWithPath: fixture.session.worktreeBindings[0].worktreeRootPath)
+            let target = URL(fileURLWithPath: fixture.session.worktreeBindings[0].logicalRootPath)
+            try fixture.git.write("source\n", to: "README.md", at: source)
+            try fixture.git.stage("README.md", at: source)
+            try fixture.git.commit("Source conflict", at: source)
+            try fixture.git.write("target\n", to: "README.md", at: target)
+            try fixture.git.stage("README.md", at: target)
+            try fixture.git.commit("Target conflict", at: target)
+            let dataService = AgentSessionDataService()
+            await dataService.test_setWorkspaceRootOverride(fixture.git.sandbox.appendingPathComponent("sessions"))
+            fixture.viewModel.test_setAgentSessionSaver { payload, workspace, count in
+                try await dataService.saveAgentSession(payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count)
+            }
+            let preview = try await fixture.viewModel.previewWorktreeMerge(sessionID: fixture.sessionID, publishArtifacts: false)
+            let applied = try await fixture.viewModel.applyConfirmedWorktreeMerge(sessionID: fixture.sessionID, operationID: preview.operationID)
+            XCTAssertEqual(applied.status, .conflicted)
+            do {
+                _ = try await fixture.viewModel.continueWorktreeMerge(sessionID: fixture.sessionID, operationID: preview.operationID)
+                XCTFail("Unresolved conflicts must refuse commit")
+            } catch let partial as AgentSessionWorktreeRuntime.PartialMerge {
+                XCTAssertFalse(partial.physicalAttemptAdmitted, "Git checks conflicts before the physical callback")
+                XCTAssertTrue(partial.requiredSaveAcknowledged)
+            }
+            XCTAssertEqual(fixture.session.worktreeMergeOperations.first?.status, .conflicted)
+            if abort {
+                let result = try await fixture.viewModel.abortWorktreeMerge(sessionID: fixture.sessionID, operationID: preview.operationID)
+                XCTAssertTrue(result.aborted)
+                XCTAssertEqual(fixture.session.worktreeMergeOperations.first?.status, .aborted)
+            } else {
+                try fixture.git.write("resolved\n", to: "README.md", at: target)
+                try fixture.git.stage("README.md", at: target)
+                let result = try await fixture.viewModel.continueWorktreeMerge(sessionID: fixture.sessionID, operationID: preview.operationID)
+                XCTAssertEqual(result.status, .completed)
+                XCTAssertEqual(fixture.session.worktreeMergeOperations.first?.status, .completed)
+            }
+        }
+    }
+
+    func testCancelledUnlimitedMergeReviewSettlesItsOwnerAndReleasesExclusion() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let dataService = AgentSessionDataService()
+        await dataService.test_setWorkspaceRootOverride(fixture.git.sandbox.appendingPathComponent("sessions"))
+        fixture.viewModel.test_setAgentSessionSaver { payload, workspace, count in
+            try await dataService.saveAgentSession(payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count)
+        }
+        let preview = try await fixture.viewModel.previewWorktreeMerge(sessionID: fixture.sessionID, publishArtifacts: false)
+        let command = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
+        let runtime = command.writer.scope.worktrees
+        let admission = try runtime.admit(command)
+        let applying = Task { @MainActor in
+            try await runtime.applyMerge(admission: admission, operationID: preview.operationID, review: true, timeoutSeconds: 0)
+        }
+        try await AsyncTestWait.waitUntil("unlimited review shown") { fixture.session.pendingWorktreeMergeReview != nil }
+        XCTAssertEqual(fixture.session.runState, .waitingForApproval)
+        applying.cancel()
+        try await AsyncTestWait.waitUntil("cancelled review settled") { runtime.mergeOwners.isEmpty }
+        do { _ = try await applying.value
+            XCTFail("Cancelled review must not apply")
+        } catch {}
+        XCTAssertNil(fixture.session.pendingWorktreeMergeReview)
+        XCTAssertEqual(fixture.session.worktreeMergeOperations.first?.status, .cancelled)
+        XCTAssertEqual(fixture.session.runState, .idle, "A cancelled standalone review must not invent a provider run")
+        XCTAssertEqual(runtime.pendingTransitions, 0)
+    }
+
+    func testAcceptedReviewFailureBeforeIntentRestoresActionablePreview() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let dataService = AgentSessionDataService()
+        await dataService.test_setWorkspaceRootOverride(fixture.git.sandbox.appendingPathComponent("sessions"))
+        fixture.viewModel.test_setAgentSessionSaver { payload, workspace, count in
+            try await dataService.saveAgentSession(payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count)
+        }
+        let preview = try await fixture.viewModel.previewWorktreeMerge(sessionID: fixture.sessionID, publishArtifacts: false)
+        let command = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
+        let runtime = command.writer.scope.worktrees
+        let admission = try runtime.admit(command)
+        var afterAcceptanceChecks = 0
+        let applying = Task { @MainActor in
+            try await runtime.applyMerge(admission: admission, operationID: preview.operationID, review: true, revalidateAuthority: {
+                if fixture.session.pendingWorktreeMergeReview == nil,
+                   fixture.session.worktreeMergeOperations.first?.status == .awaitingApproval
+                {
+                    afterAcceptanceChecks += 1
+                    // First check resumes the accepted caller. The second is its final intent fence.
+                    if afterAcceptanceChecks == 2 { throw SessionAdminHostError.authorityEnded }
+                }
+            })
+        }
+        try await AsyncTestWait.waitUntil("merge review shown") { fixture.session.pendingWorktreeMergeReview != nil }
+        let review = try XCTUnwrap(fixture.session.pendingWorktreeMergeReview)
+        XCTAssertTrue(try XCTUnwrap(command.writer.scope.installedInteractions).submitWorktreeMergeReviewDecision(command: command, reviewID: review.id, decision: .accept))
+        do { _ = try await applying.value
+            XCTFail("Revoked final intent fence must refuse Git")
+        } catch let partial as AgentSessionWorktreeRuntime.PartialMerge {
+            XCTAssertFalse(partial.physicalAttemptAdmitted)
+            XCTAssertTrue(partial.requiredSaveAcknowledged)
+        }
+        XCTAssertEqual(afterAcceptanceChecks, 2)
+        XCTAssertEqual(fixture.session.worktreeMergeOperations.first?.status, .previewed)
+        XCTAssertNil(fixture.session.pendingWorktreeMergeReview)
+    }
+
+    func testMergeCompletedSaveCannotWriteThroughReacquiredSessionObject() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let source = URL(fileURLWithPath: fixture.session.worktreeBindings[0].worktreeRootPath)
+        try fixture.git.write("merge payload\n", to: "merged.txt", at: source)
+        try fixture.git.stage("merged.txt", at: source)
+        try fixture.git.commit("Source payload", at: source)
+        let dataService = AgentSessionDataService()
+        await dataService.test_setWorkspaceRootOverride(fixture.git.sandbox.appendingPathComponent("sessions"))
+        var replacementInstalled = false
+        fixture.viewModel.test_setAgentSessionSaver { payload, workspace, count in
+            let url = try await dataService.saveAgentSession(payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count)
+            if !replacementInstalled, payload.worktreeMergeOperations.contains(where: { $0.status == .completed }) {
+                replacementInstalled = true
+                fixture.viewModel.test_removeSession(tabID: fixture.session.tabID)
+                fixture.viewModel.test_installLiveSession(fixture.session)
+                fixture.session.worktreeMergeOperations = []
+            }
+            return url
+        }
+        let preview = try await fixture.viewModel.previewWorktreeMerge(sessionID: fixture.sessionID, publishArtifacts: false)
+        let origin = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
+        do {
+            _ = try await fixture.viewModel.applyConfirmedWorktreeMerge(sessionID: fixture.sessionID, operationID: preview.operationID)
+            XCTFail("A successor cannot acknowledge the old command")
+        } catch let partial as AgentSessionWorktreeRuntime.PartialMerge {
+            XCTAssertEqual(partial.writer, origin.identity)
+            XCTAssertEqual(partial.applyResult?.status, .completed)
+            XCTAssertNotNil(partial.applyResult?.mergeCommit)
+        }
+        XCTAssertTrue(replacementInstalled)
+        XCTAssertFalse(origin.isCurrent)
+        XCTAssertTrue(fixture.session.worktreeMergeOperations.isEmpty, "Old failure cleanup must not recreate a successor's operation")
+    }
+
     private struct DurableFixture {
         let git: ReviewGitRepositoryFixture
         let prompt: PromptViewModel

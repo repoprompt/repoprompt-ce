@@ -18,7 +18,8 @@ actor GitWorktreeMergePreviewPublisher {
     func publish(
         request: GitWorktreeMergePreviewRequest,
         inspection: GitWorktreeMergeInspection,
-        operationID: String
+        operationID: String,
+        beforeWrite: (@Sendable () async throws -> Void)? = nil
     ) async throws -> GitWorktreeMergePreviewArtifacts {
         let repo = GitRepoDescriptor(
             rootURL: request.target.url,
@@ -39,7 +40,8 @@ actor GitWorktreeMergePreviewPublisher {
             contextLines: request.contextLines,
             detectRenames: request.detectRenames,
             snapshotIDOverride: request.snapshotIDOverride,
-            tabID: request.tabID
+            tabID: request.tabID,
+            beforeWrite: beforeWrite
         )
 
         let snapshotDir = store.snapshotDir(
@@ -67,7 +69,17 @@ actor GitWorktreeMergePreviewPublisher {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
-        try encoder.encode(sidecar).write(to: sidecarURL, options: .atomic)
+        do {
+            try encoder.encode(sidecar).write(to: sidecarURL, options: .atomic)
+        } catch {
+            guard beforeWrite != nil else { throw error }
+            throw GitDiffSnapshotPublisher.PartialPublication(
+                snapshotDirectory: snapshotDir,
+                snapshotWriteCompleted: true,
+                currentPointerWriteCompleted: true,
+                detail: "Merge preview sidecar failed: \(error.localizedDescription)"
+            )
+        }
 
         return GitWorktreeMergePreviewArtifacts(
             snapshotID: manifest.snapshotID,

@@ -1079,50 +1079,69 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
 
     // MARK: - Merge
 
-    func previewMerge(sessionID: UUID, repoRoot: String?, mergeTarget: String?) async throws -> Value {
-        guard let (viewModel, _) = SessionAdminWindows.liveSession(sessionID) else {
-            throw SessionAdminHostError.sessionUnavailable
-        }
-        let preview = try await viewModel.previewWorktreeMerge(
-            sessionID: sessionID, repoRoot: repoRoot, target: mergeTarget ?? "@main"
+    func previewMerge(sessionID: UUID, repoRoot: String?, mergeTarget: String?, isStillAuthorized: @escaping @MainActor () -> Bool) async throws -> Value {
+        let manager = WindowStatesManager.shared
+        manager.beginPreparedOversightPreparation(sessionID)
+        defer { manager.endPreparedOversightPreparation(sessionID) }
+        let command = try await preparedCommand(sessionID, isStillAuthorized: isStillAuthorized)
+        let runtime = command.writer.scope.worktrees
+        let admission = try runtime.admit(command)
+        let preview = try await runtime.previewMerge(
+            admission: admission, repoRoot: repoRoot, target: mergeTarget ?? "@main",
+            revalidateAuthority: {
+                guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
+            }
         )
         return try SessionAdminReply.encoded(preview)
     }
 
-    func applyMerge(sessionID: UUID, operationID: String) async throws -> Value {
-        guard let (viewModel, _) = SessionAdminWindows.liveSession(sessionID) else {
-            throw SessionAdminHostError.sessionUnavailable
-        }
+    func applyMerge(sessionID: UUID, operationID: String, isStillAuthorized: @escaping @MainActor () -> Bool) async throws -> Value {
+        let manager = WindowStatesManager.shared
+        manager.beginPreparedOversightPreparation(sessionID)
+        defer { manager.endPreparedOversightPreparation(sessionID) }
+        let command = try await preparedCommand(sessionID, isStillAuthorized: isStillAuthorized)
+        let runtime = command.writer.scope.worktrees
+        let admission = try runtime.admit(command)
         // Fence the merge's source and target worktrees to the target session's workspace roots and
         // their repositories, as `createWorktree` does; the user still decides in the review prompt.
         // Capture only: the saved operation owns its endpoints, so no default repository is elected.
-        let operation = try viewModel.statusWorktreeMerge(sessionID: sessionID, operationID: operationID)
-        guard let command = try SessionAdminWindows.preparedCommand(for: sessionID, allowingPreparation: false) else {
-            throw SessionAdminHostError.sessionUnavailable
-        }
+        let operation = try runtime.statusMerge(command: command, operationID: operationID)
         let capture = try await captureTarget(command)
         guard !capture.repos.isEmpty else {
             throw SessionAdminHostError.invalid("The target session's workspace has no Git repository.")
         }
         var authorizedRoots = Set(capture.roots.map(\.standardizedFullPath) + capture.repos.map(\.rootURL.standardizedFileURL.path))
         for endpoint in [operation.source, operation.target] {
-            if let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: endpoint.path)),
-               capture.repos.contains(where: {
-                   GitRepoRootAuthorization.canonicalPath($0.rootPath) == GitRepoRootAuthorization.canonicalPath(resolved.rootURL.path)
-               })
-            {
-                // A linked worktree of an admitted repository lives outside the workspace roots.
-                authorizedRoots.insert(URL(fileURLWithPath: endpoint.path).standardizedFileURL.path)
-            }
+            // A linked checkout resolves to its own root, not the main checkout's root. Admit
+            // its exact identity through the authorized repository's worktree advertisement.
+            _ = try await WorktreeMergeEndpointValidation.resolveAuthorizedDescriptor(for: endpoint, roots: capture.roots)
+            try admission.requireCurrent()
+            authorizedRoots.insert(URL(fileURLWithPath: endpoint.path).standardizedFileURL.path)
         }
         let snapshot = try await DomainMutationPathFence.admit(
             requestedPaths: [operation.source.path, operation.target.path],
             authorizedRoots: authorizedRoots
         )
+        try admission.requireCurrent()
+        guard try runtime.statusMerge(command: command, operationID: operationID) == operation else {
+            throw SessionAdminHostError.authorityEnded
+        }
         let physicalGuard = DomainMutationPhysicalCommitGuard(snapshot: snapshot)
-        let controller = DomainMutationCommitController(physicalMutationGuard: { physicalGuard }, willCommit: {})
+        let outer = MCPDomainMutationCommitContext.controller
+        let controller = DomainMutationCommitController(
+            admitPhysicalTargets: { paths, mappings in try await outer?.admitPhysicalTargets(paths, rootMappings: mappings) },
+            physicalMutationGuard: {
+                let outerGuard = try await outer?.physicalMutationGuard()
+                try outerGuard?.revalidate()
+                return physicalGuard
+            },
+            physicalMutationCapability: { try await outer?.physicalMutationCapability() },
+            willCommit: { try await outer?.willCommit() }
+        )
         let result = try await MCPDomainMutationCommitContext.controllerTaskLocal.withValue(controller) {
-            try await viewModel.requestWorktreeMergeReviewAndApply(sessionID: sessionID, operationID: operationID)
+            try await runtime.applyMerge(admission: admission, operationID: operationID, review: true, revalidateAuthority: {
+                guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
+            })
         }
         return try SessionAdminReply.encoded(result)
     }

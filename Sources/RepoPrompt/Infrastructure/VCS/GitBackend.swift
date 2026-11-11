@@ -191,13 +191,15 @@ actor GitBackend: VCSBackend {
         source: GitWorktreeMergeEndpoint,
         target: GitWorktreeMergeEndpoint,
         sourceHead: String,
-        message: String
+        message: String,
+        beforeCommit: (@Sendable () async throws -> Void)? = nil
     ) async throws -> (state: GitWorktreeMergeState, commit: String?) {
         try await gitService.applyAndCommitWorktreeMerge(
             sourceEndpoint: source,
             targetEndpoint: target,
             sourceHead: sourceHead,
-            message: message
+            message: message,
+            beforeCommit: beforeCommit
         )
     }
 
@@ -212,12 +214,14 @@ actor GitBackend: VCSBackend {
     func continueWorktreeMerge(
         source: GitWorktreeMergeEndpoint,
         target: GitWorktreeMergeEndpoint,
-        message: String
+        message: String,
+        beforeCommit: (@Sendable () async throws -> Void)? = nil
     ) async throws -> String {
         try await gitService.continueWorktreeMerge(
             sourceEndpoint: source,
             targetEndpoint: target,
-            message: message
+            message: message,
+            beforeCommit: beforeCommit
         )
     }
 
@@ -225,8 +229,11 @@ actor GitBackend: VCSBackend {
         try await gitService.abortWorktreeMerge(at: targetRepoURL)
     }
 
-    func abortWorktreeMerge(target: GitWorktreeMergeEndpoint) async throws -> Bool {
-        try await gitService.abortWorktreeMerge(targetEndpoint: target)
+    func abortWorktreeMerge(
+        target: GitWorktreeMergeEndpoint,
+        beforeCommit: (@Sendable () async throws -> Void)? = nil
+    ) async throws -> Bool {
+        try await gitService.abortWorktreeMerge(targetEndpoint: target, beforeCommit: beforeCommit)
     }
 
     // MARK: - Remote Operations
