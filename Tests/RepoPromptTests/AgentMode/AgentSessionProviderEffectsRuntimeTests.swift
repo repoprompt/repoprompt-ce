@@ -1191,6 +1191,81 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         ))
     }
 
+    func testProviderSwitchDeclineUsesOnlyItsOriginalLifecycleClaim() async throws {
+        for drift in ["none", "released", "reacquired", "replacement", "other-scope"] {
+            let scope = AgentSessionRuntimeStore().makeScope()
+            let session = questionSession(in: scope)
+            let runtime = scope.interactions(routeID: 42, approvalStore: ApplyEditsApprovalStore())
+            let command = try questionCommand(in: scope, for: session)
+            let target = try XCTUnwrap(scope.submissions.programmaticTarget(command))
+            let attempt = AgentComposerSubmitAttempt(
+                id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: ""
+            )
+            guard case let .claimed(claim) = scope.submissions.claim(
+                attempt, command: command, allowsPendingStartWithdrawal: false
+            ) else { return XCTFail("Expected lifecycle claim") }
+            let question = runtimeQuestion()
+            let installed = expectation(description: "Original question installed: \(drift)")
+            let attachment = observeQuestionInstallation(scope: scope, session: session, installed: installed)
+            let task = Task { try await runtime.askUser(command: command, interaction: question) }
+            addTeardownBlock { @MainActor in
+                task.cancel()
+                _ = await task.result
+                scope.submissions.release(claim)
+                await runtime.drainPendingEffects(for: session)
+            }
+            await fulfillment(of: [installed], timeout: 3)
+            scope.presentation.detach(attachment)
+            var successorQuestionID: UUID?
+            switch drift {
+            case "released": scope.submissions.release(claim)
+            case "reacquired":
+                scope.replaceSessions([:])
+                scope.replaceSessions([session.tabID: session])
+            case "replacement":
+                let successor = questionSession(in: scope, tabID: session.tabID)
+                let successorCommand = try questionCommand(in: scope, for: successor)
+                let successorQuestion = runtimeQuestion()
+                successorQuestionID = successorQuestion.id
+                let successorInstalled = expectation(description: "Successor question installed")
+                let successorAttachment = observeQuestionInstallation(scope: scope, session: successor, installed: successorInstalled)
+                let successorTask = Task { try await runtime.askUser(command: successorCommand, interaction: successorQuestion) }
+                addTeardownBlock { @MainActor in
+                    successorTask.cancel()
+                    _ = await successorTask.result
+                    await runtime.drainPendingEffects(for: successor)
+                }
+                await fulfillment(of: [successorInstalled], timeout: 3)
+                scope.presentation.detach(successorAttachment)
+            default: break
+            }
+            let otherScope = AgentSessionRuntimeStore().makeScope()
+            let selectedRuntime = drift == "other-scope"
+                ? otherScope.interactions(routeID: 43, approvalStore: ApplyEditsApprovalStore()) : runtime
+            let accepted = selectedRuntime.declinePendingInteractionsForProviderSwitch(claim: claim)
+            XCTAssertEqual(accepted, drift == "none", drift)
+            if accepted {
+                XCTAssertNil(session.pendingAskUser)
+                XCTAssertNil(session.askUserContinuation)
+                do { _ = try await task.value
+                    XCTFail("Declined question must cancel")
+                } catch { XCTAssertTrue(error is CancellationError) }
+                XCTAssertTrue(scope.submissions.isCurrent(claim), "Interaction cleanup must not consume the lifecycle claim")
+            } else {
+                XCTAssertEqual(session.pendingAskUser?.interaction.id, question.id, drift)
+                XCTAssertNotNil(session.askUserContinuation, drift)
+                if drift == "replacement" {
+                    XCTAssertEqual(scope.sessions[session.tabID]?.pendingAskUser?.interaction.id, successorQuestionID)
+                    XCTAssertNotNil(scope.sessions[session.tabID]?.askUserContinuation)
+                }
+            }
+            task.cancel()
+            _ = await task.result
+            scope.submissions.release(claim)
+            await runtime.drainPendingEffects(for: session)
+        }
+    }
+
     func testMCPQuestionCancellationOwnsInvocationBeforeAndAfterInstallation() async throws {
         let coordinator = MCPAskUserPresentationCoordinator()
         let scope = AgentSessionRuntimeStore().makeScope()

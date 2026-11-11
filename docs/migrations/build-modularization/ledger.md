@@ -7600,6 +7600,28 @@ including the stronger predecessor-reacquisition witness. Scoped pinned format a
 provider approval receipts and forced-switch interaction forwarding remain local follow-up work;
 MCP routing/registration, provider execution, and general lifecycle ownership are not migrated here.
 
+#### M9.2i checkpoint 4 — forced-switch interaction command ownership
+
+Forced-provider-switch interaction decline now runs in `AgentSessionInteractionRuntime` with the
+switch's original composer lifecycle claim. It checks the exact scope and live claim before clearing
+questions, approvals, input projections and review waits. A stale or foreign claim refuses before
+self-compaction cancellation or Stop. The claim remains available to the existing switch transaction;
+provider teardown, Stop and pending-start withdrawal retain their original owners and semantics.
+This is command ownership extraction, not a claim of a new race in the formerly synchronous VM body.
+
+Real-question witnesses cover admitted, released, reacquired, replaced and foreign-scope claims;
+the replacement has its own pending question and continuation. Both the initial focused selection
+`6e91f1aa-8448-4e4f-9aba-3d3ae0e5689e` and final reviewed selection
+`b3da81ff-0ad3-483c-9050-ad1e0140230b` passed **124 tests**, zero failures. Final review refinements
+use distinct question identities and drain the successor's effects at teardown. Scoped pinned
+formatting, strict lint and whitespace checks passed.
+
+Integration before this slice executed **281 tests with one failure** in
+`testHydrationDriftCannotSettleAReplacedPresentationAttempt` (presentation attempt identity mismatch).
+The unchanged full transcript-restoration lifecycle suite then passed **65 tests**, zero failures,
+with `a96fa24d-8a6d-49bd-972a-f7da5cbccdd7`. This is an isolated pass, not proof that the integration
+failure is fixed. No expectation or timeout was weakened.
+
 ### M9.3b PR1 — shared host route and resource ownership (refs #1406)
 
 Base `99d4e718d` (#1679). This is the first resource extraction in the expanded visible-and-saved
