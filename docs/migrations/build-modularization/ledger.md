@@ -7509,3 +7509,38 @@ including the corrected prepared-owner visit case (one), runtime store (16), pre
 notification coordinator (15) and notification planner (12). Full lint
 `fdb3ba6e-3fcd-4566-ad9d-8ea4dba50a45` passed. These tickets survived the host-app restart;
 their terminal state and exact selected cases were reconciled before more work was submitted.
+
+### M9.2j — persistence and payload-forwarding retirement (in progress)
+
+Started `runtime/20261111-m9-2j-persistence` from exact main `c791cd13a`, separately from draft
+#1687's startup execution branch. No startup, interaction, managed-Steer/self-compaction, or
+saved-host composition cutover is claimed by this lane.
+
+First bounded checkpoint removes five thin private VM forwarders: `makeSaveCommitToken`,
+`isSaveCommitTokenCurrent`, `saveSession`, `saveSessionCore`, and `waitForInFlightSave`, plus the
+dead `SessionCreationSave` alias. Six existing callers now reach the same `persistenceRuntime`
+methods directly. Getter evaluation count, lazy composition timing, arguments/defaults, async
+ordering, save-queue ownership and failure handling are unchanged. Two prepared-owner VM call
+sites and the handoff recovery-save site receive only the necessary runtime qualification; their
+host/handoff policy is not modified. DEBUG token/wait entry points remain stable for existing
+regression tests. Required-save, scheduling and flush forwarders remain for subsequent slices.
+
+One source review (Oracle `untitled-chat-DF9731`, snapshot `2026-11-11/1134`) found no correctness
+regression in this deletion-only checkpoint. Its pre-existing queue-access consistency observation
+is not changed here. Pinned formatting and strict scoped lint passed. Focused ticket
+`29571d71-e9d4-49f4-8cfa-81339bd027ea` passed **78 tests, zero failures** (35.661s): persistence,
+save runtime, quiet-check-in token validation, endpoint resolver, both saved-loader families,
+and the two handoff durable-save/recovery cases. Actual VM compiler warning occurrences were
+four, equal to exact-main `c791cd13a` compile `1b23f00d`; no positive delta. Fresh index passed
+**1,263/1,360 wrong-way edges, 53/66 largest cycle**, baseline unchanged. This is local checkpoint
+validation, not a full publication/product/live-app/release qualification.
+
+Required-save follow-up discovery: the tab/workspace ingress still defaults to `.currentOwner`,
+can survive same-object claim reacquisition during its wait, and can acknowledge dirty suppression
+as `.notRequired`. Do not blindly replace every tab ingress with writer-required failure:
+`preflightComposeTabsRemoval` intentionally includes absent/blank/unbound tabs, and unbound content
+currently obtains binding through the existing core admission. Caller migration must distinguish
+no persistence obligation from acknowledged persistence while preserving legitimate blank-tab
+close behavior. No new compatibility acknowledgement enum, parallel manager, default-true
+admission or legacy-unbound implementation was introduced by this checkpoint. Runtime exact-save
+acknowledgment hardening and remaining caller/forwarder retirement are still open.

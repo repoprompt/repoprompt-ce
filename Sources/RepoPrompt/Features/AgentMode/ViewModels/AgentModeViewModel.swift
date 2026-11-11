@@ -1272,7 +1272,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     await task.value
                 }
                 for sessionID in inFlightIDs {
-                    await waitForInFlightSave(sessionID: sessionID)
+                    await persistenceRuntime.waitForInFlightSave(sessionID: sessionID)
                 }
             }
         }
@@ -1645,11 +1645,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         func test_saveCommitToken(for session: TabSession, workspaceID: UUID) -> SessionSaveCommitToken? {
             guard let workspace = workspaceManager?.workspace(withID: workspaceID) else { return nil }
-            return makeSaveCommitToken(for: session, workspace: workspace)
+            return persistenceRuntime.makeSaveCommitToken(for: session, workspace: workspace)
         }
 
         func test_isSaveCommitTokenCurrent(_ token: SessionSaveCommitToken) -> Bool {
-            isSaveCommitTokenCurrent(token, requireWorkspaceMatch: false)
+            persistenceRuntime.isSaveCommitTokenCurrent(token, requireWorkspaceMatch: false)
         }
 
         func test_shouldAcceptSidebarIndexEntry(_ entry: AgentSessionIndexEntry) -> Bool {
@@ -5755,7 +5755,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             session.saveDebounceTask?.cancel()
             session.saveDebounceTask = nil
             if let id = session.activeAgentSessionID { await runtimeSessionStore.saveQueue.waitForInFlightSave(sessionID: id) }
-            switch await saveSession(for: session.tabID) {
+            switch await persistenceRuntime.saveSession(for: session.tabID) {
             case .saved, .notRequired: saved = saved && !session.isDirty
             case .deferred, .failed: saved = false
             }
@@ -5776,7 +5776,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         for session in sessions.values {
             guard runtimeSessionStore.settlement(for: session).legacyPreparedOwnerIsIdle, session.permitsBoundOperationAndSave else { return false }
             flushPendingAssistantDelta(session)
-            switch await saveSession(for: session.tabID) {
+            switch await persistenceRuntime.saveSession(for: session.tabID) {
             case .saved, .notRequired:
                 guard runtimeSessionStore.settlement(for: session).legacyPreparedHandoffIsSettled else { return false }
             case .deferred, .failed: return false
@@ -14743,14 +14743,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
-    private func makeSaveCommitToken(for session: TabSession, workspace: WorkspaceModel) -> SessionSaveCommitToken? {
-        persistenceRuntime.makeSaveCommitToken(for: session, workspace: workspace)
-    }
-
-    private func isSaveCommitTokenCurrent(_ token: SessionSaveCommitToken, requireWorkspaceMatch: Bool = true, creationHandle: AgentSessionCreationHandle? = nil) -> Bool {
-        persistenceRuntime.isSaveCommitTokenCurrent(token, requireWorkspaceMatch: requireWorkspaceMatch, creationHandle: creationHandle)
-    }
-
     func scheduleSave(for tabID: UUID) {
         persistenceRuntime.scheduleSave(for: tabID)
     }
@@ -14761,20 +14753,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     func scheduleSaveForCommandOutput(tabID: UUID, minInterval: TimeInterval = 5.0) {
         persistenceRuntime.scheduleSaveForCommandOutput(tabID: tabID, minInterval: minInterval)
-    }
-
-    @discardableResult
-    private func saveSession(for tabID: UUID, observingPhase: ((RequiredSavePhase) -> Void)? = nil) async -> AgentSessionSaveResult {
-        await persistenceRuntime.saveSession(for: tabID, observingPhase: observingPhase)
-    }
-
-    private typealias SessionCreationSave = AgentSessionCreationSave
-    private func saveSessionCore(for tabID: UUID, creationSave: SessionCreationSave? = nil, observingPhase: ((RequiredSavePhase) -> Void)? = nil) async -> AgentSessionSaveCoreResult {
-        await persistenceRuntime.saveSessionCore(for: tabID, creationSave: creationSave, observingPhase: observingPhase)
-    }
-
-    private func waitForInFlightSave(sessionID: UUID) async {
-        await persistenceRuntime.waitForInFlightSave(sessionID: sessionID)
     }
 
     func flushSave(for tabID: UUID) async {
@@ -20162,7 +20140,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             destSession.isDirty = true
             destSession.saveDebounceTask?.cancel()
             destSession.saveDebounceTask = nil
-            let stagedSave = await saveSessionCore(for: destTabID, creationSave: .recovery(destinationCreation))
+            let stagedSave = await persistenceRuntime.saveSessionCore(for: destTabID, creationSave: .recovery(destinationCreation))
             guard case let .durablySaved(token) = stagedSave,
                   token == expectedChildBindingToken,
                   destSession.currentRestorationBindingToken == expectedChildBindingToken,
