@@ -1770,6 +1770,99 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         }
     }
 
+    func testApplyEditsCallerCancellationSettlesItsOwnPendingReview() async {
+        let store = ApplyEditsApprovalStore()
+        let address = ApplyEditsApprovalScope(windowID: -1406, tabID: UUID())
+        let (subscription, stream) = await store.subscribe(scope: address)
+        let installed = expectation(description: "original review installed")
+        let cleared = expectation(description: "cancelled review cleared")
+        let completed = expectation(description: "caller cancellation returned")
+        let observer = Task {
+            var sawReview = false
+            for await snapshot in stream {
+                if snapshot.pendingReview != nil, !sawReview {
+                    sawReview = true
+                    installed.fulfill()
+                } else if sawReview, snapshot.pendingReview == nil {
+                    cleared.fulfill()
+                    break
+                }
+            }
+        }
+        var decision: ApplyEditsReviewDecision?
+        let caller = Task {
+            decision = await store.requestReview(scope: address, path: "original", unifiedDiff: "diff", timeoutSeconds: 60)
+            completed.fulfill()
+        }
+        addTeardownBlock {
+            await store.cleanupScope(address)
+            await store.unsubscribe(scope: address, id: subscription)
+            observer.cancel()
+            await observer.value
+            await caller.value
+        }
+        await fulfillment(of: [installed], timeout: 5)
+        caller.cancel()
+        await fulfillment(of: [completed, cleared], timeout: 5)
+        XCTAssertEqual(decision, .cancelled(reason: "Cancelled while awaiting apply_edits review"))
+    }
+
+    func testApplyEditsCallerCancellationCannotConsumeSuccessorReview() async throws {
+        let store = ApplyEditsApprovalStore()
+        let address = ApplyEditsApprovalScope(windowID: -1406, tabID: UUID())
+        let (subscription, stream) = await store.subscribe(scope: address)
+        let installed = expectation(description: "original review installed")
+        let replaced = expectation(description: "successor review installed")
+        var reviews: [String: PendingApplyEditsReview] = [:]
+        let observer = Task {
+            for await snapshot in stream {
+                guard let review = snapshot.pendingReview, reviews[review.path] == nil else { continue }
+                reviews[review.path] = review
+                if review.path == "original" { installed.fulfill() }
+                if review.path == "successor" { replaced.fulfill() }
+            }
+        }
+        let gate = TestReleaseFence(name: "original approval caller cancellation")
+        let settled = expectation(description: "original cancellation dispatched")
+        await store.test_setRequestCancellationHooks(
+            before: { await gate.enterAndWait() }, after: { settled.fulfill() }
+        )
+        let original = Task { await store.requestReview(scope: address, path: "original", unifiedDiff: "diff", timeoutSeconds: 60) }
+        addTeardownBlock {
+            gate.release()
+            await store.cleanupScope(address)
+            await store.unsubscribe(scope: address, id: subscription)
+            observer.cancel()
+            await observer.value
+            _ = await original.value
+        }
+        await fulfillment(of: [installed], timeout: 5)
+        let first = try XCTUnwrap(reviews["original"])
+        original.cancel()
+        guard await gate.waitUntilEntered() else { return }
+        let successorCompleted = expectation(description: "successor response returned")
+        var successorDecision: ApplyEditsReviewDecision?
+        let successor = Task {
+            successorDecision = await store.requestReview(scope: address, path: "successor", unifiedDiff: "diff", timeoutSeconds: 60)
+            successorCompleted.fulfill()
+        }
+        addTeardownBlock {
+            await store.cleanupScope(address)
+            await successor.value
+        }
+        await fulfillment(of: [replaced], timeout: 5)
+        let replacement = try XCTUnwrap(reviews["successor"])
+        XCTAssertNotEqual(first.id, replacement.id)
+        gate.release()
+        await fulfillment(of: [settled], timeout: 5)
+        let accepted = await store.resolveReview(scope: address, reviewID: replacement.id, decision: .accept)
+        XCTAssertTrue(accepted, "An old caller's delayed cancellation must leave the successor review pending")
+        await fulfillment(of: [successorCompleted], timeout: 5)
+        XCTAssertEqual(successorDecision, .accept)
+        let originalResult = await original.value
+        XCTAssertEqual(originalResult, .cancelled(reason: "Replaced by newer apply_edits preview"))
+    }
+
     func testLateApprovalCancellationDrainsOriginalEffectWithoutCancellingSuccessorReview() async throws {
         var scope: AgentSessionRuntimeStore.Scope? = AgentSessionRuntimeStore().makeScope()
         let session = AgentTabSession(tabID: UUID())

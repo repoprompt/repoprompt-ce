@@ -7509,3 +7509,16 @@ including the corrected prepared-owner visit case (one), runtime store (16), pre
 notification coordinator (15) and notification planner (12). Full lint
 `fdb3ba6e-3fcd-4566-ad9d-8ea4dba50a45` passed. These tickets survived the host-app restart;
 their terminal state and exact selected cases were reconciled before more work was submitted.
+
+#### M9.2i checkpoint 1 — exact apply-edits caller cancellation
+
+Caller cancellation in `ApplyEditsApprovalStore` now settles the captured review UUID, not whichever
+review later occupies the same scope. The existing replace-on-new-request behavior is unchanged.
+A held-cancellation witness replaces the original review before releasing its caller's cancellation;
+the successor still accepts. A positive witness checks that cancellation still settles its own pending
+review with the caller-cancellation reason and clears the projection. Snapshot/completion waits are
+bounded and teardown joins both callers and the snapshot consumer.
+
+Focused `a11e4e67-66d3-4e60-adcd-6ff2a5acb7e7` passed **18 interaction-runtime tests**, zero failures.
+Scoped pinned formatting, strict lint and whitespace checks passed. This is the first bounded slice,
+not completion of interaction/provider command routing or residual projection/terminal cleanup.

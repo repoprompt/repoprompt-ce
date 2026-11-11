@@ -102,6 +102,18 @@ actor ApplyEditsApprovalStore: Sendable {
     private var pendingByScope: [ApplyEditsApprovalScope: PendingRecord] = [:]
     private var subscriptions: [ApplyEditsApprovalScope: [UUID: SnapshotContinuation]] = [:]
 
+    #if DEBUG
+        private var test_beforeRequestCancellation: (@Sendable () async -> Void)?
+        private var test_afterRequestCancellation: (@Sendable () -> Void)?
+
+        func test_setRequestCancellationHooks(
+            before: (@Sendable () async -> Void)?, after: (@Sendable () -> Void)?
+        ) {
+            test_beforeRequestCancellation = before
+            test_afterRequestCancellation = after
+        }
+    #endif
+
     func autoEditEnabled(for scope: ApplyEditsApprovalScope) -> Bool {
         autoEditOverridesByScope[scope]?.value ?? Self.globalDefaultAutoEditEnabled()
     }
@@ -207,9 +219,9 @@ actor ApplyEditsApprovalStore: Sendable {
                 )
                 publishSnapshot(for: scope)
             }
-        }, onCancel: {
+        }, onCancel: { [reviewID = review.id] in
             Task {
-                await self.cancelPendingReview(scope: scope, reason: cancellationReason)
+                await self.cancelRequest(scope: scope, reviewID: reviewID, reason: cancellationReason)
             }
         })
         EditFlowPerf.end(
@@ -218,6 +230,18 @@ actor ApplyEditsApprovalStore: Sendable {
             EditFlowPerf.Dimensions(outcome: decision.editFlowPerfOutcome)
         )
         return decision
+    }
+
+    /// Caller cancellation may arrive after replacement, response, or timeout. Its public
+    /// address is not authority to cancel a later request in that same approval scope.
+    private func cancelRequest(scope: ApplyEditsApprovalScope, reviewID: UUID, reason: String) async {
+        #if DEBUG
+            await test_beforeRequestCancellation?()
+        #endif
+        resolvePendingReviewIfMatching(scope: scope, reviewID: reviewID, decision: .cancelled(reason: reason))
+        #if DEBUG
+            test_afterRequestCancellation?()
+        #endif
     }
 
     @discardableResult
