@@ -2,6 +2,24 @@ import Foundation
 import RepoPromptDomainRuntime
 
 extension AgentSessionInteractionRuntime {
+    /// The switch's existing lifecycle claim owns these synchronous interaction mutations.
+    /// Provider retirement and Stop remain with their existing owners; repeated cleanup is safe.
+    @discardableResult
+    func declinePendingInteractionsForProviderSwitch(claim: AgentSessionComposerSubmitClaim) -> Bool {
+        guard let scope, claim.scope === scope, scope.submissions.isCurrent(claim) else { return false }
+        let session = claim.sourceSession
+        // Native user-input requests die with the provider retirement that follows. Clear
+        // their projection first so cancellation reconciliation sees the final blocker state.
+        session.pendingUserInputRequest = nil
+        session.queuedUserInputRequests.removeAll()
+        Self.cancelPendingInstruction(for: session)
+        cancelPendingQuestion(for: session)
+        cancelPendingApproval(for: session)
+        cancelPendingApplyEditsReview(for: session, reason: "Provider switch")
+        cancelPendingWorktreeMergeReview(for: session, reason: "Provider switch")
+        return true
+    }
+
     /// Cancellation operates on the originating object, including after presentation removal.
     /// Namespace-addressed provider work and inbound withdrawal may not target a recycled tab.
     @discardableResult

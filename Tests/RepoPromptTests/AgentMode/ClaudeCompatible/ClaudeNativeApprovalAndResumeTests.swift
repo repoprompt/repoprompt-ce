@@ -1636,7 +1636,10 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         let f = try await fixture()
         try await feed(["type": "control_request", "request_id": "permission-first", "request": ["subtype": "can_use_tool", "tool_name": "Bash", "input": ["command": "echo fixture"]]], f.controller)
         await until("Approval-first cannot hang invisibly") { f.session.runState == .waitingForApproval }
-        XCTAssertEqual(f.session.pendingApproval?.requestID, .claudeControl("permission-first"))
+        if case let .claudeControl(receipt) = f.session.pendingApproval?.requestID {
+            XCTAssertNotNil(UUID(uuidString: receipt))
+        } else { XCTFail("Expected an opaque Claude approval response receipt") }
+        XCTAssertEqual(f.session.pendingApproval?.itemID, "permission-first")
         XCTAssertNotNil(f.session.activeRunOwnership)
         await f.harness.host.cancelAgentRun(tabID: f.session.tabID, completion: .terminalTeardownCompleted)
         XCTAssertEqual(f.session.runState, .cancelled)
@@ -2582,11 +2585,13 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         let reservation = try XCTUnwrap(f.harness.host.claudeCoordinator.reserveEventsForHostPreparation(for: f.session))
         try await feed(["type": "control_request", "request_id": "parked-permission", "request": ["subtype": "can_use_tool", "tool_name": "Bash", "input": ["command": "echo fixture"]]], f.controller)
         await until("unowned provider work and its approval reach the reserved inbox") {
-            f.session.mcpFollowUpRunPending && f.listener.pendingApprovalIDs == ["parked-permission"]
+            f.session.mcpFollowUpRunPending && f.listener.pendingApprovalIDs.count == 1
         }
         XCTAssertNil(f.session.activeRunOwnership)
         XCTAssertTrue(f.harness.host.claudeCoordinator.hasPendingProviderAdoption(for: f.session))
-        XCTAssertEqual(f.listener.pendingApprovalIDs, ["parked-permission"])
+        let receipt = try XCTUnwrap(f.listener.pendingApprovalIDs.first)
+        XCTAssertNotNil(UUID(uuidString: receipt))
+        XCTAssertNotEqual(receipt, "parked-permission", "The reserved inbox retains opaque response authority, not a wire ID")
         await f.harness.host.cancelAgentRun(tabID: f.session.tabID)
         await until("parked approval is denied") { writes.count == 1 }
         let frame = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(writes.line(at: 0))) as? [String: Any])
