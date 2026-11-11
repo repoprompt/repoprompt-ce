@@ -65,24 +65,8 @@ extension AgentModeViewModel {
         }
     }
 
-    private func sessionIndexEntryHasConversationContent(_ entry: AgentSessionIndexEntry) -> Bool {
-        AgentModeSidebarSessionBuilder.sessionIndexEntryHasConversationContent(entry)
-    }
-
     private func archivedSidebarSessionLookup() -> ArchivedSidebarSessionLookup {
         ArchivedSidebarSessionLookup(sessionIndex: ownerValidatedSessionIndex)
-    }
-
-    private func preferredArchivedSidebarEntry(
-        for tabID: UUID,
-        tabName: String?,
-        lookup: ArchivedSidebarSessionLookup
-    ) -> AgentSessionIndexEntry? {
-        AgentModeSidebarSessionBuilder.preferredSidebarEntry(
-            for: tabID,
-            tabName: tabName,
-            entries: lookup.entries(for: tabID)
-        )
     }
 
     private func archivedSidebarEntry(
@@ -90,7 +74,7 @@ extension AgentModeViewModel {
         lookup: ArchivedSidebarSessionLookup
     ) -> AgentSessionIndexEntry? {
         lookup.explicitEntry(for: stashedTab.tab.activeAgentSessionID)
-            ?? preferredArchivedSidebarEntry(for: stashedTab.tab.id, tabName: stashedTab.tab.name, lookup: lookup)
+            ?? AgentModeSidebarSessionBuilder.preferredSidebarEntry(for: stashedTab.tab.id, tabName: stashedTab.tab.name, entries: lookup.entries(for: stashedTab.tab.id))
     }
 
     private func archivedSidebarSearchFields(
@@ -160,15 +144,15 @@ extension AgentModeViewModel {
         lookup: ArchivedSidebarSessionLookup
     ) -> Bool {
         if let explicitEntry = lookup.explicitEntry(for: stashedTab.tab.activeAgentSessionID) {
-            return sessionIndexEntryHasConversationContent(explicitEntry)
+            return AgentModeSidebarSessionBuilder.sessionIndexEntryHasConversationContent(explicitEntry)
         }
         guard stashedTab.tab.activeAgentSessionID != nil || lookup.hasEntries(for: stashedTab.tab.id) else {
             return false
         }
-        guard let entry = preferredArchivedSidebarEntry(for: stashedTab.tab.id, tabName: stashedTab.tab.name, lookup: lookup) else {
+        guard let entry = AgentModeSidebarSessionBuilder.preferredSidebarEntry(for: stashedTab.tab.id, tabName: stashedTab.tab.name, entries: lookup.entries(for: stashedTab.tab.id)) else {
             return false
         }
-        return sessionIndexEntryHasConversationContent(entry)
+        return AgentModeSidebarSessionBuilder.sessionIndexEntryHasConversationContent(entry)
     }
 
     func archivedSessionDateInfo(for stashedTab: StashedTab) -> SidebarSessionDateInfo {
@@ -1539,10 +1523,6 @@ extension AgentModeViewModel {
     }
 
     func computeLastUserMessageDate(in items: [AgentChatItem]) -> Date? {
-        Self.computeLastUserMessageDateNonisolated(in: items)
-    }
-
-    private nonisolated static func computeLastUserMessageDateNonisolated(in items: [AgentChatItem]) -> Date? {
         AgentTranscriptIO.lastUserInteractionDate(in: items)
     }
 }

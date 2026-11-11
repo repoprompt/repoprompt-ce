@@ -60,7 +60,7 @@ extension AgentModeViewModel {
     /// Idempotent cleanup also covers cancellation before the asynchronous executor starts.
     func clearRepromptSubmissionState(claimID: UUID) {
         autoWorkflowJudgments.removeValue(forKey: claimID)?.cancel()
-        cancelRepromptSpeculation(claimID: claimID)
+        repromptSpeculations.removeValue(forKey: claimID)?.cancel(runtime: modelRouterRuntime)
         repromptAudits[claimID] = nil
         repromptDispatchTexts[claimID] = nil
         repromptDispatchOriginals[claimID] = nil

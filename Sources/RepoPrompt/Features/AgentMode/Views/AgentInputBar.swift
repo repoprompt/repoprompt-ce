@@ -1070,17 +1070,11 @@ struct AgentComposerView: View, Equatable {
         return Button {
             openAgentDecisionsSettings(section: .modelRouter)
         } label: {
-            HStack(spacing: 5) {
-                Image(systemName: "arrow.triangle.branch")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-                Text(serviceName.map { "Model Router · \($0)" } ?? "Model Router")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-            }
-            .foregroundColor(.accentColor)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(Color.accentColor.opacity(0.10))
-            .cornerRadius(6)
+            accentChipLabel(
+                icon: "arrow.triangle.branch",
+                title: serviceName.map { "Model Router · \($0)" } ?? "Model Router",
+                iconWeight: .medium
+            )
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Model Router")
@@ -1093,17 +1087,7 @@ struct AgentComposerView: View, Equatable {
         Button {
             openAgentDecisionsSettings(section: .autoEffort)
         } label: {
-            HStack(spacing: 5) {
-                Image(systemName: "gauge.open.with.lines.needle.33percent")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .regular))
-                Text("Auto Effort · \(serviceName)")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-            }
-            .foregroundColor(.accentColor)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(Color.accentColor.opacity(0.10))
-            .cornerRadius(6)
+            accentChipLabel(icon: "gauge.open.with.lines.needle.33percent", title: "Auto Effort · \(serviceName)")
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Auto Effort")
@@ -1148,7 +1132,7 @@ struct AgentComposerView: View, Equatable {
     }
 
     private var providerChipTitle: String {
-        let modelDisplayName = inputBarSelectedModelDisplayName
+        let modelDisplayName = props.selectedModelDisplayName
         let truncatedModelName = String.truncateModelName(
             modelDisplayName,
             maxLength: 28
@@ -1175,31 +1159,27 @@ struct AgentComposerView: View, Equatable {
         return "\(baseTooltip)\n\(AgentModelSelectionWarningVisuals.tooltip(agent: props.selectedAgent, rawModel: props.selectedModelRaw))"
     }
 
-    private var inputBarSelectedModelDisplayName: String {
-        props.selectedModelDisplayName
-    }
-
     private var connectAgentProvidersButton: some View {
-        Button(action: openCLIProvidersSettings) {
-            HStack(spacing: 5) {
-                Image(systemName: "terminal")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                Text("Connect CLI Providers")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-            }
-            .foregroundColor(.accentColor)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(Color.accentColor.opacity(0.10))
-            .cornerRadius(6)
+        Button(action: actions.openCLIProvidersSettings) {
+            accentChipLabel(icon: "terminal", title: "Connect CLI Providers")
         }
         .buttonStyle(.plain)
         .hoverTooltip("Open Settings to connect Claude Code, Codex, OpenCode, or Cursor for Agent Mode")
         .fixedSize(horizontal: true, vertical: false)
     }
 
-    private func openCLIProvidersSettings() {
-        actions.openCLIProvidersSettings()
+    private func accentChipLabel(icon: String, title: String, iconWeight: Font.Weight = .regular) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: icon)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: iconWeight))
+            Text(title)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+        }
+        .foregroundColor(.accentColor)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color.accentColor.opacity(0.10))
+        .cornerRadius(6)
     }
 
     private func openAgentDecisionsSettings(section: SettingsWindowCoordinator.AgentDecisionsSection) {
@@ -1955,7 +1935,7 @@ struct AgentComposerView: View, Equatable {
             if props.hasAvailableAgentProviders {
                 showSteeringUnsupportedNotice(props.unavailableSelectedAgentMessage ?? "Connect this agent provider in Settings before sending.")
             } else {
-                openCLIProvidersSettings()
+                actions.openCLIProvidersSettings()
             }
             return
         }

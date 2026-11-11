@@ -176,10 +176,13 @@ extension AgentModeViewModel {
             startRepromptSpeculation(session: session, operationID: operation.id, text: brief, originalText: operation.rawDraft)
         }
         operation.onStateChange = { [weak self] in self?.syncStatusPillsUIState() }
-        operation.onEdit = { [weak self] in self?.cancelRepromptSpeculation(claimID: id) }
+        operation.onEdit = { [weak self] in
+            guard let self else { return }
+            repromptSpeculations.removeValue(forKey: id)?.cancel(runtime: modelRouterRuntime)
+        }
         operation.onClose = { [weak self] in
             guard let self else { return }
-            cancelRepromptSpeculation(claimID: id)
+            repromptSpeculations.removeValue(forKey: id)?.cancel(runtime: modelRouterRuntime)
             if repromptOperations[target.tabID]?.id == id {
                 repromptOperations[target.tabID] = nil
             }

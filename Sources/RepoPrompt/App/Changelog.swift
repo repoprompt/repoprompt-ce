@@ -14,6 +14,38 @@ struct Version: Identifiable {
 }
 
 class Changelog {
+    private static let initialAgentReleaseNotes = """
+    ### New: Repo Prompt Agent
+    A completely new way to use Repo Prompt. Repo Prompt Agent is a fully integrated agent harness that brings interactive, agentic coding sessions directly into the app.
+
+    - **Full native support for Codex** - Rich integration with the Codex app server for the best agent experience
+    - **Beta support for Claude Code and Gemini** - Interactive agentic sessions via headless CLIs (long chats may have limitations)
+    - **First-class Context Builder integration** - Agents can leverage Repo Prompt's context building workflows for deeper codebase understanding
+    - **Optional edit review** - Review and approve each edit the agent makes before it's applied
+    - **Image support** - Paste or drag-and-drop images into agent conversations
+    - **Session management** - Resume sessions, track token usage, and manage multiple agent conversations
+    - **Configurable tool preferences (Codex)** - Control which tools agents can use, including approval policies and sandbox modes
+    - **Selectable reasoning effort (Codex)** - Fine-tune agent behavior with adjustable reasoning effort levels
+
+    ### New: Agent Onboarding
+    - Guided onboarding wizard for setting up Agent Mode, including license activation, provider testing, and MCP server configuration
+    """
+
+    private static let planStreamingReleaseNotes = """
+    ### New Features
+    - Added reasoning/thinking display for plan generation - see the model's thought process in a collapsible section
+    - Plan preset locking ensures consistent settings during context builder operations
+
+    ### Improvements
+    - Better cancellation support for async operations - more responsive UI when stopping queries
+    - Improved streaming with proper cleanup to prevent hangs
+    - Enhanced tab busy state indicators for plan generation
+    - Better text sync behavior on tab changes
+
+    ### Fixes
+    - Fixed potential resource leaks during streaming cancellation
+    """
+
     static let current = Version(
         id: "2.1.24",
         buildNumber: 326,
@@ -1134,20 +1166,7 @@ class Changelog {
             changes: """
             ## [2.0.1] - 2026-02-11
 
-            ### New: Repo Prompt Agent
-            A completely new way to use Repo Prompt. Repo Prompt Agent is a fully integrated agent harness that brings interactive, agentic coding sessions directly into the app.
-
-            - **Full native support for Codex** - Rich integration with the Codex app server for the best agent experience
-            - **Beta support for Claude Code and Gemini** - Interactive agentic sessions via headless CLIs (long chats may have limitations)
-            - **First-class Context Builder integration** - Agents can leverage Repo Prompt's context building workflows for deeper codebase understanding
-            - **Optional edit review** - Review and approve each edit the agent makes before it's applied
-            - **Image support** - Paste or drag-and-drop images into agent conversations
-            - **Session management** - Resume sessions, track token usage, and manage multiple agent conversations
-            - **Configurable tool preferences (Codex)** - Control which tools agents can use, including approval policies and sandbox modes
-            - **Selectable reasoning effort (Codex)** - Fine-tune agent behavior with adjustable reasoning effort levels
-
-            ### New: Agent Onboarding
-            - Guided onboarding wizard for setting up Agent Mode, including license activation, provider testing, and MCP server configuration
+            \(initialAgentReleaseNotes)
             """
         ),
         Version(
@@ -1157,20 +1176,7 @@ class Changelog {
             changes: """
             ## [2.0] - 2026-02-11
 
-            ### New: Repo Prompt Agent
-            A completely new way to use Repo Prompt. Repo Prompt Agent is a fully integrated agent harness that brings interactive, agentic coding sessions directly into the app.
-
-            - **Full native support for Codex** - Rich integration with the Codex app server for the best agent experience
-            - **Beta support for Claude Code and Gemini** - Interactive agentic sessions via headless CLIs (long chats may have limitations)
-            - **First-class Context Builder integration** - Agents can leverage Repo Prompt's context building workflows for deeper codebase understanding
-            - **Optional edit review** - Review and approve each edit the agent makes before it's applied
-            - **Image support** - Paste or drag-and-drop images into agent conversations
-            - **Session management** - Resume sessions, track token usage, and manage multiple agent conversations
-            - **Configurable tool preferences (Codex)** - Control which tools agents can use, including approval policies and sandbox modes
-            - **Selectable reasoning effort (Codex)** - Fine-tune agent behavior with adjustable reasoning effort levels
-
-            ### New: Agent Onboarding
-            - Guided onboarding wizard for setting up Agent Mode, including license activation, provider testing, and MCP server configuration
+            \(initialAgentReleaseNotes)
             """
         ),
         Version(
@@ -1769,18 +1775,7 @@ class Changelog {
             changes: """
             ## [1.5.50] - 2025-12-06
 
-            ### New Features
-            - Added reasoning/thinking display for plan generation - see the model's thought process in a collapsible section
-            - Plan preset locking ensures consistent settings during context builder operations
-
-            ### Improvements
-            - Better cancellation support for async operations - more responsive UI when stopping queries
-            - Improved streaming with proper cleanup to prevent hangs
-            - Enhanced tab busy state indicators for plan generation
-            - Better text sync behavior on tab changes
-
-            ### Fixes
-            - Fixed potential resource leaks during streaming cancellation
+            \(planStreamingReleaseNotes)
             - Fixed file deletion detection
             """
         ),
@@ -1791,18 +1786,7 @@ class Changelog {
             changes: """
             ## [1.5.49] - 2025-12-06 (unreleased)
 
-            ### New Features
-            - Added reasoning/thinking display for plan generation - see the model's thought process in a collapsible section
-            - Plan preset locking ensures consistent settings during context builder operations
-
-            ### Improvements
-            - Better cancellation support for async operations - more responsive UI when stopping queries
-            - Improved streaming with proper cleanup to prevent hangs
-            - Enhanced tab busy state indicators for plan generation
-            - Better text sync behavior on tab changes
-
-            ### Fixes
-            - Fixed potential resource leaks during streaming cancellation
+            \(planStreamingReleaseNotes)
             """
         ),
         Version(

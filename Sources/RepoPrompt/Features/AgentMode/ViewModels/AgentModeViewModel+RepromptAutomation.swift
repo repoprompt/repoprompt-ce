@@ -53,7 +53,7 @@ extension AgentModeViewModel {
     }
 
     func startRepromptSpeculation(session: TabSession, operationID: UUID, text: String, originalText: String) {
-        cancelRepromptSpeculation(claimID: operationID)
+        repromptSpeculations.removeValue(forKey: operationID)?.cancel(runtime: modelRouterRuntime)
         guard let runtime = modelRouterRuntime, sessions[session.tabID] === session else { return }
         let configuration = modelRouterSettingsStore.modelRouterConfiguration()
         let allowed = providers(for: .primarySession, configuration: configuration)
@@ -159,9 +159,5 @@ extension AgentModeViewModel {
         audit.automationJudgedText = judgedText
         audit.routerSpeculation = repromptSpeculations[claim.attempt.id]?.reuse ?? .none
         return audit
-    }
-
-    func cancelRepromptSpeculation(claimID: UUID) {
-        repromptSpeculations.removeValue(forKey: claimID)?.cancel(runtime: modelRouterRuntime)
     }
 }

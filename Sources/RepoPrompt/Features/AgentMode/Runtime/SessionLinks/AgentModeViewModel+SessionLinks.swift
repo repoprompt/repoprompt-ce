@@ -1225,20 +1225,6 @@ extension AgentModeViewModel {
         }
     }
 
-    /// Pasted-ID resolution for the sidebar's inbound `Session ID…` sheet (choose a prospective
-    /// overseer for this row). The pasted session may be any eligible session — the menu list
-    /// still offers existing overseers only, but a pasted ID may name a session that has not
-    /// overseen anything yet.
-    func resolveSidebarOverseerCandidate(
-        rawSessionID: String,
-        excludingTargetSessionID: UUID
-    ) async -> Result<AgentOversightSessionIDResolution, AgentOversightResolutionMessage> {
-        await AgentSessionLinkRuntimeBridge.shared.resolveSidebarOverseerCandidate(
-            rawSessionID: rawSessionID,
-            excludingTargetSessionID: excludingTargetSessionID
-        )
-    }
-
     /// Pasted-ID resolution for the sidebar's outbound `Session ID…` sheet (choose a prospective
     /// target for this row-as-observer). Reuses the composer pill's resolver, except that an
     /// already-linked pair resolves to `.alreadyLinked` — the sheet closes silently rather than

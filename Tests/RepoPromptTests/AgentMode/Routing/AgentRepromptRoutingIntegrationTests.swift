@@ -274,7 +274,7 @@ final class AgentRepromptTestFixture {
     func cleanUp() {
         viewModel.cancelReprompt()
         for id in Array(viewModel.repromptSpeculations.keys) {
-            viewModel.cancelRepromptSpeculation(claimID: id)
+            viewModel.repromptSpeculations.removeValue(forKey: id)?.cancel(runtime: viewModel.modelRouterRuntime)
         }
         for session in viewModel.sessions.values {
             session.agentTask?.cancel()
