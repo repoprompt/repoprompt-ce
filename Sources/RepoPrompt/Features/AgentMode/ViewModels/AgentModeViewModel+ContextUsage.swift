@@ -6,14 +6,6 @@ import RepoPromptDomainRuntime
 /// turn report was appended. The runtime can perform all accounting without constructing this VM.
 @MainActor
 extension AgentModeViewModel {
-    var claudeContextUsageEstimator: ClaudeContextUsageEstimator {
-        usageRuntime.claudeContextUsageEstimator
-    }
-
-    var acpContextUsageEstimator: ACPContextUsageEstimator {
-        usageRuntime.acpContextUsageEstimator
-    }
-
     func nonCodexContextUsageEstimator(for agent: AgentProviderKind) -> (any ContextUsageEstimating)? {
         usageRuntime.nonCodexContextUsageEstimator(for: agent)
     }
@@ -32,9 +24,5 @@ extension AgentModeViewModel {
         if usageRuntime.startNonCodexTurnAccountingIfNeeded(for: session, initialMessage: initialMessage) {
             scheduleSave(for: session)
         }
-    }
-
-    nonisolated static func contextUsageFromClaudeProviderTokens(_ usage: [AgentTokenUsagePersist], modelContextWindow: Int?) -> AgentContextUsage? {
-        AgentSessionUsageRuntime.contextUsageFromClaudeProviderTokens(usage, modelContextWindow: modelContextWindow)
     }
 }

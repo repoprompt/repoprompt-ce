@@ -1142,7 +1142,7 @@ final class AgentSessionLinkACPBackgroundCompactionSettleTests: XCTestCase {
         let session = idleSession()
         let target = candidate(tabID: session.tabID)
         XCTAssertEqual(admission(session), .ready)
-        XCTAssertTrue(AgentModeViewModel.agentSessionLinkPeriodicWakeSessionIsIdle(session))
+        XCTAssertTrue(AgentSessionLinkExecutionRuntime.agentSessionLinkPeriodicWakeSessionIsIdle(session))
 
         session.beginACPBackgroundCompactionSettle(duration: 60)
 
@@ -1153,7 +1153,7 @@ final class AgentSessionLinkACPBackgroundCompactionSettleTests: XCTestCase {
             "send, compact, and every parked when_sendable drain share this admission"
         )
         XCTAssertFalse(
-            AgentModeViewModel.agentSessionLinkPeriodicWakeSessionIsIdle(session),
+            AgentSessionLinkExecutionRuntime.agentSessionLinkPeriodicWakeSessionIsIdle(session),
             "A periodic wake would start the very turn that cancels the compaction"
         )
         let observed = AgentModeViewModel.observationSnapshot(for: session, candidate: target, subagentCounts: (0, 0))

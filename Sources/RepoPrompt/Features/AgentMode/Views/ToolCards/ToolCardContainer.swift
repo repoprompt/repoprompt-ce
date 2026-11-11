@@ -170,7 +170,7 @@ struct ToolCardContainer<Content: View>: View {
             }
         }
         .padding(10)
-        .background(backgroundColor)
+        .background(status.cardBackgroundColor(colorScheme: colorScheme))
         .cornerRadius(12)
         .contentShape(Rectangle())
     }
@@ -190,13 +190,7 @@ struct ToolCardContainer<Content: View>: View {
                 }
                 .buttonStyle(.plain)
 
-                if let headerTrailingView {
-                    headerTrailingView
-                } else if showsTimestamp, let timestamp {
-                    MessageTimestampText(date: timestamp)
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary.opacity(0.7))
-                }
+                toolCardHeaderTrailing(headerTrailingView, showsTimestamp: showsTimestamp, timestamp: timestamp)
             }
 
             if let detailText {
@@ -215,13 +209,7 @@ struct ToolCardContainer<Content: View>: View {
                 headerLeadingContent
                 Spacer()
 
-                if let headerTrailingView {
-                    headerTrailingView
-                } else if showsTimestamp, let timestamp {
-                    MessageTimestampText(date: timestamp)
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary.opacity(0.7))
-                }
+                toolCardHeaderTrailing(headerTrailingView, showsTimestamp: showsTimestamp, timestamp: timestamp)
             }
 
             if let detailText {
@@ -231,28 +219,11 @@ struct ToolCardContainer<Content: View>: View {
     }
 
     private var headerLeadingContent: some View {
-        HStack(spacing: 6) {
-            Image(systemName: iconName)
-                .font(.system(size: 11))
-                .foregroundColor(iconColor)
-
-            Text(title)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundColor(.primary)
-                .lineLimit(1)
-
+        toolCardHeaderLeading(iconName: iconName, iconColor: iconColor, title: title, subtitle: subtitle) {
             if let headerStatusText, !headerStatusText.isEmpty {
                 StatusBadge(text: headerStatusText, status: status)
             } else {
                 StatusDot(status: status, size: 6)
-            }
-
-            if let subtitle {
-                Text(subtitle)
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
             }
         }
     }
@@ -264,17 +235,6 @@ struct ToolCardContainer<Content: View>: View {
             .lineLimit(1)
             .truncationMode(.tail)
             .padding(.leading, 17)
-    }
-
-    private var backgroundColor: Color {
-        switch status {
-        case .running:
-            BubbleColors.toolCallBackground(colorScheme: colorScheme)
-        case .failure:
-            BubbleColors.errorBackground(colorScheme: colorScheme)
-        default:
-            BubbleColors.toolResultBackground(colorScheme: colorScheme)
-        }
     }
 
     private var debugRenderStatePreference: [UUID: AgentToolCardRenderState] {
@@ -376,7 +336,7 @@ struct StaticToolCardContainer<Content: View>: View {
             content()
         }
         .padding(10)
-        .background(backgroundColor)
+        .background(status.cardBackgroundColor(colorScheme: colorScheme))
         .cornerRadius(12)
         .contentShape(Rectangle())
     }
@@ -399,41 +359,60 @@ struct StaticToolCardContainer<Content: View>: View {
                 Spacer()
             }
 
-            if let headerTrailingView {
-                headerTrailingView
-            } else if showsTimestamp, let timestamp {
-                MessageTimestampText(date: timestamp)
-                    .font(.system(size: 10))
-                    .foregroundColor(.secondary.opacity(0.7))
-            }
+            toolCardHeaderTrailing(headerTrailingView, showsTimestamp: showsTimestamp, timestamp: timestamp)
         }
     }
 
     private var headerLeadingContent: some View {
-        HStack(spacing: 6) {
-            Image(systemName: iconName)
-                .font(.system(size: 11))
-                .foregroundColor(iconColor)
-
-            Text(title)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundColor(.primary)
-                .lineLimit(1)
-
+        toolCardHeaderLeading(iconName: iconName, iconColor: iconColor, title: title, subtitle: subtitle) {
             StatusDot(status: status, size: 6)
-
-            if let subtitle {
-                Text(subtitle)
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
         }
     }
+}
 
-    private var backgroundColor: Color {
-        switch status {
+@MainActor
+@ViewBuilder
+private func toolCardHeaderTrailing(_ custom: AnyView?, showsTimestamp: Bool, timestamp: Date?) -> some View {
+    if let custom {
+        custom
+    } else if showsTimestamp, let timestamp {
+        MessageTimestampText(date: timestamp)
+            .font(.system(size: 10))
+            .foregroundColor(.secondary.opacity(0.7))
+    }
+}
+
+@MainActor
+private func toolCardHeaderLeading(
+    iconName: String,
+    iconColor: Color,
+    title: String,
+    subtitle: String?,
+    @ViewBuilder status: () -> some View
+) -> some View {
+    HStack(spacing: 6) {
+        Image(systemName: iconName)
+            .font(.system(size: 11))
+            .foregroundColor(iconColor)
+        Text(title)
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundColor(.primary)
+            .lineLimit(1)
+        status()
+        if let subtitle {
+            Text(subtitle)
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+    }
+}
+
+private extension ToolCardStatus {
+    @MainActor
+    func cardBackgroundColor(colorScheme: ColorScheme) -> Color {
+        switch self {
         case .running:
             BubbleColors.toolCallBackground(colorScheme: colorScheme)
         case .failure:

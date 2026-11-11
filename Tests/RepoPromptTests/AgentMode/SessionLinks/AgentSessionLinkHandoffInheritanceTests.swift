@@ -2148,7 +2148,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 XCTAssertTrue(restored === session)
                 XCTAssertFalse(restored.items.contains { $0.id == meta.id })
                 XCTAssertEqual(restored.pendingHandoff.sourceItemID, durableTail)
-                XCTAssertFalse(AgentModeViewModel.providerSwitchNeedsReview(restored))
+                XCTAssertFalse(AgentSessionLinkExecutionRuntime.providerSwitchNeedsReview(restored))
                 guard case .success(.some) = await vm.providerSwitchSendAdmission(session: restored, input: "new ordinary input") else {
                     return XCTFail("A canonical tail must not become stale after normalization and restore")
                 }
@@ -2961,7 +2961,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     AgentSessionLinkDeliveryReadiness.failure(snapshot: AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(session: session, endpointMatchesGrant: true, isClosing: false))
                 }
                 XCTAssertEqual(failure(), .targetNotIdle, "The owned sending-save gap is ordinary busy, not uncertainty or stale history")
-                XCTAssertFalse(AgentModeViewModel.providerSwitchNeedsReview(session))
+                XCTAssertFalse(AgentSessionLinkExecutionRuntime.providerSwitchNeedsReview(session))
                 release.finish(())
                 let messages = await prepare.value
                 XCTAssertNotNil(messages)
@@ -2972,7 +2972,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 XCTAssertEqual(session.pendingHandoff.providerSwitchDispatch?.runOwnership, ownership)
                 XCTAssertEqual(failure(), .targetNotIdle)
                 XCTAssertFalse(AgentModeViewModel.providerSwitchUnconfirmed(session))
-                XCTAssertFalse(AgentModeViewModel.providerSwitchNeedsReview(session))
+                XCTAssertFalse(AgentSessionLinkExecutionRuntime.providerSwitchNeedsReview(session))
                 guard case .failure(.targetNotIdle) = await vm.providerSwitchSendAdmission(session: session, input: "later") else { return XCTFail("Owned input must use existing busy refusal") }
                 session.appendItem(.user("a genuinely different later accepted input", sequenceIndex: session.nextSequenceIndex))
                 XCTAssertEqual(failure(), .providerHandoverNeedsReview, "The exact owned input exception cannot exempt another accepted row")
@@ -3238,7 +3238,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 let response = try await waiting.value
                 XCTAssertEqual(response.text, "the answer", "The turn's own continuation reply must reach the held input")
                 XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
-                XCTAssertFalse(AgentModeViewModel.providerSwitchNeedsReview(session), "A bound handover is en route, never stale")
+                XCTAssertFalse(AgentSessionLinkExecutionRuntime.providerSwitchNeedsReview(session), "A bound handover is en route, never stale")
                 XCTAssertFalse(AgentModeViewModel.providerSwitchUnconfirmed(session))
             }
         }

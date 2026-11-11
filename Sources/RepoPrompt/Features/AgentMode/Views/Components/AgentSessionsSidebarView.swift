@@ -132,7 +132,7 @@ struct AgentModeSessionsSidebarView: View {
         return VStack(spacing: metrics.controlSpacing) {
             AgentSidebarTabStrip(selection: sidebarUI.snapshot.sidebarTab, metrics: metrics) { selected in
                 storedSidebarTab = selected.rawValue
-                agentModeVM.setSidebarTab(selected)
+                agentModeVM.ui.sessionSidebar.setSidebarTab(selected)
             }
             AgentSidebarSearchField(
                 text: agentModeVM.sidebarSearchBinding(),
@@ -146,7 +146,7 @@ struct AgentModeSessionsSidebarView: View {
         .onAppear {
             let tab = AgentSidebarTab(rawValue: storedSidebarTab) ?? .all
             if tab != sidebarUI.snapshot.sidebarTab {
-                agentModeVM.setSidebarTab(tab)
+                agentModeVM.ui.sessionSidebar.setSidebarTab(tab)
             }
         }
     }
@@ -796,7 +796,7 @@ struct AgentModeSessionsListView: View, Equatable {
             showingBulkDeleteConfirmation = false
         }
         .task(id: defaultCollapseSeedKeys) {
-            agentModeVM.seedDefaultCollapsedSidebarThreads(defaultCollapseSeedKeys)
+            agentModeVM.ui.sessionSidebar.seedDefaultCollapsedThreads(eligibleKeys: defaultCollapseSeedKeys)
         }
         .task(id: selectionRenderIdentity) {
             sidebarUI.reconcileSelection(

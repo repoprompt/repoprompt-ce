@@ -31,13 +31,7 @@ struct AgentAskUserWizardCard: View {
 
             actionButtons
         }
-        .padding(12)
-        .background(Color.blue.opacity(0.08))
-        .cornerRadius(8)
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(Color.blue.opacity(0.3), lineWidth: 1)
-        )
+        .agentQuestionCardSurface()
         .agentPendingCardFocus(store: pendingFocusStore, tabID: pendingFocusTabID, focusTarget: focusCurrentQuestion)
         .onChange(of: pending.id) { _, _ in
             cancelPendingActivitySignal()
@@ -101,21 +95,7 @@ struct AgentAskUserWizardCard: View {
     }
 
     private var headerSection: some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "questionmark.circle.fill")
-                .font(.title2)
-                .foregroundColor(.blue)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(headerTitle)
-                    .font(.headline)
-                Text("Question \(min(currentIndex + 1, questionCount)) of \(questionCount)")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-
-            Spacer()
-
+        agentQuestionCardHeader(title: headerTitle, subtitle: "Question \(min(currentIndex + 1, questionCount)) of \(questionCount)") {
             if showsTimeout {
                 let countdownAnchor = pending.timeoutStartedAt ?? pending.interaction.askedAt
                 TimeoutCountdownView(startedAt: countdownAnchor, timeoutSeconds: pending.interaction.timeoutSeconds)
@@ -221,14 +201,7 @@ struct AgentAskUserWizardCard: View {
 
                 Spacer()
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(isSelected ? Color.blue.opacity(0.15) : Color.blue.opacity(0.05))
-            .cornerRadius(6)
-            .overlay(
-                RoundedRectangle(cornerRadius: 6)
-                    .stroke(isSelected ? Color.blue.opacity(0.5) : Color.clear, lineWidth: 1)
-            )
+            .agentQuestionOptionSurface(isSelected: isSelected, outlineOpacity: 0.5)
         }
         .buttonStyle(.plain)
         .disabled(draft.skipped)

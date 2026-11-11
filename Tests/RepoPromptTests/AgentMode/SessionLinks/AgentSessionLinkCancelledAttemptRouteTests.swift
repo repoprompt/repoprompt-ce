@@ -251,7 +251,7 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             session.oversight.periodicIdleWakeIntervalSeconds = 21600
             XCTAssertNotNil(viewModel.linkExecutionRuntime.agentSessionLinkPromptContext(for: session), "prompt gate")
             XCTAssertTrue(
-                AgentModeViewModel.agentSessionLinkPeriodicWakeSessionIsIdle(session),
+                AgentSessionLinkExecutionRuntime.agentSessionLinkPeriodicWakeSessionIsIdle(session),
                 "idle: \(AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(session: session, endpointMatchesGrant: true, isClosing: false))"
             )
             XCTAssertTrue(viewModel.linkExecutionRuntime.agentSessionLinkPeriodicWakeIsEligible(session, endpoint: observer.endpoint), "periodic eligibility")

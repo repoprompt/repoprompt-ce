@@ -6282,12 +6282,12 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         fixture.session.oversight.pendingAutoWake?.phase = .preparingDispatch
         let rawID = AgentSessionLinkPromptDispatchID.headlessRun(runID: UUID())
         let monitoring = fixture.viewModel.agentSessionLinkDecoratedProviderText(
-            AgentModeViewModel.periodicWakeMessage, session: fixture.session, dispatchID: rawID
+            AgentSessionLinkExecutionRuntime.periodicWakeMessage, session: fixture.session, dispatchID: rawID
         )
         XCTAssertNil(monitoring.claim)
         XCTAssertFalse(monitoring.mustAbortDispatch)
         XCTAssertEqual(monitoring.dispatchContext?.dispatchID.autoWakeID, wakeID)
-        XCTAssertEqual(monitoring.text, AgentModeViewModel.periodicWakeMessage)
+        XCTAssertEqual(monitoring.text, AgentSessionLinkExecutionRuntime.periodicWakeMessage)
         XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: rawID))
         XCTAssertNil(fixture.session.oversight.lastOversightWakeDispatch)
         fixture.viewModel.acceptAgentSessionLinkDispatch(session: fixture.session, context: monitoring.dispatchContext, claim: nil)
@@ -6658,8 +6658,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         return Task { @MainActor in
             _ = await harness.composition.startRun(
                 tabID: fixture.tabID, session: fixture.session,
-                initialUserMessage: AgentModeViewModel.periodicWakeMessage,
-                initialMessageForRun: AgentModeViewModel.periodicWakeMessage, attachments: []
+                initialUserMessage: AgentSessionLinkExecutionRuntime.periodicWakeMessage,
+                initialMessageForRun: AgentSessionLinkExecutionRuntime.periodicWakeMessage, attachments: []
             )
             if fixture.session.oversight.pendingAutoWake?.wakeID == wakeID {
                 fixture.session.oversight.pendingAutoWake?.periodicStartReturned = true

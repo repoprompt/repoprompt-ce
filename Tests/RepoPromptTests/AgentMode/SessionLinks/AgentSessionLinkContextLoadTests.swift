@@ -1096,7 +1096,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let tabID = UUID()
         let session = AgentModeViewModel.TabSession(tabID: tabID)
         session.selectedAgent = .devin
-        viewModel.acpContextUsageEstimator.beginTurn(session: session, initialMessage: "turn")
+        viewModel.usageRuntime.acpContextUsageEstimator.beginTurn(session: session, initialMessage: "turn")
 
         _ = viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 100_000,
@@ -1133,7 +1133,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let subscription = session.monitorObservationSignal.sink { signals += 1 }
         defer { subscription.cancel() }
 
-        viewModel.acpContextUsageEstimator.beginTurn(session: session, initialMessage: "one")
+        viewModel.usageRuntime.acpContextUsageEstimator.beginTurn(session: session, initialMessage: "one")
         viewModel.ingestNonCodexTurnFinalization(
             promptTokens: 95000, completionTokens: 400, contextUsedTokens: 95000,
             modelContextWindow: nil, session: session
@@ -1151,7 +1151,7 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         XCTAssertEqual(reported()?.confidence, .exact)
         XCTAssertEqual(signals, afterBilled + 1, "Occupancy confirming the same figure republishes")
 
-        viewModel.acpContextUsageEstimator.beginTurn(session: session, initialMessage: "two")
+        viewModel.usageRuntime.acpContextUsageEstimator.beginTurn(session: session, initialMessage: "two")
         viewModel.ingestNonCodexTurnFinalization(
             promptTokens: 95000, completionTokens: 400, contextUsedTokens: 95000,
             modelContextWindow: nil, session: session
@@ -1176,9 +1176,9 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         let second = AgentModeViewModel.TabSession(tabID: UUID())
         second.selectedAgent = .devin
         XCTAssertNil(second.acpOccupancyReportThisTurn)
-        XCTAssertFalse(viewModel.acpContextUsageEstimator.hasOccupancyReportThisTurn(session: second))
+        XCTAssertFalse(viewModel.usageRuntime.acpContextUsageEstimator.hasOccupancyReportThisTurn(session: second))
 
-        viewModel.acpContextUsageEstimator.beginTurn(session: first, initialMessage: "next")
+        viewModel.usageRuntime.acpContextUsageEstimator.beginTurn(session: first, initialMessage: "next")
         XCTAssertNil(first.acpOccupancyReportThisTurn)
     }
 

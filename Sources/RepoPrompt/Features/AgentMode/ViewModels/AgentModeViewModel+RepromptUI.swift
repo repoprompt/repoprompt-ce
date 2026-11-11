@@ -215,7 +215,7 @@ extension AgentModeViewModel {
         guard currentTabID == tabID, var recovery = repromptUIStore.recoveries[tabID],
               confirmedReplacement || retrieveDraftText(for: tabID) == recovery.draftAtInvalidation else { return false }
         repromptOperation?.cancel(restoreOriginal: false, recover: false)
-        _ = loadDraftSnapshotForComposer(for: tabID)
+        _ = draftRuntime.loadSnapshot(tabID: tabID)
         restoreComposerDraft(tabID: tabID, text: recovery.originalDraft, message: "Restored original draft.", strategy: .replaceAlways)
         recovery.requiresDecision = false
         recovery.bypassesPreparation = false
@@ -229,7 +229,7 @@ extension AgentModeViewModel {
         guard currentTabID == tabID, let recovery = repromptUIStore.recoveries[tabID] else { return false }
         guard confirmedReplacement || retrieveDraftText(for: tabID) == recovery.draftAtInvalidation else { return false }
         repromptOperation?.cancel(restoreOriginal: false, recover: false)
-        _ = loadDraftSnapshotForComposer(for: tabID)
+        _ = draftRuntime.loadSnapshot(tabID: tabID)
         restoreComposerDraft(tabID: tabID, text: recovery.text, message: "Restored Re-prompt draft.", strategy: .replaceAlways)
         var kept = recovery
         kept.requiresDecision = false

@@ -2058,7 +2058,7 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
         let reservationID = viewModel.attachmentRuntime.reserveAttachmentsForTurn([attachment], session: session)
 
         viewModel.attachmentRuntime.finalizeAttachmentsForTurn(for: session, reservationID: reservationID, disposition: .deleteFiles)
-        await viewModel.waitForAttachmentRetention()
+        await viewModel.attachmentRuntime.waitForRetention()
 
         let keptPath = AgentSessionAttachmentStore(rootURL: attachmentsRoot)
             .sessionFolderURL(sessionID: agentSessionID)
@@ -2091,7 +2091,7 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
         let restoration = session.currentRestorationBindingToken
         viewModel.attachmentRuntime.finalizeAttachmentsForTurn(for: session, reservationID: reservation, disposition: .deleteFiles)
-        await viewModel.waitForAttachmentRetention()
+        await viewModel.attachmentRuntime.waitForRetention()
         XCTAssertTrue(viewModel.session(for: session.tabID, createIfNeeded: false) === session)
         XCTAssertEqual(viewModel.attachmentLocation(for: session)?.retainedRoot, root.standardizedFileURL)
         XCTAssertEqual(session.persistentSessionBindingIdentity, placement.binding)
@@ -2133,7 +2133,7 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
         _ = other.attachmentRuntime.reserveAttachmentsForTurn([reserved], session: otherSession)
         otherSession.attachmentsPendingProviderConsumptionCleanup = [consumed]
 
-        let protection = viewModel.liveAttachmentSweepProtection()
+        let protection = AgentSessionRuntimeStore.shared.attachmentSweepProtection()
         XCTAssertTrue(protection.sessionIDs.isSuperset(of: [localID, otherID]))
         XCTAssertTrue(protection.temporaryPaths.isSuperset(of: Set([local, pending, reserved, consumed].compactMap(AgentImageAttachmentAvailabilityResolver.path(for:)))))
     }
@@ -2198,7 +2198,7 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
 
         currentRoot = switchedRoot // The window switched workspace mid-turn.
         viewModel.attachmentRuntime.finalizeAttachmentsForTurn(for: session, reservationID: reservationID, disposition: .deleteFiles)
-        await viewModel.waitForAttachmentRetention()
+        await viewModel.attachmentRuntime.waitForRetention()
 
         let keptPath = AgentSessionAttachmentStore(rootURL: reservedRoot)
             .sessionFolderURL(sessionID: agentSessionID)
@@ -2221,7 +2221,7 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
         viewModel.test_installLiveSession(AgentModeViewModel.TabSession(tabID: tabID))
 
         viewModel.attachmentRuntime.finalizeAttachmentsForTurn(for: session, reservationID: reservationID, disposition: .deleteFiles)
-        await viewModel.waitForAttachmentRetention()
+        await viewModel.attachmentRuntime.waitForRetention()
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: temporaryFile.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: attachmentsRoot.path))
@@ -2244,7 +2244,7 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
         try Data("kept".utf8).write(to: kept)
 
         viewModel.attachmentRuntime.repairRetainedAttachmentPathsAfterHydration(session, sessionID: agentSessionID)
-        await viewModel.waitForAttachmentRetention()
+        await viewModel.attachmentRuntime.waitForRetention()
 
         let row = try XCTUnwrap(session.items.last { $0.kind == .user })
         XCTAssertEqual(row.attachments.first?.source, .localFile(path: kept.path))
@@ -2280,7 +2280,7 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
         try Data("compacted kept image".utf8).write(to: kept)
 
         viewModel.attachmentRuntime.repairRetainedAttachmentPathsAfterHydration(session, sessionID: sessionID)
-        await viewModel.waitForAttachmentRetention()
+        await viewModel.attachmentRuntime.waitForRetention()
 
         let expected = AgentFileAttachment(
             id: attachment.id, source: .localFile(path: kept.path), title: attachment.title, createdAt: attachment.createdAt
@@ -2348,7 +2348,7 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
             viewModel.applyTranscriptPresentation(transcript, to: session, isColdLoad: true)
 
             viewModel.attachmentRuntime.repairRetainedAttachmentPathsAfterHydration(session, sessionID: sessionID)
-            await viewModel.waitForAttachmentRetention()
+            await viewModel.attachmentRuntime.waitForRetention()
 
             let expectedHistorical = AgentFileAttachment(
                 id: attachmentID, source: .localFile(path: kept.path), title: historicalAttachment.title, createdAt: historicalAttachment.createdAt
@@ -2379,7 +2379,7 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
         let reservationID = viewModel.attachmentRuntime.reserveAttachmentsForTurn([attachment], session: session)
 
         viewModel.attachmentRuntime.finalizeAttachmentsForTurn(for: session, reservationID: reservationID, disposition: .deleteFiles)
-        await viewModel.waitForAttachmentRetention()
+        await viewModel.attachmentRuntime.waitForRetention()
 
         XCTAssertEqual(AttachmentTilePreviewCache.shared.retainedImages.availability.cachedAvailability(forPath: temporaryPath), .missing)
     }
@@ -2403,7 +2403,7 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
         let reservationID = viewModel.attachmentRuntime.reserveAttachmentsForTurn([attachment], session: session)
 
         viewModel.attachmentRuntime.finalizeAttachmentsForTurn(for: session, reservationID: reservationID, disposition: .deleteFiles)
-        await viewModel.waitForAttachmentRetention()
+        await viewModel.attachmentRuntime.waitForRetention()
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: temporaryFile.path))
         XCTAssertEqual(session.items.last { $0.kind == .user }?.attachments, [attachment])
@@ -2421,7 +2421,7 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
         let reservationID = viewModel.attachmentRuntime.reserveAttachmentsForTurn([attachment], session: session)
 
         viewModel.attachmentRuntime.finalizeAttachmentsForTurn(for: session, reservationID: reservationID, disposition: .restoreToPending)
-        await viewModel.waitForAttachmentRetention()
+        await viewModel.attachmentRuntime.waitForRetention()
 
         XCTAssertTrue(FileManager.default.fileExists(atPath: temporaryFile.path))
         XCTAssertEqual(session.pendingFileAttachments, [attachment])

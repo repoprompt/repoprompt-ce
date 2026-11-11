@@ -677,7 +677,7 @@ extension AgentModeViewModel {
         let nextSequence = session.nextSequenceIndex
         let state = session.runState
         let originalSlot = preview.originalHandoff
-        let stale = Self.providerSwitchNeedsReview(session)
+        let stale = AgentSessionLinkExecutionRuntime.providerSwitchNeedsReview(session)
         let composition = preview.composition
         let wrapped = composeProviderSwitchPreviewDraft(composition, destination: preview.destination, session: session)
         let live: @MainActor () -> Bool = { [weak self] in
@@ -943,7 +943,7 @@ extension AgentModeViewModel {
                 transcript: session.transcript, items: session.items,
                 nextSequence: session.nextSequenceIndex, state: session.runState,
                 originalSlot: preview.originalHandoff,
-                stale: Self.providerSwitchNeedsReview(session), source: source,
+                stale: AgentSessionLinkExecutionRuntime.providerSwitchNeedsReview(session), source: source,
                 reference: preview.historyReference, budget: budget
             )
             let carrier: AgentProviderHandover.Carrier? = switch preview.selected ?? .history {

@@ -51,18 +51,8 @@ extension AgentModeViewModel {
         AgentSessionLinkExecutionRuntime.providerSwitchUnconfirmed(session)
     }
 
-    /// Accepted input after the saved cutoff invalidates the ready seed. The exact input currently
-    /// being started is excluded, never arbitrary equal text. Missing retained cutoff fails closed.
-    static func providerSwitchNeedsReview(_ session: TabSession, excluding inputID: UUID? = nil) -> Bool {
-        AgentSessionLinkExecutionRuntime.providerSwitchNeedsReview(session, excluding: inputID)
-    }
-
     func providerSwitchPreparationIsCurrent(_ preparation: ProviderSwitchSendPreparation, session: TabSession) -> Bool {
         linkExecutionRuntime.providerSwitchPreparationIsCurrent(preparation, session: session)
-    }
-
-    static func providerSwitchIsInFlightOnActiveRun(_ session: TabSession) -> Bool {
-        AgentSessionLinkExecutionRuntime.providerSwitchIsInFlightOnActiveRun(session)
     }
 
     /// Assembles the pure readiness snapshot from live target state.

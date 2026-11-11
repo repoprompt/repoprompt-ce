@@ -146,7 +146,7 @@ final class AgentComposerDraftRestorationTests: XCTestCase {
         // The old editor value is stored as the tab changes before it sees A.
         viewModel.storeDraftText(for: tabID, "D", acknowledgingThrough: 0)
         XCTAssertEqual(viewModel.retrieveDraftText(for: tabID), "A\nD")
-        let snapshot = viewModel.loadDraftSnapshotForComposer(for: tabID)
+        let snapshot = viewModel.draftRuntime.loadSnapshot(tabID: tabID)
         XCTAssertEqual(snapshot.text, "A\nD")
         XCTAssertTrue(viewModel.draftRestorationLedger.tabs[tabID]?.pendingFragments.isEmpty == true)
     }
@@ -156,7 +156,7 @@ final class AgentComposerDraftRestorationTests: XCTestCase {
         let tabID = UUID()
         viewModel.restoreComposerDraft(tabID: tabID, text: "A", message: "", strategy: .prependAlways)
         let oldOperation = try XCTUnwrap(viewModel.draftRestorationEvent?.operation)
-        let snapshot = viewModel.loadDraftSnapshotForComposer(for: tabID)
+        let snapshot = viewModel.draftRuntime.loadSnapshot(tabID: tabID)
         XCTAssertEqual(snapshot.text, "A")
         XCTAssertTrue(viewModel.draftRestorationLedger.tabs[tabID]?.pendingFragments.isEmpty == true)
 
@@ -300,7 +300,7 @@ final class AgentComposerDraftRestorationTests: XCTestCase {
         XCTAssertEqual(session.activeAgentSessionID, tab.activeAgentSessionID)
         XCTAssertEqual(session.draftText, "queued\ntyped without a runtime")
         XCTAssertNil(host.tabDraftText[tab.id], "Adoption consumes the fallback rather than leaving a stale copy")
-        let snapshot = host.loadDraftSnapshotForComposer(for: tab.id)
+        let snapshot = host.draftRuntime.loadSnapshot(tabID: tab.id)
         XCTAssertEqual(snapshot.restorationSequence, 1)
         host.storeDraftText(for: tab.id, "edited", acknowledgingThrough: snapshot.restorationSequence)
         XCTAssertEqual(host.retrieveDraftText(for: tab.id), "edited")

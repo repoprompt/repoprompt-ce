@@ -155,7 +155,7 @@ struct AgentInputBar: View {
             storeDraft: { tabID, text, sequence in
                 agentModeVM.storeDraftText(for: tabID, text, acknowledgingThrough: sequence)
             },
-            loadDraft: { tabID in agentModeVM.loadDraftSnapshotForComposer(for: tabID) },
+            loadDraft: { tabID in agentModeVM.draftRuntime.loadSnapshot(tabID: tabID) },
             claimSubmit: { attempt in agentModeVM.claimComposerSubmitForImmediatePresentation(attempt) },
             executeSubmit: { claim, text in
                 await agentModeVM.executePresentedComposerSubmitAttempt(text: text, claim: claim)

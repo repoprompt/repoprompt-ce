@@ -531,7 +531,7 @@ final class AgentTabSession: ObservableObject {
 
     func invalidatePeriodicIdleSpanIfLocallyBlocked() {
         guard oversight.periodicIdleSince != nil,
-              !AgentModeViewModel.agentSessionLinkPeriodicWakeSessionIsIdle(self) else { return }
+              !AgentSessionLinkExecutionRuntime.agentSessionLinkPeriodicWakeSessionIsIdle(self) else { return }
         oversight.invalidatePeriodicIdleSpan()
     }
 
@@ -2192,7 +2192,7 @@ final class AgentTabSession: ObservableObject {
         {
             if pendingHandoff.isStagedForSend, proof.binding == currentRestorationBindingToken,
                proof.stopFence.permitsStart(of: self),
-               !AgentModeViewModel.providerSwitchNeedsReview(self, excluding: proof.acceptedInputID),
+               !AgentSessionLinkExecutionRuntime.providerSwitchNeedsReview(self, excluding: proof.acceptedInputID),
                let associated = proof.associatingRun(ownership)
             {
                 // Association borrows existing value identities; it owns no runtime lifetime.

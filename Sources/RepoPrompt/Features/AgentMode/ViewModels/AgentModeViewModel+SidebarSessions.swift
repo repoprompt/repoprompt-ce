@@ -781,10 +781,6 @@ extension AgentModeViewModel {
         )
     }
 
-    func seedDefaultCollapsedSidebarThreads(_ eligibleKeys: [AgentSidebarThreadKey]) {
-        ui.sessionSidebar.seedDefaultCollapsedThreads(eligibleKeys: eligibleKeys)
-    }
-
     func filteredSidebarSessions(
         for tabs: [ComposeTabState],
         currentTabID: UUID?,
@@ -891,15 +887,6 @@ extension AgentModeViewModel {
             )
         #endif
         return result
-    }
-
-    func setSidebarTab(_ tab: AgentSidebarTab) {
-        ui.sessionSidebar.setSidebarTab(tab)
-    }
-
-    /// Folds or unfolds one overseer's group in the Overseers tab (its own key namespace).
-    func toggleSidebarOverseerGroup(_ overseerTabID: UUID) {
-        ui.sessionSidebar.toggleThreadCollapse(.overseerGroup(overseerTabID))
     }
 
     /// Live oversight pairs in this window, flattened to session IDs. O(links).

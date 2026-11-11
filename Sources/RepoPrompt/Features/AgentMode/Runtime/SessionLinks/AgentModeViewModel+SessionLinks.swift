@@ -1699,7 +1699,7 @@ extension AgentModeViewModel {
             backgroundCompactionSettling: session.isSettlingACPBackgroundCompaction,
             isCandidateClosing: candidate.isClosing,
             providerSwitchUnconfirmed: providerSwitchUnconfirmed(session),
-            providerHandoverNeedsReview: providerSwitchNeedsReview(session)
+            providerHandoverNeedsReview: AgentSessionLinkExecutionRuntime.providerSwitchNeedsReview(session)
         )
     }
 
