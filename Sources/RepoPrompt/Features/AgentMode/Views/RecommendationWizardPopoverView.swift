@@ -26,6 +26,25 @@ private func recommendationProviderStatusRow(_ name: String, status: ProviderSta
     }
 }
 
+@MainActor
+private func recommendationUpgradeHint(title: Text, hint: String) -> some View {
+    HStack(alignment: .top, spacing: 8) {
+        Image(systemName: "arrow.up.circle.fill")
+            .foregroundColor(.orange)
+        VStack(alignment: .leading, spacing: 4) {
+            title
+                .font(.caption.bold())
+            Text(hint)
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+    }
+    .padding(10)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(Color.orange.opacity(0.08))
+    .cornerRadius(8)
+}
+
 // MARK: - Recommendation Wizard Popover View
 
 /// Main popover container for the recommendation wizard.
@@ -780,28 +799,10 @@ private struct ChatModelStepView: View {
 
                 // Upgrade hint if not using the best option
                 if let hint = rec.upgradeHint {
-                    upgradeHintSection(hint)
+                    recommendationUpgradeHint(title: Text("Want better results?"), hint: hint)
                 }
             }
         }
-    }
-
-    private func upgradeHintSection(_ hint: String) -> some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "arrow.up.circle.fill")
-                .foregroundColor(.orange)
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Want better results?")
-                    .font(.caption.bold())
-                Text(hint)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-        }
-        .padding(10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.orange.opacity(0.08))
-        .cornerRadius(8)
     }
 
     private func backendCard(_ backend: ChatBackendKind, option: ChatBackendOption) -> some View {
@@ -915,21 +916,7 @@ private struct ContextBuilderStepView: View {
 
                     // Upgrade hint if not using the best option
                     if let hint = rec.upgradeHint {
-                        HStack(alignment: .top, spacing: 8) {
-                            Image(systemName: "arrow.up.circle.fill")
-                                .foregroundColor(.orange)
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("Want better results?")
-                                    .font(.caption.bold())
-                                Text(hint)
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                            }
-                        }
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color.orange.opacity(0.08))
-                        .cornerRadius(8)
+                        recommendationUpgradeHint(title: Text("Want better results?"), hint: hint)
                     }
                 }
                 .id("recommendationContent")
@@ -1004,21 +991,7 @@ private struct MCPAgentDefaultsStepView: View {
                 .id("recommendationContent")
 
                 if let hint = rec.upgradeHint {
-                    HStack(alignment: .top, spacing: 8) {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .foregroundColor(.orange)
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Want better defaults?")
-                                .font(.caption.bold())
-                            Text(hint)
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                    .padding(10)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.orange.opacity(0.08))
-                    .cornerRadius(8)
+                    recommendationUpgradeHint(title: Text("Want better defaults?"), hint: hint)
                 }
             }
         }
@@ -1265,13 +1238,7 @@ private struct SummaryStepView: View {
             Image(systemName: icon)
                 .foregroundColor(.blue)
                 .frame(width: 20)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.caption.bold())
-                Text(detail)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
+            summaryText(title: title, detail: detail)
             Spacer()
             Image(systemName: "checkmark")
                 .foregroundColor(.blue)
@@ -1328,13 +1295,7 @@ private struct SummaryStepView: View {
             Image(systemName: icon)
                 .foregroundColor(.orange)
                 .frame(width: 20)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.caption.bold())
-                Text(detail)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
+            summaryText(title: title, detail: detail)
             Spacer()
             Button(action: {
                 viewModel.unmute(kind)
@@ -1352,13 +1313,17 @@ private struct SummaryStepView: View {
             Image(systemName: icon)
                 .foregroundColor(.green)
                 .frame(width: 20)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.caption.bold())
-                Text(detail)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
+            summaryText(title: title, detail: detail)
+        }
+    }
+
+    private func summaryText(title: String, detail: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.caption.bold())
+            Text(detail)
+                .font(.caption)
+                .foregroundColor(.secondary)
         }
     }
 
@@ -1366,13 +1331,7 @@ private struct SummaryStepView: View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: "arrow.right.circle")
                 .foregroundColor(.accentColor)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.caption.bold())
-                Text(description)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
+            summaryText(title: title, detail: description)
         }
     }
 }
