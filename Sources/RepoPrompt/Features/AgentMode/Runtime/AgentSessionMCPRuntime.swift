@@ -204,12 +204,9 @@ final class AgentSessionMCPRuntime {
     @discardableResult
     func prepareWaitTrackingForRunStart(session: AgentTabSession, stopFence: AgentRunStartStopFence) async -> Bool {
         guard let context = session.mcpControlContext else { return true }
-        guard let scope, let sessionID = session.activeAgentSessionID,
-              case let .unique(writer) = scope.resolveWriter(sessionID: sessionID),
-              writer.scope === scope, writer.session === session,
-              case let .success(command) = writer.admitCommand(),
-              context.writerIdentity == writer.identity,
-              context.sessionID == sessionID, context.registration.sessionID == sessionID,
+        guard let scope, let command = try? scope.admit(session: session),
+              context.writerIdentity == command.identity,
+              context.sessionID == command.identity.sessionID, context.registration.sessionID == command.identity.sessionID,
               stopFence.permitsStart(of: session), !session.runState.isActive,
               let execution = scope.execution else { return false }
         if context.preparedEpoch != nil { return true }
@@ -229,7 +226,7 @@ final class AgentSessionMCPRuntime {
         // An accepted epoch may have been acknowledged for the originating object after
         // Stop or retirement. That acknowledgement is not permission to dispatch a turn.
         return command.isCurrent && stopFence.permitsStart(of: session)
-            && session.mcpControlContext?.writerIdentity == writer.identity
+            && session.mcpControlContext?.writerIdentity == command.identity
             && session.mcpControlContext?.activationID == context.activationID
             && session.mcpControlContext?.preparedEpoch != nil
     }
@@ -400,15 +397,13 @@ final class AgentSessionMCPRuntime {
         cancelInstalledRun: @escaping @MainActor (AgentTabSession) async -> Void,
         afterEpochBegan: (@MainActor () async -> Void)? = nil
     ) async {
-        guard let scope, let sessionID = session.activeAgentSessionID,
-              case let .unique(writer) = scope.resolveWriter(sessionID: sessionID),
-              writer.scope === scope, writer.session === session,
-              case let .success(command) = writer.admitCommand() else { return }
+        guard let scope, let command = try? scope.admit(session: session) else { return }
         defer { withExtendedLifetime(command) {} }
+        let writer = command.writer
         guard stopFence.permitsStart(of: session), !session.runState.isActive,
               let originalContext = session.mcpControlContext,
               originalContext.writerIdentity == writer.identity,
-              originalContext.sessionID == sessionID, originalContext.registration.sessionID == sessionID
+              originalContext.sessionID == command.identity.sessionID, originalContext.registration.sessionID == command.identity.sessionID
         else { return }
         if originalContext.preparedEpoch != nil {
             return

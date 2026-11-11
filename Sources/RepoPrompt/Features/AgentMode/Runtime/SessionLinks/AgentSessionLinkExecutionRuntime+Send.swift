@@ -31,12 +31,9 @@ extension AgentSessionLinkExecutionRuntime {
         }
         guard !Self.providerSwitchNeedsReview(session) else { return .failure(.providerHandoverNeedsReview) }
         guard !session.runState.isActive, session.activeRunOwnership == nil else { return .failure(.targetNotIdle) }
-        guard let sessionID = session.activeAgentSessionID,
-              case let .unique(writer) = owner.resolveWriter(sessionID: sessionID),
-              writer.scope === owner, writer.session === session,
-              case let .success(command) = writer.admitCommand() else { return .failure(.targetStopped) }
+        guard let command = try? owner.admit(session: session) else { return .failure(.targetStopped) }
         let resourceWorkspaceID = commands.workspaceID(session)
-        guard resourceWorkspaceID == nil || resourceWorkspaceID == writer.identity.workspaceID else { return .failure(.targetStopped) }
+        guard resourceWorkspaceID == nil || resourceWorkspaceID == command.identity.workspaceID else { return .failure(.targetStopped) }
         let handoff = session.pendingHandoff
         let binding = session.currentRestorationBindingToken
         let agent = session.selectedAgent
@@ -561,15 +558,12 @@ extension AgentSessionLinkExecutionRuntime {
             let reason = AgentSessionLinkDeliveryReadiness.restorationBlockReason(liveSession.qualifiedRestorationReadiness)
             return .blocked(AgentSessionLinkSendFailure(reason ?? .targetLoading))
         }
-        guard let sessionID = liveSession.activeAgentSessionID,
-              case let .unique(writer) = owner.resolveWriter(sessionID: sessionID, expectedWorkspaceID: workspaceID),
-              writer.scope === owner, writer.session === liveSession,
-              case let .success(command) = writer.admitCommand()
-        else {
+        guard let command = try? owner.admit(session: liveSession, expectedWorkspaceID: workspaceID) else {
             releaseComposerSubmitClaim(claim)
             return .blocked(.endpointSession)
         }
         defer { withExtendedLifetime(command) {} }
+        let writer = command.writer
         var switchPreparation = providerSwitchPreparation
         if liveSession.pendingHandoff.providerSwitchDelivery != nil, switchPreparation == nil {
             let input = liveSession.isCodexComputerUseArmed

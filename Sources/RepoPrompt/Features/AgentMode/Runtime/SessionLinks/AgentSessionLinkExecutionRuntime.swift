@@ -151,10 +151,7 @@ final class AgentSessionLinkExecutionRuntime {
 
     func makeComposerSubmitTarget(tabID: UUID?, session: AgentTabSession?) -> AgentComposerSubmitTarget? {
         guard let scope, let tabID, let session = session ?? scope.sessions[tabID],
-              session.tabID == tabID, let id = session.activeAgentSessionID,
-              case let .unique(writer) = scope.resolveWriter(sessionID: id),
-              writer.scope === scope, writer.session === session,
-              let command = try? writer.admitCommand().get() else { return nil }
+              session.tabID == tabID, let command = try? scope.admit(session: session) else { return nil }
         return scope.submissions.programmaticTarget(command)
     }
 
