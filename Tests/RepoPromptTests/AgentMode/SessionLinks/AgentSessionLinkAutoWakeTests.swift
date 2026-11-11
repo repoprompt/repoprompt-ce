@@ -116,9 +116,6 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             bindSession: { _ in XCTFail("Stop must not bind")
                 return nil
             },
-            commitCreation: { _ in XCTFail("Stop must not acknowledge creation")
-                return false
-            },
             providerSwitchRefusal: { _ in XCTFail("Stop must not switch providers")
                 return "Refused"
             },
