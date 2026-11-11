@@ -62,7 +62,7 @@ struct AutoEffortTurnFeedback: Equatable {
 enum AutoEffortModelPolicy {
     private static let codexModels: Set<String> = ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]
     private static let claudeModels: Set<String> = [
-        "claude-sonnet-5-5", "claude-opus-5", "claude-opus-5-5", "claude-fable-5-1", "claude-mythos-5-1"
+        "claude-sonnet-5-5", "claude-opus-5", "claude-opus-5-5", "claude-fable-5-2", "claude-fable-5-1", "claude-mythos-5-1"
     ]
 
     /// Custom workflow templates are user-authored and may contain private content. The
