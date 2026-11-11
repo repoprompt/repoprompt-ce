@@ -15,9 +15,11 @@ private struct OwnerResolver: ClaudeCodeLaunchEnvironmentResolving {
 
 private struct OwnerHost: ClaudeNativeSessionHosting {
     var routeWitness = false
+    var approvedToolName: String?
 
-    func repoPromptPermissionMatch(toolName _: String, requestPayload _: [String: Any]) -> ClaudeNativePermissionMatch? {
-        nil
+    func repoPromptPermissionMatch(toolName: String, requestPayload _: [String: Any]) -> ClaudeNativePermissionMatch? {
+        guard toolName == approvedToolName else { return nil }
+        return .init(source: "owner-fixture", normalizedToolName: toolName, serverIdentifier: nil)
     }
 
     func filterEnvironment(_ environment: [String: String], variant _: ClaudeCodeRuntimeVariant) async -> [String: String] {
@@ -131,6 +133,112 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
         await controller.shutdown()
     }
 
+    func testCancelledPermissionReceiptCannotAnswerReusedNativeID() async throws {
+        let controller = await controller()
+        let writes = OwnerWrittenLines()
+        await controller.test_installConfigurationTransport(write: { writes.append($0) })
+        addTeardownBlock { await controller.shutdown() }
+        try await feed(initFrame, to: controller)
+        let nativeID = "reused-permission"
+        let request: [String: Any] = [
+            "type": "control_request", "request_id": nativeID,
+            "request": ["subtype": "can_use_tool", "tool_name": "Bash", "input": ["command": "echo fixture"]]
+        ]
+        try await feed(request, to: controller)
+        let first = try await nextApproval(controller)
+        guard case let .claudeControl(firstID) = first.requestID else { return XCTFail("Expected Claude approval") }
+        try await feed(["type": "control_cancel_request", "request_id": nativeID], to: controller)
+        try await feed(request, to: controller)
+        let second = try await nextApproval(controller, expectedCancellations: [firstID])
+        guard case let .claudeControl(secondID) = second.requestID else { return XCTFail("Expected Claude approval") }
+        XCTAssertNotEqual(firstID, secondID, "Reused native IDs must get new response authority")
+        await controller.respondToPermissionRequest(id: firstID, decision: .accept)
+        XCTAssertEqual(writes.count, 0, "A late decision cannot answer the successor's wire request")
+        await controller.respondToPermissionRequest(id: secondID, decision: .accept)
+        XCTAssertEqual(writes.count, 1)
+        let frame = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(writes.line(at: 0))) as? [String: Any])
+        let response = try XCTUnwrap(frame["response"] as? [String: Any])
+        XCTAssertEqual(response["request_id"] as? String, nativeID, "Opaque app receipts must not leak into the wire protocol")
+        await controller.respondToPermissionRequest(id: secondID, decision: .cancel)
+        XCTAssertEqual(writes.count, 1)
+    }
+
+    func testPendingPermissionReplayPreservesReceiptButChangedPayloadRevokesIt() async throws {
+        let controller = await controller()
+        let writes = OwnerWrittenLines()
+        await controller.test_installConfigurationTransport(write: { writes.append($0) })
+        addTeardownBlock { await controller.shutdown() }
+        try await feed(initFrame, to: controller)
+        func request(_ command: String) -> [String: Any] {
+            [
+                "type": "control_request",
+                "request_id": "same-native-id",
+                "request": ["subtype": "can_use_tool", "tool_name": "Bash", "input": ["command": command]]
+            ]
+        }
+        try await feed(request("echo original"), to: controller)
+        let first = try await nextApproval(controller)
+        guard case let .claudeControl(firstID) = first.requestID else { return XCTFail("Expected Claude approval") }
+        try await feed(request("echo original"), to: controller)
+        let replay = try await nextApproval(controller)
+        XCTAssertEqual(replay.requestID, first.requestID)
+        XCTAssertEqual(replay.id, first.id, "Pending protocol redelivery must not manufacture a new prompt")
+        try await feed(request("echo changed"), to: controller)
+        let changed = try await nextApproval(controller, expectedCancellations: [firstID])
+        guard case let .claudeControl(changedID) = changed.requestID else { return XCTFail("Expected Claude approval") }
+        XCTAssertNotEqual(changedID, firstID)
+        XCTAssertNotEqual(changed.id, first.id)
+        XCTAssertEqual(changed.command, "echo changed")
+        await controller.respondToPermissionRequest(id: firstID, decision: .accept)
+        XCTAssertEqual(writes.count, 0, "The old prompt cannot authorize changed content")
+        await controller.respondToPermissionRequest(id: changedID, decision: .accept)
+        XCTAssertEqual(writes.count, 1)
+        let frame = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(writes.line(at: 0))) as? [String: Any])
+        let envelope = try XCTUnwrap(frame["response"] as? [String: Any])
+        XCTAssertEqual(envelope["request_id"] as? String, "same-native-id")
+        let response = try XCTUnwrap(envelope["response"] as? [String: Any])
+        XCTAssertEqual((response["updatedInput"] as? [String: Any])?["command"] as? String, "echo changed")
+        try await feed(request("echo changed"), to: controller)
+        let afterSettlement = try await nextApproval(controller)
+        XCTAssertNotEqual(afterSettlement.requestID, changed.requestID, "Settled receipts cannot authorize a later identical request")
+        await controller.respondToPermissionRequest(id: changedID, decision: .accept)
+        XCTAssertEqual(writes.count, 1)
+    }
+
+    func testAutoApprovedReplacementRevokesEarlierPromptReceipt() async throws {
+        let controller = ClaudeNativeProcessSessionController(
+            host: OwnerHost(approvedToolName: "approved-fixture-tool"), runID: UUID(), tabID: UUID(), windowID: 1,
+            workspacePath: nil, config: ownerConfig(), environmentResolver: OwnerResolver()
+        )
+        let writes = OwnerWrittenLines()
+        await controller.test_installConfigurationTransport(write: { writes.append($0) })
+        addTeardownBlock { await controller.shutdown() }
+        try await feed(initFrame, to: controller)
+        try await feed([
+            "type": "control_request", "request_id": "changing-policy-request",
+            "request": ["subtype": "can_use_tool", "tool_name": "Bash", "input": ["command": "echo original"]]
+        ], to: controller)
+        let original = try await nextApproval(controller)
+        guard case let .claudeControl(receipt) = original.requestID else { return XCTFail("Expected Claude approval") }
+        try await feed([
+            "type": "control_request", "request_id": "changing-policy-request",
+            "request": ["subtype": "can_use_tool", "tool_name": "approved-fixture-tool", "input": [:]]
+        ], to: controller)
+        XCTAssertEqual(writes.count, 1)
+        await controller.respondToPermissionRequest(id: receipt, decision: .accept)
+        XCTAssertEqual(writes.count, 1, "Automatic approval must also revoke the previous prompt")
+        let events = await finish(controller)
+        XCTAssertEqual(events.compactMap { event -> String? in
+            if case let .approvalCancelled(id) = event { return id }
+            return nil
+        }, [receipt])
+        XCTAssertEqual(writes.count, 1, "Retirement must not deny an automatically settled replacement")
+        let frame = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(writes.line(at: 0))) as? [String: Any])
+        let envelope = try XCTUnwrap(frame["response"] as? [String: Any])
+        XCTAssertEqual(envelope["request_id"] as? String, "changing-policy-request")
+        XCTAssertEqual((envelope["response"] as? [String: Any])?["behavior"] as? String, "allow")
+    }
+
     func testShutdownDeniesUnconsumedPermissionsExactlyOnce() async throws {
         let controller = await controller()
         let writes = OwnerWrittenLines()
@@ -142,18 +250,22 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
                 "request": ["subtype": "can_use_tool", "tool_name": "Bash", "input": ["command": "echo fixture"]]
             ], to: controller)
         }
-        await controller.respondToPermissionRequest(id: "resolved", decision: .accept)
+        let resolved = try await nextApproval(controller)
+        guard case let .claudeControl(resolvedID) = resolved.requestID else { return XCTFail("Expected Claude approval") }
+        await controller.respondToPermissionRequest(id: resolvedID, decision: .accept)
         XCTAssertEqual(writes.count, 1)
 
-        // No listener has consumed the approval events: controller retirement must not
+        // No listener has consumed the remaining approval events: controller retirement must not
         // depend on an app-side snapshot of requests that made it through the stream.
         let events = await finish(controller)
-        let approvals = events.compactMap { event -> String? in
+        let approvals = [resolvedID] + events.compactMap { event -> String? in
             guard case let .approvalRequest(request) = event,
                   case let .claudeControl(id) = request.requestID else { return nil }
             return id
         }
-        XCTAssertEqual(approvals, ["resolved", "pending-a", "pending-b"])
+        XCTAssertEqual(approvals.count, 3)
+        XCTAssertEqual(Set(approvals).count, 3)
+        XCTAssertTrue(approvals.allSatisfy { UUID(uuidString: $0) != nil })
         XCTAssertEqual(writes.count, 3)
         var decisions: [String: String] = [:]
         for index in 0 ..< writes.count {
@@ -167,7 +279,7 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
         }
         XCTAssertEqual(decisions, ["resolved": "allow", "pending-a": "deny", "pending-b": "deny"])
         await controller.shutdown()
-        await controller.respondToPermissionRequest(id: "pending-a", decision: .accept)
+        try await controller.respondToPermissionRequest(id: XCTUnwrap(approvals.dropFirst().first), decision: .accept)
         XCTAssertEqual(writes.count, 3, "Retirement and late decisions cannot write duplicate responses")
     }
 
@@ -191,7 +303,12 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
         }), 2)
         XCTAssertEqual(writes.count, 2, "Every pending denial is attempted even if the pipe is already closed")
         await controller.shutdown()
-        await controller.respondToPermissionRequest(id: "pending-a", decision: .accept)
+        let lateReceipt = try XCTUnwrap(events.compactMap { event -> String? in
+            guard case let .approvalRequest(request) = event,
+                  case let .claudeControl(id) = request.requestID else { return nil }
+            return id
+        }.first)
+        await controller.respondToPermissionRequest(id: lateReceipt, decision: .accept)
         XCTAssertEqual(writes.count, 2)
     }
 
@@ -240,8 +357,10 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
             "type": "control_request", "request_id": "retired",
             "request": ["subtype": "can_use_tool", "tool_name": "Bash", "input": ["command": "echo fixture"]]
         ], to: controller)
+        let pending = try await nextApproval(controller)
+        guard case let .claudeControl(receipt) = pending.requestID else { return XCTFail("Expected Claude approval") }
         await controller.test_handleStdoutEOF()
-        await controller.respondToPermissionRequest(id: "retired", decision: .accept)
+        await controller.respondToPermissionRequest(id: receipt, decision: .accept)
         await controller.shutdown()
         XCTAssertEqual(writes.count, 0, "An EOF-retired request cannot authorize work or leak into a later process")
     }
@@ -261,6 +380,29 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
         "type": "system", "subtype": "init", "claude_code_version": "2.1.292",
         "capabilities": ["msg_lifecycle_v1"]
     ]
+
+    private func nextApproval(
+        _ controller: ClaudeNativeProcessSessionController, expectedCancellations: [String] = []
+    ) async throws -> AgentApprovalRequest {
+        let received = expectation(description: "Native approval event received")
+        let reader = Task { () -> (request: AgentApprovalRequest, cancellations: [String])? in
+            var cancellations: [String] = []
+            for await event in await controller.events {
+                if case let .approvalCancelled(id) = event { cancellations.append(id) }
+                if case let .approvalRequest(request) = event {
+                    received.fulfill()
+                    return (request, cancellations)
+                }
+            }
+            return nil
+        }
+        await fulfillment(of: [received], timeout: 3)
+        reader.cancel()
+        let receivedValue = await reader.value
+        let value = try XCTUnwrap(receivedValue)
+        XCTAssertEqual(value.cancellations, expectedCancellations)
+        return value.request
+    }
 
     private func feed(_ payload: [String: Any], to controller: ClaudeNativeProcessSessionController) async throws {
         let data = try JSONSerialization.data(withJSONObject: payload)
@@ -707,8 +849,9 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
                 return false
             }, 1)
             XCTAssertEqual(events.count { event in
-                if case let .approvalRequest(request) = event { return request.requestID == .claudeControl("provider-approval") }
-                return false
+                guard case let .approvalRequest(request) = event,
+                      case let .claudeControl(receipt) = request.requestID else { return false }
+                return UUID(uuidString: receipt) != nil && request.itemID == "provider-approval"
             }, 1)
         }
     }
