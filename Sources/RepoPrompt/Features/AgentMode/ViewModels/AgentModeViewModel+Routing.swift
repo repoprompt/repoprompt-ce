@@ -140,7 +140,9 @@ extension AgentModeViewModel {
               modelRouterRuntime?.isBackendReady(backendID) == true
         else { return }
         guard (try? AgentTaskRoutingCandidateBuilder().build(
-            allowedProviders: providers(for: .primarySession, configuration: configuration),
+            allowedProviders: AgentTaskRoutingCandidateBuilder.providers(
+                for: .primarySession, configuration: configuration, availability: modelRouterAvailabilityContext, surface: .general
+            ),
             availability: modelRouterAvailabilityContext
         )) != nil else { return }
         modelRouterSettingsStore.setModelRouterEnabled(true)
@@ -196,7 +198,9 @@ extension AgentModeViewModel {
             )
         }
 
-        let providers = providers(for: .primarySession, configuration: configuration)
+        let providers = AgentTaskRoutingCandidateBuilder.providers(
+            for: .primarySession, configuration: configuration, availability: modelRouterAvailabilityContext, surface: .general
+        )
         let reusable = reusableRepromptRouting(precomputedRouting, approved: repromptedText, configuration: configuration, backendID: backendID, runtime: runtime)
         let routeTask = reusable?.routingTask ?? Task {
             await routeModelThenEffort(
@@ -571,7 +575,9 @@ extension AgentModeViewModel {
             text: task,
             scope: .subagent,
             surface: surface,
-            providers: providers(for: .subagent, configuration: configuration),
+            providers: AgentTaskRoutingCandidateBuilder.providers(
+                for: .subagent, configuration: configuration, availability: modelRouterAvailabilityContext, surface: .headless
+            ),
             configuration: configuration,
             backendID: backendID,
             runtime: runtime,
@@ -758,15 +764,6 @@ extension AgentModeViewModel {
             && current.selectedBackendID == backendID
     }
 
-    func providers(for scope: AgentTaskRoutingScope, configuration: AgentTaskRouterConfiguration) -> Set<AgentProviderKind> {
-        AgentTaskRoutingCandidateBuilder.providers(
-            for: scope,
-            configuration: configuration,
-            availability: modelRouterAvailabilityContext,
-            surface: scope == .subagent ? .headless : .general
-        )
-    }
-
     func agentModelRoleDefaultReferences() -> [AgentTaskRoutingCandidateBuilder.RoleDefaultReference] {
         MCPAgentRoleDefaultsService.resolutions(
             availability: modelRouterAvailabilityContext,
@@ -814,7 +811,9 @@ extension AgentModeViewModel {
               modelRouterRuntime?.isBackendReady(backendID) == true
         else { return false }
         return AgentTaskRoutingCandidateBuilder().hasAvailableTarget(
-            allowedProviders: providers(for: .primarySession, configuration: configuration),
+            allowedProviders: AgentTaskRoutingCandidateBuilder.providers(
+                for: .primarySession, configuration: configuration, availability: modelRouterAvailabilityContext, surface: .general
+            ),
             availability: modelRouterAvailabilityContext
         )
     }

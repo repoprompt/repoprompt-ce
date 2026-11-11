@@ -1453,18 +1453,6 @@ extension AgentModeViewModel {
         ui.sessionSidebar.toggleGroupCollapsed(group)
     }
 
-    func adjacentParentSidebarSessionTabID(
-        from activeTabID: UUID?,
-        forward: Bool,
-        in tabs: [ComposeTabState]
-    ) -> UUID? {
-        Self.adjacentParentSidebarSessionTabID(
-            from: activeTabID,
-            forward: forward,
-            rows: sidebarSessions(for: tabs)
-        )
-    }
-
     static func adjacentParentSidebarSessionTabID(
         from activeTabID: UUID?,
         forward: Bool,

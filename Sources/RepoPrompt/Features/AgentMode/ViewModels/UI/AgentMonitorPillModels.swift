@@ -1401,24 +1401,7 @@ struct AgentMonitorPillProps: Equatable {
     /// deliberately refreshed on different schedules.
     func withCanAddReason(_ reason: String?) -> AgentMonitorPillProps {
         guard reason != canAddReason else { return self }
-        return AgentMonitorPillProps(
-            sessionID: sessionID,
-            endpoint: endpoint,
-            outbound: outbound,
-            inbound: inbound,
-            recentNotices: recentNotices,
-            canAddReason: reason,
-            autoWakeOnUpdatesEnabled: autoWakeOnUpdatesEnabled,
-            autoWakeTargetSessionIDs: autoWakeTargetSessionIDs,
-            autoWakeUnavailableReason: autoWakeUnavailableReason,
-            routineWakeIntervalEnabled: routineWakeIntervalEnabled,
-            routineWakeIntervalSeconds: routineWakeIntervalSeconds,
-            periodicIdleWakeEnabled: periodicIdleWakeEnabled,
-            periodicIdleWakeIntervalSeconds: periodicIdleWakeIntervalSeconds,
-            pendingUpdates: pendingUpdates,
-            overseerBootstrapState: overseerBootstrapState,
-            persistence: persistence
-        )
+        return copying(canAddReason: reason, persistence: persistence)
     }
 
     /// Overlays the process-wide persistence level onto an authoritative or synthesized projection.
@@ -1432,7 +1415,14 @@ struct AgentMonitorPillProps: Equatable {
     ) -> AgentMonitorPillProps {
         let reason = presentation.addBlockerMessage ?? eligibilityReason
         guard reason != canAddReason || presentation != persistence else { return self }
-        return AgentMonitorPillProps(
+        return copying(canAddReason: reason, persistence: presentation)
+    }
+
+    private func copying(
+        canAddReason reason: String?,
+        persistence presentation: AgentSessionOversightPersistencePresentation
+    ) -> AgentMonitorPillProps {
+        AgentMonitorPillProps(
             sessionID: sessionID,
             endpoint: endpoint,
             outbound: outbound,
