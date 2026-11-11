@@ -6,6 +6,78 @@ import RepoPromptInstrumentation
 import RepoPromptWorkspaceCore
 import XCTest
 
+@MainActor
+final class WorkspaceRootRetentionTests: XCTestCase {
+    func testUnloadDefersOnlyRetainedRootsUntilTheLastExactRelease() async throws {
+        let (store, first) = try await fixture()
+        let secondPath = try directory()
+        let second = try await store.loadRoot(path: secondPath.path)
+        let a = try await store.retainRoots(ids: [first, first])
+        let b = try await store.retainRoots(ids: [first])
+        await store.unloadRoots(ids: [first, second.id])
+        let retained = await store.rootRefs()
+        XCTAssertEqual(retained.map(\.id), [first])
+        await store.releaseRootRetention(a)
+        await store.releaseRootRetention(a)
+        let stillRetained = await store.isRootRetentionCurrent(b)
+        XCTAssertTrue(stillRetained)
+        await store.releaseRootRetention(b)
+        let final = await store.rootRefs()
+        XCTAssertTrue(final.isEmpty)
+    }
+
+    func testNewLoadCancelsTheOlderDeferredUnloadIntent() async throws {
+        let (store, rootID) = try await fixture()
+        let roots = await store.rootRefs()
+        let path = try XCTUnwrap(roots.first?.fullPath)
+        let lease = try await store.retainRoots(ids: [rootID])
+        await store.unloadRoot(id: rootID)
+        let loaded = try await store.loadRoot(path: path)
+        XCTAssertEqual(loaded.id, rootID)
+        await store.releaseRootRetention(lease)
+        let after = await store.rootRefs()
+        XCTAssertEqual(after.map(\.id), [rootID])
+    }
+
+    func testFailedAcquisitionDoesNotPartiallyPinLoadedRoots() async throws {
+        let (store, rootID) = try await fixture()
+        do {
+            _ = try await store.retainRoots(ids: [rootID, UUID()])
+            XCTFail("Unknown root must refuse the whole acquisition")
+        } catch {}
+        await store.unloadRoot(id: rootID)
+        let final = await store.rootRefs()
+        XCTAssertTrue(final.isEmpty)
+    }
+
+    func testStaleLifetimeReleaseCannotUnloadReplacement() async throws {
+        let (store, rootID) = try await fixture()
+        let lease = try await store.retainRoots(ids: [rootID])
+        await store.unloadRoot(id: rootID)
+        try await store.replaceRootLifetimeForTesting(rootID: rootID)
+        let stale = await store.isRootRetentionCurrent(lease)
+        XCTAssertFalse(stale)
+        await store.releaseRootRetention(lease)
+        let after = await store.rootRefs()
+        XCTAssertEqual(after.map(\.id), [rootID])
+    }
+
+    private func fixture() async throws -> (WorkspaceFileContextStore, UUID) {
+        let path = try directory()
+        let store = WorkspaceFileContextStore(codemapGraphIndexBuildLaunchPolicyForTesting: .disabled)
+        let root = try await store.loadRoot(path: path.path)
+        addTeardownBlock { await store.unloadRoot(id: root.id) }
+        return (store, root.id)
+    }
+
+    private func directory() throws -> URL {
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent("root-lease-\(UUID())")
+        try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: path) }
+        return path
+    }
+}
+
 final class WorkspaceContextCompositionTests: XCTestCase {
     func testAppHostsPreserveProcessWideHelperIdentities() {
         let first = WorkspaceFileContextHost.app()

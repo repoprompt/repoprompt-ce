@@ -6,8 +6,8 @@ enum BundledRoutingProfiles {
     static let data = Data((#"""
     {
       "schemaVersion": 1,
-      "profileVersion": "rpce.bundled-routing-profiles.2026-10-26.1",
-      "evidenceVersion": "rpce.model-routing-evidence.2026-10-26.1",
+      "profileVersion": "rpce.bundled-routing-profiles.2026-11-10.1",
+      "evidenceVersion": "rpce.model-routing-evidence.2026-11-10.1",
       "rubricVersion": "rpce.capability-first-frontier.v3-evidence-2026-10-26.1",
       "issuedAt": "2026-09-23T00:00:00Z",
       "expiresAt": "2027-09-23T00:00:00Z",
@@ -331,11 +331,26 @@ enum BundledRoutingProfiles {
           "providerID": "claudeCode",
           "id": "fable",
           "aliases": [
-            "claude-fable-5-1"
+            "claude-fable-5-2"
           ],
           "familyID": "fable",
           "utilityTier": "claude-fable",
-          "summary": "Claude Fable 5.1 is Anthropic's most capable generally available tier for ambitious, long-running, cross-codebase work.",
+          "summary": "Claude Fable 5.2 is Anthropic's most capable generally available tier for demanding reasoning and long-horizon agentic work, with 1M context.",
+          "rubric": null,
+          "price": {
+            "text": "API list price: $8 input / $40 output per 1M tokens.",
+            "checkedAt": "2026-11-10T00:00:00Z",
+            "expiresAt": "2026-12-31T00:00:00Z"
+          },
+          "evidenceIDs": []
+        },
+        {
+          "providerID": "claudeCode",
+          "id": "claude-fable-5-1",
+          "aliases": [],
+          "familyID": "fable",
+          "utilityTier": "claude-fable",
+          "summary": "Claude Fable 5.1 is an older premium tier for ambitious, long-running, cross-codebase work.",
           "rubric": null,
           "price": {
             "text": "API list price: $10 input / $50 output per 1M tokens.",

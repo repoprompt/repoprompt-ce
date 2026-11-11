@@ -4070,6 +4070,9 @@ extension MCPServerViewModel {
         signalRouting: Bool = true
     ) -> Bool {
         switch runRouteBindings.register(connectionID: connectionID, runID: runID, windowID: windowID) {
+        case .refusedOwnerUnavailable:
+            tabContextLog("registerRunIDMapping refused: route owner unavailable")
+            return false
         case let .refusedBoundRun(boundRun):
             tabContextLog("registerRunIDMapping refused: connectionID=\(connectionID) already bound to runID=\(boundRun), new=\(runID)")
             return false

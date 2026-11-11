@@ -9,6 +9,221 @@ import RepoPromptSettingsCore
 import XCTest
 
 @MainActor
+final class MCPHostRouteResourceTests: XCTestCase {
+    func testHostIdentityDoesNotBecomeTheLatestPresentationWindow() {
+        let window = MCPRouteIdentityAllocator.allocateWindowID()
+        let first = MCPRouteIdentityAllocator.allocateHost()
+        let second = MCPRouteIdentityAllocator.allocateHost()
+        XCTAssertEqual(WindowState.latestWindowID(), window)
+        XCTAssertNotEqual(first.id, second.id)
+        XCTAssertLessThan(window, first.routeID)
+        XCTAssertLessThan(first.routeID, second.routeID)
+        XCTAssertGreaterThan(MCPRouteIdentityAllocator.allocateWindowID(), second.routeID)
+    }
+
+    func testWithdrawalRefusesNewMappingsButDoesNotCancelTrackedTools() async throws {
+        let owner = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil)
+        let run = UUID(), connection = UUID(), execution = UUID()
+        let pending = try XCTUnwrap(owner.runRouteBindings.beginPendingPolicy(connectionID: connection, runID: run, windowID: owner.identity.routeID))
+        var cancellations = 0
+        owner.toolExecutionRuntime.registerToolExecution(executionID: execution, runID: run, connectionID: connection, toolName: "read_file") { cancellations += 1 }
+        owner.closeDomainAdmission()
+        XCTAssertTrue(owner.runRouteBindings.isCurrent(pending), "Legacy domain close must not withdraw the run's mapping owner before drain")
+        await owner.close()
+        XCTAssertFalse(owner.runRouteBindings.hasCurrentMapping(runID: run, connectionID: connection))
+        XCTAssertEqual(owner.runRouteBindings.register(connectionID: UUID(), runID: run, windowID: owner.identity.routeID), .refusedOwnerUnavailable)
+        XCTAssertNil(owner.runRouteBindings.beginPendingPolicy(connectionID: UUID(), runID: run, windowID: owner.identity.routeID))
+        XCTAssertEqual(cancellations, 0)
+        XCTAssertTrue(owner.toolExecutionRuntime.containsExecution(execution))
+        XCTAssertTrue(owner.runRouteBindings.rollback(pending, removingContext: {}))
+        owner.toolExecutionRuntime.unregisterToolExecution(executionID: execution)
+        try await owner.toolExecutionRuntime.awaitNoActiveToolExecutions(runID: run)
+        XCTAssertEqual(owner.toolExecutionRuntime.activeExecutionCount, 0)
+    }
+
+    func testWindowFreeDomainRouteKeepsItsOriginalConnectionGenerationOnClose() async throws {
+        let runtime = try await makeRuntime()
+        let windowCount = WindowState.windowCounter
+        let owner = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: runtime.routingCoordinator, runtime: runtime)
+        owner.scheduleRegistration(workspaceID: nil, contextID: nil, revision: 0)
+        let descriptor = await owner.ensureRegistered(workspaceID: nil, contextID: nil, revision: 0)
+        XCTAssertEqual(descriptor?.windowID, owner.identity.routeID)
+        XCTAssertEqual(WindowState.windowCounter, windowCount)
+        let connectionID = UUID()
+        let original = await runtime.routingCoordinator.registerConnection(connectionID: connectionID, operationID: UUID())
+        let receipt = try XCTUnwrap(original.snapshot.connections.first { $0.registration.connectionID == connectionID }?.registration)
+        owner.retainConnection(receipt)
+        _ = await runtime.routingCoordinator.unregisterConnection(receipt, operationID: UUID())
+        let replacement = await runtime.routingCoordinator.registerConnection(connectionID: connectionID, operationID: UUID())
+        let successor = try XCTUnwrap(replacement.snapshot.connections.first { $0.registration.connectionID == connectionID }?.registration)
+        XCTAssertNotEqual(successor, receipt)
+        await owner.closeDomainRoute()
+        await owner.closeDomainRoute()
+        let final = await runtime.routingCoordinator.snapshot()
+        XCTAssertFalse(final.windows.contains { $0.windowID == owner.identity.routeID })
+        XCTAssertTrue(final.connections.contains { $0.registration == successor }, "Old owner must never retract a replacement registration")
+        let refused = await owner.ensureRegistered(workspaceID: nil, contextID: nil, revision: 0)
+        XCTAssertNil(refused)
+    }
+
+    func testDisconnectThroughAnotherOwnerReleasesTheCanonicalConnection() async throws {
+        let runtime = try await makeRuntime()
+        let first = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: runtime.routingCoordinator, runtime: runtime)
+        let second = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: runtime.routingCoordinator, runtime: runtime)
+        let connectionID = UUID()
+        let registered = await runtime.routingCoordinator.registerConnection(connectionID: connectionID, operationID: UUID())
+        let receipt = try XCTUnwrap(registered.snapshot.connections.first { $0.registration.connectionID == connectionID }?.registration)
+        first.retainConnection(receipt)
+        await second.releaseDisconnectedConnection(connectionID)
+        let disconnected = await runtime.routingCoordinator.snapshot()
+        XCTAssertFalse(disconnected.connections.contains { $0.registration.connectionID == connectionID })
+        let replacement = await runtime.routingCoordinator.registerConnection(connectionID: connectionID, operationID: UUID())
+        let successor = try XCTUnwrap(replacement.snapshot.connections.first { $0.registration.connectionID == connectionID }?.registration)
+        await first.close()
+        let final = await runtime.routingCoordinator.snapshot()
+        XCTAssertTrue(final.connections.contains { $0.registration == successor }, "The old receipt retained by another owner cannot retract its successor")
+        await second.close()
+    }
+
+    func testWindowFreeCatalogFailureAndCloseUseExactRegistrationReceipts() async throws {
+        let runtime = try await makeRuntime()
+        do {
+            let before = WindowState.windowCounter
+            let owner = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: runtime.routingCoordinator, runtime: runtime)
+            let routeID = owner.identity.routeID
+            let executions = owner.toolExecutionRuntime
+            let executionID = UUID()
+            let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: "read_file"))
+            let binding = MCPDomainToolBinding(definition: definition) { _ in
+                await .bool(executions.containsExecution(executionID))
+            }
+            let binder = MCPAppToolBinder(windowID: routeID) { name, _, arguments, implementation in
+                await executions.registerToolExecution(executionID: executionID, runID: nil, connectionID: nil, toolName: name, cancel: {})
+                do {
+                    let result = try await implementation(.init(toolName: name, windowID: routeID, context: .trustedLocal(toolName: name, metadata: .init(connectionID: nil, clientName: nil, windowID: routeID))), arguments)
+                    await executions.unregisterToolExecution(executionID: executionID)
+                    return result
+                } catch {
+                    await executions.unregisterToolExecution(executionID: executionID)
+                    throw error
+                }
+            }
+            func catalog(required: Set<String>) -> MCPAppToolCatalogRegistration {
+                MCPAppToolCatalogRegistration(
+                    windowID: routeID, providers: [], sharedBindings: [binding],
+                    runtime: binder, requiredToolNames: required
+                )
+            }
+            do {
+                _ = try await owner.registerCatalog(catalog(required: ["file_search"]))
+                XCTFail("A partial catalog cannot be reported registered")
+            } catch let MCPAppToolCatalogMaterializationError.missingCanonicalTools(names) {
+                XCTAssertEqual(names, ["file_search"])
+            }
+            XCTAssertNil(owner.catalogHandle)
+            let complete = catalog(required: ["read_file"])
+            let handle = try await owner.registerCatalog(complete)
+            let active = await owner.hasActiveCatalog()
+            XCTAssertTrue(active)
+            XCTAssertEqual(owner.catalogHandle, handle)
+            let unrelated = await AppDomainRuntimeComposition.shared.isActive(handle)
+            XCTAssertFalse(unrelated, "Explicit host runtime must not register in the process fallback")
+            complete.invalidateToolsCache()
+            let refreshed = try await owner.registerCatalog(complete)
+            XCTAssertEqual(refreshed, handle, "Refreshing the stable legacy catalog keeps its exact handle")
+            let resolved = await runtime.toolRegistry.resolve(toolName: "read_file", scope: .window(id: routeID))
+            let tool = try XCTUnwrap(resolved)
+            let result = try await tool.binding([:])
+            XCTAssertEqual(result, .bool(true), "The real catalog/binder dispatch uses the host-owned execution tracker without a window")
+            XCTAssertEqual(executions.activeExecutionCount, 0)
+            XCTAssertEqual(WindowState.windowCounter, before)
+            await owner.close()
+            let retired = await owner.hasActiveCatalog()
+            XCTAssertFalse(retired)
+            XCTAssertNil(owner.catalogHandle)
+            do {
+                _ = try await owner.registerCatalog(complete)
+                XCTFail("Retired route must not reopen its catalog")
+            } catch MCPHostRouteResources.RegistrationFailure.closing {} catch { XCTFail("Unexpected refusal: \(error)") }
+        }
+    }
+
+    func testSettingsLeaseUsesExactOwnerWithoutWindowElectionAndReleasesOnce() throws {
+        let count = WindowState.windowCounter
+        let keys = KeyManager()
+        let settings = APISettingsViewModel(aiQueriesService: AIQueriesService(keyManager: keys), keyManager: keys, loadStoredDataOnInit: false)
+        let first = try XCTUnwrap(APISettingsRuntimeLease.acquire(from: settings))
+        let second = try XCTUnwrap(APISettingsRuntimeLease.acquire(from: settings))
+        XCTAssertTrue(first.settings === settings)
+        XCTAssertTrue(second.settings === settings)
+        XCTAssertEqual(WindowState.windowCounter, count)
+        settings.prepareForWindowClose()
+        XCTAssertTrue(settings.canAcquireManagedRuntimeLease)
+        first.release()
+        first.release()
+        XCTAssertEqual(settings.managedRuntimeLeaseCount, 1)
+        second.release()
+        XCTAssertEqual(settings.managedRuntimeLeaseCount, 0)
+        XCTAssertFalse(settings.canAcquireManagedRuntimeLease)
+        XCTAssertNil(APISettingsRuntimeLease.acquire(from: settings))
+    }
+
+    func testCanonicalContextLeaseDefersOnlyItsRootsAndRevalidatesTheAuthority() async throws {
+        let runtime = try await makeRuntime()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("host-root-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let files = WorkspaceFileContextStore(codemapGraphIndexBuildLaunchPolicyForTesting: .disabled)
+        let root = try await files.loadRoot(path: directory.path)
+        addTeardownBlock { await files.unloadRoot(id: root.id) }
+        var workspace = WorkspaceModel(name: "Host context", repoPaths: [directory.path])
+        let tab = ComposeTabState()
+        workspace.composeTabs = [tab]
+        let documentURL = directory.appendingPathComponent("workspace.json")
+        let document = try DomainWorkspaceDocument.decode(documentBytes: JSONEncoder().encode(workspace), fileURL: documentURL)
+        _ = await runtime.workspaceStore.registerReadDocument(document)
+        let resources = AgentHostWorkspaceResources(files: files, contexts: runtime.contextStore)
+        let before = WindowState.windowCounter
+        do {
+            _ = try await resources.acquire(context: .init(workspaceID: workspace.id, contextID: tab.id), rootIDs: [])
+            XCTFail("An incomplete root set must not claim a workspace lease")
+        } catch AgentHostWorkspaceResources.Failure.rootsChanged {} catch { XCTFail("Unexpected refusal: \(error)") }
+        let lease = try await resources.acquire(context: .init(workspaceID: workspace.id, contextID: tab.id), rootIDs: [root.id])
+        let current = await lease.isCurrent()
+        XCTAssertTrue(current)
+        XCTAssertEqual(WindowState.windowCounter, before)
+        await files.unloadRoot(id: root.id)
+        let retained = await files.rootRefs()
+        XCTAssertTrue(retained.contains { $0.id == root.id })
+        workspace.name = "Changed canonical context"
+        let replacement = try DomainWorkspaceDocument.decode(documentBytes: JSONEncoder().encode(workspace), fileURL: documentURL)
+        _ = await runtime.workspaceStore.registerReadDocument(replacement)
+        let stale = await lease.isCurrent()
+        XCTAssertFalse(stale)
+        await lease.release()
+        await lease.release()
+        let released = await files.rootRefs()
+        XCTAssertFalse(released.contains { $0.id == root.id })
+    }
+
+    private func makeRuntime() async throws -> MCPDomainRuntime {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("host-runtime-\(UUID())")
+        let runtime = MCPDomainRuntime(configuration: .init(
+            mode: .app, profileIdentifier: "host-\(UUID())", storageDirectory: directory,
+            workspaceStorageDirectory: directory.appendingPathComponent("workspaces"),
+            eventDirectory: directory.appendingPathComponent("events"), temporaryDirectory: directory.appendingPathComponent("tmp"),
+            externalReloadInterval: nil
+        ))
+        try await runtime.start()
+        addTeardownBlock {
+            _ = await runtime.shutdown()
+            try? FileManager.default.removeItem(at: directory)
+        }
+        return runtime
+    }
+}
+
+@MainActor
 final class MCPRunRouteBindingsTests: XCTestCase {
     func testStandaloneMappingRejectsReplacementAcrossRunWindowAndTab() {
         let lifetime = MCPRunRouteBindings.OwnerLifetime()
@@ -84,6 +299,16 @@ final class MCPRunRouteBindingsTests: XCTestCase {
 
 @MainActor
 final class ContextBuilderSelectionTransactionTests: XCTestCase {
+    func testLegacyDomainUnregistrationKeepsRunMappingOwnerUntilServerRelease() async throws {
+        let fixture = try await makePromptMutationFixture(name: "legacy-route-lifetime")
+        let server = fixture.window.mcpServer
+        let runID = UUID(), connectionID = UUID()
+        XCTAssertEqual(server.runRouteBindings.register(connectionID: connectionID, runID: runID, windowID: fixture.window.windowID), .registered(displacedConnectionID: nil))
+        XCTAssertTrue(server.runRouteBindings.hasCurrentMapping(runID: runID, connectionID: connectionID))
+        await server.unregisterDomainRoutingWindow()
+        XCTAssertTrue(server.runRouteBindings.hasCurrentMapping(runID: runID, connectionID: connectionID), "Domain close precedes the existing explicit run drain; it must not withdraw that run's resources")
+    }
+
     func testBackgroundPromptAppendUsesCurrentTextWithoutRefreshingTheStaleBinding() async throws {
         let fixture = try await makePromptMutationFixture(name: "shared-background-prompt")
         let server = fixture.window.mcpServer

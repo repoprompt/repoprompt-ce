@@ -4,8 +4,8 @@ import RepoPromptAIContracts
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
 
-/// Coverage for the September 2026 built-in catalog refresh: GPT-6.1 Sol / GPT-6 Astra / Luna / Sol
-/// and Claude Sonnet 5.5 / Opus 5.5 / Fable 5.1 / Mythos 5.1 across every built-in surface.
+/// Coverage for current built-in catalogs: GPT-6.1 Sol / GPT-6 Astra / Luna / Sol
+/// and Claude Sonnet 5.5 / Opus 5.5 / Fable 5.2 / Mythos 5.1 across built-in surfaces.
 final class CurrentModelCatalogTests: XCTestCase {
     // MARK: Codex CLI (chat)
 
@@ -121,6 +121,7 @@ final class CurrentModelCatalogTests: XCTestCase {
             (.claudeSonnet5, "claude-sonnet-5"),
             (.claudeOpus55, "claude-opus-5-5"),
             (.claudeOpus5, "claude-opus-5"),
+            (.claudeFable52, "claude-fable-5-2"),
             (.claudeFable51, "claude-fable-5-1"),
             (.claudeMythos51, "claude-mythos-5-1")
         ]
@@ -149,6 +150,7 @@ final class CurrentModelCatalogTests: XCTestCase {
             (.openrouterGpt6Luna, "openai/gpt-6-luna"),
             (.openrouterClaudeSonnet55, "anthropic/claude-sonnet-5.5"),
             (.openrouterClaudeOpus55, "anthropic/claude-opus-5.5"),
+            (.openrouterClaudeFable52, "anthropic/claude-fable-5.2"),
             (.openrouterClaudeFable51, "anthropic/claude-fable-5.1")
         ]
         let openRouterModels = AIModel.modelsForProvider(.openRouter)
@@ -158,6 +160,23 @@ final class CurrentModelCatalogTests: XCTestCase {
             XCTAssertEqual(AIModel.fromModelName(slug), model, slug)
             XCTAssertEqual(model.providerType, .openRouter, slug)
             XCTAssertTrue(openRouterModels.contains(model), slug)
+        }
+    }
+
+    func testFable52CatalogsPreservePinnedSelectionsAndEfforts() throws {
+        for model: AIModel in [.claudeFable52, .claudeFable51, .openrouterClaudeFable52, .openrouterClaudeFable51] {
+            XCTAssertEqual(AIModel.fromModelName(model.rawValue), model)
+        }
+        XCTAssertEqual(AIModel.claudeFable52.displayName, "Claude Fable 5.2")
+        let agents = AgentModel.modelsForAgent(.claudeCode)
+        XCTAssertTrue(agents.contains(.claudeFable52))
+        XCTAssertTrue(agents.contains(.claudeFable51))
+        XCTAssertEqual(AgentModel.claudeFable52.contextWindowTokens, 1_000_000)
+        XCTAssertEqual(AgentModel.resolvedModel(forRaw: "claude-fable-5-2", agentKind: .claudeCode), .claudeFable52)
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
+            let specifier = "claude-fable-5-2:\(effort)"
+            let model = try XCTUnwrap(ClaudeCodeAIModelCatalog.validatedModel(specifier: specifier))
+            XCTAssertEqual(ClaudeCodeAIModelCatalog.runtimeSpecifierRaw(for: model), specifier)
         }
     }
 

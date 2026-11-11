@@ -3,6 +3,7 @@ import RepoPromptAIContracts
 import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
+import RepoPromptShared
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
@@ -825,7 +826,23 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         let fixture = try makeSubmissionFixture(runtimeUnavailableMessage: { preflight.cachedMessage }, runtimePreflight: { await preflight.check() })
         let vm = fixture.viewModel
         let source = fixture.session
-        let destinationTabID = UUID()
+        // The endpoint-only fixture does not install foreground creation composition. Supply the
+        // real prompt/carrier and isolated durable storage before exercising configured creation.
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ComputerUseFirstSend-\(UUID())")
+        let root = AppProfileLocations.current.customWorkspaceDirectory(selectedDirectory: directory)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        await fixture.workspaceManager.awaitInitialized()
+        var workspace = try XCTUnwrap(fixture.workspaceManager.activeWorkspace)
+        workspace.ephemeralFlag = false
+        workspace.customStoragePath = root
+        fixture.workspaceManager.workspaces = [workspace]
+        fixture.workspaceManager.activeWorkspace = workspace
+        let prompt = fixture.workspaceManager.promptViewModel
+        prompt.loadComposeTabsFromWorkspace(workspace)
+        vm.promptManager = prompt
+        let api = try XCTUnwrap(prompt.apiSettingsViewModel)
+        api.isCodexConnected = true // Availability belongs to this fixture's fake controller.
         let text = "/computer-use inspect the screen"
         let claim = try claimLocalComposerTurn(text, session: source, viewModel: vm)
         XCTAssertEqual(claim.attempt.target.route, .createAgentSessionFromSourceTab)
@@ -834,18 +851,20 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             text: text,
             claim: claim,
             createAndActivateSessionTab: {
-                var workspace = fixture.workspaceManager.workspaces[0]
-                workspace.composeTabs.append(ComposeTabState(id: destinationTabID, name: "Computer Use destination"))
-                workspace.activeComposeTabID = destinationTabID
-                fixture.workspaceManager.workspaces = [workspace]
-                fixture.workspaceManager.activeWorkspace = workspace
-                _ = vm.session(for: destinationTabID)
-                vm.test_setCurrentTabIDOverride(destinationTabID)
-                return destinationTabID
+                // Exercise production creation/configuration/save before the pending-start alias
+                // is installed. Only focus uses the fixture override; no binding is repaired here.
+                let created = await vm.createAndActivateSessionTab()
+                // Initial settings discovery can complete across creation's awaits. Publish the
+                // fake controller's availability at the returned creation boundary as well.
+                api.isCodexConnected = true
+                XCTAssertTrue(vm.agentAvailabilityContext.codexAvailable)
+                if let created { vm.test_setCurrentTabIDOverride(created) }
+                return created
             }
         )
         XCTAssertEqual(result, .submitted)
-        let destination = try XCTUnwrap(vm.sessions[destinationTabID])
+        let destination = try XCTUnwrap(vm.sessions.values.first { $0 !== source })
+        XCTAssertNotNil(destination.persistentSessionBindingIdentity)
         XCTAssertTrue(destination.isCodexComputerUseArmed)
         XCTAssertFalse(source.isCodexComputerUseArmed)
         XCTAssertTrue(source.items.isEmpty, "The source must not receive the destination's turn")
