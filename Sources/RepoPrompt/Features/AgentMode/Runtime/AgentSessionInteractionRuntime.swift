@@ -50,7 +50,25 @@ final class AgentSessionInteractionRuntime {
     let routeID: Int
     let approvalStore: ApplyEditsApprovalStore
     weak var observer: (any AgentRunInteractionStateObserving)?
-    private var subscriptions: [ObjectIdentifier: UUID] = [:]
+    @MainActor
+    private final class ApprovalSync {
+        weak var session: AgentTabSession?
+        let identity: AgentSessionRuntimeStore.MembershipIdentity
+        let binding: AgentPersistentSessionBindingIdentity?
+        let hydrated: Bool
+        var lease: UUID?
+        var listener: Task<Void, Never>?
+
+        init(identity: AgentSessionRuntimeStore.MembershipIdentity, session: AgentTabSession) {
+            self.identity = identity
+            self.session = session
+            binding = session.persistentSessionBindingIdentity
+            hydrated = session.hasLoadedPersistedState
+        }
+    }
+
+    private var approvalSyncs: [ObjectIdentifier: ApprovalSync] = [:]
+    private var approvalTails: [ApplyEditsApprovalScope: (id: UUID, task: Task<Void, Never>)] = [:]
     /// Request-lifetime identities fence delayed caller cancellation from a subsequent question,
     /// even when a caller reuses its public interaction ID on the same session object.
     struct QuestionWait {
@@ -64,6 +82,8 @@ final class AgentSessionInteractionRuntime {
     private struct CancellationCutoff {
         weak var session: AgentTabSession?
         let instant: ContinuousClock.Instant
+        let membership: AgentSessionRuntimeStore.MembershipIdentity?
+        let reviewID: UUID?
     }
 
     private var cancellationCutoffs: [ObjectIdentifier: CancellationCutoff] = [:]
@@ -76,6 +96,11 @@ final class AgentSessionInteractionRuntime {
 
     #if DEBUG
         var test_beforeApprovalCancellation: (@MainActor () async -> Void)?
+        var test_beforeApprovalSyncCommit: (@MainActor () async -> Void)?
+        var test_onApprovalListenerJoin: (@MainActor () -> Void)?
+        var test_beforeApprovalSyncCleanup: (@MainActor () async -> Void)?
+        var test_beforeApprovalSnapshot: (@MainActor () async -> Void)?
+        var test_beforeAutoEditWrite: (@MainActor () async -> Void)?
         var test_beforeApprovalDecision: (@MainActor () async -> Void)?
         var test_onHookGateCoalescedWaiterInstalled: (@MainActor () -> Void)?
     #endif
@@ -104,35 +129,133 @@ final class AgentSessionInteractionRuntime {
         )
     }
 
-    /// Exact-object subscription: a late snapshot never gets routed by tab UUID to a replacement.
-    /// The task does not retain the scope forever; the host owns the subscription lifetime.
-    func ensureApprovalSync(for session: AgentTabSession) {
-        guard session.applyEditsApprovalSubscriptionTask == nil,
-              let scope, scope.sessions[session.tabID] === session else { return }
+    /// Transactions explicitly join their predecessor; actor scheduling is not an ordering
+    /// guarantee. Stream listeners stay outside this finite effect queue.
+    @discardableResult
+    private func enqueueApprovalEffect(
+        for session: AgentTabSession, operation: @escaping @MainActor () async -> Void
+    ) -> Task<Void, Never> {
+        let address = approvalScope(for: session)
+        let predecessor = approvalTails[address]?.task
+        let id = UUID()
+        let task = performEffect(for: session) { [self] in
+            await predecessor?.value
+            await operation()
+            if approvalTails[address]?.id == id { approvalTails.removeValue(forKey: address) }
+        }
+        approvalTails[address] = (id, task)
+        return task
+    }
+
+    /// The projection fence is reference-free; the listener cannot retain its owning scope.
+    /// Store preparation followed by membership revalidation and CAS also fences late seeds.
+    func adoptHydratedApprovalPayload(for session: AgentTabSession) {
+        ensureApprovalSync(for: session, adoptPayload: true)
+    }
+
+    func ensureApprovalSync(for session: AgentTabSession, adoptPayload: Bool = false) {
+        guard let scope, let membership = scope.membership(of: session),
+              membership.permitsBindingPreparation else { return }
         let identity = ObjectIdentifier(session)
-        let generation = UUID()
-        subscriptions[identity] = generation
+        let candidate = approvalSyncs[identity]
+        let previous = candidate?.session === session ? candidate : nil
+        if !adoptPayload, let previous, previous.identity == membership.identity,
+           previous.hydrated == session.hasLoadedPersistedState,
+           session.applyEditsApprovalSubscriptionTask != nil { return }
+        let oldListener = previous?.listener ?? session.applyEditsApprovalSubscriptionTask
+        oldListener?.cancel()
+        let record = ApprovalSync(identity: membership.identity, session: session)
+        approvalSyncs[identity] = record
         let address = approvalScope(for: session)
         let initialAutoEdit = session.autoEditEnabled
+        let replacePayload = previous == nil || previous?.binding != record.binding
         let store = approvalStore
-        session.applyEditsApprovalSubscriptionTask = Task { [weak self, weak scope, weak session] in
-            await store.setAutoEditEnabled(initialAutoEdit, for: address, updateGlobalDefault: false)
-            let (subscriptionID, stream) = await store.subscribe(scope: address)
-            if self?.subscriptions[identity] == generation, !Task.isCancelled {
-                session?.applyEditsApprovalSubscriptionID = subscriptionID
-                for await snapshot in stream {
-                    guard !Task.isCancelled, let self, let session,
-                          subscriptions[identity] == generation,
-                          scope?.sessions[session.tabID] === session else { break }
-                    applyApprovalSnapshot(snapshot, to: session)
+        session.applyEditsApprovalSubscriptionID = nil
+        // A finite begin transaction installs the listener, then completes. Cleanup and
+        // manual writes capture this record, never whichever record later occupies the key.
+        let begin = enqueueApprovalEffect(for: session) { [weak self, weak scope, weak session, record] in
+            var installedListener = false
+            defer {
+                if !installedListener, self?.approvalSyncs[identity] === record {
+                    session?.applyEditsApprovalSubscriptionID = nil
+                    session?.applyEditsApprovalSubscriptionTask = nil
                 }
             }
-            await store.unsubscribe(scope: address, id: subscriptionID)
-            if let self, subscriptions[identity] == generation {
-                subscriptions.removeValue(forKey: identity)
-                session?.applyEditsApprovalSubscriptionID = nil
-                session?.applyEditsApprovalSubscriptionTask = nil
+            await oldListener?.value
+            while let self, let scope, let session,
+                  approvalSyncs[identity] === record,
+                  scope.holds(record.identity, for: session),
+                  scope.membership(of: session)?.permitsBindingPreparation == true
+            {
+                let preparation = await store.prepareSync(scope: address)
+                #if DEBUG
+                    await test_beforeApprovalSyncCommit?()
+                #endif
+                guard approvalSyncs[identity] === record,
+                      scope.holds(record.identity, for: session),
+                      scope.membership(of: session)?.permitsBindingPreparation == true
+                else {
+                    await store.abandonSync(preparation)
+                    return
+                }
+                guard let subscription = await store.commitSync(
+                    preparation, initialValue: initialAutoEdit, replacePayload: replacePayload
+                ) else { continue }
+                record.lease = subscription.lease
+                guard approvalSyncs[identity] === record, scope.holds(record.identity, for: session) else {
+                    await store.unsubscribe(scope: address, id: subscription.id)
+                    return
+                }
+                session.applyEditsApprovalSubscriptionID = subscription.id
+                installedListener = true
+                session.applyEditsApprovalSubscriptionTask = Task { [weak self, weak scope, weak session, weak record] in
+                    for await snapshot in subscription.stream {
+                        #if DEBUG
+                            await self?.test_beforeApprovalSnapshot?()
+                        #endif
+                        guard !Task.isCancelled, let self, let session, let record,
+                              approvalSyncs[identity] === record,
+                              scope?.holds(record.identity, for: session) == true,
+                              snapshot.syncLease == record.lease else { break }
+                        applyApprovalSnapshot(snapshot, to: session)
+                    }
+                    await store.unsubscribe(scope: address, id: subscription.id)
+                    record?.listener = nil
+                    if let self, let record, approvalSyncs[identity] === record {
+                        session?.applyEditsApprovalSubscriptionID = nil
+                        session?.applyEditsApprovalSubscriptionTask = nil
+                    }
+                }
+                record.listener = session.applyEditsApprovalSubscriptionTask
+                return
             }
+        }
+        session.applyEditsApprovalSubscriptionTask = begin
+    }
+
+    /// Manual UI commands use the canonical writer; only genuine unbound drafts use
+    /// membership admission. The no-tab global preference remains a presentation concern.
+    @discardableResult
+    func setAutoEditEnabled(_ enabled: Bool, for session: AgentTabSession) -> Task<Void, Never>? {
+        guard let scope, let membership = scope.membership(of: session), membership.permitsBindingPreparation else { return nil }
+        let command: AgentSessionRuntimeStore.Command?
+        if let sessionID = session.activeAgentSessionID {
+            guard case let .unique(writer) = scope.resolveWriter(sessionID: sessionID),
+                  writer.session === session, writer.scope === scope,
+                  case let .success(admitted) = writer.admitCommand() else { return nil }
+            command = admitted
+        } else { command = nil }
+        ensureApprovalSync(for: session)
+        guard let record = approvalSyncs[ObjectIdentifier(session)] else { return nil }
+        let address = approvalScope(for: session)
+        let store = approvalStore
+        return enqueueApprovalEffect(for: session) { [weak self, weak scope, weak session] in
+            #if DEBUG
+                await self?.test_beforeAutoEditWrite?()
+            #endif
+            guard let scope, let session, scope.holds(record.identity, for: session),
+                  command?.isCurrent != false, let lease = record.lease else { return }
+            _ = await store.setAutoEditEnabled(enabled, for: address, lease: lease, updateGlobalDefault: true)
         }
     }
 
@@ -148,7 +271,11 @@ final class AgentSessionInteractionRuntime {
         scope.presentation.permissionsChanged(session)
         let cutoff = cancellationCutoffs[ObjectIdentifier(session)]
         let cancelled = cutoff?.session === session && snapshot.pendingReview.map { review in
-            cutoff.map { review.admissionTime <= $0.instant } ?? false
+            guard let cutoff else { return false }
+            if let membership = cutoff.membership, scope.holds(membership, for: session) {
+                return review.admissionTime <= cutoff.instant
+            }
+            return cutoff.reviewID == review.id
         } == true
         session.pendingApplyEditsReview = cancelled ? nil : snapshot.pendingReview
         Self.reconcileInteractiveRunState(session)
@@ -157,31 +284,49 @@ final class AgentSessionInteractionRuntime {
 
     func teardownApprovalSync(for session: AgentTabSession, cleanupScope: Bool) async {
         let identity = ObjectIdentifier(session)
-        subscriptions.removeValue(forKey: identity)
-        let task = session.applyEditsApprovalSubscriptionTask
+        let record = approvalSyncs.removeValue(forKey: identity)
+        let mayClean = cleanupScope && record.map { record in
+            scope?.sessions[session.tabID] == nil || scope?.holds(record.identity, for: session) == true
+        } == true
+        // Ephemeral session cleanup may already have cleared the compatibility task field.
+        // The interaction owner retains the original listener until unsubscribe is joined.
+        let task = record?.listener ?? session.applyEditsApprovalSubscriptionTask
+        let cutoff = ContinuousClock.now
         task?.cancel()
         session.applyEditsApprovalSubscriptionTask = nil
         session.applyEditsApprovalSubscriptionID = nil
-        // Join the original subscription before allowing cleanup to finish. Cancel alone does
-        // not acknowledge an in-flight subscribe/unsubscribe actor hop.
-        await task?.value
-        await drainPendingEffects(for: session)
-        if cleanupScope, subscriptions[identity] == nil,
-           scope?.sessions[session.tabID] == nil || scope?.sessions[session.tabID] === session
-        {
-            await approvalStore.cleanupScope(approvalScope(for: session))
+        let store = approvalStore
+        let address = approvalScope(for: session)
+        // Enqueue before the first await. A successor's begin joins this exact cleanup,
+        // and an unrelated runtime's successor lease is independently protected by CAS.
+        let cleanup = enqueueApprovalEffect(for: session) { [weak self] in
+            #if DEBUG
+                self?.test_onApprovalListenerJoin?()
+            #endif
+            await task?.value
+            #if DEBUG
+                await self?.test_beforeApprovalSyncCleanup?()
+            #endif
+            if mayClean, let lease = record?.lease {
+                await store.cleanupSync(scope: address, lease: lease, admittedAtOrBefore: cutoff)
+            }
         }
+        await cleanup.value
+        await drainPendingEffects(for: session)
     }
 
     func cancelPendingApplyEditsReview(for session: AgentTabSession, reason: String) {
         let reviewID = session.pendingApplyEditsReview?.id
         let cutoff = ContinuousClock.now
         cancellationCutoffs = cancellationCutoffs.filter { $0.value.session != nil }
-        cancellationCutoffs[ObjectIdentifier(session)] = .init(session: session, instant: cutoff)
+        let membershipAtCutoff = scope?.membership(of: session)
+        cancellationCutoffs[ObjectIdentifier(session)] = .init(
+            session: session, instant: cutoff, membership: membershipAtCutoff?.identity, reviewID: reviewID
+        )
         // This is originating cleanup, not a new command after the suspension. Capture
         // authority now; a detached caller must not acquire it by being re-added later.
         // The store-side cutoff protects all reviews admitted by a subsequent incarnation.
-        let ownedScopeAtCutoff = scope?.membership(of: session)?.isCurrent == true
+        let ownedScopeAtCutoff = membershipAtCutoff?.isCurrent == true
         session.pendingApplyEditsReview = nil
         let address = approvalScope(for: session)
         let store = approvalStore

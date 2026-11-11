@@ -7544,3 +7544,30 @@ Final focused `bc89e0ad-a2a0-474c-8841-5c703d62c678` passed **48 tests**, zero f
 Shared approval subscription/seed/teardown provenance, manual auto-edit command routing, and the
 remaining provider-native/VM-forwarding inventory are still open; other lanes' provider execution,
 MCP host composition, persistence/payload, Steer and self-compaction ownership is unchanged.
+
+#### M9.2i checkpoint 3 — approval resource ownership and manual commands
+
+Shared approval sync now retains reference-free scope/incarnation/binding provenance rather than
+only object identity. Its finite per-address begin/write/cleanup effects explicitly join predecessors;
+the long-lived listener is outside that queue. Store preparation is non-destructive, runtime admission
+is revalidated, and an actor-local compare-and-commit issues the lease used by writes, snapshots and
+cleanup. A competing begin or cleanup invalidates the prepared revision, including a return to an
+absent resource. Cleanup without a captured lease has no destructive authority.
+
+The runtime owns the original listener through unsubscribe even when ephemeral session cleanup has
+already cleared the compatibility task field. Reacquisition cannot project an old snapshot or dirty
+and save the new writer. Nonoccupant terminal cutoffs no longer hide another owner's buffered review.
+Abandoned begin tasks clear their listening latch so a temporary conflicting claim cannot permanently
+disable approval UI. Store-side seed ownership survives skipped intermediate begins while preserving
+intervening manual writes and active MCP overrides.
+
+The tab auto-edit action now captures a canonical command before its queued effect; only genuinely
+unbound drafts use membership admission. The no-tab global preference remains unchanged. The only
+hydration seam is renewal after the existing authoritative payload/readiness commit; payload loading,
+provider repair, and save authority stay with their existing owners. Explicit renewal avoids inferring
+payload adoption solely from a compatibility boolean.
+
+Final focused `5357d288-9be4-4fb9-8d3a-03d886ba446f` passed **76 tests**, zero failures
+(29 interaction, 29 restoration-admission, 18 runtime-store), including the listener-join witness.
+Scoped pinned formatting, strict lint and whitespace checks passed. Other lanes' MCP host,
+provider startup/adoption/event installation, persistence and close/handoff owners are unchanged.
