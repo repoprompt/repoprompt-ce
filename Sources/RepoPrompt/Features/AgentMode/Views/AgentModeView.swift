@@ -5760,19 +5760,10 @@ private struct AgentRunningElapsedText: View {
 
     private func elapsedText(now: Date) -> some View {
         let elapsedSeconds = max(0, Int(now.timeIntervalSince(startedAt)))
-        return Text("· \(Self.formatElapsed(elapsedSeconds))")
+        return Text("· \(AgentRuntimeDurationFormatter.string(totalSeconds: elapsedSeconds))")
             .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
             .foregroundColor(.secondary.opacity(0.75))
             .monospacedDigit()
-    }
-
-    private static func formatElapsed(_ totalSeconds: Int) -> String {
-        if totalSeconds < 60 {
-            return "\(totalSeconds)s"
-        }
-        let minutes = totalSeconds / 60
-        let seconds = totalSeconds % 60
-        return "\(minutes)m \(String(format: "%02d", seconds))s"
     }
 }
 

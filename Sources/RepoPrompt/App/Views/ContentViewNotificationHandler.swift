@@ -1,5 +1,18 @@
 import SwiftUI
 
+@MainActor
+private func notificationTargetsWindow(_ note: Notification, windowState: WindowState) -> Bool {
+    if let sender = note.object as? WindowState {
+        return sender === windowState
+    }
+    if let id = note.userInfo?["windowID"] as? Int {
+        return id == windowState.windowID
+    }
+    let target = WindowStatesManager.shared.allWindows.first(where: { $0.isCurrentlyFocused })
+        ?? WindowStatesManager.shared.latestWindowState
+    return target === windowState
+}
+
 // MARK: - Content View Notification Handler
 
 struct ContentViewNotificationHandler: ViewModifier {
@@ -70,39 +83,39 @@ private struct SettingsNotificationHandler: ViewModifier {
     private func generalNotifications(_ content: some View) -> some View {
         content
             .onReceive(NotificationCenter.default.publisher(for: .showSettingsPopover)) { note in
-                guard noteTargetsCurrentWindow(note) else { return }
-                openSettings(tab: nil)
+                guard notificationTargetsWindow(note, windowState: windowState) else { return }
+                SettingsWindowCoordinator.shared.open(windowState: windowState, selectedTab: nil)
             }
             .onReceive(NotificationCenter.default.publisher(for: .showAPISettingsTab)) { note in
-                guard noteTargetsCurrentWindow(note) else { return }
-                openSettings(tab: .apiGeneral)
+                guard notificationTargetsWindow(note, windowState: windowState) else { return }
+                SettingsWindowCoordinator.shared.open(windowState: windowState, selectedTab: .apiGeneral)
             }
             .onReceive(NotificationCenter.default.publisher(for: .showManageWorkspacesTab)) { note in
-                guard noteTargetsCurrentWindow(note) else { return }
-                openSettings(tab: .manageWorkspaces)
+                guard notificationTargetsWindow(note, windowState: windowState) else { return }
+                SettingsWindowCoordinator.shared.open(windowState: windowState, selectedTab: .manageWorkspaces)
             }
             .onReceive(NotificationCenter.default.publisher(for: .showManagePresetsTab)) { note in
-                guard noteTargetsCurrentWindow(note) else { return }
-                openSettings(tab: .managePresets)
+                guard notificationTargetsWindow(note, windowState: windowState) else { return }
+                SettingsWindowCoordinator.shared.open(windowState: windowState, selectedTab: .managePresets)
             }
             .onReceive(NotificationCenter.default.publisher(for: .showMCPSettingsTab)) { note in
-                guard noteTargetsCurrentWindow(note) else { return }
-                openSettings(tab: .mcp)
+                guard notificationTargetsWindow(note, windowState: windowState) else { return }
+                SettingsWindowCoordinator.shared.open(windowState: windowState, selectedTab: .mcp)
             }
     }
 
     private func modelNotifications(_ content: some View) -> some View {
         content
             .onReceive(NotificationCenter.default.publisher(for: .showCLIProvidersTab)) { note in
-                guard noteTargetsCurrentWindow(note) else { return }
-                openSettings(tab: .cliProviders)
+                guard notificationTargetsWindow(note, windowState: windowState) else { return }
+                SettingsWindowCoordinator.shared.open(windowState: windowState, selectedTab: .cliProviders)
             }
             .onReceive(NotificationCenter.default.publisher(for: .showAgentModeSettingsTab)) { note in
-                guard noteTargetsCurrentWindow(note) else { return }
-                openSettings(tab: .agentMode)
+                guard notificationTargetsWindow(note, windowState: windowState) else { return }
+                SettingsWindowCoordinator.shared.open(windowState: windowState, selectedTab: .agentMode)
             }
             .onReceive(NotificationCenter.default.publisher(for: .showModelRouterSettingsTab)) { note in
-                guard noteTargetsCurrentWindow(note) else { return }
+                guard notificationTargetsWindow(note, windowState: windowState) else { return }
                 if let section = note.userInfo?["agentDecisionsSection"]
                     as? SettingsWindowCoordinator.AgentDecisionsSection
                 {
@@ -111,12 +124,12 @@ private struct SettingsNotificationHandler: ViewModifier {
                         section: section
                     )
                 } else {
-                    openSettings(tab: .modelRouter)
+                    SettingsWindowCoordinator.shared.open(windowState: windowState, selectedTab: .modelRouter)
                 }
             }
             .onReceive(NotificationCenter.default.publisher(for: .showNotificationSettingsTab)) { note in
-                guard noteTargetsCurrentWindow(note) else { return }
-                openSettings(tab: .notifications)
+                guard notificationTargetsWindow(note, windowState: windowState) else { return }
+                SettingsWindowCoordinator.shared.open(windowState: windowState, selectedTab: .notifications)
             }
             .modifier(AgentModeDeepLinkNotificationHandler(windowState: windowState))
     }
@@ -124,45 +137,29 @@ private struct SettingsNotificationHandler: ViewModifier {
     private func presetNotifications(_ content: some View) -> some View {
         content
             .onReceive(NotificationCenter.default.publisher(for: .showModelPresetsTab)) { note in
-                guard noteTargetsCurrentWindow(note) else { return }
-                openSettings(tab: .modelPresets)
+                guard notificationTargetsWindow(note, windowState: windowState) else { return }
+                SettingsWindowCoordinator.shared.open(windowState: windowState, selectedTab: .modelPresets)
             }
             .onReceive(NotificationCenter.default.publisher(for: .showCopyPresetsTab)) { note in
-                guard noteTargetsCurrentWindow(note) else { return }
-                openSettings(tab: .copyPresets)
+                guard notificationTargetsWindow(note, windowState: windowState) else { return }
+                SettingsWindowCoordinator.shared.open(windowState: windowState, selectedTab: .copyPresets)
             }
             .onReceive(NotificationCenter.default.publisher(for: .showChatPresetsTab)) { note in
-                guard noteTargetsCurrentWindow(note) else { return }
-                openSettings(tab: .chatPresets)
+                guard notificationTargetsWindow(note, windowState: windowState) else { return }
+                SettingsWindowCoordinator.shared.open(windowState: windowState, selectedTab: .chatPresets)
             }
             .onReceive(NotificationCenter.default.publisher(for: .showContextBuilderSettingsTab)) { note in
-                guard noteTargetsCurrentWindow(note) else { return }
-                openSettings(tab: .contextBuilder)
+                guard notificationTargetsWindow(note, windowState: windowState) else { return }
+                SettingsWindowCoordinator.shared.open(windowState: windowState, selectedTab: .contextBuilder)
             }
             .onReceive(NotificationCenter.default.publisher(for: .showLicenseUpdatesTab)) { note in
-                guard noteTargetsCurrentWindow(note) else { return }
-                openSettings(tab: .licenseUpdates)
+                guard notificationTargetsWindow(note, windowState: windowState) else { return }
+                SettingsWindowCoordinator.shared.open(windowState: windowState, selectedTab: .licenseUpdates)
             }
             .onReceive(NotificationCenter.default.publisher(for: .showKeyboardShortcutsSettingsTab)) { note in
-                guard noteTargetsCurrentWindow(note) else { return }
-                openSettings(tab: .keyboardShortcuts)
+                guard notificationTargetsWindow(note, windowState: windowState) else { return }
+                SettingsWindowCoordinator.shared.open(windowState: windowState, selectedTab: .keyboardShortcuts)
             }
-    }
-
-    private func noteTargetsCurrentWindow(_ note: Notification) -> Bool {
-        if let sender = note.object as? WindowState {
-            return sender === windowState
-        }
-        if let id = note.userInfo?["windowID"] as? Int {
-            return id == windowState.windowID
-        }
-        let target = WindowStatesManager.shared.allWindows.first(where: { $0.isCurrentlyFocused })
-            ?? WindowStatesManager.shared.latestWindowState
-        return target === windowState
-    }
-
-    private func openSettings(tab: SettingsTab?) {
-        SettingsWindowCoordinator.shared.open(windowState: windowState, selectedTab: tab)
     }
 }
 
@@ -182,32 +179,16 @@ private struct AgentModeDeepLinkNotificationHandler: ViewModifier {
     func body(content: Content) -> some View {
         content
             .onReceive(NotificationCenter.default.publisher(for: .showAgentModelsSettingsTab)) { note in
-                guard noteTargetsCurrentWindow(note) else { return }
-                openSettings(tab: .agentModels)
+                guard notificationTargetsWindow(note, windowState: windowState) else { return }
+                SettingsWindowCoordinator.shared.open(windowState: windowState, selectedTab: .agentModels)
             }
             .onReceive(NotificationCenter.default.publisher(for: .showAgentPermissionsSettingsTab)) { note in
-                guard noteTargetsCurrentWindow(note) else { return }
-                openSettings(tab: .agentPermissions)
+                guard notificationTargetsWindow(note, windowState: windowState) else { return }
+                SettingsWindowCoordinator.shared.open(windowState: windowState, selectedTab: .agentPermissions)
             }
             .onReceive(NotificationCenter.default.publisher(for: .showWorkspaceApprovalsSettingsTab)) { note in
-                guard noteTargetsCurrentWindow(note) else { return }
-                openSettings(tab: .permissions)
+                guard notificationTargetsWindow(note, windowState: windowState) else { return }
+                SettingsWindowCoordinator.shared.open(windowState: windowState, selectedTab: .permissions)
             }
-    }
-
-    private func noteTargetsCurrentWindow(_ note: Notification) -> Bool {
-        if let sender = note.object as? WindowState {
-            return sender === windowState
-        }
-        if let id = note.userInfo?["windowID"] as? Int {
-            return id == windowState.windowID
-        }
-        let target = WindowStatesManager.shared.allWindows.first(where: { $0.isCurrentlyFocused })
-            ?? WindowStatesManager.shared.latestWindowState
-        return target === windowState
-    }
-
-    private func openSettings(tab: SettingsTab?) {
-        SettingsWindowCoordinator.shared.open(windowState: windowState, selectedTab: tab)
     }
 }

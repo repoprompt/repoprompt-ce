@@ -190,83 +190,29 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
             lastUpdatedAt = Date()
         }
 
-        let previousSnapshot = snapshot
-        var next = ContextSnapshot()
-        next.updatedAt = lastUpdatedAt
-        next.observedReadFileCount = observedReadFiles.count
-        next.estimatedTranscriptTokens = transcriptSnapshot.estimatedTranscriptTokens
-
-        let toolTotalTokens = latestWorkspaceContext?.value.tokenStats?.total ?? latestManageSelection?.value.tokenStats?.total
-        next.tokenStatsTotal = toolTotalTokens
-
-        if let codexUsage {
-            let last = codexUsage.lastTotalTokens ?? 0
-            let total = codexUsage.totalTotalTokens ?? 0
-            let used = last > 0 ? last : total
-            next.usedTokens = used > 0 ? used : nil
-            next.contextWindowTokens = codexUsage.modelContextWindow
-            next.awaitingPostCompactionUsage = codexUsage.awaitingPostCompactionUsage == true
-            next.usageSource = next.awaitingPostCompactionUsage ? .awaitingPostCompaction
-                : (next.usedTokens != nil ? .codexLive : .unavailable)
-        } else if let toolTotalTokens {
-            next.usedTokens = toolTotalTokens
-            next.contextWindowTokens = nil
-            next.usageSource = .toolDerived
-        } else {
-            next.usageSource = .unavailable
-        }
-
-        let selectionToolMetrics = latestToolSelectionMetrics()
-        let selectionFiles = liveSelectionSummary?.totalExplicitFileCount ?? liveSelectedFileCount ?? selectionToolMetrics?.fileCount
-        let selectionTokens = Self.trustedSelectionTokens(
-            from: selectionToolMetrics,
-            liveSelectionFileCount: selectionFiles,
-            liveSelectionSummary: liveSelectionSummary
+        updateContextSnapshot(
+            estimatedTranscriptTokens: transcriptSnapshot.estimatedTranscriptTokens,
+            codexUsage: codexUsage,
+            liveSelectedFileCount: liveSelectedFileCount,
+            liveSelectionSummary: liveSelectionSummary,
+            selectedAgent: selectedAgent ?? transcriptSnapshot.selectedAgent,
+            selectedModelRaw: selectedModelRaw
         )
-        next.selectionSummary = liveSelectionSummary
-        next.selectionTokens = selectionTokens
-
-        if let selectionFiles {
-            next.selectionFileCount = selectionFiles
-        }
-
-        if let previousTokens = previousSnapshot.selectionTokens,
-           let selectionTokens,
-           previousTokens != selectionTokens
-        {
-            next.selectionDeltaTokens = selectionTokens - previousTokens
-        }
-
-        next.selectedAgent = selectedAgent ?? transcriptSnapshot.selectedAgent
-        next.selectedModelRaw = selectedModelRaw
-
-        if snapshot != next {
-            snapshot = next
-        }
     }
 
-    func update(
-        items: [AgentChatItem],
+    private func updateContextSnapshot(
+        estimatedTranscriptTokens: Int?,
         codexUsage: AgentContextUsage?,
-        liveSelectedFileCount: Int? = nil,
-        liveSelectionSummary: AgentContextSelectionSummary? = nil,
-        selectedAgent: AgentProviderKind? = nil,
-        selectedModelRaw: String? = nil
+        liveSelectedFileCount: Int?,
+        liveSelectionSummary: AgentContextSelectionSummary?,
+        selectedAgent: AgentProviderKind?,
+        selectedModelRaw: String?
     ) {
-        resetIfTranscriptChanged(items: items)
-        processNewItems(items)
-
-        if lastSeenCodexUsage != codexUsage {
-            lastSeenCodexUsage = codexUsage
-            lastUpdatedAt = Date()
-        }
-
         let previousSnapshot = snapshot
         var next = ContextSnapshot()
         next.updatedAt = lastUpdatedAt
         next.observedReadFileCount = observedReadFiles.count
-        let transcriptChars = items.reduce(0) { $0 + $1.text.count }
-        next.estimatedTranscriptTokens = transcriptChars > 0 ? transcriptChars / 4 : nil
+        next.estimatedTranscriptTokens = estimatedTranscriptTokens
 
         let toolTotalTokens = latestWorkspaceContext?.value.tokenStats?.total ?? latestManageSelection?.value.tokenStats?.total
         next.tokenStatsTotal = toolTotalTokens
@@ -315,6 +261,33 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         if snapshot != next {
             snapshot = next
         }
+    }
+
+    func update(
+        items: [AgentChatItem],
+        codexUsage: AgentContextUsage?,
+        liveSelectedFileCount: Int? = nil,
+        liveSelectionSummary: AgentContextSelectionSummary? = nil,
+        selectedAgent: AgentProviderKind? = nil,
+        selectedModelRaw: String? = nil
+    ) {
+        resetIfTranscriptChanged(items: items)
+        processNewItems(items)
+
+        if lastSeenCodexUsage != codexUsage {
+            lastSeenCodexUsage = codexUsage
+            lastUpdatedAt = Date()
+        }
+
+        let transcriptChars = items.reduce(0) { $0 + $1.text.count }
+        updateContextSnapshot(
+            estimatedTranscriptTokens: transcriptChars > 0 ? transcriptChars / 4 : nil,
+            codexUsage: codexUsage,
+            liveSelectedFileCount: liveSelectedFileCount,
+            liveSelectionSummary: liveSelectionSummary,
+            selectedAgent: selectedAgent,
+            selectedModelRaw: selectedModelRaw
+        )
     }
 
     private func latestToolSelectionMetrics() -> SelectionToolMetrics? {

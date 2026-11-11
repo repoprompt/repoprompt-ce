@@ -1731,35 +1731,32 @@ enum AgentModelCatalog {
             ]
         case .engineer:
             [
-                SelectionCandidate(agent: .codexExec, modelRaw: solMedium),
-                SelectionCandidate(agent: .claudeCode, modelRaw: AgentModel.claudeSonnet.rawValue),
-                SelectionCandidate(agent: .claudeCodeGLM, modelRaw: AgentModel.claudeSonnet.rawValue),
-                SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
-                SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
-                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue),
+                SelectionCandidate(agent: .codexExec, modelRaw: solMedium)
+            ] + claudeRoleCandidates(baseModelRaw: AgentModel.claudeSonnet.rawValue) + [
                 SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue)
             ]
         case .pair:
             [
-                SelectionCandidate(agent: .codexExec, modelRaw: solHigh),
-                SelectionCandidate(agent: .claudeCode, modelRaw: AgentModel.claudeOpus.rawValue),
-                SelectionCandidate(agent: .claudeCodeGLM, modelRaw: AgentModel.claudeOpus.rawValue),
-                SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
-                SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
-                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue),
+                SelectionCandidate(agent: .codexExec, modelRaw: solHigh)
+            ] + claudeRoleCandidates(baseModelRaw: AgentModel.claudeOpus.rawValue) + [
                 SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue)
             ]
         case .design:
-            [
-                SelectionCandidate(agent: .claudeCode, modelRaw: AgentModel.claudeOpus.rawValue),
-                SelectionCandidate(agent: .claudeCodeGLM, modelRaw: AgentModel.claudeOpus.rawValue),
-                SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
-                SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
-                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue),
+            claudeRoleCandidates(baseModelRaw: AgentModel.claudeOpus.rawValue) + [
                 SelectionCandidate(agent: .codexExec, modelRaw: solMedium),
                 SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue)
             ]
         }
+    }
+
+    private static func claudeRoleCandidates(baseModelRaw: String) -> [SelectionCandidate] {
+        [
+            SelectionCandidate(agent: .claudeCode, modelRaw: baseModelRaw),
+            SelectionCandidate(agent: .claudeCodeGLM, modelRaw: baseModelRaw),
+            SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
+            SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
+            SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue)
+        ]
     }
 
     /// Checks if a candidate agent+model is currently available.

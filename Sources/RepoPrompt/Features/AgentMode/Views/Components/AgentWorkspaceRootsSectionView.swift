@@ -718,7 +718,7 @@ struct AgentWorkspaceRootsSectionView: View {
                     iconSize: rootIconButtonIconSize,
                     cornerRadius: rootIconButtonCornerRadius
                 ) {
-                    rootsStore.moveRootUp(rowID: row.id)
+                    rootsStore.moveRoot(rowID: row.id, direction: .up)
                 }
                 .focused($focusedRootAction, equals: RootActionFocus(rowID: row.id, action: .moveUp))
                 .disabled(!row.canMoveUp)
@@ -731,7 +731,7 @@ struct AgentWorkspaceRootsSectionView: View {
                     iconSize: rootIconButtonIconSize,
                     cornerRadius: rootIconButtonCornerRadius
                 ) {
-                    rootsStore.moveRootDown(rowID: row.id)
+                    rootsStore.moveRoot(rowID: row.id, direction: .down)
                 }
                 .focused($focusedRootAction, equals: RootActionFocus(rowID: row.id, action: .moveDown))
                 .disabled(!row.canMoveDown)
@@ -826,12 +826,12 @@ struct AgentWorkspaceRootsSectionView: View {
 
         if hasMultipleRoots {
             Button("Move Root Up") {
-                rootsStore.moveRootUp(rowID: row.id)
+                rootsStore.moveRoot(rowID: row.id, direction: .up)
             }
             .disabled(!row.canMoveUp)
 
             Button("Move Root Down") {
-                rootsStore.moveRootDown(rowID: row.id)
+                rootsStore.moveRoot(rowID: row.id, direction: .down)
             }
             .disabled(!row.canMoveDown)
         }

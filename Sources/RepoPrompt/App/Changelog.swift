@@ -67,32 +67,7 @@ class Changelog {
     )
 
     static let history: [Version] = [
-        Version(
-            id: "2.1.24",
-            buildNumber: 326,
-            date: ISO8601DateFormatter().date(from: "2026-05-09T00:00:00Z") ?? Date(),
-            changes: """
-            ## [2.1.24] - 2026-05-09
-
-            ### Improvements
-            - Codex /goal now works alongside selected app workflows, and typed goal objectives appear immediately as user bubbles in Agent Mode
-            - Staged /goal drafts are now visible in the Agent Mode status row
-            - ask_user prompts no longer expire while you're typing your answer
-            - Faster file tree updates during heavy filesystem activity
-            - Updated Z.ai GLM defaults to GLM-5.2 with 1M-context Claude Code routing support
-
-            ### Fixes
-            - MCP `read_file` now returns exact paths reusable by `apply_edits`, and rejects fuzzy basename or suffix matches
-            - Fixed file tree churn when folders changed on disk
-            - Fixed Oracle preview transcripts showing in the wrong chat
-            - Fixed the prompt export copy button disappearing in long Agent Mode sessions
-            - Fixed Codex goal tracking when using /goal control actions
-            - Deep Plan now waits for you instead of silently defaulting when an involvement checkpoint times out
-
-            ### Notes
-            - The agent_run MCP/CLI surface no longer accepts the native_workflow parameter — Codex /goal and /computer-use remain available as in-app slash commands
-            """
-        ),
+        current,
         Version(
             id: "2.1.23",
             buildNumber: 325,
@@ -622,30 +597,7 @@ class Changelog {
             - Fixed Claude Code support over MCP
             """
         ),
-        Version(
-            id: "2.1.0",
-            buildNumber: 302,
-            date: ISO8601DateFormatter().date(from: "2026-04-02T00:00:00Z") ?? Date(),
-            changes: """
-            ## [2.1.0] - 2026-04-02
-
-            ### New Features
-            - MCP-controlled agents and sub-agents — start and steer Agent Mode sessions from external MCP clients or the CLI, with cross-family sub-agent support (Claude can steer Codex, Codex can steer Claude)
-            - Agent role defaults — configure default models per agent role (explore, engineer, pair, design) with per-role override controls
-
-            ### Improvements
-            - Faster window restore — consolidated session data loading for less main-thread blocking
-            - Cleaner MCP API — dedicated manage_selection and prompt tools replace context_state; chat tools renamed to oracle for consistency
-            - New context_bind tool — easier workspace binding via working directories
-            - Cmd+W now stashes compose tabs instead of closing them
-
-            ### Fixes
-            - Improved app stability — fixed crashes on deeply nested directory trees
-            - Fixed memory retention issues for large repositories
-            - Fixed file_search hanging on regex patterns with .* or .+ quantifiers
-            - Fixed detached transcript jump-to-top restore
-            """
-        ),
+        _210,
         Version(
             id: "2.0.31",
             buildNumber: 301,
