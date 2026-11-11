@@ -9,12 +9,15 @@ extension AgentSessionRuntimeStore.Scope {
     /// Provider events enter through the canonical scope, never through a presenter callback.
     func adoptClaudeProviderTurn(session: AgentTabSession, listener: ClaudeControllerEventListener, turnID: UUID, fence: AgentRunStartStopFence) async -> AgentModeRunService.ClaudeProviderTurnAdoption {
         guard sessions[session.tabID] === session else { return .superseded }
-        guard let sessionID = session.activeAgentSessionID else { return .superseded }
-        let resolution = resolveWriter(sessionID: sessionID)
-        guard case let .unique(writer) = resolution,
-              writer.scope === self, writer.session === session else { return .superseded }
-        guard case let .success(command) = writer.admitCommand(), let execution else { return .refused(writer) }
-        return await execution.adoptClaudeProviderTurn(command: command, listener: listener, turnID: turnID, fence: fence)
+        do {
+            let command = try admit(session: session)
+            guard let execution else { return .refused(command.writer) }
+            return await execution.adoptClaudeProviderTurn(command: command, listener: listener, turnID: turnID, fence: fence)
+        } catch let .command(writer, _) {
+            return .refused(writer)
+        } catch {
+            return .superseded
+        }
     }
 }
 
@@ -180,11 +183,15 @@ final class AgentModeRunService {
     ) async -> ClaudeProviderTurnAdoption {
         let writer = command.writer
         let session = writer.session
+        func admissionRefusal() -> ClaudeProviderTurnAdoption? {
+            guard command.rejection != nil else { return nil }
+            return writer.isCurrent ? .refused(writer) : .superseded
+        }
         guard writer.scope.execution === self else { return .refused(writer) }
-        guard command.isCurrent else { return writer.isCurrent ? .refused(writer) : .superseded }
+        if let refusal = admissionRefusal() { return refusal }
         let activation = session.mcpControlActivationGeneration
         defer {
-            if writer.isCurrent || writer.scope.sessions[session.tabID] !== session,
+            if writer.isCurrentOrSlotReplaced,
                session.currentRestorationBindingToken == writer.identity.restoration,
                session.mcpControlActivationGeneration == activation, fence.permitsStart(of: session),
                listener.subscription == nil || session.activeRunOwnership != nil
@@ -194,10 +201,10 @@ final class AgentModeRunService {
             }
         }
         await listener.awaitTerminalPublication()
-        guard command.isCurrent else { return writer.isCurrent ? .refused(writer) : .superseded }
+        if let refusal = admissionRefusal() { return refusal }
         if let previous = session.lastTerminalCommitRevision {
             await terminalCommitBarrier.awaitTerminalPublication(for: previous.ownership, lifecycle: session.runLifecycle)
-            guard command.isCurrent else { return writer.isCurrent ? .refused(writer) : .superseded }
+            if let refusal = admissionRefusal() { return refusal }
         }
         if session.mcpControlContext != nil, session.lastTerminalCommitRevision != nil {
             guard case .accepted = session.runLifecycle.lastTerminalPublicationResult else { return .refused(writer) }
@@ -210,7 +217,7 @@ final class AgentModeRunService {
               session.pendingInstructions.isEmpty, session.operationAdmissionFailureMessage == nil
         else { return listener.subscription != nil ? .accepted : .refused(writer) }
         let prepared = await writer.scope.mcp.prepareClaudeProviderEpoch(command: command, fence: fence)
-        guard command.isCurrent else { return writer.isCurrent ? .refused(writer) : .superseded }
+        if let refusal = admissionRefusal() { return refusal }
         guard prepared, !Task.isCancelled, listener.isCurrent(), fence.permitsStart(of: session),
               listener.pendingProviderTurnID == turnID, listener.subscription == nil, listener.runtimeFailure == nil,
               !session.runState.isActive, session.agentTask == nil, session.pendingInstructions.isEmpty,
@@ -331,7 +338,7 @@ final class AgentModeRunService {
         do {
             workspacePath = try workspace.resolve(bindings: session.worktreeBindings)
         } catch {
-            let message = Self.providerStartupFailureMessage(for: error)
+            let message = AgentRunExecutionContracts.providerStartupFailureMessage(for: error)
             await failBeforeProviderStartup(session: session, message: message)
             // The non-Codex return is `nil`, which is indistinguishable from success. The recorder is
             // the only channel that tells a caller this run never reached a provider.
@@ -504,7 +511,7 @@ final class AgentModeRunService {
         do {
             workspacePath = try admission.input.resolve(bindings: session.worktreeBindings)
         } catch {
-            let message = Self.providerStartupFailureMessage(for: error)
+            let message = AgentRunExecutionContracts.providerStartupFailureMessage(for: error)
             await failBeforeProviderStartup(session: session, message: message)
             return false
         }
@@ -779,17 +786,6 @@ final class AgentModeRunService {
         }
 
         return true
-    }
-
-    private static func providerStartupFailureMessage(for error: Error) -> String {
-        if let localized = error as? LocalizedError,
-           let description = localized.errorDescription?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !description.isEmpty
-        {
-            return description
-        }
-        let description = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
-        return description.isEmpty ? String(describing: error) : description
     }
 
     private func failBeforeProviderStartup(session: AgentTabSession, message: String) async {
@@ -1172,14 +1168,15 @@ final class AgentModeRunService {
                 }
             }
 
+            @MainActor func restoreAttemptDrafts() {
+                restoreQueuedClaudeSteeringDrafts(
+                    tabID: tabID, session: session, strategy: .prependAlways,
+                    matching: { $0.targetRunID == runID && $0.targetRunAttemptID == runAttemptID }
+                )
+            }
             while true {
                 guard isCurrentClaudeSteeringAttempt(session: session, runID: runID, runAttemptID: runAttemptID) else {
-                    restoreQueuedClaudeSteeringDrafts(
-                        tabID: tabID,
-                        session: session,
-                        strategy: .prependAlways,
-                        matching: { $0.targetRunID == runID && $0.targetRunAttemptID == runAttemptID }
-                    )
+                    restoreAttemptDrafts()
                     return
                 }
                 guard !session.pendingClaudeSteeringInstructions.isEmpty else { return }
@@ -1225,12 +1222,7 @@ final class AgentModeRunService {
                     runID: runID,
                     runAttemptID: runAttemptID
                 ) else {
-                    restoreQueuedClaudeSteeringDrafts(
-                        tabID: tabID,
-                        session: session,
-                        strategy: .prependAlways,
-                        matching: { $0.targetRunID == runID && $0.targetRunAttemptID == runAttemptID }
-                    )
+                    restoreAttemptDrafts()
                     return
                 }
 
@@ -1242,12 +1234,7 @@ final class AgentModeRunService {
                 guard isCurrentClaudeSteeringAttempt(session: session, runID: runID, runAttemptID: runAttemptID),
                       !session.pendingClaudeSteeringInstructions.isEmpty
                 else {
-                    restoreQueuedClaudeSteeringDrafts(
-                        tabID: tabID,
-                        session: session,
-                        strategy: .prependAlways,
-                        matching: { $0.targetRunID == runID && $0.targetRunAttemptID == runAttemptID }
-                    )
+                    restoreAttemptDrafts()
                     return
                 }
 

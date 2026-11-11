@@ -214,7 +214,7 @@ import XCTest
                 _ = target.beginRunAttempt(source: "late-catalog ordinary cause")
                 target.runState = .running
                 target.appendItem(.assistant("ordinary cause", sequenceIndex: target.nextSequenceIndex))
-                await vm.test_finishQuietFeasibilityRun(target)
+                await vm.runService.test_publishNaturalCompletion(target)
                 await bridge.test_settleTargetPublications()
                 await bridge.test_refreshStatus(sessionIDs: [endpoint.sessionID])
                 let attempt = try XCTUnwrap(observer.oversight.pendingAutoWake)

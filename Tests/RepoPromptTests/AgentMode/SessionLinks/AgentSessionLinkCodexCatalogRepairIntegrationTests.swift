@@ -2001,7 +2001,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             _ = target.beginRunAttempt(source: "W3 ordinary reservation cause")
             target.runState = .running
             target.appendItem(.assistant("ordinary reservation cause", sequenceIndex: target.nextSequenceIndex))
-            await vm.test_finishQuietFeasibilityRun(target)
+            await vm.runService.test_publishNaturalCompletion(target)
             XCTAssertEqual(target.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 1))
             let bridge = AgentSessionLinkRuntimeBridge.shared
             await bridge.test_settleTargetPublications()
@@ -2469,7 +2469,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                         print("W4_REPEAT_DISPLAY tools=\(Set(session.items.filter { $0.toolName == "read_file" }.compactMap(\.toolInvocationID)).count) publications=\(repeatPublications) spans=\(session.transcript.turns.last?.responseSpans.count ?? 0)")
                     }
                     XCTAssertEqual(Array(session.items.prefix(w4CanonicalBefore.count)), w4CanonicalBefore, "Local staging cannot rewrite ordinary source")
-                    let expected = AgentModeViewModel.buildTranscriptPresentation(
+                    let expected = AgentSessionTranscriptBuilder.buildTranscriptPresentation(
                         from: session.transcript, sourceItems: session.items, selectedAgent: session.selectedAgent,
                         previousPerformanceSnapshot: .empty
                     )
@@ -2599,7 +2599,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             _ = target.beginRunAttempt(source: "cold catalog ordinary cause")
             target.runState = .running
             target.appendItem(.assistant("ordinary cause", sequenceIndex: target.nextSequenceIndex))
-            await vm.test_finishQuietFeasibilityRun(target)
+            await vm.runService.test_publishNaturalCompletion(target)
             await bridge.test_settleTargetPublications()
             try await bridge.test_refreshStatus(sessionIDs: [XCTUnwrap(session.activeAgentSessionID)])
             let reserved = try XCTUnwrap(session.oversight.pendingAutoWake)
@@ -2948,7 +2948,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     _ = target.beginRunAttempt(source: "W3 scale ordinary cause")
                     target.runState = .running
                     target.appendItem(.assistant("ordinary source close", sequenceIndex: target.nextSequenceIndex))
-                    await vm.test_finishQuietFeasibilityRun(target)
+                    await vm.runService.test_publishNaturalCompletion(target)
                     await drain()
                     let reserved = try XCTUnwrap(session.oversight.pendingAutoWake)
                     XCTAssertNotNil(reserved.wakeFingerprint)

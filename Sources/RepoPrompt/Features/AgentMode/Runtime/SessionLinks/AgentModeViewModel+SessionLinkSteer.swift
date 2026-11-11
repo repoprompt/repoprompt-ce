@@ -26,7 +26,7 @@ extension AgentModeViewModel {
         // or the target's own user does. Apply-edits reviews are not projected as interactions, so
         // they are checked directly.
         let pendingPromptExists = session.pendingApplyEditsReview != nil
-            || mcpPendingInteraction(for: session).map { $0.kind != .instruction } == true
+            || mcpRuntime.mcpPendingInteraction(for: session).map { $0.kind != .instruction } == true
         return AgentSessionLinkSteerAdmission.evaluate(
             readiness: Self.agentSessionLinkDeliveryReadinessSnapshot(
                 session: session,

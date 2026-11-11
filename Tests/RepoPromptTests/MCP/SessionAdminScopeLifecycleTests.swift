@@ -6098,7 +6098,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         // A genuinely loaded duplicate is still ambiguous, even when its session ID matches.
         let duplicate = AgentModeViewModel.TabSession(tabID: fixture.tab)
         second.agentModeViewModel.test_installLiveSession(duplicate)
-        XCTAssertEqual(second.agentModeViewModel.test_bindingRejection(sessionID: fixture.overseer, on: duplicate), .conflictingWriter)
+        XCTAssertEqual(second.agentModeViewModel.runtimeSessionStore.bindingRejection(fixture.overseer, on: duplicate), .conflictingWriter)
         XCTAssertNil(second.agentModeViewModel.test_installPersistentSessionBinding(sessionID: fixture.overseer, on: duplicate))
         XCTAssertNil(duplicate.persistentSessionBindingIdentity)
         // Exercise legacy corruption only after proving ordinary writer admission refuses it.
@@ -7432,7 +7432,7 @@ final class DelegationCommitFenceTests: XCTestCase {
         }
         let otherSession = AgentModeViewModel.TabSession(tabID: tab)
         second.agentModeViewModel.test_installLiveSession(otherSession)
-        XCTAssertEqual(second.agentModeViewModel.test_bindingRejection(sessionID: requester, on: otherSession), .conflictingWriter)
+        XCTAssertEqual(second.agentModeViewModel.runtimeSessionStore.bindingRejection(requester, on: otherSession), .conflictingWriter)
         XCTAssertNil(second.agentModeViewModel.test_installPersistentSessionBinding(sessionID: requester, on: otherSession))
         XCTAssertNil(otherSession.persistentSessionBindingIdentity)
         XCTAssertNil(otherSession.activeAgentSessionID)
@@ -8845,8 +8845,8 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 var currentAtDispatch = false
                 vm.test_beforeRoutineIdleFollowUpStart = { candidate, _ in
                     XCTAssertTrue(candidate === session)
-                    let protection = vm.transcriptProjectionProtection(for: candidate)
-                    currentAtDispatch = vm.canReuseDerivedTranscriptForSave(for: candidate, projectionProtection: protection)
+                    let protection = AgentSessionTranscriptRefreshRuntime.transcriptProjectionProtection(for: candidate)
+                    currentAtDispatch = AgentSessionTranscriptRefreshRuntime.canReuseDerivedTranscriptForSave(for: candidate, projectionProtection: protection)
                     XCTAssertEqual(candidate.transcript.turns.last?.conclusionActivityID, laterOrdinary.id)
                     XCTAssertEqual(candidate.transcript.turns.last?.completedAt, laterOrdinary.timestamp)
                     observed.fulfill()

@@ -1,6 +1,22 @@
 import Foundation
 import RepoPromptDomainRuntime
 
+extension AgentSelfMCPCallOrigin {
+    @MainActor
+    func matchingSession(
+        endpoint expectedEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        lookup: (UUID) -> AgentTabSession?,
+        observerEndpoint: (UUID) -> DomainAgentSessionLinkEndpointIdentity?
+    ) -> AgentTabSession? {
+        guard expectedEndpoint == endpoint,
+              let session = lookup(expectedEndpoint.tabID),
+              observerEndpoint(expectedEndpoint.tabID) == expectedEndpoint,
+              session.runID == runID,
+              session.activeRunOwnership?.attemptID == runAttemptID else { return nil }
+        return session
+    }
+}
+
 /// Owns self-only compaction admission and its required save, not the later native completion.
 extension AgentSessionLinkExecutionRuntime {
     /// Synchronous admission captures the authoritative run attempt before a future MCP await.
@@ -62,11 +78,10 @@ extension AgentSessionLinkExecutionRuntime {
         note: String,
         idempotencyKey: String
     ) async -> AgentSelfMCPToolService.Admission {
-        guard endpoint == origin.endpoint,
-              let session = sessions[endpoint.tabID],
-              agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
-              session.runID == origin.runID,
-              session.activeRunOwnership?.attemptID == origin.runAttemptID
+        guard let session = origin.matchingSession(
+            endpoint: endpoint, lookup: { sessions[$0] },
+            observerEndpoint: { agentSessionLinkObserverEndpoint(tabID: $0) }
+        )
         else { return .unavailable }
 
         var candidate = session.selfCompactState

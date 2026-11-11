@@ -1621,7 +1621,7 @@ final class AgentSidebarRowInvalidationTests: XCTestCase {
         func flushPendingSaves() async -> Bool {
             let pending = fixture.tabs.filter { fixture.vm.sessions[$0.id]?.saveDebounceTask != nil }
             for tab in pending {
-                await fixture.vm.flushSave(for: tab.id)
+                await fixture.vm.persistenceRuntime.flushSave(for: tab.id)
                 fixture.vm.sessions[tab.id]?.saveDebounceTask = nil
             }
             return !pending.isEmpty

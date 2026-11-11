@@ -169,11 +169,7 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         let unknownGroups = !order.isEmpty && !entries.contains { named.contains($0.group) }
         let affected = entries.filter { unknownGroups || named.contains($0.group) }.map(\.sessionID)
         guard Set(affected).isSubset(of: Set(batch.admittedSessionIDs)) else {
-            return .object(SessionAdminReply.diagnostic(code: "groups_outside_scope", fields: [
-                "result": .string("groups_outside_scope"),
-                "affected": .object(["workspace_id": .string(workspaceID.uuidString)]),
-                "detail": .string("Every session in the reordered groups must be in your scope; reorder only groups you fully cover, or ask the user for authority covering the workspace.")
-            ]))
+            return groupsOutsideScope(workspaceID: workspaceID)
         }
         let current = DomainAgentSessionSidebarGroup.orderedGroups(entries.map { ($0.group, $0.order) })
         if unknownGroups {
@@ -193,6 +189,14 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             return Self.orderingFailure(error, operation: request.operation.adminOperationName, arguments: request.arguments, scopeID: batch.scope.id)
         }
         return recovery(request, workspaceID: workspaceID, order: order, expected: expected, code: "order_required")
+    }
+
+    private func groupsOutsideScope(workspaceID: UUID) -> Value {
+        .object(SessionAdminReply.diagnostic(code: "groups_outside_scope", fields: [
+            "result": .string("groups_outside_scope"),
+            "affected": .object(["workspace_id": .string(workspaceID.uuidString)]),
+            "detail": .string("Every session in the reordered groups must be in your scope; reorder only groups you fully cover, or ask the user for authority covering the workspace.")
+        ]))
     }
 
     private func recovery(
@@ -505,11 +509,7 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         // mirrored on each of them.
         let affected = entries.filter { Set(order).contains($0.group) }.map(\.sessionID)
         guard Set(affected).isSubset(of: Set(context.targets)) else {
-            return .object(SessionAdminReply.diagnostic(code: "groups_outside_scope", fields: [
-                "result": .string("groups_outside_scope"),
-                "affected": .object(["workspace_id": .string(workspaceID.uuidString)]),
-                "detail": .string("Every session in the reordered groups must be in your scope; reorder only groups you fully cover, or ask the user for authority covering the workspace.")
-            ]))
+            return groupsOutsideScope(workspaceID: workspaceID)
         }
         let current = DomainAgentSessionSidebarGroup.orderedGroups(entries.map { ($0.group, $0.order) })
         if case let .failure(error) = DomainAgentSessionOrdering.permute(

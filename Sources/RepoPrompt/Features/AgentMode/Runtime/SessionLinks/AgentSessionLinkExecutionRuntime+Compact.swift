@@ -150,20 +150,8 @@ extension AgentSessionLinkExecutionRuntime {
 
         // 3. Local composer claim. Losing it means a local user Send won the race.
         guard command.isCurrent,
-              let target = makeComposerSubmitTarget(tabID: candidate.tabID, session: session),
-              target.route == .existingAgentSession,
-              target.expectedSourceAgentSessionID == candidate.sessionID
+              let claim = claimEmptyComposer(for: candidate, session: session)
         else {
-            return .blocked(.targetNotIdle)
-        }
-        let attempt = AgentComposerSubmitAttempt(
-            id: UUID(),
-            target: target,
-            inputRevision: 0,
-            noticeRevision: 0,
-            rawDraftSnapshot: ""
-        )
-        guard let claim = claimComposerSubmitAttempt(attempt) else {
             return .blocked(.targetNotIdle)
         }
 
@@ -336,10 +324,8 @@ extension AgentSessionLinkExecutionRuntime {
         isStillAdmissible: @escaping @MainActor () -> Bool,
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil
     ) async -> AgentNativeCompactDispatchResult {
-        guard let scope, let sessionID = session.activeAgentSessionID,
-              case let .unique(writer) = scope.resolveWriter(sessionID: sessionID),
-              writer.scope === scope, writer.session === session, session.tabID == tabID,
-              let command = try? writer.admitCommand().get()
+        guard let scope, session.tabID == tabID,
+              let command = try? scope.admit(session: session)
         else { return .notStarted }
         let mayDispatch = { @MainActor in command.isCurrent && isStillAdmissible() }
         guard mayDispatch(), await agentSessionLinkCompactSupport(for: session) == support,

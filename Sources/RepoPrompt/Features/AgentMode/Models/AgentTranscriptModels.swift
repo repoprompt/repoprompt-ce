@@ -249,7 +249,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         quietCheckInWakeID = try? c.decodeIfPresent(UUID.self, forKey: .quietCheckInWakeID)
     }
 
-    private static func defaultRole(for item: AgentChatItem) -> AgentTranscriptActivityRole {
+    static func defaultRole(for item: AgentChatItem) -> AgentTranscriptActivityRole {
         switch item.kind {
         case .assistant, .assistantInline:
             .assistant

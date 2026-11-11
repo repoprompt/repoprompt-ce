@@ -292,7 +292,7 @@ enum AgentFileMentionText {
 
     private static func removingTaggedPath(_ relativePath: String, from text: String) -> String {
         guard !relativePath.isEmpty, !text.isEmpty else { return text }
-        let escapedPath = escapePathForAtCommand(relativePath)
+        let escapedPath = AgentSessionProviderInputRuntime.escapePathForAtCommand(relativePath)
         // Consume one trailing horizontal space after the token when present.
         // `FileTagMentionHelper.commitHighlighted` inserts mentions as "@path " and without
         // consuming that space explicit chip removal would leave a visible gap.
@@ -301,20 +301,6 @@ enum AgentFileMentionText {
         let range = NSRange(location: 0, length: (text as NSString).length)
         let reduced = regex.stringByReplacingMatches(in: text, options: [], range: range, withTemplate: "$1")
         return reduced.replacingOccurrences(of: "[ \\t]{2,}", with: " ", options: .regularExpression)
-    }
-
-    private static func escapePathForAtCommand(_ path: String) -> String {
-        var escaped = ""
-        for character in path {
-            switch character {
-            case "\\", " ", ",", ";", "!", "?", "(", ")", "[", "]", "{", "}":
-                escaped.append("\\")
-                escaped.append(character)
-            default:
-                escaped.append(character)
-            }
-        }
-        return escaped
     }
 }
 

@@ -126,7 +126,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             XCTAssertNotNil(retry.expectedConfigurationStamp)
 
             let workspaceID = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspaceID)
-            let genericSave = await fixture.viewModel.flushSaveRequired(for: destination.tabID, workspaceID: workspaceID)
+            let genericSave = await fixture.viewModel.persistenceRuntime.flushSaveRequired(for: destination.tabID, workspaceID: workspaceID)
             guard case .failure = genericSave else {
                 return XCTFail("Only the captured creation owner may retry its configured first save.")
             }
@@ -1146,11 +1146,11 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 defer { attempt.cancel() }
                 try await AsyncTestWait.waitUntil("sending write enters or preparation settles") { sendingEntered || completed }
                 guard sendingEntered else { return XCTFail("Expected the actual sending write") }
-                await vm.flushSave(for: session.tabID) // Invalidate the in-flight token without invoking a runner.
+                await vm.persistenceRuntime.flushSave(for: session.tabID) // Invalidate the in-flight token without invoking a runner.
                 sendingRelease.finish(())
                 try await AsyncTestWait.waitUntil("ready re-save enters or preparation settles") { readyEntered || completed }
                 guard readyEntered else { return XCTFail("A returned sending write with no runner must enter the existing ready re-save") }
-                await vm.flushSave(for: session.tabID) // The ready write also returns before stale-token refusal.
+                await vm.persistenceRuntime.flushSave(for: session.tabID) // The ready write also returns before stale-token refusal.
                 readyRelease.finish(())
                 let messages = await attempt.value
                 isAttemptUnderTest = false
@@ -1216,7 +1216,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 defer { attempt.cancel() }
                 try await AsyncTestWait.waitUntil("sending write enters or preparation settles") { sendingEntered || completed }
                 guard sendingEntered else { return XCTFail("Expected the actual sending write") }
-                await vm.flushSave(for: session.tabID)
+                await vm.persistenceRuntime.flushSave(for: session.tabID)
                 sendingRelease.finish(())
                 let messages = await attempt.value
                 isAttemptUnderTest = false
@@ -1256,7 +1256,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     XCTAssertEqual(messages?.user, payload + "\n\n" + preparation.augmentedInput)
                     XCTAssertEqual(messages?.initial, payload + "\n\n" + preparation.initialThreadInput)
                     XCTAssertEqual(saves.map(\.pendingHandoffProviderSwitchDelivery), [.sending])
-                    XCTAssertEqual(fixture.viewModel.prependPendingHandoffIfNeeded("ordinary", session: session), "ordinary")
+                    XCTAssertEqual(fixture.viewModel.handoffRuntime.prependPendingHandoffIfNeeded("ordinary", session: session), "ordinary")
                     let runID = UUID()
                     session.installRunID(runID)
                     session.beginRunAttempt(source: "test.switch.physical")
@@ -1330,7 +1330,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         session.appendItem(.assistant("Later streaming output", sequenceIndex: session.nextSequenceIndex))
                     } else {
                         // A real concurrent save request invalidates the in-flight commit token.
-                        await vm.flushSave(for: session.tabID)
+                        await vm.persistenceRuntime.flushSave(for: session.tabID)
                     }
                     release.finish(())
                     try await AsyncTestWait.waitUntil("existing fresh-save owner persists the settled carrier") { writes.count >= 3 && !session.isDirty }
@@ -1512,13 +1512,13 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 let session = fixture.sourceSession
                 let workspaceID = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspaceID)
                 var phases: [AgentModeViewModel.RequiredSavePhase] = []
-                let prewrite = await fixture.viewModel.flushSaveRequired(for: session.tabID, workspaceID: UUID(), observingSavePhase: { phases.append($0) })
+                let prewrite = await fixture.viewModel.persistenceRuntime.flushSaveRequired(for: session.tabID, workspaceID: UUID(), observingSavePhase: { phases.append($0) })
                 guard case .failure = prewrite else { return XCTFail("Wrong workspace must refuse before write") }
                 XCTAssertEqual(phases, [.beforeWrite])
                 fixture.viewModel.test_setAgentSessionSaver { _, _, _ in throw Fault.write }
                 phases = []
                 session.isDirty = true
-                let write = await fixture.viewModel.flushSaveRequired(for: session.tabID, workspaceID: workspaceID, observingSavePhase: { phases.append($0) })
+                let write = await fixture.viewModel.persistenceRuntime.flushSaveRequired(for: session.tabID, workspaceID: workspaceID, observingSavePhase: { phases.append($0) })
                 guard case .failure = write else { return XCTFail("Scripted write must fail") }
                 XCTAssertEqual(phases, [.beforeWrite, .writeMayHaveCommitted])
 
@@ -1534,18 +1534,18 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 }
                 phases = []
                 let deferred = Task {
-                    await fixture.viewModel.flushSaveRequired(for: session.tabID, workspaceID: workspaceID, observingSavePhase: { phases.append($0) })
+                    await fixture.viewModel.persistenceRuntime.flushSaveRequired(for: session.tabID, workspaceID: workspaceID, observingSavePhase: { phases.append($0) })
                 }
                 defer { deferred.cancel() }
                 try await AsyncTestWait.waitUntil("required save reaches its frozen write") { entered }
-                await fixture.viewModel.flushSave(for: session.tabID)
+                await fixture.viewModel.persistenceRuntime.flushSave(for: session.tabID)
                 release.finish(())
                 guard case .failure = await deferred.value else { return XCTFail("A successful write with stale currency must still defer the generic required flush") }
                 XCTAssertEqual(phases, [.beforeWrite, .writeMayHaveCommitted, .writeReturned])
                 XCTAssertTrue(session.isDirty)
 
                 phases = []
-                let saved = await fixture.viewModel.flushSaveRequired(for: session.tabID, workspaceID: workspaceID, observingSavePhase: { phases.append($0) })
+                let saved = await fixture.viewModel.persistenceRuntime.flushSaveRequired(for: session.tabID, workspaceID: workspaceID, observingSavePhase: { phases.append($0) })
                 guard case .success = saved else { return XCTFail("An unchanged write must retain ordinary required-save success") }
                 XCTAssertEqual(phases, try [.beforeWrite, .writeMayHaveCommitted, .writeReturned, .durablySaved(XCTUnwrap(session.currentRestorationBindingToken))])
             }
@@ -1719,7 +1719,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 try await AsyncTestWait.waitUntil("wake reaches replaced transport after sending save") { started || session.oversight.pendingAutoWake == nil }
                 guard started else { return XCTFail("The owned wake must continue after its save") }
                 XCTAssertFalse(AgentModeViewModel.providerSwitchUnconfirmed(session))
-                await vm.test_publishNaturalCompletion(session)
+                await vm.runService.test_publishNaturalCompletion(session)
                 await wake.task?.value
                 XCTAssertNil(session.oversight.pendingAutoWake)
                 XCTAssertNil(session.pendingHandoff.providerSwitchDispatch)
@@ -1913,7 +1913,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         throw Fault.possibleWrite
                     }
                     vm.test_providerSwitchRetirement = { outgoing in
-                        let result = await vm.flushSaveRequired(for: outgoing.tabID, workspaceID: workspaceID)
+                        let result = await vm.persistenceRuntime.flushSaveRequired(for: outgoing.tabID, workspaceID: workspaceID)
                         guard case .failure = result else { return XCTFail("Retirement must gate all incidental saves") }
                         XCTAssertEqual(outgoing.providerSessionID, "restore-source")
                         XCTAssertEqual(saves, 0)
@@ -2978,7 +2978,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 XCTAssertEqual(failure(), .providerHandoverNeedsReview, "The exact owned input exception cannot exempt another accepted row")
                 guard case .failure(.providerHandoverNeedsReview) = await vm.providerSwitchSendAdmission(session: session, input: "later") else { return XCTFail("Different later input must still be stale") }
                 XCTAssertFalse(try vm.agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: .headlessRun(runID: XCTUnwrap(session.runID))))
-                await vm.test_publishNaturalCompletion(session)
+                await vm.runService.test_publishNaturalCompletion(session)
                 XCTAssertNil(session.pendingHandoff.providerSwitchDispatch, "Only the existing terminal publication callback retires retained sending proof")
                 XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
                 XCTAssertEqual(failure(), .providerSwitchUnconfirmed)
@@ -3341,7 +3341,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     method: "item/commandExecution/requestApproval",
                     kind: .commandExecution, threadID: "t", turnID: "t", itemID: "i"
                 )
-                vm.reconcileInteractiveRunState(session)
+                AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
                 var saves = 0
                 vm.test_setAgentSessionSaver { _, _, _ in
                     saves += 1
@@ -3609,7 +3609,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 session.installRunID(UUID())
                 session.beginRunAttempt(source: "test.forceSwitchInteraction")
                 session.waitingPrompt = "answer?"
-                vm.reconcileInteractiveRunState(session)
+                AgentSessionInteractionRuntime.reconcileInteractiveRunState(session)
                 vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("forced-deadline.json") }
                 let deadline = SwitchGate()
                 vm.test_providerSwitchDeadlineGates[.retirementTail] = { await deadline.wait() }
@@ -4397,10 +4397,10 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 session.pendingFileAttachments = [.init(source: .localFile(path: fixture.rootURL.appendingPathComponent("image.png").path), title: "destination image")]
                 await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
                 let preview = try XCTUnwrap(vm.providerSwitchPreview)
-                let expected = vm.renderProviderMessage(text: draft.trimmingCharacters(in: .whitespacesAndNewlines), attachments: preview.composition.images, agent: .openCode)
+                let expected = AgentSessionProviderInputRuntime.renderProviderMessage(text: draft.trimmingCharacters(in: .whitespacesAndNewlines), attachments: preview.composition.images, agent: .openCode)
                 let actual = await vm.augmentUserMessageForProviderSend(draft.trimmingCharacters(in: .whitespacesAndNewlines), attachments: preview.composition.images, agent: .openCode, session: session, ignoresPendingHandoff: true)
                 XCTAssertEqual(actual, expected, "Explicit destination must win over the still-selected source")
-                XCTAssertNotEqual(actual, vm.renderProviderMessage(text: draft.trimmingCharacters(in: .whitespacesAndNewlines), attachments: preview.composition.images, agent: session.selectedAgent))
+                XCTAssertNotEqual(actual, AgentSessionProviderInputRuntime.renderProviderMessage(text: draft.trimmingCharacters(in: .whitespacesAndNewlines), attachments: preview.composition.images, agent: session.selectedAgent))
                 XCTAssertEqual(try XCTUnwrap(preview.budget).inputTokens, max(2048, AgentProviderHandover.estimate("\n\n" + expected)), accuracy: 0.000001)
                 XCTAssertEqual(session.draftText, draft)
                 XCTAssertNil(session.pendingHandoff.payload)
@@ -4888,7 +4888,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 target.1.pendingHandoff.providerSwitchDelivery = .sending
                 target.1.appendItem(.user("uncertain input", sequenceIndex: target.1.nextSequenceIndex))
                 target.1.isDirty = true
-                let persisted = await target.0.flushSaveRequired(for: target.1.tabID, workspaceID: workspaceID)
+                let persisted = await target.0.persistenceRuntime.flushSaveRequired(for: target.1.tabID, workspaceID: workspaceID)
                 guard case .success = persisted else { XCTFail("Uncertainty fixture must be durable")
                     throw CancellationError()
                 }

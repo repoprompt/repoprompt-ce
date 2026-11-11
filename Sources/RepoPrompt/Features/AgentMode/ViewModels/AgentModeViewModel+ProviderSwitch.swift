@@ -124,7 +124,7 @@ extension AgentModeViewModel {
             if snapshot.runStateIsActive { return .forceable(.running) }
             return .forceable(.workInFlight)
         }
-        if !providerSwitchTerminalIsSettled(session) { return .forceable(.finishingTurn) }
+        if !runService.providerSwitchTerminalIsSettled(session) { return .forceable(.finishingTurn) }
         return .clear
     }
 
@@ -261,7 +261,7 @@ extension AgentModeViewModel {
                         return nil as String?
                     }
                 #endif
-                try await self.requireIdleProviderForWorktreeBindingTransition(session)
+                try await AgentSessionWorktreeRuntime.requireIdleProvider(session)
                 return nil as String?
             } catch { return error.localizedDescription }
         }
@@ -431,7 +431,7 @@ extension AgentModeViewModel {
         if !owned.allowsSave, owned.session.saveRequestGeneration != owned.saveGenerationAtEntry,
            owned.session.isDirty, providerSwitchPreviewIdentityIsCurrent(owned.preview)
         {
-            scheduleSave(for: owned.session)
+            persistenceRuntime.scheduleSave(for: owned.session)
         }
     }
 
@@ -995,7 +995,7 @@ extension AgentModeViewModel {
             }
             return
         }
-        guard providerSwitchPreview?.id == id, providerSwitchPreviewIsCurrent(preview), composerSubmitClaimIsCurrent(claim),
+        guard providerSwitchPreview?.id == id, providerSwitchPreviewIsCurrent(preview), composerSubmitRuntime.isCurrent(claim),
               providerSwitchTransitionBlocker(session, ownsComposerClaim: true) == nil,
               let workspaceID = workspaceManager?.activeWorkspaceID else { return }
         // Publish the exact row identity before dispatch, including synchronous fake completions.
@@ -1004,9 +1004,9 @@ extension AgentModeViewModel {
         providerSwitchPreview?.generationItemID = row.id
         providerSwitchPreview?.selected = .summary
         session.isDirty = true
-        guard case .success = await flushSaveRequired(for: session.tabID, workspaceID: workspaceID),
+        guard case .success = await persistenceRuntime.flushSaveRequired(for: session.tabID, workspaceID: workspaceID),
               providerSwitchPreview?.id == id, providerSwitchPreview?.generationItemID == row.id,
-              composerSubmitClaimIsCurrent(claim), preview.stopFence.permitsStart(of: session),
+              composerSubmitRuntime.isCurrent(claim), preview.stopFence.permitsStart(of: session),
               sessions[session.tabID] === session, session.currentRestorationBindingToken == preview.binding
         else {
             if providerSwitchPreview?.id == id {
@@ -1152,7 +1152,7 @@ extension AgentModeViewModel {
             let previewCurrent = forcing
                 ? providerSwitchPreviewIdentityIsCurrent(preview)
                 : providerSwitchPreviewIsCurrent(preview, content: !discard)
-            return composerSubmitClaimIsCurrent(claim) && providerSwitchMutation?.id == mutation.id
+            return composerSubmitRuntime.isCurrent(claim) && providerSwitchMutation?.id == mutation.id
                 && (!requiresPresentedPreview || providerSwitchPreview?.id == id) && previewCurrent
                 && workspaceManager?.activeWorkspaceID == workspaceID && providerSwitchHasExactOwner(session)
                 && (
@@ -1169,7 +1169,7 @@ extension AgentModeViewModel {
                         && session.sourceItemsRevision == preview.sourceRevision
                         && providerSwitchInstructionStrings(session, destination: preview.destination) == preview.instructions
                 )
-            return composerSubmitClaimIsCurrent(claim) && providerSwitchMutation?.id == mutation.id
+            return composerSubmitRuntime.isCurrent(claim) && providerSwitchMutation?.id == mutation.id
                 && sourceCurrent && workspaceManager?.activeWorkspaceID == workspaceID
                 && providerSwitchHasExactOwner(session)
                 && providerSwitchTransitionAdmission(session, ownsComposerClaim: true, resolvingHandoff: preview.originalHandoff).isAdmissible(forcing: forcing)
@@ -1184,7 +1184,7 @@ extension AgentModeViewModel {
                     providerSwitchBackgroundOutcome = .init(session: session, binding: preview.binding)
                 }
             } else if providerSwitchPreviewIdentityIsCurrent(preview),
-                      composerSubmitClaimIsCurrent(claim), providerSwitchMutation?.id == mutation.id,
+                      composerSubmitRuntime.isCurrent(claim), providerSwitchMutation?.id == mutation.id,
                       session.pendingHandoff == handoff
             {
                 session.appendItem(.error(message, sequenceIndex: session.nextSequenceIndex))
@@ -1308,10 +1308,10 @@ extension AgentModeViewModel {
             #if DEBUG
                 test_providerSwitchBeforeSave?(session)
             #endif
-            let result = await flushSaveRequired(for: session.tabID, workspaceID: workspaceID, observingSavePhase: { phase = $0 })
+            let result = await persistenceRuntime.flushSaveRequired(for: session.tabID, workspaceID: workspaceID, observingSavePhase: { phase = $0 })
             guard case .success = result else {
                 if phase == .beforeWrite, sessions[session.tabID] === session,
-                   session.currentRestorationBindingToken == preview.binding, composerSubmitClaimIsCurrent(claim),
+                   session.currentRestorationBindingToken == preview.binding, composerSubmitRuntime.isCurrent(claim),
                    session.pendingHandoff == staged
                 {
                     rollback.restore(session)
@@ -1331,7 +1331,7 @@ extension AgentModeViewModel {
                 return false
             }
             guard sessions[session.tabID] === session, session.currentRestorationBindingToken == preview.binding,
-                  composerSubmitClaimIsCurrent(claim), session.pendingHandoff == staged else { return false }
+                  composerSubmitRuntime.isCurrent(claim), session.pendingHandoff == staged else { return false }
             if providerSwitchPreview?.session === session, providerSwitchPreview?.binding == preview.binding { providerSwitchPreview = nil }
             updateBindingsFromSession(session)
             return true

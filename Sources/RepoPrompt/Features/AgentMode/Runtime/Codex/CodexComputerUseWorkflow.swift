@@ -64,8 +64,15 @@ private enum CodexNativeFeatureGate: Hashable {
         return (persistedValue ?? defaultPersistedValue) || environmentFlagEnabled
     }
 
-    func setEnabled(_ value: Bool, defaults: UserDefaults) {
+    func setEnabled(_ value: Bool, defaults: UserDefaults, notification: Notification.Name) {
+        let previousValue = isEnabled(defaults: defaults)
         defaults.set(value, forKey: defaultsKey)
+        Self.postDidChangeIfNeeded(previousValue: previousValue, currentValue: isEnabled(defaults: defaults), notification: notification)
+    }
+
+    static func postDidChangeIfNeeded(previousValue: Bool, currentValue: Bool, notification: Notification.Name) {
+        guard currentValue != previousValue else { return }
+        NotificationCenter.default.post(name: notification, object: nil)
     }
 
     #if DEBUG
@@ -115,14 +122,11 @@ enum CodexGoalSupport {
     }
 
     static func setEnabled(_ value: Bool, defaults: UserDefaults = .standard) {
-        let oldValue = isEnabled(defaults: defaults)
-        CodexNativeFeatureGate.goals.setEnabled(value, defaults: defaults)
-        postDidChangeIfNeeded(previousValue: oldValue, currentValue: isEnabled(defaults: defaults))
+        CodexNativeFeatureGate.goals.setEnabled(value, defaults: defaults, notification: .codexGoalSupportDidChange)
     }
 
     static func postDidChangeIfNeeded(previousValue: Bool, currentValue: Bool) {
-        guard currentValue != previousValue else { return }
-        NotificationCenter.default.post(name: .codexGoalSupportDidChange, object: nil)
+        CodexNativeFeatureGate.postDidChangeIfNeeded(previousValue: previousValue, currentValue: currentValue, notification: .codexGoalSupportDidChange)
     }
 
     #if DEBUG
@@ -245,14 +249,11 @@ enum CodexComputerUseWorkflow {
     }
 
     static func setEnabled(_ value: Bool, defaults: UserDefaults = .standard) {
-        let oldValue = isEnabled(defaults: defaults)
-        CodexNativeFeatureGate.computerUse.setEnabled(value, defaults: defaults)
-        postDidChangeIfNeeded(previousValue: oldValue, currentValue: isEnabled(defaults: defaults))
+        CodexNativeFeatureGate.computerUse.setEnabled(value, defaults: defaults, notification: .codexComputerUseDidChange)
     }
 
     static func postDidChangeIfNeeded(previousValue: Bool, currentValue: Bool) {
-        guard currentValue != previousValue else { return }
-        NotificationCenter.default.post(name: .codexComputerUseDidChange, object: nil)
+        CodexNativeFeatureGate.postDidChangeIfNeeded(previousValue: previousValue, currentValue: currentValue, notification: .codexComputerUseDidChange)
     }
 
     #if DEBUG

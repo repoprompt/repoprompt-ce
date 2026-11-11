@@ -32,7 +32,7 @@ extension AgentModeViewModel {
 
     func ingestNonCodexTurnFinalization(promptTokens: Int?, completionTokens: Int?, contextUsedTokens: Int?, modelContextWindow: Int?, session: TabSession) {
         if usageRuntime.ingestNonCodexTurnFinalization(promptTokens: promptTokens, completionTokens: completionTokens, contextUsedTokens: contextUsedTokens, modelContextWindow: modelContextWindow, session: session) {
-            scheduleSave(for: session)
+            persistenceRuntime.scheduleSave(for: session)
         }
     }
 
@@ -46,7 +46,7 @@ extension AgentModeViewModel {
 
     func startNonCodexTurnAccountingIfNeeded(for session: TabSession, initialMessage: String) {
         if usageRuntime.startNonCodexTurnAccountingIfNeeded(for: session, initialMessage: initialMessage) {
-            scheduleSave(for: session)
+            persistenceRuntime.scheduleSave(for: session)
         }
     }
 
@@ -64,7 +64,7 @@ extension AgentModeViewModel {
 
     func finalizeNonCodexTurnUsageIfNeeded(for session: TabSession, promptTokens: Int?, completionTokens: Int?, contextUsedTokens: Int?) {
         if usageRuntime.finalizeNonCodexTurnUsageIfNeeded(for: session, promptTokens: promptTokens, completionTokens: completionTokens, contextUsedTokens: contextUsedTokens) {
-            scheduleSave(for: session)
+            persistenceRuntime.scheduleSave(for: session)
         }
     }
 

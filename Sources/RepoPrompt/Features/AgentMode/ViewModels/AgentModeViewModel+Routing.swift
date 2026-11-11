@@ -174,7 +174,7 @@ extension AgentModeViewModel {
         repromptedText: String? = nil,
         precomputedRouting: RepromptSpeculation? = nil
     ) async -> UserTurnSubmissionResult {
-        guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session else {
+        guard composerSubmitRuntime.isCurrent(claim), sessions[destinationTabID] === session else {
             return .blocked(message: Self.staleComposerSubmitTargetMessage)
         }
         let configuration = modelRouterSettingsStore.modelRouterConfiguration()
@@ -258,7 +258,7 @@ extension AgentModeViewModel {
         )
 
         let currentConfiguration = modelRouterSettingsStore.modelRouterConfiguration()
-        guard composerSubmitClaimIsCurrent(claim),
+        guard composerSubmitRuntime.isCurrent(claim),
               sessions[destinationTabID] === session,
               currentConfiguration.revision == configuration.revision,
               currentConfiguration.selectedBackendID == backendID,
@@ -284,7 +284,7 @@ extension AgentModeViewModel {
             }
             routedAudit.chosenModelRaw = selected.target.modelRaw
             routedAudit.chosenEffortRaw = selected.target.reasoningEffortRaw
-            guard composerSubmitClaimIsCurrent(claim),
+            guard composerSubmitRuntime.isCurrent(claim),
                   sessions[destinationTabID] === session,
                   modelRouterSettingsStore.modelRouterConfiguration().revision == configuration.revision,
                   freshTaskRoutingEligibility(session: session, text: text)
@@ -304,7 +304,7 @@ extension AgentModeViewModel {
                 restoreRoutingSelection(baseline, on: session)
             } else {
                 session.isDirty = true
-                scheduleSave(for: session.tabID)
+                persistenceRuntime.scheduleSave(for: session.tabID)
                 if currentTabID == session.tabID {
                     syncStatusPillsUIState()
                 }
@@ -331,7 +331,7 @@ extension AgentModeViewModel {
         autoWorkflow: AutoWorkflowTurnSelection? = nil,
         repromptedText: String? = nil
     ) async -> UserTurnSubmissionResult {
-        guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session else {
+        guard composerSubmitRuntime.isCurrent(claim), sessions[destinationTabID] === session else {
             return .blocked(message: Self.staleComposerSubmitTargetMessage)
         }
         guard modelRouterSettingsStore.autoEffortEnabled() else {
@@ -368,7 +368,7 @@ extension AgentModeViewModel {
                 effortAudit.fallbackApplied = true
             }
         }
-        guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session
+        guard composerSubmitRuntime.isCurrent(claim), sessions[destinationTabID] === session
         else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
         if let routerAudit, routerAudit.usageBalancingReason != nil {
             guard modelRouterSettingsStore.modelRouterConfiguration().usageBalancing.enabled,
@@ -782,7 +782,7 @@ extension AgentModeViewModel {
     }
 
     func freshTaskRoutingEligibility(session: TabSession, text: String?) -> Bool {
-        guard isModelRouterEligibleFirstSendDestination(session),
+        guard session.isEmptyFirstSendDestination,
               session.providerSessionID == nil,
               session.codexConversationID == nil,
               session.mcpControlContext == nil,
@@ -796,19 +796,6 @@ extension AgentModeViewModel {
     }
 
     /// Selected prompt workflows still create a brand-new provider session and therefore remain
-    /// Router-owned. The broader first-send helper excludes workflows because it also guards tab
-    /// creation and cleanup, where an empty destination must not yet carry copied pending state.
-    private func isModelRouterEligibleFirstSendDestination(_ session: TabSession) -> Bool {
-        !session.runState.isActive
-            && !session.hasSentFirstMessage
-            && session.runID == nil
-            && session.activeRunAttemptID == nil
-            && session.items.isEmpty
-            && session.transcript.turns.isEmpty
-            && session.pendingFileAttachments.isEmpty
-            && session.pendingTaggedFileAttachments.isEmpty
-    }
-
     private func modelRouterCanRoutePrimarySession(_ configuration: AgentTaskRouterConfiguration) -> Bool {
         guard let backendID = configuration.selectedBackendID,
               modelRouterRuntime?.isBackendReady(backendID) == true

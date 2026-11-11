@@ -132,7 +132,7 @@ extension AgentModeViewModel {
         let candidateIDs = Set(entries.map(\.id))
         var liveTabIDs: Set<UUID> = []
         for id in candidateIDs {
-            liveTabIDs.formUnion(liveSessionTabIDs(for: id))
+            liveTabIDs.formUnion(runtimeSessionStore.liveSessionTabIDs(for: id))
         }
         var presentedElsewhere: Set<UUID> = []
         for carrier in workspaceManager.sessionCarriers(sessionIDs: candidateIDs, tabIDs: liveTabIDs) {

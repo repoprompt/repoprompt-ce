@@ -24,7 +24,7 @@ extension AgentModeViewModel {
         // Move recovery ownership into the pending send, rather than discarding it.
         repromptUIStore.clearSubmittedDraft(submittedRepromptDraft)
         // claim captured the exact original before this clear. Any later typing is a new draft.
-        if composerSubmitClaimIsCurrent(claim) {
+        if composerSubmitRuntime.isCurrent(claim) {
             claim.cancellation.oweDraftRestoration(attempt.rawDraftSnapshot)
             storeDraftText(for: attempt.sourceTabID, "")
         }

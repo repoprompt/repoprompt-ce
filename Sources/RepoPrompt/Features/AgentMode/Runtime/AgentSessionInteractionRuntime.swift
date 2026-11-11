@@ -263,10 +263,8 @@ final class AgentSessionInteractionRuntime {
     func setAutoEditEnabled(_ enabled: Bool, for session: AgentTabSession) -> Task<Void, Never>? {
         guard let scope, let membership = scope.membership(of: session), membership.permitsBindingPreparation else { return nil }
         let command: AgentSessionRuntimeStore.Command?
-        if let sessionID = session.activeAgentSessionID {
-            guard case let .unique(writer) = scope.resolveWriter(sessionID: sessionID),
-                  writer.session === session, writer.scope === scope,
-                  case let .success(admitted) = writer.admitCommand() else { return nil }
+        if session.activeAgentSessionID != nil {
+            guard let admitted = try? scope.admit(session: session) else { return nil }
             command = admitted
         } else { command = nil }
         ensureApprovalSync(for: session)

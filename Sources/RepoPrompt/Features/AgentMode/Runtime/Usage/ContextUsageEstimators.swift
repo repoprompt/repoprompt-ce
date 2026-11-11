@@ -111,6 +111,46 @@ protocol ContextUsageEstimating: AnyObject {
 }
 
 extension ContextUsageEstimating {
+    /// Native occupancy providers do not synthesize queued user-turn estimates.
+    @discardableResult
+    func enqueueUserTurnEstimate(
+        messageForProvider _: String,
+        session _: AgentTabSession
+    ) -> Int {
+        0
+    }
+
+    @discardableResult
+    func replaceNextQueuedUserTurnEstimate(
+        messageForProvider _: String,
+        session _: AgentTabSession
+    ) -> Int? {
+        nil
+    }
+
+    func dequeueQueuedUserTurnEstimate(session _: AgentTabSession) -> Int? {
+        nil
+    }
+
+    func updateSnapshot(
+        from usage: AgentContextUsage?,
+        source: ContextUsageSnapshotSource,
+        confidence: ContextUsageSnapshotConfidence,
+        session: AgentTabSession
+    ) -> ContextUsageSnapshot? {
+        let next = ContextUsageSnapshot.fromAgentContextUsage(
+            usage,
+            source: source,
+            confidence: confidence,
+            compactedAt: session.contextCompactedAt
+        )
+        if session.contextUsageSnapshot != next {
+            session.contextUsageSnapshot = next
+            return next
+        }
+        return nil
+    }
+
     @discardableResult
     func ingestNativeContextUsage(
         _ usage: AgentContextUsage?,

@@ -509,7 +509,7 @@ final class AgentSessionRuntimeStoreTests: XCTestCase {
         vm.test_installLiveSession(session)
         let ownership = session.beginRunAttempt(source: "m9.4.legacy-presentation-policy")
         session.runState = .running
-        vm.test_runPresentationHooks().setAgentRunActive(session, true)
+        vm.runtimeSessionStore.presentation.makeRunHooks().setAgentRunActive(session, true)
         return (vm, session, ownership)
     }
 
@@ -529,12 +529,12 @@ final class AgentSessionRuntimeStoreTests: XCTestCase {
         vm.test_installLiveSession(session)
         XCTAssertEqual(observedPresence.first, false, "Preserve @Published will-change ordering.")
         XCTAssertTrue(vm.sessions[session.tabID] === session)
-        XCTAssertEqual(vm.liveSessionTabIDs(for: sessionID), [session.tabID])
+        XCTAssertEqual(vm.runtimeSessionStore.liveSessionTabIDs(for: sessionID), [session.tabID])
         observedPresence.removeAll()
         vm.test_removeSession(tabID: session.tabID)
         XCTAssertEqual(observedPresence.first, true)
         XCTAssertNil(vm.sessions[session.tabID])
-        XCTAssertTrue(vm.liveSessionTabIDs(for: sessionID).isEmpty)
+        XCTAssertTrue(vm.runtimeSessionStore.liveSessionTabIDs(for: sessionID).isEmpty)
         XCTAssertNil(session.persistentSessionBindingDidChange)
     }
 }

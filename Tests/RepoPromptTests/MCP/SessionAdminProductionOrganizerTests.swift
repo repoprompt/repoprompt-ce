@@ -235,13 +235,13 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
         }
         do { try await body(windows, workspace, tab, target) } catch {
             for window in windows.reversed() {
-                window.agentModeViewModel.test_setBeforeCancellationCommit(nil)
+                window.agentModeViewModel.runService.testBeforeCancellationCommit = nil
                 await window.tearDown()
             }
             throw error
         }
         for window in windows.reversed() {
-            window.agentModeViewModel.test_setBeforeCancellationCommit(nil)
+            window.agentModeViewModel.runService.testBeforeCancellationCommit = nil
             await window.tearDown()
         }
     }
@@ -254,7 +254,7 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
         session.hasLoadedPersistedState = true
         window.agentModeViewModel.test_installLiveSession(session)
         if injectConflictingWriter {
-            XCTAssertEqual(window.agentModeViewModel.test_bindingRejection(sessionID: sessionID, on: session), .conflictingWriter)
+            XCTAssertEqual(window.agentModeViewModel.runtimeSessionStore.bindingRejection(sessionID, on: session), .conflictingWriter)
             XCTAssertNil(window.agentModeViewModel.test_installPersistentSessionBinding(
                 sessionID: sessionID, on: session
             ))
@@ -548,7 +548,7 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
                     let live = windows[1]
                     let session = try installStopRun(in: live, tabID: tab.id, sessionID: target)
                     var cancelledObjects: [ObjectIdentifier] = []
-                    live.agentModeViewModel.test_setBeforeCancellationCommit { candidate in
+                    live.agentModeViewModel.runService.testBeforeCancellationCommit = { candidate in
                         cancelledObjects.append(ObjectIdentifier(candidate))
                     }
                     let ordered = liveFirst ? [live, cold] : [cold, live]
@@ -578,7 +578,7 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
                 let runIDs = sessions.map(\.runID)
                 var cancellationCommits = 0
                 for window in windows {
-                    window.agentModeViewModel.test_setBeforeCancellationCommit { _ in cancellationCommits += 1 }
+                    window.agentModeViewModel.runService.testBeforeCancellationCommit = { _ in cancellationCommits += 1 }
                 }
                 for ordered in [windows, Array(windows.reversed())] {
                     let organizer = OpenWindowsAgentSessionOrganizer(windows: { ordered })
@@ -604,7 +604,7 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
                     let runID = session.runID
                     var cancellationCommits = 0
                     var authorityChecked = false
-                    window.agentModeViewModel.test_setBeforeCancellationCommit { _ in cancellationCommits += 1 }
+                    window.agentModeViewModel.runService.testBeforeCancellationCommit = { _ in cancellationCommits += 1 }
                     let organizer = OpenWindowsAgentSessionOrganizer(windows: { windows })
                     let outcome = await organizer.stopRun(target, isStillAuthorized: {
                         // This callback runs after the target was captured, immediately before claim.
@@ -640,9 +640,9 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
                 let viewModel = window.agentModeViewModel
                 let session = try installStopRun(in: window, tabID: tab.id, sessionID: target)
                 var completedObjects: [ObjectIdentifier] = []
-                viewModel.test_setBeforeCancellationCommit { candidate in
+                viewModel.runService.testBeforeCancellationCommit = { candidate in
                     completedObjects.append(ObjectIdentifier(candidate))
-                    await viewModel.test_publishNaturalCompletion(candidate)
+                    await viewModel.runService.test_publishNaturalCompletion(candidate)
                 }
                 let organizer = OpenWindowsAgentSessionOrganizer(windows: { windows })
                 let outcome = await organizer.stopRun(target, isStillAuthorized: { true })

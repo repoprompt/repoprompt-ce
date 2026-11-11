@@ -1961,20 +1961,20 @@ final class AgentOracleAttachmentForwardingTests: XCTestCase {
         ].joined(separator: "\n")
         for agent in [AgentProviderKind.devin, .codexExec, .grokBuild] {
             XCTAssertEqual(
-                viewModel.renderProviderMessage(text: "what do you see?", attachments: attachments, agent: agent),
+                AgentSessionProviderInputRuntime.renderProviderMessage(text: "what do you see?", attachments: attachments, agent: agent),
                 expected,
                 "\(agent)"
             )
         }
         // Image-only turns carry just the note; text-only turns are unchanged.
         XCTAssertTrue(
-            viewModel.renderProviderMessage(text: "", attachments: attachments, agent: .devin)
+            AgentSessionProviderInputRuntime.renderProviderMessage(text: "", attachments: attachments, agent: .devin)
                 .hasPrefix(AgentModeViewModel.attachmentPathNoteHeader)
         )
-        XCTAssertEqual(viewModel.renderProviderMessage(text: "hi", attachments: [], agent: .devin), "hi")
+        XCTAssertEqual(AgentSessionProviderInputRuntime.renderProviderMessage(text: "hi", attachments: [], agent: .devin), "hi")
         // @path agents keep their existing rendering.
         XCTAssertFalse(
-            viewModel.renderProviderMessage(text: "hi", attachments: attachments, agent: .claudeCode)
+            AgentSessionProviderInputRuntime.renderProviderMessage(text: "hi", attachments: attachments, agent: .claudeCode)
                 .contains(AgentModeViewModel.attachmentPathNoteHeader)
         )
     }
@@ -2268,7 +2268,7 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
         session.runState = .completed
         session.nextSequenceIndex = transcript.nextSequenceIndex
         session.setItemsSilently(AgentTranscriptIO.workingSourceItems(from: transcript), reason: .persistedSessionHydration)
-        viewModel.applyTranscriptPresentation(transcript, to: session, isColdLoad: true)
+        AgentSessionTranscriptRefreshRuntime.applyTranscriptPresentation(transcript, to: session, isColdLoad: true)
         session.isDirty = false
         let mutationGeneration = session.persistenceMutationGeneration
         XCTAssertTrue(session.items.isEmpty, "The request exists only in canonical compacted history")
@@ -2345,7 +2345,7 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
             session.runState = .completed
             session.nextSequenceIndex = transcript.nextSequenceIndex
             session.setItemsSilently([workingRequest], reason: .persistedSessionHydration)
-            viewModel.applyTranscriptPresentation(transcript, to: session, isColdLoad: true)
+            AgentSessionTranscriptRefreshRuntime.applyTranscriptPresentation(transcript, to: session, isColdLoad: true)
 
             viewModel.repairRetainedAttachmentPathsAfterHydration(session, sessionID: sessionID)
             await viewModel.waitForAttachmentRetention()
@@ -2644,7 +2644,7 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
                 XCTAssertEqual(Set(session.pendingFileAttachments.map(\.fileName)), Set(sources.map(\.lastPathComponent)))
                 XCTAssertEqual(session.pendingFileAttachments.count, sources.count)
                 XCTAssertTrue(session.items.contains { $0.kind == .error && $0.text.contains("NotAFile") })
-                let message = viewModel.renderProviderMessage(text: "Inspect these files", attachments: session.pendingFileAttachments, agent: agent)
+                let message = AgentSessionProviderInputRuntime.renderProviderMessage(text: "Inspect these files", attachments: session.pendingFileAttachments, agent: agent)
                 for attachment in session.pendingFileAttachments {
                     guard case let .localFile(path) = attachment.source else { return XCTFail("Expected owned local file") }
                     XCTAssertTrue(message.contains(path), "Non-images must reach the provider as file references, not be silently discarded")

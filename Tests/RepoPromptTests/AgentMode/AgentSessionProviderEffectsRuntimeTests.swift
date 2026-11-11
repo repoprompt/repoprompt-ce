@@ -231,20 +231,20 @@ final class AgentSessionStreamRuntimeTests: XCTestCase {
         _ = session.setRunningStatus("Thinking", source: .reasoning)
         let deltas = ["First line\nInvest", "igating the ", "parser."]
         for delta in deltas {
-            XCTAssertTrue(viewModel.test_applyClaudeReasoningStatusDelta(delta, session: session))
+            XCTAssertTrue(viewModel.streamRuntime.test_applyClaudeReasoningStatusDelta(delta, session: session))
         }
         let fullBlock = deltas.joined()
         XCTAssertEqual(session.claudeReasoningStatusBuffer, fullBlock)
         XCTAssertEqual(session.runningStatusText, "Investigating the parser.")
 
         // The translator can emit the complete multiline thinking block after its chunks.
-        XCTAssertFalse(viewModel.test_applyClaudeReasoningStatusDelta(fullBlock, session: session))
+        XCTAssertFalse(viewModel.streamRuntime.test_applyClaudeReasoningStatusDelta(fullBlock, session: session))
         XCTAssertEqual(session.runningStatusText, "Investigating the parser.")
 
         let oversizedDelta = String(repeating: "🧠", count: 4000) + "\nLatest "
-        XCTAssertTrue(viewModel.test_applyClaudeReasoningStatusDelta(oversizedDelta, session: session))
+        XCTAssertTrue(viewModel.streamRuntime.test_applyClaudeReasoningStatusDelta(oversizedDelta, session: session))
         XCTAssertEqual(session.claudeReasoningStatusBuffer.count, 4000)
-        XCTAssertTrue(viewModel.test_applyClaudeReasoningStatusDelta("bounded line", session: session))
+        XCTAssertTrue(viewModel.streamRuntime.test_applyClaudeReasoningStatusDelta("bounded line", session: session))
         XCTAssertEqual(session.claudeReasoningStatusBuffer, String((oversizedDelta + "bounded line").suffix(4000)))
         XCTAssertEqual(session.claudeReasoningStatusBuffer.count, 4000)
         XCTAssertEqual(session.runningStatusText, "Latest bounded line")
@@ -1594,7 +1594,7 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
                 fatalError("Composing terminal hooks must not launch a provider")
             }
         )
-        viewModel?.ensureRunServiceMaterializedForRunStart()
+        _ = viewModel?.runService
         let runtime = try XCTUnwrap(viewModel?.interactionRuntime)
         weak let codex = viewModel?.codexCoordinator
         weak let claude = runtime.claudeCommands

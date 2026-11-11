@@ -578,7 +578,7 @@ extension AgentSessionLinkExecutionRuntime {
             session.noteAcceptedTaskInput() // Periodic turns never gain routine origin.
             return true
         }
-        if attempt.phase == .cancelledBeforeDispatch {
+        @MainActor func abandonPendingWake() {
             if let claim = agentSessionLinkPromptClaimStore.pendingClaim(
                 dispatchID: effectiveID,
                 observerSessionID: attempt.observerEndpoint.sessionID
@@ -589,6 +589,9 @@ extension AgentSessionLinkExecutionRuntime {
             session.oversight.pendingAutoWake = nil
             requestUIRefresh(tabID: session.tabID)
             agentSessionLinkDrainAutoWakeReevaluationIfOwed(session: session)
+        }
+        if attempt.phase == .cancelledBeforeDispatch {
+            abandonPendingWake()
             return false
         }
         guard attempt.phase == .preparingDispatch || attempt.phase == .dispatching else {
@@ -614,16 +617,7 @@ extension AgentSessionLinkExecutionRuntime {
             // consult it: the physical call may already have happened, so retracting the identity
             // here would report "no call" for a turn the provider is running.
             guard agentSessionLinkAutoWakeAttemptIsStillEligible(attempt, session: session) else {
-                if let claim = agentSessionLinkPromptClaimStore.pendingClaim(
-                    dispatchID: effectiveID,
-                    observerSessionID: attempt.observerEndpoint.sessionID
-                ) {
-                    agentSessionLinkPromptClaimStore.abandon(claim)
-                }
-                attempt.task?.cancel()
-                session.oversight.pendingAutoWake = nil
-                requestUIRefresh(tabID: session.tabID)
-                agentSessionLinkDrainAutoWakeReevaluationIfOwed(session: session)
+                abandonPendingWake()
                 return false
             }
             guard let claim = agentSessionLinkPromptClaimStore.pendingClaim(
@@ -842,6 +836,17 @@ extension AgentSessionLinkExecutionRuntime {
         }
     }
 
+    private func pendingWakeForPhysicalDispatch(
+        session: TabSession, dispatchID: AgentSessionLinkPromptDispatchID
+    ) -> AgentSessionLinkAutoWakeAttempt? {
+        guard commands.isAvailable() else { return nil }
+        let effectiveID = agentSessionLinkEffectiveDispatchID(for: session, dispatchID: dispatchID)
+        guard let wakeID = effectiveID.autoWakeID,
+              let attempt = session.oversight.pendingAutoWake,
+              attempt.wakeID == wakeID else { return nil }
+        return attempt
+    }
+
     /// Settles a prepared wake when the provider path definitively exits before its transport call.
     ///
     /// Idempotent by wake identity. It installs no failure suppression, because the provider received
@@ -850,11 +855,7 @@ extension AgentSessionLinkExecutionRuntime {
         for session: TabSession,
         dispatchID: AgentSessionLinkPromptDispatchID
     ) {
-        guard commands.isAvailable() else { return }
-        let effectiveID = agentSessionLinkEffectiveDispatchID(for: session, dispatchID: dispatchID)
-        guard let wakeID = effectiveID.autoWakeID,
-              let attempt = session.oversight.pendingAutoWake,
-              attempt.wakeID == wakeID,
+        guard let attempt = pendingWakeForPhysicalDispatch(session: session, dispatchID: dispatchID),
               attempt.phase != .dispatching,
               attempt.physicalOutcome == .notAttempted
         else {
@@ -877,11 +878,7 @@ extension AgentSessionLinkExecutionRuntime {
         for session: TabSession,
         dispatchID: AgentSessionLinkPromptDispatchID
     ) {
-        guard commands.isAvailable() else { return }
-        let effectiveID = agentSessionLinkEffectiveDispatchID(for: session, dispatchID: dispatchID)
-        guard let wakeID = effectiveID.autoWakeID,
-              let attempt = session.oversight.pendingAutoWake,
-              attempt.wakeID == wakeID,
+        guard let attempt = pendingWakeForPhysicalDispatch(session: session, dispatchID: dispatchID),
               attempt.physicalOutcome == .ambiguous
         else {
             return

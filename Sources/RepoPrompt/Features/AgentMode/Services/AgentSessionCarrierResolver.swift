@@ -236,7 +236,7 @@ enum AgentSessionCarrierResolver {
                     snapshot.metadata[id, default: []].append(MetadataObservation(window: window, workspaceID: workspace.id, entry: entry))
                     snapshot.sessionIDs.insert(id)
                 }
-                let liveTabIDs = vm.liveSessionTabIDs(for: id)
+                let liveTabIDs = vm.runtimeSessionStore.liveSessionTabIDs(for: id)
                 tabIDs.formUnion(liveTabIDs)
                 for tabID in liveTabIDs {
                     // Re-read the live object after the maintained reverse lookup.

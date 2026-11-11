@@ -9,7 +9,7 @@ extension AgentModeViewModel {
         guard ownerValidatedSessionListCacheReady,
               let promptManager,
               let workspaceID = workspaceManager?.activeWorkspace?.id,
-              sidebarAutoArchiveOwner(workspaceID: workspaceID) != nil
+              sessionIndexStore.sidebarAutoArchiveOwner(workspaceID: workspaceID) != nil
         else {
             return .empty(evaluatedSessionCount: 0)
         }

@@ -118,15 +118,7 @@ extension AgentModeViewModel {
             && !session.isMCPOriginated
             && session.parentSessionID == nil
             && !session.pendingHandoff.hasPayload
-            && !session.hasSentFirstMessage
-            && session.runState == .idle
-            && session.runID == nil
-            && session.activeRunAttemptID == nil
-            && session.providerSessionID == nil
-            && session.codexConversationID == nil
-            && session.worktreeBindings.isEmpty
-            && session.items.isEmpty
-            && session.transcript.turns.isEmpty
+            && session.hasEmptyIdleExecutionLocation
     }
 
     private func executionLocationMutationDisabledReason(for session: TabSession) -> String? {

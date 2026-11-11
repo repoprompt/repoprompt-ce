@@ -74,7 +74,7 @@ extension AgentModeViewModel {
         if sessionChanged {
             session.isDirty = true
             updateBindingsFromSession(session)
-            scheduleSave(for: tabID)
+            persistenceRuntime.scheduleSave(for: tabID)
         }
         let existingDraft = retrieveDraftText(for: tabID)
         let composedDraft = AgentComposerDraftRestorationReducer.compose(
@@ -186,7 +186,7 @@ extension AgentModeViewModel {
         let targetAgent = session?.selectedAgent ?? (tabID == currentTabID ? selectedAgent : nil)
         guard targetAgent == .codexExec else { return nil }
         let draftText = draftTextOverride ?? session?.draftText ?? tabDraftText[tabID] ?? ""
-        guard let token = Self.extractSlashSkillTokens(from: draftText).first else { return nil }
+        guard let token = AgentSessionProviderInputRuntime.extractSlashSkillTokens(from: draftText).first else { return nil }
         let normalizedName = token.name.lowercased()
         guard normalizedName == CodexAgentModeCoordinator.NativeSlashCommand.goal.rawValue else { return nil }
         let argumentsText = (draftText as NSString)
@@ -295,7 +295,7 @@ extension AgentModeViewModel {
             session.appendItem(AgentChatItem.error(message, sequenceIndex: session.nextSequenceIndex))
         }
         updateBindingsFromSession(session)
-        scheduleSave(for: session)
+        persistenceRuntime.scheduleSave(for: session)
     }
 
     /// Publishes into the exact session the admission fence just revalidated; it never looks the tab up
@@ -306,7 +306,7 @@ extension AgentModeViewModel {
         session.pendingFileAttachments.append(contentsOf: outcome.imported)
         session.isDirty = true
         updateBindingsFromSession(session)
-        scheduleSave(for: session)
+        persistenceRuntime.scheduleSave(for: session)
     }
 
     private nonisolated static func importAttachments(
@@ -441,7 +441,7 @@ extension AgentModeViewModel {
         let session = session(for: tabID)
         session.appendItem(AgentChatItem.error(reason.message, sequenceIndex: session.nextSequenceIndex))
         updateBindingsFromSession(session)
-        scheduleSave(for: tabID)
+        persistenceRuntime.scheduleSave(for: tabID)
     }
 
     func removePendingFileAttachment(tabID: UUID, attachmentID: UUID) {
@@ -453,7 +453,7 @@ extension AgentModeViewModel {
         }
         session.isDirty = true
         updateBindingsFromSession(session)
-        scheduleSave(for: tabID)
+        persistenceRuntime.scheduleSave(for: tabID)
     }
 
     func clearPendingFileAttachments(tabID: UUID) {
@@ -464,13 +464,13 @@ extension AgentModeViewModel {
         session.pendingFileAttachments.removeAll()
         session.isDirty = true
         updateBindingsFromSession(session)
-        scheduleSave(for: tabID)
+        persistenceRuntime.scheduleSave(for: tabID)
     }
 
     func addPendingTaggedFile(tabID: UUID, relativePath: String, displayName: String? = nil) {
         let trimmedPath = relativePath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedPath.isEmpty else { return }
-        let normalizedPath = Self.unescapeTaggedPath(trimmedPath)
+        let normalizedPath = AgentSessionProviderInputRuntime.unescapeTaggedPath(trimmedPath)
         let session = session(for: tabID)
         if session.pendingTaggedFileAttachments.contains(where: { $0.relativePath == normalizedPath }) {
             return
@@ -482,12 +482,12 @@ extension AgentModeViewModel {
         )
         session.isDirty = true
         updateBindingsFromSession(session)
-        scheduleSave(for: tabID)
+        persistenceRuntime.scheduleSave(for: tabID)
     }
 
     @MainActor
     func commitPendingTaggedFile(tabID: UUID, relativePath: String, displayName: String? = nil) {
-        let normalizedPath = Self.unescapeTaggedPath(relativePath)
+        let normalizedPath = AgentSessionProviderInputRuntime.unescapeTaggedPath(relativePath)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedPath.isEmpty else { return }
         addPendingTaggedFile(tabID: tabID, relativePath: normalizedPath, displayName: displayName)
@@ -505,23 +505,23 @@ extension AgentModeViewModel {
         }
         session.isDirty = true
         updateBindingsFromSession(session)
-        scheduleSave(for: tabID)
+        persistenceRuntime.scheduleSave(for: tabID)
     }
 
     func syncPendingTaggedFilesFromDraft(tabID: UUID, text: String) {
         let session = session(for: tabID)
         guard !session.pendingTaggedFileAttachments.isEmpty else { return }
-        let tokens = Set(Self.extractTaggedPaths(from: text).map(Self.unescapeTaggedPath(_:)))
+        let tokens = Set(AgentSessionProviderInputRuntime.extractTaggedPaths(from: text).map(AgentSessionProviderInputRuntime.unescapeTaggedPath(_:)))
         let beforeCount = session.pendingTaggedFileAttachments.count
         session.pendingTaggedFileAttachments.removeAll { attachment in
-            let normalizedPath = Self.unescapeTaggedPath(attachment.relativePath)
-            let normalizedDisplayName = Self.unescapeTaggedPath(attachment.displayName)
+            let normalizedPath = AgentSessionProviderInputRuntime.unescapeTaggedPath(attachment.relativePath)
+            let normalizedDisplayName = AgentSessionProviderInputRuntime.unescapeTaggedPath(attachment.displayName)
             return !tokens.contains(normalizedPath) && !tokens.contains(normalizedDisplayName)
         }
         guard session.pendingTaggedFileAttachments.count != beforeCount else { return }
         session.isDirty = true
         updateBindingsFromSession(session)
-        scheduleSave(for: tabID)
+        persistenceRuntime.scheduleSave(for: tabID)
     }
 
     private func attachmentWorkspaceDirectoryURL() -> URL? {

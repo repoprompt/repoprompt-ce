@@ -74,7 +74,7 @@ final class AgentSessionStreamRuntime {
         private static func claudeReasoningDebug(_ message: @autoclosure () -> String) {}
     #endif
 
-    private static func claudeReasoningDebugSnippet(_ text: String, limit: Int = 160) -> String {
+    static func claudeReasoningDebugSnippet(_ text: String, limit: Int = 160) -> String {
         text
             .replacingOccurrences(of: "\n", with: "\\n")
             .replacingOccurrences(of: "\r", with: "\\r")
@@ -294,6 +294,18 @@ final class AgentSessionStreamRuntime {
                   session.isCurrentRunAttemptForCurrentBinding(owner) else { return }
             session.noteAcceptedStream(result, owner: owner)
             var shouldUpdateBindings = false
+            @MainActor func consumedProviderToolEvent(_ toolName: String) -> Bool {
+                flushPendingAssistantDelta(session)
+                endActiveAssistantSegment(session)
+                endActiveReasoningSegment(session)
+                if runService?.handleProviderToolStreamEvent(result, session: session) == true {
+                    shouldUpdateBindings = true
+                    return true
+                }
+                return AgentToolTrackingSupport.shouldSuppressProviderToolEvent(
+                    toolName: toolName, invocationID: result.toolInvocationID
+                )
+            }
             switch result.type {
             case "content":
                 // Normal content text
@@ -366,20 +378,7 @@ final class AgentSessionStreamRuntime {
                 // reasoning update or cleared when assistant content starts.
                 guard let toolName = result.toolName else { break }
                 let argsJSON = result.toolArgsJSON ?? result.toolArgs
-                flushPendingAssistantDelta(session)
-                endActiveAssistantSegment(session)
-                endActiveReasoningSegment(session)
-                // Route provider-specific tool events through dedicated handlers.
-                if runService?.handleProviderToolStreamEvent(result, session: session) == true {
-                    shouldUpdateBindings = true
-                    break
-                }
-                if AgentToolTrackingSupport.shouldSuppressProviderToolEvent(
-                    toolName: toolName,
-                    invocationID: result.toolInvocationID
-                ) {
-                    break
-                }
+                if consumedProviderToolEvent(toolName) { break }
                 usage.addToolInputTokens(argsJSON, for: session)
                 guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { break }
                 if AgentToolTrackingSupport.shouldAutoCompleteProviderToolCall(
@@ -411,20 +410,7 @@ final class AgentSessionStreamRuntime {
                 guard let toolName = result.toolName else { break }
                 let outputJSON = result.toolResultJSON ?? result.toolOutput ?? ""
                 let argsJSON = result.toolArgsJSON ?? result.toolArgs
-                flushPendingAssistantDelta(session)
-                endActiveAssistantSegment(session)
-                endActiveReasoningSegment(session)
-                // Route provider-specific tool events through dedicated handlers.
-                if runService?.handleProviderToolStreamEvent(result, session: session) == true {
-                    shouldUpdateBindings = true
-                    break
-                }
-                if AgentToolTrackingSupport.shouldSuppressProviderToolEvent(
-                    toolName: toolName,
-                    invocationID: result.toolInvocationID
-                ) {
-                    break
-                }
+                if consumedProviderToolEvent(toolName) { break }
                 usage.addToolOutputTokens(outputJSON, for: session)
                 guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { break }
                 let invocationID = result.toolInvocationID

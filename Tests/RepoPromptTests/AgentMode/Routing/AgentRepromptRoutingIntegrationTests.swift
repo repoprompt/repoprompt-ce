@@ -239,7 +239,7 @@ final class AgentRepromptTestFixture {
     /// callers still establish (or deliberately withhold) payload restoration themselves.
     func installPersistentWriter() throws {
         let sessionID = UUID()
-        XCTAssertNil(viewModel.test_bindingRejection(sessionID: sessionID, on: session))
+        XCTAssertNil(viewModel.runtimeSessionStore.bindingRejection(sessionID, on: session))
         session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: UUID()))
         guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: sessionID) else {
             throw NSError(domain: "AgentRepromptTestFixture.writer", code: 1)

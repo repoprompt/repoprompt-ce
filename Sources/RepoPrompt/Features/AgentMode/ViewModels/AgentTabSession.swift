@@ -269,6 +269,65 @@ final class AgentTabSession: ObservableObject {
     }
 
     @Published var runningStatusText: String? = nil
+
+    /// Mutates the shared status value; each provider retains its own publication policy.
+    /// Shared prompt/approval observations, in their original subscription order.
+    func interactionStatePublishers(includeHookGate: Bool) -> [AnyPublisher<Void, Never>] {
+        var publishers: [AnyPublisher<Void, Never>] = [
+            $waitingPrompt.map { _ in () }.eraseToAnyPublisher(),
+            $pendingAskUser.map { _ in () }.eraseToAnyPublisher(),
+            $pendingUserInputRequest.map { _ in () }.eraseToAnyPublisher(),
+            $pendingApproval.map { _ in () }.eraseToAnyPublisher()
+        ]
+        if includeHookGate {
+            publishers += [
+                $pendingCodexHookReview.map { _ in () }.eraseToAnyPublisher(),
+                $codexHookGateAudit.map { _ in () }.eraseToAnyPublisher()
+            ]
+        }
+        return publishers + [
+            $pendingPermissionsRequest.map { _ in () }.eraseToAnyPublisher(),
+            $pendingMCPElicitationRequest.map { _ in () }.eraseToAnyPublisher(),
+            $pendingApplyEditsReview.map { _ in () }.eraseToAnyPublisher(),
+            $pendingWorktreeMergeReview.map { _ in () }.eraseToAnyPublisher()
+        ]
+    }
+
+    /// Empty input destination; workflows are deliberately checked by the caller.
+    var isEmptyFirstSendDestination: Bool {
+        !runState.isActive
+            && !hasSentFirstMessage
+            && runID == nil
+            && activeRunAttemptID == nil
+            && items.isEmpty
+            && transcript.turns.isEmpty
+            && pendingFileAttachments.isEmpty
+            && pendingTaggedFileAttachments.isEmpty
+    }
+
+    /// Unstarted execution state, independent of host, handoff and preparation eligibility.
+    var hasEmptyIdleExecutionLocation: Bool {
+        !hasSentFirstMessage
+            && runState == .idle
+            && runID == nil
+            && activeRunAttemptID == nil
+            && providerSessionID == nil
+            && codexConversationID == nil
+            && worktreeBindings.isEmpty
+            && items.isEmpty
+            && transcript.turns.isEmpty
+    }
+
+    func updateRunningStatus(_ text: String?, source: RunningStatusSource?) -> Bool {
+        let normalized = text?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let value = (normalized?.isEmpty == false) ? normalized : nil
+        let normalizedSource = value == nil ? nil : source
+        guard runningStatusText != value || runningStatusSource != normalizedSource else { return false }
+        runningStatusText = value
+        runningStatusSource = normalizedSource
+        return true
+    }
+
     /// Ephemeral cancellation generation and managed-stop gate; never persisted.
     var stopState = AgentRunStopState() {
         didSet {

@@ -149,6 +149,16 @@ final class AgentSessionLinkExecutionRuntime {
         return await commands.start(session, initialMessage, directStartOptions, startOutcome, providerSwitchPreparation)
     }
 
+    func claimEmptyComposer(for candidate: AgentSessionLinkEndpointCandidate, session: TabSession) -> AgentComposerSubmitClaim? {
+        guard let target = makeComposerSubmitTarget(tabID: candidate.tabID, session: session),
+              target.route == .existingAgentSession,
+              target.expectedSourceAgentSessionID == candidate.sessionID else { return nil }
+        // Cross-session input never owns or clears the local composer's draft.
+        return claimComposerSubmitAttempt(AgentComposerSubmitAttempt(
+            id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: ""
+        ))
+    }
+
     func makeComposerSubmitTarget(tabID: UUID?, session: AgentTabSession?) -> AgentComposerSubmitTarget? {
         guard let scope, let tabID, let session = session ?? scope.sessions[tabID],
               session.tabID == tabID, let command = try? scope.admit(session: session) else { return nil }

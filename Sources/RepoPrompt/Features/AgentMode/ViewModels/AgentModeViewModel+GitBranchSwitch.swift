@@ -79,7 +79,7 @@ extension AgentModeViewModel {
             updateWorktreeBindingSummariesInIndex(for: session)
             syncSidebarUIState(refresh: true, reason: .metadataUpdated)
             syncStatusPillsUIState()
-            scheduleSave(for: session.tabID)
+            persistenceRuntime.scheduleSave(for: session.tabID)
             requestUIRefresh(tabID: session.tabID, urgent: true)
         }
         if didUpdateBinding {

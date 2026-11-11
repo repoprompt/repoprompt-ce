@@ -835,7 +835,7 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         fixture.session.runState = .running
         fixture.session.installRunID(UUID())
         _ = fixture.session.beginRunAttempt(source: "completed-before-local-stop")
-        await fixture.viewModel.test_publishNaturalCompletion(fixture.session)
+        await fixture.viewModel.runService.test_publishNaturalCompletion(fixture.session)
         let revision = try XCTUnwrap(fixture.session.lastTerminalCommitRevision)
         XCTAssertEqual(revision.terminalState, .completed)
         fixture.session.pendingInstructions = ["queued local follow-up"]
@@ -860,10 +860,10 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         fixture.session.runState = .running
         fixture.session.installRunID(UUID())
         _ = fixture.session.beginRunAttempt(source: "natural-completion-after-admission")
-        fixture.viewModel.test_setBeforeCancellationCommit { session in
-            await fixture.viewModel.test_publishNaturalCompletion(session)
+        fixture.viewModel.runService.testBeforeCancellationCommit = { session in
+            await fixture.viewModel.runService.test_publishNaturalCompletion(session)
         }
-        defer { fixture.viewModel.test_setBeforeCancellationCommit(nil) }
+        defer { fixture.viewModel.runService.testBeforeCancellationCommit = nil }
         guard case let .settled(receipt) = await stop(fixture) else { return XCTFail("expected receipt") }
         XCTAssertEqual(receipt.result, .notRunning)
         XCTAssertEqual(receipt.stopRequested, true)

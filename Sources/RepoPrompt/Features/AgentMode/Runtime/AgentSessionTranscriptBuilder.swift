@@ -128,6 +128,16 @@ enum AgentSessionTranscriptBuilder {
         )
         let localDisplayTranscript = AgentTranscriptIO.stagingQuietCandidate(quietDisplayCandidate, in: sanitizedTranscript)
         let projectionReusableTurnCount = AgentTranscriptIO.validatedReusableFrozenPrefixTurnCount(in: localDisplayTranscript) ?? 0
+        func rebuildProjection() -> AgentTranscriptProjectionBuildResult {
+            AgentTranscriptProjectionBuilder.buildWithCaches(
+                from: localDisplayTranscript,
+                protection: projectionProtection,
+                turnCaches: previousTurnProjectionCaches,
+                context: processingContext,
+                excludingQuiet: true,
+                replyPresentation: true
+            )
+        }
         let baseProjection: AgentTranscriptProjection
         let updatedTurnProjectionCaches: [UUID: AgentTranscriptTurnProjectionCache]
         if projectionReusableTurnCount > 0,
@@ -159,14 +169,7 @@ enum AgentSessionTranscriptBuilder {
                     performanceSnapshot.lastProjectionReusedTurnCount = projectionReusableTurnCount
                 #endif
             } else {
-                let buildResult = AgentTranscriptProjectionBuilder.buildWithCaches(
-                    from: localDisplayTranscript,
-                    protection: projectionProtection,
-                    turnCaches: previousTurnProjectionCaches,
-                    context: processingContext,
-                    excludingQuiet: true,
-                    replyPresentation: true
-                )
+                let buildResult = rebuildProjection()
                 baseProjection = buildResult.projection
                 updatedTurnProjectionCaches = buildResult.updatedTurnCaches
                 #if DEBUG || EDIT_FLOW_PERF
@@ -175,14 +178,7 @@ enum AgentSessionTranscriptBuilder {
                 #endif
             }
         } else {
-            let buildResult = AgentTranscriptProjectionBuilder.buildWithCaches(
-                from: localDisplayTranscript,
-                protection: projectionProtection,
-                turnCaches: previousTurnProjectionCaches,
-                context: processingContext,
-                excludingQuiet: true,
-                replyPresentation: true
-            )
+            let buildResult = rebuildProjection()
             baseProjection = buildResult.projection
             updatedTurnProjectionCaches = buildResult.updatedTurnCaches
             #if DEBUG || EDIT_FLOW_PERF

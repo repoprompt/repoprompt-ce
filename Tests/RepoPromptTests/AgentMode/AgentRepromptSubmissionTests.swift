@@ -125,7 +125,7 @@ final class AgentRepromptSubmissionTests: XCTestCase {
         XCTAssertTrue(vm.ui.composer.hasPendingSubmission(tabID: tabID))
         vm.storeDraftText(for: tabID, "Next draft")
         await vm.cancelPresentedComposerSubmission(id: attempt.id)
-        XCTAssertFalse(vm.composerSubmitClaimIsCurrent(claim))
+        XCTAssertFalse(vm.composerSubmitRuntime.isCurrent(claim))
         XCTAssertFalse(vm.ui.composer.hasPendingSubmission(tabID: tabID))
         XCTAssertEqual(vm.retrieveDraftText(for: tabID), "Pending message\nNext draft")
         // Loading the restored text acknowledges its ledger fragment, as the real editor does
@@ -140,7 +140,7 @@ final class AgentRepromptSubmissionTests: XCTestCase {
         defer { vm.finishPresentedComposerSubmitAttempt(retryClaim, result: .blocked(message: "test cleanup")) }
         let result = await vm.executePresentedComposerSubmitAttempt(text: "Pending message", claim: claim)
         guard case .blocked = result else { return XCTFail("Cancelled claim must not dispatch") }
-        XCTAssertTrue(vm.composerSubmitClaimIsCurrent(retryClaim), "Late cleanup must not release the retry's claim")
+        XCTAssertTrue(vm.composerSubmitRuntime.isCurrent(retryClaim), "Late cleanup must not release the retry's claim")
         XCTAssertEqual(vm.retrieveDraftText(for: tabID), "")
         XCTAssertEqual(vm.ui.composer.pendingSubmissions[retryAttempt.id]?.text, "Pending message\nNext draft")
         XCTAssertTrue(fixture.session.items.isEmpty)

@@ -154,7 +154,7 @@ final class AgentSessionLinkCanonicalTranscriptTests: XCTestCase {
             let canonical = AgentTranscriptCompactor.compact(seed)
             f.session.setItemsSilentlyForRetentionCompaction(AgentTranscriptIO.workingSourceItems(from: canonical))
             f.session.nextSequenceIndex = canonical.nextSequenceIndex
-            vm.applyTranscriptPresentation(canonical, to: f.session)
+            AgentSessionTranscriptRefreshRuntime.applyTranscriptPresentation(canonical, to: f.session)
             // Settle the ordinary multi-turn source import before freezing the canonical
             // input. Separate per-turn seeds still carry a completed terminalState on the
             // old turn; the normal source owner finalizes prior turns with nil state.

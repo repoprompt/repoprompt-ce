@@ -67,7 +67,7 @@ extension AgentModeViewModel {
         }
         let balancingBaseline = AgentRoutingExecutableTarget(agentRaw: baseline.agentRaw, modelRaw: baseline.modelRaw, reasoningEffortRaw: effectiveEffort, modelParameters: baseline.modelParameters)
         guard freshTaskRoutingEligibility(session: session, text: text),
-              composerSubmitClaimIsCurrent(claim),
+              composerSubmitRuntime.isCurrent(claim),
               let decision = localUsageDecision(basedOn: balancingBaseline, scope: .primarySession, surface: .general),
               applyRoutingTarget(decision.candidate, to: session)
         else {
@@ -83,7 +83,7 @@ extension AgentModeViewModel {
             restoreUsageStartingTarget(baseline, on: session)
         } else if result == .submitted {
             session.isDirty = true
-            scheduleSave(for: session.tabID)
+            persistenceRuntime.scheduleSave(for: session.tabID)
         }
         return result
     }

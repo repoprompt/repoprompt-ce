@@ -635,11 +635,11 @@ struct AgentExploreMCPToolService {
         var snapshots: [AgentRunMCPSnapshot] = []
         snapshots.reserveCapacity(sessionIDs.count)
         for sessionID in sessionIDs {
-            if let registration = agentModeVM.mcpRegistration(sessionID: sessionID),
+            if let registration = agentModeVM.mcpRuntime.registration(sessionID: sessionID),
                let liveSnapshot = agentModeVM.mcpSnapshot(registration: registration)
             {
                 snapshots.append(liveSnapshot)
-            } else if let registration = agentModeVM.mcpRegistration(sessionID: sessionID),
+            } else if let registration = agentModeVM.mcpRuntime.registration(sessionID: sessionID),
                       let storedSnapshot = await AgentRunSessionStore.snapshot(for: registration)
             {
                 snapshots.append(storedSnapshot)

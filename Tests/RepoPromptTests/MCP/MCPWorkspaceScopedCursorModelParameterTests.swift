@@ -627,7 +627,7 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
         var steerService = makeRunService(window: window)
         steerService.testDispatchSteerInstruction = { dispatchedSessionID, _, _, agentModeVM in
             XCTAssertEqual(dispatchedSessionID, sessionID)
-            let controlledSession = try XCTUnwrap(agentModeVM.mcpControlledSession(sessionID: dispatchedSessionID))
+            let controlledSession = try XCTUnwrap(agentModeVM.mcpRuntime.controlledWriter(sessionID: dispatchedSessionID)?.session)
             XCTAssertTrue(controlledSession.mcpFollowUpRunPending)
             controlledSession.runState = .running
             agentModeVM.publishMCPStateChange(for: controlledSession)
@@ -1088,7 +1088,7 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
         let viewModel = window.agentModeViewModel
         let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
         let sessionID = UUID()
-        XCTAssertNil(viewModel.test_bindingRejection(sessionID: sessionID, on: session))
+        XCTAssertNil(viewModel.runtimeSessionStore.bindingRejection(sessionID, on: session))
         _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
             sessionID: sessionID, on: session, compareAndSetInWorkspaceID: workspaceID
         ))

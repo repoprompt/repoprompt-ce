@@ -580,7 +580,7 @@ extension AgentModeViewModel {
         guard session.oversight.autoWakeOnUpdates != enabled else { return true }
         session.oversight.autoWakeOnUpdates = enabled
         session.isDirty = true
-        scheduleSave(for: endpoint.tabID)
+        persistenceRuntime.scheduleSave(for: endpoint.tabID)
         if var entry = ownerValidatedSessionIndex[endpoint.sessionID] {
             entry.autoWakeOnOversightUpdates = enabled
             sessionIndexStore.applyLocalUpsert(entry)
@@ -614,7 +614,7 @@ extension AgentModeViewModel {
         guard session.oversight.autoWakeTargetSessionIDs != targetSessionIDs else { return true }
         session.oversight.autoWakeTargetSessionIDs = targetSessionIDs
         session.isDirty = true
-        scheduleSave(for: endpoint.tabID)
+        persistenceRuntime.scheduleSave(for: endpoint.tabID)
         if var entry = ownerValidatedSessionIndex[endpoint.sessionID] {
             entry.agentSessionLinkAutoWakeTargetSessionIDs = targetSessionIDs
             sessionIndexStore.applyLocalUpsert(entry)
@@ -653,7 +653,7 @@ extension AgentModeViewModel {
         session.oversight.routineWakeIntervalEnabled = enabled
         session.oversight.routineWakeIntervalSeconds = normalizedSeconds
         session.isDirty = true
-        scheduleSave(for: endpoint.tabID)
+        persistenceRuntime.scheduleSave(for: endpoint.tabID)
         if var entry = ownerValidatedSessionIndex[endpoint.sessionID] {
             entry.routineWakeIntervalEnabled = enabled
             entry.routineWakeIntervalSeconds = normalizedSeconds
@@ -686,7 +686,7 @@ extension AgentModeViewModel {
         session.oversight.periodicIdleWakeEnabled = enabled
         session.oversight.periodicIdleWakeIntervalSeconds = normalizedSeconds
         session.isDirty = true
-        scheduleSave(for: endpoint.tabID)
+        persistenceRuntime.scheduleSave(for: endpoint.tabID)
         if var entry = ownerValidatedSessionIndex[endpoint.sessionID] {
             entry.periodicIdleWakeEnabled = enabled
             entry.periodicIdleWakeIntervalSeconds = normalizedSeconds
@@ -873,15 +873,8 @@ extension AgentModeViewModel {
 
         let publishers: [AnyPublisher<Void, Never>] = [
             session.$runState.map { _ in () }.eraseToAnyPublisher(),
-            session.$items.map { _ in () }.eraseToAnyPublisher(),
-            session.$waitingPrompt.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingAskUser.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingUserInputRequest.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingApproval.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingPermissionsRequest.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingMCPElicitationRequest.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingApplyEditsReview.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingWorktreeMergeReview.map { _ in () }.eraseToAnyPublisher(),
+            session.$items.map { _ in () }.eraseToAnyPublisher()
+        ] + session.interactionStatePublishers(includeHookGate: false) + [
             session.monitorObservationSignal.eraseToAnyPublisher(),
             agentSessionLinkSubagentCensusChanged
                 .filter { $0.contains(candidate.sessionID) }

@@ -801,7 +801,7 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
                         sessionID: sessionID, on: session, updateWorkspaceMetadata: true
                     ))
                 } else {
-                    XCTAssertEqual(window.agentModeViewModel.test_bindingRejection(sessionID: sessionID, on: session), .conflictingWriter)
+                    XCTAssertEqual(window.agentModeViewModel.runtimeSessionStore.bindingRejection(sessionID, on: session), .conflictingWriter)
                     XCTAssertNil(window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session))
                     XCTAssertNil(session.persistentSessionBindingIdentity)
                     // Discovery still diagnoses legacy corruption, even though normal installation
@@ -852,7 +852,7 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             let duplicateTabID = UUID()
             workspace.workspaces[0].composeTabs.append(ComposeTabState(id: duplicateTabID, name: "Duplicate", activeAgentSessionID: sessionID))
             let duplicate = vm.session(for: duplicateTabID)
-            XCTAssertEqual(vm.test_bindingRejection(sessionID: sessionID, on: duplicate), .conflictingWriter)
+            XCTAssertEqual(vm.runtimeSessionStore.bindingRejection(sessionID, on: duplicate), .conflictingWriter)
             XCTAssertNil(vm.test_installPersistentSessionBinding(sessionID: sessionID, on: duplicate))
             XCTAssertNil(duplicate.persistentSessionBindingIdentity)
             duplicate.testInstallPersistentSessionBinding(sessionID: sessionID)

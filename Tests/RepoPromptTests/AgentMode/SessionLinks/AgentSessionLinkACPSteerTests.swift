@@ -389,7 +389,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
 
     func testCompletedACPFallbackStopRestoresOnlyScheduledLocalDraft() async throws {
         let fixture = try await makeFixture()
-        await fixture.viewModel.test_publishNaturalCompletion(fixture.session)
+        await fixture.viewModel.runService.test_publishNaturalCompletion(fixture.session)
         let terminalRevision = try XCTUnwrap(fixture.session.lastTerminalCommitRevision)
         XCTAssertEqual(fixture.session.runState, .completed)
         XCTAssertTrue(fixture.session.acpController === fixture.controller)
@@ -469,7 +469,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
 
     func testWindowCloseJoinsGatedFollowUpWithoutLaunchingAfterRetirement() async throws {
         let fixture = try await makeFixture()
-        await fixture.viewModel.test_publishNaturalCompletion(fixture.session)
+        await fixture.viewModel.runService.test_publishNaturalCompletion(fixture.session)
         let entered = AgentSessionLinkStopSignal<Void>()
         let release = AgentSessionLinkStopSignal<Void>()
         let finished = AgentSessionLinkStopSignal<Void>()
@@ -536,7 +536,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
             fixture.viewModel.test_didFinishScheduledACPFollowUpStart = nil
         }
 
-        await fixture.viewModel.test_publishNaturalCompletion(fixture.session, supportsFollowUp: true)
+        await fixture.viewModel.runService.test_publishNaturalCompletion(fixture.session, supportsFollowUp: true)
         await entered.value()
         let terminalRevision = try XCTUnwrap(fixture.session.lastTerminalCommitRevision)
         XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
@@ -557,7 +557,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
     func testViewModelCompletedFallbackStopRestoresTypedLocalDraft() async throws {
         let fixture = try await makeFixture()
         let (batch, sink) = mixedSteeringBatch(fixture)
-        await fixture.viewModel.test_publishNaturalCompletion(fixture.session)
+        await fixture.viewModel.runService.test_publishNaturalCompletion(fixture.session)
         let terminalRevision = try XCTUnwrap(fixture.session.lastTerminalCommitRevision)
         XCTAssertEqual(fixture.session.runState, .completed)
         fixture.session.pendingACPSteeringInstructions.append(contentsOf: batch)
@@ -603,7 +603,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
 
     func testFailedSuccessorStartLeavesRemainingSiblingWithdrawableByStop() async throws {
         let fixture = try await makeFixture()
-        await fixture.viewModel.test_publishNaturalCompletion(fixture.session)
+        await fixture.viewModel.runService.test_publishNaturalCompletion(fixture.session)
         let originalFence = AgentRunStartStopFence(session: fixture.session)
         let batch = (1 ... 3).map { index in
             AgentModeViewModel.TabSession.ACPSteeringInstruction(
@@ -648,7 +648,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         ])
         XCTAssertTrue(fixture.session.pendingInstructions.allSatisfy { $0.stopFence == originalFence })
 
-        await fixture.viewModel.test_publishNaturalCompletion(fixture.session, supportsFollowUp: true)
+        await fixture.viewModel.runService.test_publishNaturalCompletion(fixture.session, supportsFollowUp: true)
         await secondFinished.value()
         XCTAssertNil(fixture.session.scheduledACPFollowUp)
         XCTAssertFalse(fixture.session.mcpFollowUpRunPending)
@@ -686,7 +686,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
 
     func testFailedScheduledACPStartWithdrawsAllFallbacksBeforeStop() async throws {
         let fixture = try await makeFixture()
-        await fixture.viewModel.test_publishNaturalCompletion(fixture.session)
+        await fixture.viewModel.runService.test_publishNaturalCompletion(fixture.session)
         let terminalRevision = try XCTUnwrap(fixture.session.lastTerminalCommitRevision)
         let (mixed, sink) = mixedSteeringBatch(fixture, localDraft: "first typed draft")
         let secondLocal = AgentModeViewModel.TabSession.ACPSteeringInstruction(
@@ -997,10 +997,10 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
             entered.fulfill()
             await release.value()
         }
-        fixture.viewModel.test_setBeforeCancellationCommit { _ in withdrawn.fulfill() }
+        fixture.viewModel.runService.testBeforeCancellationCommit = { _ in withdrawn.fulfill() }
         defer {
             fixture.viewModel.test_beforeACPToolIdleWait = nil
-            fixture.viewModel.test_setBeforeCancellationCommit(nil)
+            fixture.viewModel.runService.testBeforeCancellationCommit = nil
         }
         let first = localSteeringInstruction(fixture, draft: "first local draft")
         fixture.viewModel.storeDraftText(for: fixture.session.tabID, "still typing")
@@ -1020,7 +1020,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         await fulfillment(of: [withdrawn], timeout: 5)
         release.finish(())
         await stop.value
-        fixture.viewModel.test_setBeforeCancellationCommit(nil)
+        fixture.viewModel.runService.testBeforeCancellationCommit = nil
         let outcome = await steering.value
         XCTAssertEqual(outcome, .blocked(.steerNotAccepted))
         XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.session.tabID), "first local draft\nsecond local draft\nstill typing")
@@ -1041,10 +1041,10 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
             entered.fulfill()
             await release.value()
         }
-        fixture.viewModel.test_setBeforeCancellationCommit { _ in withdrawn.fulfill() }
+        fixture.viewModel.runService.testBeforeCancellationCommit = { _ in withdrawn.fulfill() }
         defer {
             fixture.viewModel.test_afterProviderInputAugmentation = nil
-            fixture.viewModel.test_setBeforeCancellationCommit(nil)
+            fixture.viewModel.runService.testBeforeCancellationCommit = nil
         }
         let local = localSteeringInstruction(fixture, draft: "typed local draft")
         fixture.session.pendingACPSteeringInstructions = [local]

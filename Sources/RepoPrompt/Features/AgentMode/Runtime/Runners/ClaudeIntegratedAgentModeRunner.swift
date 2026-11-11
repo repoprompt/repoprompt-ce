@@ -36,15 +36,6 @@ final class ClaudeIntegratedAgentModeRunner {
         private func reasoningDebug(_ message: @autoclosure () -> String) {}
     #endif
 
-    private func reasoningDebugSnippet(_ text: String, limit: Int = 160) -> String {
-        text
-            .replacingOccurrences(of: "\n", with: "\\n")
-            .replacingOccurrences(of: "\r", with: "\\r")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .prefix(limit)
-            .description
-    }
-
     init(
         claudeCoordinator: ClaudeAgentModeCoordinator,
         hooks: AgentModeRunService.Hooks,
@@ -195,14 +186,10 @@ final class ClaudeIntegratedAgentModeRunner {
             }
             return
         }
-        let attachmentReservationID = hooks.attachments.reserveAttachmentsForTurn(attachments, session)
-
-        if initialMessageForRun != initialUserMessage,
-           !session.pendingNonCodexUserInputTokenQueue.isEmpty
-        {
-            session.pendingNonCodexUserInputTokenQueue[0] = hooks.usage.estimateRuntimeTokens(initialMessageForRun)
-        }
-        hooks.usage.startNonCodexTurnAccountingIfNeeded(session, initialMessageForRun)
+        let attachmentReservationID = hooks.prepareNonCodexTurnInputs(
+            session: session, attachments: attachments,
+            initialUserMessage: initialUserMessage, initialMessageForRun: initialMessageForRun
+        )
         session.activeReasoningItemID = nil
         session.reasoningItemIDsByGroupID.removeAll()
         session.codexReasoningSegmentsByKey.removeAll()
@@ -620,7 +607,7 @@ final class ClaudeIntegratedAgentModeRunner {
                 #if DEBUG
                     if ClaudeReasoningExtractionFeature.isEnabled, result.type == "reasoning" {
                         let text = result.reasoning ?? result.text ?? ""
-                        reasoningDebug("stream reasoning run=\(runID.uuidString) attempt=\(runAttemptID.uuidString) tab=\(session.tabID.uuidString) len=\(text.count) snippet=\(reasoningDebugSnippet(text))")
+                        reasoningDebug("stream reasoning run=\(runID.uuidString) attempt=\(runAttemptID.uuidString) tab=\(session.tabID.uuidString) len=\(text.count) snippet=\(AgentSessionStreamRuntime.claudeReasoningDebugSnippet(text))")
                     }
                 #endif
                 await hooks.transcript.handleHeadlessStreamResult(result, session, runID, runAttemptID)
@@ -783,21 +770,12 @@ final class ClaudeIntegratedAgentModeRunner {
         ownership: AgentRunOwnership,
         attachmentReservationID: UUID?
     ) async {
-        let outcome = await lease.acquireFailureOutcome
-        hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
-        await terminalCommitBarrier.commit(.init(
-            binding: hooks.bindTerminalSession(session),
-            ownership: ownership,
-            expectedRunID: runID,
-            terminalState: outcome.terminalState,
-            source: "claudeNative.acquireFailure",
-            errorText: outcome.errorText,
+        await hooks.commitAcquireFailure(
+            session: session, lease: lease, runID: runID, ownership: ownership,
             attachmentReservationID: attachmentReservationID,
-            attachmentDisposition: .deleteFiles,
-            finalizeNonCodexUsage: true,
-            supportsFollowUp: true,
-            notifyTurnComplete: false
-        ))
+            source: "claudeNative.acquireFailure", supportsFollowUp: true,
+            barrier: terminalCommitBarrier
+        )
     }
 
     @discardableResult

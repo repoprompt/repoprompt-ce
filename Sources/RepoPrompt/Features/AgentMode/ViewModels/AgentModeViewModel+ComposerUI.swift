@@ -34,7 +34,8 @@ extension AgentModeViewModel {
     func cancelOracleBackground(target: OracleBackgroundCancelTarget) async -> Bool {
         let tabID = target.owner.binding.tabID
         guard composerOracleBackgroundCancelTarget(tabID: tabID) == target,
-              let session = sessions[tabID], let drain = closeOracleBackground(for: session)
+              let session = sessions[tabID],
+              let drain = runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore).closeOracleBackground(for: session)
         else { return false }
         _ = await OracleBackgroundInvocationRegistry.awaitDrain(drain, timeout: 30)
         return true

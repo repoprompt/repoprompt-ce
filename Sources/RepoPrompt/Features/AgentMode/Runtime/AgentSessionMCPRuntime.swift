@@ -426,6 +426,14 @@ final class AgentSessionMCPRuntime {
             .unrelated
         }
         let activationGeneration = session.mcpControlActivationGeneration
+        func originalControlContextIsCurrent() -> Bool {
+            guard session.mcpControlActivationGeneration == activationGeneration,
+                  let context = session.mcpControlContext else { return false }
+            return context.writerIdentity == originalContext.writerIdentity
+                && context.activationID == originalContext.activationID
+                && context.registration == originalContext.registration
+                && context.currentEpoch == originalContext.currentEpoch
+        }
         var recoveryCancellation: ControlActivationCancellation?
         var registration = originalContext.registration
         var result = await store.beginEpoch(
@@ -445,12 +453,7 @@ final class AgentSessionMCPRuntime {
             // Control activation already requires a persistent incarnation. An unbound or
             // retiring projection cannot recover a missing registration as a new writer.
             guard command.isCurrent, stopFence.permitsStart(of: session),
-                  session.mcpControlActivationGeneration == activationGeneration,
-                  let context = session.mcpControlContext,
-                  context.writerIdentity == originalContext.writerIdentity,
-                  context.activationID == originalContext.activationID,
-                  context.registration == originalContext.registration,
-                  context.currentEpoch == originalContext.currentEpoch,
+                  originalControlContextIsCurrent(),
                   cancellation.permitsPublication,
                   let recoveredRegistration = await store.registerIfMissing(
                       recovering: originalContext.registration,
@@ -460,12 +463,7 @@ final class AgentSessionMCPRuntime {
                 return
             }
             guard command.isCurrent, cancellation.permitsPublication, stopFence.permitsStart(of: session),
-                  session.mcpControlActivationGeneration == activationGeneration,
-                  let context = session.mcpControlContext,
-                  context.writerIdentity == originalContext.writerIdentity,
-                  context.activationID == originalContext.activationID,
-                  context.registration == originalContext.registration,
-                  context.currentEpoch == originalContext.currentEpoch
+                  originalControlContextIsCurrent()
             else {
                 await store.cleanup(registration: recoveredRegistration)
                 return
@@ -583,17 +581,8 @@ final class AgentSessionMCPRuntime {
         session.mcpStateObservationCancellable?.cancel()
         let publishers: [AnyPublisher<Void, Never>] = [
             session.$runState.map { _ in () }.eraseToAnyPublisher(),
-            session.$runningStatusText.map { _ in () }.eraseToAnyPublisher(),
-            session.$waitingPrompt.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingAskUser.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingUserInputRequest.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingApproval.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingCodexHookReview.map { _ in () }.eraseToAnyPublisher(),
-            session.$codexHookGateAudit.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingPermissionsRequest.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingMCPElicitationRequest.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingApplyEditsReview.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingWorktreeMergeReview.map { _ in () }.eraseToAnyPublisher(),
+            session.$runningStatusText.map { _ in () }.eraseToAnyPublisher()
+        ] + session.interactionStatePublishers(includeHookGate: true) + [
             session.$items.map { _ in () }.eraseToAnyPublisher()
         ]
         session.mcpStateObservationCancellable = Publishers.MergeMany(publishers)
@@ -608,6 +597,21 @@ final class AgentSessionMCPRuntime {
             scope?.presentation.bindingChanged(session)
             handleObservedMCPStateChange(for: session)
         })
+    }
+
+    static func snapshotModelParameterSelections(for session: AgentTabSession) -> [AgentRunMCPSnapshot.ModelParameterSelection] {
+        AgentMCPModelParameterSupport.effectiveSelections(
+            session.acpModelParameterSelections,
+            agentRaw: session.selectedAgent.rawValue, modelRaw: session.selectedModelRaw
+        ).map {
+            .init(
+                providerID: $0.providerID.rawValue,
+                baseModelRaw: $0.baseModelRaw,
+                kind: $0.kind.rawValue,
+                configID: $0.configID,
+                valueRaw: $0.valueRaw
+            )
+        }
     }
 
     func mcpSnapshot(
@@ -785,19 +789,7 @@ final class AgentSessionMCPRuntime {
             agentDisplayName: session.selectedAgent.displayName,
             modelRaw: session.selectedModelRaw,
             reasoningEffortRaw: session.selectedReasoningEffortRaw,
-            modelParameterSelections: AgentMCPModelParameterSupport.effectiveSelections(
-                session.acpModelParameterSelections,
-                agentRaw: session.selectedAgent.rawValue,
-                modelRaw: session.selectedModelRaw
-            ).map {
-                AgentRunMCPSnapshot.ModelParameterSelection(
-                    providerID: $0.providerID.rawValue,
-                    baseModelRaw: $0.baseModelRaw,
-                    kind: $0.kind.rawValue,
-                    configID: $0.configID,
-                    valueRaw: $0.valueRaw
-                )
-            },
+            modelParameterSelections: AgentSessionMCPRuntime.snapshotModelParameterSelections(for: session),
             status: status,
             statusText: resolvedStatusText,
             latestAssistantPreview: mcpResolvedAssistantPreview(session: session, status: status),
@@ -1224,6 +1216,18 @@ final class AgentSessionMCPRuntime {
             && writer.identity.sessionID == sessionID
     }
 
+    private func matchesObservedControl(
+        session: AgentTabSession, scope: AgentSessionRuntimeStore.Scope,
+        binding: AgentSessionRestorationBindingToken?, sessionID: UUID, context: AgentMCPControlContext
+    ) -> Bool {
+        scope.sessions[session.tabID] === session
+            && session.currentRestorationBindingToken == binding
+            && mcpControlContextMatches(
+                tabID: session.tabID, sessionID: sessionID,
+                activationID: context.activationID, registration: context.registration
+            )
+    }
+
     func handleObservedMCPStateChange(
         for session: AgentTabSession,
         store: DomainAgentRunSessionStore = AgentRunSessionStore.shared
@@ -1240,7 +1244,6 @@ final class AgentSessionMCPRuntime {
             return
         }
         guard let scope, scope.sessions[session.tabID] === session else { return }
-        let tabID = session.tabID
         let binding = session.currentRestorationBindingToken
 
         let cursor = AgentRunSessionStore.WaitCursor(
@@ -1248,14 +1251,9 @@ final class AgentSessionMCPRuntime {
             epoch: context.currentEpoch
         )
         Task { [self, scope, session] in
-            guard scope.sessions[tabID] === session,
-                  session.currentRestorationBindingToken == binding,
-                  mcpControlContextMatches(
-                      tabID: tabID,
-                      sessionID: snapshot.sessionID,
-                      activationID: context.activationID,
-                      registration: context.registration
-                  ) == true
+            guard matchesObservedControl(
+                session: session, scope: scope, binding: binding, sessionID: snapshot.sessionID, context: context
+            )
             else {
                 return
             }
@@ -1377,13 +1375,14 @@ final class AgentSessionMCPRuntime {
         return result
     }
 
-    func signalMCPInstructionDelivered(for session: AgentTabSession) async {
-        guard let scope, scope.sessions[session.tabID] === session else { return }
+    func currentSteeringSnapshot(
+        for session: AgentTabSession, operation: String
+    ) -> (AgentRunMCPSnapshot, AgentMCPControlContext)? {
         guard let snapshot = mcpSnapshot(for: session),
               let context = session.mcpControlContext
         else {
-            Self.steeringDebugLog("[AgentRunSteeringWake] skip delivered signal: missing snapshot/control context tab=\(session.tabID) runState=\(session.runState.rawValue)")
-            return
+            Self.steeringDebugLog("[AgentRunSteeringWake] skip \(operation): missing snapshot/control context tab=\(session.tabID) runState=\(session.runState.rawValue)")
+            return nil
         }
         guard mcpControlContextMatches(
             tabID: session.tabID,
@@ -1391,9 +1390,15 @@ final class AgentSessionMCPRuntime {
             activationID: context.activationID,
             registration: context.registration
         ) else {
-            Self.steeringDebugLog("[AgentRunSteeringWake] skip delivered signal: control context mismatch sessionID=\(snapshot.sessionID) tab=\(session.tabID)")
-            return
+            Self.steeringDebugLog("[AgentRunSteeringWake] skip \(operation): control context mismatch sessionID=\(snapshot.sessionID) tab=\(session.tabID)")
+            return nil
         }
+        return (snapshot, context)
+    }
+
+    func signalMCPInstructionDelivered(for session: AgentTabSession) async {
+        guard let scope, scope.sessions[session.tabID] === session else { return }
+        guard let (snapshot, context) = currentSteeringSnapshot(for: session, operation: "delivered signal") else { return }
         Self.steeringDebugLog("[AgentRunSteeringWake] signal delivered sessionID=\(snapshot.sessionID) tab=\(session.tabID) status=\(snapshot.status.rawValue) runState=\(session.runState.rawValue)")
         await AgentRunSessionStore.signalSnapshotAndWakeWaiters(
             snapshot,
@@ -1413,14 +1418,9 @@ final class AgentSessionMCPRuntime {
         let tabID = session.tabID
         let binding = session.currentRestorationBindingToken
         Task { @MainActor [self, scope, session] in
-            guard scope.sessions[tabID] === session,
-                  session.currentRestorationBindingToken == binding,
-                  mcpControlContextMatches(
-                      tabID: tabID,
-                      sessionID: snapshot.sessionID,
-                      activationID: context.activationID,
-                      registration: context.registration
-                  ) == true
+            guard matchesObservedControl(
+                session: session, scope: scope, binding: binding, sessionID: snapshot.sessionID, context: context
+            )
             else {
                 Self.steeringDebugLog("[AgentRunSteeringWake] skip delivered signal fire-and-forget: control context mismatch sessionID=\(snapshot.sessionID) tab=\(tabID)")
                 return

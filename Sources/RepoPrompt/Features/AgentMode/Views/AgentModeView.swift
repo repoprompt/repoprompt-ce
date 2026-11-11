@@ -1616,30 +1616,7 @@ struct AgentModeChatDetailView: View {
 
     private func transcriptRenderMetadata(for rows: [AgentChatItem]) -> AgentTranscriptPresentationMetadata {
         let snapshotMetadata = transcriptPresentation.metadata
-        let latestContextBuilderCall = rows.last(where: { item in
-            item.kind == .toolCall && normalizedToolCardName(item.toolName) == "context_builder"
-        })
-        let latestContextBuilderResult = rows.last(where: { item in
-            item.kind == .toolResult && normalizedToolCardName(item.toolName) == "context_builder"
-        })
-        let activeContextBuilderCallID: UUID? = {
-            guard let call = latestContextBuilderCall else { return nil }
-            if let result = latestContextBuilderResult,
-               result.sequenceIndex > call.sequenceIndex
-            {
-                return nil
-            }
-            return call.id
-        }()
-        let activeContextBuilderResultID: UUID? = {
-            guard let result = latestContextBuilderResult else { return nil }
-            if let call = latestContextBuilderCall,
-               call.sequenceIndex > result.sequenceIndex
-            {
-                return nil
-            }
-            return result.id
-        }()
+        let (activeContextBuilderCallID, activeContextBuilderResultID) = activeContextBuilderItems(in: rows)
         let mostRecentEditID = rows.last(where: isAutoExpandableEditToolResult)?.id
         return .init(
             latestUserMessageID: snapshotMetadata.latestUserMessageID,

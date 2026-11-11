@@ -210,14 +210,14 @@ final class AgentSessionLinkRunnerHarness {
                 handleHeadlessStreamResult: { result, session, runID, attemptID in
                     if replayTranscript { await harnessBox?.host.test_handleStreamResult(result, session: session, runID: runID, runAttemptID: attemptID) }
                 },
-                finalizeStreamingItems: { session in if replayTranscript { harnessBox?.host.finalizeStreamingItems(in: session) } },
+                finalizeStreamingItems: { session in if replayTranscript { harnessBox?.host.streamRuntime.finalizeStreamingItems(in: session) } },
                 finalizePendingToolCalls: { _, _ in },
                 finalizePendingToolCallsWithUpperBound: { _, _, _ in },
-                flushPendingAssistantDelta: { session in if replayTranscript { harnessBox?.host.flushPendingAssistantDelta(session) } },
+                flushPendingAssistantDelta: { session in if replayTranscript { harnessBox?.host.streamRuntime.flushPendingAssistantDelta(session) } },
                 beginClaudeProviderOutputSegment: { session in
                     if replayTranscript {
-                        harnessBox?.host.flushPendingAssistantDelta(session)
-                        harnessBox?.host.endActiveAssistantSegment(session)
+                        harnessBox?.host.streamRuntime.flushPendingAssistantDelta(session)
+                        harnessBox?.host.streamRuntime.endActiveAssistantSegment(session)
                     }
                 },
                 clearPendingAssistantDelta: { _ in }
@@ -235,7 +235,7 @@ final class AgentSessionLinkRunnerHarness {
                 augmentUserMessageForProviderSend: { text, _, _, _, _ in text },
                 stageResumeRecoveryHandoffIfNeeded: { _ in true },
                 prependPendingHandoffIfNeeded: { text, session in
-                    sessionLinkHost?.prependPendingHandoffIfNeeded(text, session: session) ?? text
+                    sessionLinkHost?.handoffRuntime.prependPendingHandoffIfNeeded(text, session: session) ?? text
                 },
                 recordPendingHandoffSendOutcome: { _, _ in },
                 claimAgentSessionLinkPrompt: { session, dispatchID in

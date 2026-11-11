@@ -417,22 +417,7 @@ extension AgentSessionLinkExecutionRuntime {
 
         // 3. Local composer claim. Losing it means a local user Send won the race, which is exactly
         //    `target_not_idle` — the observer polls and retries rather than queueing behind the user.
-        guard let target = makeComposerSubmitTarget(tabID: candidate.tabID, session: session),
-              target.route == .existingAgentSession,
-              target.expectedSourceAgentSessionID == candidate.sessionID
-        else {
-            return .blocked(.targetNotIdle)
-        }
-        let attempt = AgentComposerSubmitAttempt(
-            id: UUID(),
-            target: target,
-            inputRevision: 0,
-            noticeRevision: 0,
-            // A cross-session send carries no composer draft, so it must never look like one: an
-            // empty snapshot cannot match a real draft and therefore cannot clear the user's text.
-            rawDraftSnapshot: ""
-        )
-        guard let claim = claimComposerSubmitAttempt(attempt) else {
+        guard let claim = claimEmptyComposer(for: candidate, session: session) else {
             return .blocked(.targetNotIdle)
         }
 

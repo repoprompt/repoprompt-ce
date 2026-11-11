@@ -512,24 +512,13 @@ struct AgentSession: Codable, Identifiable {
         autoEditEnabled = try container.decode(Bool.self, forKey: .autoEditEnabled)
         // Additive and `decodeIfPresent`: every session written before version 8 decodes as off.
         // Fresh live sessions now start on, but restore deliberately preserves this legacy value.
-        autoWakeOnOversightUpdates = try container.decodeIfPresent(
-            Bool.self,
-            forKey: .autoWakeOnOversightUpdates
-        ) ?? false
-        agentSessionLinkAutoWakeTargetSessionIDs = try container.decodeIfPresent(
-            Set<UUID>.self,
-            forKey: .agentSessionLinkAutoWakeTargetSessionIDs
-        ) ?? []
-        routineWakeIntervalEnabled = try container.decodeIfPresent(Bool.self, forKey: .routineWakeIntervalEnabled) ?? false
-        routineWakeIntervalSeconds = try AgentSessionLinkRoutineWakeInterval.normalized(
-            container.decodeIfPresent(Int.self, forKey: .routineWakeIntervalSeconds)
-                ?? AgentSessionLinkRoutineWakeInterval.defaultSeconds
-        )
-        periodicIdleWakeEnabled = try container.decodeIfPresent(Bool.self, forKey: .periodicIdleWakeEnabled) ?? false
-        periodicIdleWakeIntervalSeconds = try AgentSessionLinkPeriodicWakeInterval.normalized(
-            container.decodeIfPresent(Int.self, forKey: .periodicIdleWakeIntervalSeconds)
-                ?? AgentSessionLinkPeriodicWakeInterval.defaultSeconds
-        )
+        let wakePreferences = try AgentSessionWakePreferences(from: decoder)
+        autoWakeOnOversightUpdates = wakePreferences.autoWakeOnOversightUpdates
+        agentSessionLinkAutoWakeTargetSessionIDs = wakePreferences.agentSessionLinkAutoWakeTargetSessionIDs
+        routineWakeIntervalEnabled = wakePreferences.routineWakeIntervalEnabled
+        routineWakeIntervalSeconds = wakePreferences.routineWakeIntervalSeconds
+        periodicIdleWakeEnabled = wakePreferences.periodicIdleWakeEnabled
+        periodicIdleWakeIntervalSeconds = wakePreferences.periodicIdleWakeIntervalSeconds
         providerTokenUsageByTurn = try container.decodeIfPresent([AgentTokenUsagePersist].self, forKey: .providerTokenUsageByTurn) ?? []
         automationTurnAudit = try AgentAutomationTurnAudit.retain(
             container.decodeIfPresent([AgentAutomationTurnAudit].self, forKey: .automationTurnAudit) ?? []
@@ -716,6 +705,48 @@ extension AgentSession {
                 policy: .canonical,
                 compact: false
             )
+        )
+    }
+}
+
+/// Shared additive wake-preference decoding for durable payloads and metadata indexes.
+/// Missing legacy fields remain off even though fresh live sessions may default on.
+struct AgentSessionWakePreferences: Decodable {
+    let autoWakeOnOversightUpdates: Bool
+    let agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID>
+    let routineWakeIntervalEnabled: Bool
+    let routineWakeIntervalSeconds: Int
+    let periodicIdleWakeEnabled: Bool
+    let periodicIdleWakeIntervalSeconds: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case autoWakeOnOversightUpdates
+        case agentSessionLinkAutoWakeTargetSessionIDs
+        case routineWakeIntervalEnabled
+        case routineWakeIntervalSeconds
+        case periodicIdleWakeEnabled
+        case periodicIdleWakeIntervalSeconds
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        autoWakeOnOversightUpdates = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .autoWakeOnOversightUpdates
+        ) ?? false
+        agentSessionLinkAutoWakeTargetSessionIDs = try container.decodeIfPresent(
+            Set<UUID>.self,
+            forKey: .agentSessionLinkAutoWakeTargetSessionIDs
+        ) ?? []
+        routineWakeIntervalEnabled = try container.decodeIfPresent(Bool.self, forKey: .routineWakeIntervalEnabled) ?? false
+        routineWakeIntervalSeconds = try AgentSessionLinkRoutineWakeInterval.normalized(
+            container.decodeIfPresent(Int.self, forKey: .routineWakeIntervalSeconds)
+                ?? AgentSessionLinkRoutineWakeInterval.defaultSeconds
+        )
+        periodicIdleWakeEnabled = try container.decodeIfPresent(Bool.self, forKey: .periodicIdleWakeEnabled) ?? false
+        periodicIdleWakeIntervalSeconds = try AgentSessionLinkPeriodicWakeInterval.normalized(
+            container.decodeIfPresent(Int.self, forKey: .periodicIdleWakeIntervalSeconds)
+                ?? AgentSessionLinkPeriodicWakeInterval.defaultSeconds
         )
     }
 }

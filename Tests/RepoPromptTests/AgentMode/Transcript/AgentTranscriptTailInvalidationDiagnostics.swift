@@ -274,7 +274,7 @@
             let binding = try XCTUnwrap(session.currentRestorationBindingToken)
             let beforeSave = fixture.store.snapshot
             session.isDirty = true
-            vm.scheduleSave(for: session)
+            vm.persistenceRuntime.scheduleSave(for: session)
             let save = try XCTUnwrap(session.saveDebounceTask)
             await save.value
             XCTAssertFalse(session.isDirty, "The scheduled save must actually complete")
@@ -317,8 +317,8 @@
             XCTAssertEqual(recorder.counts[userID]?["update", default: 0] ?? 0, 0)
 
             // Exercise the normal source mutation, coalescer and VM publication path too.
-            vm.enqueueAssistantDelta(" NORMAL_VM_DELTA", session: session)
-            vm.flushPendingAssistantDelta(session)
+            vm.streamRuntime.enqueueAssistantDelta(" NORMAL_VM_DELTA", session: session)
+            vm.streamRuntime.flushPendingAssistantDelta(session)
             try await wait(fixture, seconds: 5, gate: "normal VM delta reaches attached native storage") {
                 recorder.attached(tailID, window: fixture.window).contains { $0.string.contains("NORMAL_VM_DELTA") }
             }
@@ -442,8 +442,8 @@
                 let layoutsBefore = fixture.host.layouts
                 let cpuBefore = try mainThreadCPU()
                 let start = ProcessInfo.processInfo.systemUptime
-                vm.enqueueAssistantDelta(delta, session: session)
-                vm.flushPendingAssistantDelta(session)
+                vm.streamRuntime.enqueueAssistantDelta(delta, session: session)
+                vm.streamRuntime.flushPendingAssistantDelta(session)
                 var driveMS = (ProcessInfo.processInfo.systemUptime - start) * 1000
                 var serial = recorder.serial
                 var lastChange = ProcessInfo.processInfo.systemUptime

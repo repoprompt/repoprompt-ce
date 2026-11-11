@@ -31,14 +31,10 @@ final class HeadlessAgentModeRunner {
             if !candidateTransferred { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
         }
         guard stopFence?.permitsStart(of: session) ?? true else { return nil }
-        let attachmentReservationID = hooks.attachments.reserveAttachmentsForTurn(attachments, session)
-
-        if initialMessageForRun != initialUserMessage,
-           !session.pendingNonCodexUserInputTokenQueue.isEmpty
-        {
-            session.pendingNonCodexUserInputTokenQueue[0] = hooks.usage.estimateRuntimeTokens(initialMessageForRun)
-        }
-        hooks.usage.startNonCodexTurnAccountingIfNeeded(session, initialMessageForRun)
+        let attachmentReservationID = hooks.prepareNonCodexTurnInputs(
+            session: session, attachments: attachments,
+            initialUserMessage: initialUserMessage, initialMessageForRun: initialMessageForRun
+        )
 
         let runID = AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
         let lease = makeLease(runID)
@@ -209,26 +205,17 @@ final class HeadlessAgentModeRunner {
         ownership: AgentRunOwnership,
         attachmentReservationID: UUID?
     ) async {
-        let outcome = await lease.acquireFailureOutcome
-        hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
-        await terminalCommitBarrier.commit(.init(
-            binding: hooks.bindTerminalSession(session),
-            ownership: ownership,
-            expectedRunID: runID,
-            terminalState: outcome.terminalState,
-            source: "headless.acquireFailure",
-            errorText: outcome.errorText,
+        await hooks.commitAcquireFailure(
+            session: session, lease: lease, runID: runID, ownership: ownership,
             attachmentReservationID: attachmentReservationID,
-            attachmentDisposition: .deleteFiles,
-            finalizeNonCodexUsage: true,
-            supportsFollowUp: false,
-            notifyTurnComplete: false,
+            source: "headless.acquireFailure", supportsFollowUp: false,
+            barrier: terminalCommitBarrier,
             prepareProviderState: {
                 session.provider = nil
                 session.clearRunID(ifCurrent: runID)
                 return nil
             }
-        ))
+        )
     }
 
     private func executeHeadlessRun(

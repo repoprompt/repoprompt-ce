@@ -153,15 +153,7 @@ extension AgentModeViewModel {
             sessionName: workspaceManager?.composeTabName(with: session.tabID) ?? "Agent Session",
             agentRaw: session.selectedAgent.rawValue, agentDisplayName: session.selectedAgent.displayName,
             modelRaw: session.selectedModelRaw, reasoningEffortRaw: session.selectedReasoningEffortRaw,
-            modelParameterSelections: AgentMCPModelParameterSupport.effectiveSelections(
-                session.acpModelParameterSelections,
-                agentRaw: session.selectedAgent.rawValue, modelRaw: session.selectedModelRaw
-            ).map {
-                AgentRunMCPSnapshot.ModelParameterSelection(
-                    providerID: $0.providerID.rawValue, baseModelRaw: $0.baseModelRaw,
-                    kind: $0.kind.rawValue, configID: $0.configID, valueRaw: $0.valueRaw
-                )
-            },
+            modelParameterSelections: AgentSessionMCPRuntime.snapshotModelParameterSelections(for: session),
             status: status, statusText: session.runningStatusText,
             latestAssistantPreview: nil, interaction: nil,
             hookGate: session.codexHookGateAudit.map { AgentRunMCPSnapshot.HookGate(audit: $0) },
@@ -210,7 +202,7 @@ extension AgentModeViewModel {
         }
         let session = target.session
         let protectedPrompt = session.pendingApplyEditsReview != nil || session.pendingWorktreeMergeReview != nil
-            || mcpPendingInteraction(for: session).map { $0.kind != .instruction } == true
+            || mcpRuntime.mcpPendingInteraction(for: session).map { $0.kind != .instruction } == true
         guard !protectedPrompt else { throw MCPError.invalidParams(Self.mcpResidentProtectedError) }
         let admission = AgentSessionLinkSteerAdmission.evaluate(
             readiness: Self.agentSessionLinkDeliveryReadinessSnapshot(
@@ -271,7 +263,7 @@ extension AgentModeViewModel {
                 attribution: nil, stopFence: stopFence
             ) {
                 windowIsAvailable() && self.mcpResidentTargetIsCurrent(target)
-                    && self.composerSubmitClaimIsCurrent(claim) && stopFence.permitsStart(of: session)
+                    && self.composerSubmitRuntime.isCurrent(claim) && stopFence.permitsStart(of: session)
                     && AgentSessionLinkDeliveryReadiness.failure(snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
                         session: session, endpointMatchesGrant: true, isClosing: false,
                         ignoresComposerSubmissionInFlight: true,

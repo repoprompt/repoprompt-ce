@@ -787,7 +787,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             XCTAssertTrue(session.permitsBoundOperationAndSave, "The failed route must leave the original saved session usable.")
             XCTAssertNil(session.operationAdmissionFailureMessage)
             XCTAssertNil(session.oversight.overseerActivation)
-            let saveResult = await viewModel.flushSaveRequired(for: tabID, workspaceID: fixture.workspaceID)
+            let saveResult = await viewModel.persistenceRuntime.flushSaveRequired(for: tabID, workspaceID: fixture.workspaceID)
             guard case .success = saveResult else { return XCTFail("The unchanged session must remain saveable: \(saveResult)") }
             if activated {
                 try await AsyncTestWait.waitUntil("retired advertisement", timeout: 10) { retirements() == 1 }
@@ -1816,7 +1816,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                     XCTAssertNil(viewModel.captureSessionCreationRetry(for: lane), "Preparation has no configured payload to retry.")
                     XCTAssertTrue(lane.items.isEmpty)
 
-                    let requiredSave = await viewModel.flushSaveRequired(
+                    let requiredSave = await viewModel.persistenceRuntime.flushSaveRequired(
                         for: tabID, workspaceID: fixture.workspaceID
                     )
                     guard case let .failure(failure) = requiredSave else {
@@ -1824,7 +1824,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                     }
                     XCTAssertEqual(failure.operation, .save)
                     XCTAssertEqual(failure.tabID, tabID)
-                    await viewModel.flushSave(for: tabID)
+                    await viewModel.persistenceRuntime.flushSave(for: tabID)
                     let blocker = try XCTUnwrap(lane.operationAdmissionFailureMessage)
                     let submission = viewModel.submitUserTurn(text: "Do not dispatch while preparing", tabID: tabID)
                     guard case let .blocked(message) = submission else {
@@ -2322,7 +2322,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
 
             child.runState = .completed
             child.isDirty = true
-            await viewModel.flushSave(for: child.tabID)
+            await viewModel.persistenceRuntime.flushSave(for: child.tabID)
             let grandchildTarget = try await viewModel.mcpResolveOrCreateSessionTarget(
                 tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Grandchild",
                 parentSessionID: childID, expectedWorkspaceID: fixture.workspaceID
@@ -2334,7 +2334,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             XCTAssertFalse(childrenSettled(), "an active grandchild must also block the stash cascade")
             grandchild.runState = .completed
             grandchild.isDirty = true
-            await viewModel.flushSave(for: grandchild.tabID)
+            await viewModel.persistenceRuntime.flushSave(for: grandchild.tabID)
             XCTAssertTrue(childrenSettled(), "finished children must not block retirement")
             let persistedBlocker = await WindowStatesManager.shared.agentSessionLinkHasPersistedActiveChildSessions(
                 parentSessionID: parentID
@@ -2380,7 +2380,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             let grandchild = try XCTUnwrap(viewModel.sessions[target.tabID])
             grandchild.runState = .completed
             grandchild.isDirty = true
-            await viewModel.flushSave(for: target.tabID)
+            await viewModel.persistenceRuntime.flushSave(for: target.tabID)
             XCTAssertNil(viewModel.test_ownerValidatedSessionIndex[diskOnlyChild.id])
             let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: parentTabID))
             grandchild.runState = .running // Disk still says completed.
@@ -2420,7 +2420,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             let child = try XCTUnwrap(viewModel.sessions[target.tabID])
             child.runState = .completed
             child.isDirty = true
-            await viewModel.flushSave(for: target.tabID)
+            await viewModel.persistenceRuntime.flushSave(for: target.tabID)
             _ = await fixture.window.workspaceManager.pollAndSaveStateWithOutcomeAsync(
                 workspaceID: fixture.workspaceID, source: WorkspaceSaveSource("retireChildTest")
             )
@@ -2726,7 +2726,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 try children.append((XCTUnwrap(child.activeAgentSessionID), target.tabID))
                 child.runState = .running
                 child.isDirty = true
-                await viewModel.flushSave(for: target.tabID)
+                await viewModel.persistenceRuntime.flushSave(for: target.tabID)
                 child.runState = .completed
                 child.isDirty = true
             }
@@ -2862,7 +2862,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             let child = try XCTUnwrap(viewModel.sessions[target.tabID])
             child.runState = .idle
             child.isDirty = true
-            await viewModel.flushSave(for: target.tabID)
+            await viewModel.persistenceRuntime.flushSave(for: target.tabID)
             // Arm the refusal inside the stop admission hook: the preflight probe has already
             // passed, so the rejection can only land on the post-unlink workspace save — which no
             // longer gates the outcome once the stash has committed.
@@ -2946,7 +2946,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         let childSessionID = try XCTUnwrap(child.activeAgentSessionID)
         child.runState = .idle
         child.isDirty = true
-        await viewModel.flushSave(for: target.tabID)
+        await viewModel.persistenceRuntime.flushSave(for: target.tabID)
         child.hasLoadedPersistedState = false
         var persisted = AgentSession(id: childSessionID, name: "Mid-hydration child", savedAt: Date())
         persisted.parentSessionID = laneSessionID
@@ -3192,7 +3192,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             let childSessionID = try XCTUnwrap(child.activeAgentSessionID)
             child.runState = .idle
             child.isDirty = true
-            await viewModel.flushSave(for: target.tabID)
+            await viewModel.persistenceRuntime.flushSave(for: target.tabID)
             // The disk row disagrees with live lineage: it claims the lane as parent and is active.
             var persisted = AgentSession(id: childSessionID, name: "Cross-tier child", savedAt: Date())
             persisted.parentSessionID = lane.sessionID
@@ -3245,7 +3245,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             let childSessionID = try XCTUnwrap(child.activeAgentSessionID)
             child.runState = .idle
             child.isDirty = true
-            await viewModel.flushSave(for: target.tabID)
+            await viewModel.persistenceRuntime.flushSave(for: target.tabID)
             // The disk row disagrees completely: it claims no parent edge and still says running.
             var persisted = AgentSession(id: childSessionID, name: "Disk-orphaned child", savedAt: Date())
             persisted.parentSessionID = nil
@@ -3297,7 +3297,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             let child = try XCTUnwrap(viewModel.sessions[target.tabID])
             child.runState = .idle
             child.isDirty = true
-            await viewModel.flushSave(for: target.tabID)
+            await viewModel.persistenceRuntime.flushSave(for: target.tabID)
             // The loaded session now reports itself top-level while disk still claims the edge.
             child.parentSessionID = nil
             let blocked = await host.agentSessionLinkHasPersistedActiveChildSessions(

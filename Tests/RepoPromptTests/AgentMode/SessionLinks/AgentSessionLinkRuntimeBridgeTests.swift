@@ -2836,7 +2836,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(viewModel.agentSidebarLaneCreator(tabID: tabID, expectedSessionID: sessionID)?.sessionID, freshCreator)
         let secondTabID = UUID()
         let second = viewModel.session(for: secondTabID)
-        XCTAssertEqual(viewModel.test_bindingRejection(sessionID: sessionID, on: second), .conflictingWriter)
+        XCTAssertEqual(viewModel.runtimeSessionStore.bindingRejection(sessionID, on: second), .conflictingWriter)
         XCTAssertNil(viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: second, updateWorkspaceMetadata: false))
         second.createdByOverseerSessionID = indexedCreator
         // A refused second writer cannot impersonate the first row's provenance.

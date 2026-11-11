@@ -993,7 +993,11 @@ final class DelegationScopeRuntime: ObservableObject {
         guard var request = requests[requestID], request.state == .pending else { return }
         request.state = .granted(scopeID: record.id)
         requests[requestID] = request
-        let continuation = overseeContinuations.removeValue(forKey: requestID)
+        notifyGranted(request: request, record: record)
+    }
+
+    private func notifyGranted(request: DelegationScopeRequest, record: DomainDelegationScopeRecord) {
+        let continuation = overseeContinuations.removeValue(forKey: request.id)
         if let continuation {
             startOverseeContinuation(request: request, record: record, continuation: continuation)
         }
@@ -1094,17 +1098,7 @@ final class DelegationScopeRuntime: ObservableObject {
             requests[requestID] = request
             if grantAllForSession { sessionWideApprovals.insert(request.requesterSessionID) }
             didChange(grantees: [record.grant.granteeSessionID], invalidated: [])
-            let continuation = overseeContinuations.removeValue(forKey: requestID)
-            if let continuation {
-                startOverseeContinuation(request: request, record: record, continuation: continuation)
-            }
-            enqueueDecision(
-                sessionID: request.requesterSessionID,
-                tabID: request.requesterTabID,
-                result: "granted",
-                identifier: record.id,
-                automaticContinuation: continuation != nil
-            )
+            notifyGranted(request: request, record: record)
         case let .failure(denial):
             overseeContinuations.removeValue(forKey: requestID)
             overseeInitialRequests.remove(requestID)

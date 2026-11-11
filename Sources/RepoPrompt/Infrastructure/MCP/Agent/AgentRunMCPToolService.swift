@@ -553,7 +553,7 @@ struct AgentRunMCPToolService {
 
     static func startExpirySnapshot(sessionID: UUID, agentModeVM: AgentModeViewModel) -> AgentRunMCPSnapshot {
         guard let live = agentModeVM.mcpSnapshot(sessionID: sessionID) else { return .expired(sessionID: sessionID) }
-        if let session = agentModeVM.mcpControlledSession(sessionID: sessionID),
+        if let session = agentModeVM.mcpRuntime.controlledWriter(sessionID: sessionID)?.session,
            let epoch = session.mcpControlContext?.currentEpoch
         {
             let ownership = session.runState.isActive
@@ -1423,7 +1423,7 @@ struct AgentRunMCPToolService {
             throw AgentSessionTargetOperationGuard.denialError(reference: reference)
         }
         guard let session = resolvedSession,
-              agentModeVM.mcpControlledSession(sessionID: sessionID) === session,
+              agentModeVM.mcpRuntime.controlledWriter(sessionID: sessionID)?.session === session,
               session.activeAgentSessionID == sessionID,
               let binding = session.persistentSessionBindingIdentity,
               let control = session.mcpControlContext,
@@ -1481,7 +1481,7 @@ struct AgentRunMCPToolService {
               !target.window.isClosing, !WindowStatesManager.shared.isTerminating,
               target.window.workspaceManager.activeWorkspaceID == target.workspaceID,
               resolvedSession === session,
-              viewModel.mcpControlledSession(sessionID: target.sessionID) === session,
+              viewModel.mcpRuntime.controlledWriter(sessionID: target.sessionID)?.session === session,
               session.activeAgentSessionID == target.sessionID,
               session.persistentSessionBindingIdentity == target.binding,
               session.mcpControlContext == target.control,
@@ -1537,7 +1537,7 @@ struct AgentRunMCPToolService {
         var outcomeSnapshot: AgentRunMCPSnapshot?
         if target.pendingStart {
             admitted = viewModel.linkExecutionRuntime.withdrawPendingStartForSessionLink(session: target.session, admission: admission)
-            if admitted { outcomeSnapshot = viewModel.mcpSnapshot(for: target.session) }
+            if admitted { outcomeSnapshot = viewModel.mcpRuntime.mcpSnapshot(for: target.session) }
         } else {
             guard let ownership = target.ownership else {
                 throw AgentSessionTargetOperationGuard.denialError(sessionID: target.sessionID)
@@ -1550,7 +1550,7 @@ struct AgentRunMCPToolService {
                        !target.session.runState.isActive,
                        target.session.runID == nil || target.session.runID == target.runID
                     {
-                        outcomeSnapshot = viewModel.mcpSnapshot(
+                        outcomeSnapshot = viewModel.mcpRuntime.mcpSnapshot(
                             for: target.session, canonicalTerminalState: .cancelled,
                             canonicalProviderRunID: target.runID
                         )
@@ -1574,7 +1574,7 @@ struct AgentRunMCPToolService {
            let revision = target.session.lastTerminalCommitRevision,
            revision.ownership == target.ownership, revision.expectedRunID == target.runID
         {
-            outcomeSnapshot = viewModel.mcpSnapshot(
+            outcomeSnapshot = viewModel.mcpRuntime.mcpSnapshot(
                 for: target.session, canonicalTerminalState: revision.terminalState,
                 canonicalProviderRunID: target.runID
             )
@@ -1661,7 +1661,7 @@ struct AgentRunMCPToolService {
                 snapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
             } else {
                 // Inactive steering starts a new epoch without replacing the session activation.
-                agentModeVM.setMCPFollowUpRunPending(sessionID: sessionID, true)
+                agentModeVM.mcpRuntime.setFollowUpRunPending(sessionID: sessionID, true)
                 do {
                     delivery = try await agentModeVM.withMCPRunEpochTransition(
                         sessionID: sessionID,
@@ -1781,10 +1781,10 @@ struct AgentRunMCPToolService {
         // The pending running mask is session-scoped rather than activation-scoped. A failed
         // inactive steer must always drop it so MCP snapshots stop reporting a queued run,
         // even if a concurrent replacement means destructive context cleanup must be skipped.
-        agentModeVM.setMCPFollowUpRunPending(sessionID: sessionID, false)
+        agentModeVM.mcpRuntime.setFollowUpRunPending(sessionID: sessionID, false)
 
         if let identity = resolution.reactivatedControlIdentity {
-            guard let session = agentModeVM.mcpControlledSession(sessionID: identity.sessionID),
+            guard let session = agentModeVM.mcpRuntime.controlledWriter(sessionID: identity.sessionID)?.session,
                   let context = session.mcpControlContext,
                   context.sessionID == identity.sessionID,
                   context.activationID == identity.activationID,
@@ -1802,7 +1802,7 @@ struct AgentRunMCPToolService {
         metadata: RequestMetadata,
         expectedWorkspaceID: UUID?
     ) async throws -> SteerControlResolution {
-        if let controlledSession = agentModeVM.mcpControlledSession(sessionID: sessionID) {
+        if let controlledSession = agentModeVM.mcpRuntime.controlledWriter(sessionID: sessionID)?.session {
             return SteerControlResolution(
                 session: controlledSession,
                 reactivatedTarget: nil,
@@ -1860,7 +1860,7 @@ struct AgentRunMCPToolService {
             await agentModeVM.mcpDiscardSessionTarget(target)
             throw error
         }
-        guard let reactivatedSession = agentModeVM.mcpControlledSession(sessionID: sessionID),
+        guard let reactivatedSession = agentModeVM.mcpRuntime.controlledWriter(sessionID: sessionID)?.session,
               let context = reactivatedSession.mcpControlContext,
               context.sessionID == sessionID
         else {
@@ -1956,7 +1956,7 @@ struct AgentRunMCPToolService {
         initialDelivery: AgentModeViewModel.MCPInstructionDispatch? = nil,
         liveSnapshot _: AgentRunMCPSnapshot? = nil
     ) async throws -> Value {
-        guard let initialCursor = agentModeVM.mcpWaitCursor(sessionID: sessionID) else {
+        guard let initialCursor = agentModeVM.mcpRuntime.waitCursor(sessionID: sessionID) else {
             if let unavailable = unavailableControlReadSnapshot(sessionID: sessionID, agentModeVM: agentModeVM) {
                 var object = unavailable.asObject()
                 object["_meta"] = .object(["wait_result": .string("unavailable")])
@@ -2333,7 +2333,7 @@ struct AgentRunMCPToolService {
         waitConsumerParentRunID: UUID?
     ) async throws -> Value {
         let cursors = await MainActor.run {
-            sessionIDs.compactMap { agentModeVM.mcpWaitCursor(sessionID: $0) }
+            sessionIDs.compactMap { agentModeVM.mcpRuntime.waitCursor(sessionID: $0) }
         }
         guard !cursors.isEmpty else {
             for sessionID in sessionIDs {
@@ -3343,7 +3343,7 @@ struct AgentRunMCPToolService {
         registration suppliedRegistration: AgentRunSessionStore.Registration? = nil,
         agentModeVM: AgentModeViewModel
     ) async -> AgentRunMCPSnapshot {
-        let registration = suppliedRegistration ?? agentModeVM.mcpRegistration(sessionID: sessionID)
+        let registration = suppliedRegistration ?? agentModeVM.mcpRuntime.registration(sessionID: sessionID)
         let storedSnapshot: AgentRunMCPSnapshot? = if let registration {
             await AgentRunSessionStore.snapshot(for: registration)
         } else {
