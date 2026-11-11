@@ -605,18 +605,12 @@ extension AgentModeViewModel {
         }
     }
 
-    typealias SourceItemsMutation = AgentSourceItemsMutation
-
     enum AgentTranscriptAutoFollowArmingState: String, Codable, Equatable {
         case armed
         case disarmedAfterManualDetach
     }
 
-    typealias PendingSourceItemsMutationSummary = AgentPendingSourceItemsMutationSummary
-
     typealias DerivedTranscriptSyncState = AgentDerivedTranscriptSyncState
-
-    typealias PersistableTranscriptSnapshot = AgentPersistableTranscriptSnapshot
 
     struct ActiveTranscriptFollowBindingState: Equatable {
         var tabID: UUID?

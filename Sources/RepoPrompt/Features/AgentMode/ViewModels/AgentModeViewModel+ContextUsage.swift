@@ -36,34 +36,12 @@ extension AgentModeViewModel {
         }
     }
 
-    func clearContextUsageSnapshot(for session: TabSession) {
-        usageRuntime.clearContextUsageSnapshot(for: session)
-    }
-
     func dequeuePendingNonCodexUserTokens(for session: TabSession) -> Int? {
         usageRuntime.dequeuePendingNonCodexUserTokens(for: session)
     }
 
     func startNonCodexTurnAccountingIfNeeded(for session: TabSession, initialMessage: String) {
         if usageRuntime.startNonCodexTurnAccountingIfNeeded(for: session, initialMessage: initialMessage) {
-            scheduleSave(for: session)
-        }
-    }
-
-    func addUserInputTokensToActiveNonCodexTurn(_ tokens: Int, for session: TabSession) {
-        usageRuntime.addUserInputTokensToActiveNonCodexTurn(tokens, for: session)
-    }
-
-    func addToolInputTokens(_ payload: String?, for session: TabSession) {
-        usageRuntime.addToolInputTokens(payload, for: session)
-    }
-
-    func addToolOutputTokens(_ payload: String?, for session: TabSession) {
-        usageRuntime.addToolOutputTokens(payload, for: session)
-    }
-
-    func finalizeNonCodexTurnUsageIfNeeded(for session: TabSession, promptTokens: Int?, completionTokens: Int?, contextUsedTokens: Int?) {
-        if usageRuntime.finalizeNonCodexTurnUsageIfNeeded(for: session, promptTokens: promptTokens, completionTokens: completionTokens, contextUsedTokens: contextUsedTokens) {
             scheduleSave(for: session)
         }
     }

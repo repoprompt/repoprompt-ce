@@ -9,7 +9,167 @@ private enum AgentSelectedFilesPopoverTab {
     case codemaps
 }
 
-struct AgentExportCard: View {
+@MainActor
+private protocol AgentContextExportSourceView: View {
+    var promptManager: PromptViewModel { get }
+    var selectionCoordinator: WorkspaceSelectionCoordinator? { get }
+    var currentTabID: UUID? { get }
+    var activeAgentSessionID: UUID? { get }
+    var worktreeBindingsProvider: (@MainActor (UUID, UUID?) -> [AgentSessionWorktreeBinding])? { get }
+}
+
+private extension AgentContextExportSourceView {
+    func makeExportSource(flushPendingUI: Bool = true) -> AgentContextExportSource {
+        let requestedTabID = currentTabID ?? promptManager.activeComposeTabID
+        let selectionSnapshot = requestedTabID.flatMap {
+            selectionCoordinator?.selectionSnapshot(for: $0, flushPendingUIIfActive: flushPendingUI)
+        }
+        return AgentContextExportSourceBuilder.makeSource(
+            AgentContextExportSourceBuildRequest(
+                requestedTabID: requestedTabID,
+                activeComposeTabID: promptManager.activeComposeTabID,
+                activePromptText: promptManager.promptText,
+                selectionSnapshot: selectionSnapshot,
+                composeTabs: promptManager.currentComposeTabs,
+                explicitActiveAgentSessionID: activeAgentSessionID,
+                worktreeBindingsProvider: { sessionID, tabID in
+                    worktreeBindingsProvider?(sessionID, tabID) ?? []
+                }
+            )
+        )
+    }
+}
+
+@MainActor
+private protocol AgentSelectedFilesManaging: AgentContextExportSourceView {
+    var perfRecorder: any AgentModePerfRecording { get }
+    var modelCoordinator: AgentSelectedFilesModelCoordinator { get }
+    var activePopoverTab: AgentSelectedFilesPopoverTab { get }
+    var exportComponent: String { get }
+}
+
+private extension AgentSelectedFilesManaging {
+    var selectionChangesPublisher: AnyPublisher<WorkspaceSelectionCoordinator.Change, Never> {
+        selectionCoordinator?.changes ?? Empty<WorkspaceSelectionCoordinator.Change, Never>(completeImmediately: false).eraseToAnyPublisher()
+    }
+
+    func makeModelRequest(flushPendingUI: Bool = true) -> AgentSelectedFilesModelRequest {
+        let startMS = AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).timestampMSIfEnabled()
+        let source = makeExportSource(flushPendingUI: flushPendingUI)
+        let cfg = promptManager.resolvePromptContext(BuiltInCopyPresets.standard, custom: nil)
+        let codeMapUsage = effectiveCodeMapUsage(for: activePopoverTab, configuredUsage: cfg.codeMapUsage)
+        var fields = AgentSelectedFilesDiagnostics.sourceFields(source)
+        fields["component"] = exportComponent
+        fields["flushPendingUI"] = String(flushPendingUI)
+        fields["activeTab"] = String(describing: activePopoverTab)
+        fields["configuredCodeMapUsage"] = String(describing: cfg.codeMapUsage)
+        fields["codeMapUsage"] = String(describing: codeMapUsage)
+        fields.merge(AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).elapsedFields(since: startMS)) { _, new in new }
+        AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event("view.makeModelRequest", fields: fields)
+        return AgentSelectedFilesModelRequest(
+            identity: AgentSelectedFilesModelIdentity(
+                exportContextIdentity: source.exportContextIdentity,
+                filePathDisplay: promptManager.filePathDisplayOption,
+                codeMapUsage: codeMapUsage
+            ),
+            source: source,
+            store: promptManager.workspaceFileContextStore,
+            filePathDisplay: promptManager.filePathDisplayOption,
+            codeMapUsage: codeMapUsage,
+            entryMetricsSnapshot: AgentSelectedFilesRequestMetricsSnapshotResolver.activeTokenMetricsSnapshot(
+                source: source,
+                promptManager: promptManager,
+                codeMapUsage: codeMapUsage,
+                filePathDisplay: promptManager.filePathDisplayOption
+            )
+        )
+    }
+
+    func effectiveCodeMapUsage(
+        for activeTab: AgentSelectedFilesPopoverTab,
+        configuredUsage: CodeMapUsage
+    ) -> CodeMapUsage {
+        activeTab == .codemaps ? configuredUsage : .none
+    }
+
+    func refreshExportModel(force: Bool = false, preserveDisplayedModel: Bool = false) {
+        modelCoordinator.perfRecorder = perfRecorder
+        let request = makeModelRequest(flushPendingUI: true)
+        var fields = AgentSelectedFilesDiagnostics.requestFields(request)
+        fields["component"] = exportComponent
+        fields["force"] = String(force)
+        fields["preserveDisplayedModel"] = String(preserveDisplayedModel)
+        let outcome = modelCoordinator.refreshIfNeeded(
+            request,
+            force: force,
+            preserveDisplayedModel: preserveDisplayedModel
+        )
+        fields["outcome"] = String(describing: outcome)
+        AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event("view.refresh", fields: fields, includeStack: true)
+    }
+
+    func loadRowContent(
+        _ row: AgentContextExportRow,
+        model: AgentContextExportModel,
+        purpose: AgentContextExportRow.ContentPurpose
+    ) async -> String? {
+        await AgentContextExportResolver.loadRowContent(
+            for: row,
+            model: model,
+            store: promptManager.workspaceFileContextStore,
+            purpose: purpose
+        )
+    }
+
+    func remove(_ row: AgentContextExportRow, from model: AgentContextExportModel) {
+        guard row.canRemove else { return }
+        Task {
+            let latestSelection = await MainActor.run { self.latestSelection(for: model.source) }
+            let updated = await AgentContextExportResolver.removeRow(
+                row,
+                from: latestSelection,
+                lookupContext: model.lookupContext,
+                store: promptManager.workspaceFileContextStore
+            )
+            await persistSelection(updated, source: model.source)
+            await MainActor.run { refreshExportModel(force: true) }
+        }
+    }
+
+    func clearSelection(for model: AgentContextExportModel) {
+        Task {
+            let latestSelection = await MainActor.run { self.latestSelection(for: model.source) }
+            let updated = AgentContextExportResolver.removeSelectionSnapshot(model.source.selection, from: latestSelection)
+            await persistSelection(updated, source: model.source)
+            await MainActor.run { refreshExportModel(force: true) }
+        }
+    }
+
+    @MainActor
+    func latestSelection(for source: AgentContextExportSource) -> StoredSelection {
+        guard let tabID = source.tabID else { return source.selection }
+        if let snapshot = selectionCoordinator?.selectionSnapshot(for: tabID, flushPendingUIIfActive: true) {
+            return snapshot.selection
+        }
+        return promptManager.currentComposeTabs.first { $0.id == tabID }?.selection ?? source.selection
+    }
+
+    @MainActor
+    func persistSelection(_ selection: StoredSelection, source: AgentContextExportSource) async {
+        guard let selectionCoordinator else { return }
+        if let tabID = source.tabID,
+           let workspaceID = selectionCoordinator.activeSelectionIdentity()?.workspaceID
+        {
+            _ = await selectionCoordinator.persistSelection(
+                selection,
+                for: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID),
+                source: .runtimeMutation
+            )
+        }
+    }
+}
+
+struct AgentExportCard: View, AgentContextExportSourceView {
     @ObservedObject var promptManager: PromptViewModel
     @ObservedObject var tokenCounter: TokenCountingViewModel
     let selectionCoordinator: WorkspaceSelectionCoordinator?
@@ -114,26 +274,6 @@ struct AgentExportCard: View {
         }
     }
 
-    private func makeExportSource(flushPendingUI: Bool = true) -> AgentContextExportSource {
-        let requestedTabID = currentTabID ?? promptManager.activeComposeTabID
-        let selectionSnapshot = requestedTabID.flatMap {
-            selectionCoordinator?.selectionSnapshot(for: $0, flushPendingUIIfActive: flushPendingUI)
-        }
-        return AgentContextExportSourceBuilder.makeSource(
-            AgentContextExportSourceBuildRequest(
-                requestedTabID: requestedTabID,
-                activeComposeTabID: promptManager.activeComposeTabID,
-                activePromptText: promptManager.promptText,
-                selectionSnapshot: selectionSnapshot,
-                composeTabs: promptManager.currentComposeTabs,
-                explicitActiveAgentSessionID: activeAgentSessionID,
-                worktreeBindingsProvider: { sessionID, tabID in
-                    worktreeBindingsProvider?(sessionID, tabID) ?? []
-                }
-            )
-        )
-    }
-
     private func buildAgentClipboard(for cfg: PromptContextResolved) async -> String {
         let source = await MainActor.run { makeExportSource() }
         let lookupContext = await AgentContextExportResolver.lookupContext(
@@ -205,7 +345,11 @@ struct AgentExportCard: View {
     }
 }
 
-struct AgentSelectedFilesPopoverTrigger<Label: View>: View {
+struct AgentSelectedFilesPopoverTrigger<Label: View>: View, AgentSelectedFilesManaging {
+    fileprivate var exportComponent: String {
+        "trigger"
+    }
+
     @ObservedObject var promptManager: PromptViewModel
     let selectionCoordinator: WorkspaceSelectionCoordinator?
     let currentTabID: UUID?
@@ -214,10 +358,10 @@ struct AgentSelectedFilesPopoverTrigger<Label: View>: View {
     let summaryOverride: AgentContextSelectionSummary?
     @ViewBuilder let label: (AgentContextSelectionSummary) -> Label
 
-    @Environment(\.agentModePerfRecorder) private var perfRecorder
-    @StateObject private var modelCoordinator = AgentSelectedFilesModelCoordinator()
+    @Environment(\.agentModePerfRecorder) fileprivate var perfRecorder
+    @StateObject fileprivate var modelCoordinator = AgentSelectedFilesModelCoordinator()
     @State private var showSelectedFilesPopover = false
-    @State private var activePopoverTab: AgentSelectedFilesPopoverTab = .files
+    @State fileprivate var activePopoverTab: AgentSelectedFilesPopoverTab = .files
 
     private var selectionSummary: AgentContextSelectionSummary {
         if let summaryOverride {
@@ -226,10 +370,6 @@ struct AgentSelectedFilesPopoverTrigger<Label: View>: View {
         return AgentContextExportResolver.selectionSummary(
             for: makeExportSource(flushPendingUI: false).selection
         )
-    }
-
-    private var selectionChangesPublisher: AnyPublisher<WorkspaceSelectionCoordinator.Change, Never> {
-        selectionCoordinator?.changes ?? Empty<WorkspaceSelectionCoordinator.Change, Never>(completeImmediately: false).eraseToAnyPublisher()
     }
 
     var body: some View {
@@ -317,81 +457,6 @@ struct AgentSelectedFilesPopoverTrigger<Label: View>: View {
         return min(440, Double(visibleRows) * 40 + 64)
     }
 
-    private func makeExportSource(flushPendingUI: Bool = true) -> AgentContextExportSource {
-        let requestedTabID = currentTabID ?? promptManager.activeComposeTabID
-        let selectionSnapshot = requestedTabID.flatMap {
-            selectionCoordinator?.selectionSnapshot(for: $0, flushPendingUIIfActive: flushPendingUI)
-        }
-        return AgentContextExportSourceBuilder.makeSource(
-            AgentContextExportSourceBuildRequest(
-                requestedTabID: requestedTabID,
-                activeComposeTabID: promptManager.activeComposeTabID,
-                activePromptText: promptManager.promptText,
-                selectionSnapshot: selectionSnapshot,
-                composeTabs: promptManager.currentComposeTabs,
-                explicitActiveAgentSessionID: activeAgentSessionID,
-                worktreeBindingsProvider: { sessionID, tabID in
-                    worktreeBindingsProvider?(sessionID, tabID) ?? []
-                }
-            )
-        )
-    }
-
-    private func makeModelRequest(flushPendingUI: Bool = true) -> AgentSelectedFilesModelRequest {
-        let startMS = AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).timestampMSIfEnabled()
-        let source = makeExportSource(flushPendingUI: flushPendingUI)
-        let cfg = promptManager.resolvePromptContext(BuiltInCopyPresets.standard, custom: nil)
-        let codeMapUsage = effectiveCodeMapUsage(for: activePopoverTab, configuredUsage: cfg.codeMapUsage)
-        var fields = AgentSelectedFilesDiagnostics.sourceFields(source)
-        fields["component"] = "trigger"
-        fields["flushPendingUI"] = String(flushPendingUI)
-        fields["activeTab"] = String(describing: activePopoverTab)
-        fields["configuredCodeMapUsage"] = String(describing: cfg.codeMapUsage)
-        fields["codeMapUsage"] = String(describing: codeMapUsage)
-        fields.merge(AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).elapsedFields(since: startMS)) { _, new in new }
-        AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event("view.makeModelRequest", fields: fields)
-        return AgentSelectedFilesModelRequest(
-            identity: AgentSelectedFilesModelIdentity(
-                exportContextIdentity: source.exportContextIdentity,
-                filePathDisplay: promptManager.filePathDisplayOption,
-                codeMapUsage: codeMapUsage
-            ),
-            source: source,
-            store: promptManager.workspaceFileContextStore,
-            filePathDisplay: promptManager.filePathDisplayOption,
-            codeMapUsage: codeMapUsage,
-            entryMetricsSnapshot: AgentSelectedFilesRequestMetricsSnapshotResolver.activeTokenMetricsSnapshot(
-                source: source,
-                promptManager: promptManager,
-                codeMapUsage: codeMapUsage,
-                filePathDisplay: promptManager.filePathDisplayOption
-            )
-        )
-    }
-
-    private func effectiveCodeMapUsage(
-        for activeTab: AgentSelectedFilesPopoverTab,
-        configuredUsage: CodeMapUsage
-    ) -> CodeMapUsage {
-        activeTab == .codemaps ? configuredUsage : .none
-    }
-
-    private func refreshExportModel(force: Bool = false, preserveDisplayedModel: Bool = false) {
-        modelCoordinator.perfRecorder = perfRecorder
-        let request = makeModelRequest(flushPendingUI: true)
-        var fields = AgentSelectedFilesDiagnostics.requestFields(request)
-        fields["component"] = "trigger"
-        fields["force"] = String(force)
-        fields["preserveDisplayedModel"] = String(preserveDisplayedModel)
-        let outcome = modelCoordinator.refreshIfNeeded(
-            request,
-            force: force,
-            preserveDisplayedModel: preserveDisplayedModel
-        )
-        fields["outcome"] = String(describing: outcome)
-        AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event("view.refresh", fields: fields, includeStack: true)
-    }
-
     private func resetOrRefreshExportModelForContextChange() {
         AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event(
             "trigger.resetForContextChange",
@@ -423,69 +488,13 @@ struct AgentSelectedFilesPopoverTrigger<Label: View>: View {
             modelCoordinator.invalidate()
         }
     }
-
-    private func loadRowContent(
-        _ row: AgentContextExportRow,
-        model: AgentContextExportModel,
-        purpose: AgentContextExportRow.ContentPurpose
-    ) async -> String? {
-        await AgentContextExportResolver.loadRowContent(
-            for: row,
-            model: model,
-            store: promptManager.workspaceFileContextStore,
-            purpose: purpose
-        )
-    }
-
-    private func remove(_ row: AgentContextExportRow, from model: AgentContextExportModel) {
-        guard row.canRemove else { return }
-        Task {
-            let latestSelection = await MainActor.run { self.latestSelection(for: model.source) }
-            let updated = await AgentContextExportResolver.removeRow(
-                row,
-                from: latestSelection,
-                lookupContext: model.lookupContext,
-                store: promptManager.workspaceFileContextStore
-            )
-            await persistSelection(updated, source: model.source)
-            await MainActor.run { refreshExportModel(force: true) }
-        }
-    }
-
-    private func clearSelection(for model: AgentContextExportModel) {
-        Task {
-            let latestSelection = await MainActor.run { self.latestSelection(for: model.source) }
-            let updated = AgentContextExportResolver.removeSelectionSnapshot(model.source.selection, from: latestSelection)
-            await persistSelection(updated, source: model.source)
-            await MainActor.run { refreshExportModel(force: true) }
-        }
-    }
-
-    @MainActor
-    private func latestSelection(for source: AgentContextExportSource) -> StoredSelection {
-        guard let tabID = source.tabID else { return source.selection }
-        if let snapshot = selectionCoordinator?.selectionSnapshot(for: tabID, flushPendingUIIfActive: true) {
-            return snapshot.selection
-        }
-        return promptManager.currentComposeTabs.first { $0.id == tabID }?.selection ?? source.selection
-    }
-
-    @MainActor
-    private func persistSelection(_ selection: StoredSelection, source: AgentContextExportSource) async {
-        guard let selectionCoordinator else { return }
-        if let tabID = source.tabID,
-           let workspaceID = selectionCoordinator.activeSelectionIdentity()?.workspaceID
-        {
-            _ = await selectionCoordinator.persistSelection(
-                selection,
-                for: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID),
-                source: .runtimeMutation
-            )
-        }
-    }
 }
 
-struct AgentSelectedFilesInlineManager: View {
+struct AgentSelectedFilesInlineManager: View, AgentSelectedFilesManaging {
+    fileprivate var exportComponent: String {
+        "inline"
+    }
+
     @ObservedObject var promptManager: PromptViewModel
     let selectionCoordinator: WorkspaceSelectionCoordinator?
     let currentTabID: UUID?
@@ -493,13 +502,9 @@ struct AgentSelectedFilesInlineManager: View {
     let worktreeBindingsProvider: (@MainActor (UUID, UUID?) -> [AgentSessionWorktreeBinding])?
     let summary: AgentContextSelectionSummary
 
-    @Environment(\.agentModePerfRecorder) private var perfRecorder
-    @StateObject private var modelCoordinator = AgentSelectedFilesModelCoordinator()
-    @State private var activePopoverTab: AgentSelectedFilesPopoverTab = .files
-
-    private var selectionChangesPublisher: AnyPublisher<WorkspaceSelectionCoordinator.Change, Never> {
-        selectionCoordinator?.changes ?? Empty<WorkspaceSelectionCoordinator.Change, Never>(completeImmediately: false).eraseToAnyPublisher()
-    }
+    @Environment(\.agentModePerfRecorder) fileprivate var perfRecorder
+    @StateObject fileprivate var modelCoordinator = AgentSelectedFilesModelCoordinator()
+    @State fileprivate var activePopoverTab: AgentSelectedFilesPopoverTab = .files
 
     var body: some View {
         AgentSelectedFilesPopover(
@@ -556,81 +561,6 @@ struct AgentSelectedFilesInlineManager: View {
         }
     }
 
-    private func makeExportSource(flushPendingUI: Bool = true) -> AgentContextExportSource {
-        let requestedTabID = currentTabID ?? promptManager.activeComposeTabID
-        let selectionSnapshot = requestedTabID.flatMap {
-            selectionCoordinator?.selectionSnapshot(for: $0, flushPendingUIIfActive: flushPendingUI)
-        }
-        return AgentContextExportSourceBuilder.makeSource(
-            AgentContextExportSourceBuildRequest(
-                requestedTabID: requestedTabID,
-                activeComposeTabID: promptManager.activeComposeTabID,
-                activePromptText: promptManager.promptText,
-                selectionSnapshot: selectionSnapshot,
-                composeTabs: promptManager.currentComposeTabs,
-                explicitActiveAgentSessionID: activeAgentSessionID,
-                worktreeBindingsProvider: { sessionID, tabID in
-                    worktreeBindingsProvider?(sessionID, tabID) ?? []
-                }
-            )
-        )
-    }
-
-    private func makeModelRequest(flushPendingUI: Bool = true) -> AgentSelectedFilesModelRequest {
-        let startMS = AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).timestampMSIfEnabled()
-        let source = makeExportSource(flushPendingUI: flushPendingUI)
-        let cfg = promptManager.resolvePromptContext(BuiltInCopyPresets.standard, custom: nil)
-        let codeMapUsage = effectiveCodeMapUsage(for: activePopoverTab, configuredUsage: cfg.codeMapUsage)
-        var fields = AgentSelectedFilesDiagnostics.sourceFields(source)
-        fields["component"] = "inline"
-        fields["flushPendingUI"] = String(flushPendingUI)
-        fields["activeTab"] = String(describing: activePopoverTab)
-        fields["configuredCodeMapUsage"] = String(describing: cfg.codeMapUsage)
-        fields["codeMapUsage"] = String(describing: codeMapUsage)
-        fields.merge(AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).elapsedFields(since: startMS)) { _, new in new }
-        AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event("view.makeModelRequest", fields: fields)
-        return AgentSelectedFilesModelRequest(
-            identity: AgentSelectedFilesModelIdentity(
-                exportContextIdentity: source.exportContextIdentity,
-                filePathDisplay: promptManager.filePathDisplayOption,
-                codeMapUsage: codeMapUsage
-            ),
-            source: source,
-            store: promptManager.workspaceFileContextStore,
-            filePathDisplay: promptManager.filePathDisplayOption,
-            codeMapUsage: codeMapUsage,
-            entryMetricsSnapshot: AgentSelectedFilesRequestMetricsSnapshotResolver.activeTokenMetricsSnapshot(
-                source: source,
-                promptManager: promptManager,
-                codeMapUsage: codeMapUsage,
-                filePathDisplay: promptManager.filePathDisplayOption
-            )
-        )
-    }
-
-    private func effectiveCodeMapUsage(
-        for activeTab: AgentSelectedFilesPopoverTab,
-        configuredUsage: CodeMapUsage
-    ) -> CodeMapUsage {
-        activeTab == .codemaps ? configuredUsage : .none
-    }
-
-    private func refreshExportModel(force: Bool = false, preserveDisplayedModel: Bool = false) {
-        modelCoordinator.perfRecorder = perfRecorder
-        let request = makeModelRequest(flushPendingUI: true)
-        var fields = AgentSelectedFilesDiagnostics.requestFields(request)
-        fields["component"] = "inline"
-        fields["force"] = String(force)
-        fields["preserveDisplayedModel"] = String(preserveDisplayedModel)
-        let outcome = modelCoordinator.refreshIfNeeded(
-            request,
-            force: force,
-            preserveDisplayedModel: preserveDisplayedModel
-        )
-        fields["outcome"] = String(describing: outcome)
-        AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event("view.refresh", fields: fields, includeStack: true)
-    }
-
     private func resetAndRefreshExportModelForContextChange() {
         AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event("inline.resetForContextChange", includeStack: true)
         modelCoordinator.invalidate()
@@ -650,66 +580,6 @@ struct AgentSelectedFilesInlineManager: View {
         }
         AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).event("view.selectionChange", fields: fields, includeStack: true)
         refreshExportModel(preserveDisplayedModel: true)
-    }
-
-    private func loadRowContent(
-        _ row: AgentContextExportRow,
-        model: AgentContextExportModel,
-        purpose: AgentContextExportRow.ContentPurpose
-    ) async -> String? {
-        await AgentContextExportResolver.loadRowContent(
-            for: row,
-            model: model,
-            store: promptManager.workspaceFileContextStore,
-            purpose: purpose
-        )
-    }
-
-    private func remove(_ row: AgentContextExportRow, from model: AgentContextExportModel) {
-        guard row.canRemove else { return }
-        Task {
-            let latestSelection = await MainActor.run { self.latestSelection(for: model.source) }
-            let updated = await AgentContextExportResolver.removeRow(
-                row,
-                from: latestSelection,
-                lookupContext: model.lookupContext,
-                store: promptManager.workspaceFileContextStore
-            )
-            await persistSelection(updated, source: model.source)
-            await MainActor.run { refreshExportModel(force: true) }
-        }
-    }
-
-    private func clearSelection(for model: AgentContextExportModel) {
-        Task {
-            let latestSelection = await MainActor.run { self.latestSelection(for: model.source) }
-            let updated = AgentContextExportResolver.removeSelectionSnapshot(model.source.selection, from: latestSelection)
-            await persistSelection(updated, source: model.source)
-            await MainActor.run { refreshExportModel(force: true) }
-        }
-    }
-
-    @MainActor
-    private func latestSelection(for source: AgentContextExportSource) -> StoredSelection {
-        guard let tabID = source.tabID else { return source.selection }
-        if let snapshot = selectionCoordinator?.selectionSnapshot(for: tabID, flushPendingUIIfActive: true) {
-            return snapshot.selection
-        }
-        return promptManager.currentComposeTabs.first { $0.id == tabID }?.selection ?? source.selection
-    }
-
-    @MainActor
-    private func persistSelection(_ selection: StoredSelection, source: AgentContextExportSource) async {
-        guard let selectionCoordinator else { return }
-        if let tabID = source.tabID,
-           let workspaceID = selectionCoordinator.activeSelectionIdentity()?.workspaceID
-        {
-            _ = await selectionCoordinator.persistSelection(
-                selection,
-                for: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID),
-                source: .runtimeMutation
-            )
-        }
     }
 }
 
