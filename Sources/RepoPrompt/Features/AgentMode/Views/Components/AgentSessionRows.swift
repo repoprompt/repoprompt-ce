@@ -3,6 +3,24 @@ import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import SwiftUI
 
+extension AgentWorktreeMergeAttention.Kind {
+    var presentationColor: Color {
+        switch self {
+        case .conflicted: .orange
+        case .awaitingApproval: .purple
+        case .awaitingCommit: .yellow
+        }
+    }
+
+    var presentationGlyph: String {
+        switch self {
+        case .conflicted: "exclamationmark.triangle.fill"
+        case .awaitingApproval: "arrow.triangle.merge"
+        case .awaitingCommit: "checkmark.circle"
+        }
+    }
+}
+
 // MARK: - Agent Session Row
 
 /// Code-level UX switch (deliberately not a user setting, repurposed from the overseer-only
@@ -1184,17 +1202,8 @@ struct AgentSessionRow: View {
     /// `conflicted`, or `awaiting_commit` state. Sized to match the existing
     /// pin glyph so layout does not jitter when attention attaches/detaches.
     private func mergeAttentionBadge(for attention: AgentWorktreeMergeAttention) -> some View {
-        let tint: Color = switch attention.kind {
-        case .conflicted: .orange
-        case .awaitingApproval: .purple
-        case .awaitingCommit: .yellow
-        }
-        let glyph = switch attention.kind {
-        case .conflicted: "exclamationmark.triangle.fill"
-        case .awaitingApproval: "arrow.triangle.merge"
-        case .awaitingCommit: "checkmark.circle"
-        }
-        return Image(systemName: glyph)
+        let tint = attention.kind.presentationColor
+        return Image(systemName: attention.kind.presentationGlyph)
             .font(.system(size: pinFontSize, weight: .semibold))
             .foregroundStyle(tint)
             .frame(width: pinFontSize + 2, height: pinFontSize + 2)

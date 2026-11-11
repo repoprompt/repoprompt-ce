@@ -8,6 +8,22 @@ extension EnvironmentValues {
     @Entry var handoffOmittedImageCount: Binding<Int> = .constant(0)
 }
 
+private extension View {
+    func transcriptHistoryActionSurface(verticalPadding: CGFloat) -> some View {
+        frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10)
+            .padding(.vertical, verticalPadding)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color(nsColor: .controlBackgroundColor).opacity(0.96))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color.secondary.opacity(0.2), lineWidth: 0.5)
+            )
+    }
+}
+
 /// Agent Mode view - a chat-style interface for long-running agent interactions
 /// with per-tab session management, markdown message rendering, and tool call display
 struct AgentModeView: View {
@@ -2207,38 +2223,26 @@ struct AgentModeChatDetailView: View {
         if #available(macOS 15.0, *) {
             modernScrollableContent(proxy: proxy, viewportHeight: viewportHeight)
         } else {
-            legacyScrollableContent(proxy: proxy, viewportHeight: viewportHeight)
+            scrollableContent(proxy: proxy, viewportHeight: viewportHeight)
         }
     }
 
     @available(macOS 15.0, *)
     private func modernScrollableContent(proxy: ScrollViewProxy, viewportHeight: CGFloat) -> some View {
         // Keep the ScrollView identity stable across pinned/detached transitions.
-        modernScrollableContentBase(proxy: proxy, viewportHeight: viewportHeight)
-    }
-
-    @available(macOS 15.0, *)
-    private func modernScrollableContentBase(proxy: ScrollViewProxy, viewportHeight: CGFloat) -> some View {
-        ScrollView {
-            messageListContent(viewportHeight: viewportHeight, proxy: proxy)
-        }
-        .id(transcriptScrollResetRevision)
-        .accessibilityIdentifier("agentTranscript.scrollView")
-        .transaction { txn in
-            if didChatChange { txn.disablesAnimations = true }
-        }
-        .onScrollGeometryChange(for: AgentTranscriptScrollMetrics.self, of: { geometry in
-            scrollMetrics(from: geometry)
-        }, action: { _, newMetrics in
-            handleScrollDriverEvent(.metricsChanged(newMetrics), proxy: proxy)
-        })
-        .onScrollPhaseChange { oldPhase, newPhase, context in
-            debugLog("scrollPhase", details: "old=\(oldPhase) new=\(newPhase)")
-            handleScrollDriverEvent(
-                .phaseChanged(userScrollPhase(from: newPhase), metrics: scrollMetrics(from: context.geometry)),
-                proxy: proxy
-            )
-        }
+        scrollableContent(proxy: proxy, viewportHeight: viewportHeight)
+            .onScrollGeometryChange(for: AgentTranscriptScrollMetrics.self, of: { geometry in
+                scrollMetrics(from: geometry)
+            }, action: { _, newMetrics in
+                handleScrollDriverEvent(.metricsChanged(newMetrics), proxy: proxy)
+            })
+            .onScrollPhaseChange { oldPhase, newPhase, context in
+                debugLog("scrollPhase", details: "old=\(oldPhase) new=\(newPhase)")
+                handleScrollDriverEvent(
+                    .phaseChanged(userScrollPhase(from: newPhase), metrics: scrollMetrics(from: context.geometry)),
+                    proxy: proxy
+                )
+            }
     }
 
     /// Single entry point for scroll reports coming back from the transcript scroll
@@ -2311,7 +2315,7 @@ struct AgentModeChatDetailView: View {
         }
     }
 
-    private func legacyScrollableContent(proxy: ScrollViewProxy, viewportHeight: CGFloat) -> some View {
+    private func scrollableContent(proxy: ScrollViewProxy, viewportHeight: CGFloat) -> some View {
         ScrollView {
             messageListContent(viewportHeight: viewportHeight, proxy: proxy)
         }
@@ -2629,47 +2633,11 @@ struct AgentModeChatDetailView: View {
         #endif
         switch block.kind {
         case .activityCluster:
-            let supportsExpansion = transcriptBlockSupportsExpansion(block)
-            let persistedExpansion = persistedTranscriptBlockExpansion(for: block)
-            let summaryLockTarget = isDynamicSummaryLockTarget(block)
-            let isExpanded = supportsExpansion && !summaryLockTarget && persistedExpansion
-            transcriptBlockRow {
-                VStack(alignment: .leading, spacing: 8) {
-                    if !supportsExpansion || summaryLockTarget {
-                        clusterSummaryLabel(for: block, isExpanded: isExpanded)
-                    } else {
-                        Button {
-                            transcriptBlockExpansion[block.id] = !persistedExpansion
-                            transcriptBlockDefaultExpansion[block.id] = block.defaultPresentation == .expanded
-                        } label: {
-                            clusterSummaryLabel(for: block, isExpanded: isExpanded)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    if isExpanded {
-                        let useScroll = block.rows.count > 5
-                        Group {
-                            if useScroll {
-                                ScrollView {
-                                    expandedClusterContent(block: block, renderContext: renderContext)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                }
-                                .frame(maxHeight: 220)
-                            } else {
-                                expandedClusterContent(block: block, renderContext: renderContext)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                        }
-                        .padding(8)
-                        .background(
-                            RoundedRectangle(cornerRadius: 8)
-                                .fill(Color.secondary.opacity(0.04))
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 8)
-                                .stroke(Color.secondary.opacity(0.08), lineWidth: 0.5)
-                        )
-                    }
+            expandableTranscriptBlock(block) { isExpanded in
+                clusterSummaryLabel(for: block, isExpanded: isExpanded)
+            } expandedContent: {
+                expandedTranscriptSurface(useScroll: block.rows.count > 5, maxHeight: 220) {
+                    expandedClusterContent(block: block, renderContext: renderContext)
                 }
             }
             .accessibilityIdentifier("agentTranscript.activityCluster")
@@ -2679,47 +2647,13 @@ struct AgentModeChatDetailView: View {
             }
             .accessibilityIdentifier("agentTranscript.collapsedHistoryRange")
         case .groupedHistory:
-            let supportsExpansion = transcriptBlockSupportsExpansion(block)
-            let persistedExpansion = persistedTranscriptBlockExpansion(for: block)
-            let summaryLockTarget = isDynamicSummaryLockTarget(block)
-            let isExpanded = supportsExpansion && !summaryLockTarget && persistedExpansion
-            transcriptBlockRow {
-                VStack(alignment: .leading, spacing: 8) {
-                    if !supportsExpansion || summaryLockTarget {
-                        groupedHistorySummaryLabel(for: block, isExpanded: isExpanded)
-                    } else {
-                        Button {
-                            transcriptBlockExpansion[block.id] = !persistedExpansion
-                            transcriptBlockDefaultExpansion[block.id] = block.defaultPresentation == .expanded
-                        } label: {
-                            groupedHistorySummaryLabel(for: block, isExpanded: isExpanded)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    if isExpanded, let groupedHistory = block.groupedHistory {
-                        let totalRows = groupedHistory.sections.reduce(0) { $0 + $1.childBlocks.reduce(0) { $0 + $1.rows.count } }
-                        let useScroll = totalRows > 5
-                        Group {
-                            if useScroll {
-                                ScrollView {
-                                    expandedGroupedContent(sections: groupedHistory.sections, renderContext: renderContext)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                }
-                                .frame(maxHeight: 260)
-                            } else {
-                                expandedGroupedContent(sections: groupedHistory.sections, renderContext: renderContext)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                        }
-                        .padding(8)
-                        .background(
-                            RoundedRectangle(cornerRadius: 8)
-                                .fill(Color.secondary.opacity(0.04))
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 8)
-                                .stroke(Color.secondary.opacity(0.08), lineWidth: 0.5)
-                        )
+            expandableTranscriptBlock(block) { isExpanded in
+                groupedHistorySummaryLabel(for: block, isExpanded: isExpanded)
+            } expandedContent: {
+                if let groupedHistory = block.groupedHistory {
+                    let totalRows = groupedHistory.sections.reduce(0) { $0 + $1.childBlocks.reduce(0) { $0 + $1.rows.count } }
+                    expandedTranscriptSurface(useScroll: totalRows > 5, maxHeight: 260) {
+                        expandedGroupedContent(sections: groupedHistory.sections, renderContext: renderContext)
                     }
                 }
             }
@@ -2824,6 +2758,63 @@ struct AgentModeChatDetailView: View {
             return normalizedToolCardName(item.toolName) == "bash"
         }
         return true
+    }
+
+    private func expandableTranscriptBlock(
+        _ block: AgentTranscriptRenderBlock,
+        @ViewBuilder summary: (Bool) -> some View,
+        @ViewBuilder expandedContent: () -> some View
+    ) -> some View {
+        let supportsExpansion = transcriptBlockSupportsExpansion(block)
+        let persistedExpansion = persistedTranscriptBlockExpansion(for: block)
+        let summaryLockTarget = isDynamicSummaryLockTarget(block)
+        let isExpanded = supportsExpansion && !summaryLockTarget && persistedExpansion
+        return transcriptBlockRow {
+            VStack(alignment: .leading, spacing: 8) {
+                if !supportsExpansion || summaryLockTarget {
+                    summary(isExpanded)
+                } else {
+                    Button {
+                        transcriptBlockExpansion[block.id] = !persistedExpansion
+                        transcriptBlockDefaultExpansion[block.id] = block.defaultPresentation == .expanded
+                    } label: {
+                        summary(isExpanded)
+                    }
+                    .buttonStyle(.plain)
+                }
+                if isExpanded {
+                    expandedContent()
+                }
+            }
+        }
+    }
+
+    private func expandedTranscriptSurface(
+        useScroll: Bool,
+        maxHeight: CGFloat,
+        @ViewBuilder content: () -> some View
+    ) -> some View {
+        Group {
+            if useScroll {
+                ScrollView {
+                    content()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: maxHeight)
+            } else {
+                content()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(8)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.secondary.opacity(0.04))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.secondary.opacity(0.08), lineWidth: 0.5)
+        )
     }
 
     private func transcriptBlockRow(@ViewBuilder content: () -> some View) -> some View {
@@ -3366,17 +3357,7 @@ struct AgentModeChatDetailView: View {
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(.secondary)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color(nsColor: .controlBackgroundColor).opacity(0.96))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(Color.secondary.opacity(0.2), lineWidth: 0.5)
-            )
+            .transcriptHistoryActionSurface(verticalPadding: 8)
         }
         .buttonStyle(.plain)
     }
@@ -3405,17 +3386,7 @@ struct AgentModeChatDetailView: View {
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
                     .foregroundStyle(Color.accentColor)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 9)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color(nsColor: .controlBackgroundColor).opacity(0.96))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(Color.secondary.opacity(0.2), lineWidth: 0.5)
-            )
+            .transcriptHistoryActionSurface(verticalPadding: 9)
         }
         .buttonStyle(.plain)
     }
