@@ -46,6 +46,7 @@ final class CodeMapGlobalDisableObservation {
 
 @MainActor
 struct WindowStateComposition {
+    let workspaceResources: AgentHostWorkspaceResources
     let workspaceFileContextStore: WorkspaceFileContextStore
     let workspaceSearchService: WorkspaceSearchService
     let selectionCoordinator: WorkspaceSelectionCoordinator
@@ -103,25 +104,11 @@ enum WindowStateCompositionFactory {
         #endif
         let modelRouterRuntime = injectedModelRouterRuntime ?? WindowStatesManager.shared.modelRouterRuntime
         // 1) Workspace file context store + visible file-tree UI adapter
-        #if DEBUG
-            let defaultWorkspaceFileContextStore = WorkspaceFileContextStore(
-                startupFeatureFlags: .current(),
-                enableCatalogShardShadowValidation: false,
-                nonGitCodeMapsEnabled: settingsStore.nonGitCodeMapsEnabled,
-                codeMapsGloballyDisabled: settingsStore.globalCodeMapsDisabled(),
-                restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
-                perfRecorder: AppAgentModePerfRecorder()
-            )
-        #else
-            let defaultWorkspaceFileContextStore = WorkspaceFileContextStore(
-                startupFeatureFlags: .current(),
-                nonGitCodeMapsEnabled: settingsStore.nonGitCodeMapsEnabled,
-                codeMapsGloballyDisabled: settingsStore.globalCodeMapsDisabled(),
-                restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
-                perfRecorder: AppAgentModePerfRecorder()
-            )
-        #endif
-        let workspaceFileContextStore = injectedWorkspaceFileContextStore ?? defaultWorkspaceFileContextStore
+        let workspaceResources = AgentHostWorkspaceResources(
+            files: injectedWorkspaceFileContextStore ?? AgentHostWorkspaceResources.makeFiles(settingsStore: settingsStore),
+            contexts: domainRuntime?.contextStore
+        )
+        let workspaceFileContextStore = workspaceResources.files
         let workspaceSearchService = injectedWorkspaceSearchService ?? WorkspaceSearchService()
         let workspaceFilesViewModel = WorkspaceFilesViewModel(
             workspaceFileContextStore: workspaceFileContextStore,
@@ -216,6 +203,10 @@ enum WindowStateCompositionFactory {
 
         // 11) MCP server (one listener app-wide, this window may be owner)
         let applyEditsApprovalStore = ApplyEditsApprovalStore.shared
+        let routeResources = MCPHostRouteResources(
+            identity: .legacyWindow(windowID), coordinator: domainRuntime?.routingCoordinator,
+            runtime: domainRuntime ?? AppDomainRuntimeComposition.shared.runtime
+        )
         let mcpServer = MCPServerViewModel(
             service: sharedMCPService,
             perfRecorder: AppAgentModePerfRecorder(),
@@ -251,6 +242,7 @@ enum WindowStateCompositionFactory {
                 )
             },
             domainRoutingCoordinator: domainRuntime?.routingCoordinator,
+            routeResources: routeResources,
             domainWorkspaceAuthorityClient: domainWorkspaceClient,
             domainReadSideEffectCoordinator: domainRuntime?.readSideEffectCoordinator,
             domainReadRuntimeIdentity: domainRuntime?.identity,
@@ -340,6 +332,7 @@ enum WindowStateCompositionFactory {
 
         #if DEBUG
             return WindowStateComposition(
+                workspaceResources: workspaceResources,
                 workspaceFileContextStore: workspaceFileContextStore,
                 workspaceSearchService: workspaceSearchService,
                 selectionCoordinator: selectionCoordinator,
@@ -362,6 +355,7 @@ enum WindowStateCompositionFactory {
             )
         #else
             return WindowStateComposition(
+                workspaceResources: workspaceResources,
                 workspaceFileContextStore: workspaceFileContextStore,
                 workspaceSearchService: workspaceSearchService,
                 selectionCoordinator: selectionCoordinator,

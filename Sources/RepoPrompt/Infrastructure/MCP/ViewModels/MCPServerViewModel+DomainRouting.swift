@@ -27,22 +27,9 @@ extension MCPServerViewModel {
         activeContextID: UUID?,
         presentationRevision: UInt64
     ) {
-        guard let coordinator = domainRoutingCoordinator,
-              !domainRoutingWindowIsClosing,
-              domainWindowDescriptor == nil,
-              domainWindowRegistrationTask == nil
-        else { return }
-        let windowID = windowID
-        domainWindowRegistrationTask = Task {
-            let outcome = await coordinator.openWindow(
-                windowID: windowID,
-                activeWorkspaceID: activeWorkspaceID,
-                activeContextID: activeContextID,
-                presentationRevision: presentationRevision,
-                operationID: UUID()
-            )
-            return outcome.snapshot.windows.first { $0.windowID == windowID }
-        }
+        routeResources.scheduleRegistration(
+            workspaceID: activeWorkspaceID, contextID: activeContextID, revision: presentationRevision
+        )
     }
 
     @MainActor
@@ -51,17 +38,9 @@ extension MCPServerViewModel {
         activeContextID: UUID?,
         presentationRevision: UInt64
     ) async -> DomainWindowDescriptor? {
-        if let domainWindowDescriptor { return domainWindowDescriptor }
-        scheduleDomainWindowRegistration(
-            activeWorkspaceID: activeWorkspaceID,
-            activeContextID: activeContextID,
-            presentationRevision: presentationRevision
+        await routeResources.ensureRegistered(
+            workspaceID: activeWorkspaceID, contextID: activeContextID, revision: presentationRevision
         )
-        guard let registrationTask = domainWindowRegistrationTask else { return nil }
-        let descriptor = await registrationTask.value
-        domainWindowRegistrationTask = nil
-        domainWindowDescriptor = descriptor
-        return descriptor
     }
 
     /// Publishes a presentation-cache transition to the runtime routing authority.
@@ -128,8 +107,9 @@ extension MCPServerViewModel {
                     $0.registration.connectionID == connectionID
                 }?.registration
             }
-            guard let registration, !domainRoutingWindowIsClosing else { return }
-            domainRoutingConnectionIDs.insert(connectionID)
+            guard let registration else { return }
+            routeResources.retainConnection(registration)
+            guard !domainRoutingWindowIsClosing else { return }
             let bound = await coordinator.bind(
                 connection: registration,
                 binding: binding,
@@ -143,36 +123,10 @@ extension MCPServerViewModel {
 
     @MainActor
     func publishDomainRoutingRelease(connectionID: UUID) {
-        guard let coordinator = domainRoutingCoordinator else {
-            domainRoutingConnectionIDs.remove(connectionID)
-            return
-        }
         let previousPublish = domainRoutingPublishTask
-        domainRoutingPublishTask = Task { @MainActor [weak self] in
+        domainRoutingPublishTask = Task { @MainActor [resources = routeResources] in
             await previousPublish?.value
-            let snapshot = await coordinator.snapshot()
-            guard let registration = snapshot.connections.first(where: {
-                $0.registration.connectionID == connectionID
-            })?.registration else {
-                self?.domainRoutingConnectionIDs.remove(connectionID)
-                return
-            }
-            let released = await coordinator.unregisterConnection(
-                registration,
-                operationID: UUID()
-            )
-            if released.disposition == .applied || released.disposition == .unchanged {
-                await AppDomainRuntimeComposition.shared.runtime.domainHost.releaseConnection(
-                    connectionID: registration.connectionID,
-                    connectionGeneration: registration.generation
-                )
-            }
-            if released.disposition != .applied, released.disposition != .unchanged {
-                self?.logger.warning(
-                    "Domain routing release rejected: \(released.diagnostic ?? String(describing: released.disposition))"
-                )
-            }
-            self?.domainRoutingConnectionIDs.remove(connectionID)
+            await resources.releaseDisconnectedConnection(connectionID)
         }
     }
 
@@ -369,7 +323,7 @@ extension MCPServerViewModel {
                 diagnostic: "connection registration unavailable"
             )
         }
-        domainRoutingConnectionIDs.insert(connectionID)
+        routeResources.retainConnection(registration)
         let targetContext = DomainContextIdentity(
             workspaceID: workspaceID,
             contextID: context.tabID
@@ -593,41 +547,11 @@ extension MCPServerViewModel {
     /// Runs before the server is stopped so no presentation binding can outlive its window.
     @MainActor
     func unregisterDomainRoutingWindow() async {
-        domainRoutingWindowIsClosing = true
+        routeResources.closeDomainAdmission()
         domainReadAppExecutionContexts.removeAll()
         let pendingPublish = domainRoutingPublishTask
         domainRoutingPublishTask = nil
         await pendingPublish?.value
-        domainWindowRegistrationTask?.cancel()
-        if domainWindowDescriptor == nil,
-           let registrationTask = domainWindowRegistrationTask
-        {
-            domainWindowDescriptor = await registrationTask.value
-        }
-        domainWindowRegistrationTask = nil
-        guard let coordinator = domainRoutingCoordinator,
-              let descriptor = domainWindowDescriptor
-        else { return }
-        let routing = await coordinator.snapshot()
-        let ownedConnectionIDs = domainRoutingConnectionIDs
-        domainRoutingConnectionIDs.removeAll()
-        for connection in routing.connections where ownedConnectionIDs.contains(connection.registration.connectionID) {
-            let released = await coordinator.unregisterConnection(
-                connection.registration,
-                operationID: UUID()
-            )
-            if released.disposition == .applied || released.disposition == .unchanged {
-                await AppDomainRuntimeComposition.shared.runtime.domainHost.releaseConnection(
-                    connectionID: connection.registration.connectionID,
-                    connectionGeneration: connection.registration.generation
-                )
-            }
-        }
-        _ = await coordinator.unregisterWindow(
-            windowID: descriptor.windowID,
-            generation: descriptor.generation,
-            operationID: UUID()
-        )
-        domainWindowDescriptor = nil
+        await routeResources.closeDomainRoute()
     }
 }

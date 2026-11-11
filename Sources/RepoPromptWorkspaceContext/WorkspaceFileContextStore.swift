@@ -3101,6 +3101,19 @@ package actor WorkspaceFileContextStore {
     private let sessionRootLifetimeClock = WorkspaceSessionRootLifetimeClock()
     private var rootLifetimeTokensByID: [UUID: WorkspaceContextRootLifetimeToken] = [:]
     private var rootStatesByID: [UUID: RootState] = [:]
+
+    package struct RootRetention {
+        fileprivate let id: UUID
+    }
+
+    private struct RetainedRootLifetime: Hashable {
+        let rootID: UUID
+        let lifetimeID: UUID
+    }
+
+    private var rootRetentions: [UUID: Set<RetainedRootLifetime>] = [:]
+    private var rootRetentionCounts: [RetainedRootLifetime: Int] = [:]
+    private var deferredRootUnloads: Set<RetainedRootLifetime> = []
     private var rootIDsByStandardizedPath: [String: UUID] = [:]
     private var foldersByID: [UUID: WorkspaceFolderRecord] = [:]
     private var filesByID: [UUID: WorkspaceFileRecord] = [:]
@@ -12063,6 +12076,9 @@ package actor WorkspaceFileContextStore {
             guard let existingConfiguration = rootLoadConfigurationsByPath[standardizedPath], existingConfiguration == loadConfiguration else {
                 throw WorkspaceFileContextStoreError.rootAlreadyLoadedWithDifferentConfiguration(standardizedPath)
             }
+            if let state = rootStatesByID[existingID] {
+                deferredRootUnloads.remove(.init(rootID: existingID, lifetimeID: state.lifetimeID))
+            }
             #if DEBUG
                 restorePerfRecorder.event(
                     "store.rootLoad.existing",
@@ -12607,13 +12623,65 @@ package actor WorkspaceFileContextStore {
         }
     }
 
+    /// Retain exact already-loaded root lifetimes without changing catalog or workspace authority.
+    /// An unloading root has already been removed from rootStatesByID before the first teardown await.
+    package func retainRoots(ids: [UUID]) throws -> RootRetention {
+        var lifetimes: Set<RetainedRootLifetime> = []
+        for id in Set(ids) {
+            guard let state = rootStatesByID[id] else { throw WorkspaceFileContextStoreError.rootNotLoaded(id) }
+            lifetimes.insert(.init(rootID: id, lifetimeID: state.lifetimeID))
+        }
+        let token = RootRetention(id: UUID())
+        rootRetentions[token.id] = lifetimes
+        for lifetime in lifetimes {
+            rootRetentionCounts[lifetime, default: 0] += 1
+        }
+        return token
+    }
+
+    package func isRootRetentionCurrent(_ token: RootRetention) -> Bool {
+        guard let lifetimes = rootRetentions[token.id] else { return false }
+        return lifetimes.allSatisfy { rootStatesByID[$0.rootID]?.lifetimeID == $0.lifetimeID }
+    }
+
+    /// Explicit and idempotent. Deferred unload is joined only after the last exact lease ends;
+    /// a later load request cancels the old deferred intent and a stale lease cannot unload a successor.
+    package func releaseRootRetention(_ token: RootRetention) async {
+        guard let lifetimes = rootRetentions.removeValue(forKey: token.id) else { return }
+        var ready: [UUID] = []
+        for lifetime in lifetimes {
+            let remaining = (rootRetentionCounts[lifetime] ?? 1) - 1
+            if remaining > 0 {
+                rootRetentionCounts[lifetime] = remaining
+            } else {
+                rootRetentionCounts.removeValue(forKey: lifetime)
+                if deferredRootUnloads.remove(lifetime) != nil,
+                   rootStatesByID[lifetime.rootID]?.lifetimeID == lifetime.lifetimeID
+                {
+                    ready.append(lifetime.rootID)
+                }
+            }
+        }
+        await unloadRoots(ids: ready)
+    }
+
     package func unloadRoot(id rootID: UUID) async {
         await unloadRoots(ids: [rootID])
     }
 
     package func unloadRoots(ids rootIDs: [UUID]) async {
         var seenRootIDs = Set<UUID>()
-        let orderedRootIDs = rootIDs.filter { seenRootIDs.insert($0).inserted }
+        let orderedRootIDs = rootIDs.filter { rootID in
+            guard seenRootIDs.insert(rootID).inserted else { return false }
+            guard let state = rootStatesByID[rootID] else { return true }
+            let lifetime = RetainedRootLifetime(rootID: rootID, lifetimeID: state.lifetimeID)
+            if rootRetentionCounts[lifetime, default: 0] > 0 {
+                deferredRootUnloads.insert(lifetime)
+                return false
+            }
+            deferredRootUnloads.remove(lifetime)
+            return true
+        }
         guard !orderedRootIDs.isEmpty else { return }
 
         var statesToUnload: [(rootID: UUID, state: RootState)] = []
