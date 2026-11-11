@@ -6868,6 +6868,80 @@ Remaining M9.2f: merge preview/apply/continue/abort runtime ownership, physical 
 required acknowledgements and honest partial receipts. This checkpoint is not completion of M9.2
 or #1406. No hosted-CI, live-app, release or full-suite qualification is claimed.
 
+#### M9.2f checkpoint 5 — final Git and preview-artifact fences
+
+Optional callbacks now reach apply/continue/abort's first physical Git command after process
+admission and the existing mutation guard. They are explicit runner parameters, not inherited
+TaskLocals; apply's later commit does not repeat the first-effect callback. Worktree creation uses
+the same explicit runner path. Fenced continue propagates refusal/uncertain errors, and an abort
+whose final HEAD read fails retains its completed-abort fact and invalidates the VCS cache.
+
+Preview publication checks its callback after async inputs/graph collection and before ID allocation
+and writes. Typed partial receipts preserve the exact artifact directory and completed-write flags;
+a false completion flag does not assert that no partial filesystem effect occurred. Sidecar failure
+also retains the completed snapshot receipt. Legacy callback-free callers retain their contracts.
+
+Validation: scoped pinned formatting, strict lint and diff checks passed. Conductor
+`b7df30d9-17b7-4347-a1a9-6259c0d26cc6` passed **43 tests**, zero failures, in 30.220 seconds,
+covering merge review state, creation preconditions, tracked checkout cloning and pipe drain.
+The initial attempt failed compilation on the new internal error type's access level; that was
+corrected before the successful run. One implementation review was addressed. This checkpoint is
+local infrastructure only: actual merge command runtime ownership, front-door provenance and
+required-save acknowledgement remain in progress. No new push/full-suite/live-app/CI claim.
+
+#### M9.2f checkpoint 6 — merge command runtime ownership
+
+`scope.worktrees` now owns the actual preview/apply/continue/abort/status algorithms. VM methods
+are command adapters; MCP and administration retain one canonical command/resource/full-binding
+admission before authorization, discovery and review awaits. Admin preparation remains a counted
+lifetime hold, not writer election. Its endpoint fence validates linked worktree advertisements and
+exact identities rather than comparing linked checkout paths to the main checkout's path. Additional
+host root fences compose the outer mutation journal and physical policy instead of replacing them.
+
+Preview artifacts and operation records receive required-save acknowledgement. Apply/continue/abort
+acknowledge an `.applying` intent before Git and the actual outcome afterward. Final physical fences
+revalidate the originating admission; post-effect bookkeeping and uncancelled required saves target
+only that writer. Partial receipts retain actual commit/conflict/abort/artifact evidence, including
+uncertain admitted attempts. Pre-process refusal restores an actionable prior operation; uncertain
+Git failure remains abortable. No post-await successor lookup or no-effect retry claim is introduced.
+
+Merge and binding changes exclude each other through runtime-owned tokens. Discovery and physical
+work join the existing transition drain; human review does not hold that drain. The existing
+interaction runtime still owns review waits, cancellation and settlement. Caller cancellation settles
+only its review UUID, including unlimited waits. A standalone review restores its captured inactive
+run state on the original run rather than manufacturing `.running`; active-run cleanup retains its
+existing resume behavior. Presentation uses the existing scope hooks with originating-writer fences.
+
+Validation: one implementation review addressed; scoped pinned formatting, strict lint and diff checks
+passed. Final focused Conductor `faf4af65-4743-411b-95d1-ac27d741a3a0` passed **99 tests**, zero
+failures, in **138.332 seconds** (65 admission, 16 interaction, 16 merge-review, one structure authority
+and one cold saved-target journey). Full lint `6db25fef-288b-45b7-8e76-055eed5e9a44` passed with
+zero formatting violations across 2,157 files. Earlier attempts exposed and repaired linked-root
+admission and standalone-review state defects; the existing active-run cleanup fixture now explicitly
+starts a run, preserving its assertion. A durable-intent witness reads acknowledged JSON before
+restoration reconciliation. No assertion or timeout budget was weakened. Both-product, fresh-index,
+per-file warning and broader integration gates for checkpoints 5–6 remain pending. No new push,
+full-suite, live-app, hosted-CI or full M9/#1406 completion is claimed.
+
+Checkpoint 6 qualification: both products `1244a70a-5aa3-4fb2-bbbf-75367152257b` passed;
+fresh compiler-index check passed **1,267/1,360 edges, 53/66 largest component**. Exact published
+base `401b23f00` products/tests (`4dd92380…`, `602c463f…`) and head product/test compilation
+show **13 → 12** distinct line/column/message warnings across the 19 changed Swift files:
+Host 2, VM 2, GitService 3 → 2, VCSService 1, scope-lifecycle tests 5, zero elsewhere.
+The removed GitService closure no longer produces its explicit-self warning. This is an incremental
+per-file comparison, not a clean whole-repository warning ratchet.
+
+Broad `000431b3-36eb-4e66-a695-773cf741c007` executed **2,537 tests**, **19 skipped**, with
+four assertions failing in two cases, in **1,503.246 seconds**; it is **not green**. Three assertions
+are the previously observed LiveDiscovery default-workspace CAS failure. The other exposed an old
+saved-endpoint fixture using fabricated HEAD hashes, now rejected by the earlier exact-identity
+fence. That fixture now supplies real Git HEADs while preserving its operation-state/default-election
+assertions; production code is unchanged. Final isolation `7a85f3b9-80a4-4fa1-90db-441606423067`
+passed **68 tests**, **four skipped**, zero failures in **231.453 seconds** (whole LiveDiscovery
+and worktree-recovery suites). This does not establish that the broad-load CAS intermittent is fixed.
+No assertion/timeout weakening or unrelated production repair was made. Publication remains gated
+by the overseer's #1681 CI timing; no push or full M9 completion is claimed here.
+
 #### M9.2b checkpoint 9 — hook-review runtime ownership (validated locally; push frozen)
 
 The hook gate's actual discovery, waiting, response, refresh and completion bodies now live in

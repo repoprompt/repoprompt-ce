@@ -49,15 +49,17 @@ final class AgentSessionWorktreeRuntime {
         let store: WorkspaceFileContextStore?
         let fallbackWorkspacePath: String?
         let declaredRepoPaths: [String]
+        let storageDirectory: URL?
         let isCurrent: @MainActor () -> Bool
 
         init(
             store: WorkspaceFileContextStore?, fallbackWorkspacePath: String?,
-            declaredRepoPaths: [String], isCurrent: @escaping @MainActor () -> Bool
+            declaredRepoPaths: [String], storageDirectory: URL? = nil, isCurrent: @escaping @MainActor () -> Bool
         ) {
             self.store = store
             self.fallbackWorkspacePath = fallbackWorkspacePath
             self.declaredRepoPaths = declaredRepoPaths
+            self.storageDirectory = storageDirectory
             self.isCurrent = isCurrent
         }
     }
@@ -114,6 +116,22 @@ final class AgentSessionWorktreeRuntime {
     var presentation: Presentation?
     private(set) var pendingTransitions = 0
     private var drainWaiters: [CheckedContinuation<Void, Never>] = []
+    var mergeOwners: [UUID: UUID] = [:]
+
+    func beginPendingOperation() {
+        pendingTransitions += 1
+    }
+
+    func endPendingOperation() {
+        pendingTransitions -= 1
+        if pendingTransitions == 0 {
+            let waiters = drainWaiters
+            drainWaiters.removeAll()
+            for waiter in waiters {
+                waiter.resume()
+            }
+        }
+    }
 
     func waitForTransitions() async {
         guard pendingTransitions > 0 else { return }
@@ -176,8 +194,11 @@ final class AgentSessionWorktreeRuntime {
         }
         do { try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(desiredBindings) }
         catch { throw TransitionError.unavailable(error.localizedDescription) }
+        guard mergeOwners[sessionID] == nil else {
+            throw TransitionError.unavailable("A worktree merge or merge review is in progress for this session. Finish or cancel it before changing execution location.")
+        }
         guard !session.worktreeBindingTransitionInProgress else { throw TransitionError.stale }
-        pendingTransitions += 1
+        beginPendingOperation()
         let gateOwner = UUID()
         session.worktreeBindingTransitionInProgress = true
         session.worktreeBindingTransitionOwner = gateOwner
@@ -186,7 +207,7 @@ final class AgentSessionWorktreeRuntime {
             command.writer.ownsPersistentClaim && session.currentRestorationBindingToken == command.identity.restoration
         }
         defer {
-            pendingTransitions -= 1
+            endPendingOperation()
             // Release only this operation's resource leases, including after claim loss. A direct
             // successor setter clears the token, so old cleanup cannot release a successor gate.
             if session.worktreeBindingTransitionOwner == gateOwner {
@@ -196,13 +217,6 @@ final class AgentSessionWorktreeRuntime {
                 session.isChangingExecutionLocation = false
             }
             if ownsOrigin() { presentation?.gateChanged(session) }
-            if pendingTransitions == 0 {
-                let waiters = drainWaiters
-                drainWaiters.removeAll()
-                for waiter in waiters {
-                    waiter.resume()
-                }
-            }
         }
         func requireCurrent() throws {
             guard command.isCurrent, resources.isCurrent(), session.worktreeBindings == previousBindings else {

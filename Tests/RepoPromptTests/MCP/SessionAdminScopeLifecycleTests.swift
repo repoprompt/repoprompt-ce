@@ -2622,13 +2622,15 @@ final class SessionAdminStructureTests: XCTestCase {
             false
         }
 
-        func previewMerge(sessionID _: UUID, repoRoot _: String?, mergeTarget _: String?) async throws -> Value {
+        func previewMerge(sessionID _: UUID, repoRoot _: String?, mergeTarget _: String?, isStillAuthorized: @escaping @MainActor () -> Bool) async throws -> Value {
             await beforePreviewReturn?()
+            guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
             return .object(["operation_id": .string("op-1")])
         }
 
-        func applyMerge(sessionID _: UUID, operationID: String) async throws -> Value {
-            .object(["status": .string("completed"), "operation_id": .string(operationID)])
+        func applyMerge(sessionID _: UUID, operationID: String, isStillAuthorized: @escaping @MainActor () -> Bool) async throws -> Value {
+            guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
+            return .object(["status": .string("completed"), "operation_id": .string(operationID)])
         }
 
         static func summary(_ worktreeID: String) -> AgentSessionWorktreeBindingSummary {
@@ -7808,12 +7810,12 @@ final class SessionAdminDeferredOutcomeTests: XCTestCase {
             return false
         }
 
-        func previewMerge(sessionID: UUID, repoRoot: String?, mergeTarget: String?) async throws -> Value {
-            try await base.previewMerge(sessionID: sessionID, repoRoot: repoRoot, mergeTarget: mergeTarget)
+        func previewMerge(sessionID: UUID, repoRoot: String?, mergeTarget: String?, isStillAuthorized: @escaping @MainActor () -> Bool) async throws -> Value {
+            try await base.previewMerge(sessionID: sessionID, repoRoot: repoRoot, mergeTarget: mergeTarget, isStillAuthorized: isStillAuthorized)
         }
 
-        func applyMerge(sessionID: UUID, operationID: String) async throws -> Value {
-            try await base.applyMerge(sessionID: sessionID, operationID: operationID)
+        func applyMerge(sessionID: UUID, operationID: String, isStillAuthorized: @escaping @MainActor () -> Bool) async throws -> Value {
+            try await base.applyMerge(sessionID: sessionID, operationID: operationID, isStillAuthorized: isStillAuthorized)
         }
     }
 }

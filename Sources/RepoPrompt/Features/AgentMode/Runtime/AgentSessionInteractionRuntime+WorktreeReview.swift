@@ -10,6 +10,7 @@ struct AgentWorktreeMergeReviewWait {
     let originatingWriter: AgentSessionRuntimeStore.WriterIdentity
     let runID: UUID?
     let runAttemptID: UUID?
+    let runStateBeforeReview: AgentSessionRunState
     let continuation: CheckedContinuation<WorktreeMergeReviewDecision, Never>
     var timeoutTask: Task<Void, Never>?
 }
@@ -34,38 +35,48 @@ extension AgentSessionInteractionRuntime {
             scope: WorktreeMergeReviewScope(windowID: 0, tabID: session.tabID),
             preview: preview
         )
-        let decision = await withCheckedContinuation { continuation in
-            var wait = AgentWorktreeMergeReviewWait(
-                reviewID: review.id,
-                operationID: review.operationID,
-                originatingWriter: command.identity,
-                runID: session.runID,
-                runAttemptID: session.activeRunAttemptID,
-                continuation: continuation
-            )
-            if timeoutSeconds > 0 {
-                let reviewID = review.id
-                wait.timeoutTask = Task { @MainActor [weak self, weak session] in
-                    do {
-                        try await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
-                    } catch {
-                        return
+        let reviewID = review.id
+        let decision = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                var wait = AgentWorktreeMergeReviewWait(
+                    reviewID: review.id,
+                    operationID: review.operationID,
+                    originatingWriter: command.identity,
+                    runID: session.runID,
+                    runAttemptID: session.activeRunAttemptID,
+                    runStateBeforeReview: session.runState,
+                    continuation: continuation
+                )
+                if timeoutSeconds > 0 {
+                    let reviewID = review.id
+                    wait.timeoutTask = Task { @MainActor [weak self, weak session] in
+                        do {
+                            try await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
+                        } catch {
+                            return
+                        }
+                        guard let self, let session else { return }
+                        expireWorktreeMergeReview(session: session, reviewID: reviewID)
                     }
-                    guard let self, let session else { return }
-                    expireWorktreeMergeReview(session: session, reviewID: reviewID)
+                }
+                session.worktreeMergeReviewWait = wait
+                AgentWorktreeMergeCoordinator.upsert(
+                    AgentWorktreeMergeCoordinator.makeOperation(preview: preview, status: .awaitingApproval),
+                    in: &session.worktreeMergeOperations
+                )
+                session.isDirty = true
+                // The exact wait must exist before observers can see the review.
+                session.pendingWorktreeMergeReview = review
+                if command.isCurrent, session.worktreeMergeReviewWait?.reviewID == review.id {
+                    Self.reconcileInteractiveRunState(session)
+                    publishWorktreeReviewChange(session: session, writer: command.identity)
                 }
             }
-            session.worktreeMergeReviewWait = wait
-            AgentWorktreeMergeCoordinator.upsert(
-                AgentWorktreeMergeCoordinator.makeOperation(preview: preview, status: .awaitingApproval),
-                in: &session.worktreeMergeOperations
-            )
-            session.isDirty = true
-            // The exact wait must exist before observers can see the review.
-            session.pendingWorktreeMergeReview = review
-            if command.isCurrent, session.worktreeMergeReviewWait?.reviewID == review.id {
-                Self.reconcileInteractiveRunState(session)
-                publishWorktreeReviewChange(session: session, writer: command.identity)
+        } onCancel: { [weak self, weak session] in
+            Task { @MainActor in
+                guard let self, let session else { return }
+                // Settle only this wait; an old caller cannot cancel a replacement review.
+                _ = self.settleWorktreeMergeReview(session: session, reviewID: reviewID, decision: .cancelled(reason: "Worktree merge request was cancelled."))
             }
         }
         // Retain the runtime scope through detached expiry even without a presentation.
@@ -113,6 +124,13 @@ extension AgentSessionInteractionRuntime {
             if session.persistentSessionBindingIdentity == wait.originatingWriter.restoration.bindingIdentity,
                session.runID == wait.runID, session.activeRunAttemptID == wait.runAttemptID
             {
+                // An admin review can start while no provider run exists. Reconciliation may
+                // resume an active run, but must not manufacture one from an idle/terminal state.
+                if !wait.runStateBeforeReview.isActive, session.runState == .waitingForApproval,
+                   session.activeRunLiveness == nil, session.agentTask == nil
+                {
+                    session.runState = wait.runStateBeforeReview
+                }
                 Self.reconcileInteractiveRunState(session)
             }
         }
