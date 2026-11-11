@@ -1172,6 +1172,10 @@ public class APISettingsViewModel: ObservableObject {
     private(set) var managedRuntimeLeaseCount = 0
     private var windowCloseRequested = false
 
+    var canAcquireManagedRuntimeLease: Bool {
+        !hasPreparedForWindowClose
+    }
+
     func retainForManagedRuntime() {
         precondition(!hasPreparedForWindowClose)
         managedRuntimeLeaseCount += 1

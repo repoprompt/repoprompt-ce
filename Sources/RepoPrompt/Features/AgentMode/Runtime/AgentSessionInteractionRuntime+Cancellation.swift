@@ -11,6 +11,9 @@ extension AgentSessionInteractionRuntime {
         origin: AgentModeRunService.CancellationOrigin,
         links: AgentSessionLinkExecutionRuntime
     ) -> (@MainActor () async -> Void)? {
+        if intent == .userStop, origin == .explicitStop {
+            session.composerStartCancellation?.withdraw(on: session)
+        }
         Self.cancelPendingInstruction(for: session)
         let current = scope?.sessions[session.tabID]
         let providerTeardown = current == nil || current === session

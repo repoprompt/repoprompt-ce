@@ -42,9 +42,11 @@ extension AgentModeViewModel {
 
     /// The guarded target behind the composer Stop button; `nil` when there is nothing to stop.
     func composerRunCancelTarget(tabID: UUID?) -> AgentRunCancelTarget? {
-        guard let tabID,
-              let session = sessions[tabID],
-              session.runState.isActive,
+        guard let tabID, let session = sessions[tabID] else { return nil }
+        if session.composerStartCancellation?.canWithdraw(on: session) == true {
+            return makeRunCancelTarget(tabID: tabID, session: session)
+        }
+        guard session.runState.isActive,
               session.runState != .waitingForUser,
               session.runID != nil
         else { return nil }

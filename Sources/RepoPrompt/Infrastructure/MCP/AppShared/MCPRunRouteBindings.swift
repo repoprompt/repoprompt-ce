@@ -39,6 +39,7 @@ final class MCPRunRouteBindings {
         case registered(displacedConnectionID: UUID?)
         case refusedBoundRun(UUID)
         case refusedWindow(Int)
+        case refusedOwnerUnavailable
     }
 
     var tabContextByConnectionID: [UUID: MCPTabContextSnapshot] = [:]
@@ -67,6 +68,7 @@ final class MCPRunRouteBindings {
     }
 
     func register(connectionID: UUID, runID: UUID, windowID: Int) -> RegistrationResult {
+        guard ownerLifetime != nil else { return .refusedOwnerUnavailable }
         if connectionIDByRunID[runID] == connectionID,
            connectionIDToRunID[connectionID] == runID
         {
@@ -95,6 +97,7 @@ final class MCPRunRouteBindings {
     }
 
     func beginPendingPolicy(connectionID: UUID, runID: UUID, windowID: Int) -> PendingPolicyToken? {
+        guard ownerLifetime != nil else { return nil }
         if let boundRun = tabContextByConnectionID[connectionID]?.runID, boundRun != runID { return nil }
         let displacedConnectionID = connectionIDByRunID[runID]
         if let displacedConnectionID, displacedConnectionID != connectionID,
