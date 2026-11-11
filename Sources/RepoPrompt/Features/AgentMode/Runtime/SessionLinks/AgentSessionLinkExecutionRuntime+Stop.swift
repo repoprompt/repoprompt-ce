@@ -73,6 +73,7 @@ extension AgentSessionLinkExecutionRuntime {
         }
         guard withdrawInbound() else { return .blocked(.targetBusy) }
 
+        let pendingComposerStart = selection == .pendingStart ? session.composerStartCancellation : nil
         let admission = AgentRunCancellationAdmission(
             scope: selection == .activeRun ? .activeRun : .pendingStart,
             session: session,
@@ -81,6 +82,7 @@ extension AgentSessionLinkExecutionRuntime {
             expectedRunID: session.runID,
             cancellationGeneration: session.stopState.cancellationGeneration,
             pendingStartFence: nil,
+            expectedComposerAttemptID: pendingComposerStart?.attemptID,
             validateAndClaim: { writer.isCurrent }
         )
 
@@ -95,7 +97,12 @@ extension AgentSessionLinkExecutionRuntime {
             let itemID = agentSessionLinkAppendStopRow(
                 request: request, candidate: candidate, session: session, binding: binding, writer: writer
             )
-            guard await interactions.awaitOracleBackgroundDrain(for: session, timeout: teardownDeadlineSeconds) else {
+            let composerDrained = await awaitPendingComposerStartDrain(
+                pendingComposerStart, command: command, requestID: request.requestID,
+                deadlineSeconds: teardownDeadlineSeconds, deadlineSleep: deadlineSleep
+            )
+            let oracleDrained = await interactions.awaitOracleBackgroundDrain(for: session, timeout: teardownDeadlineSeconds)
+            guard composerDrained, oracleDrained else {
                 return .settled(Self.agentSessionLinkStopReceipt(
                     request: request,
                     targetSessionID: candidate.sessionID,
@@ -114,7 +121,7 @@ extension AgentSessionLinkExecutionRuntime {
             )
             return .settled(Self.agentSessionLinkStopReceipt(
                 request: request, targetSessionID: candidate.sessionID,
-                result: .stopped, stopRequested: true, itemID: itemID,
+                result: .stopped, stopRequested: true, teardownCompleted: true, itemID: itemID,
                 audit: audit, runState: "pending_start_withdrawn"
             ))
         }
@@ -391,6 +398,26 @@ extension AgentSessionLinkExecutionRuntime {
             admission: admission, outcomeRecorder: outcomeRecorder
         )
         return outcomeRecorder.initiatedCancellation
+    }
+
+    private func awaitPendingComposerStartDrain(
+        _ start: AgentComposerStartCancellation?, command: AgentSessionRuntimeStore.Command,
+        requestID: UUID, deadlineSeconds: TimeInterval,
+        deadlineSleep: @escaping @MainActor (TimeInterval) async -> Void
+    ) async -> Bool {
+        guard let start, !start.isFinalized else { return true }
+        let result = AgentSessionLinkStopSignal<Bool>()
+        let cleanup = Task { [self, command] in
+            await start.finalized.value()
+            pendingStopEffects.removeValue(forKey: requestID)
+            result.finish(true)
+            withExtendedLifetime(command) {}
+        }
+        pendingStopEffects[requestID] = PendingSendEffect(sessionIdentity: ObjectIdentifier(command.writer.session), task: cleanup)
+        Task { await deadlineSleep(deadlineSeconds)
+            result.finish(false)
+        }
+        return await result.value()
     }
 
     @discardableResult

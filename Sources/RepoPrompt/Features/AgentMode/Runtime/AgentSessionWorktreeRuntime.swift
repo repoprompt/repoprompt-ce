@@ -48,7 +48,49 @@ final class AgentSessionWorktreeRuntime {
     struct Resources {
         let store: WorkspaceFileContextStore?
         let fallbackWorkspacePath: String?
+        let declaredRepoPaths: [String]
         let isCurrent: @MainActor () -> Bool
+
+        init(
+            store: WorkspaceFileContextStore?, fallbackWorkspacePath: String?,
+            declaredRepoPaths: [String], isCurrent: @escaping @MainActor () -> Bool
+        ) {
+            self.store = store
+            self.fallbackWorkspacePath = fallbackWorkspacePath
+            self.declaredRepoPaths = declaredRepoPaths
+            self.isCurrent = isCurrent
+        }
+    }
+
+    /// Call-scoped provenance captured before repository discovery, authorization or creation awaits.
+    /// Never store this on a session: the command retains its originating session.
+    @MainActor
+    struct Admission {
+        let command: AgentSessionRuntimeStore.Command
+        let resources: Resources
+        let bindings: [AgentSessionWorktreeBinding]
+
+        var session: AgentTabSession {
+            command.writer.session
+        }
+
+        var isCurrent: Bool {
+            command.isCurrent && resources.isCurrent() && session.worktreeBindings == bindings
+        }
+
+        func requireCurrent() throws {
+            try Task.checkCancellation()
+            guard isCurrent else { throw TransitionError.stale }
+        }
+    }
+
+    func admit(_ command: AgentSessionRuntimeStore.Command) throws -> Admission {
+        guard let scope, command.writer.scope === scope, command.isCurrent else { throw TransitionError.stale }
+        try Task.checkCancellation()
+        guard let resources = captureResources?(command), resources.isCurrent() else {
+            throw TransitionError.unavailable("The session's execution workspace is unavailable.")
+        }
+        return Admission(command: command, resources: resources, bindings: command.writer.session.worktreeBindings)
     }
 
     struct Effects {
@@ -96,13 +138,41 @@ final class AgentSessionWorktreeRuntime {
     ) async throws -> [AgentSessionWorktreeBinding] {
         guard let scope, command.writer.scope === scope, command.isCurrent else { throw TransitionError.stale }
         try Task.checkCancellation()
-        let session = command.writer.session
+        // A synchronous command-level no-op does not need workspace resources. Callers that
+        // suspended before entry use the admission overload, which validates their older snapshot.
+        guard command.writer.session.worktreeBindings != desiredBindings else { return desiredBindings }
+        return try await transition(
+            desiredBindings, admission: admit(command), intent: intent,
+            startupContext: startupContext, initializationHintsByBindingID: initializationHintsByBindingID,
+            beforeCommit: beforeCommit, revalidateAuthority: revalidateAuthority,
+            commitAuthority: commitAuthority, afterCommit: afterCommit
+        )
+    }
+
+    @discardableResult
+    func transition(
+        _ desiredBindings: [AgentSessionWorktreeBinding],
+        admission: Admission,
+        intent: Intent,
+        startupContext: WorktreeStartupContext? = nil,
+        initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint] = [:],
+        beforeCommit: (@MainActor () async throws -> Void)? = nil,
+        revalidateAuthority: (@MainActor () async throws -> Void)? = nil,
+        commitAuthority: (@MainActor (@MainActor () throws -> Void) throws -> Void)? = nil,
+        afterCommit: (@MainActor () -> Void)? = nil
+    ) async throws -> [AgentSessionWorktreeBinding] {
+        let command = admission.command
+        guard let scope, command.writer.scope === scope else { throw TransitionError.stale }
+        try admission.requireCurrent()
+        let session = admission.session
         let sessionID = command.identity.sessionID
-        let previousBindings = session.worktreeBindings
-        // Even no-ops require the original writer, but do not touch resources/provider/presentation.
+        let previousBindings = admission.bindings
         guard previousBindings != desiredBindings else { return previousBindings }
-        guard let resources = captureResources?(command), resources.isCurrent(), let effects else {
-            throw TransitionError.unavailable("The session's execution workspace is unavailable.")
+        let resources = admission.resources
+        guard let effects else { throw TransitionError.unavailable("The session's execution workspace is unavailable.") }
+        let requiresAcknowledgedSave = switch intent {
+        case .externalManagement, .userExecutionLocationChange: true
+        case .initialSend: false // The existing configured first-save owner acknowledges creation.
         }
         do { try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(desiredBindings) }
         catch { throw TransitionError.unavailable(error.localizedDescription) }
@@ -274,7 +344,7 @@ final class AgentSessionWorktreeRuntime {
             scope.persistence.scheduleSave(for: session)
             presentation?.bindingsChanged(session, previousLocation)
             afterCommit?()
-            if case .externalManagement = intent {
+            if requiresAcknowledgedSave {
                 switch await saveOrigin() {
                 case .success:
                     guard command.writer.isCurrent, session.worktreeBindings == desiredBindings else {
