@@ -7572,3 +7572,63 @@ formatting and strict lint passed; both changed Swift files emitted zero warning
 this actual compile, matching exact-main `c791cd13a` compile `1b23f00d`. Full publication gates,
 products and live-app/release validation are not claimed for this local checkpoint. Fresh index
 passed **1,263/1,360 wrong-way edges, 53/66 largest cycle**, baseline unchanged.
+
+#### M9.2j — capture bound tab required-save ingress (in progress)
+
+Bound tab/workspace required-save calls now capture their unique exact writer before the phase
+observer and before the save-queue wait. The captured expectation flows through the existing
+queue, preserved-debounce helper, physical save and final acknowledgment checks. Clean conflicting,
+unscoped or wrong-workspace bindings refuse rather than receiving a no-write success. Existing
+unscoped bindings are not qualified by `ensureSessionBoundToTab` (it returns the existing ID), so
+no legitimate binding-admission path is removed. A bound session with no restoration failure is
+authoritative by the existing readiness enum; no relaxed-readiness escape hatch was added.
+
+Missing/unbound calls retain their existing no-obligation/creation policy, but the phase observer
+cannot insert or bind a new writer and then use the uncaptured branch. Three focused tests cover
+queue ABA and stable success with a held independent debounce; clean observer ABA, conflicting,
+unscoped and wrong-workspace refusals; dirty suppression; clean suppressed/blank/absent no-ops;
+and observer binding of a formerly blank tab. The ABA refusal retains the ordinary debounce,
+which subsequently performs the one real save; the stable required save cancels it without a
+second write. Refusal messages and phase counts are asserted. No test expectations or budgets
+were relaxed.
+
+Oracle review `untitled-chat-DF9731`, snapshot `2026-11-11/1227`, found no correctness defect;
+message assertions and debounce coverage were added as requested. Unbound same-object membership
+ABA, core binding admission for unbound content, capture before callers' earlier awaits,
+close-preflight claim incarnations across multiple tabs, and continuous exclusivity against a
+transient foreign claim remain open. No host/route, interaction or managed-operation files changed.
+
+Expanded focused ticket `a375a820-2c14-4ef2-83d2-501ef3341ba5` passed **391 tests, zero failures**
+(608.659s), including all 104 handoff tests, 39 provider-switch tests and 32 worktree-recovery tests.
+Full lint `91670f1c-d1a6-4feb-90e3-597a68dc073f` passed. Afterwards two test saver stubs were narrowed
+to capture only the root URL rather than retaining their fixtures; scoped pinned formatting and
+strict lint passed for that test-only cleanup.
+
+Publication-gate attempt `b37325c9-2370-428d-8112-cd7138fb7e7a` built successfully but ran no tests:
+Swift's test discovery could not find `RepoPromptMCPServerTests.xctest`. The following coordinated
+job rebuilt the products; isolated handoff `adde2c08-d5af-4a2c-a72d-380e97a3024c` passed all **104**
+tests (161.738s). Both products `d04c9fd1-4d46-4315-854a-5e3f742fc5fd` and final full lint
+`63dcbaed-a066-4a23-84cd-fe2864c28c46` passed.
+
+Broad retry `b7cd16ba-67f5-47e4-b36b-be481a68e1d2` executed **2,800 tests, 22 skipped, five failing
+cases** (app 2,747/22 skipped/four unexpected failures, Settings 1, SecureStorage 27, Domain 7,
+CodexProvider 18/one assertion failure). Failures were resident Steer refusing as busy/changing
+(3.103s), LiveDiscovery schema decoding at `tools[15].inputSchema.properties.op.enum[14]` (5.323s),
+worktree held-resolution `ambiguousGitTopology` (6.701s), invalid-base-ref setup's three-second
+`foreground drafts published` timeout (6.979s), and Codex retry count 2 instead of 3 (5.190s).
+No expectations or budgets were changed. The focused head pair `9b27926a` passed LiveDiscovery
+(2.946s) but resident Steer threw `CancellationError` (3.738s), so it was not classified as a
+broad-only pass. Additional head isolation `42b63c86` passed the two worktree cases (19.409s,
+7.473s) and Codex retry case (0.856s). Exact main `c1e089b33`, ticket `4ebb6086`, passed all five
+(resident 1.320s, discovery 2.591s, worktree 14.259s/5.302s, retry 0.565s). The three-file patch
+was preserved in an exact-path stash and restored byte-identically; protected local artifacts
+were untouched. Resident single-case head isolation `0127fa88` passed unchanged (1.355s). Under
+the overseer's classification rule, these local failures remain **intermittent, not root-caused,
+under watch**; the failed two-case resident run is retained above rather than called broad-only.
+The waiting-instruction path and its provider-input proof contain no required save call; no Steer
+admission or MCP schema/decoding code was modified by this checkpoint. No further broad rerun was
+requested. Per-file actual compiler-warning occurrences across cold/affected compiles remain
+VM **4→4**, persistence runtime **0→0**, persistence tests **0→0**, against exact-base `c791cd13a`
+compile `1b23f00d`; this is no positive delta, not zero total warnings. Fresh post-build index
+passed **1,263/1,360 wrong-way edges, 53/66 largest cycle**, baseline unchanged. No live-app,
+release, sanitizer or hosted-CI success is claimed.

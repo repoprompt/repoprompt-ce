@@ -241,6 +241,141 @@ final class AgentSessionPersistenceRuntimeTests: XCTestCase {
         XCTAssertFalse(f.session.isDirty)
     }
 
+    func testBoundTabRequiredSaveKeepsItsWriterAcrossQueueWait() async throws {
+        for reacquire in [false, true] {
+            let f = try Fixture()
+            defer { f.cleanUp() }
+            let sessionID = try XCTUnwrap(f.session.activeAgentSessionID)
+            let binding = f.session.currentRestorationBindingToken
+            var writes = 0
+            f.scope.persistence.saver = { payload, workspace, count in
+                writes += 1
+                return try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count)
+            }
+            let debounce = TestReleaseFence(name: "ordinary save retained through tab required-save wait")
+            f.scope.persistence.debounce = {
+                await debounce.enterAndWait()
+                try Task.checkCancellation()
+            }
+            f.scope.persistence.scheduleSave(for: f.session)
+            let pendingTask = try XCTUnwrap(f.session.saveDebounceTask)
+            let pendingID = try XCTUnwrap(f.session.saveDebounceRequestID)
+            XCTAssertTrue(f.scope.persistence.queue.begin(sessionID: sessionID))
+            var ownsQueueSlot = true
+            let entered = expectation(description: "Tab required save entered its queue wait")
+            let task = Task {
+                await f.scope.persistence.flushSaveRequired(for: f.session.tabID, workspaceID: f.placement.workspace.id, observingSavePhase: { phase in
+                    if phase == .beforeWrite { entered.fulfill() }
+                })
+            }
+            defer {
+                if ownsQueueSlot { _ = f.scope.persistence.queue.finish(sessionID: sessionID) }
+                task.cancel()
+                pendingTask.cancel()
+                debounce.release()
+            }
+            await fulfillment(of: [entered], timeout: 5)
+            if reacquire {
+                f.scope.replaceSessions([:])
+                f.scope.replaceSessions([f.session.tabID: f.session])
+                XCTAssertEqual(f.session.currentRestorationBindingToken, binding, "Binding checks alone cannot detect this ABA")
+            }
+            _ = f.scope.persistence.queue.finish(sessionID: sessionID)
+            ownsQueueSlot = false
+            let result = await task.value
+            if reacquire {
+                guard case let .failure(failure) = result else { return XCTFail("A queued tab save must not adopt a reacquired writer") }
+                XCTAssertEqual(failure.message, "The live session owner changed during required persistence.")
+                XCTAssertEqual(writes, 0)
+                XCTAssertTrue(f.session.isDirty)
+                XCTAssertEqual(f.session.saveDebounceRequestID, pendingID)
+                XCTAssertFalse(pendingTask.isCancelled, "Refusal must preserve the independent ordinary save")
+            } else {
+                try result.get()
+                XCTAssertEqual(writes, 1)
+                XCTAssertFalse(f.session.isDirty)
+                XCTAssertNil(f.session.saveDebounceTask)
+                XCTAssertTrue(pendingTask.isCancelled)
+            }
+            debounce.release()
+            await pendingTask.value
+            XCTAssertEqual(writes, 1, "Either the exact flush or the retained ordinary save writes, not both")
+            XCTAssertFalse(f.session.isDirty)
+        }
+    }
+
+    func testBoundTabRequiredSaveRefusesObserverReacquisitionAndUnownedCleanClaims() async throws {
+        enum Refusal: CaseIterable { case observerReacquire, conflicting, unscoped, wrongWorkspace, suppressedDirty }
+        for refusal in Refusal.allCases {
+            let f = try Fixture()
+            defer { f.cleanUp() }
+            var writes = 0
+            f.scope.persistence.saver = { [root = f.root] _, _, _ in writes += 1
+                return root
+            }
+            f.session.isDirty = refusal == .suppressedDirty
+            let otherScope = f.store.makeScope()
+            if refusal == .conflicting {
+                let other = AgentTabSession(tabID: UUID())
+                try other.installPersistentSessionBinding(.init(tabID: other.tabID, sessionID: XCTUnwrap(f.session.activeAgentSessionID), workspaceID: f.placement.workspace.id))
+                otherScope.replaceSessions([other.tabID: other])
+            } else if refusal == .unscoped {
+                try f.session.installPersistentSessionBinding(.init(tabID: f.session.tabID, sessionID: XCTUnwrap(f.session.activeAgentSessionID)))
+                f.session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            }
+            f.placement.suppressed = refusal == .suppressedDirty
+            var phases: [AgentSessionRequiredSavePhase] = []
+            let result = await f.scope.persistence.flushSaveRequired(
+                for: f.session.tabID, workspaceID: refusal == .wrongWorkspace ? UUID() : f.placement.workspace.id,
+                observingSavePhase: { phase in
+                    phases.append(phase)
+                    if refusal == .observerReacquire, phase == .beforeWrite {
+                        f.scope.replaceSessions([:])
+                        f.scope.replaceSessions([f.session.tabID: f.session])
+                    }
+                }
+            )
+            withExtendedLifetime(otherScope) {}
+            guard case let .failure(failure) = result else { return XCTFail("Unowned or suppressed persistence must refuse: \(refusal)") }
+            let expectedMessage = switch refusal {
+            case .observerReacquire: "The originating writer changed before required persistence."
+            case .conflicting, .unscoped, .wrongWorkspace: "The session does not have a unique runtime writer for this workspace."
+            case .suppressedDirty: "Required persistence was skipped without a clean, restored session."
+            }
+            XCTAssertEqual(failure.message, expectedMessage)
+            XCTAssertEqual(writes, 0)
+            XCTAssertEqual(phases, [.beforeWrite])
+            XCTAssertEqual(f.session.isDirty, refusal == .suppressedDirty)
+        }
+    }
+
+    func testTabRequiredSavePreservesCleanAndBlankNoOpPolicy() async throws {
+        let f = try Fixture()
+        defer { f.cleanUp() }
+        var writes = 0
+        f.scope.persistence.saver = { [root = f.root] _, _, _ in writes += 1
+            return root
+        }
+        f.session.isDirty = false
+        f.placement.suppressed = true
+        try await f.scope.persistence.flushSaveRequired(for: f.session.tabID, workspaceID: f.placement.workspace.id).get()
+        f.placement.suppressed = false
+        let blank = AgentTabSession(tabID: UUID())
+        f.scope.replaceSessions([blank.tabID: blank])
+        try await f.scope.persistence.flushSaveRequired(for: blank.tabID, workspaceID: f.placement.workspace.id).get()
+        try await f.scope.persistence.flushSaveRequired(for: UUID(), workspaceID: f.placement.workspace.id).get()
+        XCTAssertNil(blank.activeAgentSessionID, "Closing a blank tab must not allocate a persistent identity")
+        XCTAssertEqual(writes, 0)
+        let insertedBinding = await f.scope.persistence.flushSaveRequired(for: blank.tabID, workspaceID: f.placement.workspace.id, observingSavePhase: { phase in
+            if phase == .beforeWrite {
+                blank.installPersistentSessionBinding(.init(tabID: blank.tabID, sessionID: UUID(), workspaceID: f.placement.workspace.id))
+                blank.recordRestorationAuthoritative(.persistedPayloadApplied)
+            }
+        })
+        guard case .failure = insertedBinding else { return XCTFail("An observer cannot promote an unbound ingress into an uncaptured writer") }
+        XCTAssertEqual(writes, 0)
+    }
+
     func testHeldRequiredSaveDoesNotAcknowledgeMovedStorageOrReboundIncarnation() async throws {
         for rebind in [false, true] {
             let f = try Fixture()

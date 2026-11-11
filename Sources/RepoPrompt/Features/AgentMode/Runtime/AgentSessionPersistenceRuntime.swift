@@ -516,17 +516,41 @@ final class AgentSessionPersistenceRuntime {
         )
     }
 
+    /// Bound tab ingress must capture its writer before callbacks or queue suspension.
+    /// Missing and unbound tabs retain their existing no-obligation/creation policy until
+    /// those callers move to explicit classification and binding admission.
+    private func requiredSaveExpectation(
+        _ requested: WriterExpectation, tabID: UUID, workspaceID: UUID
+    ) -> WriterExpectation? {
+        guard case .currentOwner = requested, let session = sessions[tabID],
+              let sessionID = session.activeAgentSessionID else { return requested }
+        guard let scope,
+              case let .unique(writer) = scope.resolveWriter(workspaceID: workspaceID, sessionID: sessionID),
+              writer.scope === scope, writer.session === session else { return nil }
+        return .exact(writer)
+    }
+
     func flushSaveRequired(
         for tabID: UUID,
         workspaceID: UUID,
-        writer expectation: WriterExpectation = .currentOwner,
+        writer requestedExpectation: WriterExpectation = .currentOwner,
         observingSavePhase: ((RequiredSavePhase) -> Void)? = nil
     ) async -> Result<Void, AgentSessionPersistenceFailure> {
+        let entrySession = sessions[tabID]
+        let entryExpectation = requiredSaveExpectation(requestedExpectation, tabID: tabID, workspaceID: workspaceID)
         observingSavePhase?(.beforeWrite)
         guard let retainedScope = scope, composition != nil else {
             return .failure(.init(operation: .save, tabID: tabID, message: "The runtime persistence owner is unavailable."))
         }
         defer { withExtendedLifetime(retainedScope) {} }
+        guard let expectation = entryExpectation else {
+            return .failure(.init(operation: .save, tabID: tabID, message: "The session does not have a unique runtime writer for this workspace."))
+        }
+        if case .currentOwner = expectation {
+            guard sessions[tabID] === entrySession, entrySession?.activeAgentSessionID == nil else {
+                return .failure(.init(operation: .save, tabID: tabID, message: "The session binding changed before required persistence."))
+            }
+        }
         guard permits(expectation, tabID: tabID) else {
             return .failure(.init(operation: .save, tabID: tabID, message: "The originating writer changed before required persistence."))
         }
@@ -673,9 +697,9 @@ final class AgentSessionPersistenceRuntime {
             return .success(())
         case .notRequired:
             // Suppression can skip a dirty save. An exact-writer caller requires an
-            // acknowledgment, not merely the absence of an attempted write. The legacy
-            // currentOwner ingress still accepts all notRequired outcomes, including dirty
-            // suppression, until callers classify no-persistence obligations explicitly.
+            // acknowledgment, not merely the absence of an attempted write. Remaining
+            // unbound/missing tab ingress keeps its legacy notRequired behavior until callers
+            // classify no-persistence obligations and binding admission explicitly.
             if case .exact = expectation {
                 guard !capturedSession.isDirty,
                       capturedSession.qualifiedRestorationReadiness.isAuthoritative,
