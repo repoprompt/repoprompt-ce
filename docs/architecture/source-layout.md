@@ -88,6 +88,25 @@ The external target graph is intentionally stable at its boundary: the executabl
 
 `RepoPromptProviderQuota` is an internal, Foundation-only owner with no first-party target dependencies. It owns provider/account/window quota facts, pure mapping and presentation, injected acquisition ports/coordinators, and cached advisory signals. Concrete HTTP, credential access, and app-server adapters remain in the app's `Infrastructure/AI/Providers/` owners; composition stays in `App/ProviderQuotaRuntime.swift`. Settings projections depend on the quota owner, not the generic MCP runtime. Acquisition consent and presentation preferences are independent. Router policy is not part of this quota module, and cached lookup never acquires data.
 
+### AgentMode session writer admission
+
+`Features/AgentMode/Runtime/AgentSessionRuntimeStore+CommandAdmission.swift` owns the shared helpers.
+`Scope.admit(session:expectedWorkspaceID:requirement:)` combines canonical resolution,
+exact scope/object ownership and command admission. Resolution failures remain separate
+from command rejections; workspace mismatch remains a conflict. Only command rejection
+carries its resolved writer for refusal mapping. `Command.rejection` and throwing
+`requireCurrent()` reuse the existing admission rules. Preserve each surface's refusal order.
+
+Keep three authority tiers distinct: `command.isCurrent` admits new commands;
+`writer.isCurrent` permits originating cleanup even during retirement;
+`writer.ownsPersistentClaim` additionally survives binding preparation for its exact claim.
+`writer.isCurrentOrSlotReplaced` names the existing detached-original cleanup predicate;
+it is not command admission and rejects same-object claim reacquisition.
+Use one local validator per distinct invariant or phase. Never merge pre-commit,
+acknowledgement and cleanup validators or move consent/cancellation checks across them.
+Do not wrap arbitrary awaits in automatic revalidation: effects may already own cleanup
+or require a partial-success receipt before writer freshness can be reported.
+
 The legacy top-level layer buckets under `Sources/RepoPrompt` have been pruned and must not be recreated:
 
 - `Models`

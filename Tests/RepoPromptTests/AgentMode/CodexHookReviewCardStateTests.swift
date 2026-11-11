@@ -78,6 +78,117 @@ final class CodexHookReviewCardStateTests: XCTestCase {
 }
 
 final class CodexHookReviewRuntimeTests: XCTestCase {
+    /// Characterize the shared admission helpers through this pilot's real hook-command fixture.
+    @MainActor
+    func testAdmissionKeepsResolutionOwnershipAndCommandRefusalsDistinct() throws {
+        let fixture = try Fixture(strict: true)
+        defer { fixture.cleanup() }
+        let foreign = fixture.store.makeScope()
+        let session = fixture.session
+        let command = try fixture.scope.admit(session: session)
+        XCTAssertEqual(command.identity, fixture.command.identity)
+        XCTAssertNil(command.rejection)
+        try command.requireCurrent()
+        for failure in ["absent", "workspace", "foreign", "conflict", "retiring"] {
+            if failure == "conflict" { foreign.replaceSessions([session.tabID: session]) }
+            if failure == "retiring" { fixture.scope.beginRetirement() }
+            defer { foreign.replaceSessions([:]) }
+            do {
+                _ = try (failure == "foreign" ? foreign : fixture.scope).admit(
+                    session: failure == "absent" ? AgentTabSession(tabID: UUID()) : session,
+                    expectedWorkspaceID: failure == "workspace" ? UUID() : nil
+                )
+                XCTFail("Expected \(failure) refusal")
+            } catch {
+                switch (failure, error) {
+                case ("absent", .unavailable(.absent)), ("workspace", .conflicting),
+                     ("conflict", .conflicting), ("foreign", .foreignOwner): break
+                case let ("retiring", .command(writer, reason)):
+                    XCTAssertEqual(writer.identity, command.identity)
+                    XCTAssertEqual(reason, .retiring)
+                default: XCTFail("Wrong failure for \(failure): \(error)")
+                }
+            }
+        }
+        XCTAssertEqual(command.rejection, .retiring)
+        XCTAssertThrowsError(try command.requireCurrent()) { error in
+            XCTAssertEqual(error as? AgentSessionRuntimeStore.CommandRejection, .retiring)
+        }
+        XCTAssertTrue(command.writer.isCurrent, "Retirement blocks commands, not originating cleanup")
+        XCTAssertTrue(command.writer.ownsPersistentClaim)
+        XCTAssertTrue(command.writer.isCurrentOrSlotReplaced)
+        XCTAssertThrowsError(try fixture.runtime.codexHookCommand(for: session)) { error in
+            XCTAssertEqual(error as? AgentCodexHookReviewResolutionError, .staleWriter)
+        }
+    }
+
+    @MainActor
+    func testBindingTransitionIsAResolutionFailureNotACommandRefusal() throws {
+        let fixture = try Fixture(strict: true)
+        defer { fixture.cleanup() }
+        let generation = fixture.session.beginPersistentBindingTransition()
+        defer { fixture.session.finishPersistentBindingTransition(generation: generation) }
+        do {
+            _ = try fixture.scope.admit(session: fixture.session)
+            XCTFail("An in-flight rebind cannot admit a command")
+        } catch {
+            guard case .unavailable(.bindingTransition) = error else {
+                return XCTFail("Expected binding-transition resolution failure: \(error)")
+            }
+        }
+        XCTAssertEqual(fixture.command.rejection, .staleWriter)
+        XCTAssertThrowsError(try fixture.runtime.codexHookCommand(for: fixture.session)) { error in
+            XCTAssertEqual(error as? AgentCodexHookReviewResolutionError, .staleWriter)
+        }
+    }
+
+    @MainActor
+    func testCleanupPredicateDistinguishesDetachmentFromSameObjectReacquisition() throws {
+        let fixture = try Fixture(strict: true)
+        defer { fixture.cleanup() }
+        let command = fixture.command
+        fixture.scope.replaceSessions([:])
+        XCTAssertEqual(command.rejection, .staleWriter)
+        XCTAssertFalse(command.writer.ownsPersistentClaim)
+        XCTAssertTrue(command.writer.isCurrentOrSlotReplaced)
+        fixture.scope.replaceSessions([fixture.session.tabID: fixture.session])
+        XCTAssertEqual(command.rejection, .staleWriter)
+        XCTAssertFalse(command.writer.isCurrentOrSlotReplaced)
+        let successor = try fixture.runtime.codexHookCommand(for: fixture.session)
+        XCTAssertNotEqual(successor.identity, command.identity)
+        let replacement = AgentTabSession(tabID: fixture.session.tabID)
+        fixture.scope.replaceSessions([replacement.tabID: replacement])
+        XCTAssertTrue(command.writer.isCurrentOrSlotReplaced)
+        XCTAssertTrue(successor.writer.isCurrentOrSlotReplaced)
+        XCTAssertEqual(successor.rejection, .staleWriter)
+    }
+
+    @MainActor
+    func testCommandRejectionRetainsCreationRequirement() throws {
+        let store = AgentSessionRuntimeStore()
+        let scope = store.makeScope()
+        let workspaceID = UUID()
+        let claim = AgentSessionCreationClaim(workspaceID: workspaceID)
+        let session = scope.makeSession(tabID: UUID())
+        defer { session.saveDebounceTask?.cancel() }
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: claim.sessionID, workspaceID: workspaceID))
+        let handle = try XCTUnwrap(session.acceptFreshCreation(claim, workspaceID: workspaceID))
+        scope.replaceSessions([session.tabID: session])
+        let command = try scope.admit(session: session, requirement: .creation(handle))
+        XCTAssertNil(command.rejection)
+        try command.requireCurrent()
+        XCTAssertThrowsError(try scope.admit(session: session)) { error in
+            guard case let AgentSessionRuntimeStore.AdmissionRejection.command(writer, reason) = error else {
+                return XCTFail("Expected readiness refusal, not resolution failure: \(error)")
+            }
+            XCTAssertEqual(writer.identity, command.identity)
+            XCTAssertEqual(reason, .restorationUnavailable)
+        }
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: workspaceID))
+        XCTAssertEqual(command.rejection, .staleWriter)
+        XCTAssertThrowsError(try command.requireCurrent())
+    }
+
     @MainActor
     func testExactGateConsentAndDuplicateResponse() async throws {
         for strict in [false, true] {

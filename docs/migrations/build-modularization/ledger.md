@@ -7874,3 +7874,7 @@ lifecycle tests **5**, with no positive count/signature delta across the 42 audi
 The 2,122-case broad, both-product and full-lint receipts above qualify the pre-integration
 step-4 checkpoint; they are not misrepresented as a new merged-tree full-suite run. No source
 changed after merged-tree execution; this final addition records its integration receipts.
+
+## M9 writer-admission readability pilot (refs #1406)
+
+Added a sibling admission helper that preserves resolution, exact-owner and command-refusal distinctions, exposes the existing command rejection without copying authority rules, and names the detached-original cleanup predicate. The pilot converts only Codex hook command admission, managed interaction response admission and MCP's two current-or-replaced cleanup checks; compound phase validators, consent/cancellation ordering and all three authority tiers remain unchanged. No automatic await wrapper or pattern ratchet is introduced. The architecture convention and helper tests accompany the pilot; validation receipts and measured source delta are recorded in the PR rather than expanding this ledger.

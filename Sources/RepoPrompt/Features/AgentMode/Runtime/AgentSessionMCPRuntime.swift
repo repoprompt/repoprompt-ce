@@ -172,7 +172,7 @@ final class AgentSessionMCPRuntime {
     func clearStagedEpochTransition(_ staged: StagedEpochTransition) {
         let writer = staged.writer
         guard writer.scope === scope,
-              writer.isCurrent || writer.scope.sessions[writer.session.tabID] !== writer.session,
+              writer.isCurrentOrSlotReplaced,
               writer.session.currentRestorationBindingToken == writer.identity.restoration,
               var context = writer.session.mcpControlContext,
               context.writerIdentity == writer.identity,
@@ -488,7 +488,7 @@ final class AgentSessionMCPRuntime {
         // object must retain its writer incarnation: release/reacquisition is a successor even
         // when the binding token was copied. Recovery additionally requires control admission.
         guard recoveryCancellation?.permitsPublication != false,
-              writer.isCurrent || scope.sessions[session.tabID] !== session,
+              writer.isCurrentOrSlotReplaced,
               case let .accepted(epoch) = result,
               stopFence.binding == session.persistentSessionBindingIdentity,
               !session.bindingTransitionInProgress,
