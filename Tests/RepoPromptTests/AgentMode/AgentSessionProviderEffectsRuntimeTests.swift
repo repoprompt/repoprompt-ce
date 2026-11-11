@@ -1770,6 +1770,99 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         }
     }
 
+    func testApplyEditsCallerCancellationSettlesItsOwnPendingReview() async {
+        let store = ApplyEditsApprovalStore()
+        let address = ApplyEditsApprovalScope(windowID: -1406, tabID: UUID())
+        let (subscription, stream) = await store.subscribe(scope: address)
+        let installed = expectation(description: "original review installed")
+        let cleared = expectation(description: "cancelled review cleared")
+        let completed = expectation(description: "caller cancellation returned")
+        let observer = Task {
+            var sawReview = false
+            for await snapshot in stream {
+                if snapshot.pendingReview != nil, !sawReview {
+                    sawReview = true
+                    installed.fulfill()
+                } else if sawReview, snapshot.pendingReview == nil {
+                    cleared.fulfill()
+                    break
+                }
+            }
+        }
+        var decision: ApplyEditsReviewDecision?
+        let caller = Task {
+            decision = await store.requestReview(scope: address, path: "original", unifiedDiff: "diff", timeoutSeconds: 60)
+            completed.fulfill()
+        }
+        addTeardownBlock {
+            await store.cleanupScope(address)
+            await store.unsubscribe(scope: address, id: subscription)
+            observer.cancel()
+            await observer.value
+            await caller.value
+        }
+        await fulfillment(of: [installed], timeout: 5)
+        caller.cancel()
+        await fulfillment(of: [completed, cleared], timeout: 5)
+        XCTAssertEqual(decision, .cancelled(reason: "Cancelled while awaiting apply_edits review"))
+    }
+
+    func testApplyEditsCallerCancellationCannotConsumeSuccessorReview() async throws {
+        let store = ApplyEditsApprovalStore()
+        let address = ApplyEditsApprovalScope(windowID: -1406, tabID: UUID())
+        let (subscription, stream) = await store.subscribe(scope: address)
+        let installed = expectation(description: "original review installed")
+        let replaced = expectation(description: "successor review installed")
+        var reviews: [String: PendingApplyEditsReview] = [:]
+        let observer = Task {
+            for await snapshot in stream {
+                guard let review = snapshot.pendingReview, reviews[review.path] == nil else { continue }
+                reviews[review.path] = review
+                if review.path == "original" { installed.fulfill() }
+                if review.path == "successor" { replaced.fulfill() }
+            }
+        }
+        let gate = TestReleaseFence(name: "original approval caller cancellation")
+        let settled = expectation(description: "original cancellation dispatched")
+        await store.test_setRequestCancellationHooks(
+            before: { await gate.enterAndWait() }, after: { settled.fulfill() }
+        )
+        let original = Task { await store.requestReview(scope: address, path: "original", unifiedDiff: "diff", timeoutSeconds: 60) }
+        addTeardownBlock {
+            gate.release()
+            await store.cleanupScope(address)
+            await store.unsubscribe(scope: address, id: subscription)
+            observer.cancel()
+            await observer.value
+            _ = await original.value
+        }
+        await fulfillment(of: [installed], timeout: 5)
+        let first = try XCTUnwrap(reviews["original"])
+        original.cancel()
+        guard await gate.waitUntilEntered() else { return }
+        let successorCompleted = expectation(description: "successor response returned")
+        var successorDecision: ApplyEditsReviewDecision?
+        let successor = Task {
+            successorDecision = await store.requestReview(scope: address, path: "successor", unifiedDiff: "diff", timeoutSeconds: 60)
+            successorCompleted.fulfill()
+        }
+        addTeardownBlock {
+            await store.cleanupScope(address)
+            await successor.value
+        }
+        await fulfillment(of: [replaced], timeout: 5)
+        let replacement = try XCTUnwrap(reviews["successor"])
+        XCTAssertNotEqual(first.id, replacement.id)
+        gate.release()
+        await fulfillment(of: [settled], timeout: 5)
+        let accepted = await store.resolveReview(scope: address, reviewID: replacement.id, decision: .accept)
+        XCTAssertTrue(accepted, "An old caller's delayed cancellation must leave the successor review pending")
+        await fulfillment(of: [successorCompleted], timeout: 5)
+        XCTAssertEqual(successorDecision, .accept)
+        let originalResult = await original.value
+        XCTAssertEqual(originalResult, .cancelled(reason: "Replaced by newer apply_edits preview"))
+    }
+
     func testLateApprovalCancellationDrainsOriginalEffectWithoutCancellingSuccessorReview() async throws {
         var scope: AgentSessionRuntimeStore.Scope? = AgentSessionRuntimeStore().makeScope()
         let session = AgentTabSession(tabID: UUID())
@@ -1871,6 +1964,56 @@ final class AgentSessionInteractionRuntimeTests: XCTestCase {
         let thirdResult = await third.value
         XCTAssertEqual(thirdResult, .accept, "An old object without a known review has no namespace-wide cancellation authority")
         await store.unsubscribe(scope: address, id: subscription)
+    }
+
+    func testTerminalCancellationRetainsOnlyItsOriginalCutoffAuthorityAcrossReacquisition() async throws {
+        for occupiedAtAdmission in [false, true] {
+            let scope = AgentSessionRuntimeStore().makeScope()
+            let original = AgentTabSession(tabID: UUID())
+            let replacement = AgentTabSession(tabID: original.tabID)
+            scope.replaceSessions([original.tabID: occupiedAtAdmission ? original : replacement])
+            let store = ApplyEditsApprovalStore()
+            let runtime = scope.interactions(routeID: 42, approvalStore: store)
+            let address = runtime.approvalScope(for: original)
+            let (subscription, stream) = await store.subscribe(scope: address)
+            let installed = expectation(description: "review admitted before terminal cutoff")
+            var review: PendingApplyEditsReview?
+            let observer = Task {
+                for await snapshot in stream {
+                    if let pending = snapshot.pendingReview {
+                        review = pending
+                        installed.fulfill()
+                        break
+                    }
+                }
+            }
+            let caller = Task { await store.requestReview(scope: address, path: "undisplayed", unifiedDiff: "diff", timeoutSeconds: 60) }
+            let gate = TestReleaseFence(name: "terminal cancellation before same-object reacquisition")
+            runtime.test_beforeApprovalCancellation = { await gate.enterAndWait() }
+            addTeardownBlock {
+                gate.release()
+                await runtime.drainPendingEffects()
+                await store.cleanupScope(address)
+                await store.unsubscribe(scope: address, id: subscription)
+                observer.cancel()
+                await observer.value
+                _ = await caller.value
+            }
+            await fulfillment(of: [installed], timeout: 5)
+            let pending = try XCTUnwrap(review)
+            XCTAssertNil(original.pendingApplyEditsReview, "No exact review receipt has reached this terminal caller")
+            runtime.cancelPendingApplyEditsReview(for: original, reason: "Late terminal")
+            guard await gate.waitUntilEntered() else { return XCTFail("Terminal cancellation never reached the held effect") }
+            scope.replaceSessions([:])
+            scope.replaceSessions([original.tabID: original])
+            gate.release()
+            await runtime.drainPendingEffects(for: original)
+            let accepted = await store.resolveReview(scope: address, reviewID: pending.id, decision: .accept)
+            XCTAssertEqual(accepted, !occupiedAtAdmission, "Only the original occupant may cancel its undisplayed pre-Stop review")
+            if !accepted { await store.cleanupScope(address) }
+            let decision = await caller.value
+            XCTAssertEqual(decision, occupiedAtAdmission ? .cancelled(reason: "Late terminal") : .accept)
+        }
     }
 
     func testApprovalSubscriptionRejectsRecycledTabAndJoinsBeforeTeardown() async throws {

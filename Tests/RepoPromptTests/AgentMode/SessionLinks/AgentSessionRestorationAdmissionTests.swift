@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
@@ -166,6 +167,90 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
             if outcome == "missing" { try bytes.write(to: sessionFile(root: fixture.root, sessionID: sessionID)) }
             _ = await fixture.vm.ensureSessionReady(tabID: tabID)
             XCTAssertTrue(session.qualifiedRestorationReadiness.isAuthoritative, outcome)
+        }
+    }
+
+    func testAskUserWrapperKeepsOriginalWriterAcrossHydrationReadiness() async throws {
+        for change in ["none", "reacquire", "replacement", "binding"] {
+            let fixture = try await makeFixture()
+            let created = await fixture.vm.createAndActivateSessionTab()
+            let tabID = try XCTUnwrap(created)
+            let session = try XCTUnwrap(fixture.vm.sessions[tabID])
+            let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+            guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+                workspaceID: fixture.workspaceID, sessionID: sessionID
+            ) else { return XCTFail("Fixture must own its canonical writer") }
+            let generation = session.beginPersistentBindingTransition()
+            session.finishPersistentBindingTransition(generation: generation)
+            session.hasLoadedPersistedState = false
+            let gate = TestReleaseFence(name: "askUser readiness \(change)")
+            await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook { id in
+                if id == sessionID { await gate.enterAndWait() }
+            }
+            let interaction = AgentAskUserInteraction(title: "Original writer", timeoutSeconds: 60, questions: [
+                AgentAskUserQuestion(id: "answer", question: "Which files?", options: [], allowsMultiple: false, allowsCustom: true)
+            ])
+            let completed = expectation(description: "question wrapper completed \(change)")
+            var result: Result<AgentAskUserResponse, Error>?
+            let asking = Task {
+                do { result = try await .success(fixture.vm.askUser(tabID: tabID, interaction: interaction)) }
+                catch { result = .failure(error) }
+                completed.fulfill()
+            }
+            addTeardownBlock {
+                gate.release()
+                asking.cancel()
+                await asking.value
+                await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook(nil)
+            }
+            guard await gate.waitUntilEntered() else { return XCTFail("The real question wrapper must reach hydration: \(change)") }
+            let members = writer.scope.sessions
+            switch change {
+            case "reacquire":
+                writer.scope.replaceSessions(members.filter { $0.key != tabID })
+                writer.scope.replaceSessions(members)
+            case "replacement":
+                let successor = AgentTabSession(tabID: tabID)
+                successor.installPersistentSessionBinding(.init(tabID: tabID, sessionID: sessionID, workspaceID: fixture.workspaceID))
+                writer.scope.replaceSessions(members.merging([tabID: successor]) { _, new in new })
+            case "binding":
+                session.installPersistentSessionBinding(.init(tabID: tabID, sessionID: UUID(), workspaceID: fixture.workspaceID))
+            default: break
+            }
+            gate.release()
+            if change == "none" {
+                try await AsyncTestWait.waitUntil("question installed after real hydration") {
+                    await MainActor.run { session.pendingAskUser?.interaction.id == interaction.id }
+                }
+                XCTAssertTrue(session.hasLoadedPersistedState)
+                XCTAssertTrue(session.qualifiedRestorationReadiness.isAuthoritative)
+                XCTAssertTrue(fixture.vm.notificationSkipAskUser(tabID: tabID, interactionID: interaction.id))
+            }
+            await fulfillment(of: [completed], timeout: 5)
+            switch try XCTUnwrap(result) {
+            case let .success(response):
+                XCTAssertEqual(change, "none", "A stale readiness continuation must never ask on a successor")
+                XCTAssertTrue(response.skipped)
+            case let .failure(error):
+                XCTAssertNotEqual(change, "none")
+                guard case let MCPError.invalidParams(message) = error else {
+                    return XCTFail("Unexpected readiness refusal: \(error)")
+                }
+                // Reacquisition drops the old hydration proof, so this case exercises the
+                // wrapper's readiness refusal; replacement/rebind exercise its identity guard.
+                XCTAssertEqual(
+                    message,
+                    change == "reacquire"
+                        ? "Wait for this session to finish loading."
+                        : "The Agent session changed while preparing its question."
+                )
+            }
+            XCTAssertNil(session.pendingAskUser)
+            XCTAssertNil(session.askUserContinuation)
+            XCTAssertNil(fixture.vm.sessions[tabID]?.pendingAskUser)
+            XCTAssertNil(fixture.vm.sessions[tabID]?.askUserContinuation)
+            XCTAssertTrue(fixture.providerRequests.events.isEmpty)
+            await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook(nil)
         }
     }
 

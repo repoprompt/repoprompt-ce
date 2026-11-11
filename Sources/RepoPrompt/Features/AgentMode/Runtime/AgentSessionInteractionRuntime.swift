@@ -178,8 +178,10 @@ final class AgentSessionInteractionRuntime {
         let cutoff = ContinuousClock.now
         cancellationCutoffs = cancellationCutoffs.filter { $0.value.session != nil }
         cancellationCutoffs[ObjectIdentifier(session)] = .init(session: session, instant: cutoff)
-        let binding = session.persistentSessionBindingIdentity
-        let restoration = session.currentRestorationBindingToken
+        // This is originating cleanup, not a new command after the suspension. Capture
+        // authority now; a detached caller must not acquire it by being re-added later.
+        // The store-side cutoff protects all reviews admitted by a subsequent incarnation.
+        let ownedScopeAtCutoff = scope?.membership(of: session)?.isCurrent == true
         session.pendingApplyEditsReview = nil
         let address = approvalScope(for: session)
         let store = approvalStore
@@ -194,10 +196,7 @@ final class AgentSessionInteractionRuntime {
             #if DEBUG
                 await test_beforeApprovalCancellation?()
             #endif
-            if owner?.sessions[session.tabID] === session,
-               session.persistentSessionBindingIdentity == binding,
-               session.currentRestorationBindingToken == restoration
-            {
+            if ownedScopeAtCutoff {
                 // Cancel all already-admitted work for this exact stopping owner, including
                 // a newer review whose snapshot has not reached the runtime yet. A review
                 // admitted after Stop cannot be consumed by this delayed store operation.

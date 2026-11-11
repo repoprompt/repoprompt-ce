@@ -40,8 +40,6 @@ final class TaskLocalPayloadLayoutGuardTests: XCTestCase {
         "Sources/RepoPromptWorkspaceContext/Search/WorkspaceFileSearchDebugTiming.swift#coldStartCollector":
             "final class",
         "Sources/RepoPrompt/Infrastructure/VCS/GitService.swift#currentReceiptParentLookupTrace": "final class",
-        "Sources/RepoPrompt/Infrastructure/VCS/GitService.swift#worktreeCreationCommitFence":
-            "closure (optional @Sendable async throwing function)",
         "Sources/RepoPromptInstrumentation/MCPToolExecutionPhaseInstrumentation.swift#recorder": "existential container",
         "Sources/RepoPromptFileSystem/FileSystemRuntimeHooks.swift#currentContext":
             "struct of closures and an existential only; no Foundation or resilient fields",
