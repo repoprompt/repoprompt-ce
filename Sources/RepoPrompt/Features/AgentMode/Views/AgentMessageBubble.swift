@@ -465,7 +465,7 @@ struct AgentMessageBubble: View {
         case .assistant:
             assistantBubble
         case .assistantInline:
-            assistantInline
+            assistantBubble
         case .toolCall:
             if isHiddenAgentTool(item.toolName) {
                 EmptyView()
@@ -646,27 +646,6 @@ struct AgentMessageBubble: View {
                 )
             }
 
-            Spacer(minLength: 60)
-        }
-    }
-
-    // MARK: - Assistant Inline
-
-    private var assistantInline: some View {
-        HStack(alignment: .top) {
-            VStack(alignment: .leading, spacing: 4) {
-                assistantContent
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                MessageFooterStrip(
-                    text: item.text,
-                    timestamp: item.timestamp,
-                    isTrailing: false,
-                    handoffConfig: handoffConfig,
-                    hasHandoffButton: handoffConfig != nil,
-                    runtimeFooter: runtimeFooter
-                )
-            }
             Spacer(minLength: 60)
         }
     }
@@ -2079,7 +2058,8 @@ struct ToolResultContentView: View {
             }
 
             if needsCollapse, !isDiffContent, !isJSONContent {
-                expandCollapseButton
+                messageExpansionButton(isExpanded: $isExpanded, remainingLineCount: remainingLineCount, fontPreset: fontPreset)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
     }
@@ -2137,26 +2117,30 @@ struct ToolResultContentView: View {
         return (trimmed.hasPrefix("{") && trimmed.hasSuffix("}")) ||
             (trimmed.hasPrefix("[") && trimmed.hasSuffix("]"))
     }
+}
 
-    private var expandCollapseButton: some View {
-        Button(action: {
-            withAnimation(.easeInOut(duration: 0.2)) {
-                isExpanded.toggle()
-            }
-        }) {
-            HStack(spacing: 4) {
-                Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .medium))
-                Text(isExpanded ? "Show less" : "Show \(remainingLineCount) more lines")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-            }
-            .foregroundColor(.secondary)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
+@MainActor
+private func messageExpansionButton(
+    isExpanded: Binding<Bool>,
+    remainingLineCount: @autoclosure () -> Int,
+    fontPreset: FontScalePreset
+) -> some View {
+    Button(action: {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            isExpanded.wrappedValue.toggle()
         }
-        .buttonStyle(PlainButtonStyle())
-        .frame(maxWidth: .infinity, alignment: .leading)
+    }) {
+        HStack(spacing: 4) {
+            Image(systemName: isExpanded.wrappedValue ? "chevron.up" : "chevron.down")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .medium))
+            Text(isExpanded.wrappedValue ? "Show less" : "Show \(remainingLineCount()) more lines")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+        }
+        .foregroundColor(.secondary)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
     }
+    .buttonStyle(PlainButtonStyle())
 }
 
 // MARK: - Diff Content View
@@ -2226,22 +2210,7 @@ private struct DiffContentView: View {
             .cornerRadius(6)
 
             if needsCollapse {
-                Button(action: {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        isExpanded.toggle()
-                    }
-                }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                            .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .medium))
-                        Text(isExpanded ? "Show less" : "Show \(remainingLineCount) more lines")
-                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                    }
-                    .foregroundColor(.secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
-                }
-                .buttonStyle(PlainButtonStyle())
+                messageExpansionButton(isExpanded: $isExpanded, remainingLineCount: remainingLineCount, fontPreset: fontPreset)
             }
         }
     }

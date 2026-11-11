@@ -1,5 +1,16 @@
 import SwiftUI
 
+extension View {
+    func agentPillSurface(cornerRadius: CGFloat, strokeColor: Color, lineWidth: CGFloat) -> some View {
+        background(.ultraThinMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .stroke(strokeColor, lineWidth: lineWidth)
+            )
+    }
+}
+
 // MARK: - Shared Pill Metrics
 
 /// All composer pills (Workflow, Interview, Auto Edit, Oracle, Context, the

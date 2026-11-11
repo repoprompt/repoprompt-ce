@@ -138,12 +138,7 @@ struct AgentContextPill: View {
             }
             .padding(.horizontal, AgentPillMetrics.horizontalPadding())
             .frame(height: AgentPillMetrics.height())
-            .background(.ultraThinMaterial)
-            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(Color.secondary.opacity(0.15), lineWidth: 0.5)
-            )
+            .agentPillSurface(cornerRadius: cornerRadius, strokeColor: Color.secondary.opacity(0.15), lineWidth: 0.5)
         }
         .buttonStyle(.plain)
         .hoverTooltip(contextUsageTooltip(detailedFileSummaryText: detailedFileSummaryText), .top)

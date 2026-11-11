@@ -42,12 +42,9 @@ struct ReadFileResultCard: View {
             title: "Read File",
             subtitle: summary,
             status: status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }
 
@@ -75,12 +72,9 @@ struct NativeReadResultCard: View {
             title: "Read",
             subtitle: nonEmptyToolCardSummary(summary, fallbackStatusFor: item),
             status: status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }
 
@@ -131,12 +125,9 @@ struct FileSearchResultCard: View {
             title: "Search",
             subtitle: nonEmptyToolCardSummary(summary, fallbackStatusFor: item),
             status: status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }
 
@@ -161,12 +152,9 @@ struct WebSearchResultCard: View {
             title: presentation?.title ?? toolDisplayName(for: normalizedToolName),
             subtitle: nonEmptyToolCardSummary(summary, fallbackStatusFor: item),
             status: status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }
 
@@ -184,12 +172,9 @@ struct NativeToolResultCard: View {
             subtitle: nonEmptyToolCardSummary(presentation?.inlineSummaryText, fallbackStatusFor: item),
             status: presentation.map { ToolCardStatus.fromRenderStatus($0.status) }
                 ?? ToolResultStatusResolver.resolve(toolIsError: item.toolIsError, raw: item.toolResultJSON, fallback: .neutral),
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }
 
@@ -316,11 +301,8 @@ struct FileActionResultCard: View {
             title: "File Action",
             subtitle: summary,
             status: status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }

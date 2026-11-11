@@ -159,12 +159,9 @@ struct ChatsResultCard: View {
             detailText: nil,
             subtitle: inlineToolCardSummary(summary, detailText),
             status: status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }
 
@@ -207,12 +204,9 @@ struct ListModelsResultCard: View {
             detailText: nil,
             subtitle: inlineToolCardSummary(summary, detailText),
             status: status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }
 
@@ -288,12 +282,9 @@ struct ManageWorkspacesResultCard: View {
             detailText: nil,
             subtitle: inlineToolCardSummary(summary, detailText),
             status: status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }
 

@@ -48,6 +48,33 @@ struct AgentToolCardRenderStatePreferenceKey: PreferenceKey {
     }
 }
 
+extension ToolCardContainer where Content == ToolMarkdownExpandedContent {
+    init(
+        iconName: String,
+        iconColor: Color,
+        title: String,
+        detailText: String? = nil,
+        subtitle: String?,
+        status: ToolCardStatus,
+        item: AgentChatItem,
+        isExpanded: Binding<Bool>
+    ) {
+        self.init(
+            iconName: iconName,
+            iconColor: iconColor,
+            title: title,
+            detailText: detailText,
+            subtitle: subtitle,
+            status: status,
+            timestamp: item.timestamp,
+            isExpandable: toolResultHasPayload(item),
+            isExpanded: isExpanded
+        ) {
+            ToolMarkdownExpandedContent(item: item)
+        }
+    }
+}
+
 /// Shared container providing consistent UI chrome for all tool cards
 /// Supports collapsed (1-line summary) and expanded states via isExpanded binding
 struct ToolCardContainer<Content: View>: View {
@@ -84,46 +111,7 @@ struct ToolCardContainer<Content: View>: View {
         showsTimestamp: Bool = true,
         headerTrailingView: AnyView? = nil,
         isExpandable: Bool = true,
-        debugItemID: UUID? = nil,
-        debugToolName: String? = nil,
-        debugBashPhase: AgentToolCardRenderedBashPhase? = nil,
-        debugRenderMode: AgentToolCardRenderMode? = nil,
-        isExpanded: Binding<Bool>,
-        @ViewBuilder content: @escaping () -> Content
-    ) {
-        self.iconName = iconName
-        self.iconColor = iconColor
-        self.title = title
-        self.headerStatusText = headerStatusText
-        self.detailText = detailText
-        self.subtitle = subtitle
-        self.status = status
-        self.timestamp = timestamp
-        self.showsTimestamp = showsTimestamp
-        self.headerTrailingView = headerTrailingView
-        self.isExpandable = isExpandable
-        managesOwnExpansion = false
-        self.debugItemID = debugItemID
-        self.debugToolName = debugToolName
-        self.debugBashPhase = debugBashPhase
-        self.debugRenderMode = debugRenderMode
-        _isExpanded = isExpanded
-        self.content = content
-    }
-
-    init(
-        iconName: String,
-        iconColor: Color = .orange,
-        title: String,
-        headerStatusText: String? = nil,
-        detailText: String? = nil,
-        subtitle: String? = nil,
-        status: ToolCardStatus = .neutral,
-        timestamp: Date? = nil,
-        showsTimestamp: Bool = true,
-        headerTrailingView: AnyView? = nil,
-        isExpandable: Bool = true,
-        managesOwnExpansion: Bool,
+        managesOwnExpansion: Bool = false,
         debugItemID: UUID? = nil,
         debugToolName: String? = nil,
         debugBashPhase: AgentToolCardRenderedBashPhase? = nil,

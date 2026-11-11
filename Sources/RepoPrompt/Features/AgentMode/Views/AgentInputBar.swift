@@ -1508,57 +1508,50 @@ struct AgentComposerView: View, Equatable {
         }
     }
 
+    private var toolsButtonLabel: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "slider.horizontal.3")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+            Text("Tools")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+            Image(systemName: "chevron.down")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .semibold))
+        }
+        .foregroundColor(.primary)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .contentShape(Rectangle())
+    }
+
     @ViewBuilder
     private var codexToolsButton: some View {
         if props.selectedAgent == .codexExec {
-            HStack(spacing: 4) {
-                Image(systemName: "slider.horizontal.3")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                Text("Tools")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                Image(systemName: "chevron.down")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .semibold))
-            }
-            .foregroundColor(.primary)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .contentShape(Rectangle())
-            .onTapGesture {
-                guard !isCodexRunActive else { return }
-                showCodexToolsPopover.toggle()
-            }
-            .popover(isPresented: $showCodexToolsPopover, arrowEdge: .bottom) {
-                codexToolsPopoverContent
-            }
-            .opacity(isCodexRunActive ? 0.4 : 1.0)
-            .hoverTooltip(isCodexRunActive ? "Tool controls locked during active run" : "Configure Codex tools & MCP servers")
-            .fixedSize()
+            toolsButtonLabel
+                .onTapGesture {
+                    guard !isCodexRunActive else { return }
+                    showCodexToolsPopover.toggle()
+                }
+                .popover(isPresented: $showCodexToolsPopover, arrowEdge: .bottom) {
+                    codexToolsPopoverContent
+                }
+                .opacity(isCodexRunActive ? 0.4 : 1.0)
+                .hoverTooltip(isCodexRunActive ? "Tool controls locked during active run" : "Configure Codex tools & MCP servers")
+                .fixedSize()
         }
     }
 
     @ViewBuilder
     private var claudeToolsButton: some View {
         if props.selectedAgent.usesClaudeTooling {
-            HStack(spacing: 4) {
-                Image(systemName: "slider.horizontal.3")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                Text("Tools")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                Image(systemName: "chevron.down")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .semibold))
-            }
-            .foregroundColor(.primary)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .contentShape(Rectangle())
-            .onTapGesture {
-                showClaudeToolsPopover.toggle()
-            }
-            .popover(isPresented: $showClaudeToolsPopover, arrowEdge: .bottom) {
-                claudeToolsPopoverContent
-            }
-            .hoverTooltip("Configure Claude tools")
-            .fixedSize()
+            toolsButtonLabel
+                .onTapGesture {
+                    showClaudeToolsPopover.toggle()
+                }
+                .popover(isPresented: $showClaudeToolsPopover, arrowEdge: .bottom) {
+                    claudeToolsPopoverContent
+                }
+                .hoverTooltip("Configure Claude tools")
+                .fixedSize()
         }
     }
 

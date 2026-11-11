@@ -176,12 +176,9 @@ struct FileTreeResultCard: View {
             detailText: nil,
             subtitle: inlineToolCardSummary(presentation.subtitle, presentation.detailText),
             status: presentation.status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }
 
@@ -254,12 +251,9 @@ struct CodeStructureResultCard: View {
             detailText: nil,
             subtitle: inlineToolCardSummary(summary, detailText),
             status: status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }
 
@@ -325,12 +319,9 @@ struct ManageSelectionResultCard: View {
             detailText: nil,
             subtitle: inlineToolCardSummary(summary, detailText),
             status: status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }
 
@@ -395,11 +386,8 @@ struct WorkspaceContextResultCard: View {
             detailText: nil,
             subtitle: inlineToolCardSummary(summary, detailText),
             status: status,
-            timestamp: item.timestamp,
-            isExpandable: toolResultHasPayload(item),
+            item: item,
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }
