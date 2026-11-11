@@ -167,6 +167,44 @@ final class AgentTranscriptReplyPresentationTests: XCTestCase {
         }
     }
 
+    func testMemoizedToolNamesPreserveExecutionsAndVisibility() throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let context = AgentToolResultProcessingContext(cachesToolExecutions: false)
+        let names = ["Bash", "exec-command", " tool ", "\tOTHER\n", "t-ool", "oth er", "functions.mcp__RepoPrompt__read_file", "Sources/A.swift", "Tools\\file.ts", "/tmp/file.swift", "web_search", "", "Src/Caf\u{00e9}.swift", "Src/Cafe\u{0301}.swift"]
+        for _ in 0 ..< 2 {
+            for name in names {
+                let row = AgentChatItem.toolResult(name: name, invocationID: UUID(), resultJSON: "{}", isError: false)
+                let expected = AgentTranscriptToolNormalizer.toolExecution(for: row)
+                let cached = AgentTranscriptToolNormalizer.toolExecution(for: row, context: context)
+                XCTAssertEqual(try encoder.encode(cached), try encoder.encode(expected), name)
+                let activity = AgentTranscriptActivity(from: row, toolExecution: cached)
+                XCTAssertEqual(
+                    AgentTranscriptToolVisibilityPolicy.shouldSuppressActivity(activity),
+                    AgentTranscriptToolVisibilityPolicy.shouldSuppressRow(activity.toItem()), name
+                )
+            }
+        }
+    }
+
+    func testBufferedSummaryNarrationDoesNotLeakIntoToolSection() throws {
+        var (transcript, _) = fixture(interrupted: false)
+        transcript.turns[0].request = nil
+        transcript.turns[0].conclusionActivityID = nil
+        for replyPresentation in [false, true] {
+            let projection = AgentTranscriptProjectionBuilder.buildWithCaches(
+                from: transcript, turnCaches: [:], replyPresentation: replyPresentation
+            ).projection
+            let history = try XCTUnwrap(projection.workingBlocks.first { $0.kind == .groupedHistory }?.groupedHistory)
+            let groupSummary = try XCTUnwrap(history.summary.toolSummary)
+            let sectionSummary = try XCTUnwrap(history.sections.first?.clusterSummary)
+            XCTAssertEqual(groupSummary.shortNarration, "answer")
+            XCTAssertNil(sectionSummary.shortNarration)
+            XCTAssertEqual(groupSummary.toolCount, sectionSummary.toolCount)
+            XCTAssertEqual(groupSummary.toolNameCounts, sectionSummary.toolNameCounts)
+        }
+    }
+
     func testMixedTranscriptStress() {
         var items: [AgentChatItem] = [.user("question", sequenceIndex: 0)]
         var sequence = 1
@@ -579,12 +617,15 @@ final class AgentTranscriptReplyPresentationTests: XCTestCase {
             _ = AgentTranscriptProjectionBuilder.buildWithCaches(from: transcript, turnCaches: [:], replyPresentation: true)
             return Date.timeIntervalSinceReferenceDate - start
         }
-        let small = make(150), large = make(300)
+        let small = make(150), large = make(600)
         _ = elapsed(small)
         _ = elapsed(large)
-        let t1 = elapsed(small), t2 = elapsed(large)
+        // Best of three warmed builds limits shared-runner interruptions. A 4x
+        // workload gets 6x time, not the 16x a quadratic implementation needs.
+        let t1 = (0 ..< 3).map { _ in elapsed(small) }.min()!
+        let t2 = (0 ..< 3).map { _ in elapsed(large) }.min()!
         print("MULTISPAN_GROWTH_SECONDS=\(t1),\(t2)")
-        XCTAssertLessThan(t2, t1 * 4 + 0.1)
+        XCTAssertLessThan(t2, t1 * 6)
     }
 
     func testRequestlessBufferedAssistantSurvivesCrossSpanConclusionSplit() throws {

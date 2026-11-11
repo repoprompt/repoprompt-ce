@@ -9,7 +9,12 @@ enum AgentTranscriptToolVisibilityPolicy {
     ]
 
     static func shouldSuppressActivity(_ activity: AgentTranscriptActivity) -> Bool {
-        shouldSuppressRow(activity.toItem(), execution: activity.toolExecution)
+        // Only placeholder tools can be suppressed. Avoid reconstructing a chat row
+        // (attachments, attribution validation, etc.) for every ordinary activity.
+        guard activity.itemKind == .toolCall || activity.itemKind == .toolResult,
+              isPlaceholderToolName(activity.toolExecution?.toolName)
+        else { return false }
+        return shouldSuppressRow(activity.toItem(), execution: activity.toolExecution)
     }
 
     static func shouldSuppressRow(_ row: AgentChatItem) -> Bool {
@@ -17,8 +22,11 @@ enum AgentTranscriptToolVisibilityPolicy {
     }
 
     static func isPlaceholderToolName(_ raw: String?) -> Bool {
-        guard let normalized = normalizedToolNameForComparison(raw), !normalized.isEmpty else { return false }
-        return placeholderToolNames.contains(normalized)
+        guard let raw else { return false }
+        // Alias normalization only replaces hyphens/spaces with underscores; none
+        // of the placeholder names contain underscores, so those replacements
+        // cannot create a match and need not run in this per-activity predicate.
+        return placeholderToolNames.contains(raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
     }
 
     static func isPathLikeToolName(_ raw: String?) -> Bool {
