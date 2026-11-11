@@ -1,6 +1,13 @@
 import SwiftUI
 
 extension View {
+    func agentOversightPreviewSurface() -> some View {
+        padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.accentColor.opacity(0.08))
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+    }
+
     func agentPillSurface(cornerRadius: CGFloat, strokeColor: Color, lineWidth: CGFloat) -> some View {
         background(.ultraThinMaterial)
             .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))

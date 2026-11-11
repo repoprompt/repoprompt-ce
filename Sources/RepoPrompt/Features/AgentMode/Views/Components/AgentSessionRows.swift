@@ -845,17 +845,9 @@ struct AgentSessionRow: View {
         showDeleteConfirmation = true
     }
 
-    private var currentSelectionGesture: AgentSidebarSelectionGesture {
-        var modifiers: AgentSidebarSelectionModifiers = []
-        let flags = NSApp.currentEvent?.modifierFlags ?? []
-        if flags.contains(.command) { modifiers.insert(.command) }
-        if flags.contains(.shift) { modifiers.insert(.shift) }
-        return AgentSidebarSelectionGesture(modifiers: modifiers)
-    }
-
     private func handleRowTap() {
         guard isInteractionEnabled else { return }
-        if onSelectionGesture(currentSelectionGesture) == .activate {
+        if onSelectionGesture(.currentEvent) == .activate {
             onSelect()
         }
     }
@@ -971,17 +963,7 @@ struct AgentSessionRow: View {
         let sidebarOversightTargetEndpoint = resolveSidebarOversightTargetEndpoint?()
         HStack(spacing: rowSpacing) {
             if showsSelectionPresentation {
-                Button(action: toggleSelection) {
-                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                        .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
-                        .padding(6)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .padding(-6) // Keep the row layout unchanged around the larger hit target.
-                .disabled(!isInteractionEnabled)
-                .accessibilityLabel("\(isSelected ? "Deselect" : "Select") \(title)")
-                .accessibilityValue(isSelected ? "Selected" : "Not selected")
+                agentSidebarSelectionButton(isSelected: isSelected, isInteractionEnabled: isInteractionEnabled, title: title, action: toggleSelection)
             }
 
             if threadDepth > 0 {
@@ -1077,43 +1059,15 @@ struct AgentSessionRow: View {
                 }
 
                 if allowsDirectMutations {
-                    Button(action: onTogglePin) {
-                        Image(systemName: isPinned ? "pin.slash" : "pin")
-                            .font(.system(size: 11))
-                            .foregroundColor(isPinHovered ? .accentColor : .secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .onHover { isPinHovered = $0 }
-                    .hoverTooltip(pinActionLabel)
+                    agentSidebarRowActionButton(systemImage: isPinned ? "pin.slash" : "pin", isHovered: $isPinHovered, highlightColor: .accentColor, tooltip: pinActionLabel, action: onTogglePin)
 
-                    Button(action: beginRename) {
-                        Image(systemName: "pencil")
-                            .font(.system(size: 11))
-                            .foregroundColor(isRenameHovered ? .accentColor : .secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .onHover { isRenameHovered = $0 }
-                    .hoverTooltip(renameActionLabel)
+                    agentSidebarRowActionButton(systemImage: "pencil", isHovered: $isRenameHovered, highlightColor: .accentColor, tooltip: renameActionLabel, action: beginRename)
 
                     if let onStash {
-                        Button(action: onStash) {
-                            Image(systemName: "tray.and.arrow.down")
-                                .font(.system(size: 11))
-                                .foregroundColor(isStashHovered ? .accentColor : .secondary)
-                        }
-                        .buttonStyle(.plain)
-                        .onHover { isStashHovered = $0 }
-                        .hoverTooltip(stashActionLabel)
+                        agentSidebarRowActionButton(systemImage: "tray.and.arrow.down", isHovered: $isStashHovered, highlightColor: .accentColor, tooltip: stashActionLabel, action: onStash)
                     }
 
-                    Button(action: requestDeleteConfirmation) {
-                        Image(systemName: "trash")
-                            .font(.system(size: 11))
-                            .foregroundColor(isDeleteHovered ? .red : .secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .onHover { isDeleteHovered = $0 }
-                    .hoverTooltip(deleteActionLabel)
+                    agentSidebarRowActionButton(systemImage: "trash", isHovered: $isDeleteHovered, highlightColor: .red, tooltip: deleteActionLabel, action: requestDeleteConfirmation)
                 }
             }
             // Selected state is already signaled by the accent-tinted background +

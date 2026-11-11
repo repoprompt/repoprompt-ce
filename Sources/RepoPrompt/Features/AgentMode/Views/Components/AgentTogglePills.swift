@@ -1,5 +1,16 @@
 import SwiftUI
 
+@MainActor
+private func togglePillContent(isOn: Bool, cornerRadius: CGFloat, @ViewBuilder content: () -> some View) -> some View {
+    ZStack {
+        if isOn {
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .fill(Color.accentColor.opacity(0.12))
+        }
+        content()
+    }
+}
+
 // MARK: - Auto Edit Pill
 
 struct AgentAutoEditPill: View {
@@ -73,12 +84,7 @@ struct AgentInterviewPill: View {
         let cornerRadius = AgentPillMetrics.cornerRadius()
         let size = AgentPillMetrics.height()
         Button(action: onToggle) {
-            ZStack {
-                if isOn {
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .fill(Color.accentColor.opacity(0.12))
-                }
-
+            togglePillContent(isOn: isOn, cornerRadius: cornerRadius) {
                 Image(systemName: isOn ? "questionmark.bubble.fill" : "questionmark.bubble")
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                     .foregroundStyle(isOn ? Color.accentColor : .secondary)
@@ -123,11 +129,7 @@ struct AgentIconTogglePill: View {
         let cornerRadius = AgentPillMetrics.cornerRadius()
         let size = AgentPillMetrics.height()
         Button(action: onToggle) {
-            ZStack {
-                if isOn {
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .fill(Color.accentColor.opacity(0.12))
-                }
+            togglePillContent(isOn: isOn, cornerRadius: cornerRadius) {
                 if isBusy {
                     ProgressView().controlSize(.small)
                 } else {
