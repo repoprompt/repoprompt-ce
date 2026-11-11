@@ -856,7 +856,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 XCTAssertTrue(literal.augmentedInput.contains(approved))
                 XCTAssertFalse(literal.augmentedInput.contains(skillBody))
                 vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("literal-switch.json") }
-                let preparedHandover = await vm.prepareProviderSwitchHandoverForSend(literal, session: session, stopFence: .init(session: session))
+                let preparedHandover = await vm.linkExecutionRuntime.prepareProviderSwitchHandoverForSend(literal, session: session, stopFence: .init(session: session))
                 let handover = try XCTUnwrap(preparedHandover)
                 XCTAssertTrue(handover.user.contains(approved))
                 XCTAssertFalse(handover.user.contains(skillBody))
@@ -934,7 +934,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         text = "short"
                     }
                     let initial = await fixture.viewModel.buildInitialThreadMessageIfNeeded(tabID: session.tabID, session: session, initialMessage: text)
-                    let budget = AgentProviderHandover.Budget(catalogWindow: nil, instructions: fixture.viewModel.providerSwitchInstructionStrings(session), composedInput: initial, isPreview: false)
+                    let budget = AgentProviderHandover.Budget(catalogWindow: nil, instructions: fixture.viewModel.linkExecutionRuntime.providerSwitchInstructionStrings(session), composedInput: initial, isPreview: false)
                     let empty = try switchCarrier()
                     let padding = Int((budget.remainingCarrierTokens - 1000) * 4 / 1.05) - empty.utf8.count
                     try installSwitch(fixture, padding: padding)
@@ -1046,7 +1046,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     }
                     if !duringSave { reacquire() }
                     let receipt = preparation.accepting(accepted.id, session: session)
-                    let result = await vm.prepareProviderSwitchHandoverForSend(receipt, session: session, stopFence: .init(session: session))
+                    let result = await vm.linkExecutionRuntime.prepareProviderSwitchHandoverForSend(receipt, session: session, stopFence: .init(session: session))
                     XCTAssertNil(result)
                     XCTAssertEqual(saves, duringSave ? 1 : 0, "No compensating save may target the successor")
                     if duringSave {
@@ -1085,7 +1085,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         }
                         return fixture.rootURL.appendingPathComponent("switch.json")
                     }
-                    let messages = await fixture.viewModel.prepareProviderSwitchHandoverForSend(preparation.accepting(accepted.id, session: session), session: session, stopFence: fence)
+                    let messages = await fixture.viewModel.linkExecutionRuntime.prepareProviderSwitchHandoverForSend(preparation.accepting(accepted.id, session: session), session: session, stopFence: fence)
                     XCTAssertNil(messages)
                     XCTAssertEqual(saves, fault == "sending" ? [.sending] : [.sending, .ready])
                     XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, fault == "none" ? .ready : .sending)
@@ -1139,7 +1139,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 }
                 var completed = false
                 let attempt = Task {
-                    let messages = await vm.prepareProviderSwitchHandoverForSend(preparation.accepting(accepted.id, session: session), session: session, stopFence: .init(session: session))
+                    let messages = await vm.linkExecutionRuntime.prepareProviderSwitchHandoverForSend(preparation.accepting(accepted.id, session: session), session: session, stopFence: .init(session: session))
                     completed = true
                     return messages
                 }
@@ -1209,7 +1209,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 }
                 var completed = false
                 let attempt = Task {
-                    let messages = await vm.prepareProviderSwitchHandoverForSend(preparation.accepting(accepted.id, session: session), session: session, stopFence: .init(session: session))
+                    let messages = await vm.linkExecutionRuntime.prepareProviderSwitchHandoverForSend(preparation.accepting(accepted.id, session: session), session: session, stopFence: .init(session: session))
                     completed = true
                     return messages
                 }
@@ -1252,7 +1252,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         }
                         return fixture.rootURL.appendingPathComponent("switch.json")
                     }
-                    let messages = await fixture.viewModel.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
+                    let messages = await fixture.viewModel.linkExecutionRuntime.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
                     XCTAssertEqual(messages?.user, payload + "\n\n" + preparation.augmentedInput)
                     XCTAssertEqual(messages?.initial, payload + "\n\n" + preparation.initialThreadInput)
                     XCTAssertEqual(saves.map(\.pendingHandoffProviderSwitchDelivery), [.sending])
@@ -1313,7 +1313,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         }
                         return file
                     }
-                    let messages = await vm.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
+                    let messages = await vm.linkExecutionRuntime.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
                     XCTAssertNotNil(messages)
                     let runID = UUID()
                     session.installRunID(runID)
@@ -1364,7 +1364,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         return savedURL
                     }
                     defer { vm.test_setAgentSessionSaver { _, _, _ in savedURL } }
-                    let messages = await vm.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
+                    let messages = await vm.linkExecutionRuntime.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
                     XCTAssertNotNil(messages)
                     let runID = UUID()
                     session.installRunID(runID)
@@ -1443,7 +1443,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         try JSONEncoder().encode(saved).write(to: savedURL, options: .atomic)
                         return savedURL
                     }
-                    let messages = await vm.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
+                    let messages = await vm.linkExecutionRuntime.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
                     XCTAssertNotNil(messages)
                     let runID = UUID()
                     session.installRunID(runID)
@@ -1489,7 +1489,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 try installSwitch(fixture)
                 let preparation = try await switchPreparation(fixture)
                 fixture.viewModel.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("switch.json") }
-                _ = await fixture.viewModel.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
+                _ = await fixture.viewModel.linkExecutionRuntime.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
                 let runID = UUID()
                 session.installRunID(runID)
                 session.beginRunAttempt(source: "test.switch.latePhysical")
@@ -1560,7 +1560,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 let request = AgentSessionLinkSendRequest(linkID: UUID(), linkGeneration: 1, observerEndpoint: endpoint, observerDisplayName: "Observer", message: "assigned task", workflow: nil)
                 let rows = session.items.map(\.id)
                 var commits = 0
-                let refused = await fixture.viewModel.agentSessionLinkPerformSend(to: candidate, request: request, liveness: {
+                let refused = await fixture.viewModel.linkExecutionRuntime.agentSessionLinkPerformSend(to: candidate, request: request, liveness: {
                     .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false)
                 }, commitAuthorization: {
                     commits += 1
@@ -1577,7 +1577,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 let recorder = AgentRunStartOutcomeRecorder()
                 _ = await fixture.viewModel.startAgentRun(tabID: session.tabID, initialMessage: "forbidden", startOutcome: recorder)
                 XCTAssertFalse(recorder.outcome.didStart)
-                let orphan = await fixture.viewModel.agentSessionLinkPerformSend(to: candidate, request: request, liveness: {
+                let orphan = await fixture.viewModel.linkExecutionRuntime.agentSessionLinkPerformSend(to: candidate, request: request, liveness: {
                     .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false)
                 }, commitAuthorization: { commits += 1
                     return .committed
@@ -1628,9 +1628,9 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                             )
                             session.oversight.pendingAutoWake = attempt
                             sawAttempt = true
-                            await fixture.viewModel.agentSessionLinkRunPeriodicAttempt(attempt, session: session)
+                            await fixture.viewModel.linkExecutionRuntime.agentSessionLinkRunPeriodicAttempt(attempt, session: session)
                             // A stale scheduled callback cannot reserve another attempt or start a loop.
-                            fixture.viewModel.agentSessionLinkScheduleAutoWakeReevaluation(wakeID: attempt.wakeID, endpoint: endpoint)
+                            fixture.viewModel.linkExecutionRuntime.agentSessionLinkScheduleAutoWakeReevaluation(wakeID: attempt.wakeID, endpoint: endpoint)
                         } else {
                             let waiting = Task { try await fixture.viewModel.waitForNextUserInstruction(tabID: session.tabID, timeoutSeconds: 10) }
                             try await AsyncTestWait.waitUntil("waiting continuation installed") { session.instructionContinuation != nil }
@@ -1650,7 +1650,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                             sawAttempt = true
                             await attempt.task?.value
                             XCTAssertNotNil(session.instructionContinuation, "Refusal must not resume the provider's held input")
-                            fixture.viewModel.agentSessionLinkScheduleAutoWakeReevaluation(wakeID: attempt.wakeID, endpoint: endpoint)
+                            fixture.viewModel.linkExecutionRuntime.agentSessionLinkScheduleAutoWakeReevaluation(wakeID: attempt.wakeID, endpoint: endpoint)
                             session.oversight.autoWakeOnUpdates = false
                             session.instructionTimeoutTask?.cancel()
                             session.instructionWait?.timeoutTask = nil
@@ -1751,7 +1751,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     session.stopState.invalidateScheduledStarts()
                     return fixture.rootURL.appendingPathComponent("source.json")
                 }
-                let withheld = await vm.prepareProviderSwitchHandoverForSend(preparation.accepting(attributed.id, session: session), session: session, stopFence: fence)
+                let withheld = await vm.linkExecutionRuntime.prepareProviderSwitchHandoverForSend(preparation.accepting(attributed.id, session: session), session: session, stopFence: fence)
                 XCTAssertNil(withheld)
                 XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .ready)
                 guard case .failure(.providerHandoverNeedsReview) = await vm.providerSwitchSendAdmission(session: session, input: "later input") else { return XCTFail("A later input cannot consume the old carrier") }
@@ -1771,7 +1771,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 XCTAssertNil(session.providerSessionID)
                 XCTAssertNil(session.codexConversationID)
                 let next = try await switchPreparation(fixture)
-                let inserted = await vm.prepareProviderSwitchHandoverForSend(next, session: session, stopFence: .init(session: session))
+                let inserted = await vm.linkExecutionRuntime.prepareProviderSwitchHandoverForSend(next, session: session, stopFence: .init(session: session))
                 let user = try XCTUnwrap(inserted?.user)
                 XCTAssertEqual(user.components(separatedBy: "<repoprompt_provider_handover ").count - 1, 1)
                 XCTAssertTrue(user.contains("accepted linked request, never executed"))
@@ -1819,7 +1819,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 XCTAssertEqual(session.pendingHandoff.sourceItemID, uncertain.id)
                 XCTAssertTrue(session.pendingHandoff.payload?.contains("<message role=\"user\">uncertain previous input</message>") == true)
                 let next = try await switchPreparation(fixture)
-                let payload = await vm.prepareProviderSwitchHandoverForSend(next, session: session, stopFence: .init(session: session))
+                let payload = await vm.linkExecutionRuntime.prepareProviderSwitchHandoverForSend(next, session: session, stopFence: .init(session: session))
                 XCTAssertTrue(payload?.user.hasSuffix("\n\nordinary input") == true)
                 XCTAssertFalse(payload?.user.hasSuffix("\n\nuncertain previous input") == true)
                 XCTAssertNil(session.agentTask)
@@ -2284,7 +2284,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 let finished = AgentSessionLinkPassiveStatusNotices.Sample(reference: lane.reference, targetEndpoint: lane.targetEndpoint, targetSessionID: lane.targetSessionID, displayName: lane.displayName, status: .idle, idleForSend: true, latestVisibleAssistantPreview: "First lane result")
                 notices.reconcile(samples: [finished], linkSetRevision: 1, deliverable: true)
                 XCTAssertEqual(notices.snapshot.entries.count, 1)
-                vm.agentSessionLinkPublishPassiveStatusNotices(notices.snapshot, to: endpoint)
+                vm.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(notices.snapshot, to: endpoint)
                 vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("owed-summary.json") }
                 var generations = 0
                 vm.test_providerSwitchGeneration = { [unowned vm] outgoing, _, request in
@@ -2296,7 +2296,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         vm.acceptAgentSessionLinkPromptClaim(decorated.claim)
                         notices.apply(receipt)
                         XCTAssertTrue(notices.snapshot.entries.isEmpty, "Apply the actually rendered receipt through the existing reducer")
-                        vm.agentSessionLinkPublishPassiveStatusNotices(notices.snapshot, to: endpoint)
+                        vm.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(notices.snapshot, to: endpoint)
                     } catch { XCTFail("Missing ordinary notice claim: \(error)") }
                     outgoing.appendItem(.assistant("summary remains valid after normal notice delivery", sequenceIndex: outgoing.nextSequenceIndex))
                     outgoing.runState = .completed
@@ -2312,7 +2312,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 notices.reconcile(samples: [lane], linkSetRevision: 1, deliverable: true)
                 notices.reconcile(samples: [finished], linkSetRevision: 1, deliverable: true)
                 XCTAssertEqual(notices.snapshot.entries.count, 1)
-                vm.agentSessionLinkPublishPassiveStatusNotices(notices.snapshot, to: endpoint)
+                vm.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(notices.snapshot, to: endpoint)
                 vm.updateBindingsFromSession(session)
                 try await AsyncTestWait.waitUntil("summary refit for newly owed notice") { vm.providerSwitchPreview?.id != settled.id && vm.providerSwitchPreview?.building == false }
                 let current = try XCTUnwrap(vm.providerSwitchPreview)
@@ -2367,7 +2367,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     try await AsyncTestWait.waitUntil("summary before stable instruction change") { vm.providerSwitchPreview?.id != originalID && vm.providerSwitchPreview?.building == false }
                     let settled = try XCTUnwrap(vm.providerSwitchPreview)
                     XCTAssertNotNil(settled.generatedSummary)
-                    vm.agentSessionLinkPublishPromptInventory(.init(
+                    vm.linkExecutionRuntime.agentSessionLinkPublishPromptInventory(.init(
                         observerSessionID: endpoint.sessionID, linkSetRevision: 2,
                         items: drift == "membership" ? [] : [.init(targetSessionID: lane.targetSessionID, displayName: lane.displayName, capabilityNames: drift == "grant" ? ["poll"] : ["poll", "read"], reference: drift == "reference" ? .init(linkID: lane.reference.linkID, generation: lane.reference.generation + 1) : lane.reference)]
                     ), to: endpoint)
@@ -2392,7 +2392,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 let (endpoint, lane) = try summaryMonitorContext(fixture)
                 var notices = AgentSessionLinkPassiveStatusNotices(observerEndpoint: endpoint)
                 notices.enable(samples: [lane], linkSetRevision: 1)
-                vm.agentSessionLinkPublishPassiveStatusNotices(notices.snapshot, to: endpoint)
+                vm.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(notices.snapshot, to: endpoint)
                 vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("summary-full-budget.json") }
                 var generations = 0
                 vm.test_providerSwitchGeneration = { outgoing, _, _ in
@@ -2417,7 +2417,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 let finished = AgentSessionLinkPassiveStatusNotices.Sample(reference: lane.reference, targetEndpoint: lane.targetEndpoint, targetSessionID: lane.targetSessionID, displayName: lane.displayName, status: .idle, idleForSend: true, latestVisibleAssistantPreview: String(repeating: "N", count: 280))
                 notices.reconcile(samples: [finished], linkSetRevision: 1, deliverable: true)
                 XCTAssertEqual(notices.snapshot.entries.count, 1)
-                vm.agentSessionLinkPublishPassiveStatusNotices(notices.snapshot, to: endpoint)
+                vm.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(notices.snapshot, to: endpoint)
                 vm.updateBindingsFromSession(session)
                 try await AsyncTestWait.waitUntil("summary exceeds full current instruction budget") { vm.providerSwitchPreview?.id != fitting.id && vm.providerSwitchPreview?.building == false }
                 let current = try XCTUnwrap(vm.providerSwitchPreview)
@@ -2547,7 +2547,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                                 vm.interviewFirst = false
                             case "instructions":
                                 guard let instructionEndpoint else { return XCTFail("Missing stable membership endpoint") }
-                                vm.agentSessionLinkPublishPromptInventory(.init(observerSessionID: instructionEndpoint.sessionID, linkSetRevision: 2, items: []), to: instructionEndpoint)
+                                vm.linkExecutionRuntime.agentSessionLinkPublishPromptInventory(.init(observerSessionID: instructionEndpoint.sessionID, linkSetRevision: 2, items: []), to: instructionEndpoint)
                             default:
                                 XCTFail("Unexpected drift case: \(drift)")
                             }
@@ -2878,7 +2878,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     let preparation = try await switchPreparation(fixture)
                     XCTAssertEqual(preparation.catalogWindow, 1_000_000)
                     vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("window.json") }
-                    let prepared = await vm.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
+                    let prepared = await vm.linkExecutionRuntime.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
                     XCTAssertNotNil(prepared)
                     session.installRunID(UUID())
                     session.beginRunAttempt(source: "test.switch.windowFence")
@@ -2887,7 +2887,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         var changed = config
                         changed.modelBehavior = .claudeSlotMapping(.init(haiku: "glm-5.2", sonnet: "glm-5.2", opus: "glm-5.2"))
                         store.saveConfig(changed)
-                        XCTAssertNotEqual(vm.providerSwitchCatalogWindow(agent: session.selectedAgent, model: session.selectedModelRaw), preparation.catalogWindow)
+                        XCTAssertNotEqual(vm.linkExecutionRuntime.providerSwitchCatalogWindow(agent: session.selectedAgent, model: session.selectedModelRaw), preparation.catalogWindow)
                     }
                     XCTAssertEqual(vm.agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: .headlessRun(runID: UUID())), !drift)
                     XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
@@ -2909,7 +2909,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     let preparation = try await switchPreparation(fixture)
                     XCTAssertTrue(preparation.historyToolAllowed)
                     vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("physical-policy.json") }
-                    let prepared = await vm.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
+                    let prepared = await vm.linkExecutionRuntime.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
                     XCTAssertNotNil(prepared)
                     session.installRunID(UUID())
                     session.beginRunAttempt(source: "test.switch.compositionFence")
@@ -2918,7 +2918,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         let id = try XCTUnwrap(session.activeAgentSessionID)
                         let registration = await AgentRunSessionStore.register(sessionID: id)
                         session.mcpControlContext = try .init(sessionID: id, activationID: UUID(), writerIdentity: controlWriterIdentity(for: session), registration: registration, currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil, originatingConnectionID: nil, interactionTransport: .mcp(sessionID: id, originatingConnectionID: nil), suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: session.autoEditEnabled, taskLabelKind: .explore, autoEditOverride: nil)
-                        XCTAssertNotEqual(vm.providerSwitchInstructionStrings(session), preparation.instructions)
+                        XCTAssertNotEqual(vm.linkExecutionRuntime.providerSwitchInstructionStrings(session), preparation.instructions)
                         XCTAssertTrue(AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(toolName: "history", taskLabelKind: session.mcpControlContext?.taskLabelKind), "This role change affects composition, not history availability")
                     }
                     XCTAssertEqual(vm.agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: .codexNativeSend(UUID())), drift == "unchanged")
@@ -2952,7 +2952,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     return fixture.rootURL.appendingPathComponent("owned-carrier.json")
                 }
                 let prepare = Task {
-                    let messages = await vm.prepareProviderSwitchHandoverForSend(accepted, session: session, stopFence: .init(session: session))
+                    let messages = await vm.linkExecutionRuntime.prepareProviderSwitchHandoverForSend(accepted, session: session, stopFence: .init(session: session))
                     if messages == nil { entered.finish(()) }
                     return messages
                 }
@@ -2994,7 +2994,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 try installSwitch(fixture)
                 let preparation = try await switchPreparation(fixture)
                 vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("old-proof.json") }
-                _ = await vm.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
+                _ = await vm.linkExecutionRuntime.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
                 let originalRun = UUID()
                 session.installRunID(originalRun)
                 let original = session.beginRunAttempt(source: "test.switch.original")
@@ -3032,7 +3032,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         saves.append(saved.pendingHandoffProviderSwitchDelivery)
                         return fixture.rootURL.appendingPathComponent("native.json")
                     }
-                    _ = await vm.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
+                    _ = await vm.linkExecutionRuntime.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
                     XCTAssertEqual(saves, [.sending])
                     session.installRunID(UUID())
                     session.beginRunAttempt(source: "test.switch.nativePhysical")
@@ -3203,7 +3203,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 try installSwitch(fixture)
                 let preparation = try await switchPreparation(fixture)
                 vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("wait-switch.json") }
-                _ = await vm.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
+                _ = await vm.linkExecutionRuntime.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
                 session.installRunID(UUID())
                 session.beginRunAttempt(source: "test.switch.waitReply")
                 session.runState = .running
@@ -3271,7 +3271,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     starts += 1
                     firstInput = user
                 }
-                let outcome = await vm.agentSessionLinkPerformSend(
+                let outcome = await vm.linkExecutionRuntime.agentSessionLinkPerformSend(
                     to: candidate, request: request,
                     liveness: { .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false) },
                     commitAuthorization: { .committed }
@@ -3901,7 +3901,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     ),
                     observerDisplayName: "Lane", message: "hi", workflow: nil
                 )
-                let outcome = await vm.agentSessionLinkPerformSend(
+                let outcome = await vm.linkExecutionRuntime.agentSessionLinkPerformSend(
                     to: candidate, request: request,
                     liveness: { .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false) },
                     commitAuthorization: { .committed }
@@ -3965,7 +3965,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         if saves == 1 { throw Fault.write }
                         return fixture.rootURL.appendingPathComponent("ordinary-send-rollback.json")
                     }
-                    let result = await vm.agentSessionLinkPerformSend(to: candidate, request: request, liveness: {
+                    let result = await vm.linkExecutionRuntime.agentSessionLinkPerformSend(to: candidate, request: request, liveness: {
                         .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false)
                     }, commitAuthorization: {
                         session.pendingCodexComputerUseActivation = initiallyArmed ? nil : .init(id: UUID(), createdAt: Date())
@@ -4467,7 +4467,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 let vm = fixture.viewModel
                 let session = fixture.sourceSession
                 vm.storeDraftText(for: session.tabID, "tiny")
-                let rawBudget = AgentProviderHandover.Budget(catalogWindow: nil, instructions: vm.providerSwitchInstructionStrings(session, destination: .openCode), composedInput: "tiny", isPreview: true)
+                let rawBudget = AgentProviderHandover.Budget(catalogWindow: nil, instructions: vm.linkExecutionRuntime.providerSwitchInstructionStrings(session, destination: .openCode), composedInput: "tiny", isPreview: true)
                 let historyBytes = Int((rawBudget.remainingCarrierTokens - 1000) * 4 / 1.05)
                 XCTAssertGreaterThan(historyBytes, 0)
                 session.appendItem(.assistant(String(repeating: "h", count: max(0, historyBytes)), sequenceIndex: session.nextSequenceIndex))
@@ -4539,7 +4539,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     vm.test_setAgentSessionSaver { _, _, _ in saves += 1
                         return fixture.rootURL.appendingPathComponent("no-write.json")
                     }
-                    let outcome = await vm.agentSessionLinkPerformSend(
+                    let outcome = await vm.linkExecutionRuntime.agentSessionLinkPerformSend(
                         to: candidate,
                         request: request,
                         liveness: { .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false) },
@@ -4951,7 +4951,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             let endpoint = try XCTUnwrap(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.sourceTabID))
             let target = DomainAgentSessionLinkEndpointIdentity(windowID: 99, workspaceID: UUID(), tabID: UUID(), sessionID: UUID(), persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1)
             let reference = DomainAgentSessionLinkReference(linkID: UUID(), generation: 1)
-            fixture.viewModel.agentSessionLinkPublishPromptInventory(.init(
+            fixture.viewModel.linkExecutionRuntime.agentSessionLinkPublishPromptInventory(.init(
                 observerSessionID: endpoint.sessionID, linkSetRevision: 1,
                 items: [.init(targetSessionID: target.sessionID, displayName: "Summary lane", capabilityNames: ["poll", "read"], reference: reference)]
             ), to: endpoint)
@@ -4961,18 +4961,18 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
         private func publishSwitchWake(_ fixture: Fixture, endpoint: DomainAgentSessionLinkEndpointIdentity) throws {
             let session = fixture.sourceSession
             let runID = try XCTUnwrap(session.runID)
-            fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(.init(
+            fixture.viewModel.linkExecutionRuntime.agentSessionLinkPublishRunCatalogProjection(.init(
                 runID: runID, routeToken: .init(runID: runID, observerEndpoint: endpoint, connectionID: UUID(), routingAuthorityGeneration: 1, connectionLifecycleGeneration: 1),
                 projectionRevision: 1, hasAgentSessionLink: true, hasAnyActiveLink: true
             ), to: endpoint)
             let target = DomainAgentSessionLinkEndpointIdentity(windowID: 99, workspaceID: UUID(), tabID: UUID(), sessionID: UUID(), persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1)
             let reference = DomainAgentSessionLinkReference(linkID: UUID(), generation: 1)
-            fixture.viewModel.agentSessionLinkPublishPromptInventory(.init(
+            fixture.viewModel.linkExecutionRuntime.agentSessionLinkPublishPromptInventory(.init(
                 observerSessionID: endpoint.sessionID, linkSetRevision: 1,
                 items: [.init(targetSessionID: target.sessionID, displayName: "Lane", capabilityNames: ["poll", "read", "send_when_idle", "wait"], reference: reference)]
             ), to: endpoint)
             session.oversight.autoWakeOnUpdates = true
-            fixture.viewModel.agentSessionLinkPublishPassiveStatusNotices(.init(
+            fixture.viewModel.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(.init(
                 observerEndpoint: endpoint, queueEpoch: UUID(), queueRevision: 1, linkSetRevision: 1,
                 isEnabled: true, isDeliverable: true,
                 entries: [.init(reference: reference, targetEndpoint: target, targetSessionID: target.sessionID, displayName: "Lane", fromStatus: .running, toStatus: .idle, observedAt: Date(), idleForSend: true, latestVisibleAssistantPreview: "Done.", changeSequence: 1, edgeSequence: 1)],

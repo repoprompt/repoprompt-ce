@@ -667,7 +667,7 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
                     revision: 2,
                     hasAgentSessionLink: false
                 )
-                fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(projection, to: endpoint)
+                fixture.viewModel.linkExecutionRuntime.agentSessionLinkPublishRunCatalogProjection(projection, to: endpoint)
                 try publishCatalogProjection(fixture, revision: 1, hasAgentSessionLink: false)
                 try publishCatalogProjection(fixture, revision: 3, hasAgentSessionLink: true)
             } catch {
@@ -834,7 +834,7 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
             hasAnyActiveLink: hasActiveOutboundLink,
             hasActiveOutboundLink: hasActiveOutboundLink
         )
-        fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(projection, to: endpoint)
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkPublishRunCatalogProjection(projection, to: endpoint)
         return projection
     }
 
@@ -843,7 +843,7 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
             fixture.viewModel,
             tabID: fixture.tabID
         )
-        fixture.viewModel.agentSessionLinkPublishPromptInventory(
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkPublishPromptInventory(
             AgentSessionLinkPromptInventory(
                 observerSessionID: fixture.sessionID,
                 linkSetRevision: 1,
@@ -865,7 +865,7 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
             fixture.viewModel,
             tabID: fixture.tabID
         )
-        fixture.viewModel.agentSessionLinkPublishPassiveStatusNotices(
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(
             Self.laneSnapshot(observerEndpoint: endpoint, queueRevision: queueRevision),
             to: endpoint
         )

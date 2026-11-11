@@ -375,7 +375,7 @@ enum ClaudeCompatibleModelCatalogAdapter {
         }
     }
 
-    private static func compatibleBackendID(for agentKind: AgentProviderKind) -> ClaudeCodeCompatibleBackendID? {
+    static func compatibleBackendID(for agentKind: AgentProviderKind) -> ClaudeCodeCompatibleBackendID? {
         switch agentKind {
         case .claudeCodeGLM:
             .glmZAI
@@ -396,7 +396,7 @@ enum ClaudeCompatibleModelCatalogAdapter {
         ClaudeCompatibleProviderRuntimeBridge.noModelRawValue(for: id)
     }
 
-    private static func normalizedRawModel(_ rawValue: String?) -> String? {
+    static func normalizedRawModel(_ rawValue: String?) -> String? {
         guard let rawValue else { return nil }
         let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }

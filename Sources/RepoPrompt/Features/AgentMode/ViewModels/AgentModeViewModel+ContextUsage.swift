@@ -18,18 +18,6 @@ extension AgentModeViewModel {
         usageRuntime.nonCodexContextUsageEstimator(for: agent)
     }
 
-    func applyCodexNativeContextUsage(_ usage: AgentContextUsage, session: TabSession) {
-        usageRuntime.applyCodexNativeContextUsage(usage, session: session)
-    }
-
-    func ingestNonCodexUsageReport(promptTokens: Int?, completionTokens: Int?, contextUsedTokens: Int?, modelContextWindow: Int?, session: TabSession) -> Bool {
-        usageRuntime.ingestNonCodexUsageReport(promptTokens: promptTokens, completionTokens: completionTokens, contextUsedTokens: contextUsedTokens, modelContextWindow: modelContextWindow, session: session)
-    }
-
-    func refreshCodexContextUsageSnapshot(for session: TabSession) {
-        usageRuntime.refreshCodexContextUsageSnapshot(for: session)
-    }
-
     func ingestNonCodexTurnFinalization(promptTokens: Int?, completionTokens: Int?, contextUsedTokens: Int?, modelContextWindow: Int?, session: TabSession) {
         if usageRuntime.ingestNonCodexTurnFinalization(promptTokens: promptTokens, completionTokens: completionTokens, contextUsedTokens: contextUsedTokens, modelContextWindow: modelContextWindow, session: session) {
             scheduleSave(for: session)

@@ -8,7 +8,7 @@ extension AgentModeViewModel {
     /// Summary provenance excludes host-owned one-shot delivery content, not stable instructions
     /// or monitor authority. Full actual instructions still own every preview currency/fit check.
     private func providerSwitchInstructionProvenance(_ session: TabSession, destination: AgentProviderKind) -> [String] {
-        providerSwitchInstructionStrings(session, destination: destination, includeOwedContent: false)
+        linkExecutionRuntime.providerSwitchInstructionStrings(session, destination: destination, includeOwedContent: false)
     }
 
     /// Switch admission separates hard blockers (integrity or a real pending handover) from
@@ -562,7 +562,7 @@ extension AgentModeViewModel {
             sourceParameters: session.acpModelParameterSelections,
             composition: providerSwitchComposition(session, destination: agent), sourceRevision: session.sourceItemsRevision,
             draftRevision: session.draftMutationGeneration,
-            instructions: providerSwitchInstructionStrings(session, destination: agent),
+            instructions: linkExecutionRuntime.providerSwitchInstructionStrings(session, destination: agent),
             instructionProvenance: providerSwitchInstructionProvenance(session, destination: agent),
             generatedSummary: retainingSummary, updated: updated
         )
@@ -591,7 +591,7 @@ extension AgentModeViewModel {
                 session.sourceItemsRevision == preview.sourceRevision
                     && session.draftMutationGeneration == preview.draftRevision
                     && providerSwitchComposition(session, destination: preview.destination) == preview.composition
-                    && providerSwitchInstructionStrings(session, destination: preview.destination) == preview.instructions
+                    && linkExecutionRuntime.providerSwitchInstructionStrings(session, destination: preview.destination) == preview.instructions
             ))
     }
 
@@ -704,7 +704,7 @@ extension AgentModeViewModel {
             return
         }
         let budget = AgentProviderHandover.Budget(
-            catalogWindow: providerSwitchCatalogWindow(agent: preview.destination, model: preview.model),
+            catalogWindow: linkExecutionRuntime.providerSwitchCatalogWindow(agent: preview.destination, model: preview.model),
             instructions: preview.instructions, composedInput: "\n\n" + composed, isPreview: true
         )
         let server = preview.destination == .grokBuild ? RepoPromptMCPServerConfiguration.grokBuildRuntimeServerName : MCPIntegrationHelper.repoPromptMCPServerName
@@ -712,7 +712,7 @@ extension AgentModeViewModel {
             try AgentProviderHandover.HistoryReference(
                 server: server,
                 sessionID: $0,
-                historyAllowed: providerSwitchHistoryToolAllowed(session, destination: preview.destination),
+                historyAllowed: linkExecutionRuntime.providerSwitchHistoryToolAllowed(session, destination: preview.destination),
                 indicesMatch: true
             )
         }
@@ -746,7 +746,7 @@ extension AgentModeViewModel {
                 .init(mode: .summary, unavailable: preview.isReview ? AgentSessionLinkSendFailure.providerHandoverNeedsReview.message : (result.wordLimit == nil ? "no room for a summary" : nil), hidden: !preview.isReview)
             ]
             if !stale, let payload = originalSlot.payload, let descriptor = preview.originalDescriptor,
-               providerSwitchReadReferenceIsCurrent(descriptor, session: session, destination: preview.destination),
+               linkExecutionRuntime.providerSwitchReadReferenceIsCurrent(descriptor, session: session, destination: preview.destination),
                let mode = AgentProviderHandover.Mode(rawValue: descriptor.mode),
                AgentProviderHandover.estimate(payload) <= budget.remainingCarrierTokens,
                payload.utf8.count <= AgentProviderHandover.maximumBytes,
@@ -1166,7 +1166,7 @@ extension AgentModeViewModel {
                 : (
                     providerSwitchPreviewIsCurrent(preview, content: false)
                         && session.sourceItemsRevision == preview.sourceRevision
-                        && providerSwitchInstructionStrings(session, destination: preview.destination) == preview.instructions
+                        && linkExecutionRuntime.providerSwitchInstructionStrings(session, destination: preview.destination) == preview.instructions
                 )
             return composerSubmitClaimIsCurrent(claim) && providerSwitchMutation?.id == mutation.id
                 && sourceCurrent && workspaceManager?.activeWorkspaceID == workspaceID
@@ -1285,7 +1285,7 @@ extension AgentModeViewModel {
                     sourceItemID: cutoff,
                     providerSwitchDelivery: .ready
                 )
-                agentSessionLinkReoweSupplementForRebuiltProviderContext(for: session)
+                linkExecutionRuntime.agentSessionLinkReoweSupplementForRebuiltProviderContext(for: session)
             } else { session.pendingHandoff.clearAfterSend() }
             let text: String
             if discard { text = "Pending handover discarded; chat history unchanged." }

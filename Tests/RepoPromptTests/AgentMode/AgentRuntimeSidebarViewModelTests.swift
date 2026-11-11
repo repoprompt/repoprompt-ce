@@ -582,7 +582,7 @@ final class ClaudeContextWindowResolutionTests: XCTestCase {
     func testCappedReportedWindowKeepsTheWindowVouch() {
         let viewModel = makeViewModel()
         let session = makeSession(autoCompactWindow: 400_000)
-        XCTAssertTrue(viewModel.ingestNonCodexUsageReport(
+        XCTAssertTrue(viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: 150_000,
             modelContextWindow: 1_000_000, session: session
         ))

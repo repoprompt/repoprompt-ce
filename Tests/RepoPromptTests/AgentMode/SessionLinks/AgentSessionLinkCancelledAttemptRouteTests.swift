@@ -192,7 +192,7 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             )
             XCTAssertNotNil(token, "the live route survives a cancelled attempt")
             XCTAssertNotNil(
-                window(observer).agentSessionLinkPromptContext(for: observer.session),
+                window(observer).linkExecutionRuntime.agentSessionLinkPromptContext(for: observer.session),
                 "the observer's prompt gate stays open on the still-mapped connection"
             )
             _ = try await observer.manager.debugListToolNames(for: observer.connectionID)
@@ -249,13 +249,13 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             session.runState = .idle
             session.oversight.periodicIdleWakeEnabled = true
             session.oversight.periodicIdleWakeIntervalSeconds = 21600
-            XCTAssertNotNil(viewModel.agentSessionLinkPromptContext(for: session), "prompt gate")
+            XCTAssertNotNil(viewModel.linkExecutionRuntime.agentSessionLinkPromptContext(for: session), "prompt gate")
             XCTAssertTrue(
                 AgentModeViewModel.agentSessionLinkPeriodicWakeSessionIsIdle(session),
                 "idle: \(AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(session: session, endpointMatchesGrant: true, isClosing: false))"
             )
-            XCTAssertTrue(viewModel.agentSessionLinkPeriodicWakeIsEligible(session, endpoint: observer.endpoint), "periodic eligibility")
-            viewModel.agentSessionLinkReconcilePeriodicWake(for: observer.endpoint)
+            XCTAssertTrue(viewModel.linkExecutionRuntime.agentSessionLinkPeriodicWakeIsEligible(session, endpoint: observer.endpoint), "periodic eligibility")
+            viewModel.linkExecutionRuntime.agentSessionLinkReconcilePeriodicWake(for: observer.endpoint)
             XCTAssertNotNil(
                 session.oversight.periodicDeadline,
                 "the periodic idle wake must still arm after a cancelled reused-run attempt"
@@ -266,7 +266,7 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             session.oversight.periodicIdleWakeEnabled = false
             session.oversight.autoWakeOnUpdates = true
             session.runState = .running
-            viewModel.agentSessionLinkPublishPassiveStatusNotices(
+            viewModel.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(
                 laneSnapshot(observerEndpoint: observer.endpoint),
                 to: observer.endpoint
             )
@@ -1079,7 +1079,7 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             session.installRunID(runID)
             let sessionID = try installRestoredBinding(on: session, in: window.agentModeViewModel)
             let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(window.agentModeViewModel, tabID: tabID)
-            window.agentModeViewModel.agentSessionLinkPublishPromptInventory(
+            window.agentModeViewModel.linkExecutionRuntime.agentSessionLinkPublishPromptInventory(
                 AgentSessionLinkPromptInventory(
                     observerSessionID: sessionID,
                     linkSetRevision: 1,
@@ -1255,7 +1255,7 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
                 line: line
             )
             XCTAssertNotNil(
-                host.agentSessionLinkPromptContext(for: observer.session),
+                host.linkExecutionRuntime.agentSessionLinkPromptContext(for: observer.session),
                 "\(label): observer prompt gate open",
                 file: file,
                 line: line

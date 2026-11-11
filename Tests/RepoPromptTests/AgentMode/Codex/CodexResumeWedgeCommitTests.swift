@@ -922,7 +922,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         }
         await vm.toggleComputerUse(tabID: session.tabID, expectedSessionIdentity: ObjectIdentifier(session))
         let request = computerUseRemoteRequest("inspect the screen")
-        let outcome = await vm.agentSessionLinkPerformSend(
+        let outcome = await vm.linkExecutionRuntime.agentSessionLinkPerformSend(
             to: candidate, request: request,
             liveness: { .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false) },
             commitAuthorization: { .committed }

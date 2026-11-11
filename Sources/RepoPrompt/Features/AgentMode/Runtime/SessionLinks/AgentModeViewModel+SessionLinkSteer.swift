@@ -60,7 +60,7 @@ extension AgentModeViewModel {
         managedRequest.framing = .management
 
         // 1. Exact endpoint incarnations.
-        guard let session = agentSessionLinkLiveSession(matching: candidate) else {
+        guard let session = linkExecutionRuntime.agentSessionLinkLiveSession(matching: candidate) else {
             return .blocked(.endpointSession)
         }
         let admissionLiveness = liveness()
@@ -72,7 +72,7 @@ extension AgentModeViewModel {
         //    admission re-reads the same state it was classified from.
         switch agentSessionLinkSteerAdmission(for: session, liveness: admissionLiveness) {
         case .idleTurn:
-            return await agentSessionLinkPerformSend(
+            return await linkExecutionRuntime.agentSessionLinkPerformSend(
                 to: candidate,
                 request: managedRequest,
                 liveness: liveness,
@@ -95,7 +95,7 @@ extension AgentModeViewModel {
         //    suspends. A workspace switch is an endpoint loss: a steer never follows a target into a
         //    workspace its grant was not given for.
         let postCommitLiveness = liveness()
-        guard let liveSession = agentSessionLinkLiveSession(matching: candidate),
+        guard let liveSession = linkExecutionRuntime.agentSessionLinkLiveSession(matching: candidate),
               liveSession === session
         else {
             return .blocked(.endpointPostSession)

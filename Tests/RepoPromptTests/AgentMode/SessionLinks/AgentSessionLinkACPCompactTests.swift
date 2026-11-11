@@ -855,7 +855,7 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
 
     /// A live ACP occupancy report, so the count starts out vouched.
     private func reportOccupancy(_ fixture: Fixture, used: Int, window: Int) {
-        _ = fixture.viewModel.ingestNonCodexUsageReport(
+        _ = fixture.viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil,
             completionTokens: nil,
             contextUsedTokens: used,
@@ -1032,7 +1032,7 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
         XCTAssertNil(fixture.session.vouchedContextCount, "Invalidated at dispatch")
         XCTAssertEqual(fixture.session.vouchedContextWindow?.tokens, 1000, "The window is unchanged")
 
-        _ = fixture.viewModel.ingestNonCodexUsageReport(
+        _ = fixture.viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: 850,
             completionTokens: nil,
             contextUsedTokens: nil,

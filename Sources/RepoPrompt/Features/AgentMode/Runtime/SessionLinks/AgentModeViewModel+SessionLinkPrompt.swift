@@ -95,98 +95,11 @@ extension AgentModeViewModel {
         linkExecutionRuntime.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: qualification)
     }
 
-    func agentSessionLinkPublishPromptInventory(
-        _ inventory: AgentSessionLinkPromptInventory,
-        to endpoint: DomainAgentSessionLinkEndpointIdentity
-    ) {
-        linkExecutionRuntime.agentSessionLinkPublishPromptInventory(inventory, to: endpoint)
-    }
-
-    func agentSessionLinkPublishRunCatalogProjection(
-        _ projection: AgentSessionLinkRunCatalogProjection,
-        to endpoint: DomainAgentSessionLinkEndpointIdentity
-    ) {
-        linkExecutionRuntime.agentSessionLinkPublishRunCatalogProjection(projection, to: endpoint)
-    }
-
-    func agentSessionLinkCatalogRepairIsEnabled(for session: TabSession) -> Bool {
-        linkExecutionRuntime.agentSessionLinkCatalogRepairIsEnabled(for: session)
-    }
-
-    func agentSessionLinkPublishPassiveStatusNotices(
-        _ snapshot: AgentSessionLinkPassiveStatusNotices.Snapshot,
-        to endpoint: DomainAgentSessionLinkEndpointIdentity
-    ) {
-        linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(snapshot, to: endpoint)
-    }
-
-    func agentSessionLinkWithholdPromptInventory(
-        for endpoint: DomainAgentSessionLinkEndpointIdentity
-    ) -> UInt64 {
-        linkExecutionRuntime.agentSessionLinkWithholdPromptInventory(for: endpoint)
-    }
-
-    func agentSessionLinkReleasePromptInventoryHold(
-        _ token: UInt64?,
-        for endpoint: DomainAgentSessionLinkEndpointIdentity,
-        publishing inventory: AgentSessionLinkPromptInventory?
-    ) {
-        linkExecutionRuntime.agentSessionLinkReleasePromptInventoryHold(token, for: endpoint, publishing: inventory)
-    }
-
-    func agentSessionLinkPrunePromptState(liveSessionIDs: Set<UUID>) {
-        linkExecutionRuntime.agentSessionLinkPrunePromptState(liveSessionIDs: liveSessionIDs)
-    }
-
-    func agentSessionLinkPromptContext(for session: TabSession) -> AgentSessionLinkPromptContext? {
-        linkExecutionRuntime.agentSessionLinkPromptContext(for: session)
-    }
-
-    func agentSessionLinkEffectivePromptInventory(
-        for session: TabSession
-    ) -> AgentSessionLinkPromptInventory? {
-        linkExecutionRuntime.agentSessionLinkEffectivePromptInventory(for: session)
-    }
-
-    func agentSessionLinkPromptClaim(
-        for session: TabSession,
-        dispatchID: AgentSessionLinkPromptDispatchID
-    ) -> AgentSessionLinkOutboundPromptClaim? {
-        linkExecutionRuntime.agentSessionLinkPromptClaim(for: session, dispatchID: dispatchID)
-    }
-
-    func agentSessionLinkPromptClaimOutcome(
-        for session: TabSession,
-        dispatchID: AgentSessionLinkPromptDispatchID,
-        allowsQuietCheckIn: Bool = true
-    ) -> AgentSessionLinkPromptClaimOutcome {
-        linkExecutionRuntime.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatchID, allowsQuietCheckIn: allowsQuietCheckIn)
-    }
-
-    func agentSessionLinkCanReuseAcceptedPromptClaim(
-        _ claim: AgentSessionLinkOutboundPromptClaim,
-        for session: TabSession,
-        dispatchID: AgentSessionLinkPromptDispatchID
-    ) -> Bool {
-        linkExecutionRuntime.agentSessionLinkCanReuseAcceptedPromptClaim(claim, for: session, dispatchID: dispatchID)
-    }
-
-    func agentSessionLinkEffectiveDispatchID(
-        for session: TabSession,
-        dispatchID: AgentSessionLinkPromptDispatchID
-    ) -> AgentSessionLinkPromptDispatchID {
-        linkExecutionRuntime.agentSessionLinkEffectiveDispatchID(for: session, dispatchID: dispatchID)
-    }
-
     static func dispatchRequiresLaneBatch(
         _ session: TabSession,
         _ dispatchID: AgentSessionLinkPromptDispatchID
     ) -> Bool {
         AgentSessionLinkExecutionRuntime.dispatchRequiresLaneBatch(session, dispatchID)
-    }
-
-    func agentSessionLinkReoweSupplementForRebuiltProviderContext(for session: TabSession) {
-        linkExecutionRuntime.agentSessionLinkReoweSupplementForRebuiltProviderContext(for: session)
     }
 
     func agentSessionLinkDecoratedProviderText(
@@ -195,10 +108,6 @@ extension AgentModeViewModel {
         dispatchID: AgentSessionLinkPromptDispatchID
     ) -> AgentSessionLinkDecoratedProviderText {
         linkExecutionRuntime.agentSessionLinkDecoratedProviderText(providerText, session: session, dispatchID: dispatchID)
-    }
-
-    func selfNoopHintIsCurrent(for session: TabSession) -> Bool {
-        linkExecutionRuntime.selfNoopHintIsCurrent(for: session)
     }
 
     func agentSessionLinkProveProviderInput(
@@ -219,13 +128,6 @@ extension AgentModeViewModel {
         linkExecutionRuntime.agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: dispatchID)
     }
 
-    func agentSessionLinkHandoffAcceptedReplay(
-        for session: TabSession, claim: AgentSessionLinkOutboundPromptClaim?,
-        proof: AgentSessionLinkProviderInputRelease.Proof?, requiresLaneBatch: Bool
-    ) -> AgentSessionLinkProviderInputRelease.ReleasedDispatchContext {
-        linkExecutionRuntime.agentSessionLinkHandoffAcceptedReplay(for: session, claim: claim, proof: proof, requiresLaneBatch: requiresLaneBatch)
-    }
-
     func acceptAgentSessionLinkDispatch(
         session: TabSession,
         context: AgentSessionLinkDispatchContext?,
@@ -236,9 +138,5 @@ extension AgentModeViewModel {
 
     func acceptAgentSessionLinkPromptClaim(_ claim: AgentSessionLinkOutboundPromptClaim?) {
         linkExecutionRuntime.acceptAgentSessionLinkPromptClaim(claim)
-    }
-
-    func abandonAgentSessionLinkPromptClaim(_ claim: AgentSessionLinkOutboundPromptClaim?) {
-        linkExecutionRuntime.abandonAgentSessionLinkPromptClaim(claim)
     }
 }
