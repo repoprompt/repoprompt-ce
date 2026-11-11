@@ -790,36 +790,20 @@ private struct AgentSelectedFilesPopover: View {
     }
 }
 
-private struct AgentSelectedFileRow: View {
+private struct AgentSelectedFileRow: View, AgentSelectedFilePresenting {
     let row: AgentContextExportRow
     let canRemove: Bool
     @ObservedObject var previewCoordinator: AgentSelectedFilePreviewLoadCoordinator
     let onLoadContent: (AgentContextExportRow, AgentContextExportRow.ContentPurpose) async -> String?
     let onRemove: (AgentContextExportRow) -> Void
 
-    @State private var copyTask: Task<Void, Never>?
-    @State private var isCopying = false
+    @State var copyTask: Task<Void, Never>?
+    @State var isCopying = false
     @State private var isHovered = false
     @ObservedObject private var fontScale = FontScaleManager.shared
 
     private var fontPreset: FontScalePreset {
         fontScale.preset
-    }
-
-    private var accentColor: Color {
-        switch row.kind {
-        case .codemap: .purple
-        case .slices: .orange
-        case .full: .accentColor
-        }
-    }
-
-    private var leadingIconName: String {
-        switch row.kind {
-        case .codemap: "square.grid.2x2"
-        case .slices: "curlybraces"
-        case .full: "doc.text"
-        }
     }
 
     private var disabledRemoveExplanation: String? {
@@ -832,76 +816,49 @@ private struct AgentSelectedFileRow: View {
         return nil
     }
 
-    private var parentPathDisplay: String? {
-        let parent = (row.relativePath as NSString).deletingLastPathComponent
-        guard parent != ".", !parent.isEmpty else { return nil }
-        let components = parent.split(separator: "/").map(String.init)
-        guard components.count > 2 else { return parent }
-        return "…/" + components.suffix(2).joined(separator: "/")
-    }
-
-    private var sliceCountText: String? {
-        guard row.kind == .slices, let count = row.lineRanges?.count, count > 0 else { return nil }
-        return "\(count)"
-    }
-
     var body: some View {
-        HStack(alignment: .center, spacing: 8) {
-            Image(systemName: leadingIconName)
-                .symbolRenderingMode(.monochrome)
-                .foregroundColor(accentColor)
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .medium))
-                .imageScale(.medium)
-                .frame(width: 16, height: 16)
+        presentingFilePreview {
+            HStack(alignment: .center, spacing: 8) {
+                Image(systemName: leadingIconName)
+                    .symbolRenderingMode(.monochrome)
+                    .foregroundColor(accentColor)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .medium))
+                    .imageScale(.medium)
+                    .frame(width: 16, height: 16)
 
-            VStack(alignment: .leading, spacing: parentPathDisplay == nil ? 0 : 2) {
-                Text(row.displayName)
-                    .font(fontPreset.standardFont.weight(.medium))
-                    .foregroundColor(.primary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .layoutPriority(1)
-
-                if let parentPathDisplay {
-                    Text(parentPathDisplay)
-                        .font(fontPreset.captionFont)
-                        .foregroundColor(.secondary)
+                VStack(alignment: .leading, spacing: parentPathDisplay == nil ? 0 : 2) {
+                    Text(row.displayName)
+                        .font(fontPreset.standardFont.weight(.medium))
+                        .foregroundColor(.primary)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .layoutPriority(1)
-            .hoverTooltip(row.displayPath)
-            .accessibilityLabel(row.displayPath)
+                        .layoutPriority(1)
 
-            trailingControls
-        }
-        .padding(.horizontal, 7)
-        .padding(.vertical, parentPathDisplay == nil ? 6 : 4)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(isHovered ? Color(NSColor.controlBackgroundColor).opacity(0.26) : Color(NSColor.controlBackgroundColor).opacity(0.10))
-        )
-        .contentShape(Rectangle())
-        .onHover { hovering in
-            isHovered = hovering
-        }
-        .popover(
-            isPresented: Binding(
-                get: { previewCoordinator.isPreviewPresented(for: row) },
-                set: { previewCoordinator.handlePreviewPresentationChanged(row: row, isPresented: $0) }
-            ),
-            arrowEdge: .bottom
-        ) {
-            AgentResolvedFilePreviewPopover(
-                row: row,
-                previewCoordinator: previewCoordinator
+                    if let parentPathDisplay {
+                        Text(parentPathDisplay)
+                            .font(fontPreset.captionFont)
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .layoutPriority(1)
+                .hoverTooltip(row.displayPath)
+                .accessibilityLabel(row.displayPath)
+
+                trailingControls
+            }
+            .padding(.horizontal, 7)
+            .padding(.vertical, parentPathDisplay == nil ? 6 : 4)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(isHovered ? Color(NSColor.controlBackgroundColor).opacity(0.26) : Color(NSColor.controlBackgroundColor).opacity(0.10))
             )
-        }
-        .onDisappear {
-            previewCoordinator.handleRowDisappear(row: row)
-            copyTask?.cancel()
+            .contentShape(Rectangle())
+            .onHover { hovering in
+                isHovered = hovering
+            }
         }
     }
 
@@ -966,28 +923,9 @@ private struct AgentSelectedFileRow: View {
             )
         }
     }
-
-    private func openPreview() {
-        previewCoordinator.openPreview(row: row, loadContent: onLoadContent)
-    }
-
-    private func copyToClipboard() {
-        isCopying = true
-        copyTask?.cancel()
-        copyTask = Task {
-            let text = await onLoadContent(row, .copy) ?? ""
-            guard !Task.isCancelled else { return }
-            await MainActor.run {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(text, forType: .string)
-                isCopying = false
-                copyTask = nil
-            }
-        }
-    }
 }
 
-private struct AgentFileRowActionButton: View {
+private struct AgentFileRowActionButton: View, AgentFileActionPresenting {
     let systemName: String
     let tooltip: String
     let rowIsHovered: Bool
@@ -996,36 +934,12 @@ private struct AgentFileRowActionButton: View {
     var isDisabled = false
     let action: () -> Void
 
-    @State private var isButtonHovered = false
-
-    private var foregroundColor: Color {
-        guard !isDisabled else { return .secondary.opacity(0.35) }
-        if isButtonHovered { return hoverColor }
-        return .secondary.opacity(rowIsHovered ? 1 : 0.55)
-    }
+    @State var isButtonHovered = false
 
     var body: some View {
-        Button(action: action) {
-            ZStack {
-                Image(systemName: systemName)
-                    .font(.system(size: 12, weight: .regular))
-                    .imageScale(.medium)
-                    .opacity(isLoading ? 0 : 1)
-                if isLoading {
-                    ProgressView()
-                        .controlSize(.small)
-                        .scaleEffect(0.60)
-                }
+        actionButton
+            .onHover { hovering in
+                isButtonHovered = hovering
             }
-            .foregroundColor(foregroundColor)
-            .frame(width: 26, height: 26)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .disabled(isDisabled)
-        .hoverTooltip(tooltip)
-        .onHover { hovering in
-            isButtonHovered = hovering
-        }
     }
 }

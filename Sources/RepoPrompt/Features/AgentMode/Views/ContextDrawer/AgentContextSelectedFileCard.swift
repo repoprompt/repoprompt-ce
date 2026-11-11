@@ -76,7 +76,7 @@ struct AgentContextSelectedFileCardMetricRowPresentation: Equatable {
     }
 }
 
-struct AgentContextSelectedFileCard: View {
+struct AgentContextSelectedFileCard: View, AgentSelectedFilePresenting {
     let row: AgentContextExportRow
     let canRemove: Bool
     @ObservedObject var previewCoordinator: AgentSelectedFilePreviewLoadCoordinator
@@ -86,29 +86,13 @@ struct AgentContextSelectedFileCard: View {
     let onClearSlices: ((AgentContextExportRow) -> Void)?
     let onRemove: (AgentContextExportRow) -> Void
 
-    @State private var copyTask: Task<Void, Never>?
-    @State private var isCopying = false
+    @State var copyTask: Task<Void, Never>?
+    @State var isCopying = false
     @State private var isHovered = false
     @ObservedObject private var fontScale = FontScaleManager.shared
 
     private var fontPreset: FontScalePreset {
         fontScale.preset
-    }
-
-    private var accentColor: Color {
-        switch row.kind {
-        case .codemap: .purple
-        case .slices: .orange
-        case .full: .accentColor
-        }
-    }
-
-    private var leadingIconName: String {
-        switch row.kind {
-        case .codemap: "square.grid.2x2"
-        case .slices: "curlybraces"
-        case .full: "doc.text"
-        }
     }
 
     private var disabledRemoveExplanation: String? {
@@ -133,66 +117,39 @@ struct AgentContextSelectedFileCard: View {
         canRemove && row.canClearSlices && onClearSlices != nil
     }
 
-    private var sliceCountText: String? {
-        guard row.kind == .slices, let count = row.lineRanges?.count, count > 0 else { return nil }
-        return "\(count)"
-    }
-
-    private var parentPathDisplay: String? {
-        let parent = (row.relativePath as NSString).deletingLastPathComponent
-        guard parent != ".", !parent.isEmpty else { return nil }
-        let components = parent.split(separator: "/").map(String.init)
-        guard components.count > 2 else { return parent }
-        return "…/" + components.suffix(2).joined(separator: "/")
-    }
-
     var body: some View {
-        HStack(alignment: .top, spacing: 9) {
-            Image(systemName: leadingIconName)
-                .symbolRenderingMode(.monochrome)
-                .foregroundColor(accentColor)
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .medium))
-                .imageScale(.medium)
-                .frame(width: 18, height: 18)
-                .padding(.top, 2)
-                .accessibilityHidden(true)
+        presentingFilePreview {
+            HStack(alignment: .top, spacing: 9) {
+                Image(systemName: leadingIconName)
+                    .symbolRenderingMode(.monochrome)
+                    .foregroundColor(accentColor)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .medium))
+                    .imageScale(.medium)
+                    .frame(width: 18, height: 18)
+                    .padding(.top, 2)
+                    .accessibilityHidden(true)
 
-            VStack(alignment: .leading, spacing: 4) {
-                titleRow
-                detailRow
+                VStack(alignment: .leading, spacing: 4) {
+                    titleRow
+                    detailRow
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 8)
             .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(.horizontal, 9)
-        .padding(.vertical, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(
-                    isHovered
-                        ? Color(NSColor.controlBackgroundColor).opacity(0.34)
-                        : Color(NSColor.controlBackgroundColor).opacity(0.16)
-                )
-        )
-        .contentShape(Rectangle())
-        .onHover { hovering in
-            isHovered = hovering
-        }
-        .popover(
-            isPresented: Binding(
-                get: { previewCoordinator.isPreviewPresented(for: row) },
-                set: { previewCoordinator.handlePreviewPresentationChanged(row: row, isPresented: $0) }
-            ),
-            arrowEdge: .bottom
-        ) {
-            AgentResolvedFilePreviewPopover(
-                row: row,
-                previewCoordinator: previewCoordinator
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(
+                        isHovered
+                            ? Color(NSColor.controlBackgroundColor).opacity(0.34)
+                            : Color(NSColor.controlBackgroundColor).opacity(0.16)
+                    )
             )
-        }
-        .onDisappear {
-            previewCoordinator.handleRowDisappear(row: row)
-            copyTask?.cancel()
+            .contentShape(Rectangle())
+            .onHover { hovering in
+                isHovered = hovering
+            }
         }
     }
 
@@ -400,10 +357,6 @@ struct AgentContextSelectedFileCard: View {
         }
     }
 
-    private func openPreview() {
-        previewCoordinator.openPreview(row: row, loadContent: onLoadContent)
-    }
-
     private func copyAbsolutePath() {
         guard let physicalPath = row.physicalPath else { return }
         NSPasteboard.general.clearContents()
@@ -424,24 +377,9 @@ struct AgentContextSelectedFileCard: View {
         guard let physicalPath = row.physicalPath else { return }
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: physicalPath)])
     }
-
-    private func copyToClipboard() {
-        isCopying = true
-        copyTask?.cancel()
-        copyTask = Task {
-            let text = await onLoadContent(row, .copy) ?? ""
-            guard !Task.isCancelled else { return }
-            await MainActor.run {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(text, forType: .string)
-                isCopying = false
-                copyTask = nil
-            }
-        }
-    }
 }
 
-private struct AgentContextFileActionButton: View {
+private struct AgentContextFileActionButton: View, AgentFileActionPresenting {
     let systemName: String
     let tooltip: String
     let rowIsHovered: Bool
@@ -450,38 +388,14 @@ private struct AgentContextFileActionButton: View {
     var isDisabled = false
     let action: () -> Void
 
-    @State private var isButtonHovered = false
-
-    private var foregroundColor: Color {
-        guard !isDisabled else { return .secondary.opacity(0.35) }
-        if isButtonHovered { return hoverColor }
-        return .secondary.opacity(rowIsHovered ? 1 : 0.55)
-    }
+    @State var isButtonHovered = false
 
     var body: some View {
-        Button(action: action) {
-            ZStack {
-                Image(systemName: systemName)
-                    .font(.system(size: 12, weight: .regular))
-                    .imageScale(.medium)
-                    .opacity(isLoading ? 0 : 1)
-                if isLoading {
-                    ProgressView()
-                        .controlSize(.small)
-                        .scaleEffect(0.60)
-                }
+        actionButton
+            .accessibilityLabel(tooltip)
+            .onHover { hovering in
+                isButtonHovered = hovering
             }
-            .foregroundColor(foregroundColor)
-            .frame(width: 26, height: 26)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .disabled(isDisabled)
-        .hoverTooltip(tooltip)
-        .accessibilityLabel(tooltip)
-        .onHover { hovering in
-            isButtonHovered = hovering
-        }
     }
 }
 

@@ -814,61 +814,51 @@ struct AgentModeSessionsListView: View, Equatable {
         operation: AgentSidebarBulkActionOperation
     ) -> some View {
         let selectedCount = selectionState.selectedIdentities.count
-        return VStack(alignment: .leading, spacing: bulkBarRowSpacing) {
-            HStack(spacing: 8) {
-                Text("1 selected")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
-                Spacer(minLength: 8)
-                Text("Select All")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-                Text("Cancel")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-            }
-            HStack(spacing: bulkChipSpacing) {
-                BulkActionChipLabel(systemImage: "trash", count: operation.targetCount)
-            }
-        }
-        .hidden()
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
-        .overlay(alignment: .topLeading) {
+        return bulkBarSurface {
             VStack(alignment: .leading, spacing: bulkBarRowSpacing) {
-                if selectedCount > 0 {
-                    Text("\(selectedCount) selected")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                        .accessibilityAddTraits(.isHeader)
-                } else {
+                HStack(spacing: 8) {
                     Text("1 selected")
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
-                        .hidden()
-                        .accessibilityHidden(true)
+                    Spacer(minLength: 8)
+                    Text("Select All")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+                    Text("Cancel")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
                 }
-
-                HStack(spacing: 6) {
-                    ProgressView().controlSize(.small)
-                    Text("\(operation.kind.rawValue.capitalized) \(operation.targetCount) \(operation.targetCount == 1 ? "chat" : "chats")…")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                    Spacer(minLength: 0)
+                HStack(spacing: bulkChipSpacing) {
+                    BulkActionChipLabel(systemImage: "trash", count: operation.targetCount)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .hidden()
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+            .overlay(alignment: .topLeading) {
+                VStack(alignment: .leading, spacing: bulkBarRowSpacing) {
+                    if selectedCount > 0 {
+                        Text("\(selectedCount) selected")
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .accessibilityAddTraits(.isHeader)
+                    } else {
+                        Text("1 selected")
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
+                            .hidden()
+                            .accessibilityHidden(true)
+                    }
+
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("\(operation.kind.rawValue.capitalized) \(operation.targetCount) \(operation.targetCount == 1 ? "chat" : "chats")…")
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        Spacer(minLength: 0)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
-        .padding(.horizontal, bulkBarInnerHorizontalPadding)
-        .padding(.vertical, bulkBarInnerVerticalPadding)
-        .background(
-            RoundedRectangle(cornerRadius: bulkBarCornerRadius, style: .continuous)
-                .fill(Color(NSColor.systemGray).opacity(0.12))
-                .overlay(
-                    RoundedRectangle(cornerRadius: bulkBarCornerRadius, style: .continuous)
-                        .stroke(Color(NSColor.systemGray).opacity(0.3), lineWidth: 0.5)
-                )
-        )
-        .padding(.horizontal, listHorizontalPadding)
-        .padding(.top, 4)
     }
 
     private func bulkActionBar(
@@ -879,77 +869,83 @@ struct AgentModeSessionsListView: View, Equatable {
         let selectedCount = selectionState.selectedIdentities.count
         let deleteCount = targets.activeDeleteTabIDs.count + targets.archivedDeleteTargets.count
         let canSelectAll = selectedCount != renderedOrder.count
-        return VStack(alignment: .leading, spacing: bulkBarRowSpacing) {
-            HStack(spacing: 8) {
-                Text("\(selectedCount) selected")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .accessibilityAddTraits(.isHeader)
-                Spacer(minLength: 8)
-                Button("Select All") {
-                    sidebarUI.selectAll(renderedOrder: renderedOrder, workspaceID: targets.workspaceID)
-                }
-                .buttonStyle(.plain)
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-                .foregroundStyle(canSelectAll ? Color.accentColor : Color.secondary.opacity(0.5))
-                .disabled(!canSelectAll)
-                Button("Cancel") { sidebarUI.clearSelection() }
+        return bulkBarSurface {
+            VStack(alignment: .leading, spacing: bulkBarRowSpacing) {
+                HStack(spacing: 8) {
+                    Text("\(selectedCount) selected")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .accessibilityAddTraits(.isHeader)
+                    Spacer(minLength: 8)
+                    Button("Select All") {
+                        sidebarUI.selectAll(renderedOrder: renderedOrder, workspaceID: targets.workspaceID)
+                    }
                     .buttonStyle(.plain)
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .keyboardShortcut(.cancelAction)
-            }
+                    .foregroundStyle(canSelectAll ? Color.accentColor : Color.secondary.opacity(0.5))
+                    .disabled(!canSelectAll)
+                    Button("Cancel") { sidebarUI.clearSelection() }
+                        .buttonStyle(.plain)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .keyboardShortcut(.cancelAction)
+                }
 
-            HStack(spacing: bulkChipSpacing) {
-                if !targets.pinTabIDs.isEmpty {
-                    BulkActionChip(systemImage: "pin", verb: "Pin", count: targets.pinTabIDs.count) {
-                        performBulkAction(.pin, origin: .selection, commandProgressPlacement: nil, targets: targets)
+                HStack(spacing: bulkChipSpacing) {
+                    if !targets.pinTabIDs.isEmpty {
+                        BulkActionChip(systemImage: "pin", verb: "Pin", count: targets.pinTabIDs.count) {
+                            performBulkAction(.pin, origin: .selection, commandProgressPlacement: nil, targets: targets)
+                        }
                     }
-                }
-                if !targets.unpinTabIDs.isEmpty {
-                    BulkActionChip(systemImage: "pin.slash", verb: "Unpin", count: targets.unpinTabIDs.count) {
-                        performBulkAction(.unpin, origin: .selection, commandProgressPlacement: nil, targets: targets)
+                    if !targets.unpinTabIDs.isEmpty {
+                        BulkActionChip(systemImage: "pin.slash", verb: "Unpin", count: targets.unpinTabIDs.count) {
+                            performBulkAction(.unpin, origin: .selection, commandProgressPlacement: nil, targets: targets)
+                        }
                     }
-                }
-                if !targets.stashTabIDs.isEmpty {
+                    if !targets.stashTabIDs.isEmpty {
+                        BulkActionChip(
+                            systemImage: "tray.and.arrow.down",
+                            verb: "Stash",
+                            count: targets.stashTabIDs.count,
+                            tooltip: "Stash — related sub-agent chats may also be stashed"
+                        ) {
+                            performBulkAction(.stash, origin: .selection, commandProgressPlacement: nil, targets: targets)
+                        }
+                    }
                     BulkActionChip(
-                        systemImage: "tray.and.arrow.down",
-                        verb: "Stash",
-                        count: targets.stashTabIDs.count,
-                        tooltip: "Stash — related sub-agent chats may also be stashed"
+                        systemImage: "trash",
+                        verb: "Delete",
+                        count: deleteCount,
+                        isDestructive: true
                     ) {
-                        performBulkAction(.stash, origin: .selection, commandProgressPlacement: nil, targets: targets)
+                        showingBulkDeleteConfirmation = true
+                    }
+                    .popover(isPresented: $showingBulkDeleteConfirmation, arrowEdge: .bottom) {
+                        bulkDeleteConfirmation(targets: targets)
                     }
                 }
-                BulkActionChip(
-                    systemImage: "trash",
-                    verb: "Delete",
-                    count: deleteCount,
-                    isDestructive: true
-                ) {
-                    showingBulkDeleteConfirmation = true
-                }
-                .popover(isPresented: $showingBulkDeleteConfirmation, arrowEdge: .bottom) {
-                    bulkDeleteConfirmation(targets: targets)
-                }
-            }
 
-            if let notice = selectionState.notice {
-                bulkNotice(notice)
+                if let notice = selectionState.notice {
+                    bulkNotice(notice)
+                }
             }
         }
-        .padding(.horizontal, bulkBarInnerHorizontalPadding)
-        .padding(.vertical, bulkBarInnerVerticalPadding)
-        .background(
-            RoundedRectangle(cornerRadius: bulkBarCornerRadius, style: .continuous)
-                .fill(Color(NSColor.systemGray).opacity(0.12))
-                .overlay(
-                    RoundedRectangle(cornerRadius: bulkBarCornerRadius, style: .continuous)
-                        .stroke(Color(NSColor.systemGray).opacity(0.3), lineWidth: 0.5)
-                )
-        )
-        .padding(.horizontal, listHorizontalPadding)
-        .padding(.top, 4)
+    }
+
+    private func bulkBarSurface(@ViewBuilder content: () -> some View) -> some View {
+        content()
+            .padding(.horizontal, bulkBarInnerHorizontalPadding)
+            .padding(.vertical, bulkBarInnerVerticalPadding)
+            .background(
+                RoundedRectangle(cornerRadius: bulkBarCornerRadius, style: .continuous)
+                    .fill(Color(NSColor.systemGray).opacity(0.12))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: bulkBarCornerRadius, style: .continuous)
+                            .stroke(Color(NSColor.systemGray).opacity(0.3), lineWidth: 0.5)
+                    )
+            )
+            .padding(.horizontal, listHorizontalPadding)
+            .padding(.top, 4)
     }
 
     @ViewBuilder
