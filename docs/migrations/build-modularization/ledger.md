@@ -7622,6 +7622,30 @@ The unchanged full transcript-restoration lifecycle suite then passed **65 tests
 with `a96fa24d-8a6d-49bd-972a-f7da5cbccdd7`. This is an isolated pass, not proof that the integration
 failure is fixed. No expectation or timeout was weakened.
 
+#### M9.2i checkpoint 5 — native approval response receipts
+
+Claude permission prompts now carry opaque, incarnation-specific response receipts. The provider
+controller maps each native request ID to its current receipt and retains the native ID only for
+wire encoding. Native cancellation withdraws that receipt; a reused native ID cannot consume a late
+answer to an earlier prompt. Identical pending redelivery retains its receipt and prompt identity,
+while changed content revokes the previous receipt before either manual or automatic approval.
+Existing shutdown, EOF, process-start and test-transport reset boundaries clear both maps. This is
+approval ownership only: provider execution, event installation and terminal follow-up owners stay
+unchanged. Callers echo emitted IDs; semantic tool-use IDs and native wire response IDs are preserved.
+
+A real protocol red witness showed the old answer writing the successor request. Final owning-provider
+`ecca773f-c594-4f9c-8fa8-3bc5f22b1195` passed **29 tests**, zero failures, including cancellation/reuse,
+identical replay, changed content, automatic replacement, shutdown and EOF settlement. Initial app
+integration executed **265 tests with two assertions failing in one case** that still expected a raw
+native ID in the reserved approval inbox. Its assertions now require an opaque receipt and retain the
+exact native wire denial and teardown checks. Final `7a59e80e-d37d-4041-8036-806ac5241255` passed
+**265 tests**, zero failures. Scoped pinned formatting, strict lint and whitespace checks passed.
+
+The assigned interaction-command and residual-cleanup slices are locally implemented; this is not
+completion of M9. Provider adoption/event hooks, general lifecycle cleanup, MCP host routing and
+persistence/payload/Steer ownership remain with their respective lanes. Broader integrated gates and
+follow-up publication remain separate receipts.
+
 ### M9.3b PR1 — shared host route and resource ownership (refs #1406)
 
 Base `99d4e718d` (#1679). This is the first resource extraction in the expanded visible-and-saved
