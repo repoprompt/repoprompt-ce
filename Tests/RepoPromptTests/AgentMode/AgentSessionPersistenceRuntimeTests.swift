@@ -5,6 +5,48 @@ import XCTest
 
 @MainActor
 final class AgentSessionPersistenceRuntimeTests: XCTestCase {
+    func testConcurrentSourceBurstsCoalesceAndDoNotRearmIdleSessions() async throws {
+        let fixtures = try (0 ..< 3).map { _ in try Fixture() }
+        let gate = TestReleaseFence(name: "streaming burst debounce")
+        defer {
+            gate.release()
+            fixtures.forEach { $0.cleanUp() }
+        }
+        var writes: [UUID: Int] = [:]
+        for fixture in fixtures {
+            fixture.session.hasLoadedPersistedState = true
+            fixture.session.runState = .running
+            fixture.scope.observation.install(on: fixture.session)
+            fixture.scope.persistence.debounce = { await gate.enterAndWait() }
+            fixture.scope.persistence.saver = { payload, workspace, count in
+                writes[payload.id, default: 0] += 1
+                return try await AgentSessionDataService.shared.saveAgentSession(
+                    payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count
+                )
+            }
+        }
+        for delta in 0 ..< 30 {
+            for fixture in fixtures {
+                fixture.session.appendItem(.init(kind: .assistant, text: "Stream delta \(delta)", sequenceIndex: delta + 2))
+            }
+            await Task.yield()
+        }
+        let pending = try fixtures.map { try XCTUnwrap($0.session.saveDebounceTask) }
+        gate.release()
+        for task in pending {
+            await task.value
+        }
+        for fixture in fixtures {
+            let sessionID = try XCTUnwrap(fixture.session.activeAgentSessionID)
+            XCTAssertEqual(writes[sessionID], 1, "All deltas must share one source debounce")
+            XCTAssertFalse(fixture.session.isDirty)
+            XCTAssertNil(fixture.session.saveDebounceTask, "An idle session must not retain/rearm a save loop")
+            XCTAssertFalse(fixture.scope.persistence.queue.hasPendingSave(sessionID: sessionID))
+            let saved = try await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: fixture.placement.workspace)
+            XCTAssertEqual(saved?.effectiveItemCount, 32, "Coalescing must retain every delta")
+        }
+    }
+
     func testRunHookPersistsWithoutPresentationAndRetainsScopeUntilDebounceSettles() async throws {
         var fixture: Fixture? = try Fixture()
         let root = try XCTUnwrap(fixture?.root)
