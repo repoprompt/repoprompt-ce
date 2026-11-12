@@ -952,3 +952,97 @@ private final class FileTagSelectionHost: WorkspaceSelectionHost {
 
     func applySelectionMirrorAttempt(_: StoredSelection, forTabID _: UUID, workspaceID _: UUID) async {}
 }
+
+@MainActor
+final class AgentExplicitTaggedFilePolicyTests: XCTestCase {
+    func testMissingInferredPathsStaySilentButExplicitPathsReportFailuresEvenWithXMLMarker() async throws {
+        let (root, store) = try await fixture()
+        let context = AgentSessionProviderInputRuntime.Context(store: store, lookup: .visibleWorkspace)
+        let inferred = await AgentSessionProviderInputRuntime.prepareTaggedFileContents(
+            "Inspect @missing.txt", taggedFileAttachments: [], context: context
+        )
+        XCTAssertEqual(inferred.text, "Inspect @missing.txt")
+        XCTAssertEqual(inferred.warningText, inferred.text)
+        XCTAssertTrue(inferred.failures.isEmpty)
+        let attachment = AgentTaggedFileAttachment(relativePath: root.appendingPathComponent("missing.txt").path, displayName: "missing.txt")
+        for text in ["Inspect @missing.txt", "<file_contents>user-authored</file_contents>"] {
+            let explicit = await AgentSessionProviderInputRuntime.prepareTaggedFileContents(text, taggedFileAttachments: [attachment], context: context)
+            XCTAssertEqual(explicit.failures.map(\.attachment.id), [attachment.id])
+            XCTAssertTrue(explicit.warningText.contains("missing.txt"))
+            XCTAssertTrue(explicit.warningText.contains("could not be included"))
+            XCTAssertTrue(explicit.includedPaths.isEmpty)
+        }
+    }
+
+    func testEveryExplicitFileBeyondFileOrTokenLimitsIsReported() async throws {
+        let (root, store) = try await fixture(files: 8)
+        let context = AgentSessionProviderInputRuntime.Context(store: store, lookup: .visibleWorkspace)
+        let attachments = (0 ..< 8).map { AgentTaggedFileAttachment(relativePath: root.appendingPathComponent("file\($0).txt").path, displayName: "file\($0).txt") }
+        let files = await AgentSessionProviderInputRuntime.prepareTaggedFileContents("inspect", taggedFileAttachments: attachments, context: context)
+        XCTAssertEqual(files.includedPaths.count, 5)
+        XCTAssertEqual(files.failures.map(\.attachment.id), Array(attachments.suffix(3)).map(\.id))
+        XCTAssertTrue(files.failures.allSatisfy { $0.reason.contains("5-file") })
+        let tokens = await AgentSessionProviderInputRuntime.prepareTaggedFileContents("inspect", taggedFileAttachments: attachments, context: context, tokenBudget: 1)
+        XCTAssertTrue(tokens.includedPaths.isEmpty)
+        XCTAssertEqual(tokens.failures.count, attachments.count)
+        XCTAssertTrue(tokens.failures.allSatisfy { $0.reason.contains("1-token") })
+    }
+
+    func testExplicitAttachmentOwnsBudgetBeforeGuessedTextPaths() async throws {
+        let (root, store) = try await fixture(files: 8)
+        let attachment = AgentTaggedFileAttachment(relativePath: root.appendingPathComponent("file7.txt").path, displayName: "file7.txt")
+        let text = (0 ..< 7).map { "@file\($0).txt" }.joined(separator: " ")
+        let result = await AgentSessionProviderInputRuntime.prepareTaggedFileContents(text, taggedFileAttachments: [attachment], context: .init(store: store, lookup: .visibleWorkspace))
+        XCTAssertTrue(result.failures.isEmpty)
+        XCTAssertEqual(result.includedPaths.first, attachment.relativePath)
+        XCTAssertTrue(result.text.contains("file 7 content"))
+        XCTAssertEqual(result.includedPaths.count, 5)
+    }
+
+    func testOversizedExplicitAttachmentDoesNotExcludeLaterExplicitFileThatFits() async throws {
+        let (root, store) = try await fixture(files: 2, oversizedFirst: true)
+        let attachments = (0 ..< 2).map {
+            AgentTaggedFileAttachment(relativePath: root.appendingPathComponent("file\($0).txt").path, displayName: "file\($0).txt")
+        }
+        let context = AgentSessionProviderInputRuntime.Context(store: store, lookup: .visibleWorkspace)
+        let explicit = await AgentSessionProviderInputRuntime.prepareTaggedFileContents("inspect", taggedFileAttachments: attachments, context: context)
+        XCTAssertEqual(explicit.failures.map(\.attachment.id), [attachments[0].id])
+        XCTAssertTrue(explicit.failures.allSatisfy { $0.reason.contains("12000-token") })
+        XCTAssertEqual(explicit.includedPaths, [attachments[1].relativePath])
+        XCTAssertTrue(explicit.text.contains("file 1 content"))
+
+        // Guessed text paths retain their historical stop-at-first-overflow behavior.
+        let inferredText = "Inspect @file0.txt @file1.txt"
+        let inferred = await AgentSessionProviderInputRuntime.prepareTaggedFileContents(inferredText, taggedFileAttachments: [], context: context)
+        XCTAssertEqual(inferred.text, inferredText)
+        XCTAssertTrue(inferred.includedPaths.isEmpty)
+        XCTAssertTrue(inferred.failures.isEmpty)
+    }
+
+    func testAliasesShareTheIncludedOutcomeAndMissingWorkspaceIsExplicit() async throws {
+        let (root, store) = try await fixture(files: 1)
+        let attachments = [
+            AgentTaggedFileAttachment(relativePath: "file0.txt", displayName: "file0.txt"),
+            AgentTaggedFileAttachment(relativePath: root.appendingPathComponent("file0.txt").path, displayName: "same file")
+        ]
+        let result = await AgentSessionProviderInputRuntime.prepareTaggedFileContents("inspect", taggedFileAttachments: attachments, context: .init(store: store, lookup: .visibleWorkspace))
+        XCTAssertTrue(result.failures.isEmpty)
+        XCTAssertEqual(result.text.components(separatedBy: "File:").count - 1, 1)
+        let unavailable = await AgentSessionProviderInputRuntime.prepareTaggedFileContents("inspect", taggedFileAttachments: attachments, context: nil)
+        XCTAssertEqual(unavailable.failures.map(\.attachment.id), attachments.map(\.id))
+        XCTAssertTrue(unavailable.failures.allSatisfy { $0.reason.contains("workspace") })
+    }
+
+    private func fixture(files: Int = 0, oversizedFirst: Bool = false) async throws -> (URL, WorkspaceFileContextStore) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("ExplicitTags-\(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        for index in 0 ..< files {
+            let content = oversizedFirst && index == 0 ? String(repeating: "oversized attached content ", count: 20000) : "file \(index) content"
+            try content.write(to: root.appendingPathComponent("file\(index).txt"), atomically: true, encoding: .utf8)
+        }
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        return (root, store)
+    }
+}

@@ -937,6 +937,242 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        private func configureExplicitPolicyProvider(_ fixture: Fixture) {
+            fixture.window.promptManager.apiSettingsViewModel?.isOpenCodeConnected = true
+            fixture.sourceSession.selectedAgent = .openCode
+            fixture.sourceSession.selectedModelRaw = "unknown-window"
+            XCTAssertTrue(fixture.viewModel.agentAvailabilityContext.openCodeAvailable)
+        }
+
+        private func explicitPolicyAttachments(_ fixture: Fixture, failure: String) async throws -> [AgentTaggedFileAttachment] {
+            configureExplicitPolicyProvider(fixture)
+            let count = failure == "files" ? 7 : 1
+            let paths = (0 ..< count).map { fixture.rootURL.appendingPathComponent("policy-\(failure)-\($0).txt") }
+            if failure != "missing" {
+                for path in paths {
+                    let content = failure == "tokens" ? String(repeating: "large attached content ", count: 20000) : "attached content"
+                    try content.write(to: path, atomically: true, encoding: .utf8)
+                }
+            }
+            return paths.map { .init(relativePath: $0.path, displayName: $0.lastPathComponent) }
+        }
+
+        func testExplicitTaggedFileLimitsBlockInteractiveSendWithoutConsumingComposer() async throws {
+            for failure in ["files", "tokens"] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let session = fixture.sourceSession
+                    session.selectedAgent = .openCode
+                    let attachments = try await explicitPolicyAttachments(fixture, failure: failure)
+                    session.pendingTaggedFileAttachments = attachments
+                    session.selectedWorkflow = .init(customID: UUID(), displayName: "Retained")
+                    vm.storeDraftText(for: session.tabID, "keep draft")
+                    let rows = session.items
+                    let workflow = session.selectedWorkflow
+                    let claim = try composerClaim(fixture, text: "keep draft")
+                    let result = await vm.executeComposerSubmitAttempt(text: "keep draft", claim: claim)
+                    guard case let .blocked(message) = result else { return XCTFail("Explicit \(failure) limit must block") }
+                    XCTAssertTrue(message.contains(failure == "files" ? "5-file" : "12000-token"), message)
+                    for attachment in failure == "files" ? Array(attachments.suffix(2)) : attachments {
+                        XCTAssertTrue(message.contains(attachment.displayName), message)
+                    }
+                    XCTAssertEqual(session.draftText, "keep draft")
+                    XCTAssertEqual(session.selectedWorkflow, workflow)
+                    XCTAssertEqual(session.pendingTaggedFileAttachments, attachments)
+                    XCTAssertEqual(session.items, rows)
+                }
+            }
+        }
+
+        func testUnattendedExplicitTaggedFileLimitsWarnInsteadOfBlocking() async throws {
+            for failure in ["files", "tokens"] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let session = fixture.sourceSession
+                    session.selectedAgent = .openCode
+                    let attachments = try await explicitPolicyAttachments(fixture, failure: failure)
+                    var sent: String?
+                    vm.test_providerSwitchStart = { _, user, _ in sent = user }
+                    vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("limits.json") }
+                    _ = await vm.startAgentRun(tabID: session.tabID, initialMessage: "unattended task", taggedFileAttachments: attachments)
+                    let text = try XCTUnwrap(sent)
+                    XCTAssertTrue(text.contains(failure == "files" ? "5-file" : "12000-token"), text)
+                    let notice = try XCTUnwrap(session.items.first { $0.kind == .system && $0.text.contains("could not be included") })
+                    for attachment in failure == "files" ? Array(attachments.suffix(2)) : attachments {
+                        XCTAssertTrue(text.contains(attachment.displayName), text)
+                        XCTAssertTrue(notice.text.contains(attachment.displayName), notice.text)
+                    }
+                }
+            }
+        }
+
+        func testSuccessfulInteractiveTaggedFileSendUsesPreparedBytesAfterDeletion() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.selectedAgent = .openCode
+                configureExplicitPolicyProvider(fixture)
+                let file = fixture.rootURL.appendingPathComponent("prepared.txt")
+                let content = "Captured file bytes survive deletion before provider dispatch."
+                try content.write(to: file, atomically: true, encoding: .utf8)
+                let attachment = AgentTaggedFileAttachment(relativePath: file.path, displayName: file.lastPathComponent)
+                session.pendingTaggedFileAttachments = [attachment]
+                session.selectedWorkflow = .init(customID: UUID(), displayName: "Workflow")
+                vm.storeDraftText(for: session.tabID, "inspect")
+                var prepared = false
+                vm.test_afterExplicitTaggedFilePreparation = { _ in
+                    prepared = true
+                    try? FileManager.default.removeItem(at: file)
+                }
+                var sent: String?
+                vm.test_providerSwitchStart = { _, user, _ in sent = user }
+                vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("prepared.json") }
+                let claim = try composerClaim(fixture, text: "inspect")
+                let result = await vm.executeComposerSubmitAttempt(text: "inspect", claim: claim)
+                XCTAssertEqual(result, .submitted)
+                try await AsyncTestWait.waitUntil("prepared attachment dispatch") { sent != nil }
+                let text = try XCTUnwrap(sent)
+                XCTAssertTrue(prepared)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+                XCTAssertTrue(text.contains(content), text)
+                XCTAssertEqual(text.components(separatedBy: "<file_contents>").count - 1, 1)
+                XCTAssertFalse(text.contains("could not be included"), text)
+                XCTAssertTrue(session.pendingTaggedFileAttachments.isEmpty)
+                XCTAssertNil(session.selectedWorkflow)
+                XCTAssertEqual(session.draftText, "")
+                XCTAssertEqual(session.items.last(where: { $0.kind == .user })?.taggedFileAttachments, [attachment])
+            }
+        }
+
+        func testStopAfterTaggedFilePreparationCannotMutateComposerOrSend() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.selectedAgent = .openCode
+                let attachments = try await explicitPolicyAttachments(fixture, failure: "valid")
+                session.pendingTaggedFileAttachments = attachments
+                vm.storeDraftText(for: session.tabID, "retained")
+                let rows = session.items
+                var starts = 0
+                vm.test_providerSwitchStart = { _, _, _ in starts += 1 }
+                var prepared = false
+                vm.test_afterExplicitTaggedFilePreparation = { outgoing in
+                    prepared = true
+                    outgoing.stopState.invalidateScheduledStarts()
+                }
+                let claim = try composerClaim(fixture, text: "retained")
+                let result = await vm.executeComposerSubmitAttempt(text: "retained", claim: claim)
+                guard case .blocked = result else { return XCTFail("Stop must fence prepared input") }
+                XCTAssertTrue(prepared, "This test must reach attachment admission before Stop")
+                XCTAssertEqual(starts, 0)
+                XCTAssertEqual(session.draftText, "retained")
+                XCTAssertEqual(session.pendingTaggedFileAttachments, attachments)
+                XCTAssertEqual(session.items, rows)
+            }
+        }
+
+        func testSynchronousExplicitAttachmentRefusalRestoresClearedDraftWithoutDuplicatingRetainedDraft() async throws {
+            let rawDraft = "  keep exact rejected draft  "
+            for currentDraft in [rawDraft, "", "newer typing"] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let session = fixture.sourceSession
+                    let attachments = try await explicitPolicyAttachments(fixture, failure: "missing")
+                    session.pendingTaggedFileAttachments = attachments
+                    session.selectedWorkflow = .init(customID: UUID(), displayName: "Retained")
+                    let workflow = session.selectedWorkflow
+                    let rows = session.items
+                    vm.storeDraftText(for: session.tabID, rawDraft)
+                    XCTAssertEqual(vm.submitUserTurn(text: rawDraft.trimmingCharacters(in: .whitespacesAndNewlines), tabID: session.tabID, rawDraftText: rawDraft), .submitted)
+                    // Legacy synchronous ingress acknowledges scheduling before admission runs.
+                    vm.storeDraftText(for: session.tabID, currentDraft)
+                    try await AsyncTestWait.waitUntil("explicit attachment refusal notice") { vm.draftRestorationEvent != nil }
+                    let expected = currentDraft == rawDraft || currentDraft.isEmpty ? rawDraft : rawDraft + "\n" + currentDraft
+                    XCTAssertEqual(vm.draftRuntime.text(for: session.tabID), expected)
+                    XCTAssertTrue(vm.draftRestorationEvent?.message.contains("could not be included") == true)
+                    XCTAssertEqual(session.pendingTaggedFileAttachments, attachments)
+                    XCTAssertEqual(session.selectedWorkflow, workflow)
+                    XCTAssertEqual(session.items, rows)
+                    XCTAssertNil(session.activeComposerSubmitAttempt)
+                }
+            }
+        }
+
+        func testExplicitTaggedFileFailureBlocksInteractiveSendWithoutChangingComposerOrRows() async throws {
+            for switching in [false, true] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let session = fixture.sourceSession
+                    configureExplicitPolicyProvider(fixture)
+                    if switching { try installSwitch(fixture) }
+                    let attachment = AgentTaggedFileAttachment(relativePath: fixture.rootURL.appendingPathComponent("missing.txt").path, displayName: "missing.txt")
+                    session.pendingTaggedFileAttachments = [attachment]
+                    session.selectedWorkflow = .init(customID: UUID(), displayName: "Keep workflow")
+                    vm.storeDraftText(for: session.tabID, "keep my draft")
+                    let rows = session.items
+                    let workflow = session.selectedWorkflow
+                    let handoff = session.pendingHandoff
+                    var starts = 0
+                    vm.test_providerSwitchStart = { _, _, _ in starts += 1 }
+                    let claim = try composerClaim(fixture, text: "keep my draft")
+                    let result = await vm.executeComposerSubmitAttempt(text: "keep my draft", claim: claim)
+                    guard case let .blocked(message) = result else { return XCTFail("Missing explicit attachment must block, switching=\(switching)") }
+                    XCTAssertTrue(message.contains("missing.txt"), message)
+                    XCTAssertTrue(message.contains("could not be included"), message)
+                    XCTAssertEqual(session.draftText, "keep my draft")
+                    XCTAssertEqual(session.selectedWorkflow, workflow)
+                    XCTAssertEqual(session.pendingTaggedFileAttachments, [attachment])
+                    XCTAssertEqual(session.items, rows)
+                    XCTAssertEqual(session.pendingHandoff, handoff)
+                    XCTAssertEqual(starts, 0)
+                    XCTAssertNil(session.activeComposerSubmitAttempt)
+                }
+            }
+        }
+
+        func testUnattendedExplicitTaggedFileFailureWarnsModelAndTranscript() async throws {
+            for switching in [false, true] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let session = fixture.sourceSession
+                    configureExplicitPolicyProvider(fixture)
+                    if switching { try installSwitch(fixture) }
+                    let attachment = AgentTaggedFileAttachment(relativePath: fixture.rootURL.appendingPathComponent("missing.txt").path, displayName: "missing.txt")
+                    var providerText: String?
+                    vm.test_providerSwitchStart = { _, user, _ in providerText = user }
+                    vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("warning.json") }
+                    let preparation: AgentModeViewModel.ProviderSwitchSendPreparation?
+                    if switching {
+                        guard case let .success(value) = await vm.linkExecutionRuntime.providerSwitchSendAdmission(session: session, input: "unattended task", taggedFiles: [attachment])
+                        else { return XCTFail("Unattended attachment failure must not block switch admission") }
+                        preparation = value
+                        XCTAssertFalse(session.items.contains { $0.text.contains("could not be included") }, "Admission/preview must not post a notice")
+                    } else { preparation = nil }
+                    _ = await vm.startAgentRun(tabID: session.tabID, initialMessage: "unattended task", taggedFileAttachments: [attachment], providerSwitchPreparation: preparation)
+                    let sent = try XCTUnwrap(providerText)
+                    XCTAssertTrue(sent.contains("missing.txt"), sent)
+                    XCTAssertTrue(sent.contains("could not be included"), sent)
+                    let notices = session.items.filter { $0.kind == .system && $0.text.contains("could not be included") }
+                    XCTAssertEqual(notices.count, 1)
+                    XCTAssertTrue(notices.first?.text.contains("missing.txt") == true)
+                }
+            }
+        }
+
+        func testUnresolvedInferredTaggedPathStillSendsWithoutWarning() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                configureExplicitPolicyProvider(fixture)
+                var providerText: String?
+                vm.test_providerSwitchStart = { _, user, _ in providerText = user }
+                vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("inferred.json") }
+                _ = await vm.startAgentRun(tabID: session.tabID, initialMessage: "Inspect @missing.txt")
+                XCTAssertEqual(providerText, "Inspect @missing.txt")
+                XCTAssertFalse(session.items.contains { $0.text.contains("could not be included") })
+            }
+        }
+
         func testSwitchExpandedSkillAndTaggedFileRefusalsRetainClaimedComposer() async throws {
             for skill in [true, false] {
                 try await withFixture { fixture in

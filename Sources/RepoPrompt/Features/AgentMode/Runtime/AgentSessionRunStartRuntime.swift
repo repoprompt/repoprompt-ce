@@ -166,9 +166,11 @@ final class AgentSessionRunStartRuntime {
                 guard queueClaudeSteering(
                     session: session, service: execution,
                     wrappedText: initialMessage, attachments: attachments,
-                    taggedFiles: taggedFileAttachments, draftText: initialMessage, userItem: userItem,
+                    taggedFiles: existingItem?.taggedFileAttachments ?? taggedFileAttachments,
+                    draftText: directStartOptions.restorationDraftText ?? initialMessage, userItem: userItem,
                     localComposerCandidate: directStartOptions.localComposerCandidate,
-                    skipsSlashExpansion: directStartOptions.skipsSlashExpansion
+                    skipsSlashExpansion: directStartOptions.skipsSlashExpansion,
+                    providerTaggedFiles: taggedFileAttachments
                 ) else {
                     recordClaudeStartRefusal()
                     return nil
@@ -289,6 +291,7 @@ final class AgentSessionRunStartRuntime {
         } else {
             switchMessages = nil
         }
+        var taggedFileFailures = providerSwitchPreparation?.taggedFileFailures ?? []
         let augmentedInitialMessage = if let switchMessages { switchMessages.user } else if directStartOptions.skipsUserAugmentation {
             initialMessage
         } else {
@@ -297,7 +300,8 @@ final class AgentSessionRunStartRuntime {
                 agent: session.selectedAgent, workspacePaths: environment.workspacePaths(),
                 workspace: { environment.inputWorkspace(session) }, session: session, handoff: owner.handoff,
                 ignoresPendingHandoff: directStartOptions.ignoresPendingHandoff,
-                skipsSlashExpansion: directStartOptions.skipsSlashExpansion, isCurrent: inputIsCurrent
+                skipsSlashExpansion: directStartOptions.skipsSlashExpansion, isCurrent: inputIsCurrent,
+                onTaggedFileFailures: { taggedFileFailures = $0 }
             )
         }
         guard inputIsCurrent() else { return nil }
@@ -330,6 +334,7 @@ final class AgentSessionRunStartRuntime {
         #if DEBUG
             if await environment.test_startOverride?(session, augmentedInitialMessage, initialMessageForRun) == true {
                 guard inputIsCurrent() else { return nil }
+                AgentSessionProviderInputRuntime.recordTaggedFileFailures(taggedFileFailures, session: session, scope: owner)
                 startOutcome?.recordAccepted()
                 return nil
             }
@@ -339,6 +344,7 @@ final class AgentSessionRunStartRuntime {
             recordClaudeStartRefusal()
             return nil
         }
+        AgentSessionProviderInputRuntime.recordTaggedFileFailures(taggedFileFailures, session: session, scope: owner)
         candidateTransferred = true
         claudeEventsTransferred = true
         return await environment.composition().startRun(
@@ -367,7 +373,8 @@ final class AgentSessionRunStartRuntime {
         session: AgentTabSession, service: AgentModeRunService, wrappedText: String,
         attachments: [AgentFileAttachment], taggedFiles: [AgentTaggedFileAttachment],
         draftText: String, userItem: AgentChatItem, localComposerCandidate: UUID?,
-        skipsSlashExpansion: Bool, accepted: (() -> Void)? = nil
+        skipsSlashExpansion: Bool, providerTaggedFiles: [AgentTaggedFileAttachment]? = nil,
+        accepted: (() -> Void)? = nil
     ) -> Bool {
         guard let owner = scope, owner.sessions[session.tabID] === session,
               !owner.hasReleasedWriterClaims else { return false }
@@ -384,7 +391,8 @@ final class AgentSessionRunStartRuntime {
             optimisticUserItemID: userItem.id,
             createdAt: Date(),
             supersedingProtectedTurnIDs: [],
-            skipsSlashExpansion: skipsSlashExpansion
+            skipsSlashExpansion: skipsSlashExpansion,
+            providerTaggedFileAttachments: providerTaggedFiles
         )
         session.pendingClaudeSteeringInstructions.append(steering)
         session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)

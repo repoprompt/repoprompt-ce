@@ -49,11 +49,13 @@ extension AgentSessionLinkExecutionRuntime {
                 && commands.workspaceID(session) == resourceWorkspaceID && stopFence.permitsStart(of: session)
         }
         guard inputIsCurrent() else { return .failure(.targetStopped) }
+        var taggedFileFailures: [AgentSessionProviderInputRuntime.ExplicitFileFailure] = []
         let augmented = skipsAugmentation ? input : await commands.input.augmentUserMessage(
             input, attachments: attachments, taggedFileAttachments: taggedFiles, agent: agent,
             workspacePaths: commands.workspacePaths(), workspace: { commands.inputWorkspace(session) },
             session: session, handoff: owner.handoff, ignoresPendingHandoff: true,
-            skipsSlashExpansion: skipsSlashExpansion, isCurrent: inputIsCurrent
+            skipsSlashExpansion: skipsSlashExpansion, isCurrent: inputIsCurrent,
+            onTaggedFileFailures: { taggedFileFailures = $0 }
         )
         guard inputIsCurrent() else { return .failure(.targetStopped) }
         let initial = await commands.input.buildInitialThreadMessageIfNeeded(
@@ -94,7 +96,8 @@ extension AgentSessionLinkExecutionRuntime {
             augmentedInput: augmented, initialThreadInput: initial, instructions: instructions,
             inputAlreadyIncludesSupplement: inputAlreadyIncludesSupplement,
             historyToolAllowed: historyAllowed, computerUseArmed: computerUseArmed,
-            catalogWindow: catalogWindow, composerAttemptID: composerAttemptID, autoWakeID: autoWakeID, stopFence: stopFence
+            catalogWindow: catalogWindow, composerAttemptID: composerAttemptID, autoWakeID: autoWakeID, stopFence: stopFence,
+            taggedFileFailures: taggedFileFailures
         ))
     }
 

@@ -329,7 +329,7 @@ final class AgentSessionLinkRunnerHarness {
                         )
                     }
                 },
-                augmentUserMessageForProviderSend: { text, _, _, _, _, _ in text },
+                augmentUserMessageForProviderSend: { text, _, _, _, _, _ in .init(text: text) },
                 stageResumeRecoveryHandoffIfNeeded: { _ in true },
                 prependPendingHandoffIfNeeded: { text, session in
                     sessionLinkHost?.handoffRuntime.prependPendingHandoffIfNeeded(text, session: session) ?? text

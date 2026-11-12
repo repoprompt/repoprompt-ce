@@ -167,6 +167,32 @@ extension AgentModeViewModel {
             && freshTaskRoutingEligibility(session: session, text: nil)
     }
 
+    /// Scheduled attachment admission must remain joined to the composer claim, just like
+    /// provider-switch admission; `.submitted` from the synchronous ingress is only scheduling.
+    private func submitClaimedOrdinaryUserTurn(
+        text: String, tabID: UUID, claim: AgentComposerSubmitClaim, rawDraftText: String,
+        composerOrigin: AgentUserInputOrigin,
+        autoEffortSelection: AutoEffortTurnSelection? = nil,
+        autoEffortAudit: AgentAutomationTurnAudit.Feature? = nil,
+        routerAudit: AgentAutomationTurnAudit.Feature? = nil,
+        autoWorkflow: AutoWorkflowTurnSelection? = nil,
+        repromptedText: String? = nil,
+        repromptAudit: AgentAutomationTurnAudit.Reprompt? = nil
+    ) async -> UserTurnSubmissionResult {
+        var pending: Task<UserTurnSubmissionResult, Never>?
+        let immediate = submitUserTurn(
+            text: text, tabID: tabID, rawDraftText: rawDraftText, composerOrigin: composerOrigin,
+            autoEffortSelection: autoEffortSelection, autoEffortAudit: autoEffortAudit,
+            routerAudit: routerAudit, autoWorkflow: autoWorkflow, repromptedText: repromptedText,
+            repromptAudit: repromptAudit, providerSwitchClaim: claim,
+            scheduledProviderSwitchSubmission: { pending = $0 }
+        )
+        if let pending {
+            return await withTaskCancellationHandler { await pending.value } onCancel: { pending.cancel() }
+        }
+        return immediate
+    }
+
     func submitUserTurnAfterFreshTaskRouting(
         text: String,
         claim: AgentComposerSubmitClaim,
@@ -296,9 +322,9 @@ extension AgentModeViewModel {
                 restoreRoutingSelection(baseline, on: session)
                 return .blocked(message: "The routing request became stale before submission.")
             }
-            let result = submitUserTurn(
+            let result = await submitClaimedOrdinaryUserTurn(
                 text: text,
-                tabID: destinationTabID,
+                tabID: destinationTabID, claim: claim,
                 rawDraftText: claim.attempt.rawDraftSnapshot,
                 composerOrigin: .localComposer,
                 routerAudit: routedAudit, autoWorkflow: autoWorkflow, repromptedText: repromptedText,
@@ -339,9 +365,9 @@ extension AgentModeViewModel {
             return .blocked(message: Self.staleComposerSubmitTargetMessage)
         }
         guard modelRouterSettingsStore.autoEffortEnabled() else {
-            return submitUserTurn(
+            return await submitClaimedOrdinaryUserTurn(
                 text: text,
-                tabID: destinationTabID,
+                tabID: destinationTabID, claim: claim,
                 rawDraftText: claim.attempt.rawDraftSnapshot,
                 composerOrigin: .localComposer,
                 routerAudit: routerAudit, autoWorkflow: autoWorkflow, repromptedText: repromptedText,
@@ -387,9 +413,9 @@ extension AgentModeViewModel {
                 return .blocked(message: "The usage-balanced selection changed before submission. Send again with the current selection.")
             }
         }
-        let result = submitUserTurn(
+        let result = await submitClaimedOrdinaryUserTurn(
             text: text,
-            tabID: destinationTabID,
+            tabID: destinationTabID, claim: claim,
             rawDraftText: claim.attempt.rawDraftSnapshot,
             composerOrigin: .localComposer,
             autoEffortSelection: selection,

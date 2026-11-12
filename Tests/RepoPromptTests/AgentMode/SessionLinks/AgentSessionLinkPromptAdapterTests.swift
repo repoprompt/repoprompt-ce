@@ -718,6 +718,18 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
     func testManualRouteQualificationSupersessionRestoresExactOptimisticSubmission() async throws {
         #if DEBUG
             let fixture = try makeFixture()
+            // Route supersession must run after successful attachment admission, not rely on
+            // silently dropping a nonexistent chip in a fixture with no readable-file context.
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("CodexRouteAttachment-\(UUID())")
+            let file = root.appendingPathComponent("Sources/Feature/Superseded.swift")
+            try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let content = "// real attachment for the route-supersession regression"
+            try content.write(to: file, atomically: true, encoding: .utf8)
+            let prompt = fixture.workspaceManager.promptViewModel
+            let api = try XCTUnwrap(prompt.apiSettingsViewModel)
+            fixture.viewModel.promptManager = prompt
+            _ = try await prompt.workspaceFileContextStore.loadRoot(path: root.path)
+            defer { try? FileManager.default.removeItem(at: root) }
             fixture.viewModel.test_setCurrentTabIDOverride(fixture.tabID)
             defer { fixture.viewModel.test_setCurrentTabIDOverride(nil) }
             let authorityGate = CatalogAuthorityGate()
@@ -791,11 +803,17 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
                 displayName: "Superseded Workflow",
                 template: "Wrapped: $ARGUMENTS"
             )
+            let expanded = await fixture.viewModel.augmentUserMessageForProviderSend("fixture precondition", taggedFileAttachments: [taggedFile], session: fixture.session)
+            XCTAssertTrue(expanded.contains(content), "The route test must really admit the explicitly attached file: \(expanded)")
             fixture.session.pendingFileAttachments = [image]
             fixture.session.pendingTaggedFileAttachments = [taggedFile]
             fixture.session.selectedWorkflow = workflow
             let rawDraft = "  restore exact superseded input  "
             fixture.viewModel.storeDraftText(for: fixture.tabID, rawDraft)
+            // Settings discovery may finish across the preparation awaits. The connected fake
+            // controller owns availability at this synchronous submission boundary.
+            api.isCodexConnected = true
+            XCTAssertTrue(fixture.viewModel.agentAvailabilityContext.codexAvailable)
             XCTAssertEqual(
                 fixture.viewModel.submitUserTurn(
                     text: rawDraft.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -806,7 +824,12 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             )
             fixture.viewModel.storeDraftText(for: fixture.tabID, "")
 
-            await authorityGate.waitUntilEntered()
+            do {
+                try await authorityGate.waitUntilEntered(timeout: 3)
+            } catch {
+                XCTFail("Route qualification was never reached: \(fixture.viewModel.draftRestorationEvent?.message ?? "no refusal notice")")
+                throw error
+            }
             // Rebind the process run while qualification is suspended. No catalog event is needed.
             fixture.session.installRunID(UUID())
             await authorityGate.open()
