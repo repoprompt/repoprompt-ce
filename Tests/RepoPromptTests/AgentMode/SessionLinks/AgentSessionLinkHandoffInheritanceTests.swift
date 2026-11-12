@@ -188,15 +188,17 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     XCTAssertEqual(vm.currentTabID, session.tabID)
                     XCTAssertNil(session.pendingHandoff.providerSwitchDelivery)
                     XCTAssertFalse(vm.ui.composer.props.areModelControlsDisabled)
-                    let input = AgentInputBar(
+                    let makeInput: (Binding<Bool>) -> AgentInputBar = { resetTrigger in AgentInputBar(
                         agentModeVM: vm, composerUI: vm.ui.composer, statusPillsUI: vm.ui.statusPills,
                         openContextDrawerFiles: {}, oracleViewModel: fixture.window.oracleViewModel,
                         promptManager: fixture.window.promptManager, workspaceSearchService: fixture.window.workspaceSearchService,
                         selectionCoordinator: fixture.window.selectionCoordinator, runtimeVM: AgentRuntimeSidebarViewModel(),
                         windowID: fixture.window.windowID, currentTabID: session.tabID,
-                        resetTextFieldTrigger: .constant(false), composerBottomInset: .constant(0), transcriptBottomClearance: .constant(0)
-                    )
-                    // Inspect the real body value, not a copied action or direct preview helper.
+                        resetTextFieldTrigger: resetTrigger, composerBottomInset: .constant(0), transcriptBottomClearance: .constant(0)
+                    ) }
+                    let input = makeInput(.constant(false))
+                    // Inspect the real InputBar body, not a copied picker action or preview helper.
+                    // The mounted twin below differs only in its production-style reset backing.
                     let composer = try XCTUnwrap(findPickerView(in: input.body, as: AgentComposerView.self))
                     XCTAssertFalse(composer.actions.canSelectAgentInCurrentChat(.codexExec))
                     let destinationModel = AgentModel.gpt6SolHigh.rawValue
@@ -206,7 +208,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     var inputAppeared = false
                     let composerBodiesBeforeMount = (AgentModePerfDiagnostics.debugStateSnapshot(lineLimit: 1)["counters"] as? [String: Int])?["ui.body.composer"] ?? 0
                     let host = NSHostingView(rootView: AnyView(
-                        input
+                        PickerResetBacking(content: makeInput)
                             .environment(\.agentModePerfRecorder, AppAgentModePerfRecorder())
                             .onAppear { inputAppeared = true }
                     ))
@@ -241,6 +243,11 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     XCTAssertGreaterThan(composerBodiesBefore, composerBodiesBeforeMount, "Mounting the real composer must increment the counter.")
                     let composerRevision = vm.ui.composer.revision
                     let publicationCount = 10
+                    let countersBefore = AgentModePerfDiagnostics.debugStateSnapshot(lineLimit: 1)["counters"] as? [String: Int] ?? [:]
+                    let presentationBodiesBefore = countersBefore["ui.body.providerSwitchPresentation"] ?? 0
+                    let chromeBodiesBefore = countersBefore["ui.body.providerSwitchChrome"] ?? 0
+                    XCTAssertGreaterThan(presentationBodiesBefore, 0)
+                    XCTAssertGreaterThan(chromeBodiesBefore, 0)
                     var sidebarPublications = 0
                     let sidebarObservation = vm.$sessionSidebarSearchText.dropFirst().sink { _ in sidebarPublications += 1 }
                     defer { sidebarObservation.cancel() }
@@ -257,9 +264,16 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         await fulfillment(of: [rendered], timeout: 2)
                     }
                     let composerBodiesAfter = (AgentModePerfDiagnostics.debugStateSnapshot(lineLimit: 1)["counters"] as? [String: Int])?["ui.body.composer"] ?? 0
+                    let countersAfter = AgentModePerfDiagnostics.debugStateSnapshot(lineLimit: 1)["counters"] as? [String: Int] ?? [:]
+                    let presentationBodiesAfter = countersAfter["ui.body.providerSwitchPresentation"] ?? 0
+                    let chromeBodiesAfter = countersAfter["ui.body.providerSwitchChrome"] ?? 0
+                    // This pins the observation boundary even when SwiftUI's equality path happens
+                    // to suppress composer bodies. Re-observing the VM above content fails every time.
+                    XCTAssertEqual(presentationBodiesAfter, presentationBodiesBefore, "Unrelated VM writes must not resubmit the composer container.")
+                    XCTAssertGreaterThan(chromeBodiesAfter, chromeBodiesBefore, "The observed banner/sheet leaf must really receive the publications.")
                     XCTAssertEqual(sidebarPublications, publicationCount, "Distinct writes must really publish on the observed VM.")
                     XCTAssertEqual(vm.ui.composer.revision, composerRevision, "Sidebar searches must not change composer inputs.")
-                    XCTContext.runActivity(named: "Unrelated VM publications: \(sidebarPublications); composer bodies: \(composerBodiesBefore) → \(composerBodiesAfter)") { _ in
+                    XCTContext.runActivity(named: "Unrelated VM publications: \(sidebarPublications); container: \(presentationBodiesBefore) → \(presentationBodiesAfter); chrome: \(chromeBodiesBefore) → \(chromeBodiesAfter); composer bodies: \(composerBodiesBefore) → \(composerBodiesAfter)") { _ in
                         XCTAssertEqual(composerBodiesAfter, composerBodiesBefore, "The observed presentation wrapper must preserve the equatable composer boundary.")
                     }
                     XCTAssertNil(window.attachedSheet)
@@ -394,6 +408,16 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 if let editor = findPickerEditor(in: child) { return editor }
             }
             return nil
+        }
+
+        /// Match AgentModeView's state-backed reset binding, not an untracked constant location.
+        private struct PickerResetBacking<Content: View>: View {
+            let content: (Binding<Bool>) -> Content
+            @State private var resetTextFieldTrigger = false
+
+            var body: some View {
+                content($resetTextFieldTrigger)
+            }
         }
 
         private struct PickerStablePresentationControl: View {
