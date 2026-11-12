@@ -530,6 +530,18 @@ final class AgentSessionPersistenceRuntime {
         return .exact(writer)
     }
 
+    /// Removal may discard a clean local projection without asking an unowned writer to
+    /// acknowledge durability. This is not a save result and must be rechecked after awaits.
+    func canRemoveWithoutRequiredSave(for tabID: UUID, workspaceID: UUID) -> Bool {
+        guard let session = sessions[tabID], let sessionID = session.activeAgentSessionID,
+              !session.isDirty, session.saveDebounceTask == nil, session.saveDebounceRequestID == nil,
+              session.creationState == nil, !session.bindingTransitionInProgress,
+              !session.isInstallingHandoffWorktreeBindings, session.persistedLoadTask == nil,
+              requiredSaveExpectation(.currentOwner, tabID: tabID, workspaceID: workspaceID) == nil
+        else { return false }
+        return !queue.hasPendingSave(sessionID: sessionID)
+    }
+
     func flushSaveRequired(
         for tabID: UUID,
         workspaceID: UUID,

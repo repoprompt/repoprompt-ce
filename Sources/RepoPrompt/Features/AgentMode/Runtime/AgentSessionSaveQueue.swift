@@ -9,6 +9,10 @@ final class AgentSessionSaveQueue {
     private var requestedWhileInFlight: Set<UUID> = []
     private var completionWaiters: [UUID: [CheckedContinuation<Void, Never>]] = [:]
 
+    func hasPendingSave(sessionID: UUID) -> Bool {
+        inFlightSessionIDs.contains(sessionID) || requestedWhileInFlight.contains(sessionID)
+    }
+
     func begin(sessionID: UUID) -> Bool {
         guard inFlightSessionIDs.insert(sessionID).inserted else {
             requestFollowUp(sessionID: sessionID)
