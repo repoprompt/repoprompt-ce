@@ -664,6 +664,8 @@ final class AgentTabSession: ObservableObject {
         /// Claude turn completions protected by this accepted steering instruction.
         var supersedingProtectedTurnIDs: Set<UUID> = []
         var skipsSlashExpansion = false
+        /// Provider-only list after read-only composer preparation; original chips remain recoverable.
+        var providerTaggedFileAttachments: [AgentTaggedFileAttachment]?
     }
 
     var pendingClaudeSteeringInstructions: [ClaudeSteeringInstruction] = [] {
@@ -743,6 +745,8 @@ final class AgentTabSession: ObservableObject {
         let createdAt: Date
         var managed: ACPSteeringManagedContext?
         var skipsSlashExpansion = false
+        /// Provider-only list after read-only composer preparation; original chips remain recoverable.
+        var providerTaggedFileAttachments: [AgentTaggedFileAttachment]?
     }
 
     /// Lifecycle disposal withdraws only rows from the exact binding that accepted the steer.

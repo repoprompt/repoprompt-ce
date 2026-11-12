@@ -705,7 +705,7 @@ final class AgentModeRunService {
                 let augmentedSteeringText = await hooks.providerInput.augmentUserMessageForProviderSend(
                     providerTextForSend,
                     steeringBatch.flatMap(\.attachments),
-                    steeringBatch.flatMap(\.taggedFileAttachments),
+                    steeringBatch.flatMap { $0.providerTaggedFileAttachments ?? $0.taggedFileAttachments },
                     session, steeringBatch.contains(where: \.skipsSlashExpansion),
                     {
                         if Task.isCancelled || session.acpSteeringFlushID != flushID
@@ -752,7 +752,7 @@ final class AgentModeRunService {
                 let writeReceipt = ACPAgentSessionController.PromptWriteReceipt()
                 let sent = await submitActiveACPPromptIfSupported(
                     session: session,
-                    messageForRun: augmentedSteeringText,
+                    messageForRun: augmentedSteeringText.text,
                     attachments: steeringBatch.flatMap(\.attachments),
                     targetRunID: runID,
                     targetRunAttemptID: runAttemptID,
@@ -763,6 +763,9 @@ final class AgentModeRunService {
                    session.acpController === controller,
                    hooks.queuedWorkRecovery.isCurrentSessionBinding(session, flushStopFence)
                 {
+                    if sent || writeReceipt.wasWritten {
+                        hooks.providerInput.recordTaggedFileFailures(augmentedSteeringText.failures, session)
+                    }
                     hooks.providerInput.recordPendingHandoffSendOutcome(session, sent || writeReceipt.wasWritten)
                 }
                 if !sent, writeReceipt.wasWritten {
@@ -1311,7 +1314,7 @@ final class AgentModeRunService {
                 let augmentedSteeringText = await hooks.providerInput.augmentUserMessageForProviderSend(
                     steering.providerText,
                     steering.attachments,
-                    steering.taggedFileAttachments,
+                    steering.providerTaggedFileAttachments ?? steering.taggedFileAttachments,
                     session, steering.skipsSlashExpansion, admitsPreparation
                 )
                 guard ownsFlush() else { return }
@@ -1336,7 +1339,7 @@ final class AgentModeRunService {
                 var inputWasAttempted = false
                 let sendOutcome = await dependencies.claudeCoordinator.sendClaudeNativeMessage(
                     session: session,
-                    text: augmentedSteeringText,
+                    text: augmentedSteeringText.text,
                     attachments: [],
                     intent: .runAttempt(ownership: ownership, runID: runID),
                     // The active runner owns the current controller's event stream. Replacing it
@@ -1347,10 +1350,12 @@ final class AgentModeRunService {
                 steeringDebugLog("[AgentRunSteeringWake] Claude flush send completed id=\(steering.id) tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) outcome=\(String(describing: sendOutcome))")
                 switch sendOutcome {
                 case .sent:
+                    hooks.providerInput.recordTaggedFileFailures(augmentedSteeringText.failures, session)
                     hooks.providerInput.recordPendingHandoffSendOutcome(session, true)
                     await hooks.continuation.signalMCPInstructionDelivered(session)
                 case .failed:
                     if inputWasAttempted, session.activeRunOwnership == ownership {
+                        hooks.providerInput.recordTaggedFileFailures(augmentedSteeringText.failures, session)
                         dependencies.claudeCoordinator.notifySteeringSettlement(session: session, protectedIDs: steering.supersedingProtectedTurnIDs, inputWasAttempted: true)
                     }
                     guard ownsFlush() else { return }

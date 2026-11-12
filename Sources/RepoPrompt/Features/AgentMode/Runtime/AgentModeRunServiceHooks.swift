@@ -117,7 +117,8 @@ extension AgentModeRunService {
             _ session: AgentTabSession?,
             _ skipsSlashExpansion: Bool,
             _ isCurrent: @escaping @MainActor () -> Bool
-        ) async -> String
+        ) async -> AgentSessionProviderInputRuntime.ProviderMessage
+        var recordTaggedFileFailures: ([AgentSessionProviderInputRuntime.ExplicitFileFailure], AgentTabSession) -> Void = { _, _ in }
         /// False refuses a fresh-session fallback whose recovery context was superseded or unavailable.
         let stageResumeRecoveryHandoffIfNeeded: (_ session: AgentTabSession) async -> Bool
         /// Prepends a staged handoff payload to provider-facing text.

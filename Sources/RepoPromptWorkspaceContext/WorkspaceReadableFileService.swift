@@ -198,14 +198,7 @@ package struct WorkspaceReadableFileService {
         _ userPath: String,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async throws -> WorkspaceReadableFileHandle? {
-        let roots = await store.rootRefs(scope: rootScope)
-        let namespace = WorkspaceExactFileNamespace.identity(roots: roots)
-        let resolution = try await resolveReadFileRequest(
-            WorkspaceExactFileInput.parse(userPath),
-            rootScope: rootScope,
-            rootRefs: roots,
-            namespace: namespace
-        )
+        let resolution = try await resolveReadFileRequest(userPath, rootScope: rootScope)
         switch resolution {
         case let .workspace(match):
             return .workspace(match.file)
@@ -214,6 +207,18 @@ package struct WorkspaceReadableFileService {
         case .folder, .issue, .noCandidate:
             return nil
         }
+    }
+
+    /// Retain resolution diagnostics for callers that must account for explicit attachments.
+    package func resolveReadFileRequest(
+        _ userPath: String,
+        rootScope: WorkspaceLookupRootScope = .visibleWorkspace
+    ) async throws -> WorkspaceReadableFileResolution {
+        let roots = await store.rootRefs(scope: rootScope)
+        return try await resolveReadFileRequest(
+            WorkspaceExactFileInput.parse(userPath), rootScope: rootScope, rootRefs: roots,
+            namespace: .identity(roots: roots)
+        )
     }
 
     package func resolveReadFileRequest(

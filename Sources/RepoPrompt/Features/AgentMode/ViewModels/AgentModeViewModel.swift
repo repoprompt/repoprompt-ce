@@ -312,6 +312,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var test_providerSwitchBeforeSave: (@MainActor (TabSession) -> Void)?
         var test_providerSwitchStart: (@MainActor (TabSession, String, String) async -> Void)?
         var test_beforeProviderSwitchScheduledAdmission: (@MainActor (TabSession) async -> Void)?
+        var test_afterExplicitTaggedFilePreparation: (@MainActor (TabSession) async -> Void)?
         var test_beforeProviderSwitchPreviewRefresh: (@MainActor (TabSession) async -> Void)?
         var test_providerSwitchForceStop: (@MainActor (TabSession) async -> Void)?
         var test_providerSwitchStopDeadlineSeconds: TimeInterval = AgentRunStopState.managedStopDeadlineSeconds
@@ -3862,16 +3863,23 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     )
                 },
                 augmentUserMessageForProviderSend: { [weak self] text, attachments, taggedFileAttachments, session, skipsSlashExpansion, isCurrent in
-                    guard let self else { return text }
-                    return await augmentUserMessageForProviderSend(
+                    guard let self else { return .init(text: text) }
+                    var failures: [AgentSessionProviderInputRuntime.ExplicitFileFailure] = []
+                    let prepared = await augmentUserMessageForProviderSend(
                         text,
                         attachments: attachments,
                         taggedFileAttachments: taggedFileAttachments,
                         agent: session?.selectedAgent,
                         session: session,
                         skipsSlashExpansion: skipsSlashExpansion,
+                        onTaggedFileFailures: { failures = $0 },
                         shouldPublishCatalog: isCurrent
                     )
+                    return .init(text: prepared, failures: failures)
+                },
+                recordTaggedFileFailures: { [weak scope = runtimeSessionStore] failures, session in
+                    guard let scope else { return }
+                    AgentSessionProviderInputRuntime.recordTaggedFileFailures(failures, session: session, scope: scope)
                 },
                 stageResumeRecoveryHandoffIfNeeded: { [weak self] session in
                     await self?.prepareResumeRecoveryHandoff(for: session).permitsFreshSession ?? false
@@ -15812,6 +15820,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // An unloaded payload may restore a pending switch. Its composer remains untouched until
         // hydration and actual input admission finish.
         if session.pendingHandoff.providerSwitchDelivery == nil,
+           !(isLocalComposerInput && codexAttemptID == nil && !taggedFilesToSend.isEmpty),
            session.activeAgentSessionID == nil || session.hasLoadedPersistedState
         {
             session.selectedWorkflow = nil
@@ -16126,7 +16135,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         selectedWorkflowMutationGeneration: UInt64?,
         managedTurn: AgentNoncomposerTurn? = nil,
         localComposerCandidate: UUID? = nil,
-        skipsSlashExpansion: Bool = false
+        skipsSlashExpansion: Bool = false,
+        providerTaggedFiles: [AgentTaggedFileAttachment]? = nil
     ) {
         let expectedOwnership = session.activeRunOwnership
         let expectedWaitID = session.instructionWaitID
@@ -16186,13 +16196,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 return
             }
 
+            var taggedFileFailures: [AgentSessionProviderInputRuntime.ExplicitFileFailure] = []
             let augmentedText = await augmentUserMessageForProviderSend(
                 text,
                 attachments: attachments,
-                taggedFileAttachments: taggedFiles,
+                taggedFileAttachments: providerTaggedFiles ?? taggedFiles,
                 agent: session.selectedAgent,
                 session: session,
-                skipsSlashExpansion: skipsSlashExpansion
+                skipsSlashExpansion: skipsSlashExpansion,
+                onTaggedFileFailures: { taggedFileFailures = $0 },
+                shouldPublishCatalog: stillOwnsContinuation
             )
             guard stillOwnsContinuation() else {
                 rollbackWaitingInstructionSubmission(
@@ -16341,6 +16354,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 )
                 return
             }
+            AgentSessionProviderInputRuntime.recordTaggedFileFailures(taggedFileFailures, session: session, scope: runtimeSessionStore)
             session.deferredActiveAgentRunTimerRollback = nil
             managedTurn?.sink.resolve(.delivered(.deliveredToWaitingInstruction))
         }
@@ -16642,6 +16656,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         isLocalComposerInput: Bool = true,
         providerSwitchPreparation: ProviderSwitchSendPreparation? = nil,
         providerSwitchClaim: AgentComposerSubmitClaim? = nil,
+        preparedTaggedInput: String? = nil,
         scheduledProviderSwitchSubmission: ((Task<UserTurnSubmissionResult, Never>) -> Void)? = nil
     ) -> UserTurnSubmissionResult {
         guard repromptedText == nil || (isLocalComposerInput && managedTurn == nil) else { return .blocked(message: "Re-prompt is local composer input only.") }
@@ -16693,7 +16708,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // A managed steer carries its own RepoPrompt-framed provider text and never consumes the
         // target user's interview preference.
         let computerUseArmedAtComposition = session.isCodexComputerUseArmed
-        let wrappedText = providerSwitchPreparation?.rawInput ?? composeOrdinaryUserTurnText(
+        let unexpandedWrappedText = composeOrdinaryUserTurnText(
             managedTurn?.providerText ?? nativePreparedTurn?.providerText ?? trimmedText,
             computerUseArmed: nativePreparedTurn == nil && computerUseArmedAtComposition,
             includesInterview: managedTurn == nil && interviewFirst
@@ -16701,6 +16716,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             workflow: activeWorkflow,
             includeBuiltInCleanupGuidance: GlobalSettingsStore.shared.showBuiltInWorkflowCleanupGuidance()
         )
+        let wrappedText = providerSwitchPreparation?.rawInput ?? preparedTaggedInput ?? unexpandedWrappedText
         // Once the .sending dispatch is owned by a live run (ACP keeps the marker until the turn's
         // physical acceptance), ordinary input is steering or continuation on that same run, not a
         // new handover decision. Routing it through switch admission would refuse it — including the
@@ -16712,8 +16728,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             && session.runState == .waitingForUser && session.instructionContinuation != nil
             && Self.providerSwitchHasOwnedCarryingAttempt(session)
             && session.pendingHandoff.providerSwitchDispatch?.dispatchID != nil
-        if session.pendingHandoff.providerSwitchDelivery != nil, providerSwitchPreparation == nil,
-           !switchInFlightOnActiveRun
+        let requiresAttachmentAdmission = isLocalComposerInput && managedTurn == nil && codexAttemptID == nil
+            && !taggedFilesToSend.isEmpty && preparedTaggedInput == nil
+        if (session.pendingHandoff.providerSwitchDelivery != nil && providerSwitchPreparation == nil && !switchInFlightOnActiveRun)
+            || requiresAttachmentAdmission
         {
             let claim: AgentComposerSubmitClaim
             let ownsClaim = providerSwitchClaim == nil
@@ -16728,6 +16746,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             let capturedHandoff = session.pendingHandoff
             let capturedBinding = session.currentRestorationBindingToken
+            let capturedWorkspaceID = workspaceManager?.activeWorkspaceID
+            let capturedAgent = session.selectedAgent
+            let capturedModel = session.selectedModelRaw
             let capturedStop = stopFence ?? claim.cancellation.pendingStartFence(for: session)
                 ?? AgentRunStartStopFence(session: session)
             let task = Task<UserTurnSubmissionResult, Never> { @MainActor [self] in
@@ -16740,11 +16761,45 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
                 guard sessions[tabID] === session, session.currentRestorationBindingToken == capturedBinding,
                       session.pendingHandoff == capturedHandoff else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
-                let admission = await providerSwitchSendAdmission(
-                    session: session, input: wrappedText, attachments: attachmentsToSend, taggedFiles: taggedFilesToSend,
-                    skipsSlashExpansion: repromptedText != nil,
-                    isCurrent: { self.composerSubmitClaimIsCurrent(claim) && capturedStop.permitsStart(of: session) }
-                )
+                @MainActor func inputIsCurrent() -> Bool {
+                    composerSubmitClaimIsCurrent(claim) && capturedStop.permitsStart(of: session)
+                        && workspaceManager?.activeWorkspaceID == capturedWorkspaceID && !Task.isCancelled
+                        && session.pendingHandoff == capturedHandoff
+                        && session.selectedAgent == capturedAgent && session.selectedModelRaw == capturedModel
+                        && session.isCodexComputerUseArmed == computerUseArmedAtComposition
+                }
+                var preparedInput = preparedTaggedInput
+                if requiresAttachmentAdmission {
+                    let result = await providerInputRuntime.prepareUserInput(
+                        wrappedText, taggedFileAttachments: taggedFilesToSend, agent: session.selectedAgent,
+                        workspacePaths: currentWorkspacePaths(),
+                        workspace: { self.providerWorkspaceSource(tabID: tabID, session: session) },
+                        skipsSlashExpansion: repromptedText != nil, isCurrent: inputIsCurrent
+                    )
+                    guard inputIsCurrent() else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
+                    if let failure = result.failureMessage {
+                        let message = failure + "\nRemove the attachment(s) or retry before sending."
+                        if ownsClaim, scheduledProviderSwitchSubmission == nil {
+                            restoreComposerDraft(tabID: tabID, text: "", message: message, strategy: .prependAlways)
+                        }
+                        return .blocked(message: message)
+                    }
+                    preparedInput = result.text
+                    #if DEBUG
+                        await test_afterExplicitTaggedFilePreparation?(session)
+                    #endif
+                    guard inputIsCurrent() else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
+                }
+                let admission: Result<ProviderSwitchSendPreparation?, AgentSessionLinkSendFailure> = if switchInFlightOnActiveRun || capturedHandoff.providerSwitchDelivery == nil {
+                    .success(nil)
+                } else {
+                    await providerSwitchSendAdmission(
+                        session: session, input: preparedInput ?? wrappedText, attachments: attachmentsToSend,
+                        taggedFiles: preparedInput == nil ? taggedFilesToSend : [],
+                        skipsSlashExpansion: preparedInput != nil || repromptedText != nil,
+                        isCurrent: inputIsCurrent
+                    )
+                }
                 switch admission {
                 case let .failure(failure):
                     let message = failure == .providerHandoverDoesNotFit && isLocalComposerInput
@@ -16754,8 +16809,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     managedTurn?.sink.resolve(.notAccepted(message: message))
                     return .blocked(message: message)
                 case let .success(preparation):
-                    guard let preparation, composerSubmitClaimIsCurrent(claim), capturedStop.permitsStart(of: session),
-                          !Task.isCancelled else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
+                    guard inputIsCurrent() else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
+                    guard capturedHandoff.providerSwitchDelivery == nil || switchInFlightOnActiveRun || preparation != nil
+                    else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
                     let result = submitPreparedUserTurn(
                         tabID: tabID, session: session, trimmedText: originalText,
                         attachmentsToSend: attachmentsToSend, taggedFilesToSend: taggedFilesToSend,
@@ -16766,7 +16822,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         restorationSelectedWorkflow: restorationSelectedWorkflow,
                         restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
                         managedTurn: managedTurn, stopFence: capturedStop, isLocalComposerInput: isLocalComposerInput,
-                        providerSwitchPreparation: preparation, providerSwitchClaim: claim
+                        providerSwitchPreparation: preparation, providerSwitchClaim: claim,
+                        preparedTaggedInput: preparedInput
                     )
                     if result == .submitted, ownsClaim, isLocalComposerInput { clearComposerDraftIfUnchanged(for: claim) }
                     return result
@@ -16775,11 +16832,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             scheduledProviderSwitchSubmission?(task)
             return .submitted // Existing sync ingress means scheduled; claimed/MCP callers await it.
         }
+        // Original attachments remain on the row and in every recovery snapshot. Only the
+        // provider-facing list is consumed: prepared bytes must not be read a second time.
+        let providerTaggedFiles = preparedTaggedInput == nil ? taggedFilesToSend : []
+        let providerSkipsSlashExpansion = preparedTaggedInput != nil || repromptedText != nil
         if let providerSwitchPreparation {
             guard providerSwitchPreparationIsCurrent(providerSwitchPreparation, session: session)
             else {
                 return .blocked(message: AgentSessionLinkSendFailure.providerHandoverNeedsReview.message)
             }
+        }
+        if providerSwitchPreparation != nil || preparedTaggedInput != nil {
             if isLocalComposerInput {
                 if session.userWorkflowSelectionMutationGeneration == restorationSelectedWorkflowMutationGeneration {
                     session.selectedWorkflow = nil
@@ -16822,7 +16885,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             sequenceIndex: session.nextSequenceIndex,
             workflow: activeWorkflow,
             crossSessionAttribution: managedTurn?.attribution,
-            dispatchedProviderText: managedTurn != nil || repromptedText != nil ? wrappedText : nil
+            dispatchedProviderText: managedTurn != nil || repromptedText != nil ? unexpandedWrappedText : nil
         )
         let acceptedSwitchPreparation = providerSwitchPreparation?.accepting(userItem.id, session: session)
         let turnRuntimeAnchorRollback = recordAgentTurnUserAnchor(for: session, userItem: userItem)
@@ -16883,7 +16946,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         updateBindingsFromSession(session)
         scheduleSave(for: tabID)
 
-        let steeringMessage = trimmedText.isEmpty ? nil : (repromptedText == nil ? trimmedText : wrappedText)
+        let steeringMessage = trimmedText.isEmpty ? nil : (repromptedText == nil ? trimmedText : unexpandedWrappedText)
         if session.runState == .running,
            !session.isMCPInstructionDispatchInProgress
         {
@@ -16944,7 +17007,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
                 managedTurn: managedTurn,
                 localComposerCandidate: localComposerCandidate,
-                skipsSlashExpansion: repromptedText != nil
+                skipsSlashExpansion: providerSkipsSlashExpansion,
+                providerTaggedFiles: providerTaggedFiles
             )
             return UserTurnSubmissionResult.submitted
         }
@@ -17022,10 +17086,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         tabID: tabID,
                         initialMessage: wrappedText,
                         attachments: attachmentsToSend,
-                        taggedFileAttachments: taggedFilesToSend,
+                        taggedFileAttachments: providerTaggedFiles,
                         codexFallbackContext: fallbackContext,
                         autoEffortSelection: autoEffortSelection,
-                        directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: producerStopFence),
+                        directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: providerSkipsSlashExpansion, stopFence: producerStopFence),
                         providerSwitchPreparation: acceptedSwitchPreparation
                     )
                 } else {
@@ -17169,9 +17233,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         tabID: tabID,
                         initialMessage: wrappedText,
                         attachments: attachmentsToSend,
-                        taggedFileAttachments: taggedFilesToSend,
+                        taggedFileAttachments: providerTaggedFiles,
                         autoEffortSelection: autoEffortSelection,
-                        directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: resumedFence, localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id),
+                        directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: providerSkipsSlashExpansion, stopFence: resumedFence, localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id, restorationDraftText: restorationDraftText),
                         providerSwitchPreparation: acceptedSwitchPreparation
                     )
                 }
@@ -17193,7 +17257,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
                     managedTurn: managedTurn,
                     localComposerCandidate: localComposerCandidate,
-                    skipsSlashExpansion: repromptedText != nil
+                    skipsSlashExpansion: providerSkipsSlashExpansion,
+                    providerTaggedFiles: providerTaggedFiles
                 )
                 return UserTurnSubmissionResult.submitted
             }
@@ -17230,9 +17295,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     tabID: tabID,
                     initialMessage: wrappedText,
                     attachments: attachmentsToSend,
-                    taggedFileAttachments: taggedFilesToSend,
+                    taggedFileAttachments: providerTaggedFiles,
                     autoEffortSelection: autoEffortSelection,
-                    directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: producerStopFence, localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id),
+                    directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: providerSkipsSlashExpansion, stopFence: producerStopFence, localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id, restorationDraftText: restorationDraftText),
                     providerSwitchPreparation: acceptedSwitchPreparation
                 )
             }
@@ -17248,7 +17313,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 userInputTokenEstimate: userInputTokenEstimate,
                 managedTurn: managedTurn,
                 localComposerCandidate: localComposerCandidate,
-                skipsSlashExpansion: repromptedText != nil
+                skipsSlashExpansion: providerSkipsSlashExpansion,
+                providerTaggedFiles: providerTaggedFiles
             )
             if !accepted {
                 session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
@@ -17263,8 +17329,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             // Shared follow-up queue for providers that consume queued instructions at the next turn boundary.
             session.pendingInstructions.append(.init(
                 providerText: wrappedText,
-                localDraftText: managedTurn == nil ? (repromptedText == nil ? wrappedText : restorationDraftText) : nil,
-                skipsSlashExpansion: repromptedText != nil
+                localDraftText: managedTurn == nil ? (preparedTaggedInput == nil && repromptedText == nil ? wrappedText : restorationDraftText) : nil,
+                skipsSlashExpansion: providerSkipsSlashExpansion
             ))
             // Accepted retained follow-up ownership: later Stop/provider failure restores drafts,
             // not this local user row. This is not the optimistic append boundary.
@@ -17378,7 +17444,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         userInputTokenEstimate: Int,
         managedTurn: AgentNoncomposerTurn? = nil,
         localComposerCandidate: UUID? = nil,
-        skipsSlashExpansion: Bool = false
+        skipsSlashExpansion: Bool = false,
+        providerTaggedFiles: [AgentTaggedFileAttachment]? = nil
     ) -> Bool {
         // Steering recovery restores a queued instruction's draft into the composer. A managed
         // steer carries none, so a withdrawn one can never reappear as the target user's draft.
@@ -17409,7 +17476,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         attribution: $0.attribution
                     )
                 },
-                skipsSlashExpansion: skipsSlashExpansion
+                skipsSlashExpansion: skipsSlashExpansion,
+                providerTaggedFileAttachments: providerTaggedFiles
             )
             session.pendingACPSteeringInstructions.append(steering)
             session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
@@ -17435,6 +17503,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 attachments: attachmentsToSend, taggedFiles: taggedFilesToSend,
                 draftText: restorableDraftText, userItem: userItem,
                 localComposerCandidate: localComposerCandidate, skipsSlashExpansion: skipsSlashExpansion,
+                providerTaggedFiles: providerTaggedFiles,
                 accepted: { managedTurn?.sink.resolve(.delivered(.queuedInterrupt)) }
             )
         }
@@ -17964,8 +18033,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session: TabSession? = nil,
         ignoresPendingHandoff: Bool = false,
         skipsSlashExpansion: Bool = false,
+        onTaggedFileFailures: ([AgentSessionProviderInputRuntime.ExplicitFileFailure]) -> Void = { _ in },
         shouldPublishCatalog: @MainActor () -> Bool = { true }
     ) async -> String {
+        var taggedFileFailures: [AgentSessionProviderInputRuntime.ExplicitFileFailure] = []
         let effectiveAgent = agent ?? session?.selectedAgent ?? activeSession?.selectedAgent ?? selectedAgent
         let providerText = await providerInputRuntime.augmentUserMessage(
             text,
@@ -17978,7 +18049,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             handoff: handoffRuntime,
             ignoresPendingHandoff: ignoresPendingHandoff,
             skipsSlashExpansion: skipsSlashExpansion,
-            isCurrent: shouldPublishCatalog
+            isCurrent: shouldPublishCatalog,
+            onTaggedFileFailures: { taggedFileFailures = $0 }
         )
         guard shouldPublishCatalog() else { return providerText }
         #if DEBUG
@@ -17986,6 +18058,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 await test_afterProviderInputAugmentation?()
             }
         #endif
+        if shouldPublishCatalog(), !Task.isCancelled { onTaggedFileFailures(taggedFileFailures) }
         return providerText
     }
 

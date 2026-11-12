@@ -47,17 +47,13 @@ final class AgentSessionProviderInputRuntime {
         session: AgentTabSession?,
         handoff: AgentSessionHandoffRuntime,
         ignoresPendingHandoff: Bool,
-        isCurrent: @MainActor () -> Bool
+        isCurrent: @MainActor () -> Bool,
+        onTaggedFileFailures: ([ExplicitFileFailure]) -> Void = { _ in }
     ) async -> String {
-        let withTaggedFiles: String = if let context {
-            await Self.augmentUserMessageWithTaggedFileContents(
-                text, taggedFileAttachments: taggedFileAttachments,
-                store: context.store, lookupContext: context.lookup
-            )
-        } else {
-            text
-        }
+        let tagged = await Self.prepareTaggedFileContents(text, taggedFileAttachments: taggedFileAttachments, context: context)
+        let withTaggedFiles = tagged.warningText
         guard isCurrent() else { return withTaggedFiles }
+        onTaggedFileFailures(tagged.failures)
         let rendered = Self.renderProviderMessage(text: withTaggedFiles, attachments: attachments, agent: agent)
         if let session, !ignoresPendingHandoff {
             return handoff.prependPendingHandoffIfNeeded(rendered, session: session)
@@ -67,8 +63,8 @@ final class AgentSessionProviderInputRuntime {
 
     private static let taggedFileTrailingTrimSet = CharacterSet(charactersIn: ").,;:!?]}")
     private static let taggedFileTerminatingScalars = CharacterSet.whitespacesAndNewlines
-    private static let taggedFileContentsTokenBudget = 12000
-    private static let taggedFileContentsMaxFiles = 5
+    nonisolated static let taggedFileContentsTokenBudget = 12000
+    nonisolated static let taggedFileContentsMaxFiles = 5
     private static let slashSkillNameScalars = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
 
     func resolvedSlashSkillInvocations(in text: String, agentKind: AgentProviderKind) -> [AgentResolvedSlashSkillInvocation] {
@@ -322,116 +318,14 @@ final class AgentSessionProviderInputRuntime {
         store: WorkspaceFileContextStore,
         lookupContext: WorkspaceLookupContext = .visibleWorkspace
     ) async -> String? {
-        guard !taggedPaths.isEmpty else { return nil }
-
-        enum TaggedReadableFile {
-            case workspace(ResolvedPromptFileEntry)
-            case external(WorkspaceExternalReadableFile)
-        }
-
-        let readableService = WorkspaceReadableFileService(store: store)
-        var orderedFiles: [TaggedReadableFile] = []
-        orderedFiles.reserveCapacity(min(taggedPaths.count, maxFiles))
-        var workspaceEntries: [ResolvedPromptFileEntry] = []
-        workspaceEntries.reserveCapacity(min(taggedPaths.count, maxFiles))
-        var seenFileIDs = Set<UUID>()
-        var seenExternalPaths = Set<String>()
-        let scopedRootRefs = await store.rootRefs(scope: lookupContext.rootScope)
-        let rootsByID = Dictionary(uniqueKeysWithValues: scopedRootRefs.map { ($0.id, $0) })
-        let displayRootRefs = lookupContext.bindingProjection?.visibleLogicalRootRefs ?? scopedRootRefs
-
-        for taggedPath in taggedPaths {
-            guard orderedFiles.count < maxFiles else { break }
-            let translatedPath = lookupContext.translateInputPath(taggedPath)
-            guard let readable = try? await readableService.resolveReadableFile(
-                translatedPath,
-                rootScope: lookupContext.rootScope
-            ) else { continue }
-            switch readable {
-            case let .workspace(file):
-                guard seenFileIDs.insert(file.id).inserted,
-                      let content = try? await store.readContent(rootID: file.rootID, relativePath: file.standardizedRelativePath),
-                      let root = rootsByID[file.rootID]
-                else { continue }
-                let entry = ResolvedPromptFileEntry(
-                    file: file,
-                    isCodemap: false,
-                    mode: .fullFile,
-                    loadedContent: content,
-                    rootFolderPath: root.standardizedFullPath
-                )
-                workspaceEntries.append(entry)
-                orderedFiles.append(.workspace(entry))
-            case let .external(externalFile):
-                guard seenExternalPaths.insert(externalFile.absolutePath).inserted else { continue }
-                orderedFiles.append(.external(externalFile))
-            }
-        }
-
-        guard !orderedFiles.isEmpty else { return nil }
-
-        let workspaceBlocks = PromptPackagingService.generateFileBlocksDetailed(
-            files: workspaceEntries,
-            filePathDisplay: .relative,
-            codemapPresentation: .empty,
-            displayPathResolver: { entry in
-                if let projected = lookupContext.bindingProjection?.projectedLogicalPathComponents(
-                    forPhysicalPath: entry.file.standardizedFullPath
-                ) {
-                    return ClientPathFormatter.nonAbsoluteDisplayPath(
-                        root: projected.root,
-                        relativePath: projected.relativePath,
-                        visibleRoots: displayRootRefs
-                    )
-                }
-                guard let root = rootsByID[entry.file.rootID] else {
-                    return entry.file.standardizedRelativePath
-                }
-                return ClientPathFormatter.nonAbsoluteDisplayPath(
-                    root: root,
-                    relativePath: entry.file.standardizedRelativePath,
-                    visibleRoots: displayRootRefs
-                )
-            }
+        let result = await prepareTaggedFileContents(
+            "", taggedFileAttachments: [], context: .init(store: store, lookup: lookupContext),
+            tokenBudget: tokenBudget, maxFiles: maxFiles, inferredPaths: taggedPaths
         )
-        let workspaceBlocksByID = Dictionary(uniqueKeysWithValues: workspaceBlocks.map { ($0.file.id, $0.text) })
-
-        var blocks: [String] = []
-        blocks.reserveCapacity(orderedFiles.count)
-        for file in orderedFiles {
-            switch file {
-            case let .workspace(workspaceEntry):
-                guard let block = workspaceBlocksByID[workspaceEntry.file.id], !block.isEmpty else { continue }
-                blocks.append(block)
-            case let .external(externalFile):
-                guard let content = try? await readableService.readAlwaysReadableExternalFile(externalFile) else { continue }
-                blocks.append(Self.externalTaggedFileBlock(displayPath: externalFile.displayPath, content: content))
-            }
-        }
-
-        guard !blocks.isEmpty else { return nil }
-
-        var acceptedBlocks: [String] = []
-        acceptedBlocks.reserveCapacity(blocks.count)
-        var runningTokens = 0
-        for block in blocks {
-            let blockTokens = TokenCalculationService.estimateTokens(for: block)
-            if runningTokens + blockTokens > tokenBudget {
-                break
-            }
-            acceptedBlocks.append(block)
-            runningTokens += blockTokens
-        }
-
-        guard !acceptedBlocks.isEmpty else { return nil }
-        return """
-        <file_contents>
-        \(acceptedBlocks.joined(separator: "\n\n"))
-        </file_contents>
-        """
+        return result.text.isEmpty ? nil : result.text
     }
 
-    private nonisolated static func externalTaggedFileBlock(displayPath: String, content: String) -> String {
+    nonisolated static func externalTaggedFileBlock(displayPath: String, content: String) -> String {
         let fence = PromptPackagingService.codeFenceStart(for: displayPath)
         return """
         File: \(displayPath)
@@ -561,36 +455,9 @@ final class AgentSessionProviderInputRuntime {
         store: WorkspaceFileContextStore,
         lookupContext: WorkspaceLookupContext = .visibleWorkspace
     ) async -> String {
-        guard !text.contains("<file_contents>") else { return text }
-        var orderedPaths: [String] = []
-        var seen = Set<String>()
-        for taggedPath in Self.extractTaggedPaths(from: text) {
-            let normalized = Self.unescapeTaggedPath(taggedPath)
-            guard !normalized.isEmpty else { continue }
-            if seen.insert(normalized).inserted {
-                orderedPaths.append(normalized)
-            }
-        }
-        for attachment in taggedFileAttachments {
-            let normalized = Self.unescapeTaggedPath(attachment.relativePath)
-            guard !normalized.isEmpty else { continue }
-            if seen.insert(normalized).inserted {
-                orderedPaths.append(normalized)
-            }
-        }
-        guard !orderedPaths.isEmpty else { return text }
-        guard let xml = await taggedFileContentsXMLForTaggedPaths(
-            orderedPaths,
-            tokenBudget: Self.taggedFileContentsTokenBudget,
-            maxFiles: Self.taggedFileContentsMaxFiles,
-            store: store,
-            lookupContext: lookupContext
-        ) else {
-            return text
-        }
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return xml }
-        return "\(text)\n\n\(xml)"
+        await prepareTaggedFileContents(
+            text, taggedFileAttachments: taggedFileAttachments, context: .init(store: store, lookup: lookupContext)
+        ).warningText
     }
 
     func buildHeadlessAgentMessage(

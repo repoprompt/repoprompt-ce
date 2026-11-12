@@ -128,6 +128,8 @@ struct AgentDirectRunStartOptions: Equatable {
     /// Exact row appended by this submission, never inferred from transcript history.
     /// Auto-wake and maintenance producers append no user row and leave this absent.
     var initialUserItemID: UUID?
+    /// Original composer snapshot, separate from provider text containing prepared file bytes.
+    var restorationDraftText: String?
     var skipsUserAugmentation: Bool {
         isLaneUpdate || periodicWakeID != nil || providerControlCommand != nil || selfCompactDispatchID != nil
     }

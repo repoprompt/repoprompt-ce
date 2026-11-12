@@ -33,7 +33,8 @@ extension AgentSessionProviderInputRuntime {
         handoff: AgentSessionHandoffRuntime,
         ignoresPendingHandoff: Bool,
         skipsSlashExpansion: Bool,
-        isCurrent: @MainActor () -> Bool
+        isCurrent: @MainActor () -> Bool,
+        onTaggedFileFailures: ([ExplicitFileFailure]) -> Void = { _ in }
     ) async -> String {
         guard isCurrent() else { return text }
         let expanded = skipsSlashExpansion ? text : await expandSlashSkillInvocationIfNeeded(
@@ -51,8 +52,31 @@ extension AgentSessionProviderInputRuntime {
         return await finishUserMessage(
             expanded, attachments: attachments, taggedFileAttachments: taggedFileAttachments,
             agent: agent, context: context, session: session, handoff: handoff,
-            ignoresPendingHandoff: ignoresPendingHandoff, isCurrent: isCurrent
+            ignoresPendingHandoff: ignoresPendingHandoff, isCurrent: isCurrent,
+            onTaggedFileFailures: onTaggedFileFailures
         )
+    }
+
+    /// Read-only composer admission: skill and file bytes are captured before any user state changes.
+    func prepareUserInput(
+        _ text: String,
+        taggedFileAttachments: [AgentTaggedFileAttachment],
+        agent: AgentProviderKind,
+        workspacePaths: [String],
+        workspace: @MainActor () -> WorkspaceSource?,
+        skipsSlashExpansion: Bool,
+        isCurrent: @MainActor () -> Bool
+    ) async -> TaggedFileAugmentation {
+        guard isCurrent() else { return .init(text: text, includedPaths: [], failures: []) }
+        let expanded = skipsSlashExpansion ? text : await expandSlashSkillInvocationIfNeeded(
+            text, agentKind: agent, workspacePaths: workspacePaths, shouldPublishCatalog: isCurrent
+        )
+        guard isCurrent() else { return .init(text: text, includedPaths: [], failures: []) }
+        let context: Context? = if let source = workspace() {
+            await Context(store: source.store, lookup: source.lookupContext())
+        } else { nil }
+        guard isCurrent() else { return .init(text: text, includedPaths: [], failures: []) }
+        return await Self.prepareTaggedFileContents(expanded, taggedFileAttachments: taggedFileAttachments, context: context)
     }
 
     /// Resource capture remains host-composed; context construction and admission are runtime work.

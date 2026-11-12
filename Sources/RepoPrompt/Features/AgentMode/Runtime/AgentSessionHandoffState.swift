@@ -102,6 +102,7 @@ struct AgentProviderSwitchSendPreparation {
     let autoWakeID: UUID?
     let stopFence: AgentRunStartStopFence
     var acceptedInputID: UUID?
+    var taggedFileFailures: [AgentSessionProviderInputRuntime.ExplicitFileFailure] = []
 
     @MainActor
     func accepting(_ itemID: UUID, session: AgentTabSession) -> Self {
