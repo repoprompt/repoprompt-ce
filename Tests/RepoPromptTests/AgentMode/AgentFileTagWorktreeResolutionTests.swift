@@ -3,6 +3,7 @@ import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptInstrumentation
 @testable import RepoPromptWorkspaceContext
+import RepoPromptWorkspaceCore
 import XCTest
 
 final class AgentFileTagWorktreeResolutionTests: XCTestCase {
@@ -125,6 +126,196 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
         let refused = await unpublished.expandSlashSkillInvocationIfNeeded("/skill:compact do not publish", agentKind: .claudeCode, workspacePaths: [root.path], shouldPublishCatalog: { false })
         XCTAssertEqual(refused, "/skill:compact do not publish")
         XCTAssertNil(freshCatalog.resolve(name: "compact"), "A refused discovery must not publish a skill catalog")
+    }
+
+    @MainActor
+    func testRuntimeSkillExpansionReadsJustInstalledSkillWithoutWatcherSignal() async throws {
+        let root = try makeTemporaryRoot(name: "ProviderInputNewSkill")
+        let catalog = AgentSkillCatalog(homeDirectoryURL: root.appendingPathComponent("home"))
+        await catalog.refresh(workspacePaths: [root.path], agentKind: .openCode)
+        XCTAssertNil(catalog.resolve(name: "large"))
+        let content = String(repeating: "expanded context ", count: 1000) + "END_FIXTURE"
+        try write("---\nname: large\ndescription: Fixture\n---\n\(content)", to: root.appendingPathComponent(".agents/skills/large/SKILL.md"))
+        let input = AgentSessionProviderInputRuntime(skillCatalog: catalog)
+        // No markDirty, debounce or watcher delivery: the unresolved-token fallback must
+        // await direct filesystem discovery even though the initial cache is clean.
+        let expanded = await input.expandSlashSkillInvocationIfNeeded("/large short", agentKind: .openCode, workspacePaths: [root.path])
+        XCTAssertTrue(expanded.contains(content), "skill=true: the send must discover a just-installed skill")
+        XCTAssertTrue(expanded.contains("<selected_skill_context name=\"large\""))
+    }
+
+    @MainActor
+    func testRuntimeTaggedFileExpansionRetainsConcurrentCatalogPublication() async throws {
+        let points: [WorkspaceFileContextStore.ExactFileSuspensionPoint] = [
+            .candidateEligibility, .candidateObservation, .explicitMaterializationEligibility, .explicitManagedRegistration
+        ]
+        for point in points {
+            for relativePath in [false, true] {
+                try await assertRuntimeTaggedFileExpansion(point: point, relativePath: relativePath)
+            }
+        }
+    }
+
+    @MainActor
+    func testRuntimeTaggedFileExpansionRetainsPublisherFileAddition() async throws {
+        try await assertRuntimeTaggedFileExpansion(point: .candidateEligibility, relativePath: false, viaPublisher: true)
+    }
+
+    @MainActor
+    private func assertRuntimeTaggedFileExpansion(
+        point: WorkspaceFileContextStore.ExactFileSuspensionPoint,
+        relativePath: Bool,
+        viaPublisher: Bool = false
+    ) async throws {
+        let rootURL = try makeTemporaryRoot(name: "ProviderInputCatalogPublication")
+        let store = WorkspaceFileContextStore()
+        let root = try await store.loadRoot(path: rootURL.path)
+        if viaPublisher {
+            let attached = try await store.attachPublisherIngressWithoutStartingWatcherForTesting(rootID: root.id)
+            XCTAssertTrue(attached, "Publisher ingress must be installed before emitting the controlled file-add")
+        }
+        let watcherGate = AgentFileTagTestAsyncGate()
+        let lookupGate = AgentFileTagTestAsyncGate()
+        // Hold natural watcher delivery so the absent -> published transition is controlled,
+        // rather than depending on how soon FSEvents happens to deliver the new file.
+        await store.setWatcherSinkWillApplyHandler { _ in await watcherGate.wait() }
+        await store.setExactFileSuspensionGateForTesting(point: point, rootID: root.id) {
+            await lookupGate.wait()
+        }
+        addTeardownBlock {
+            await lookupGate.open()
+            await watcherGate.open()
+            await store.clearExactFileCandidateProbeGateForTesting()
+            await store.setWatcherSinkWillApplyHandler(nil)
+            await store.unloadRoot(id: root.id)
+        }
+        let content = String(repeating: "expanded context ", count: 1000) + "END_FIXTURE"
+        let fileURL = rootURL.appendingPathComponent("large.txt")
+        try write(content, to: fileURL)
+        let before = await store.file(rootID: root.id, relativePath: "large.txt")
+        XCTAssertNil(before)
+        let input = AgentSessionProviderInputRuntime(skillCatalog: AgentSkillCatalog(homeDirectoryURL: rootURL.appendingPathComponent("home")))
+        let scope = AgentSessionRuntimeStore().makeScope()
+        let expansion = Task {
+            await input.augmentUserMessage(
+                "short", attachments: [], taggedFileAttachments: [.init(relativePath: relativePath ? "large.txt" : fileURL.path, displayName: "large.txt")],
+                agent: .openCode, workspacePaths: [rootURL.path], workspace: { .init(store: store, lookupSource: nil) },
+                session: nil, handoff: scope.handoff, ignoresPendingHandoff: true,
+                skipsSlashExpansion: true, isCurrent: { true }
+            )
+        }
+        addTeardownBlock {
+            expansion.cancel()
+            await lookupGate.open()
+            await watcherGate.open()
+            _ = await expansion.value
+        }
+        do {
+            try await AsyncTestWait.waitUntil("tagged file lookup reached \(point)") { await lookupGate.didEnter() }
+        } catch {
+            await lookupGate.open()
+            _ = await expansion.value
+            throw error
+        }
+        // The paused lookup retains its captured gate, but later publication work must not
+        // inherit that pause point. Exercise both explicit-write and publisher file-add ingress.
+        await store.clearExactFileCandidateProbeGateForTesting()
+        let published: WorkspaceFileRecord
+        if viaPublisher {
+            try await store.publishSyntheticFileSystemDeltasForTesting(rootID: root.id, deltas: [.fileAdded("large.txt")])
+            await watcherGate.open()
+            try await AsyncTestWait.waitUntil("publisher file-add is applied while lookup is suspended") {
+                await store.file(rootID: root.id, relativePath: "large.txt") != nil
+            }
+            let record = await store.file(rootID: root.id, relativePath: "large.txt")
+            published = try XCTUnwrap(record)
+        } else {
+            let publication = try await store.materializeCatalogFileAfterDiskWrite(rootID: root.id, relativePath: "large.txt")
+            guard case let .materialized(record) = publication else { return XCTFail("Expected controlled catalog publication, got \(publication)") }
+            published = record
+        }
+        await lookupGate.open()
+        let expanded = await expansion.value
+        XCTAssertTrue(expanded.contains(content), "skill=false, point=\(point), relativePath=\(relativePath): a catalog publication must not silently drop the attachment; got \(expanded)")
+        XCTAssertEqual(expanded.components(separatedBy: "<file_contents>").count - 1, 1)
+        let after = await store.file(rootID: root.id, relativePath: "large.txt")
+        XCTAssertEqual(after?.id, published.id, "Lookup must retain the published identity, not manufacture a replacement")
+        await watcherGate.open()
+    }
+
+    @MainActor
+    func testPublishedExactFileAdoptionPreservesCancellationAndTurnoverFences() async throws {
+        for change in ["cancel", "root", "record"] {
+            let rootURL = try makeTemporaryRoot(name: "PublishedFileAdoption-\(change)")
+            let store = WorkspaceFileContextStore()
+            let root = try await store.loadRoot(path: rootURL.path)
+            let watcherGate = AgentFileTagTestAsyncGate()
+            let eligibilityGate = AgentFileTagTestAsyncGate()
+            let adoptionGate = AgentFileTagTestAsyncGate()
+            await store.setWatcherSinkWillApplyHandler { _ in await watcherGate.wait() }
+            addTeardownBlock {
+                await eligibilityGate.open()
+                await adoptionGate.open()
+                await watcherGate.open()
+                await store.clearExactFileCandidateProbeGateForTesting()
+                await store.setWatcherSinkWillApplyHandler(nil)
+                await store.unloadRoot(id: root.id)
+            }
+            let fileURL = rootURL.appendingPathComponent("large.txt")
+            try write("original contents", to: fileURL)
+            let roots = await store.rootRefs(scope: .visibleWorkspace)
+            await store.setExactFileSuspensionGateForTesting(point: .candidateEligibility, rootID: root.id) {
+                await eligibilityGate.wait()
+            }
+            let resolution = Task {
+                try await store.resolveExactExistingWorkspaceFile(.parse(fileURL.path), namespace: .identity(roots: roots))
+            }
+            addTeardownBlock {
+                resolution.cancel()
+                await eligibilityGate.open()
+                await adoptionGate.open()
+                await watcherGate.open()
+                _ = try? await resolution.value
+            }
+            try await AsyncTestWait.waitUntil("uncatalogued file reaches eligibility for \(change)") { await eligibilityGate.didEnter() }
+            await store.clearExactFileCandidateProbeGateForTesting()
+            let publication = try await store.materializeCatalogFileAfterDiskWrite(rootID: root.id, relativePath: "large.txt")
+            guard case let .materialized(original) = publication else { return XCTFail("Expected initial catalog publication") }
+            await store.setExactFileSuspensionGateForTesting(point: .catalogValidation, rootID: root.id) {
+                await adoptionGate.wait()
+            }
+            await eligibilityGate.open()
+            try await AsyncTestWait.waitUntil("published record reaches validation for \(change)") { await adoptionGate.didEnter() }
+            await store.clearExactFileCandidateProbeGateForTesting()
+            if change == "cancel" {
+                resolution.cancel()
+            } else if change == "root" {
+                await watcherGate.open()
+                await store.setWatcherSinkWillApplyHandler(nil)
+                await store.unloadRoot(id: root.id)
+                let replacement = try await store.loadRoot(path: rootURL.path)
+                XCTAssertNotEqual(replacement.id, root.id)
+                addTeardownBlock { await store.unloadRoot(id: replacement.id) }
+            } else {
+                try FileManager.default.removeItem(at: fileURL)
+                _ = await store.reconcileLoadedRootCatalogWithDisk(rootID: root.id)
+                try write("replacement contents", to: fileURL)
+                let replacement = try await store.materializeCatalogFileAfterDiskWrite(rootID: root.id, relativePath: "large.txt")
+                guard case let .materialized(record) = replacement else { return XCTFail("Expected replacement catalog record") }
+                XCTAssertNotEqual(record.id, original.id)
+            }
+            await adoptionGate.open()
+            if change == "cancel" {
+                do {
+                    _ = try await resolution.value
+                    XCTFail("Cancellation during adoption must throw, not become an unresolved path")
+                } catch is CancellationError {}
+            } else {
+                let result = try await resolution.value
+                guard case .issue(.unresolved) = result else { return XCTFail("Adoption must not cross \(change) turnover: \(result)") }
+            }
+            await watcherGate.open()
+        }
     }
 
     @MainActor
@@ -650,7 +841,7 @@ private actor AgentFileTagTestAsyncSignal {
 
 private actor AgentFileTagTestAsyncGate {
     private var enteredContinuation: CheckedContinuation<Void, Never>?
-    private var openContinuation: CheckedContinuation<Void, Never>?
+    private var openContinuations: [CheckedContinuation<Void, Never>] = []
     private var hasEntered = false
     private var isOpen = false
 
@@ -665,9 +856,13 @@ private actor AgentFileTagTestAsyncGate {
             if isOpen {
                 continuation.resume()
             } else {
-                openContinuation = continuation
+                openContinuations.append(continuation)
             }
         }
+    }
+
+    func didEnter() -> Bool {
+        hasEntered
     }
 
     func waitUntilEntered() async {
@@ -684,8 +879,11 @@ private actor AgentFileTagTestAsyncGate {
     func open() {
         guard !isOpen else { return }
         isOpen = true
-        openContinuation?.resume()
-        openContinuation = nil
+        let continuations = openContinuations
+        openContinuations.removeAll()
+        for continuation in continuations {
+            continuation.resume()
+        }
     }
 }
 

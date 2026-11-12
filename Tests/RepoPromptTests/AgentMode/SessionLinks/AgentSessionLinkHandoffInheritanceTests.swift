@@ -941,7 +941,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     // Raw text fits; the actual existing skill/file expansion must be measured instead.
                     guard case .success = await fixture.viewModel.providerSwitchSendAdmission(session: session, input: text, skipsAugmentation: true) else { return XCTFail("Raw input should fit") }
                     let expanded = await fixture.viewModel.augmentUserMessageForProviderSend(text, taggedFileAttachments: session.pendingTaggedFileAttachments, session: session, ignoresPendingHandoff: true)
-                    XCTAssertTrue(expanded.contains(content), "The fixture must really expand the skill/tagged file")
+                    XCTAssertTrue(expanded.contains(content), "The fixture must really expand the skill/tagged file (skill=\(skill), expandedBytes=\(expanded.utf8.count))")
                     fixture.viewModel.storeDraftText(for: session.tabID, text)
                     let workflow = session.selectedWorkflow
                     let files = session.pendingTaggedFileAttachments
