@@ -945,6 +945,8 @@ package actor ACPAgentSessionController {
                 }
             #endif
             settlePromptTurn(promptTurnID, result: .failure(error))
+            // Latched when the response arrived; only the preserved branch below sets it again.
+            lastPromptFailurePreservedSession = false
             // Local admission refused before construction or transport; the connection is intact.
             if refusedUnsupportedImages {
                 if state == .promptRunning { state = .sessionOpen }
@@ -1697,9 +1699,6 @@ package actor ACPAgentSessionController {
             guard state != .closing, state != .closed else {
                 throw ControllerError.transportClosed
             }
-            guard !lastPromptFailurePreservedSession else {
-                throw ControllerError.invalidState(expected: "a turn still in progress", actual: state)
-            }
             resetPerTurnStateForSteeringPrompt()
             if state == .promptRunning {
                 state = .sessionOpen
@@ -2045,6 +2044,9 @@ package actor ACPAgentSessionController {
                     if pendingRequest.method == "session/prompt",
                        let preserved = provider.sessionPreservingPromptFailure(forResponseError: error)
                     {
+                        // Latched before the prompt's catch runs, so a steer arriving in between
+                        // cannot send session/cancel for a turn the provider already ended.
+                        lastPromptFailurePreservedSession = true
                         pendingRequest.continuation.resume(throwing: preserved)
                     } else {
                         pendingRequest.continuation.resume(throwing: ControllerError.requestFailed(message, code: code))

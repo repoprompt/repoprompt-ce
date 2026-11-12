@@ -90,8 +90,9 @@ final class ACPAgentSessionControllerHostTests: XCTestCase {
 
     /// #1699: Devin's retryable `EmptyResponse` fails only the turn. The live process and session
     /// stay open, nothing is cancelled or resent, and the next explicit prompt runs in that session.
+    /// A steer already waiting on the turn when the error lands is refused, as after any failed turn.
     func testDevinEmptyResponseFailsTheTurnButKeepsTheSessionForTheNextPrompt() async throws {
-        for retryable in [true, false] {
+        for (retryable, steers) in [(true, false), (false, false), (true, true)] {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ACPEmptyResponse-\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: directory) }
@@ -100,10 +101,16 @@ final class ACPAgentSessionControllerHostTests: XCTestCase {
             try #"""
             import json, os, sys
             prompts = 0
+            held = None
             for line in sys.stdin:
                 request = json.loads(line)
                 with open(os.environ['OBS_FILE'], 'a') as output:
                     output.write(json.dumps(request) + '\n')
+                if request.get('method') == 'session/cancel' and held is not None:
+                    error = json.loads(os.environ['FIXTURE_PROMPT_ERROR'])
+                    print(json.dumps({'jsonrpc': '2.0', 'id': held, 'error': error}), flush=True)
+                    held = None
+                    continue
                 if 'id' not in request: continue
                 method = request.get('method')
                 reply = {'jsonrpc': '2.0', 'id': request['id'], 'result': {}}
@@ -113,6 +120,9 @@ final class ACPAgentSessionControllerHostTests: XCTestCase {
                     reply['result'] = {'sessionId': 'devin-session'}
                 elif method == 'session/prompt':
                     prompts += 1
+                    if prompts == 1 and \#(steers ? "True" : "False"):
+                        held = request['id']
+                        continue
                     if prompts == 1:
                         del reply['result']
                         reply['error'] = json.loads(os.environ['FIXTURE_PROMPT_ERROR'])
@@ -136,8 +146,20 @@ final class ACPAgentSessionControllerHostTests: XCTestCase {
             let message = AgentMessage(systemPrompt: "", userMessage: "Run the tools", resumeSessionID: nil)
 
             let firstEvents = await controller.events
+            let firstPrompt = Task { try await controller.prompt(message) }
+            if steers {
+                var sent = false
+                for _ in 0 ..< 100 where !sent {
+                    sent = try recordedMethods(at: observations).contains("session/prompt")
+                    if !sent { try await Task.sleep(nanoseconds: 20_000_000) }
+                }
+                do {
+                    try await controller.interruptActivePromptForSteering()
+                    XCTFail("A steer waiting on the turn when the provider ends it must be refused")
+                } catch {}
+            }
             do {
-                try await controller.prompt(message)
+                try await firstPrompt.value
                 XCTFail("The provider error must fail the turn")
             } catch {
                 XCTAssertEqual(error is ACPSessionPreservingPromptFailure, retryable, "\(error)")
@@ -181,7 +203,7 @@ final class ACPAgentSessionControllerHostTests: XCTestCase {
             XCTAssertEqual(allMethods.count(where: { $0 == "session/new" }), 1)
             XCTAssertEqual(allMethods.count(where: { $0 == "session/prompt" }), 2)
             XCTAssertFalse(allMethods.contains("session/load"))
-            XCTAssertFalse(allMethods.contains("session/cancel"))
+            XCTAssertEqual(allMethods.count(where: { $0 == "session/cancel" }), steers ? 1 : 0, "Only the steer cancels")
             XCTAssertEqual(host.events().count(where: { $0 == "register" }), 1)
         }
     }
