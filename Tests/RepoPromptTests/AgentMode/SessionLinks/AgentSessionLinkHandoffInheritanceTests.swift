@@ -1071,6 +1071,33 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testSynchronousExplicitAttachmentRefusalRestoresClearedDraftWithoutDuplicatingRetainedDraft() async throws {
+            let rawDraft = "  keep exact rejected draft  "
+            for currentDraft in [rawDraft, "", "newer typing"] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let session = fixture.sourceSession
+                    let attachments = try await explicitPolicyAttachments(fixture, failure: "missing")
+                    session.pendingTaggedFileAttachments = attachments
+                    session.selectedWorkflow = .init(customID: UUID(), displayName: "Retained")
+                    let workflow = session.selectedWorkflow
+                    let rows = session.items
+                    vm.storeDraftText(for: session.tabID, rawDraft)
+                    XCTAssertEqual(vm.submitUserTurn(text: rawDraft.trimmingCharacters(in: .whitespacesAndNewlines), tabID: session.tabID, rawDraftText: rawDraft), .submitted)
+                    // Legacy synchronous ingress acknowledges scheduling before admission runs.
+                    vm.storeDraftText(for: session.tabID, currentDraft)
+                    try await AsyncTestWait.waitUntil("explicit attachment refusal notice") { vm.draftRestorationEvent != nil }
+                    let expected = currentDraft == rawDraft || currentDraft.isEmpty ? rawDraft : rawDraft + "\n" + currentDraft
+                    XCTAssertEqual(vm.draftRuntime.text(for: session.tabID), expected)
+                    XCTAssertTrue(vm.draftRestorationEvent?.message.contains("could not be included") == true)
+                    XCTAssertEqual(session.pendingTaggedFileAttachments, attachments)
+                    XCTAssertEqual(session.selectedWorkflow, workflow)
+                    XCTAssertEqual(session.items, rows)
+                    XCTAssertNil(session.activeComposerSubmitAttempt)
+                }
+            }
+        }
+
         func testExplicitTaggedFileFailureBlocksInteractiveSendWithoutChangingComposerOrRows() async throws {
             for switching in [false, true] {
                 try await withFixture { fixture in
@@ -1116,7 +1143,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("warning.json") }
                     let preparation: AgentModeViewModel.ProviderSwitchSendPreparation?
                     if switching {
-                        guard case let .success(value) = await vm.providerSwitchSendAdmission(session: session, input: "unattended task", taggedFiles: [attachment])
+                        guard case let .success(value) = await vm.linkExecutionRuntime.providerSwitchSendAdmission(session: session, input: "unattended task", taggedFiles: [attachment])
                         else { return XCTFail("Unattended attachment failure must not block switch admission") }
                         preparation = value
                         XCTAssertFalse(session.items.contains { $0.text.contains("could not be included") }, "Admission/preview must not post a notice")

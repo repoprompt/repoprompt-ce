@@ -999,6 +999,26 @@ final class AgentExplicitTaggedFilePolicyTests: XCTestCase {
         XCTAssertEqual(result.includedPaths.count, 5)
     }
 
+    func testOversizedExplicitAttachmentDoesNotExcludeLaterExplicitFileThatFits() async throws {
+        let (root, store) = try await fixture(files: 2, oversizedFirst: true)
+        let attachments = (0 ..< 2).map {
+            AgentTaggedFileAttachment(relativePath: root.appendingPathComponent("file\($0).txt").path, displayName: "file\($0).txt")
+        }
+        let context = AgentSessionProviderInputRuntime.Context(store: store, lookup: .visibleWorkspace)
+        let explicit = await AgentSessionProviderInputRuntime.prepareTaggedFileContents("inspect", taggedFileAttachments: attachments, context: context)
+        XCTAssertEqual(explicit.failures.map(\.attachment.id), [attachments[0].id])
+        XCTAssertTrue(explicit.failures.allSatisfy { $0.reason.contains("12000-token") })
+        XCTAssertEqual(explicit.includedPaths, [attachments[1].relativePath])
+        XCTAssertTrue(explicit.text.contains("file 1 content"))
+
+        // Guessed text paths retain their historical stop-at-first-overflow behavior.
+        let inferredText = "Inspect @file0.txt @file1.txt"
+        let inferred = await AgentSessionProviderInputRuntime.prepareTaggedFileContents(inferredText, taggedFileAttachments: [], context: context)
+        XCTAssertEqual(inferred.text, inferredText)
+        XCTAssertTrue(inferred.includedPaths.isEmpty)
+        XCTAssertTrue(inferred.failures.isEmpty)
+    }
+
     func testAliasesShareTheIncludedOutcomeAndMissingWorkspaceIsExplicit() async throws {
         let (root, store) = try await fixture(files: 1)
         let attachments = [
@@ -1013,11 +1033,12 @@ final class AgentExplicitTaggedFilePolicyTests: XCTestCase {
         XCTAssertTrue(unavailable.failures.allSatisfy { $0.reason.contains("workspace") })
     }
 
-    private func fixture(files: Int = 0) async throws -> (URL, WorkspaceFileContextStore) {
+    private func fixture(files: Int = 0, oversizedFirst: Bool = false) async throws -> (URL, WorkspaceFileContextStore) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("ExplicitTags-\(UUID())")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         for index in 0 ..< files {
-            try "file \(index) content".write(to: root.appendingPathComponent("file\(index).txt"), atomically: true, encoding: .utf8)
+            let content = oversizedFirst && index == 0 ? String(repeating: "oversized attached content ", count: 20000) : "file \(index) content"
+            try content.write(to: root.appendingPathComponent("file\(index).txt"), atomically: true, encoding: .utf8)
         }
         let store = WorkspaceFileContextStore()
         _ = try await store.loadRoot(path: root.path)

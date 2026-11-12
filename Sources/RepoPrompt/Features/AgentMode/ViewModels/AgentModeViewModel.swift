@@ -16243,7 +16243,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     if let failure = result.failureMessage {
                         let message = failure + "\nRemove the attachment(s) or retry before sending."
                         if ownsClaim, scheduledProviderSwitchSubmission == nil {
-                            restoreComposerDraft(tabID: tabID, text: "", message: message, strategy: .prependAlways)
+                            let submittedDraft = claim.attempt.rawDraftSnapshot
+                            restoreRejectedManualSubmissionComposerState(
+                                repromptedText: repromptedText,
+                                tabID: tabID, session: session,
+                                draftText: draftRuntime.text(for: tabID) == submittedDraft ? "" : submittedDraft,
+                                attachments: attachmentsToSend, taggedFiles: taggedFilesToSend,
+                                selectedWorkflow: restorationSelectedWorkflow,
+                                selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
+                                message: message
+                            )
                         }
                         return .blocked(message: message)
                     }

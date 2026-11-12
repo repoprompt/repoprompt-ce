@@ -98,7 +98,7 @@ extension AgentSessionProviderInputRuntime {
         var outcomes: [String: String] = [:] // empty reason means included
         var admittedFiles = 0
         var tokens = 0
-        var budgetExhausted = false
+        var inferredBudgetExhausted = false
         let budgetFailure = "the \(tokenBudget)-token attachment budget was reached"
         for request in requests {
             func fail(_ reason: String) {
@@ -127,7 +127,7 @@ extension AgentSessionProviderInputRuntime {
                 }
                 // Account for every excluded attachment without opening content that cannot
                 // fit. Resolution still deduplicates aliases of already-included files above.
-                if budgetExhausted {
+                if inferredBudgetExhausted {
                     outcomes[key] = budgetFailure
                     fail(budgetFailure)
                     continue
@@ -179,7 +179,9 @@ extension AgentSessionProviderInputRuntime {
                 }
                 let blockTokens = TokenCalculationService.estimateTokens(for: block)
                 guard tokens + blockTokens <= tokenBudget else {
-                    budgetExhausted = true
+                    // Explicit attachments are independent admission requests: a later smaller
+                    // file may still fit. Only inferred paths keep stop-at-first-overflow.
+                    if request.attachments.isEmpty { inferredBudgetExhausted = true }
                     outcomes[key] = budgetFailure
                     fail(budgetFailure)
                     continue
