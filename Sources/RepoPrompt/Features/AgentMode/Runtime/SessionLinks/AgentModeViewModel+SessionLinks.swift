@@ -1375,7 +1375,10 @@ extension AgentModeViewModel {
         }
         return AgentSessionLinkEndpointEligibility.Input(
             hasDurableBinding: identity?.persistentBindingGeneration != nil,
-            hasLoadedPersistedState: session.hasLoadedPersistedState && session.permitsBoundOperationAndSave,
+            // Eligibility is earned restoration/consent provenance, not permission to admit new
+            // input during a transient adoption fence. Do not revoke links merely for being busy.
+            hasLoadedPersistedState: session.hasLoadedPersistedState && !session.bindingTransitionInProgress
+                && session.qualifiedRestorationReadiness.permitsBoundOperationAndSave,
             isChildSession: session.parentSessionID != nil,
             isMCPControlled: session.mcpControlContext != nil,
             isMCPOriginated: session.isMCPOriginated,

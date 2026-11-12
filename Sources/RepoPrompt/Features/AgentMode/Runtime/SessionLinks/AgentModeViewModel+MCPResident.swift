@@ -84,8 +84,11 @@ extension AgentModeViewModel {
     func mcpPreflightResidentActivation(sessionID: UUID, admittedWindow: WindowState?) async throws -> MCPResidentTarget? {
         // An unloaded runtime has not established persisted origin yet. Explicit adoption may
         // hydrate it; the shared preparation/activation fences requalify before any control action.
-        guard let resolved = try mcpResidentTarget(sessionID: sessionID),
-              resolved.session.permitsBoundOperationAndSave else { return nil }
+        guard let resolved = try mcpResidentTarget(sessionID: sessionID) else { return nil }
+        guard !resolved.session.isAwaitingWorkspaceAdoption else {
+            throw MCPError.invalidParams(TabSession.loadingAdmissionFailureMessage)
+        }
+        guard resolved.session.permitsBoundOperationAndSave else { return nil }
         let target = MCPResidentTarget(session: resolved.session, endpoint: resolved.endpoint, window: admittedWindow)
         let hasLinks = await linkExecutionRuntime.agentSessionLinkHasActiveOutboundLink(target.endpoint)
         try mcpRequireResidentActivationFence(target, authoritativeHasLinks: hasLinks)
@@ -194,6 +197,9 @@ extension AgentModeViewModel {
         windowIsAvailable: @escaping @MainActor () -> Bool
     ) async throws -> MCPInstructionDispatch {
         try Task.checkCancellation()
+        guard !target.session.isAwaitingWorkspaceAdoption else {
+            throw MCPError.invalidParams(Self.mcpResidentBusyError)
+        }
         if let failure = target.session.restorationAdmissionFailureMessage {
             throw MCPError.invalidParams(failure)
         }

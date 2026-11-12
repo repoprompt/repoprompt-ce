@@ -24,7 +24,9 @@ struct AgentSessionSaveCommitToken: Equatable {
             && session.sourceItemsRevision == sourceItemsRevision
             && session.persistenceMutationGeneration == persistenceMutationGeneration
             && session.saveRequestGeneration == saveRequestGeneration
-            && (session.permitsBoundOperationAndSave || creationHandle.map { session.creationHandleIsCurrent($0) } == true)
+            // A transient refusal of new operations does not revoke an admitted writer's IO.
+            // Binding/revision/claim/storage fences still qualify this exact originating save.
+            && (session.qualifiedRestorationReadiness.permitsBoundOperationAndSave || creationHandle.map { session.creationHandleIsCurrent($0) } == true)
     }
 }
 

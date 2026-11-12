@@ -119,6 +119,7 @@ final class AgentSessionRuntimeStore {
             guard !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: binding.sessionID),
                   !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: binding.sessionID)
             else { return .deleted }
+            guard !scope.isAwaitingWorkspaceAdoption else { return .restorationUnavailable }
             switch requirement {
             case .restored:
                 guard session.permitsBoundOperationAndSave else { return .restorationUnavailable }
@@ -173,7 +174,7 @@ final class AgentSessionRuntimeStore {
         /// New binding work needs exclusive ownership; originating transition cleanup may
         /// still use isCurrent while retirement or a conflicting claim blocks new work.
         var permitsBindingPreparation: Bool {
-            isCurrent && !scope.isRetiring
+            isCurrent && !scope.isRetiring && !scope.isAwaitingWorkspaceAdoption
                 && !scope.store.scopes.values.contains { reference in
                     guard let other = reference.value, other !== scope else { return false }
                     return other.sessions[session.tabID] === session
@@ -271,7 +272,14 @@ final class AgentSessionRuntimeStore {
         let owners = scopes.values.compactMap(\.value).filter { $0.sessions[session.tabID] === session }
         guard !owners.isEmpty else {
             session.persistentSessionBindingDidChange = nil
+            session.workspaceAdoptionPending = { false }
             return
+        }
+        // Read through the actual holders without retaining their session/scope graphs. Multiple
+        // claims remain conflicts; none can hide another holder's negative readiness fence.
+        let references = owners.map { WeakScope(value: $0) }
+        session.workspaceAdoptionPending = {
+            references.contains { $0.value?.isAwaitingWorkspaceAdoption == true }
         }
         session.persistentSessionBindingDidChange = { [weak self, weak session] in
             guard let self, let session else { return }
@@ -428,6 +436,14 @@ final class AgentSessionRuntimeStore {
         lazy var drafts = AgentSessionDraftRuntime(scope: self)
         var saveQueue: AgentSessionSaveQueue {
             persistence.queue
+        }
+
+        /// The host fences readiness synchronously when destructive owner adoption is queued,
+        /// and releases it only after that adoption's discard slice (or its own abandoned exit).
+        private(set) var isAwaitingWorkspaceAdoption = false
+
+        func setWorkspaceAdoptionPending(_ pending: Bool) {
+            isAwaitingWorkspaceAdoption = pending
         }
 
         private(set) var isRetiring = false

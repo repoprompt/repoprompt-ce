@@ -304,11 +304,13 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
                 .receive(on: RunLoop.main)
                 .sink { [weak self] _ in self?.schedulePreparedOversightCleanup() }
         }
+        guard !owner.agentModeViewModel.isAwaitingWorkspaceAdoption else { return .failure(.changed) }
         let ready = await owner.agentModeViewModel.prepareSavedOversightSession(
             tabID: location.tab.id, sessionID: target, workspaceID: location.workspace.id,
             isStillAuthorized: { isStillAuthorized() && location.isCurrent }
         )
-        guard isStillAuthorized(), location.isCurrent else { return .failure(.changed) }
+        guard isStillAuthorized(), location.isCurrent,
+              !owner.agentModeViewModel.isAwaitingWorkspaceAdoption else { return .failure(.changed) }
         guard ready else { return .failure(.unreadable) }
         guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
             sessionID: target, expectedWorkspaceID: location.workspace.id
