@@ -1,24 +1,44 @@
 import SwiftUI
 
-/// Keep the populated composer as a stable sheet host even when no session/banner exists.
+/// Keep VM observation in the chrome sibling. Unrelated VM publications must not
+/// resubmit the cached composer content, regardless of SwiftUI's equality path.
 struct AgentProviderSwitchPresentation<Content: View>: View {
-    @ObservedObject var viewModel: AgentModeViewModel
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
+    let viewModel: AgentModeViewModel
     let tabID: UUID?
     let content: Content
     @Binding var bannerHeight: CGFloat
 
     var body: some View {
+        #if DEBUG
+            let _ = perfRecorder.increment("ui.body.providerSwitchPresentation")
+        #endif
         VStack(spacing: 0) {
-            VStack(spacing: 0) {
-                if let tabID, let session = viewModel.sessions[tabID] {
-                    AgentProviderSwitchBanner(viewModel: viewModel, session: session)
-                }
-            }
-            .background(GeometryReader { geometry in
-                Color.clear.onAppear { bannerHeight = geometry.size.height }
-                    .onChange(of: geometry.size.height) { _, height in bannerHeight = height }
-            })
+            AgentProviderSwitchChrome(viewModel: viewModel, tabID: tabID)
+                .background(GeometryReader { geometry in
+                    Color.clear.onAppear { bannerHeight = geometry.size.height }
+                        .onChange(of: geometry.size.height) { _, height in bannerHeight = height }
+                })
             content
+        }
+    }
+}
+
+/// The sheet anchor is unconditional even when no session/banner exists. Broad VM
+/// publications may update this leaf, but must not resubmit its composer sibling.
+private struct AgentProviderSwitchChrome: View {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
+    @ObservedObject var viewModel: AgentModeViewModel
+    let tabID: UUID?
+
+    var body: some View {
+        #if DEBUG
+            let _ = perfRecorder.increment("ui.body.providerSwitchChrome")
+        #endif
+        VStack(spacing: 0) {
+            if let tabID, let session = viewModel.sessions[tabID] {
+                AgentProviderSwitchBanner(viewModel: viewModel, session: session)
+            }
         }
         .sheet(isPresented: Binding(
             get: {
