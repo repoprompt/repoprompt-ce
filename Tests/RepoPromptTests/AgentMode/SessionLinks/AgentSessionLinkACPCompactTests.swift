@@ -509,7 +509,7 @@ final class AgentSessionLinkACPCompactRunnerTests: XCTestCase {
         )
         XCTAssertEqual(
             AgentSessionLinkDeliveryReadiness.evaluate(
-                snapshot: AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
+                snapshot: AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
                     session: fixture.session,
                     endpointMatchesGrant: true,
                     isClosing: false
@@ -863,7 +863,7 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
 
     /// A live ACP occupancy report, so the count starts out vouched.
     private func reportOccupancy(_ fixture: Fixture, used: Int, window: Int) {
-        _ = fixture.viewModel.ingestNonCodexUsageReport(
+        _ = fixture.viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: nil,
             completionTokens: nil,
             contextUsedTokens: used,
@@ -1040,7 +1040,7 @@ final class AgentSessionLinkACPCompactTransactionTests: XCTestCase {
         XCTAssertNil(fixture.session.vouchedContextCount, "Invalidated at dispatch")
         XCTAssertEqual(fixture.session.vouchedContextWindow?.tokens, 1000, "The window is unchanged")
 
-        _ = fixture.viewModel.ingestNonCodexUsageReport(
+        _ = fixture.viewModel.usageRuntime.ingestNonCodexUsageReport(
             promptTokens: 850,
             completionTokens: nil,
             contextUsedTokens: nil,
@@ -1120,7 +1120,7 @@ final class AgentSessionLinkACPBackgroundCompactionSettleTests: XCTestCase {
 
     private func admission(_ session: AgentModeViewModel.TabSession) -> AgentSessionLinkDeliveryReadiness.Decision {
         AgentSessionLinkDeliveryReadiness.evaluate(
-            snapshot: AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
+            snapshot: AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
                 session: session,
                 endpointMatchesGrant: true,
                 isClosing: false
@@ -1150,7 +1150,7 @@ final class AgentSessionLinkACPBackgroundCompactionSettleTests: XCTestCase {
         let session = idleSession()
         let target = candidate(tabID: session.tabID)
         XCTAssertEqual(admission(session), .ready)
-        XCTAssertTrue(AgentModeViewModel.agentSessionLinkPeriodicWakeSessionIsIdle(session))
+        XCTAssertTrue(AgentSessionLinkExecutionRuntime.agentSessionLinkPeriodicWakeSessionIsIdle(session))
 
         session.beginACPBackgroundCompactionSettle(duration: 60)
 
@@ -1161,7 +1161,7 @@ final class AgentSessionLinkACPBackgroundCompactionSettleTests: XCTestCase {
             "send, compact, and every parked when_sendable drain share this admission"
         )
         XCTAssertFalse(
-            AgentModeViewModel.agentSessionLinkPeriodicWakeSessionIsIdle(session),
+            AgentSessionLinkExecutionRuntime.agentSessionLinkPeriodicWakeSessionIsIdle(session),
             "A periodic wake would start the very turn that cancels the compaction"
         )
         let observed = AgentModeViewModel.observationSnapshot(for: session, candidate: target, subagentCounts: (0, 0))

@@ -204,7 +204,7 @@ final class AgentSessionProviderInputRuntime {
         return lines.joined(separator: "\n")
     }
 
-    static func escapePathForAtCommand(_ path: String) -> String {
+    nonisolated static func escapePathForAtCommand(_ path: String) -> String {
         var escaped = ""
         for character in path {
             switch character {

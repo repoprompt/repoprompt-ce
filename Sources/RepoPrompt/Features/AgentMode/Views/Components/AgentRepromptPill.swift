@@ -64,12 +64,12 @@ struct AgentRepromptPill: View {
                 Button("Agent Models Settings", action: openSettings)
             }
         }
-        .onAppear { viewModel.syncStatusPillsUIState() }
+        .onAppear { viewModel.ui.statusPills.update(viewModel.makeStatusPillsSnapshot()) }
         .onReceive(availableModelChanges) { _ in
             // @Published emits in willSet. Resolve after the new model list is stored.
             Task { @MainActor in
                 await Task.yield()
-                viewModel.syncStatusPillsUIState()
+                viewModel.ui.statusPills.update(viewModel.makeStatusPillsSnapshot())
             }
         }
         .onReceive(store.$oneShotDisclosureRequest) { request in

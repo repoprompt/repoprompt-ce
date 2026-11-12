@@ -4,7 +4,7 @@ import RepoPromptVCS
 import RepoPromptWorkspaceContext
 import SwiftUI
 
-struct AgentContextDrawerPromptTab: View {
+struct AgentContextDrawerPromptTab: View, AgentContextDrawerModelRefreshing {
     @ObservedObject var promptManager: PromptViewModel
     @ObservedObject var modelCoordinator: AgentSelectedFilesModelCoordinator
     let exportContext: AgentContextExportViewContext
@@ -135,32 +135,8 @@ struct AgentContextDrawerPromptTab: View {
         }
     }
 
-    private func refreshIfNeeded(force: Bool = false, preserveDisplayedModel: Bool = false) {
-        guard !isSwitchBlankingSelectedFiles else { return }
-        guard !exportContext.promptManager.isSwitchingComposeTab else { return }
-        modelCoordinator.refreshIfNeeded(
-            exportContext.makeModelRequest(flushPendingUI: true),
-            force: force,
-            preserveDisplayedModel: preserveDisplayedModel
-        )
-    }
-
-    private func resetOrRefresh(isVisible: Bool) {
-        guard !isSwitchBlankingSelectedFiles else { return }
-        guard !exportContext.promptManager.isSwitchingComposeTab else { return }
-        modelCoordinator.invalidate()
-        if isVisible {
-            refreshIfNeeded()
-        }
-    }
-
-    private func handleSelectionChange(_ change: WorkspaceSelectionCoordinator.Change, isVisible: Bool) {
-        guard exportContext.tabMatchesSelectionChange(change) else { return }
-        if isVisible {
-            refreshIfNeeded(force: true, preserveDisplayedModel: true)
-        } else {
-            modelCoordinator.invalidate()
-        }
+    var isContextModelRefreshBlanked: Bool {
+        isSwitchBlankingSelectedFiles
     }
 
     func makeRenderState() -> RenderState {
@@ -566,9 +542,7 @@ struct AgentContextDrawerPromptTab: View {
                 Spacer(minLength: 8)
 
                 if isSelected {
-                    Image(systemName: "checkmark")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
-                        .foregroundStyle(Color.accentColor)
+                    agentSelectionCheckmark(fontPreset: fontPreset)
                 }
             }
             .padding(.horizontal, 8)
@@ -1290,12 +1264,7 @@ private struct AgentContextPromptInstructionsEditor: View {
                 }
             }
             .padding(8)
-            .background(Color(NSColor.textBackgroundColor).opacity(0.65))
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(Color.secondary.opacity(0.18), lineWidth: 0.5)
-            )
+            .agentContextDrawerTextInputSurface()
         }
     }
 }

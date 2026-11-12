@@ -5,11 +5,7 @@ import RepoPromptSettingsCore
 
 extension AgentSessionInteractionRuntime {
     func codexHookCommand(for session: AgentTabSession) throws -> AgentSessionRuntimeStore.Command {
-        guard let scope, let sessionID = session.activeAgentSessionID,
-              case let .unique(writer) = scope.resolveWriter(sessionID: sessionID),
-              writer.scope === scope, writer.session === session,
-              case let .success(command) = writer.admitCommand()
-        else { throw AgentCodexHookReviewResolutionError.staleWriter }
+        guard let command = try? scope?.admit(session: session) else { throw AgentCodexHookReviewResolutionError.staleWriter }
         return command
     }
 

@@ -750,22 +750,11 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
     }
 
     private static func normalizedStatusWord(_ raw: String?) -> String? {
-        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-              !raw.isEmpty
-        else {
-            return nil
-        }
-        switch raw {
-        case "ok", "success", "succeeded", "complete", "completed", "done", "exited", "finished":
-            return "success"
-        case "partial", "warning", "warn", "limited":
-            return "warning"
-        case "error", "failed", "failure", "rejected", "denied", "cancelled", "canceled", "terminated", "stopped", "timeout", "timed_out", "killed", "interrupted":
-            return "failed"
-        case "running", "in_progress", "inprogress", "in-progress", "pending":
-            return "running"
-        default:
-            return raw
+        let normalized = AgentTranscriptToolStatusSemantics.normalizedStatusWord(raw)
+        switch normalized {
+        case "cancelled": return "failed"
+        case "pending": return "running"
+        default: return normalized
         }
     }
 

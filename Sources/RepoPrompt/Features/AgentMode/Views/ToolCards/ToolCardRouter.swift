@@ -3,6 +3,34 @@ import RepoPromptDomainRuntime
 import RepoPromptShared
 import SwiftUI
 
+func activeContextBuilderItems(in rows: [AgentChatItem]) -> (callID: UUID?, resultID: UUID?) {
+    let latestContextBuilderCall = rows.last(where: { item in
+        item.kind == .toolCall && normalizedToolCardName(item.toolName) == "context_builder"
+    })
+    let latestContextBuilderResult = rows.last(where: { item in
+        item.kind == .toolResult && normalizedToolCardName(item.toolName) == "context_builder"
+    })
+    let activeContextBuilderCallID: UUID? = {
+        guard let call = latestContextBuilderCall else { return nil }
+        if let result = latestContextBuilderResult,
+           result.sequenceIndex > call.sequenceIndex
+        {
+            return nil
+        }
+        return call.id
+    }()
+    let activeContextBuilderResultID: UUID? = {
+        guard let result = latestContextBuilderResult else { return nil }
+        if let call = latestContextBuilderCall,
+           call.sequenceIndex > result.sequenceIndex
+        {
+            return nil
+        }
+        return result.id
+    }()
+    return (activeContextBuilderCallID, activeContextBuilderResultID)
+}
+
 func normalizedToolCardName(_ name: String?) -> String? {
     guard let acceptedName = AgentToolNamePolicy.accepted(name) else { return nil }
     let raw = acceptedName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -667,7 +695,7 @@ private enum ToolCardSubtitleBuilder {
         let trimmed = argsJSON.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return nil }
         if !trimmed.hasPrefix("{"), !trimmed.hasPrefix("[") {
-            return unquotedString(trimmed) ?? trimmed
+            return AgentToolResultProcessingContext.unquotedCommandText(trimmed) ?? trimmed
         }
         guard let data = trimmed.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data, options: [])
@@ -675,7 +703,7 @@ private enum ToolCardSubtitleBuilder {
             return nil
         }
         if let extracted = extractStringValue(from: json, keys: keys) {
-            return unquotedString(extracted) ?? extracted
+            return AgentToolResultProcessingContext.unquotedCommandText(extracted) ?? extracted
         }
         return nil
     }
@@ -691,7 +719,7 @@ private enum ToolCardSubtitleBuilder {
                     if !text.isEmpty { return text }
                 }
                 if let nested = dictionary[key],
-                   let joined = joinedStringArrayValue(from: nested)
+                   let joined = AgentToolResultProcessingContext.joinedStringArrayValue(from: nested)
                 {
                     return joined
                 }
@@ -708,7 +736,7 @@ private enum ToolCardSubtitleBuilder {
             }
         }
         if let array = value as? [Any] {
-            if let joined = joinedStringArrayValue(from: array) {
+            if let joined = AgentToolResultProcessingContext.joinedStringArrayValue(from: array) {
                 return joined
             }
             for element in array {
@@ -722,31 +750,6 @@ private enum ToolCardSubtitleBuilder {
             return text.isEmpty ? nil : text
         }
         return nil
-    }
-
-    private static func joinedStringArrayValue(from value: Any) -> String? {
-        guard let array = value as? [Any] else { return nil }
-        let parts = array.compactMap { element -> String? in
-            if let string = element as? String {
-                let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
-                return trimmed.isEmpty ? nil : trimmed
-            }
-            if let number = element as? NSNumber {
-                let trimmed = number.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-                return trimmed.isEmpty ? nil : trimmed
-            }
-            return nil
-        }
-        return parts.isEmpty ? nil : parts.joined(separator: " ")
-    }
-
-    private static func unquotedString(_ raw: String) -> String? {
-        guard raw.count >= 2 else { return nil }
-        guard let first = raw.first, let last = raw.last, first == last, first == "\"" || first == "'" else {
-            return nil
-        }
-        let inner = String(raw.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
-        return inner.isEmpty ? nil : inner
     }
 }
 
@@ -828,16 +831,6 @@ struct ToolCallCard: View {
             && MCPIntegrationHelper.isRepoPromptToolNameAfterNormalization(item.toolName)
     }
 
-    private var onTap: (() -> Void)? {
-        guard let userInfo = oracleToolCallPopoverUserInfo(
-            item: item,
-            openContext: oracleOpenContext
-        ) else { return nil }
-        return {
-            NotificationCenter.default.post(name: .showAgentOraclePopover, object: nil, userInfo: userInfo)
-        }
-    }
-
     var body: some View {
         StaticToolCardContainer(
             iconName: toolIcon(for: item.toolName),
@@ -848,7 +841,7 @@ struct ToolCallCard: View {
             timestamp: item.timestamp,
             showsTimestamp: !showsCancelButton,
             headerTrailingView: showsCancelButton ? AnyView(ToolCardCancelButton(action: cancelActiveToolsAction!)) : nil,
-            onTap: onTap
+            onTap: agentOraclePopoverAction(userInfo: oracleToolCallPopoverUserInfo(item: item, openContext: oracleOpenContext))
         ) {
             // Tool calls in progress don't show args by default
             EmptyView()

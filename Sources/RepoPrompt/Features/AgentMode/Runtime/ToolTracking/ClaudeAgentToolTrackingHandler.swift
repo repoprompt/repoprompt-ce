@@ -590,26 +590,38 @@ final class ClaudeAgentToolTrackingHandler {
 
     // MARK: - Tracker Callbacks (MCP observer)
 
-    func handleTrackerToolCall(
+    private func pendingSignatureCandidates(signature: String, session: AgentTabSession) -> (indices: [Int], scanned: Int, usedFallback: Bool) {
+        let indexed = session.indexedToolItemIndices(signature: signature, pendingCallsOnly: true)
+        guard indexed.isEmpty else { return (indexed, indexed.count, false) }
+        let fallback = session.activeTurnToolItemIndices(where: { item in
+            item.kind == .toolCall
+                && Self.repoPromptInvocationSignature(toolName: item.toolName ?? "", argsJSON: item.toolArgsJSON) == signature
+        })
+        return (fallback.indices, indexed.count + fallback.scannedItemCount, !fallback.indices.isEmpty)
+    }
+
+    private func prepareTrackerObservation(
         invocationID: UUID,
         toolName: String,
         args: [String: Value]?,
+        result: String?,
+        isError: Bool,
         session: AgentTabSession,
-        observationOwner: AgentRunOwnership? = nil
-    ) {
+        observationOwner: AgentRunOwnership?
+    ) -> (storedToolName: String, argsJSON: String?, signature: String)? {
         if let observationOwner,
-           !session.isCurrentRunAttemptForCurrentBinding(observationOwner, expectedRunID: trackedRunID) { return }
-        guard AgentToolTrackingSupport.isRepoPromptTool(toolName) else { return }
-        guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
+           !session.isCurrentRunAttemptForCurrentBinding(observationOwner, expectedRunID: trackedRunID) { return nil }
+        guard AgentToolTrackingSupport.isRepoPromptTool(toolName) else { return nil }
+        guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return nil }
         if handleExactHostObservation(
             invocationID: invocationID,
             toolName: toolName,
             args: args,
-            result: nil,
-            isError: false,
+            result: result,
+            isError: isError,
             observationOwner: observationOwner,
             session: session
-        ) { return }
+        ) { return nil }
         // Flush buffered assistant content before inserting tool card to preserve interleaving order.
         hooks.flushPendingAssistantDelta(session)
         hooks.endActiveAssistantSegment(session)
@@ -617,6 +629,20 @@ final class ClaudeAgentToolTrackingHandler {
         let storedToolName = Self.canonicalTranscriptToolName(toolName)
         let argsJSON = AgentToolTrackingController.encodeArgsToJSON(args)
         let signature = Self.repoPromptInvocationSignature(toolName: toolName, argsJSON: argsJSON)
+        return (storedToolName, argsJSON, signature)
+    }
+
+    func handleTrackerToolCall(
+        invocationID: UUID,
+        toolName: String,
+        args: [String: Value]?,
+        session: AgentTabSession,
+        observationOwner: AgentRunOwnership? = nil
+    ) {
+        guard let (storedToolName, argsJSON, signature) = prepareTrackerObservation(
+            invocationID: invocationID, toolName: toolName, args: args,
+            result: nil, isError: false, session: session, observationOwner: observationOwner
+        ) else { return }
         if let providerInvocationID = consumePendingProviderInvocationID(
             forSignature: signature,
             session: session
@@ -654,25 +680,10 @@ final class ClaudeAgentToolTrackingHandler {
         }
 
         var inspectedItemCount = 0
-        let indexedSignatureCandidates = session.indexedToolItemIndices(
-            signature: signature,
-            pendingCallsOnly: true
-        )
-        inspectedItemCount += indexedSignatureCandidates.count
-        var signatureCandidates = indexedSignatureCandidates
-        var signatureUsedFallback = false
-        if signatureCandidates.isEmpty {
-            let fallback = session.activeTurnToolItemIndices(where: { item in
-                item.kind == .toolCall
-                    && Self.repoPromptInvocationSignature(
-                        toolName: item.toolName ?? "",
-                        argsJSON: item.toolArgsJSON
-                    ) == signature
-            })
-            inspectedItemCount += fallback.scannedItemCount
-            signatureCandidates = fallback.indices
-            signatureUsedFallback = !fallback.indices.isEmpty
-        }
+        let candidates = pendingSignatureCandidates(signature: signature, session: session)
+        inspectedItemCount += candidates.scanned
+        let signatureCandidates = candidates.indices
+        let signatureUsedFallback = candidates.usedFallback
 
         let matchingProviderBackedSignatureIndices = signatureCandidates.filter {
             session.items[$0].toolInvocationID != nil
@@ -809,26 +820,10 @@ final class ClaudeAgentToolTrackingHandler {
         session: AgentTabSession,
         observationOwner: AgentRunOwnership? = nil
     ) {
-        if let observationOwner,
-           !session.isCurrentRunAttemptForCurrentBinding(observationOwner, expectedRunID: trackedRunID) { return }
-        guard AgentToolTrackingSupport.isRepoPromptTool(toolName) else { return }
-        guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
-        if handleExactHostObservation(
-            invocationID: invocationID,
-            toolName: toolName,
-            args: args,
-            result: resultJSON,
-            isError: isError,
-            observationOwner: observationOwner,
-            session: session
-        ) { return }
-        // Flush buffered assistant content before inserting tool result to preserve interleaving order.
-        hooks.flushPendingAssistantDelta(session)
-        hooks.endActiveAssistantSegment(session)
-        hooks.endActiveReasoningSegment(session)
-        let storedToolName = Self.canonicalTranscriptToolName(toolName)
-        let argsJSON = AgentToolTrackingController.encodeArgsToJSON(args)
-        let signature = Self.repoPromptInvocationSignature(toolName: toolName, argsJSON: argsJSON)
+        guard let (storedToolName, argsJSON, signature) = prepareTrackerObservation(
+            invocationID: invocationID, toolName: toolName, args: args,
+            result: resultJSON, isError: isError, session: session, observationOwner: observationOwner
+        ) else { return }
         let resolvedInvocationID = providerInvocationByTrackerInvocationID[invocationID]?.providerID ?? invocationID
         providerInvocationByTrackerInvocationID.removeValue(forKey: invocationID)
 
@@ -872,25 +867,10 @@ final class ClaudeAgentToolTrackingHandler {
                     return byProviderInvocation
                 }
             }
-            let indexedSignatureCandidates = session.indexedToolItemIndices(
-                signature: signature,
-                pendingCallsOnly: true
-            )
-            inspectedItemCount += indexedSignatureCandidates.count
-            var matchingPendingSignatureIndices = indexedSignatureCandidates
-            var signatureUsedFallback = false
-            if matchingPendingSignatureIndices.isEmpty {
-                let fallback = session.activeTurnToolItemIndices(where: { item in
-                    item.kind == .toolCall
-                        && Self.repoPromptInvocationSignature(
-                            toolName: item.toolName ?? "",
-                            argsJSON: item.toolArgsJSON
-                        ) == signature
-                })
-                inspectedItemCount += fallback.scannedItemCount
-                matchingPendingSignatureIndices = fallback.indices
-                signatureUsedFallback = !fallback.indices.isEmpty
-            }
+            let candidates = pendingSignatureCandidates(signature: signature, session: session)
+            inspectedItemCount += candidates.scanned
+            let matchingPendingSignatureIndices = candidates.indices
+            let signatureUsedFallback = candidates.usedFallback
             if matchingPendingSignatureIndices.count > 1 {
                 diagnosticLog(
                     "ambiguous tracker result signature fallback tab=\(session.tabID.uuidString) " +

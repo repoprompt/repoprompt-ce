@@ -250,7 +250,7 @@ final class AgentSessionLanePolicyTests: XCTestCase {
         let session = await viewModel.ensureSessionReady(tabID: tabID)
         // MCP configuration now requires an admitted writer, not an unbound composer draft.
         let sessionID = UUID()
-        XCTAssertNil(viewModel.test_bindingRejection(sessionID: sessionID, on: session))
+        XCTAssertNil(viewModel.runtimeSessionStore.bindingRejection(sessionID, on: session))
         _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
             sessionID: sessionID, on: session, compareAndSetInWorkspaceID: activeWorkspace.id
         ))

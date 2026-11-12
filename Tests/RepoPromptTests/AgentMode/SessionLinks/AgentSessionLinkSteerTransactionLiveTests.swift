@@ -185,7 +185,7 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         XCTAssertEqual(fixture.session.selectedWorkflow, workflow, file: file, line: line)
         XCTAssertTrue(fixture.viewModel.interviewFirst, file: file, line: line)
         XCTAssertEqual(
-            fixture.viewModel.retrieveDraftText(for: fixture.tabID),
+            fixture.viewModel.draftRuntime.text(for: fixture.tabID),
             "the user's own half-typed draft",
             "an overseer's words must never enter or replace the target user's composer",
             file: file,
@@ -409,9 +409,9 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         XCTAssertEqual(counts.awaitingUser, 1)
         XCTAssertEqual(counts.unavailable, 1)
         XCTAssertThrowsError(try fixture.viewModel.mcpResidentLaneStateCounts(for: endpoint, hasOutboundLinks: false))
-        let hold = fixture.viewModel.agentSessionLinkWithholdPromptInventory(for: endpoint)
+        let hold = fixture.viewModel.linkExecutionRuntime.agentSessionLinkWithholdPromptInventory(for: endpoint)
         XCTAssertThrowsError(try fixture.viewModel.mcpResidentLaneStateCounts(for: endpoint, hasOutboundLinks: true))
-        fixture.viewModel.agentSessionLinkReleasePromptInventoryHold(hold, for: endpoint, publishing: nil)
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkReleasePromptInventoryHold(hold, for: endpoint, publishing: nil)
         fixture.viewModel.agentSessionLinkPromptInventoryBySessionID.removeValue(forKey: endpoint.sessionID)
         XCTAssertThrowsError(try fixture.viewModel.mcpResidentLaneStateCounts(for: endpoint, hasOutboundLinks: true))
         let zero = try fixture.viewModel.mcpResidentLaneStateCounts(for: endpoint, hasOutboundLinks: false)

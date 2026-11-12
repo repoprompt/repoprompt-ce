@@ -6,13 +6,6 @@ import RepoPromptDomainRuntime
 /// uses.
 @MainActor
 extension AgentModeViewModel: AgentNotificationActionTarget {
-    func resolveNotificationAction(
-        _ request: AgentNotificationActionRequest,
-        preferences: NotificationPreferences
-    ) -> AgentNotificationActionOutcome {
-        AgentNotificationActionResolver.resolve(request, target: self, preferences: preferences)
-    }
-
     func notificationSession(tabID: UUID) -> AgentTabSession? {
         sessions[tabID]
     }

@@ -314,7 +314,7 @@ enum AgentModelCatalog {
     ) -> NormalizedAgentSelection {
         let parsedAgent = normalizedAgentKind(agentRaw)
         var agent = parsedAgent ?? .claudeCode
-        var candidateModelRaw = normalizedRawModel(modelRaw)
+        var candidateModelRaw = ClaudeCompatibleModelCatalogAdapter.normalizedRawModel(modelRaw)
         var effectiveAvailability = availability
 
         if agent == .claudeCodeGLM {
@@ -1276,6 +1276,16 @@ enum AgentModelCatalog {
     private static func openCodeRawProviderComponents(
         from value: String
     ) -> (providerID: String, modelID: String)? {
+        guard let components = openCodeProviderComponents(from: value) else { return nil }
+        let providerID = components.provider
+        let modelID = components.model
+        guard !providerID.isEmpty, !modelID.isEmpty else { return nil }
+        return (providerID, modelID)
+    }
+
+    private static func openCodeProviderComponents(
+        from value: String
+    ) -> (provider: String, model: String)? {
         let parts = value
             .split(separator: "/", omittingEmptySubsequences: true)
             .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -1292,35 +1302,15 @@ enum AgentModelCatalog {
 
         let modelIndex = providerIndex + 1
         guard modelIndex < parts.count else { return nil }
-        let providerID = parts[providerIndex]
-        let modelID = parts[modelIndex...].joined(separator: "/")
-        guard !providerID.isEmpty, !modelID.isEmpty else { return nil }
-        return (providerID, modelID)
+        return (parts[providerIndex], parts[modelIndex...].joined(separator: "/"))
     }
 
     private static func openCodeDisplayProviderComponents(
         from value: String
     ) -> (providerDisplayName: String, modelDisplayName: String)? {
-        let parts = value
-            .split(separator: "/", omittingEmptySubsequences: true)
-            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        guard parts.count >= 2 else { return nil }
-
-        let providerIndex: Int
-        if parts[0].caseInsensitiveCompare("opencode") == .orderedSame {
-            guard parts.count >= 3 else { return nil }
-            providerIndex = 1
-        } else {
-            providerIndex = 0
-        }
-
-        let modelIndex = providerIndex + 1
-        guard modelIndex < parts.count else { return nil }
-        let providerDisplayName = strippedOpenCodeProviderPrefix(from: parts[providerIndex])
-        let modelDisplayName = parts[modelIndex...]
-            .joined(separator: "/")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let components = openCodeProviderComponents(from: value) else { return nil }
+        let providerDisplayName = strippedOpenCodeProviderPrefix(from: components.provider)
+        let modelDisplayName = components.model.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !providerDisplayName.isEmpty, !modelDisplayName.isEmpty else { return nil }
         return (providerDisplayName, modelDisplayName)
     }
@@ -1444,13 +1434,6 @@ enum AgentModelCatalog {
         return AgentProviderKind(rawValue: trimmed)
     }
 
-    private static func normalizedRawModel(_ rawValue: String?) -> String? {
-        guard let rawValue else { return nil }
-        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        return trimmed
-    }
-
     private static func backendIsAvailable(
         _ id: ClaudeCodeCompatibleBackendID,
         store: ClaudeCodeCompatibleBackendStore = .shared
@@ -1459,203 +1442,12 @@ enum AgentModelCatalog {
         return store.isConfigured(id) && config.isEnabled && config.isValid
     }
 
-    private static func compatibleBackendID(for agentKind: AgentProviderKind) -> ClaudeCodeCompatibleBackendID? {
-        switch agentKind {
-        case .claudeCodeGLM:
-            .glmZAI
-        case .kimiCode:
-            .kimi
-        case .customClaudeCompatible:
-            .custom
-        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild, .antigravity, .devin:
-            nil
-        }
-    }
-
     private static func isCompatibleBackendAgent(_ agentKind: AgentProviderKind) -> Bool {
-        compatibleBackendID(for: agentKind) != nil
-    }
-
-    private static func compatibleBackendConfig(for agentKind: AgentProviderKind) -> ClaudeCodeCompatibleBackendConfig? {
-        compatibleBackendID(for: agentKind).map { ClaudeCodeCompatibleBackendStore.shared.config(for: $0).normalized }
-    }
-
-    private static func compatibleBackendModelBehavior(for agentKind: AgentProviderKind) -> ClaudeCodeCompatibleBackendConfig.ModelBehavior? {
-        compatibleBackendConfig(for: agentKind)?.modelBehavior
-    }
-
-    private static func noModelRawValue(for id: ClaudeCodeCompatibleBackendID) -> String {
-        ClaudeCompatibleProviderRuntimeBridge.noModelRawValue(for: id)
+        ClaudeCompatibleModelCatalogAdapter.compatibleBackendID(for: agentKind) != nil
     }
 
     private static func defaultCompatibleBackendModelRaw(for agentKind: AgentProviderKind) -> String {
         ClaudeCompatibleModelCatalogAdapter.defaultModelRaw(for: agentKind) ?? AgentModel.defaultModel.rawValue
-    }
-
-    private static func compatibleBackendOptions(for agentKind: AgentProviderKind) -> [AgentModelOption] {
-        guard let id = compatibleBackendID(for: agentKind),
-              let config = compatibleBackendConfig(for: agentKind) else { return [] }
-        switch config.modelBehavior {
-        case .noModel:
-            return [AgentModelOption(
-                rawValue: noModelRawValue(for: id),
-                displayName: noModelDisplayName(for: id, config: config),
-                description: "No model flag. RepoPrompt does not pass --model or Claude effort settings for this backend.",
-                isPlaceholderDefault: false,
-                isProviderDefault: true
-            )]
-        case let .claudeSlotMapping(mapping):
-            let normalized = mapping.normalized
-            return [
-                compatibleSlotOption(slotRaw: AgentModel.claudeHaiku.rawValue, backendModelID: normalized.haiku, slotName: "Haiku"),
-                compatibleSlotOption(slotRaw: AgentModel.claudeSonnet.rawValue, backendModelID: normalized.sonnet, slotName: "Sonnet", isProviderDefault: true),
-                compatibleSlotOption(slotRaw: AgentModel.claudeOpus.rawValue, backendModelID: normalized.opus, slotName: "Opus")
-            ]
-        }
-    }
-
-    private static func noModelDisplayName(
-        for id: ClaudeCodeCompatibleBackendID,
-        config: ClaudeCodeCompatibleBackendConfig
-    ) -> String {
-        switch id {
-        case .kimi:
-            "Kimi Code"
-        case .glmZAI, .custom:
-            config.normalizedDisplayName
-        }
-    }
-
-    private static func compatibleSlotOption(
-        slotRaw: String,
-        backendModelID: String,
-        slotName: String,
-        isProviderDefault: Bool = false
-    ) -> AgentModelOption {
-        AgentModelOption(
-            rawValue: slotRaw,
-            displayName: displayName(forBackendModelID: backendModelID),
-            description: "Routes Claude Code's \(slotName) model slot to \(backendModelID).",
-            isPlaceholderDefault: false,
-            isProviderDefault: isProviderDefault
-        )
-    }
-
-    private static func displayName(forBackendModelID modelID: String) -> String {
-        if let model = AgentModel(rawValue: modelID) {
-            return model.displayName
-        }
-        return modelID
-    }
-
-    private static func compatibleBackendDisplayName(
-        forRequestedModelRaw rawModel: String?,
-        agentKind: AgentProviderKind
-    ) -> String? {
-        guard let id = compatibleBackendID(for: agentKind),
-              let config = compatibleBackendConfig(for: agentKind) else { return nil }
-        switch config.modelBehavior {
-        case .noModel:
-            let specifier = ClaudeModelSpecifier(raw: rawModel)
-            guard specifier.effortLevel == nil else { return nil }
-            let base = specifier.baseModel ?? noModelRawValue(for: id)
-            return base.caseInsensitiveCompare(noModelRawValue(for: id)) == .orderedSame
-                ? noModelDisplayName(for: id, config: config)
-                : nil
-        case let .claudeSlotMapping(mapping):
-            let normalized = mapping.normalized
-            guard let slot = canonicalCompatibleBackendBaseRaw(rawModel, for: agentKind) else { return nil }
-            switch slot {
-            case AgentModel.claudeHaiku.rawValue:
-                return displayName(forBackendModelID: normalized.haiku)
-            case AgentModel.claudeSonnet.rawValue:
-                return displayName(forBackendModelID: normalized.sonnet)
-            case AgentModel.claudeOpus.rawValue:
-                return displayName(forBackendModelID: normalized.opus)
-            default:
-                return nil
-            }
-        }
-    }
-
-    private static func compatibleBackendDescription(
-        forRequestedModelRaw rawModel: String?,
-        agentKind: AgentProviderKind
-    ) -> String? {
-        guard let config = compatibleBackendConfig(for: agentKind) else { return nil }
-        switch config.modelBehavior {
-        case .noModel:
-            return "No model flag. RepoPrompt does not pass --model or Claude effort settings for this backend."
-        case let .claudeSlotMapping(mapping):
-            let normalized = mapping.normalized
-            guard let slot = canonicalCompatibleBackendBaseRaw(rawModel, for: agentKind) else { return nil }
-            switch slot {
-            case AgentModel.claudeHaiku.rawValue:
-                return "Routes Claude Code's Haiku model slot to \(normalized.haiku)."
-            case AgentModel.claudeSonnet.rawValue:
-                return "Routes Claude Code's Sonnet model slot to \(normalized.sonnet)."
-            case AgentModel.claudeOpus.rawValue:
-                return "Routes Claude Code's Opus model slot to \(normalized.opus)."
-            default:
-                return nil
-            }
-        }
-    }
-
-    private static func canonicalCompatibleBackendBaseRaw(_ rawModel: String?, for agentKind: AgentProviderKind) -> String? {
-        guard let id = compatibleBackendID(for: agentKind),
-              let config = compatibleBackendConfig(for: agentKind) else { return nil }
-        switch config.modelBehavior {
-        case .noModel:
-            let specifier = ClaudeModelSpecifier(raw: rawModel)
-            guard specifier.effortLevel == nil else { return nil }
-            let base = specifier.baseModel ?? noModelRawValue(for: id)
-            return base.caseInsensitiveCompare(noModelRawValue(for: id)) == .orderedSame ? noModelRawValue(for: id) : nil
-        case .claudeSlotMapping:
-            let specifier = ClaudeModelSpecifier(raw: rawModel)
-            let base = specifier.baseModel
-            return ClaudeCodeGLMIntegration.normalizedSlotModel(
-                base,
-                config: config
-            )
-        }
-    }
-
-    private static func canonicalCompatibleBackendModelRaw(_ rawModel: String?, for agentKind: AgentProviderKind) -> String? {
-        let specifier = ClaudeModelSpecifier(raw: rawModel)
-        guard let base = canonicalCompatibleBackendBaseRaw(specifier.baseModel, for: agentKind) else { return rawModel }
-        if let effort = specifier.effortLevel {
-            return ClaudeModelSpecifier.encodedRaw(baseModelRaw: base, effort: effort)
-        }
-        return base
-    }
-
-    private static func isValidCompatibleBackendModel(
-        _ rawModel: String,
-        for agentKind: AgentProviderKind,
-        availability: AvailabilityContext
-    ) -> Bool {
-        guard isAgentAvailable(agentKind, availability: availability) else { return false }
-        guard let config = compatibleBackendConfig(for: agentKind) else { return false }
-        let specifier = ClaudeModelSpecifier(raw: rawModel)
-        switch config.modelBehavior {
-        case .noModel:
-            guard specifier.effortLevel == nil,
-                  let base = specifier.baseModel else { return false }
-            return compatibleBackendID(for: agentKind).map { base.caseInsensitiveCompare(noModelRawValue(for: $0)) == .orderedSame } ?? false
-        case .claudeSlotMapping:
-            guard let canonical = canonicalCompatibleBackendModelRaw(rawModel, for: agentKind) else { return false }
-            let canonicalSpecifier = ClaudeModelSpecifier(raw: canonical)
-            guard let base = canonicalSpecifier.baseModel,
-                  [AgentModel.claudeHaiku.rawValue, AgentModel.claudeSonnet.rawValue, AgentModel.claudeOpus.rawValue].contains(base)
-            else {
-                return false
-            }
-            if let effort = canonicalSpecifier.effortLevel {
-                return claudeEffort(effort, isSupportedForBaseModelRaw: base, agentKind: agentKind)
-            }
-            return true
-        }
     }
 
     private static func isAvailable(
@@ -1678,23 +1470,6 @@ enum AgentModelCatalog {
     private static func canonicalModelRaw(_ rawModel: String, for agentKind: AgentProviderKind) -> String {
         guard agentKind == .cursor else { return rawModel }
         return CursorAIModelCatalog.option(matching: rawModel)?.rawValue ?? rawModel
-    }
-
-    private static func canonicalClaudeGLMModelRaw(_ rawModel: String?) -> String? {
-        guard let rawModel = normalizedRawModel(rawModel) else {
-            return ClaudeCodeGLMIntegration.normalizedGLMModel(nil)
-        }
-        let specifier = ClaudeModelSpecifier(raw: rawModel)
-        guard let baseModel = specifier.baseModel else {
-            return rawModel
-        }
-        guard let mappedBaseModel = ClaudeCodeGLMIntegration.normalizedGLMModel(baseModel) else {
-            return rawModel
-        }
-        if let effort = specifier.effortLevel {
-            return ClaudeModelSpecifier.encodedRaw(baseModelRaw: mappedBaseModel, effort: effort)
-        }
-        return mappedBaseModel
     }
 
     private static func staticOption(_ model: AgentModel, for agentKind: AgentProviderKind) -> AgentModelOption {
@@ -1956,35 +1731,32 @@ enum AgentModelCatalog {
             ]
         case .engineer:
             [
-                SelectionCandidate(agent: .codexExec, modelRaw: solMedium),
-                SelectionCandidate(agent: .claudeCode, modelRaw: AgentModel.claudeSonnet.rawValue),
-                SelectionCandidate(agent: .claudeCodeGLM, modelRaw: AgentModel.claudeSonnet.rawValue),
-                SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
-                SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
-                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue),
+                SelectionCandidate(agent: .codexExec, modelRaw: solMedium)
+            ] + claudeRoleCandidates(baseModelRaw: AgentModel.claudeSonnet.rawValue) + [
                 SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue)
             ]
         case .pair:
             [
-                SelectionCandidate(agent: .codexExec, modelRaw: solHigh),
-                SelectionCandidate(agent: .claudeCode, modelRaw: AgentModel.claudeOpus.rawValue),
-                SelectionCandidate(agent: .claudeCodeGLM, modelRaw: AgentModel.claudeOpus.rawValue),
-                SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
-                SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
-                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue),
+                SelectionCandidate(agent: .codexExec, modelRaw: solHigh)
+            ] + claudeRoleCandidates(baseModelRaw: AgentModel.claudeOpus.rawValue) + [
                 SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue)
             ]
         case .design:
-            [
-                SelectionCandidate(agent: .claudeCode, modelRaw: AgentModel.claudeOpus.rawValue),
-                SelectionCandidate(agent: .claudeCodeGLM, modelRaw: AgentModel.claudeOpus.rawValue),
-                SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
-                SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
-                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue),
+            claudeRoleCandidates(baseModelRaw: AgentModel.claudeOpus.rawValue) + [
                 SelectionCandidate(agent: .codexExec, modelRaw: solMedium),
                 SelectionCandidate(agent: .grokBuild, modelRaw: AgentModel.defaultModel.rawValue)
             ]
         }
+    }
+
+    private static func claudeRoleCandidates(baseModelRaw: String) -> [SelectionCandidate] {
+        [
+            SelectionCandidate(agent: .claudeCode, modelRaw: baseModelRaw),
+            SelectionCandidate(agent: .claudeCodeGLM, modelRaw: baseModelRaw),
+            SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
+            SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
+            SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue)
+        ]
     }
 
     /// Checks if a candidate agent+model is currently available.

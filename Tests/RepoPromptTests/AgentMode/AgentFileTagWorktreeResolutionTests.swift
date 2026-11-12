@@ -363,7 +363,7 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
         let lookupContext = await makeLookupContext(fixture: fixture)
         let physicalWorktreePath = fixture.worktreeRoot.appendingPathComponent("Sources/App.swift").path
 
-        let resolvedXML = await AgentModeViewModel.taggedFileContentsXMLForTaggedPaths(
+        let resolvedXML = await AgentSessionProviderInputRuntime.taggedFileContentsXMLForTaggedPaths(
             ["Sources/App.swift", physicalWorktreePath],
             tokenBudget: 10000,
             maxFiles: 10,
@@ -568,7 +568,7 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
         XCTAssertFalse(allTokenText.contains { $0.hasPrefix("/") }, allTokenText.joined(separator: "\n"))
         XCTAssertFalse(allTokenText.contains { $0.contains(fixture.base.path) }, allTokenText.joined(separator: "\n"))
 
-        let resolvedXML = await AgentModeViewModel.taggedFileContentsXMLForTaggedPaths(
+        let resolvedXML = await AgentSessionProviderInputRuntime.taggedFileContentsXMLForTaggedPaths(
             [expectedSecondToken],
             tokenBudget: 10000,
             maxFiles: 10,
@@ -591,7 +591,7 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
         _ = try await store.loadRoot(path: shadowRoot.path)
         let generatedToken = "B/SharedRoot/Sources/Target.swift"
 
-        let resolvedXML = await AgentModeViewModel.taggedFileContentsXMLForTaggedPaths(
+        let resolvedXML = await AgentSessionProviderInputRuntime.taggedFileContentsXMLForTaggedPaths(
             [generatedToken],
             tokenBudget: 10000,
             maxFiles: 10,
@@ -700,7 +700,7 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
         _ = try await fixture.store.loadRoot(path: unboundRoot.path)
         let lookupContext = await makeLookupContext(fixture: fixture)
 
-        let resolvedXML = await AgentModeViewModel.taggedFileContentsXMLForTaggedPaths(
+        let resolvedXML = await AgentSessionProviderInputRuntime.taggedFileContentsXMLForTaggedPaths(
             [unboundFile.path],
             tokenBudget: 10000,
             maxFiles: 10,
@@ -717,7 +717,7 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
         let fixture = try await makeBoundFixture(includeBranchOnly: true)
         _ = await makeLookupContext(fixture: fixture) // Keep hidden worktree loaded; visible lookups must still ignore it.
 
-        let resolvedVisibleXML = await AgentModeViewModel.taggedFileContentsXMLForTaggedPaths(
+        let resolvedVisibleXML = await AgentSessionProviderInputRuntime.taggedFileContentsXMLForTaggedPaths(
             ["Sources/App.swift"],
             tokenBudget: 10000,
             maxFiles: 10,
@@ -725,7 +725,7 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
             lookupContext: .visibleWorkspace
         )
         let visibleXML = try XCTUnwrap(resolvedVisibleXML)
-        let hiddenXML = await AgentModeViewModel.taggedFileContentsXMLForTaggedPaths(
+        let hiddenXML = await AgentSessionProviderInputRuntime.taggedFileContentsXMLForTaggedPaths(
             ["Sources/BranchOnly.swift"],
             tokenBudget: 10000,
             maxFiles: 10,

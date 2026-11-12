@@ -113,7 +113,7 @@ struct JevRoutingClient: JevRoutingClientProtocol {
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
         request.httpMethod = method
         request.httpBody = body
-        request.timeoutInterval = max(0.001, timeout.secondsValue)
+        request.timeoutInterval = max(0.001, timeout.routingTimeInterval)
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         if body != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
@@ -217,12 +217,5 @@ final class JevOwnedFirstResult<Value>: @unchecked Sendable {
         lock.unlock()
         tasks.forEach { $0.cancel() }
         continuation?.resume(with: result)
-    }
-}
-
-private extension Duration {
-    var secondsValue: TimeInterval {
-        let c = components
-        return TimeInterval(c.seconds) + TimeInterval(c.attoseconds) / 1_000_000_000_000_000_000
     }
 }

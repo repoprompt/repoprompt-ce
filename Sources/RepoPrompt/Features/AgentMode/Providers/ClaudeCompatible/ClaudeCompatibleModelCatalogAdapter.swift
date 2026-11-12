@@ -83,17 +83,6 @@ enum ClaudeCompatibleModelCatalogAdapter {
         pluginOptions.map { modelOption(from: $0, for: agentKind) }
     }
 
-    static func pluginModelOption(from option: AgentModelOption) -> ClaudeCompatiblePluginModelOption {
-        ClaudeCompatiblePluginModelOption(
-            rawValue: option.rawValue,
-            displayName: option.displayName,
-            description: option.description,
-            isPlaceholderDefault: option.isPlaceholderDefault,
-            isProviderDefault: option.isProviderDefault,
-            supportedEffortLevels: []
-        )
-    }
-
     static func compatibleBackendModelBehavior(
         for agentKind: AgentProviderKind
     ) -> ClaudeCodeCompatibleBackendConfig.ModelBehavior? {
@@ -386,7 +375,7 @@ enum ClaudeCompatibleModelCatalogAdapter {
         }
     }
 
-    private static func compatibleBackendID(for agentKind: AgentProviderKind) -> ClaudeCodeCompatibleBackendID? {
+    static func compatibleBackendID(for agentKind: AgentProviderKind) -> ClaudeCodeCompatibleBackendID? {
         switch agentKind {
         case .claudeCodeGLM:
             .glmZAI
@@ -407,7 +396,7 @@ enum ClaudeCompatibleModelCatalogAdapter {
         ClaudeCompatibleProviderRuntimeBridge.noModelRawValue(for: id)
     }
 
-    private static func normalizedRawModel(_ rawValue: String?) -> String? {
+    static func normalizedRawModel(_ rawValue: String?) -> String? {
         guard let rawValue else { return nil }
         let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }

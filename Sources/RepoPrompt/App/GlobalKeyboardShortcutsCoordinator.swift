@@ -385,10 +385,10 @@ final class GlobalKeyboardShortcutsCoordinator {
         guard let win = guardedFocusedWindowState() else { return }
         let tabs = win.promptManager.currentComposeTabs
         let activeTabID = win.promptManager.activeComposeTabID
-        guard let targetTabID = win.agentModeViewModel.adjacentParentSidebarSessionTabID(
+        guard let targetTabID = AgentModeViewModel.adjacentParentSidebarSessionTabID(
             from: activeTabID,
             forward: forward,
-            in: tabs
+            rows: win.agentModeViewModel.sidebarSessions(for: tabs)
         ) else {
             return
         }

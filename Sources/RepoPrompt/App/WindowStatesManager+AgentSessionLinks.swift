@@ -751,7 +751,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else {
             return .refused(.observerUnavailable)
         }
-        return viewModel.agentSessionLinkRequestManualWakeNow(for: endpoint)
+        return viewModel.linkExecutionRuntime.agentSessionLinkRequestManualWakeNow(for: endpoint)
     }
 
     @discardableResult
@@ -776,7 +776,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else {
             return .failure(.observerUnavailable)
         }
-        return viewModel.agentSessionLinkAutoWakeSnoozeProjection(
+        return viewModel.linkExecutionRuntime.agentSessionLinkAutoWakeSnoozeProjection(
             endpoint: endpoint,
             targetSessionID: targetSessionID,
             expectedReference: expectedReference
@@ -798,7 +798,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else {
             return .failure(.observerUnavailable)
         }
-        return viewModel.agentSessionLinkMutateAutoWakeSnooze(
+        return viewModel.linkExecutionRuntime.agentSessionLinkMutateAutoWakeSnooze(
             endpoint: endpoint,
             targetSessionID: targetSessionID,
             expectedReference: expectedReference,
@@ -838,7 +838,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         to endpoint: DomainAgentSessionLinkEndpointIdentity
     ) {
         guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return }
-        viewModel.agentSessionLinkPublishPromptInventory(inventory, to: endpoint)
+        viewModel.linkExecutionRuntime.agentSessionLinkPublishPromptInventory(inventory, to: endpoint)
     }
 
     func agentSessionLinkPublishRunCatalogProjection(
@@ -847,7 +847,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         guard let endpoint = projection.routeToken?.observerEndpoint,
               let viewModel = agentSessionLinkOwningViewModel(for: endpoint)
         else { return }
-        viewModel.agentSessionLinkPublishRunCatalogProjection(projection, to: endpoint)
+        viewModel.linkExecutionRuntime.agentSessionLinkPublishRunCatalogProjection(projection, to: endpoint)
     }
 
     /// Routes one passive status-notice queue to the exact incarnation it was reduced for.
@@ -859,7 +859,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         to endpoint: DomainAgentSessionLinkEndpointIdentity
     ) {
         guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return }
-        viewModel.agentSessionLinkPublishPassiveStatusNotices(snapshot, to: endpoint)
+        viewModel.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(snapshot, to: endpoint)
     }
 
     func agentSessionLinkWillActivate(_ endpoint: DomainAgentSessionLinkEndpointIdentity) async {
@@ -871,7 +871,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> UInt64? {
         guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return nil }
-        return viewModel.agentSessionLinkWithholdPromptInventory(for: endpoint)
+        return viewModel.linkExecutionRuntime.agentSessionLinkWithholdPromptInventory(for: endpoint)
     }
 
     func agentSessionLinkReleasePromptInventoryHold(
@@ -880,7 +880,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         publishing inventory: AgentSessionLinkPromptInventory?
     ) {
         guard let viewModel = agentSessionLinkOwningViewModel(for: endpoint) else { return }
-        viewModel.agentSessionLinkReleasePromptInventoryHold(
+        viewModel.linkExecutionRuntime.agentSessionLinkReleasePromptInventoryHold(
             token,
             for: endpoint,
             publishing: inventory
@@ -900,7 +900,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         let viewModel = window.agentModeViewModel
         // Full incarnation match, not `(tabID, sessionID)`: an in-place rebind keeps both while
         // advancing the binding generations.
-        guard viewModel.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint else {
+        guard viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint else {
             return nil
         }
         return viewModel

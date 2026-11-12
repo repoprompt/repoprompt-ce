@@ -6053,14 +6053,14 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         _ = try XCTUnwrap(fixture.window.agentModeViewModel.test_installPersistentSessionBinding(
             sessionID: fixture.overseer, on: presenter
         ))
-        let endpoint = try XCTUnwrap(fixture.window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tab))
+        let endpoint = try XCTUnwrap(fixture.window.agentModeViewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: fixture.tab))
         XCTAssertTrue(endpoint.hasResolvedPersistentBinding)
         XCTAssertEqual(endpoint.sessionID, fixture.overseer)
         XCTAssertEqual(endpoint.workspaceID, presentingWorkspace.id)
         XCTAssertEqual(endpoint.windowID, fixture.window.windowID)
         let physicalTab = fixture.tab
         fixture.physicalObserverEndpoint = { [weak window = fixture.window] in
-            window?.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: physicalTab)
+            window?.agentModeViewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: physicalTab)
         }
         var catalog = WorkspaceModel(name: "Non-presenting batch catalog", repoPaths: [], isSavedWorkspace: false)
         catalog.isEphemeral = true
@@ -6098,7 +6098,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         // A genuinely loaded duplicate is still ambiguous, even when its session ID matches.
         let duplicate = AgentModeViewModel.TabSession(tabID: fixture.tab)
         second.agentModeViewModel.test_installLiveSession(duplicate)
-        XCTAssertEqual(second.agentModeViewModel.test_bindingRejection(sessionID: fixture.overseer, on: duplicate), .conflictingWriter)
+        XCTAssertEqual(second.agentModeViewModel.runtimeSessionStore.bindingRejection(fixture.overseer, on: duplicate), .conflictingWriter)
         XCTAssertNil(second.agentModeViewModel.test_installPersistentSessionBinding(sessionID: fixture.overseer, on: duplicate))
         XCTAssertNil(duplicate.persistentSessionBindingIdentity)
         // Exercise legacy corruption only after proving ordinary writer admission refuses it.
@@ -7432,7 +7432,7 @@ final class DelegationCommitFenceTests: XCTestCase {
         }
         let otherSession = AgentModeViewModel.TabSession(tabID: tab)
         second.agentModeViewModel.test_installLiveSession(otherSession)
-        XCTAssertEqual(second.agentModeViewModel.test_bindingRejection(sessionID: requester, on: otherSession), .conflictingWriter)
+        XCTAssertEqual(second.agentModeViewModel.runtimeSessionStore.bindingRejection(requester, on: otherSession), .conflictingWriter)
         XCTAssertNil(second.agentModeViewModel.test_installPersistentSessionBinding(sessionID: requester, on: otherSession))
         XCTAssertNil(otherSession.persistentSessionBindingIdentity)
         XCTAssertNil(otherSession.activeAgentSessionID)
@@ -8845,18 +8845,18 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 var currentAtDispatch = false
                 vm.test_beforeRoutineIdleFollowUpStart = { candidate, _ in
                     XCTAssertTrue(candidate === session)
-                    let protection = vm.transcriptProjectionProtection(for: candidate)
-                    currentAtDispatch = vm.canReuseDerivedTranscriptForSave(for: candidate, projectionProtection: protection)
+                    let protection = AgentSessionTranscriptRefreshRuntime.transcriptProjectionProtection(for: candidate)
+                    currentAtDispatch = AgentSessionTranscriptRefreshRuntime.canReuseDerivedTranscriptForSave(for: candidate, projectionProtection: protection)
                     XCTAssertEqual(candidate.transcript.turns.last?.conclusionActivityID, laterOrdinary.id)
                     XCTAssertEqual(candidate.transcript.turns.last?.completedAt, laterOrdinary.timestamp)
                     observed.fulfill()
                     return false
                 }
                 defer { vm.test_beforeRoutineIdleFollowUpStart = nil }
-                vm.agentSessionLinkPublishPromptInventory(
+                vm.linkExecutionRuntime.agentSessionLinkPublishPromptInventory(
                     AgentSessionLinkAutoWakeTests.inventory(observerSessionID: targetID, revision: 1), to: endpoint
                 )
-                vm.agentSessionLinkPublishPassiveStatusNotices(
+                vm.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(
                     AgentSessionLinkAutoWakeTests.laneSnapshot(observerEndpoint: endpoint), to: endpoint
                 )
                 await fulfillment(of: [observed], timeout: 5)
@@ -9362,12 +9362,12 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     if !realCatalog {
                         let connectionID = UUID()
                         vm.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { [weak vm] runID, _, tabID in
-                            guard let vm, let endpoint = vm.agentSessionLinkObserverEndpoint(tabID: tabID) else { return nil }
+                            guard let vm, let endpoint = vm.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID) else { return nil }
                             let token = AgentSessionLinkRunCatalogRouteToken(
                                 runID: runID, observerEndpoint: endpoint, connectionID: connectionID,
                                 routingAuthorityGeneration: 1, connectionLifecycleGeneration: 1
                             )
-                            vm.agentSessionLinkPublishRunCatalogProjection(.init(
+                            vm.linkExecutionRuntime.agentSessionLinkPublishRunCatalogProjection(.init(
                                 runID: runID, routeToken: token, projectionRevision: 1,
                                 hasAgentSessionLink: true, hasAnyActiveLink: true
                             ), to: endpoint)
@@ -9376,7 +9376,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                         vm.test_agentSessionLinkCurrentRunCatalogRouteToken = { [weak vm] token, tabID in
                             // The synchronous fence receives the tab ID, not the run ID.
                             vm?.sessions[tabID]?.runID == token.runID
-                                && vm?.agentSessionLinkObserverEndpoint(tabID: tabID) == token.observerEndpoint
+                                && vm?.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID) == token.observerEndpoint
                         }
                     }
                     return vm
@@ -9928,8 +9928,8 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 }
             } catch {
                 let resumed = await observerController.sentMessages
-                let readiness = AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(session: observer, endpointMatchesGrant: true, isClosing: false)
-                return XCTFail("Requester delivery did not settle: messages=\(resumed), state=\(observer.runState), readiness=\(String(describing: AgentSessionLinkDeliveryReadiness.evaluate(snapshot: readiness))), items=\(observer.items.map(\.text)), terminating=\(WindowStatesManager.shared.isTerminating), admission=\(String(describing: observer.operationAdmissionFailureMessage)), endpoint=\(String(describing: observerVM.agentSessionLinkObserverEndpoint(tabID: observerTab.id))), presentation=\(String(describing: DelegationScopeRuntime.loadedPresentation(forTab: observerTab.id, in: WindowStatesManager.shared.allWindows)?.sessionID)), sameSession=\(observerVM.sessions[observerTab.id] === observer), closing=\(observerFixture.window.isClosing), authority=\(bridge.delegationScopes.availability)")
+                let readiness = AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(session: observer, endpointMatchesGrant: true, isClosing: false)
+                return XCTFail("Requester delivery did not settle: messages=\(resumed), state=\(observer.runState), readiness=\(String(describing: AgentSessionLinkDeliveryReadiness.evaluate(snapshot: readiness))), items=\(observer.items.map(\.text)), terminating=\(WindowStatesManager.shared.isTerminating), admission=\(String(describing: observer.operationAdmissionFailureMessage)), endpoint=\(String(describing: observerVM.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: observerTab.id))), presentation=\(String(describing: DelegationScopeRuntime.loadedPresentation(forTab: observerTab.id, in: WindowStatesManager.shared.allWindows)?.sessionID)), sameSession=\(observerVM.sessions[observerTab.id] === observer), closing=\(observerFixture.window.isClosing), authority=\(bridge.delegationScopes.availability)")
             }
             let resumed = await observerController.sentMessages
             XCTAssertEqual(resumed.count(where: { $0.contains(terminalNotice) }), 1, "One final result across all watch re-arms")
@@ -10396,7 +10396,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 XCTAssertEqual(owner.workspaceID, workspace.id)
                 XCTAssertTrue(viewModel.sessionIndexStore.isOwnerCurrent(owner))
                 XCTAssertEqual(Set(viewModel.test_ownerValidatedSessionIndex.keys), Set(entries.keys))
-                let preferred = try XCTUnwrap(viewModel.preferredSidebarEntry(for: archived.id, tabName: archived.name))
+                let preferred = try XCTUnwrap(AgentModeSidebarSessionBuilder.preferredSidebarEntry(for: archived.id, tabName: archived.name, entries: viewModel.sessionIndexStore.ownerValidatedEntries(forTabID: archived.id)))
                 XCTAssertEqual(preferred.id, newer)
 
                 let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [window] }, links: { ([], []) })

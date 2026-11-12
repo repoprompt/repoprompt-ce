@@ -81,7 +81,7 @@ extension AgentModeViewModel {
     ) -> AgentSessionOverseerBootstrapRefusal? {
         guard agentSessionLinkBootstrapState(for: endpoint) == nil else { return nil }
         let isLane = sessions[endpoint.tabID]?.createdByOverseerSessionID != nil
-        return .classify(candidate: agentSessionLinkModelCandidate(for: endpoint), isOverseerLane: isLane)
+        return .classify(candidate: linkExecutionRuntime.agentSessionLinkModelCandidate(for: endpoint), isOverseerLane: isLane)
     }
 }
 
@@ -96,7 +96,7 @@ extension AgentModeViewModel {
     func agentSessionLinkBootstrapState(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> AgentSessionOverseerBootstrapState? {
-        guard let candidate = agentSessionLinkModelCandidate(for: endpoint),
+        guard let candidate = linkExecutionRuntime.agentSessionLinkModelCandidate(for: endpoint),
               let session = sessions[endpoint.tabID],
               session.createdByOverseerSessionID == nil,
               AgentSessionLinkEndpointEligibility.addDisabledReason(

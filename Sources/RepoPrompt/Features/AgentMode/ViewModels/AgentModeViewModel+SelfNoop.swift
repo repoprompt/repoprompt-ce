@@ -19,7 +19,7 @@ extension AgentModeViewModel {
         guard let session = sessions[origin.endpoint.tabID], session.runID == origin.runID,
               let owner = session.activeRunOwnership, owner.attemptID == origin.runAttemptID,
               session.isCurrentRunAttemptForCurrentBinding(owner) else { return }
-        guard let endpoint, agentSessionLinkObserverEndpoint(tabID: session.tabID) == endpoint,
+        guard let endpoint, linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: session.tabID) == endpoint,
               let wakeID = session.quietLedger.routineWakeID(owner: owner),
               !session.hasOwnPendingQuietInteraction
         else {

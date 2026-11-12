@@ -44,6 +44,29 @@ extension AgentSessionRow {
             }
         }
 
+        func unlinkItem(
+            _ option: AgentSidebarOversightMenuProps.PeerOption,
+            observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+            targetEndpoint: DomainAgentSessionLinkEndpointIdentity
+        ) -> StableMenuItem? {
+            guard case let .linked(reference, _) = option.relationship else { return nil }
+            let busy = busyKeys.contains(.unlink(
+                observerEndpoint: observerEndpoint,
+                targetEndpoint: targetEndpoint,
+                reference: reference
+            ))
+            return .action(
+                option.menuLabel,
+                isEnabled: !busy,
+                imageSystemName: busy ? "hourglass" : nil,
+                accessibilityLabel: AgentOversightUICopy.unlinkAccessibilityLabel(option.menuLabel),
+                accessibilityValue: busy ? "In progress" : nil,
+                accessibilityHint: option.fullIdentityDescription
+            ) {
+                actions.unlink(observerEndpoint, targetEndpoint, reference)
+            }
+        }
+
         var items: [StableMenuItem] = []
 
         if !hasTopSections {
@@ -167,43 +190,13 @@ extension AgentSessionRow {
             if !menu.linkedObservers.isEmpty {
                 unlinkItems.append(.header(AgentOversightUICopy.unlinkOverseerSectionLabel))
                 unlinkItems += menu.linkedObservers.compactMap { option in
-                    guard case let .linked(reference, _) = option.relationship else { return nil }
-                    let busy = busyKeys.contains(.unlink(
-                        observerEndpoint: option.peerEndpoint,
-                        targetEndpoint: menu.targetEndpoint,
-                        reference: reference
-                    ))
-                    return .action(
-                        option.menuLabel,
-                        isEnabled: !busy,
-                        imageSystemName: busy ? "hourglass" : nil,
-                        accessibilityLabel: AgentOversightUICopy.unlinkAccessibilityLabel(option.menuLabel),
-                        accessibilityValue: busy ? "In progress" : nil,
-                        accessibilityHint: option.fullIdentityDescription
-                    ) {
-                        actions.unlink(option.peerEndpoint, menu.targetEndpoint, reference)
-                    }
+                    unlinkItem(option, observerEndpoint: option.peerEndpoint, targetEndpoint: menu.targetEndpoint)
                 }
             }
             if !menu.linkedTargets.isEmpty {
                 unlinkItems.append(.header(AgentOversightUICopy.unlinkOverseenSectionLabel))
                 unlinkItems += menu.linkedTargets.compactMap { option in
-                    guard case let .linked(reference, _) = option.relationship else { return nil }
-                    let busy = busyKeys.contains(.unlink(
-                        observerEndpoint: menu.targetEndpoint,
-                        targetEndpoint: option.peerEndpoint,
-                        reference: reference
-                    ))
-                    return .action(
-                        option.menuLabel,
-                        isEnabled: !busy,
-                        imageSystemName: busy ? "hourglass" : nil,
-                        accessibilityLabel: AgentOversightUICopy.unlinkAccessibilityLabel(option.menuLabel),
-                        accessibilityValue: busy ? "In progress" : nil,
-                        accessibilityHint: option.fullIdentityDescription
-                    ) {
-                        actions.unlink(menu.targetEndpoint, option.peerEndpoint, reference)
-                    }
+                    unlinkItem(option, observerEndpoint: menu.targetEndpoint, targetEndpoint: option.peerEndpoint)
                 }
             }
             items.append(.submenu(

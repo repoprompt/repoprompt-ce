@@ -191,11 +191,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
         var authorityLost = false
         for lease in batch.leases {
             let target = lease.targetSessionID
-            guard !authorityLost, context.scopes.isCurrent(lease) else {
-                authorityLost = true
-                items.append(.revoked(target))
-                continue
-            }
+            if context.appendRevocationIfNeeded(lease, authorityLost: &authorityLost, items: &items) { continue }
             guard target != observer else {
                 items.append(SessionAdminItemResult(sessionID: target, result: "not_applied", code: "self_link"))
                 continue
@@ -242,11 +238,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
         var authorityLost = false
         for lease in batch.leases {
             let target = lease.targetSessionID
-            guard !authorityLost, context.scopes.isCurrent(lease) else {
-                authorityLost = true
-                items.append(.revoked(target))
-                continue
-            }
+            if context.appendRevocationIfNeeded(lease, authorityLost: &authorityLost, items: &items) { continue }
             if batch.request.preview {
                 let linked = await host.activeLinkCapabilities(observer: observer, target: target) != nil
                 items.append(SessionAdminItemResult(sessionID: target, result: linked ? "would_unlink" : "not_linked"))
@@ -475,11 +467,7 @@ final class SessionAdminRestructureHandler: AgentSessionAdministrationOperationH
         var authorityLost = false
         for lease in batch.leases {
             let source = lease.targetSessionID
-            guard !authorityLost, context.scopes.isCurrent(lease) else {
-                authorityLost = true
-                items.append(.revoked(source))
-                continue
-            }
+            if context.appendRevocationIfNeeded(lease, authorityLost: &authorityLost, items: &items) { continue }
             if batch.request.preview {
                 items.append(SessionAdminItemResult(
                     sessionID: source, result: "would_move",

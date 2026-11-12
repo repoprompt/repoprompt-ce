@@ -660,7 +660,7 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
                     // provider-facing prepend and accepted-send consumption used by the runner.
                     try await Task { @MainActor in
                         XCTAssertFalse(fixture.session.isChangingExecutionLocation)
-                        let text = fixture.viewModel.prependPendingHandoffIfNeeded("message", session: fixture.session)
+                        let text = fixture.viewModel.handoffRuntime.prependPendingHandoffIfNeeded("message", session: fixture.session)
                         _ = try await native.sendUserMessage(text)
                         fixture.session.pendingHandoff.clearAfterSend()
                     }.value
@@ -674,7 +674,7 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         XCTAssertEqual(fixture.session.worktreeBindings, original)
         XCTAssertNil(fixture.session.pendingHandoff.payload, "A delivered handoff must not be resurrected by an unrelated rollback")
         XCTAssertNil(saved?.pendingHandoffPayload, "Rollback must not force-save the already-delivered payload")
-        XCTAssertEqual(fixture.viewModel.prependPendingHandoffIfNeeded("next", session: fixture.session), "next")
+        XCTAssertEqual(fixture.viewModel.handoffRuntime.prependPendingHandoffIfNeeded("next", session: fixture.session), "next")
     }
 
     func testSameRootRefusalDoesNotRestageHandoffAfterConcurrentCancelRun() async throws {
@@ -712,7 +712,7 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         XCTAssertEqual(fixture.session.worktreeBindings, original)
         XCTAssertEqual(fixture.session.pendingHandoff.payload, "handoff P")
         XCTAssertFalse(fixture.session.pendingHandoff.isStagedForSend, "Rollback must not undo cancelRun's unstage")
-        XCTAssertEqual(fixture.viewModel.prependPendingHandoffIfNeeded("next", session: fixture.session), "handoff P\n\nnext")
+        XCTAssertEqual(fixture.viewModel.handoffRuntime.prependPendingHandoffIfNeeded("next", session: fixture.session), "handoff P\n\nnext")
     }
 
     func testRefusalDoesNotOverwriteNewerHandoffAfterTransitionStaging() async throws {

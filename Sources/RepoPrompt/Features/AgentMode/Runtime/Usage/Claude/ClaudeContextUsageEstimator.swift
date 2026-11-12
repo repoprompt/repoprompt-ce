@@ -410,25 +410,6 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         return normalized
     }
 
-    private func updateSnapshot(
-        from usage: AgentContextUsage?,
-        source: ContextUsageSnapshotSource,
-        confidence: ContextUsageSnapshotConfidence,
-        session: AgentTabSession
-    ) -> ContextUsageSnapshot? {
-        let next = ContextUsageSnapshot.fromAgentContextUsage(
-            usage,
-            source: source,
-            confidence: confidence,
-            compactedAt: session.contextCompactedAt
-        )
-        if session.contextUsageSnapshot != next {
-            session.contextUsageSnapshot = next
-            return next
-        }
-        return nil
-    }
-
     private func tokenEstimate(for payload: String?) -> Int {
         max(0, tokenEstimator(payload ?? ""))
     }

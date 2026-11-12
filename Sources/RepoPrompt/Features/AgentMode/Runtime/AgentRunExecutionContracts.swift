@@ -7,6 +7,17 @@ import RepoPromptAIContracts
 /// presentation composition supplies implementations without becoming their type owner.
 /// These are in-process closures, not persisted type identities or a second provider registry.
 enum AgentRunExecutionContracts {
+    static func providerStartupFailureMessage(for error: Error) -> String {
+        if let localized = error as? LocalizedError,
+           let description = localized.errorDescription?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !description.isEmpty
+        {
+            return description
+        }
+        let description = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        return description.isEmpty ? String(describing: error) : description
+    }
+
     typealias HeadlessProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?) -> HeadlessAgentProvider
     typealias ACPProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?) async throws -> (any ACPAgentProvider)?
     typealias ACPControllerFactory = (_ provider: any ACPAgentProvider, _ runRequest: ACPRunRequest) throws -> ACPAgentSessionController

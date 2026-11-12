@@ -78,12 +78,7 @@ extension AgentProviderPermissionProfile {
     func codexPermissionLevel(
         userConfigured: CodexAgentToolPreferences.PermissionLevel = CodexAgentToolPreferences.permissionLevel()
     ) -> CodexAgentToolPreferences.PermissionLevel {
-        switch self {
-        case .userConfigured: userConfigured
-        case .mcpSafeDefaults: .autoReview
-        case let .providerOverride(.codex(level)): level
-        case .providerOverride: .defaultPermission
-        }
+        codexPermissionLevel(loadUserConfigured: { userConfigured })
     }
 
     var claudePermissionMode: String {
@@ -102,12 +97,7 @@ extension AgentProviderPermissionProfile {
     func claudePermissionLevel(
         userConfigured: ClaudeAgentToolPreferences.PermissionLevel = ClaudeAgentToolPreferences.permissionLevel()
     ) -> ClaudeAgentToolPreferences.PermissionLevel {
-        switch self {
-        case .userConfigured: userConfigured
-        case .mcpSafeDefaults: .requireApproval
-        case let .providerOverride(.claude(level)): level
-        case .providerOverride: .requireApproval
-        }
+        claudePermissionLevel(loadUserConfigured: { userConfigured })
     }
 
     var openCodeSessionModeID: String {
@@ -126,30 +116,69 @@ extension AgentProviderPermissionProfile {
     func openCodePermissionLevel(
         userConfigured: OpenCodeAgentToolPreferences.PermissionLevel = OpenCodeAgentToolPreferences.permissionLevel()
     ) -> OpenCodeAgentToolPreferences.PermissionLevel {
+        openCodePermissionLevel(loadUserConfigured: { userConfigured })
+    }
+
+    func cursorPermissionLevel(
+        userConfigured: CursorAgentToolPreferences.PermissionLevel = CursorAgentToolPreferences.permissionLevel()
+    ) -> CursorAgentToolPreferences.PermissionLevel {
+        cursorPermissionLevel(loadUserConfigured: { userConfigured })
+    }
+
+    func grokBuildPermissionLevel(
+        userConfigured: GrokBuildAgentToolPreferences.PermissionLevel = GrokBuildAgentToolPreferences.permissionLevel()
+    ) -> GrokBuildAgentToolPreferences.PermissionLevel {
+        grokBuildPermissionLevel(loadUserConfigured: { userConfigured })
+    }
+
+    func codexPermissionLevel(loadUserConfigured: () -> CodexAgentToolPreferences.PermissionLevel) -> CodexAgentToolPreferences.PermissionLevel {
         switch self {
-        case .userConfigured: userConfigured
+        case .userConfigured: loadUserConfigured()
+        case .mcpSafeDefaults: .autoReview
+        case let .providerOverride(.codex(level)): level
+        case .providerOverride: .defaultPermission
+        }
+    }
+
+    func claudePermissionLevel(loadUserConfigured: () -> ClaudeAgentToolPreferences.PermissionLevel) -> ClaudeAgentToolPreferences.PermissionLevel {
+        switch self {
+        case .userConfigured: loadUserConfigured()
+        case .mcpSafeDefaults: .requireApproval
+        case let .providerOverride(.claude(level)): level
+        case .providerOverride: .requireApproval
+        }
+    }
+
+    func openCodePermissionLevel(loadUserConfigured: () -> OpenCodeAgentToolPreferences.PermissionLevel) -> OpenCodeAgentToolPreferences.PermissionLevel {
+        switch self {
+        case .userConfigured: loadUserConfigured()
         case .mcpSafeDefaults: .managedDefault
         case let .providerOverride(.openCode(level)): level
         case .providerOverride: .managedDefault
         }
     }
 
-    func cursorPermissionLevel(
-        userConfigured: CursorAgentToolPreferences.PermissionLevel = CursorAgentToolPreferences.permissionLevel()
-    ) -> CursorAgentToolPreferences.PermissionLevel {
+    func antigravityPermissionLevel(loadUserConfigured: () -> AntigravityAgentToolPreferences.PermissionLevel) -> AntigravityAgentToolPreferences.PermissionLevel {
         switch self {
-        case .userConfigured: userConfigured
+        case .userConfigured: loadUserConfigured()
+        case .mcpSafeDefaults: .autoEdit
+        case let .providerOverride(.antigravity(level)): level
+        case .providerOverride: .autoEdit
+        }
+    }
+
+    func cursorPermissionLevel(loadUserConfigured: () -> CursorAgentToolPreferences.PermissionLevel) -> CursorAgentToolPreferences.PermissionLevel {
+        switch self {
+        case .userConfigured: loadUserConfigured()
         case .mcpSafeDefaults: .managedDefault
         case let .providerOverride(.cursor(level)): level
         case .providerOverride: .managedDefault
         }
     }
 
-    func grokBuildPermissionLevel(
-        userConfigured: GrokBuildAgentToolPreferences.PermissionLevel = GrokBuildAgentToolPreferences.permissionLevel()
-    ) -> GrokBuildAgentToolPreferences.PermissionLevel {
+    func grokBuildPermissionLevel(loadUserConfigured: () -> GrokBuildAgentToolPreferences.PermissionLevel) -> GrokBuildAgentToolPreferences.PermissionLevel {
         switch self {
-        case .userConfigured: userConfigured
+        case .userConfigured: loadUserConfigured()
         case .mcpSafeDefaults: .managedDefault
         case let .providerOverride(.grokBuild(level)): level
         case .providerOverride: .managedDefault

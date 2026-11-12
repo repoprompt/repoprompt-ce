@@ -357,7 +357,7 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
             forModelRaw: session.selectedModelRaw, agentKind: session.selectedAgent
         )
         XCTAssertEqual(settings.controlsBinding(for: .claude)?.claudeTools?.effortLevel, expected)
-        await viewModel.flushSave(for: tabID)
+        await viewModel.persistenceRuntime.flushSave(for: tabID)
         XCTAssertTrue(saves.isEmpty, "Projecting cold controls must not persist an incomplete existing conversation")
         XCTAssertNil(session.selectedClaudeEffortRaw, "Default adoption waits for authoritative hydration")
 
@@ -371,7 +371,7 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
             "Only the applied conversation payload may permit the legacy-effort migration save."
         )
         viewModel.restoreClaudeEffort(from: AgentSession(id: sessionID, name: "Legacy conversation"), to: session)
-        await viewModel.flushSave(for: tabID)
+        await viewModel.persistenceRuntime.flushSave(for: tabID)
         XCTAssertEqual(saves.count, 1)
         let saved = try XCTUnwrap(saves.last)
         XCTAssertEqual(saved.id, sessionID)
@@ -451,7 +451,7 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
         XCTAssertEqual(session.selectedReasoningEffortRaw, "low")
         XCTAssertEqual(session.persistedReasoningEffortRaw, "low")
         session.isDirty = true
-        await viewModel.flushSave(for: tabID)
+        await viewModel.persistenceRuntime.flushSave(for: tabID)
         let saved = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: savedFile))
         XCTAssertEqual(saved.agentReasoningEffort, "low")
         XCTAssertEqual(viewModel.ownerValidatedSessionIndex[sessionID]?.agentReasoningEffortRaw, "low")

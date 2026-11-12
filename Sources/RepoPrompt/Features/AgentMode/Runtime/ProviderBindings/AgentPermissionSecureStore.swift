@@ -460,35 +460,35 @@ final class AgentPermissionSecureStore {
 
             var subagent = SecureSubagentPermissionDocument.failClosedDocument(now: resetDate)
             _ = normalizeSubagent(&subagent)
-            record(.subagent, resetLocked(subagent, domain: .subagent, cache: &subagentCache, deferred: &effects))
+            record(.subagent, saveLocked(subagent, domain: .subagent, cache: &subagentCache, deferred: &effects, deleteOnFailure: true))
 
             var codex = SecureCodexPermissionDocument(updatedAt: resetDate)
             _ = normalizeCodex(&codex)
-            record(.codex, resetLocked(codex, domain: .codex, cache: &codexCache, deferred: &effects))
+            record(.codex, saveLocked(codex, domain: .codex, cache: &codexCache, deferred: &effects, deleteOnFailure: true))
 
             var claude = SecureClaudePermissionDocument.failClosedDocument(now: resetDate)
             _ = normalizeClaude(&claude)
-            record(.claude, resetLocked(claude, domain: .claude, cache: &claudeCache, deferred: &effects))
+            record(.claude, saveLocked(claude, domain: .claude, cache: &claudeCache, deferred: &effects, deleteOnFailure: true))
 
             var openCode = SecureOpenCodePermissionDocument.failClosedDocument(now: resetDate)
             _ = normalizeOpenCode(&openCode)
-            record(.openCode, resetLocked(openCode, domain: .openCode, cache: &openCodeCache, deferred: &effects))
+            record(.openCode, saveLocked(openCode, domain: .openCode, cache: &openCodeCache, deferred: &effects, deleteOnFailure: true))
 
             var cursor = SecureCursorPermissionDocument.failClosedDocument(now: resetDate)
             _ = normalizeCursor(&cursor)
-            record(.cursor, resetLocked(cursor, domain: .cursor, cache: &cursorCache, deferred: &effects))
+            record(.cursor, saveLocked(cursor, domain: .cursor, cache: &cursorCache, deferred: &effects, deleteOnFailure: true))
 
             var grokBuild = SecureGrokBuildPermissionDocument.failClosedDocument(now: resetDate)
             _ = normalizeGrokBuild(&grokBuild)
-            record(.grokBuild, resetLocked(grokBuild, domain: .grokBuild, cache: &grokBuildCache, deferred: &effects))
+            record(.grokBuild, saveLocked(grokBuild, domain: .grokBuild, cache: &grokBuildCache, deferred: &effects, deleteOnFailure: true))
 
             var antigravity = SecureAntigravityPermissionDocument.failClosedDocument(now: resetDate)
             _ = normalizeAntigravity(&antigravity)
-            record(.antigravity, resetLocked(antigravity, domain: .antigravity, cache: &antigravityCache, deferred: &effects))
+            record(.antigravity, saveLocked(antigravity, domain: .antigravity, cache: &antigravityCache, deferred: &effects, deleteOnFailure: true))
 
             var devin = SecureDevinPermissionDocument.failClosedDocument(now: resetDate)
             _ = normalizeDevin(&devin)
-            record(.devin, resetLocked(devin, domain: .devin, cache: &devinCache, deferred: &effects))
+            record(.devin, saveLocked(devin, domain: .devin, cache: &devinCache, deferred: &effects, deleteOnFailure: true))
 
             return AgentPermissionStorageResetResult(
                 succeededDomains: succeededDomains,
@@ -917,7 +917,8 @@ final class AgentPermissionSecureStore {
         _ document: Document,
         domain: AgentPermissionSecureDomain,
         cache: inout Document?,
-        deferred effects: inout DeferredSideEffects
+        deferred effects: inout DeferredSideEffects,
+        deleteOnFailure: Bool = false
     ) -> Bool {
         do {
             try saveDocument(document, domain: domain)
@@ -930,30 +931,9 @@ final class AgentPermissionSecureStore {
         } catch {
             recordDiagnostic(domain: domain, kind: keychainFailureKind(for: error, fallback: .keychainWriteFailed), error: error)
             effects.requestDiagnosticsNotification(for: domain)
-            cache = failClosedDocument(for: domain) as? Document
-            effects.requestChangeNotification(domain: domain, writeSucceeded: false)
-            return false
-        }
-    }
-
-    private func resetLocked<Document: Codable>(
-        _ document: Document,
-        domain: AgentPermissionSecureDomain,
-        cache: inout Document?,
-        deferred effects: inout DeferredSideEffects
-    ) -> Bool {
-        do {
-            try saveDocument(document, domain: domain)
-            cache = document
-            if clearDiagnostic(for: domain) {
-                effects.requestDiagnosticsNotification(for: domain)
+            if deleteOnFailure {
+                try? secureStrings.deletePlainValue(for: domain.secureStorageAccount, accessMode: .interactive)
             }
-            effects.requestChangeNotification(domain: domain, writeSucceeded: true)
-            return true
-        } catch {
-            recordDiagnostic(domain: domain, kind: keychainFailureKind(for: error, fallback: .keychainWriteFailed), error: error)
-            effects.requestDiagnosticsNotification(for: domain)
-            try? secureStrings.deletePlainValue(for: domain.secureStorageAccount, accessMode: .interactive)
             cache = failClosedDocument(for: domain) as? Document
             effects.requestChangeNotification(domain: domain, writeSucceeded: false)
             return false

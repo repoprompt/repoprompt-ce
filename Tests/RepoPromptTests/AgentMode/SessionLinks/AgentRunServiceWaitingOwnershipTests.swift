@@ -199,7 +199,7 @@ final class AgentRunServiceWaitingOwnershipTests: XCTestCase {
                     let response = try await waiting.value
                     XCTAssertEqual(response.text, frame)
                     XCTAssertFalse(response.timedOut)
-                    XCTAssertEqual(host.retrieveDraftText(for: tabID), "untouched local draft")
+                    XCTAssertEqual(host.draftRuntime.text(for: tabID), "untouched local draft")
                     XCTAssertEqual(session.items.count(where: { $0.kind == .user && $0.text == frame }), 1)
                     XCTAssertNil(session.instructionContinuation)
                     XCTAssertEqual(session.activeRunOwnership, owner)

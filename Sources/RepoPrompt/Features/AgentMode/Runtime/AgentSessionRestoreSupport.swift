@@ -168,7 +168,7 @@ enum AgentSessionRestoreSupport {
         for activity in turn.allActivities {
             guard let execution = activity.toolExecution else { continue }
             if let existing = latestStatusByID[execution.stableExecutionID],
-               coldRestoredToolStatusRank(existing) > coldRestoredToolStatusRank(execution.status)
+               AgentTranscriptToolStatusSemantics.mergePrecedence(existing) > AgentTranscriptToolStatusSemantics.mergePrecedence(execution.status)
             {
                 continue
             }
@@ -195,30 +195,11 @@ enum AgentSessionRestoreSupport {
         }
     }
 
-    private static func coldRestoredToolStatusRank(_ status: AgentTranscriptToolStatus) -> Int {
-        switch status {
-        case .pending:
-            0
-        case .running:
-            1
-        case .unknown:
-            2
-        case .success:
-            3
-        case .warning:
-            4
-        case .failed:
-            5
-        case .cancelled:
-            6
-        }
-    }
-
     private static func coldRestoredCancelledToolResultJSON(
         toolName: String?,
         existingResultJSON: String?
     ) -> String {
-        var payload = coldRestoredToolResultObject(from: existingResultJSON) ?? [:]
+        var payload = AgentToolResultProcessingContext.toolResultObject(from: existingResultJSON) ?? [:]
         payload["status"] = "cancelled"
         payload["reason"] = "restored_without_live_run"
         payload["note"] = "This tool execution was restored from a previous app process and is no longer running."
@@ -233,17 +214,6 @@ enum AgentSessionRestoreSupport {
             return json
         }
         return #"{"status":"cancelled","reason":"restored_without_live_run"}"#
-    }
-
-    private static func coldRestoredToolResultObject(from raw: String?) -> [String: Any]? {
-        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty,
-              let data = raw.data(using: .utf8),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else {
-            return nil
-        }
-        return object
     }
 
     private static func sanitizedColdRestoredGroupedHistorySummary(

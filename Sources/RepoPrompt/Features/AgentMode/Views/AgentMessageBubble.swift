@@ -465,7 +465,7 @@ struct AgentMessageBubble: View {
         case .assistant:
             assistantBubble
         case .assistantInline:
-            assistantInline
+            assistantBubble
         case .toolCall:
             if isHiddenAgentTool(item.toolName) {
                 EmptyView()
@@ -650,27 +650,6 @@ struct AgentMessageBubble: View {
         }
     }
 
-    // MARK: - Assistant Inline
-
-    private var assistantInline: some View {
-        HStack(alignment: .top) {
-            VStack(alignment: .leading, spacing: 4) {
-                assistantContent
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                MessageFooterStrip(
-                    text: item.text,
-                    timestamp: item.timestamp,
-                    isTrailing: false,
-                    handoffConfig: handoffConfig,
-                    hasHandoffButton: handoffConfig != nil,
-                    runtimeFooter: runtimeFooter
-                )
-            }
-            Spacer(minLength: 60)
-        }
-    }
-
     @ViewBuilder
     private var assistantContent: some View {
         if shouldShowCollapsedAssistantView {
@@ -830,95 +809,80 @@ struct AgentMessageBubble: View {
     /// Pending question (tool_call state) - shows structured questions while waiting for response
     private var askUserQuestionPendingView: some View {
         let summary = parseAskUserQuestionSummaryRobust(args: item.toolArgsJSON, result: nil)
-        return HStack {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(alignment: .top, spacing: 8) {
-                    Image(systemName: "questionmark.circle.fill")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 14))
-                        .foregroundColor(.blue)
+        return askUserQuestionBubble {
+            VStack(alignment: .leading, spacing: 6) {
+                questionTitle(summary.displayTitle)
 
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(summary.displayTitle)
-                            .font(fontPreset.standardFont)
-                            .foregroundColor(.primary)
-                            .textSelection(.enabled)
-
-                        if let context = summary.contextLine {
-                            Text(context)
-                                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                                .foregroundColor(.secondary)
-                                .lineLimit(2)
-                                .textSelection(.enabled)
-                        }
-
-                        askUserQuestionList(summary.questions)
-
-                        HStack(spacing: 4) {
-                            ProgressView()
-                                .scaleEffect(0.5)
-                                .frame(width: 12, height: 12)
-                            Text("Waiting for response...")
-                                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                                .foregroundColor(.secondary)
-                        }
-                    }
+                if let context = summary.contextLine {
+                    questionContext(context)
                 }
 
-                timestampView
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .background(Color.blue.opacity(0.08))
-            .cornerRadius(12)
-            .overlay(
-                RoundedRectangle(cornerRadius: 12)
-                    .stroke(Color.blue.opacity(0.2), lineWidth: 1)
-            )
+                askUserQuestionList(summary.questions)
 
-            Spacer(minLength: 40)
+                HStack(spacing: 4) {
+                    ProgressView()
+                        .scaleEffect(0.5)
+                        .frame(width: 12, height: 12)
+                    Text("Waiting for response...")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                        .foregroundColor(.secondary)
+                }
+            }
         }
     }
 
     /// Completed question exchange (tool_result state) - shows Q&A grouped together
     private var askUserQuestionExchangeView: some View {
         let summary = parseAskUserQuestionSummaryRobust(args: item.toolArgsJSON, result: item.toolResultJSON)
-        return HStack {
+        return askUserQuestionBubble {
+            VStack(alignment: .leading, spacing: 10) {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        questionTitle(summary.displayTitle)
+                        if let status = summary.statusText {
+                            Text(status)
+                                .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .medium))
+                                .foregroundColor(.secondary)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.secondary.opacity(0.12))
+                                .cornerRadius(6)
+                        }
+                    }
+                    if let context = summary.contextLine {
+                        questionContext(context)
+                    }
+                }
+
+                AskUserQuestionResultView(summary: summary)
+            }
+        }
+    }
+
+    private func questionTitle(_ title: String) -> some View {
+        Text(title)
+            .font(fontPreset.standardFont)
+            .foregroundColor(.primary)
+            .textSelection(.enabled)
+    }
+
+    private func questionContext(_ context: String) -> some View {
+        Text(context)
+            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+            .foregroundColor(.secondary)
+            .lineLimit(2)
+            .textSelection(.enabled)
+    }
+
+    private func askUserQuestionBubble(@ViewBuilder content: () -> some View) -> some View {
+        HStack {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "questionmark.circle.fill")
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 14))
                         .foregroundColor(.blue)
-
-                    VStack(alignment: .leading, spacing: 10) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack(spacing: 6) {
-                                Text(summary.displayTitle)
-                                    .font(fontPreset.standardFont)
-                                    .foregroundColor(.primary)
-                                    .textSelection(.enabled)
-                                if let status = summary.statusText {
-                                    Text(status)
-                                        .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .medium))
-                                        .foregroundColor(.secondary)
-                                        .padding(.horizontal, 6)
-                                        .padding(.vertical, 2)
-                                        .background(Color.secondary.opacity(0.12))
-                                        .cornerRadius(6)
-                                }
-                            }
-                            if let context = summary.contextLine {
-                                Text(context)
-                                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                                    .foregroundColor(.secondary)
-                                    .lineLimit(2)
-                                    .textSelection(.enabled)
-                            }
-                        }
-
-                        AskUserQuestionResultView(summary: summary)
-                    }
+                    content()
                 }
-
                 timestampView
             }
             .padding(.horizontal, 12)
@@ -929,7 +893,6 @@ struct AgentMessageBubble: View {
                 RoundedRectangle(cornerRadius: 12)
                     .stroke(Color.blue.opacity(0.2), lineWidth: 1)
             )
-
             Spacer(minLength: 40)
         }
     }
@@ -987,14 +950,8 @@ struct AgentMessageBubble: View {
                     maxHeight: AgentTranscriptCollapsedCardMetrics.collapsedHeight,
                     alignment: .leading
                 )
-                .background(
-                    RoundedRectangle(cornerRadius: 16)
-                        .fill(BubbleColors.toolResultBackground(colorScheme: colorScheme))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16)
-                        .stroke(Color.secondary.opacity(0.15), lineWidth: 0.5)
-                )
+                .background(systemBubbleBackground)
+                .overlay(systemBubbleOutline)
             } else if let laneUpdate = laneUpdatePresentation {
                 laneUpdateRow(laneUpdate)
             } else {
@@ -1014,16 +971,20 @@ struct AgentMessageBubble: View {
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 7)
-                .background(
-                    RoundedRectangle(cornerRadius: 16)
-                        .fill(BubbleColors.toolResultBackground(colorScheme: colorScheme))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16)
-                        .stroke(Color.secondary.opacity(0.15), lineWidth: 0.5)
-                )
+                .background(systemBubbleBackground)
+                .overlay(systemBubbleOutline)
             }
         }
+    }
+
+    private var systemBubbleBackground: some View {
+        RoundedRectangle(cornerRadius: 16)
+            .fill(BubbleColors.toolResultBackground(colorScheme: colorScheme))
+    }
+
+    private var systemBubbleOutline: some View {
+        RoundedRectangle(cornerRadius: 16)
+            .stroke(Color.secondary.opacity(0.15), lineWidth: 0.5)
     }
 
     // MARK: - Lane Update Row
@@ -2079,7 +2040,8 @@ struct ToolResultContentView: View {
             }
 
             if needsCollapse, !isDiffContent, !isJSONContent {
-                expandCollapseButton
+                messageExpansionButton(isExpanded: $isExpanded, remainingLineCount: remainingLineCount, fontPreset: fontPreset)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
     }
@@ -2137,26 +2099,30 @@ struct ToolResultContentView: View {
         return (trimmed.hasPrefix("{") && trimmed.hasSuffix("}")) ||
             (trimmed.hasPrefix("[") && trimmed.hasSuffix("]"))
     }
+}
 
-    private var expandCollapseButton: some View {
-        Button(action: {
-            withAnimation(.easeInOut(duration: 0.2)) {
-                isExpanded.toggle()
-            }
-        }) {
-            HStack(spacing: 4) {
-                Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .medium))
-                Text(isExpanded ? "Show less" : "Show \(remainingLineCount) more lines")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-            }
-            .foregroundColor(.secondary)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
+@MainActor
+private func messageExpansionButton(
+    isExpanded: Binding<Bool>,
+    remainingLineCount: @autoclosure () -> Int,
+    fontPreset: FontScalePreset
+) -> some View {
+    Button(action: {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            isExpanded.wrappedValue.toggle()
         }
-        .buttonStyle(PlainButtonStyle())
-        .frame(maxWidth: .infinity, alignment: .leading)
+    }) {
+        HStack(spacing: 4) {
+            Image(systemName: isExpanded.wrappedValue ? "chevron.up" : "chevron.down")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .medium))
+            Text(isExpanded.wrappedValue ? "Show less" : "Show \(remainingLineCount()) more lines")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+        }
+        .foregroundColor(.secondary)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
     }
+    .buttonStyle(PlainButtonStyle())
 }
 
 // MARK: - Diff Content View
@@ -2226,22 +2192,7 @@ private struct DiffContentView: View {
             .cornerRadius(6)
 
             if needsCollapse {
-                Button(action: {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        isExpanded.toggle()
-                    }
-                }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                            .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .medium))
-                        Text(isExpanded ? "Show less" : "Show \(remainingLineCount) more lines")
-                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                    }
-                    .foregroundColor(.secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
-                }
-                .buttonStyle(PlainButtonStyle())
+                messageExpansionButton(isExpanded: $isExpanded, remainingLineCount: remainingLineCount, fontPreset: fontPreset)
             }
         }
     }

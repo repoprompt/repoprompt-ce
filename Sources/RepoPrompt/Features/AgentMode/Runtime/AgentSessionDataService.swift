@@ -260,23 +260,7 @@ actor AgentSessionDataService {
         }
 
         switch preparation {
-        case .alreadyCanonicalTranscript:
-            if stored.transcript == nil {
-                let canonicalWorkingItems = workingItems()
-                if !canonicalWorkingItems.isEmpty {
-                    let nextSequenceIndex = max((canonicalWorkingItems.map(\.sequenceIndex).max() ?? -1) + 1, 0)
-                    stored.transcript = AgentTranscriptIO.buildTranscript(
-                        from: canonicalWorkingItems,
-                        terminalState: lastRunState,
-                        nextSequenceIndex: nextSequenceIndex,
-                        policy: .canonical
-                    )
-                }
-            }
-            if let transcript = stored.transcript {
-                stored.transcript = AgentTranscriptIO.persistedTranscript(transcript)
-            }
-        case .canonicalize:
+        case .alreadyCanonicalTranscript, .canonicalize:
             if stored.transcript == nil {
                 let canonicalWorkingItems = workingItems()
                 if !canonicalWorkingItems.isEmpty {
@@ -628,6 +612,14 @@ actor AgentSessionDataService {
             #endif
             return cached
         }
+        #if DEBUG
+            return readMetadataIndexFromDisk(folder: folder, key: key, readStartMS: readStartMS)
+        #else
+            return readMetadataIndexFromDisk(folder: folder, key: key)
+        #endif
+    }
+
+    private func readMetadataIndexFromDisk(folder: URL, key: URL, readStartMS: Double? = nil) -> AgentSessionMetadataIndex? {
         let fileURL = metadataIndexFileURL(forAgentSessionsFolder: folder)
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
             metadataIndexCacheByFolder.removeValue(forKey: key)
@@ -1059,28 +1051,10 @@ actor AgentSessionDataService {
             )
         }
 
-        let fileURL = metadataIndexFileURL(forAgentSessionsFolder: folder)
-        guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            metadataIndexCacheByFolder.removeValue(forKey: key)
-            return nil
-        }
-
-        do {
-            let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
-            let index = try decoder.decode(AgentSessionMetadataIndex.self, from: data)
-            guard index.schemaVersion == AgentSessionMetadataIndex.currentSchemaVersion else {
-                metadataIndexCacheByFolder.removeValue(forKey: key)
-                return nil
-            }
-            metadataIndexCacheByFolder[key] = index
-            return FastMetadataRecordsResult(
-                records: index.entries.sortedForAgentSessionMetadataIndex(),
-                source: .diskIndex
-            )
-        } catch {
-            metadataIndexCacheByFolder.removeValue(forKey: key)
-            return nil
-        }
+        guard let index = readMetadataIndexFromDisk(folder: folder, key: key) else { return nil }
+        return FastMetadataRecordsResult(
+            records: index.entries.sortedForAgentSessionMetadataIndex(), source: .diskIndex
+        )
     }
 
     func metadataRecordForSessionID(_ id: UUID, for workspace: WorkspaceModel) async throws -> AgentSessionMetadataRecord? {
@@ -1286,15 +1260,23 @@ actor AgentSessionDataService {
         _ = try await saveAgentSession(session, for: workspace)
     }
 
-    /// Load an AgentSession from disk.
-    func loadAgentSession(from fileURL: URL) async throws -> AgentSession {
+    /// Filename refusal stays outside the load-failure wrapper; physical reads retain it.
+    private func validatedSessionData(from fileURL: URL) throws -> Data {
         let filename = fileURL.lastPathComponent
         guard filename.starts(with: "AgentSession-"), filename.hasSuffix(".json") else {
             throw AgentSessionDataError.invalidFilename(filename)
         }
-
         do {
-            let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
+            return try Data(contentsOf: fileURL, options: .mappedIfSafe)
+        } catch {
+            throw AgentSessionDataError.loadFailed(error)
+        }
+    }
+
+    /// Load an AgentSession from disk.
+    func loadAgentSession(from fileURL: URL) async throws -> AgentSession {
+        let data = try validatedSessionData(from: fileURL)
+        do {
             let session = try decoder.decode(AgentSession.self, from: data)
             if session.selfCompactPersistenceWarning {
                 try preserveMalformedSelfCompactRecord(data, from: fileURL)
@@ -1339,13 +1321,8 @@ actor AgentSessionDataService {
         recoverMissingMetadata: Bool = false,
         persistRecoveredMetadata: Bool = false
     ) async throws -> AgentSession {
-        let filename = fileURL.lastPathComponent
-        guard filename.starts(with: "AgentSession-"), filename.hasSuffix(".json") else {
-            throw AgentSessionDataError.invalidFilename(filename)
-        }
-
+        let data = try validatedSessionData(from: fileURL)
         do {
-            let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
             let header = try decoder.decode(AgentSessionHeader.self, from: data)
             var recoveredLastUserMessageAt = header.lastUserMessageAt
             var recoveredProjectionCounts = header.transcriptProjectionCounts
@@ -1471,47 +1448,6 @@ actor AgentSessionDataService {
         }.map(\.url)
     }
 
-    /// Get metadata for recent agent sessions without loading full content.
-    func recentSessions(for workspace: WorkspaceModel, limit: Int = 10) async throws -> [AgentSessionMeta] {
-        do {
-            return try await metadataRecords(for: workspace, limit: limit).map {
-                $0.agentSessionMeta()
-            }
-        } catch {
-            let files = try await listAgentSessions(for: workspace)
-            var metadataList: [AgentSessionMeta] = []
-
-            for fileURL in files.prefix(max(limit, 0)) {
-                do {
-                    let session = try await loadAgentSessionStub(from: fileURL, recoverMissingMetadata: false)
-                    let lastModified = (try? fileURL.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? session.savedAt
-
-                    let meta = AgentSessionMeta(
-                        id: session.id,
-                        composeTabID: session.composeTabID,
-                        name: session.name,
-                        lastModified: lastModified,
-                        itemCount: session.effectiveItemCount,
-                        agentKind: session.agentKind,
-                        agentModel: session.agentModel,
-                        lastRunState: session.lastRunState,
-                        acpModelParameterSelections: session.acpModelParameterSelections,
-                        parentSessionID: session.parentSessionID,
-                        createdByOverseerSessionID: session.createdByOverseerSessionID,
-                        isMCPOriginated: session.isMCPOriginated,
-                        worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
-                        activeWorktreeMergeSummaries: session.worktreeMergeOperations.activeWorktreeMergeSummaries
-                    )
-                    metadataList.append(meta)
-                } catch {
-                    continue
-                }
-            }
-
-            return metadataList
-        }
-    }
-
     /// Get lightweight metadata for agent sessions without loading full transcript content.
     func listAgentSessionsMeta(
         for workspace: WorkspaceModel,
@@ -1589,20 +1525,6 @@ actor AgentSessionDataService {
         return try await loadAgentSession(id: sessionID, for: workspace)
     }
 
-    /// Find an agent session by its ID for a workspace.
-    func findAgentSession(id: UUID, for workspace: WorkspaceModel) async throws -> AgentSession? {
-        let files = try await listAgentSessions(for: workspace)
-
-        for fileURL in files {
-            let filename = fileURL.lastPathComponent
-            if filename == "AgentSession-\(id.uuidString).json" {
-                return try await loadAgentSession(from: fileURL)
-            }
-        }
-
-        return nil
-    }
-
     /// Load an agent session by ID without scanning the session directory.
     func loadAgentSession(id: UUID, for workspace: WorkspaceModel) async throws -> AgentSession? {
         let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
@@ -1614,37 +1536,6 @@ actor AgentSessionDataService {
         }
 
         return try await loadAgentSession(from: fileURL)
-    }
-
-    /// Find an agent session by compose tab ID.
-    func findAgentSessionForTab(_ tabID: UUID, for workspace: WorkspaceModel) async throws -> AgentSession? {
-        if let records = try? await metadataRecords(for: workspace),
-           let best = records
-           .filter({ $0.composeTabID == tabID })
-           .sortedForAgentSessionMetadataIndex()
-           .first
-        {
-            if let session = try await loadAgentSession(id: best.id, for: workspace) {
-                return session
-            }
-            let folder = try ensureAgentSessionsFolder(for: workspace)
-            await removeMetadataRecords(matching: { $0.id == best.id }, folder: folder)
-        }
-
-        let files = try await listAgentSessions(for: workspace)
-
-        for fileURL in files {
-            do {
-                let stub = try await loadAgentSessionStub(from: fileURL, recoverMissingMetadata: false)
-                if stub.composeTabID == tabID {
-                    return try await loadAgentSession(from: fileURL)
-                }
-            } catch {
-                continue
-            }
-        }
-
-        return nil
     }
 
     /// Delete a particular agent session file.

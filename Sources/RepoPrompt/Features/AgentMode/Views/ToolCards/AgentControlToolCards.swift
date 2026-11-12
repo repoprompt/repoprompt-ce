@@ -257,24 +257,6 @@ struct AgentRunResultCard: View {
             ?? ToolResultStatusResolver.resolve(toolIsError: item.toolIsError, raw: item.toolResultJSON, fallback: .neutral)
     }
 
-    private var hasExpandablePayload: Bool {
-        guard let raw = item.toolResultJSON?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
-            return false
-        }
-        if let object = ToolJSON.rawObject(from: item.toolResultJSON),
-           ToolRawJSON.bool(object, key: "summary_only") == true
-        {
-            return false
-        }
-        return true
-    }
-
-    private var headerTrailingView: AnyView? {
-        presentation?.reasoningBadge.map {
-            AnyView(AgentReasoningEffortHeaderTrailingView(badge: $0, timestamp: item.timestamp))
-        }
-    }
-
     var body: some View {
         ToolCardContainer(
             iconName: "play.circle",
@@ -283,13 +265,11 @@ struct AgentRunResultCard: View {
             detailText: nil,
             subtitle: presentation?.subtitle,
             status: status,
-            timestamp: item.timestamp,
-            headerTrailingView: headerTrailingView,
-            isExpandable: hasExpandablePayload,
+            item: item,
+            headerTrailingView: agentControlResultHeaderTrailing(item: item, presentation: presentation),
+            isExpandable: agentControlResultHasExpandablePayload(item),
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }
 
@@ -372,24 +352,6 @@ struct AgentExploreResultCard: View {
             ?? ToolResultStatusResolver.resolve(toolIsError: item.toolIsError, raw: item.toolResultJSON, fallback: .neutral)
     }
 
-    private var hasExpandablePayload: Bool {
-        guard let raw = item.toolResultJSON?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
-            return false
-        }
-        if let object = ToolJSON.rawObject(from: item.toolResultJSON),
-           ToolRawJSON.bool(object, key: "summary_only") == true
-        {
-            return false
-        }
-        return true
-    }
-
-    private var headerTrailingView: AnyView? {
-        presentation?.reasoningBadge.map {
-            AnyView(AgentReasoningEffortHeaderTrailingView(badge: $0, timestamp: item.timestamp))
-        }
-    }
-
     var body: some View {
         ToolCardContainer(
             iconName: "magnifyingglass.circle",
@@ -398,13 +360,11 @@ struct AgentExploreResultCard: View {
             detailText: nil,
             subtitle: batchPresentation?.subtitle ?? presentation?.subtitle,
             status: status,
-            timestamp: item.timestamp,
-            headerTrailingView: headerTrailingView,
-            isExpandable: hasExpandablePayload,
+            item: item,
+            headerTrailingView: agentControlResultHeaderTrailing(item: item, presentation: presentation),
+            isExpandable: agentControlResultHasExpandablePayload(item),
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
     }
 }
 
@@ -475,18 +435,6 @@ struct AgentManageResultCard: View {
         return nil
     }
 
-    private var hasExpandablePayload: Bool {
-        guard let raw = item.toolResultJSON?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
-            return false
-        }
-        if let object = ToolJSON.rawObject(from: item.toolResultJSON),
-           ToolRawJSON.bool(object, key: "summary_only") == true
-        {
-            return false
-        }
-        return true
-    }
-
     var body: some View {
         ToolCardContainer(
             iconName: "tray.full",
@@ -495,11 +443,28 @@ struct AgentManageResultCard: View {
             detailText: nil,
             subtitle: subtitle,
             status: status,
-            timestamp: item.timestamp,
-            isExpandable: hasExpandablePayload,
+            item: item,
+            isExpandable: agentControlResultHasExpandablePayload(item),
             isExpanded: $isExpanded
-        ) {
-            ToolMarkdownExpandedContent(item: item)
-        }
+        )
+    }
+}
+
+private func agentControlResultHasExpandablePayload(_ item: AgentChatItem) -> Bool {
+    guard let raw = item.toolResultJSON?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+        return false
+    }
+    if let object = ToolJSON.rawObject(from: item.toolResultJSON),
+       ToolRawJSON.bool(object, key: "summary_only") == true
+    {
+        return false
+    }
+    return true
+}
+
+@MainActor
+private func agentControlResultHeaderTrailing(item: AgentChatItem, presentation: AgentRunCardPresentation?) -> AnyView? {
+    presentation?.reasoningBadge.map {
+        AnyView(AgentReasoningEffortHeaderTrailingView(badge: $0, timestamp: item.timestamp))
     }
 }

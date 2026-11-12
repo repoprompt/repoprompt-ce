@@ -145,7 +145,7 @@ final class AgentSessionLinkReadEndpointIncarnationTests: XCTestCase {
             "The weaker (tabID, sessionID) pair is deliberately still equal in this scenario"
         )
         XCTAssertNotEqual(
-            fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID),
+            fixture.viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: fixture.tabID),
             fixture.candidate.domainEndpoint,
             "...while the exact incarnation has changed"
         )
@@ -211,7 +211,7 @@ final class AgentSessionLinkReadEndpointIncarnationTests: XCTestCase {
         // exactly one place in the read. An unchanged endpoint here would mean the window was never
         // entered and the refusal came from somewhere else.
         XCTAssertNotEqual(
-            fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID),
+            fixture.viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: fixture.tabID),
             fixture.candidate.domainEndpoint,
             "the rebind must have been applied while the read held its materialized page"
         )
@@ -221,11 +221,11 @@ final class AgentSessionLinkReadEndpointIncarnationTests: XCTestCase {
     func testObserverEndpointRoutingIsExactAndFailsClosed() throws {
         let fixture = try makeFixture()
         XCTAssertEqual(
-            fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID),
+            fixture.viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: fixture.tabID),
             fixture.candidate.domainEndpoint
         )
         XCTAssertNil(
-            fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: UUID()),
+            fixture.viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: UUID()),
             "An unrouted tab must yield no endpoint rather than an invented one"
         )
     }

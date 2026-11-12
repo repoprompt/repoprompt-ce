@@ -178,14 +178,16 @@ enum AgentTranscriptHistoricalTruncationPolicy {
         turn.allActivities.reduce(into: 0) { partial, activity in
             partial += activity.text.utf8.count
             partial += (activity.reasoning ?? "").utf8.count
-            guard let execution = activity.toolExecution else { return }
-            partial += (execution.argsJSON ?? "").utf8.count
-            let resultJSON = execution.resultJSON ?? ""
-            if resultJSON != activity.text {
-                partial += resultJSON.utf8.count
-            }
-            partial += (execution.summaryText ?? "").utf8.count
+            partial += retainedToolDetailBytes(for: activity)
         }
+    }
+
+    private static func retainedToolDetailBytes(for activity: AgentTranscriptActivity) -> Int {
+        guard let execution = activity.toolExecution else { return 0 }
+        let resultJSON = execution.resultJSON ?? ""
+        return (execution.argsJSON ?? "").utf8.count
+            + (resultJSON == activity.text ? 0 : resultJSON.utf8.count)
+            + (execution.summaryText ?? "").utf8.count
     }
 
     /// Simulated retained detail bytes for a turn, as if truncation had been applied to
@@ -203,13 +205,7 @@ enum AgentTranscriptHistoricalTruncationPolicy {
             if let reasoning = activity.reasoning {
                 partial += min(reasoning.utf8.count, cap)
             }
-            guard let execution = activity.toolExecution else { return }
-            partial += (execution.argsJSON ?? "").utf8.count
-            let resultJSON = execution.resultJSON ?? ""
-            if resultJSON != activity.text {
-                partial += resultJSON.utf8.count
-            }
-            partial += (execution.summaryText ?? "").utf8.count
+            partial += retainedToolDetailBytes(for: activity)
         }
     }
 }

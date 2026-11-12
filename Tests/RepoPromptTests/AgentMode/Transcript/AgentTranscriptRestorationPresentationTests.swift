@@ -2541,7 +2541,7 @@ extension AgentTranscriptRestorationLifecycleTests {
                         let marker = root.appendingPathComponent("joined-session-write")
                         try Data("settled".utf8).write(to: marker)
                         wroteBeforeRemoval = true
-                        viewModel?.scheduleSave(for: session.tabID)
+                        viewModel?.persistenceRuntime.scheduleSave(for: session.tabID)
                         return marker
                     }
                     fixture.viewModel.test_beforeSessionPersistenceDrainWait = {

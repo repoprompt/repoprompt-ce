@@ -164,14 +164,23 @@ final class AgentSessionHandoffRuntime {
                 """
             )
         }
-        if !trimmedTranscriptXML.isEmpty {
-            payloadSections.append(trimmedTranscriptXML)
-        }
+        return Self.forkedSessionEnvelope(
+            sourceTabName: sourceTabName, deliveryID: deliveryID,
+            introduction: "You are continuing a session that was restarted after a native resume failed for \(sourceAgentName). Use the recovered transcript below, plus any preserved thread context, to continue seamlessly.",
+            sections: payloadSections, transcriptXML: trimmedTranscriptXML
+        )
+    }
 
-        let payloadBody = payloadSections.joined(separator: "\n\n")
+    nonisolated static func forkedSessionEnvelope(
+        sourceTabName: String, deliveryID: String, introduction: String,
+        sections: [String], transcriptXML: String
+    ) -> String {
+        var sections = sections
+        if !transcriptXML.isEmpty { sections.append(transcriptXML) }
+        let payloadBody = sections.joined(separator: "\n\n")
         return """
         <forked_session source="\(sourceTabName)" delivery_id="\(deliveryID)">
-        You are continuing a session that was restarted after a native resume failed for \(sourceAgentName). Use the recovered transcript below, plus any preserved thread context, to continue seamlessly.
+        \(introduction)
 
         \(payloadBody)
         </forked_session>

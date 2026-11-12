@@ -275,7 +275,7 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         XCTAssertEqual(receipt.result, .notRunning)
         XCTAssertFalse(heldFence.permitsStart(of: fixture.session))
         XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .cancelledBeforeDispatch)
-        XCTAssertFalse(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(
+        XCTAssertFalse(fixture.viewModel.linkExecutionRuntime.agentSessionLinkAcquirePhysicalDispatch(
             for: fixture.session, dispatchID: .autoWake(wakeID: wakeID)
         ), "the held wake must never reach a provider call")
     }
@@ -427,8 +427,8 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         let outcome = await stop(fixture)
         guard case let .settled(receipt) = outcome else { return XCTFail("expected receipt") }
         XCTAssertEqual(receipt.result, .stopped)
-        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.tabID), "the user's own draft")
-        XCTAssertFalse(fixture.viewModel.retrieveDraftText(for: fixture.tabID).contains("overseer-only"))
+        XCTAssertEqual(fixture.viewModel.draftRuntime.text(for: fixture.tabID), "the user's own draft")
+        XCTAssertFalse(fixture.viewModel.draftRuntime.text(for: fixture.tabID).contains("overseer-only"))
         XCTAssertTrue(fixture.session.pendingClaudeSteeringInstructions.isEmpty)
     }
 
@@ -835,7 +835,7 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         fixture.session.runState = .running
         fixture.session.installRunID(UUID())
         _ = fixture.session.beginRunAttempt(source: "completed-before-local-stop")
-        await fixture.viewModel.test_publishNaturalCompletion(fixture.session)
+        await fixture.viewModel.runService.test_publishNaturalCompletion(fixture.session)
         let revision = try XCTUnwrap(fixture.session.lastTerminalCommitRevision)
         XCTAssertEqual(revision.terminalState, .completed)
         fixture.session.pendingInstructions = ["queued local follow-up"]
@@ -860,10 +860,10 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         fixture.session.runState = .running
         fixture.session.installRunID(UUID())
         _ = fixture.session.beginRunAttempt(source: "natural-completion-after-admission")
-        fixture.viewModel.test_setBeforeCancellationCommit { session in
-            await fixture.viewModel.test_publishNaturalCompletion(session)
+        fixture.viewModel.runService.testBeforeCancellationCommit = { session in
+            await fixture.viewModel.runService.test_publishNaturalCompletion(session)
         }
-        defer { fixture.viewModel.test_setBeforeCancellationCommit(nil) }
+        defer { fixture.viewModel.runService.testBeforeCancellationCommit = nil }
         guard case let .settled(receipt) = await stop(fixture) else { return XCTFail("expected receipt") }
         XCTAssertEqual(receipt.result, .notRunning)
         XCTAssertEqual(receipt.stopRequested, true)
@@ -988,7 +988,7 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         fixture.viewModel.storeDraftText(for: fixture.tabID, "replacement draft")
         releaseRestart.finish(())
         await finishedRestart.value()
-        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.tabID), "replacement draft")
+        XCTAssertEqual(fixture.viewModel.draftRuntime.text(for: fixture.tabID), "replacement draft")
         XCTAssertNotEqual(fixture.session.runState, .running)
     }
 
@@ -1007,7 +1007,7 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
             attachmentsToSend: [], taggedFilesToSend: [], activeWorkflow: nil,
             stopFence: heldFence
         )
-        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.tabID), "replacement draft")
+        XCTAssertEqual(fixture.viewModel.draftRuntime.text(for: fixture.tabID), "replacement draft")
         XCTAssertTrue(replacement.pendingFileAttachments.isEmpty)
         XCTAssertTrue(replacement.pendingTaggedFileAttachments.isEmpty)
     }

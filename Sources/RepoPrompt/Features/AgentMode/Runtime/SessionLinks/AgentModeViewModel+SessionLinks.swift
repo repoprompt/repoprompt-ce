@@ -275,16 +275,6 @@ extension AgentModeViewModel {
         }
     }
 
-    /// The exact live endpoint incarnation bound to one compose tab of this window.
-    ///
-    /// This is the single conversion used to turn server-owned connection routing
-    /// (`connection → run policy → window/tab`) into an oversight endpoint, and to address a projection
-    /// publication at one incarnation. It is deliberately read-only and creates nothing: an unbound
-    /// or unresolvable tab yields `nil` so the caller fails closed instead of inventing an endpoint.
-    func agentSessionLinkObserverEndpoint(tabID: UUID) -> DomainAgentSessionLinkEndpointIdentity? {
-        linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID)
-    }
-
     func agentSessionLinkCandidate(
         tabID: UUID,
         sessionID: UUID,
@@ -360,7 +350,7 @@ extension AgentModeViewModel {
     /// answers "would any Oversee row render differently?" rather than "did some worktree field
     /// change?". A color, icon, or head-only edit therefore compares equal and repaints nothing.
     func agentSessionLinkLocationProjection(forTabID tabID: UUID) -> AgentSessionLinkLocationProjection? {
-        guard let endpoint = agentSessionLinkObserverEndpoint(tabID: tabID) else { return nil }
+        guard let endpoint = linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID) else { return nil }
         return AgentSessionLinkLocationProjection(
             endpoint: endpoint,
             label: AgentMonitorLocationLabelFormatter.label(
@@ -571,7 +561,7 @@ extension AgentModeViewModel {
         _ enabled: Bool,
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool {
-        guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+        guard linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
               let session = sessions[endpoint.tabID],
               session.hasLoadedPersistedState
         else {
@@ -580,7 +570,7 @@ extension AgentModeViewModel {
         guard session.oversight.autoWakeOnUpdates != enabled else { return true }
         session.oversight.autoWakeOnUpdates = enabled
         session.isDirty = true
-        scheduleSave(for: endpoint.tabID)
+        persistenceRuntime.scheduleSave(for: endpoint.tabID)
         if var entry = ownerValidatedSessionIndex[endpoint.sessionID] {
             entry.autoWakeOnOversightUpdates = enabled
             sessionIndexStore.applyLocalUpsert(entry)
@@ -591,13 +581,13 @@ extension AgentModeViewModel {
         // routine status/overflow attempts while retaining exact purposeful attention, which is not
         // governed by routine Auto-wake selection.
         if enabled {
-            agentSessionLinkClearAutoWakeSuppression(for: endpoint)
+            linkExecutionRuntime.agentSessionLinkClearAutoWakeSuppression(for: endpoint)
         }
         // Turning the master off may leave granular lanes effective, and turning it on selects every
         // lane at once. Either way the resulting per-target selection is fenced synchronously here
         // rather than waiting for the projection this signal schedules.
-        agentSessionLinkFenceAutoWakeSelectionChange(for: endpoint)
-        syncStatusPillsUIState()
+        linkExecutionRuntime.agentSessionLinkFenceAutoWakeSelectionChange(for: endpoint)
+        ui.statusPills.update(makeStatusPillsSnapshot())
         session.monitorObservationSignal.send(())
         return true
     }
@@ -607,14 +597,14 @@ extension AgentModeViewModel {
         _ targetSessionIDs: Set<UUID>,
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool {
-        guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+        guard linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
               let session = sessions[endpoint.tabID],
               session.hasLoadedPersistedState
         else { return false }
         guard session.oversight.autoWakeTargetSessionIDs != targetSessionIDs else { return true }
         session.oversight.autoWakeTargetSessionIDs = targetSessionIDs
         session.isDirty = true
-        scheduleSave(for: endpoint.tabID)
+        persistenceRuntime.scheduleSave(for: endpoint.tabID)
         if var entry = ownerValidatedSessionIndex[endpoint.sessionID] {
             entry.agentSessionLinkAutoWakeTargetSessionIDs = targetSessionIDs
             sessionIndexStore.applyLocalUpsert(entry)
@@ -622,8 +612,8 @@ extension AgentModeViewModel {
         // Baselines newly selected lanes at the epoch they hold now and retracts an attempt this
         // change made ineligible, both before the republication can observe a target that moved in
         // between.
-        agentSessionLinkFenceAutoWakeSelectionChange(for: endpoint)
-        syncStatusPillsUIState()
+        linkExecutionRuntime.agentSessionLinkFenceAutoWakeSelectionChange(for: endpoint)
+        ui.statusPills.update(makeStatusPillsSnapshot())
         session.monitorObservationSignal.send(())
         return true
     }
@@ -638,7 +628,7 @@ extension AgentModeViewModel {
         seconds: Int,
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool {
-        guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+        guard linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
               let session = sessions[endpoint.tabID],
               session.hasLoadedPersistedState
         else {
@@ -653,7 +643,7 @@ extension AgentModeViewModel {
         session.oversight.routineWakeIntervalEnabled = enabled
         session.oversight.routineWakeIntervalSeconds = normalizedSeconds
         session.isDirty = true
-        scheduleSave(for: endpoint.tabID)
+        persistenceRuntime.scheduleSave(for: endpoint.tabID)
         if var entry = ownerValidatedSessionIndex[endpoint.sessionID] {
             entry.routineWakeIntervalEnabled = enabled
             entry.routineWakeIntervalSeconds = normalizedSeconds
@@ -661,9 +651,9 @@ extension AgentModeViewModel {
         }
         // Fences an attempt this change just made ineligible and replays exactly one evaluation of
         // the retained snapshot, which is also where the shared deadline is re-armed.
-        agentSessionLinkNoteRoutineWakeIntervalChanged(for: endpoint)
+        linkExecutionRuntime.agentSessionLinkNoteRoutineWakeIntervalChanged(for: endpoint)
         // Oversight preferences have no mirrored-field invalidation in a full binding refresh.
-        syncStatusPillsUIState()
+        ui.statusPills.update(makeStatusPillsSnapshot())
         session.monitorObservationSignal.send(())
         return true
     }
@@ -675,7 +665,7 @@ extension AgentModeViewModel {
         seconds: Int,
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool {
-        guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+        guard linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
               let session = sessions[endpoint.tabID],
               session.hasLoadedPersistedState
         else { return false }
@@ -686,14 +676,14 @@ extension AgentModeViewModel {
         session.oversight.periodicIdleWakeEnabled = enabled
         session.oversight.periodicIdleWakeIntervalSeconds = normalizedSeconds
         session.isDirty = true
-        scheduleSave(for: endpoint.tabID)
+        persistenceRuntime.scheduleSave(for: endpoint.tabID)
         if var entry = ownerValidatedSessionIndex[endpoint.sessionID] {
             entry.periodicIdleWakeEnabled = enabled
             entry.periodicIdleWakeIntervalSeconds = normalizedSeconds
             sessionIndexStore.applyLocalUpsert(entry)
         }
-        agentSessionLinkReconcilePeriodicWake(for: endpoint)
-        syncStatusPillsUIState()
+        linkExecutionRuntime.agentSessionLinkReconcilePeriodicWake(for: endpoint)
+        ui.statusPills.update(makeStatusPillsSnapshot())
         session.monitorObservationSignal.send(())
         return true
     }
@@ -703,17 +693,13 @@ extension AgentModeViewModel {
         _ waitingOn: DomainAgentSessionWaitingOn?,
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool {
-        guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+        guard linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
               let session = sessions[endpoint.tabID]
         else { return false }
         guard session.oversight.waitingOn != waitingOn else { return true }
         session.oversight.waitingOn = waitingOn
         session.monitorObservationSignal.send(())
         return true
-    }
-
-    func agentSessionLinkClearWaitingOnAfterAcceptedTurn(_ session: TabSession) {
-        session.clearAgentSessionLinkWaitingOnAfterAcceptedTurn()
     }
 
     func agentSessionLinkStatusProjection(
@@ -873,15 +859,8 @@ extension AgentModeViewModel {
 
         let publishers: [AnyPublisher<Void, Never>] = [
             session.$runState.map { _ in () }.eraseToAnyPublisher(),
-            session.$items.map { _ in () }.eraseToAnyPublisher(),
-            session.$waitingPrompt.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingAskUser.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingUserInputRequest.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingApproval.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingPermissionsRequest.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingMCPElicitationRequest.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingApplyEditsReview.map { _ in () }.eraseToAnyPublisher(),
-            session.$pendingWorktreeMergeReview.map { _ in () }.eraseToAnyPublisher(),
+            session.$items.map { _ in () }.eraseToAnyPublisher()
+        ] + session.interactionStatePublishers(includeHookGate: false) + [
             session.monitorObservationSignal.eraseToAnyPublisher(),
             agentSessionLinkSubagentCensusChanged
                 .filter { $0.contains(candidate.sessionID) }
@@ -935,7 +914,7 @@ extension AgentModeViewModel {
     }
 
     func agentSessionLinkWillActivate(_ endpoint: DomainAgentSessionLinkEndpointIdentity) async {
-        guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+        guard linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
               let session = sessions[endpoint.tabID] else { return }
         await codexCoordinator.awaitCodexComputerUseRetirement(for: session.tabID)
     }
@@ -996,7 +975,7 @@ extension AgentModeViewModel {
         agentSessionLinkOversightRole(
             tabID: tabID,
             expectedSessionID: expectedSessionID,
-            endpoint: agentSessionLinkObserverEndpoint(tabID: tabID)
+            endpoint: linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID)
         )
     }
 
@@ -1159,7 +1138,7 @@ extension AgentModeViewModel {
         expectedSessionID: UUID
     ) -> DomainAgentSessionLinkEndpointIdentity? {
         guard sessions[tabID]?.activeAgentSessionID == expectedSessionID else { return nil }
-        return agentSessionLinkObserverEndpoint(tabID: tabID)
+        return linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID)
     }
 
     /// Adds one exact current overseer to one exact target through the shared establishment core.
@@ -1167,19 +1146,10 @@ extension AgentModeViewModel {
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         targetEndpoint: DomainAgentSessionLinkEndpointIdentity
     ) async -> AgentSidebarOversightActionOutcome {
-        switch await AgentSessionLinkRuntimeBridge.shared.addSidebarMonitorLink(
+        await AgentSessionLinkRuntimeBridge.shared.addSidebarMonitorLink(
             observerEndpoint: observerEndpoint,
             targetEndpoint: targetEndpoint
-        ) {
-        case .added:
-            .changed
-        case .alreadyLinked:
-            .alreadyInRequestedState
-        case let .failed(failure):
-            .failed(message: failure.uiMessage)
-        case let .rejected(message):
-            .failed(message: message)
-        }
+        ).sidebarActionOutcome
     }
 
     /// Removes only the captured generation-qualified observer-target relationship.
@@ -1210,33 +1180,10 @@ extension AgentModeViewModel {
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         targetEndpoint: DomainAgentSessionLinkEndpointIdentity
     ) async -> AgentSidebarOversightActionOutcome {
-        switch await AgentSessionLinkRuntimeBridge.shared.addMonitorLink(
+        await AgentSessionLinkRuntimeBridge.shared.addMonitorLink(
             observerEndpoint: observerEndpoint,
             targetEndpoint: targetEndpoint
-        ) {
-        case .added:
-            .changed
-        case .alreadyLinked:
-            .alreadyInRequestedState
-        case let .failed(failure):
-            .failed(message: failure.uiMessage)
-        case let .rejected(message):
-            .failed(message: message)
-        }
-    }
-
-    /// Pasted-ID resolution for the sidebar's inbound `Session ID…` sheet (choose a prospective
-    /// overseer for this row). The pasted session may be any eligible session — the menu list
-    /// still offers existing overseers only, but a pasted ID may name a session that has not
-    /// overseen anything yet.
-    func resolveSidebarOverseerCandidate(
-        rawSessionID: String,
-        excludingTargetSessionID: UUID
-    ) async -> Result<AgentOversightSessionIDResolution, AgentOversightResolutionMessage> {
-        await AgentSessionLinkRuntimeBridge.shared.resolveSidebarOverseerCandidate(
-            rawSessionID: rawSessionID,
-            excludingTargetSessionID: excludingTargetSessionID
-        )
+        ).sidebarActionOutcome
     }
 
     /// Pasted-ID resolution for the sidebar's outbound `Session ID…` sheet (choose a prospective
@@ -1304,7 +1251,7 @@ extension AgentModeViewModel {
                 linkID: row.linkID,
                 generation: row.generation
             )
-            let projection: AgentSessionLinkAutoWakeSnoozeProjection? = switch agentSessionLinkAutoWakeSnoozeProjection(
+            let projection: AgentSessionLinkAutoWakeSnoozeProjection? = switch linkExecutionRuntime.agentSessionLinkAutoWakeSnoozeProjection(
                 endpoint: endpoint,
                 targetSessionID: row.targetSessionID,
                 expectedReference: reference
@@ -1388,7 +1335,7 @@ extension AgentModeViewModel {
     /// Resolved through the lifecycle identity rather than assembled from `sessions` alone, so it is
     /// the same value space the bridge publishes against.
     func agentSessionLinkLiveEndpoints() -> Set<DomainAgentSessionLinkEndpointIdentity> {
-        Set(sessions.keys.compactMap { agentSessionLinkObserverEndpoint(tabID: $0) })
+        Set(sessions.keys.compactMap { linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: $0) })
     }
 
     /// Drops projections whose exact incarnation is no longer live in this window.
@@ -1401,7 +1348,7 @@ extension AgentModeViewModel {
         // Prompt state is pruned unconditionally: an observer can lose its binding without ever
         // having had a published pill projection, and a stale acknowledgement would otherwise silence
         // the supplement for a later incarnation reusing the same session UUID.
-        agentSessionLinkPrunePromptState(
+        linkExecutionRuntime.agentSessionLinkPrunePromptState(
             liveSessionIDs: Set(sessions.values.compactMap(\.activeAgentSessionID))
         )
         let stale = monitorPillPropsByEndpoint.keys.filter { !liveEndpoints.contains($0) }
@@ -1456,7 +1403,7 @@ extension AgentModeViewModel {
     ) {
         guard agentSessionLinkPersistencePresentation != presentation else { return }
         agentSessionLinkPersistencePresentation = presentation
-        syncStatusPillsUIState()
+        ui.statusPills.update(makeStatusPillsSnapshot())
     }
 
     /// Oversee props for the tab currently on screen, or an explicitly disabled projection when the
@@ -1475,7 +1422,7 @@ extension AgentModeViewModel {
         // from whatever was last cached under this session UUID. A rebind that has not yet been
         // republished therefore renders eligibility-only props instead of the previous incarnation's
         // links and notices.
-        let endpoint = agentSessionLinkObserverEndpoint(tabID: tabID)
+        let endpoint = linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID)
         let published = endpoint.flatMap { monitorPillPropsByEndpoint[$0] }
         var props = Self.monitorPillProps(
             sessionID: sessionID,
@@ -1492,7 +1439,7 @@ extension AgentModeViewModel {
         // link. Every read below is pure.
         if let endpoint {
             props = agentSessionLinkOverlayingAutoWakePolicy(props, endpoint: endpoint)
-            props.pendingUpdates = agentSessionLinkPendingUpdatesProjection(
+            props.pendingUpdates = linkExecutionRuntime.agentSessionLinkPendingUpdatesProjection(
                 for: endpoint,
                 outbound: props.outbound
             )
@@ -1682,7 +1629,7 @@ extension AgentModeViewModel {
     ) -> SendReadinessInputs {
         SendReadinessInputs(
             status: status,
-            runStateIsActive: session.runState.isActive || providerSwitchHasOwnedCarryingAttempt(session),
+            runStateIsActive: session.runState.isActive || AgentSessionLinkExecutionRuntime.providerSwitchHasOwnedCarryingAttempt(session),
             hasLoadedPersistedState: session.hasLoadedPersistedState,
             bindingTransitionInProgress: session.bindingTransitionInProgress,
             terminalCommitInProgress: session.terminalCommitInProgress,
@@ -1698,8 +1645,8 @@ extension AgentModeViewModel {
             stopInProgress: session.stopState.isStopping(binding: session.persistentSessionBindingIdentity),
             backgroundCompactionSettling: session.isSettlingACPBackgroundCompaction,
             isCandidateClosing: candidate.isClosing,
-            providerSwitchUnconfirmed: providerSwitchUnconfirmed(session),
-            providerHandoverNeedsReview: providerSwitchNeedsReview(session)
+            providerSwitchUnconfirmed: AgentSessionLinkExecutionRuntime.providerSwitchUnconfirmed(session),
+            providerHandoverNeedsReview: AgentSessionLinkExecutionRuntime.providerSwitchNeedsReview(session)
         )
     }
 

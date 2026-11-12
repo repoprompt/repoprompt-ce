@@ -2107,7 +2107,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         persisted.selectedAgent = .devin
         persisted.selectedModelRaw = AgentModelCatalog.defaultModelRaw(for: .devin)
         persisted.providerSessionID = "hosted-persisted-acp-session"
-        await fixture.vm.flushSave(for: tabID)
+        await fixture.vm.persistenceRuntime.flushSave(for: tabID)
         fixture.vm.test_setCurrentTabIDOverride(fixture.tabs[1].id)
         fixture.vm.test_removeSession(tabID: tabID)
         await settleHostedPublication(in: fixture)
@@ -2289,7 +2289,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         persisted.selectedAgent = .devin
         persisted.selectedModelRaw = AgentModelCatalog.defaultModelRaw(for: .devin)
         persisted.providerSessionID = "hosted-existing-acp-session"
-        await fixture.vm.flushSave(for: tabID)
+        await fixture.vm.persistenceRuntime.flushSave(for: tabID)
         // Keep ordinary active-chat ownership away from this cold menu target.
         fixture.vm.test_setCurrentTabIDOverride(fixture.tabs[1].id)
         fixture.vm.test_removeSession(tabID: tabID)
@@ -2314,7 +2314,7 @@ final class AgentSidebarHostedContextMenuTests: XCTestCase {
         session.selectedModelRaw = AgentModelCatalog.defaultModelRaw(for: .devin)
         session.providerSessionID = "hosted-existing-acp-session"
         XCTAssertFalse(fixture.vm.test_isCursorModelPollingActive)
-        await fixture.vm.flushSave(for: tabID)
+        await fixture.vm.persistenceRuntime.flushSave(for: tabID)
         let retired = try menuProps(in: fixture).targetEndpoint
         let items = session.items
         let revision = session.sourceItemsRevision

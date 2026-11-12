@@ -3,10 +3,10 @@ import RepoPromptDomainRuntime
 import RepoPromptShared
 import SwiftUI
 
-struct ContextBuilderCallCard: View {
+struct ContextBuilderCallCard: View, ContextBuilderLiveCard {
     let item: AgentChatItem
-    private let context: ContextBuilderCardContext
-    @ObservedObject private var contextBuilderAgentVM: ContextBuilderAgentViewModel
+    fileprivate let context: ContextBuilderCardContext
+    @ObservedObject fileprivate var contextBuilderAgentVM: ContextBuilderAgentViewModel
     @State private var isExpanded = false
 
     init(item: AgentChatItem, context: ContextBuilderCardContext) {
@@ -15,34 +15,8 @@ struct ContextBuilderCallCard: View {
         _contextBuilderAgentVM = ObservedObject(wrappedValue: context.contextBuilderAgentVM)
     }
 
-    private var isRunningForTab: Bool {
-        guard let tabID = context.tabID else { return false }
-        return contextBuilderAgentVM.tabsWithActiveContextBuilderRun.contains(tabID)
-    }
-
-    private var isActiveCallCard: Bool {
+    fileprivate var isActiveCard: Bool {
         context.activeContextBuilderCallItemID == item.id
-    }
-
-    private var planStatusForTab: ContextBuilderPlanStatus {
-        contextBuilderAgentVM.planStatus(for: context.tabID)
-    }
-
-    private var isPlanGeneratingForTab: Bool {
-        if case .generating = planStatusForTab {
-            return true
-        }
-        return false
-    }
-
-    private var phase: ContextBuilderCardPhase {
-        if isActiveCallCard, isRunningForTab {
-            return .running
-        }
-        if isActiveCallCard, isPlanGeneratingForTab {
-            return .generatingPlan
-        }
-        return .completed
     }
 
     private var detailLine: String? {
@@ -66,24 +40,6 @@ struct ContextBuilderCallCard: View {
         }
     }
 
-    private var canCancelRunningContextBuilder: Bool {
-        context.cancelActiveToolsAction != nil || context.tabID != nil
-    }
-
-    private var showsHeaderCancelButton: Bool {
-        phase == .running
-            && context.showRunScopedToolCancel
-            && canCancelRunningContextBuilder
-    }
-
-    private func cancelRun() {
-        cancelContextBuilderRun(
-            contextBuilderAgentVM: contextBuilderAgentVM,
-            tabID: context.tabID,
-            cancelActiveToolsAction: context.cancelActiveToolsAction
-        )
-    }
-
     var body: some View {
         ToolCardContainer(
             iconName: toolIcon(for: item.toolName),
@@ -100,24 +56,9 @@ struct ContextBuilderCallCard: View {
         ) {
             switch phase {
             case .running:
-                ContextBuilderRunDetailsView(
-                    contextBuilderAgentVM: contextBuilderAgentVM,
-                    tabID: context.tabID,
-                    maxLogEntries: 6,
-                    showQuestionCard: true,
-                    showCancelRunButton: true,
-                    onCancelRun: cancelRun
-                )
+                runningDetails
             case .generatingPlan:
-                ContextBuilderPlanProgressView(
-                    contextBuilderAgentVM: contextBuilderAgentVM,
-                    tabID: context.tabID,
-                    followUpLabel: contextBuilderFollowUpLabel(contextBuilderAgentVM: contextBuilderAgentVM),
-                    oracleOpenContext: context.oracleOpenContext,
-                    onCancelPlan: {
-                        contextBuilderAgentVM.cancelBackgroundPlanGeneration(forTabID: context.tabID)
-                    }
-                )
+                planProgress
             case .completed:
                 Text("Context builder run completed.")
                     .font(.system(size: 11))
@@ -144,10 +85,10 @@ struct ContextBuilderCallCard: View {
     }
 }
 
-struct ContextBuilderResultCard: View {
+struct ContextBuilderResultCard: View, ContextBuilderLiveCard {
     let item: AgentChatItem
-    private let context: ContextBuilderCardContext
-    @ObservedObject private var contextBuilderAgentVM: ContextBuilderAgentViewModel
+    fileprivate let context: ContextBuilderCardContext
+    @ObservedObject fileprivate var contextBuilderAgentVM: ContextBuilderAgentViewModel
     @State private var isExpanded = false
 
     init(item: AgentChatItem, context: ContextBuilderCardContext) {
@@ -160,34 +101,8 @@ struct ContextBuilderResultCard: View {
         ToolJSON.decode(ToolResultDTOs.ContextBuilderDTO.self, from: item.toolResultJSON)
     }
 
-    private var isActiveResultCard: Bool {
+    fileprivate var isActiveCard: Bool {
         context.activeContextBuilderResultItemID == item.id
-    }
-
-    private var isRunningForTab: Bool {
-        guard let tabID = context.tabID else { return false }
-        return contextBuilderAgentVM.tabsWithActiveContextBuilderRun.contains(tabID)
-    }
-
-    private var planStatusForTab: ContextBuilderPlanStatus {
-        contextBuilderAgentVM.planStatus(for: context.tabID)
-    }
-
-    private var isPlanGeneratingForTab: Bool {
-        if case .generating = planStatusForTab {
-            return true
-        }
-        return false
-    }
-
-    private var phase: ContextBuilderCardPhase {
-        if isActiveResultCard, isRunningForTab {
-            return .running
-        }
-        if isActiveResultCard, isPlanGeneratingForTab {
-            return .generatingPlan
-        }
-        return .completed
     }
 
     private var detailLine: String? {
@@ -195,7 +110,7 @@ struct ContextBuilderResultCard: View {
     }
 
     var summary: String {
-        let label = isActiveResultCard
+        let label = isActiveCard
             ? contextBuilderCardSubtitle(
                 contextBuilderAgentVM: contextBuilderAgentVM,
                 fallbackStatus: dto?.status,
@@ -242,24 +157,6 @@ struct ContextBuilderResultCard: View {
         return true
     }
 
-    private var canCancelRunningContextBuilder: Bool {
-        context.cancelActiveToolsAction != nil || context.tabID != nil
-    }
-
-    private var showsHeaderCancelButton: Bool {
-        phase == .running
-            && context.showRunScopedToolCancel
-            && canCancelRunningContextBuilder
-    }
-
-    private func cancelRun() {
-        cancelContextBuilderRun(
-            contextBuilderAgentVM: contextBuilderAgentVM,
-            tabID: context.tabID,
-            cancelActiveToolsAction: context.cancelActiveToolsAction
-        )
-    }
-
     var body: some View {
         ToolCardContainer(
             iconName: toolIcon(for: item.toolName),
@@ -276,24 +173,9 @@ struct ContextBuilderResultCard: View {
             isExpanded: $isExpanded
         ) {
             if phase == .running {
-                ContextBuilderRunDetailsView(
-                    contextBuilderAgentVM: contextBuilderAgentVM,
-                    tabID: context.tabID,
-                    maxLogEntries: 6,
-                    showQuestionCard: true,
-                    showCancelRunButton: true,
-                    onCancelRun: cancelRun
-                )
+                runningDetails
             } else if phase == .generatingPlan {
-                ContextBuilderPlanProgressView(
-                    contextBuilderAgentVM: contextBuilderAgentVM,
-                    tabID: context.tabID,
-                    followUpLabel: contextBuilderFollowUpLabel(contextBuilderAgentVM: contextBuilderAgentVM),
-                    oracleOpenContext: context.oracleOpenContext,
-                    onCancelPlan: {
-                        contextBuilderAgentVM.cancelBackgroundPlanGeneration(forTabID: context.tabID)
-                    }
-                )
+                planProgress
             } else {
                 ContextBuilderCompletedSummaryView(
                     dto: dto,
@@ -313,13 +195,74 @@ struct ContextBuilderResultCard: View {
                     isExpanded = true
                 }
             case .completed:
-                if isActiveResultCard {
+                if isActiveCard {
                     performAgentToolCardExpansionStateUpdateWithoutAnimation {
                         isExpanded = false
                     }
                 }
             }
         }
+    }
+}
+
+@MainActor
+private protocol ContextBuilderLiveCard: View {
+    var context: ContextBuilderCardContext { get }
+    var contextBuilderAgentVM: ContextBuilderAgentViewModel { get }
+    var isActiveCard: Bool { get }
+}
+
+private extension ContextBuilderLiveCard {
+    var isRunningForTab: Bool {
+        guard let tabID = context.tabID else { return false }
+        return contextBuilderAgentVM.tabsWithActiveContextBuilderRun.contains(tabID)
+    }
+
+    var phase: ContextBuilderCardPhase {
+        if isActiveCard, isRunningForTab {
+            return .running
+        }
+        if isActiveCard, case .generating = contextBuilderAgentVM.planStatus(for: context.tabID) {
+            return .generatingPlan
+        }
+        return .completed
+    }
+
+    var showsHeaderCancelButton: Bool {
+        phase == .running
+            && context.showRunScopedToolCancel
+            && (context.cancelActiveToolsAction != nil || context.tabID != nil)
+    }
+
+    func cancelRun() {
+        cancelContextBuilderRun(
+            contextBuilderAgentVM: contextBuilderAgentVM,
+            tabID: context.tabID,
+            cancelActiveToolsAction: context.cancelActiveToolsAction
+        )
+    }
+
+    var runningDetails: some View {
+        ContextBuilderRunDetailsView(
+            contextBuilderAgentVM: contextBuilderAgentVM,
+            tabID: context.tabID,
+            maxLogEntries: 6,
+            showQuestionCard: true,
+            showCancelRunButton: true,
+            onCancelRun: cancelRun
+        )
+    }
+
+    var planProgress: some View {
+        ContextBuilderPlanProgressView(
+            contextBuilderAgentVM: contextBuilderAgentVM,
+            tabID: context.tabID,
+            followUpLabel: contextBuilderFollowUpLabel(contextBuilderAgentVM: contextBuilderAgentVM),
+            oracleOpenContext: context.oracleOpenContext,
+            onCancelPlan: {
+                contextBuilderAgentVM.cancelBackgroundPlanGeneration(forTabID: context.tabID)
+            }
+        )
     }
 }
 
@@ -431,14 +374,6 @@ private struct ContextBuilderPlanProgressView: View {
         contextBuilderAgentVM.currentFollowUpOracleChatID(for: tabID)
     }
 
-    private func openOraclePreview() {
-        guard let userInfo = contextBuilderOraclePopoverUserInfo(
-            openContext: oracleOpenContext,
-            chatID: followUpChatID
-        ) else { return }
-        NotificationCenter.default.post(name: .showAgentOraclePopover, object: nil, userInfo: userInfo)
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
@@ -459,7 +394,9 @@ private struct ContextBuilderPlanProgressView: View {
             }
 
             HStack(spacing: 8) {
-                Button(action: openOraclePreview) {
+                Button {
+                    agentOraclePopoverAction(userInfo: contextBuilderOraclePopoverUserInfo(openContext: oracleOpenContext, chatID: followUpChatID))?()
+                } label: {
                     HStack(spacing: 4) {
                         Image(systemName: "doc.text.magnifyingglass")
                             .font(.system(size: 11))
@@ -517,14 +454,6 @@ private struct ContextBuilderCompletedSummaryView: View {
         contextBuilderOracleLaneSummaries(for: dto)
     }
 
-    private func openOraclePreview() {
-        guard let userInfo = contextBuilderOraclePopoverUserInfo(
-            openContext: oracleOpenContext,
-            chatID: followUpChatID
-        ) else { return }
-        NotificationCenter.default.post(name: .showAgentOraclePopover, object: nil, userInfo: userInfo)
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Context builder run completed.")
@@ -552,13 +481,15 @@ private struct ContextBuilderCompletedSummaryView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Button("Open Oracle", action: openOraclePreview)
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(contextBuilderOraclePopoverUserInfo(
-                    openContext: oracleOpenContext,
-                    chatID: followUpChatID
-                ) == nil)
+            Button("Open Oracle") {
+                agentOraclePopoverAction(userInfo: contextBuilderOraclePopoverUserInfo(openContext: oracleOpenContext, chatID: followUpChatID))?()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(contextBuilderOraclePopoverUserInfo(
+                openContext: oracleOpenContext,
+                chatID: followUpChatID
+            ) == nil)
         }
     }
 }
