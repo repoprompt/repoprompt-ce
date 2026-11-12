@@ -14066,7 +14066,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             ))
         }
         var flushedSessionClaims: [RemovalPreflightSessionClaim] = []
+        var noSaveRequiredTabIDs: Set<UUID> = []
         for tabID in tabIDs.sorted(by: { $0.uuidString < $1.uuidString }) {
+            if persistenceRuntime.canRemoveWithoutRequiredSave(for: tabID, workspaceID: workspaceID) {
+                // No write or durability acknowledgement: removing this clean replica can
+                // itself resolve a conflicting claim. Keep its snapshot in the final fence.
+                noSaveRequiredTabIDs.insert(tabID)
+                flushedSessionClaims.append(removalPreflightSessionClaim(for: tabID))
+                continue
+            }
             switch await persistenceRuntime.flushSaveRequired(for: tabID, workspaceID: workspaceID) {
             case .success:
                 flushedSessionClaims.append(removalPreflightSessionClaim(for: tabID))
@@ -14078,7 +14086,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 ))
             }
         }
-        guard flushedSessionClaims.allSatisfy({ removalPreflightSessionClaim(for: $0.tabID) == $0 }) else {
+        guard flushedSessionClaims.allSatisfy({ removalPreflightSessionClaim(for: $0.tabID) == $0 }),
+              noSaveRequiredTabIDs.allSatisfy({ persistenceRuntime.canRemoveWithoutRequiredSave(for: $0, workspaceID: workspaceID) })
+        else {
             return .abort(.init(
                 stage: .requiredSessionFlush,
                 tabID: nil,
