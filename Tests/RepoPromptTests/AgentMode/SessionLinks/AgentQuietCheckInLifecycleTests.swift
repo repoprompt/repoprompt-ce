@@ -159,7 +159,7 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
             row.isStreaming = true
             s.appendItem(row)
             switch variant {
-            case 0: h.host.finalizeStreamingItems(in: s)
+            case 0: h.host.streamRuntime.finalizeStreamingItems(in: s)
             case 1: s.setItemsSilentlyForRetentionCompaction(s.items)
             case 2: s.replaceItem(at: 0, with: .assistant("[ack]", sequenceIndex: 0))
             case 3: s.setItemsSilently(s.items, reason: .persistedSessionHydration)

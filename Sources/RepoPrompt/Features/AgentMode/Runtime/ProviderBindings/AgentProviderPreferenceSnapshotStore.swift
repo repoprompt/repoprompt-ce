@@ -173,8 +173,7 @@ final class AgentProviderPreferenceSnapshotStore {
         }
     }
 
-    @discardableResult
-    func setPermissionLevel(_ id: AgentProviderPermissionLevelID) -> AgentProviderBindingID {
+    static func writePermissionLevel(_ id: AgentProviderPermissionLevelID, defaults: UserDefaults, securePermissions: AgentPermissionSecureStore?) {
         switch id {
         case let .codex(level):
             CodexAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
@@ -191,12 +190,9 @@ final class AgentProviderPreferenceSnapshotStore {
         case let .devin(level):
             DevinAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         }
-        bumpRevision(for: id.providerID)
-        return id.providerID
     }
 
-    @discardableResult
-    func applyCodexToolSettingMutation(_ mutation: CodexToolSettingMutation) -> AgentProviderBindingID {
+    static func writeCodexToolSettingMutation(_ mutation: CodexToolSettingMutation, defaults: UserDefaults, securePermissions: AgentPermissionSecureStore?) {
         switch mutation {
         case let .bashTool(enabled):
             CodexAgentToolPreferences.setBashToolEnabled(enabled, defaults: defaults, secureStore: securePermissions)
@@ -226,6 +222,31 @@ final class AgentProviderPreferenceSnapshotStore {
                 secureStore: securePermissions
             )
         }
+    }
+
+    static func writeClaudeToolSettingMutation(_ mutation: ClaudeToolSettingMutation, defaults: UserDefaults, securePermissions: AgentPermissionSecureStore?) {
+        switch mutation {
+        case let .bashTool(enabled):
+            ClaudeAgentToolPreferences.setBashToolEnabled(enabled, defaults: defaults, secureStore: securePermissions)
+        case let .mcpStrictMode(enabled):
+            ClaudeAgentToolPreferences.setMCPStrictModeEnabled(enabled, defaults: defaults, secureStore: securePermissions)
+        case let .toolSearch(enabled):
+            ClaudeAgentToolPreferences.setToolSearchEnabled(enabled, defaults: defaults)
+        case let .agentModePromptDelivery(delivery):
+            ClaudeAgentToolPreferences.setAgentModePromptDelivery(delivery, defaults: defaults)
+        }
+    }
+
+    @discardableResult
+    func setPermissionLevel(_ id: AgentProviderPermissionLevelID) -> AgentProviderBindingID {
+        Self.writePermissionLevel(id, defaults: defaults, securePermissions: securePermissions)
+        bumpRevision(for: id.providerID)
+        return id.providerID
+    }
+
+    @discardableResult
+    func applyCodexToolSettingMutation(_ mutation: CodexToolSettingMutation) -> AgentProviderBindingID {
+        Self.writeCodexToolSettingMutation(mutation, defaults: defaults, securePermissions: securePermissions)
         bumpRevision(for: .codex)
         return .codex
     }
@@ -278,16 +299,7 @@ final class AgentProviderPreferenceSnapshotStore {
 
     @discardableResult
     func applyClaudeToolSettingMutation(_ mutation: ClaudeToolSettingMutation) -> AgentProviderBindingID {
-        switch mutation {
-        case let .bashTool(enabled):
-            ClaudeAgentToolPreferences.setBashToolEnabled(enabled, defaults: defaults, secureStore: securePermissions)
-        case let .mcpStrictMode(enabled):
-            ClaudeAgentToolPreferences.setMCPStrictModeEnabled(enabled, defaults: defaults, secureStore: securePermissions)
-        case let .toolSearch(enabled):
-            ClaudeAgentToolPreferences.setToolSearchEnabled(enabled, defaults: defaults)
-        case let .agentModePromptDelivery(delivery):
-            ClaudeAgentToolPreferences.setAgentModePromptDelivery(delivery, defaults: defaults)
-        }
+        Self.writeClaudeToolSettingMutation(mutation, defaults: defaults, securePermissions: securePermissions)
         bumpRevision(for: .claude)
         return .claude
     }
@@ -492,9 +504,10 @@ final class AgentProviderPreferenceSnapshotStore {
         profile: AgentProviderPermissionProfile
     ) -> CodexToolSettingsBinding {
         let entries = codexMCPServerEntriesProvider()
+        var states: [String: Bool] = [:]
+        let bashToolEnabled: Bool
         switch profile {
         case .userConfigured, .providerOverride:
-            var states: [String: Bool] = [:]
             for entry in entries {
                 let key = normalizedServerToggleKey(entry.normalizedName)
                 states[key] = CodexAgentToolPreferences.mcpServerEnabled(
@@ -503,42 +516,29 @@ final class AgentProviderPreferenceSnapshotStore {
                     secureStore: securePermissions
                 )
             }
-            return CodexToolSettingsBinding(
-                bashToolEnabled: CodexAgentToolPreferences.bashToolEnabled(defaults: defaults, secureStore: securePermissions),
-                searchToolEnabled: CodexAgentToolPreferences.searchToolEnabled(defaults: defaults),
-                goalSupportEnabled: codexGoalSupportEnabled(),
-                computerUseEnabled: codexComputerUseEnabled(),
-                reasoningSummariesEnabled: codexReasoningSummariesEnabled(),
-                memoriesEnabled: codexMemoriesEnabled(),
-                appsEnabled: codexAppsEnabled(),
-                pluginsEnabled: codexPluginsEnabled(),
-                mcpElicitationEnabled: codexMCPElicitationEnabled(),
-                toolSuggestionsEnabled: codexToolSuggestionsEnabled(),
-                mcpServerEntries: entries,
-                mcpServerStatesByNormalizedName: states
-            )
+            bashToolEnabled = CodexAgentToolPreferences.bashToolEnabled(defaults: defaults, secureStore: securePermissions)
         case .mcpSafeDefaults:
             // Codex Safe Managed keeps its product-default Bash capability while suppressing
             // every user-toggled third-party MCP server. Search remains user-configurable.
-            var states: [String: Bool] = [:]
             for entry in entries {
                 states[normalizedServerToggleKey(entry.normalizedName)] = false
             }
-            return CodexToolSettingsBinding(
-                bashToolEnabled: true,
-                searchToolEnabled: CodexAgentToolPreferences.searchToolEnabled(defaults: defaults),
-                goalSupportEnabled: codexGoalSupportEnabled(),
-                computerUseEnabled: codexComputerUseEnabled(),
-                reasoningSummariesEnabled: codexReasoningSummariesEnabled(),
-                memoriesEnabled: codexMemoriesEnabled(),
-                appsEnabled: codexAppsEnabled(),
-                pluginsEnabled: codexPluginsEnabled(),
-                mcpElicitationEnabled: codexMCPElicitationEnabled(),
-                toolSuggestionsEnabled: codexToolSuggestionsEnabled(),
-                mcpServerEntries: entries,
-                mcpServerStatesByNormalizedName: states
-            )
+            bashToolEnabled = true
         }
+        return CodexToolSettingsBinding(
+            bashToolEnabled: bashToolEnabled,
+            searchToolEnabled: CodexAgentToolPreferences.searchToolEnabled(defaults: defaults),
+            goalSupportEnabled: codexGoalSupportEnabled(),
+            computerUseEnabled: codexComputerUseEnabled(),
+            reasoningSummariesEnabled: codexReasoningSummariesEnabled(),
+            memoriesEnabled: codexMemoriesEnabled(),
+            appsEnabled: codexAppsEnabled(),
+            pluginsEnabled: codexPluginsEnabled(),
+            mcpElicitationEnabled: codexMCPElicitationEnabled(),
+            toolSuggestionsEnabled: codexToolSuggestionsEnabled(),
+            mcpServerEntries: entries,
+            mcpServerStatesByNormalizedName: states
+        )
     }
 
     /// Builds the Claude tool snapshot with Safe Managed overrides applied when the profile
@@ -625,91 +625,37 @@ final class AgentProviderPreferenceSnapshotStore {
     private func effectiveCodexPermissionLevel(
         profile: AgentProviderPermissionProfile
     ) -> CodexAgentToolPreferences.PermissionLevel {
-        switch profile {
-        case .userConfigured:
-            CodexAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
-        case .mcpSafeDefaults:
-            .autoReview
-        case let .providerOverride(.codex(level)):
-            level
-        case .providerOverride:
-            .defaultPermission
-        }
+        profile.codexPermissionLevel(loadUserConfigured: { CodexAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions) })
     }
 
     private func effectiveClaudePermissionLevel(
         profile: AgentProviderPermissionProfile
     ) -> ClaudeAgentToolPreferences.PermissionLevel {
-        switch profile {
-        case .userConfigured:
-            ClaudeAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
-        case .mcpSafeDefaults:
-            .requireApproval
-        case let .providerOverride(.claude(level)):
-            level
-        case .providerOverride:
-            .requireApproval
-        }
+        profile.claudePermissionLevel(loadUserConfigured: { ClaudeAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions) })
     }
 
     private func effectiveOpenCodePermissionLevel(
         profile: AgentProviderPermissionProfile
     ) -> OpenCodeAgentToolPreferences.PermissionLevel {
-        switch profile {
-        case .userConfigured:
-            OpenCodeAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
-        case .mcpSafeDefaults:
-            .managedDefault
-        case let .providerOverride(.openCode(level)):
-            level
-        case .providerOverride:
-            .managedDefault
-        }
+        profile.openCodePermissionLevel(loadUserConfigured: { OpenCodeAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions) })
     }
 
     private func effectiveAntigravityPermissionLevel(
         profile: AgentProviderPermissionProfile
     ) -> AntigravityAgentToolPreferences.PermissionLevel {
-        switch profile {
-        case .userConfigured:
-            AntigravityAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
-        case .mcpSafeDefaults:
-            .autoEdit
-        case let .providerOverride(.antigravity(level)):
-            level
-        case .providerOverride:
-            .autoEdit
-        }
+        profile.antigravityPermissionLevel(loadUserConfigured: { AntigravityAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions) })
     }
 
     private func effectiveCursorPermissionLevel(
         profile: AgentProviderPermissionProfile
     ) -> CursorAgentToolPreferences.PermissionLevel {
-        switch profile {
-        case .userConfigured:
-            CursorAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
-        case .mcpSafeDefaults:
-            .managedDefault
-        case let .providerOverride(.cursor(level)):
-            level
-        case .providerOverride:
-            .managedDefault
-        }
+        profile.cursorPermissionLevel(loadUserConfigured: { CursorAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions) })
     }
 
     private func effectiveGrokBuildPermissionLevel(
         profile: AgentProviderPermissionProfile
     ) -> GrokBuildAgentToolPreferences.PermissionLevel {
-        switch profile {
-        case .userConfigured:
-            GrokBuildAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
-        case .mcpSafeDefaults:
-            .managedDefault
-        case let .providerOverride(.grokBuild(level)):
-            level
-        case .providerOverride:
-            .managedDefault
-        }
+        profile.grokBuildPermissionLevel(loadUserConfigured: { GrokBuildAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions) })
     }
 
     private func effectiveDevinPermissionLevel(

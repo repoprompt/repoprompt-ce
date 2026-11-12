@@ -60,7 +60,7 @@ extension AgentModeViewModel {
             guard autoEditPermissionGuidance != nil else { return false }
             autoEditPermissionGuidance = nil
             if syncUI {
-                syncStatusPillsUIState()
+                ui.statusPills.update(makeStatusPillsSnapshot())
             }
             return true
         }
@@ -75,7 +75,7 @@ extension AgentModeViewModel {
         guard autoEditPermissionGuidance != nextGuidance else { return false }
         autoEditPermissionGuidance = nextGuidance
         if syncUI {
-            syncStatusPillsUIState()
+            ui.statusPills.update(makeStatusPillsSnapshot())
         }
         return true
     }
@@ -118,7 +118,7 @@ extension AgentModeViewModel {
                 activeSession.selectedReasoningEffortRaw = level.rawValue
             }
             activeSession.isDirty = true
-            scheduleSave(for: activeSession)
+            persistenceRuntime.scheduleSave(for: activeSession)
             updateBindingsFromSession(activeSession)
             claudeCoordinator.scheduleApplyCurrentClaudeModelAndEffortIfPossible(
                 for: activeSession,
@@ -151,7 +151,7 @@ extension AgentModeViewModel {
             currentTabID: currentTabID,
             codexCoordinator: codexCoordinator,
             scheduleSave: { [weak self] tabID in
-                self?.scheduleSave(for: tabID)
+                self?.persistenceRuntime.scheduleSave(for: tabID)
             },
             updateActiveBindings: { [weak self] session in
                 self?.updateBindingsFromSession(session)

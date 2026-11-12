@@ -7,12 +7,69 @@ private struct AgentContextDrawerSwitchKey: Equatable {
 }
 
 @MainActor
-@discardableResult
-func refreshSelectedFilesModelAfterTokenMetricsCompletion(
-    request: AgentSelectedFilesModelRequest,
-    coordinator: AgentSelectedFilesModelCoordinator
-) -> AgentSelectedFilesRefreshOutcome? {
-    coordinator.refreshAfterTokenMetricsCompletion(request)
+protocol AgentContextDrawerModelRefreshing: View {
+    var modelCoordinator: AgentSelectedFilesModelCoordinator { get }
+    var exportContext: AgentContextExportViewContext { get }
+    var isContextModelRefreshBlanked: Bool { get }
+}
+
+extension AgentContextDrawerModelRefreshing {
+    func refreshIfNeeded(force: Bool = false, preserveDisplayedModel: Bool = false) {
+        guard !isContextModelRefreshBlanked else { return }
+        guard !exportContext.promptManager.isSwitchingComposeTab else { return }
+        modelCoordinator.refreshIfNeeded(
+            exportContext.makeModelRequest(flushPendingUI: true),
+            force: force,
+            preserveDisplayedModel: preserveDisplayedModel
+        )
+    }
+
+    func resetOrRefresh(isVisible: Bool) {
+        guard !isContextModelRefreshBlanked else { return }
+        guard !exportContext.promptManager.isSwitchingComposeTab else { return }
+        modelCoordinator.invalidate()
+        if isVisible {
+            refreshIfNeeded()
+        }
+    }
+
+    func handleSelectionChange(_ change: WorkspaceSelectionCoordinator.Change, isVisible: Bool) {
+        guard exportContext.tabMatchesSelectionChange(change) else { return }
+        if isVisible {
+            refreshIfNeeded(force: true, preserveDisplayedModel: true)
+        } else {
+            modelCoordinator.invalidate()
+        }
+    }
+}
+
+extension View {
+    func agentContextDrawerTextInputSurface() -> some View {
+        background(Color(NSColor.textBackgroundColor).opacity(0.65))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(Color.secondary.opacity(0.18), lineWidth: 0.5)
+            )
+    }
+}
+
+@MainActor
+func agentContextDrawerEmptyState(fontPreset: FontScalePreset, icon: String, title: String, subtitle: String) -> some View {
+    VStack(spacing: 10) {
+        Image(systemName: icon)
+            .font(.system(size: 34))
+            .foregroundStyle(.secondary.opacity(0.45))
+        Text(title)
+            .font(fontPreset.standardFont.weight(.semibold))
+            .foregroundStyle(.secondary)
+        Text(subtitle)
+            .font(fontPreset.captionFont)
+            .foregroundStyle(.tertiary)
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: 320)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
 }
 
 struct AgentContextControlDrawerView: View {
@@ -347,10 +404,7 @@ struct AgentContextControlDrawerView: View {
         clearCompletedTokenBlankingIfNeeded()
         guard isPresented else { return }
         let request = exportContext.makeModelRequest(flushPendingUI: false)
-        refreshSelectedFilesModelAfterTokenMetricsCompletion(
-            request: request,
-            coordinator: modelCoordinator
-        )
+        modelCoordinator.refreshAfterTokenMetricsCompletion(request)
     }
 
     private func clearCompletedTokenBlankingIfNeeded() {

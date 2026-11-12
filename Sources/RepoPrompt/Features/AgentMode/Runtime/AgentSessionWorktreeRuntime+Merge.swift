@@ -268,39 +268,48 @@ extension AgentSessionWorktreeRuntime {
         admission: Admission, operationID: String, commitMessage: String? = nil,
         revalidateAuthority: (@MainActor () async throws -> Void)? = nil
     ) async throws -> GitWorktreeMergeApplyResult {
-        let token = try acquireMerge(admission)
-        beginPendingOperation()
-        defer { endPendingOperation()
-            releaseMerge(admission, token: token)
-        }
-        let context = MergeCommand(admission, revalidateAuthority: revalidateAuthority)
-        let operation = try statusMerge(command: admission.command, operationID: operationID)
-        guard operation.status == .conflicted || operation.status == .awaitingCommit else {
-            throw MCPError.invalidParams("continue is only valid for a conflicted or awaiting_commit worktree merge operation.")
-        }
-        context.expectedOperation = operation
-        return try await mutateMerge(context, kind: .resume, commitMessage: commitMessage).applyValue()
+        try await continueOrAbortMerge(
+            admission: admission, operationID: operationID, aborting: false,
+            commitMessage: commitMessage, revalidateAuthority: revalidateAuthority
+        ).applyValue()
     }
 
     func abortMerge(
         admission: Admission, operationID: String,
         revalidateAuthority: (@MainActor () async throws -> Void)? = nil
     ) async throws -> GitWorktreeMergeAbortResult {
+        switch try await continueOrAbortMerge(
+            admission: admission, operationID: operationID, aborting: true,
+            commitMessage: nil, revalidateAuthority: revalidateAuthority
+        ) {
+        case let .abort(result): result
+        case .apply: preconditionFailure("Abort returned an apply result")
+        }
+    }
+
+    private func continueOrAbortMerge(
+        admission: Admission, operationID: String, aborting: Bool, commitMessage: String?,
+        revalidateAuthority: (@MainActor () async throws -> Void)?
+    ) async throws -> MergeResult {
         let token = try acquireMerge(admission)
         beginPendingOperation()
-        defer { endPendingOperation()
+        defer {
+            endPendingOperation()
             releaseMerge(admission, token: token)
         }
         let context = MergeCommand(admission, revalidateAuthority: revalidateAuthority)
         let operation = try statusMerge(command: admission.command, operationID: operationID)
-        guard operation.status == .conflicted || operation.status == .awaitingCommit || operation.status == .applying else {
-            throw MCPError.invalidParams("abort is only valid for an active worktree merge operation.")
+        guard operation.status == .conflicted || operation.status == .awaitingCommit
+            || (aborting && operation.status == .applying)
+        else {
+            throw MCPError.invalidParams(
+                aborting
+                    ? "abort is only valid for an active worktree merge operation."
+                    : "continue is only valid for a conflicted or awaiting_commit worktree merge operation."
+            )
         }
         context.expectedOperation = operation
-        switch try await mutateMerge(context, kind: .abort, commitMessage: nil) {
-        case let .abort(result): return result
-        case .apply: preconditionFailure("Abort returned an apply result")
-        }
+        return try await mutateMerge(context, kind: aborting ? .abort : .resume, commitMessage: commitMessage)
     }
 
     private enum MergeKind { case apply(GitWorktreeMergePreview), resume, abort }

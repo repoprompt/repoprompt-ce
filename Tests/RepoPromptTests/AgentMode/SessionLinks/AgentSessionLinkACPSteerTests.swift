@@ -380,7 +380,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
 
         XCTAssertEqual(fixture.session.runState, .running)
         await fixture.viewModel.cancelAgentRun(tabID: fixture.session.tabID)
-        let restored = fixture.viewModel.retrieveDraftText(for: fixture.session.tabID)
+        let restored = fixture.viewModel.draftRuntime.text(for: fixture.session.tabID)
         XCTAssertEqual(restored, "local draft")
         XCTAssertFalse(restored.contains("managed direction"))
         XCTAssertFalse(restored.contains("local provider text"))
@@ -389,7 +389,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
 
     func testCompletedACPFallbackStopRestoresOnlyScheduledLocalDraft() async throws {
         let fixture = try await makeFixture()
-        await fixture.viewModel.test_publishNaturalCompletion(fixture.session)
+        await fixture.viewModel.runService.test_publishNaturalCompletion(fixture.session)
         let terminalRevision = try XCTUnwrap(fixture.session.lastTerminalCommitRevision)
         XCTAssertEqual(fixture.session.runState, .completed)
         XCTAssertTrue(fixture.session.acpController === fixture.controller)
@@ -461,7 +461,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         XCTAssertTrue(fixture.provider.promptedMessages.isEmpty)
         XCTAssertEqual(fixture.session.lastTerminalCommitRevision, terminalRevision)
         XCTAssertEqual(fixture.session.runState, .completed)
-        let draft = fixture.viewModel.retrieveDraftText(for: fixture.session.tabID)
+        let draft = fixture.viewModel.draftRuntime.text(for: fixture.session.tabID)
         XCTAssertTrue(draft.contains("typed local draft"))
         XCTAssertFalse(draft.contains(message.message))
         XCTAssertFalse(draft.contains(envelope))
@@ -469,7 +469,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
 
     func testWindowCloseJoinsGatedFollowUpWithoutLaunchingAfterRetirement() async throws {
         let fixture = try await makeFixture()
-        await fixture.viewModel.test_publishNaturalCompletion(fixture.session)
+        await fixture.viewModel.runService.test_publishNaturalCompletion(fixture.session)
         let entered = AgentSessionLinkStopSignal<Void>()
         let release = AgentSessionLinkStopSignal<Void>()
         let finished = AgentSessionLinkStopSignal<Void>()
@@ -507,7 +507,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         XCTAssertTrue(fixture.provider.promptedMessages.isEmpty)
         XCTAssertNil(fixture.session.scheduledACPFollowUp)
         XCTAssertFalse(fixture.session.mcpFollowUpRunPending)
-        let draft = fixture.viewModel.retrieveDraftText(for: fixture.session.tabID)
+        let draft = fixture.viewModel.draftRuntime.text(for: fixture.session.tabID)
         XCTAssertTrue(draft.contains("typed local draft"))
         XCTAssertFalse(draft.contains("managed scheduled direction"))
     }
@@ -536,7 +536,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
             fixture.viewModel.test_didFinishScheduledACPFollowUpStart = nil
         }
 
-        await fixture.viewModel.test_publishNaturalCompletion(fixture.session, supportsFollowUp: true)
+        await fixture.viewModel.runService.test_publishNaturalCompletion(fixture.session, supportsFollowUp: true)
         await entered.value()
         let terminalRevision = try XCTUnwrap(fixture.session.lastTerminalCommitRevision)
         XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
@@ -548,7 +548,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         XCTAssertTrue(fixture.provider.promptedMessages.isEmpty)
         XCTAssertEqual(fixture.session.lastTerminalCommitRevision, terminalRevision)
         XCTAssertEqual(fixture.session.runState, .completed)
-        let draft = fixture.viewModel.retrieveDraftText(for: fixture.session.tabID)
+        let draft = fixture.viewModel.draftRuntime.text(for: fixture.session.tabID)
         XCTAssertTrue(draft.contains("typed local draft"))
         XCTAssertFalse(draft.contains("local provider text"))
         XCTAssertFalse(draft.contains("managed scheduled direction"))
@@ -557,7 +557,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
     func testViewModelCompletedFallbackStopRestoresTypedLocalDraft() async throws {
         let fixture = try await makeFixture()
         let (batch, sink) = mixedSteeringBatch(fixture)
-        await fixture.viewModel.test_publishNaturalCompletion(fixture.session)
+        await fixture.viewModel.runService.test_publishNaturalCompletion(fixture.session)
         let terminalRevision = try XCTUnwrap(fixture.session.lastTerminalCommitRevision)
         XCTAssertEqual(fixture.session.runState, .completed)
         fixture.session.pendingACPSteeringInstructions.append(contentsOf: batch)
@@ -595,7 +595,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         XCTAssertEqual(fixture.session.runState, .completed)
         XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
         XCTAssertTrue(fixture.session.pendingACPSteeringInstructions.isEmpty)
-        let draft = fixture.viewModel.retrieveDraftText(for: fixture.session.tabID)
+        let draft = fixture.viewModel.draftRuntime.text(for: fixture.session.tabID)
         XCTAssertTrue(draft.contains("typed local draft"))
         XCTAssertFalse(draft.contains("local provider text"))
         XCTAssertFalse(draft.contains("managed scheduled direction"))
@@ -603,7 +603,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
 
     func testFailedSuccessorStartLeavesRemainingSiblingWithdrawableByStop() async throws {
         let fixture = try await makeFixture()
-        await fixture.viewModel.test_publishNaturalCompletion(fixture.session)
+        await fixture.viewModel.runService.test_publishNaturalCompletion(fixture.session)
         let originalFence = AgentRunStartStopFence(session: fixture.session)
         let batch = (1 ... 3).map { index in
             AgentModeViewModel.TabSession.ACPSteeringInstruction(
@@ -648,13 +648,13 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         ])
         XCTAssertTrue(fixture.session.pendingInstructions.allSatisfy { $0.stopFence == originalFence })
 
-        await fixture.viewModel.test_publishNaturalCompletion(fixture.session, supportsFollowUp: true)
+        await fixture.viewModel.runService.test_publishNaturalCompletion(fixture.session, supportsFollowUp: true)
         await secondFinished.value()
         XCTAssertNil(fixture.session.scheduledACPFollowUp)
         XCTAssertFalse(fixture.session.mcpFollowUpRunPending)
         XCTAssertEqual(fixture.session.pendingInstructions.map(\.providerText), ["pre-Stop payload 3"])
-        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.session.tabID), "typed draft 2")
-        let snapshot = AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
+        XCTAssertEqual(fixture.viewModel.draftRuntime.text(for: fixture.session.tabID), "typed draft 2")
+        let snapshot = AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
             session: fixture.session, endpointMatchesGrant: true, isClosing: false
         )
         XCTAssertEqual(AgentSessionLinkStopAdmission.classify(snapshot), .pendingStart)
@@ -671,7 +671,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         guard case let .settled(receipt) = stop else { return XCTFail("Expected Stop receipt") }
         XCTAssertEqual(receipt.result, .stopped)
         XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
-        let recovered = fixture.viewModel.retrieveDraftText(for: fixture.session.tabID)
+        let recovered = fixture.viewModel.draftRuntime.text(for: fixture.session.tabID)
         XCTAssertEqual(recovered.components(separatedBy: "\n"), ["typed draft 3", "typed draft 2"])
 
         fixture.session.selectedAgent = .openCode
@@ -681,12 +681,12 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         XCTAssertTrue(prompted.contains("fresh run after Stop"))
         XCTAssertFalse(prompted.contains("pre-Stop payload 2"))
         XCTAssertFalse(prompted.contains("pre-Stop payload 3"))
-        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.session.tabID), recovered)
+        XCTAssertEqual(fixture.viewModel.draftRuntime.text(for: fixture.session.tabID), recovered)
     }
 
     func testFailedScheduledACPStartWithdrawsAllFallbacksBeforeStop() async throws {
         let fixture = try await makeFixture()
-        await fixture.viewModel.test_publishNaturalCompletion(fixture.session)
+        await fixture.viewModel.runService.test_publishNaturalCompletion(fixture.session)
         let terminalRevision = try XCTUnwrap(fixture.session.lastTerminalCommitRevision)
         let (mixed, sink) = mixedSteeringBatch(fixture, localDraft: "first typed draft")
         let secondLocal = AgentModeViewModel.TabSession.ACPSteeringInstruction(
@@ -728,7 +728,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         XCTAssertFalse(fixture.session.mcpFollowUpRunPending)
         XCTAssertEqual(fixture.session.lastTerminalCommitRevision, terminalRevision)
         XCTAssertTrue(fixture.provider.promptedMessages.isEmpty)
-        let recovered = fixture.viewModel.retrieveDraftText(for: fixture.session.tabID)
+        let recovered = fixture.viewModel.draftRuntime.text(for: fixture.session.tabID)
         XCTAssertEqual(recovered, "first typed draft\nsecond typed draft")
         XCTAssertFalse(recovered.contains("managed scheduled direction"))
 
@@ -745,7 +745,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         )
         guard case let .settled(receipt) = stop else { return XCTFail("Expected Stop receipt") }
         XCTAssertEqual(receipt.result, .notRunning)
-        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.session.tabID), recovered)
+        XCTAssertEqual(fixture.viewModel.draftRuntime.text(for: fixture.session.tabID), recovered)
         fixture.session.selectedAgent = .openCode
         await fixture.viewModel.startAgentRun(tabID: fixture.session.tabID, initialMessage: "fresh run after Stop")
         await fixture.session.agentTask?.value
@@ -809,7 +809,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
             [local, managed], session: fixture.session, stopFence: oldFence
         )
         guard case .notAccepted = sink.outcome else { return XCTFail("managed steer must be refused") }
-        let draft = fixture.viewModel.retrieveDraftText(for: fixture.session.tabID)
+        let draft = fixture.viewModel.draftRuntime.text(for: fixture.session.tabID)
         XCTAssertTrue(draft.contains("local direction"))
         XCTAssertFalse(draft.contains("managed direction"))
         XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
@@ -838,7 +838,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         let outcome = await steering.value
         guard case .blocked = outcome else { return XCTFail("stale steer must not be delivered") }
         XCTAssertEqual(fixture.session.pendingNonCodexUserInputTokenQueue, [222])
-        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.session.tabID), "replacement draft")
+        XCTAssertEqual(fixture.viewModel.draftRuntime.text(for: fixture.session.tabID), "replacement draft")
         XCTAssertTrue(
             fixture.session.items.contains(where: { $0.text == message.message }),
             "a stale flush must not remove a row from the rebound session"
@@ -881,7 +881,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
 
     func testComposerAcceptanceAdvancesGenerationButManagedInputDoesNot() async throws {
         let fixture = try await makeFixture()
-        let endpoint = try XCTUnwrap(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.session.tabID))
+        let endpoint = try XCTUnwrap(fixture.viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: fixture.session.tabID))
         let bridge = AgentSessionLinkRuntimeBridge.shared
         // This suite builds a synthetic window. Publish its live endpoint to the shared bridge
         // so ordinary stale-endpoint sweeps cannot retire the generation during provider awaits.
@@ -908,7 +908,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
 
     func testDeferredMCPInputDoesNotBecomeLocalAfterItsDispatchScopeEnds() async throws {
         let fixture = try await makeFixture()
-        let endpoint = try XCTUnwrap(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.session.tabID))
+        let endpoint = try XCTUnwrap(fixture.viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: fixture.session.tabID))
         let bridge = AgentSessionLinkRuntimeBridge.shared
         // This suite builds a synthetic window. Publish its live endpoint to the shared bridge
         // so ordinary stale-endpoint sweeps cannot retire the generation during provider awaits.
@@ -997,10 +997,10 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
             entered.fulfill()
             await release.value()
         }
-        fixture.viewModel.test_setBeforeCancellationCommit { _ in withdrawn.fulfill() }
+        fixture.viewModel.runService.testBeforeCancellationCommit = { _ in withdrawn.fulfill() }
         defer {
             fixture.viewModel.test_beforeACPToolIdleWait = nil
-            fixture.viewModel.test_setBeforeCancellationCommit(nil)
+            fixture.viewModel.runService.testBeforeCancellationCommit = nil
         }
         let first = localSteeringInstruction(fixture, draft: "first local draft")
         fixture.viewModel.storeDraftText(for: fixture.session.tabID, "still typing")
@@ -1020,15 +1020,15 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         await fulfillment(of: [withdrawn], timeout: 5)
         release.finish(())
         await stop.value
-        fixture.viewModel.test_setBeforeCancellationCommit(nil)
+        fixture.viewModel.runService.testBeforeCancellationCommit = nil
         let outcome = await steering.value
         XCTAssertEqual(outcome, .blocked(.steerNotAccepted))
-        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.session.tabID), "first local draft\nsecond local draft\nstill typing")
+        XCTAssertEqual(fixture.viewModel.draftRuntime.text(for: fixture.session.tabID), "first local draft\nsecond local draft\nstill typing")
         XCTAssertTrue(fixture.session.pendingACPSteeringInstructions.isEmpty)
         XCTAssertTrue(fixture.session.pendingNonCodexUserInputTokenQueue.isEmpty)
         XCTAssertTrue(fixture.provider.promptedMessages.isEmpty)
         await fixture.viewModel.cancelAgentRun(tabID: fixture.session.tabID)
-        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.session.tabID), "first local draft\nsecond local draft\nstill typing")
+        XCTAssertEqual(fixture.viewModel.draftRuntime.text(for: fixture.session.tabID), "first local draft\nsecond local draft\nstill typing")
     }
 
     func testUserStopRestoresDequeuedLocalACPTextWithoutManagedEnvelope() async throws {
@@ -1041,10 +1041,10 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
             entered.fulfill()
             await release.value()
         }
-        fixture.viewModel.test_setBeforeCancellationCommit { _ in withdrawn.fulfill() }
+        fixture.viewModel.runService.testBeforeCancellationCommit = { _ in withdrawn.fulfill() }
         defer {
             fixture.viewModel.test_afterProviderInputAugmentation = nil
-            fixture.viewModel.test_setBeforeCancellationCommit(nil)
+            fixture.viewModel.runService.testBeforeCancellationCommit = nil
         }
         let local = localSteeringInstruction(fixture, draft: "typed local draft")
         fixture.session.pendingACPSteeringInstructions = [local]
@@ -1058,7 +1058,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         await stop.value
         let outcome = await steering.value
         XCTAssertEqual(outcome, .blocked(.steerNotAccepted))
-        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.session.tabID), "typed local draft")
+        XCTAssertEqual(fixture.viewModel.draftRuntime.text(for: fixture.session.tabID), "typed local draft")
         XCTAssertTrue(fixture.session.pendingNonCodexUserInputTokenQueue.isEmpty)
         XCTAssertTrue(fixture.provider.promptedMessages.isEmpty)
     }
@@ -1077,7 +1077,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         await fixture.viewModel.cancelAgentRun(tabID: fixture.session.tabID, completion: .terminalTeardownCompleted)
         let outcome = await steering.value
         XCTAssertEqual(outcome, .blocked(.steerUnconfirmed))
-        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.session.tabID), "still typing")
+        XCTAssertEqual(fixture.viewModel.draftRuntime.text(for: fixture.session.tabID), "still typing")
         XCTAssertTrue(fixture.session.items.contains { $0.id == local.optimisticUserItemID })
         XCTAssertTrue(fixture.session.items.contains { $0.id == managedRow.id })
         XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
@@ -1167,7 +1167,7 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         XCTAssertFalse(fixture.session.pendingHandoff.isStagedForSend)
         XCTAssertTrue(fixture.session.pendingHandoff.hasPayload)
         XCTAssertTrue(fixture.provider.promptedMessages.isEmpty)
-        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.session.tabID), "local discovery draft")
+        XCTAssertEqual(fixture.viewModel.draftRuntime.text(for: fixture.session.tabID), "local discovery draft")
     }
 
     func testInterruptedAttributedReplayUsesExactStoredProviderBytes() async throws {

@@ -25,6 +25,21 @@ struct SessionAdminHandlerContext {
         )
     }
 
+    /// The identical initial batch-loop check used by link, unlink, reparent and worktree handlers.
+    /// This is not write-time authorization; callers retain their later operation-specific checks.
+    func appendRevocationIfNeeded(
+        _ lease: DomainDelegationScopeLease,
+        authorityLost: inout Bool,
+        items: inout [SessionAdminItemResult]
+    ) -> Bool {
+        guard !authorityLost, scopes.isCurrent(lease) else {
+            authorityLost = true
+            items.append(.revoked(lease.targetSessionID))
+            return true
+        }
+        return false
+    }
+
     /// The caller's scope and every ancestor scope.
     func scopeChain(of scope: DomainDelegationScopeRecord) -> [DomainDelegationScopeRecord] {
         scopes.scopeChain(from: scope.id)

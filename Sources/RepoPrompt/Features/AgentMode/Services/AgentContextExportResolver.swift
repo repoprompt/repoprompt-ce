@@ -570,77 +570,12 @@ enum AgentContextExportResolver {
                 phaseDidBeginForTesting: phaseDidBeginForTesting
             )
         }
-        let coordinator = presentationCoordinator ?? WorkspaceCodemapPresentationCoordinator(store: store)
-        do {
-            try await presentationWillBeginForTesting?()
-            return try await coordinator.withPresentation(
-                prepareAttempt: {
-                    let attempt = await modelPresentationAttempt(
-                        source: source,
-                        store: store,
-                        codeMapUsage: codeMapUsage
-                    )
-                    return WorkspaceCodemapPresentationAttempt(
-                        context: attempt,
-                        intent: attempt.authority.presentationPlan.intent,
-                        rootScope: attempt.authority.rootScope,
-                        logicalRootDisplayNamesByRootID: attempt.authority.logicalRootDisplayNamesByRootID,
-                        requestedCodemapCount: requestedCodemapCount(
-                            for: attempt.authority.presentationPlan.intent,
-                            codeMapUsage: codeMapUsage
-                        )
-                    )
-                }
-            ) { attempt, presentation in
-                let presentation = merging(
-                    presentation,
-                    preflightIssues: attempt.authority.presentationPlan.preflightIssues
-                )
-                let resolution = await validatedSelectedFallbackResolution(
-                    attempt.resolution,
-                    presentation: presentation,
-                    store: store,
-                    codeMapUsage: codeMapUsage
-                )
-                try checkCancellation()
-                phaseDidBeginForTesting?(.codemapFileRecords)
-                let codemapFilesByID = await codemapFileRecordsByID(
-                    for: presentation,
-                    resolution: resolution,
-                    roots: attempt.authority.roots,
-                    store: store,
-                    codeMapUsage: codeMapUsage
-                )
-                return try await makeModel(
-                    source: source,
-                    lookupContext: attempt.authority.lookupContext,
-                    resolution: resolution,
-                    roots: attempt.authority.roots,
-                    codemapFilesByID: codemapFilesByID,
-                    store: store,
-                    filePathDisplay: filePathDisplay,
-                    codeMapUsage: codeMapUsage,
-                    codemapPresentation: presentation,
-                    logicalRootDisplayNamesByRootID: attempt.authority.logicalRootDisplayNamesByRootID,
-                    entryMetricsSnapshot: entryMetricsSnapshot,
-                    phaseDidBeginForTesting: phaseDidBeginForTesting
-                )
-            }
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            let issue: WorkspaceCodemapOperationIssue = if Task.isCancelled || error is CancellationError {
-                .cancelled
-            } else {
-                .coordinationUnavailable
-            }
-            let attempt = await modelPresentationAttempt(
-                source: source,
-                store: store,
-                codeMapUsage: codeMapUsage
-            )
+        @Sendable func model(
+            for attempt: ModelPresentationAttempt,
+            presentation: WorkspaceCodemapOperationPresentation
+        ) async throws -> AgentContextExportModel {
             let presentation = merging(
-                unavailablePresentation(issue),
+                presentation,
                 preflightIssues: attempt.authority.presentationPlan.preflightIssues
             )
             let resolution = await validatedSelectedFallbackResolution(
@@ -672,6 +607,45 @@ enum AgentContextExportResolver {
                 entryMetricsSnapshot: entryMetricsSnapshot,
                 phaseDidBeginForTesting: phaseDidBeginForTesting
             )
+        }
+        let coordinator = presentationCoordinator ?? WorkspaceCodemapPresentationCoordinator(store: store)
+        do {
+            try await presentationWillBeginForTesting?()
+            return try await coordinator.withPresentation(
+                prepareAttempt: {
+                    let attempt = await modelPresentationAttempt(
+                        source: source,
+                        store: store,
+                        codeMapUsage: codeMapUsage
+                    )
+                    return WorkspaceCodemapPresentationAttempt(
+                        context: attempt,
+                        intent: attempt.authority.presentationPlan.intent,
+                        rootScope: attempt.authority.rootScope,
+                        logicalRootDisplayNamesByRootID: attempt.authority.logicalRootDisplayNamesByRootID,
+                        requestedCodemapCount: requestedCodemapCount(
+                            for: attempt.authority.presentationPlan.intent,
+                            codeMapUsage: codeMapUsage
+                        )
+                    )
+                }
+            ) { attempt, presentation in
+                try await model(for: attempt, presentation: presentation)
+            }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            let issue: WorkspaceCodemapOperationIssue = if Task.isCancelled || error is CancellationError {
+                .cancelled
+            } else {
+                .coordinationUnavailable
+            }
+            let attempt = await modelPresentationAttempt(
+                source: source,
+                store: store,
+                codeMapUsage: codeMapUsage
+            )
+            return try await model(for: attempt, presentation: unavailablePresentation(issue))
         }
     }
 
@@ -1080,36 +1054,7 @@ enum AgentContextExportResolver {
         var seenPhysicalPaths = Set<String>()
         try checkCancellation()
 
-        let selectedPaths = source.selection.selectedPaths
-        for path in selectedPaths {
-            try checkCancellation()
-            let translatedPath = lookupContext.translateInputPath(path)
-            var requiresStoreFallback = false
-            guard let row = metadataOnlyRow(
-                originalPath: path,
-                translatedPath: translatedPath,
-                lineRanges: sliceRanges(forOriginalPath: path, translatedPath: translatedPath, selection: source.selection),
-                projection: projection,
-                filePathDisplay: filePathDisplay,
-                missingPaths: &missingPaths,
-                invalidPaths: &invalidPaths,
-                requiresStoreFallback: &requiresStoreFallback
-            ) else {
-                if requiresStoreFallback || metadataOnlyPathRequiresStoreFallback(translatedPath, projection: projection) {
-                    return nil
-                }
-                continue
-            }
-            guard let location = row.resolvedContentLocation,
-                  seenPhysicalPaths.insert(location.resolvedFileURL.path).inserted
-            else { continue }
-            rows.append(row)
-            try checkCancellation()
-        }
-
-        for (path, ranges) in source.selection.slices where !ranges.isEmpty && !selectedPaths.contains(where: { normalizedSelectionKey($0) == normalizedSelectionKey(path) }) {
-            try checkCancellation()
-            let translatedPath = lookupContext.translateInputPath(path)
+        func appendMetadataRow(path: String, translatedPath: String, ranges: [LineRange]?) throws -> Bool {
             var requiresStoreFallback = false
             guard let row = metadataOnlyRow(
                 originalPath: path,
@@ -1122,15 +1067,32 @@ enum AgentContextExportResolver {
                 requiresStoreFallback: &requiresStoreFallback
             ) else {
                 if requiresStoreFallback || metadataOnlyPathRequiresStoreFallback(translatedPath, projection: projection) {
-                    return nil
+                    return false
                 }
-                continue
+                return true
             }
             guard let location = row.resolvedContentLocation,
                   seenPhysicalPaths.insert(location.resolvedFileURL.path).inserted
-            else { continue }
+            else { return true }
             rows.append(row)
             try checkCancellation()
+            return true
+        }
+
+        let selectedPaths = source.selection.selectedPaths
+        for path in selectedPaths {
+            try checkCancellation()
+            let translatedPath = lookupContext.translateInputPath(path)
+            guard try appendMetadataRow(
+                path: path, translatedPath: translatedPath,
+                ranges: sliceRanges(forOriginalPath: path, translatedPath: translatedPath, selection: source.selection)
+            ) else { return nil }
+        }
+
+        for (path, ranges) in source.selection.slices where !ranges.isEmpty && !selectedPaths.contains(where: { normalizedSelectionKey($0) == normalizedSelectionKey(path) }) {
+            try checkCancellation()
+            let translatedPath = lookupContext.translateInputPath(path)
+            guard try appendMetadataRow(path: path, translatedPath: translatedPath, ranges: ranges) else { return nil }
         }
 
         let directMetricsSnapshot: PromptContextEntryMetricsSnapshot
@@ -1807,35 +1769,20 @@ enum AgentContextExportResolver {
             }
 
             if let file = result.file {
-                selectedFileIDs.insert(file.id)
-                let ranges = sliceRangesByFileID[file.id]
-                let entry = ResolvedPromptFileEntry(
-                    file: file,
-                    lineRanges: ranges,
-                    mode: (ranges?.isEmpty == false) ? .sliced : .fullFile,
-                    loadedContent: nil,
-                    rootFolderPath: result.location.rootPath
+                appendSelectedFile(
+                    file, rootPath: result.location.rootPath, ranges: sliceRangesByFileID[file.id],
+                    directlySelected: true, selectedFileIDs: &selectedFileIDs,
+                    rows: &rows, seenAccountingIdentities: &seenAccountingIdentities
                 )
-                append(entry, canRemove: true, to: &rows, seenAccountingIdentities: &seenAccountingIdentities)
             } else if let folder = result.folder {
                 let files = await store.files(inRoot: folder.rootID)
                 let prefix = folder.standardizedRelativePath
                 for file in files where prefix.isEmpty || file.standardizedRelativePath == prefix || file.standardizedRelativePath.hasPrefix(prefix + "/") {
                     guard !directlySelectedFileIDs.contains(file.id) else { continue }
-                    selectedFileIDs.insert(file.id)
-                    let ranges = sliceRangesByFileID[file.id]
-                    let entry = ResolvedPromptFileEntry(
-                        file: file,
-                        lineRanges: ranges,
-                        mode: (ranges?.isEmpty == false) ? .sliced : .fullFile,
-                        loadedContent: nil,
-                        rootFolderPath: result.location.rootPath
-                    )
-                    append(
-                        entry,
-                        canRemove: ranges?.isEmpty == false,
-                        to: &rows,
-                        seenAccountingIdentities: &seenAccountingIdentities
+                    appendSelectedFile(
+                        file, rootPath: result.location.rootPath, ranges: sliceRangesByFileID[file.id],
+                        directlySelected: false, selectedFileIDs: &selectedFileIDs,
+                        rows: &rows, seenAccountingIdentities: &seenAccountingIdentities
                     )
                 }
             } else {
@@ -1999,6 +1946,23 @@ enum AgentContextExportResolver {
         return lhs.id.fileID.uuidString < rhs.id.fileID.uuidString
     }
 
+    private static func appendSelectedFile(
+        _ file: WorkspaceFileRecord, rootPath: String, ranges: [LineRange]?,
+        directlySelected: Bool, selectedFileIDs: inout Set<UUID>,
+        rows: inout [RowResolutionEntry], seenAccountingIdentities: inout PromptContextAccountingIdentitySet
+    ) {
+        selectedFileIDs.insert(file.id)
+        let entry = ResolvedPromptFileEntry(
+            file: file, lineRanges: ranges,
+            mode: (ranges?.isEmpty == false) ? .sliced : .fullFile,
+            loadedContent: nil, rootFolderPath: rootPath
+        )
+        append(
+            entry, canRemove: directlySelected || ranges?.isEmpty == false,
+            to: &rows, seenAccountingIdentities: &seenAccountingIdentities
+        )
+    }
+
     private static func appendDirectoryRows(
         for path: String,
         store: WorkspaceFileContextStore,
@@ -2020,20 +1984,10 @@ enum AgentContextExportResolver {
             let files = await store.files(inRoot: root.id)
             for file in files where relativePrefix.isEmpty || file.standardizedRelativePath.hasPrefix(relativePrefix + "/") {
                 guard !directlySelectedFileIDs.contains(file.id) else { continue }
-                selectedFileIDs.insert(file.id)
-                let ranges = sliceRangesByFileID[file.id]
-                let entry = ResolvedPromptFileEntry(
-                    file: file,
-                    lineRanges: ranges,
-                    mode: (ranges?.isEmpty == false) ? .sliced : .fullFile,
-                    loadedContent: nil,
-                    rootFolderPath: root.standardizedFullPath
-                )
-                append(
-                    entry,
-                    canRemove: ranges?.isEmpty == false,
-                    to: &rows,
-                    seenAccountingIdentities: &seenAccountingIdentities
+                appendSelectedFile(
+                    file, rootPath: root.standardizedFullPath, ranges: sliceRangesByFileID[file.id],
+                    directlySelected: false, selectedFileIDs: &selectedFileIDs,
+                    rows: &rows, seenAccountingIdentities: &seenAccountingIdentities
                 )
             }
         }

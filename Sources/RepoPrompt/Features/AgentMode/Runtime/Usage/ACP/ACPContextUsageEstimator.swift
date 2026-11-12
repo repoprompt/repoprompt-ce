@@ -46,26 +46,6 @@ final class ACPContextUsageEstimator: ContextUsageEstimating {
             && session.contextUsageSnapshot?.used != nil
     }
 
-    @discardableResult
-    func enqueueUserTurnEstimate(
-        messageForProvider _: String,
-        session _: AgentTabSession
-    ) -> Int {
-        0
-    }
-
-    @discardableResult
-    func replaceNextQueuedUserTurnEstimate(
-        messageForProvider _: String,
-        session _: AgentTabSession
-    ) -> Int? {
-        nil
-    }
-
-    func dequeueQueuedUserTurnEstimate(session _: AgentTabSession) -> Int? {
-        nil
-    }
-
     func beginTurn(session: AgentTabSession, initialMessage _: String) {
         session.acpOccupancyReportThisTurn = nil
     }
@@ -241,24 +221,5 @@ final class ACPContextUsageEstimator: ContextUsageEstimating {
             return nil
         }
         return normalized
-    }
-
-    private func updateSnapshot(
-        from usage: AgentContextUsage?,
-        source: ContextUsageSnapshotSource,
-        confidence: ContextUsageSnapshotConfidence,
-        session: AgentTabSession
-    ) -> ContextUsageSnapshot? {
-        let next = ContextUsageSnapshot.fromAgentContextUsage(
-            usage,
-            source: source,
-            confidence: confidence,
-            compactedAt: session.contextCompactedAt
-        )
-        if session.contextUsageSnapshot != next {
-            session.contextUsageSnapshot = next
-            return next
-        }
-        return nil
     }
 }

@@ -864,7 +864,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         XCTAssertTrue(writer.isCurrent, "Refusing commands cannot revoke the originating final-write capability")
 
         fixture.session.isDirty = true
-        let save = await fixture.viewModel.flushSaveRequired(for: fixture.tabID, workspaceID: endpoint.workspaceID)
+        let save = await fixture.viewModel.persistenceRuntime.flushSaveRequired(for: fixture.tabID, workspaceID: endpoint.workspaceID)
         guard case .success = save else { return XCTFail("Retiring writer must still acknowledge its final save") }
         XCTAssertFalse(fixture.session.isDirty)
         XCTAssertTrue(fixture.events.contains(.save))

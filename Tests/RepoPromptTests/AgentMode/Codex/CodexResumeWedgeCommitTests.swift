@@ -88,7 +88,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         }
         // These fixtures dispatch directly to the native coordinator, so compose the same
         // terminal owner that the production command entrypoints install before dispatch.
-        viewModel.ensureRunServiceMaterializedForRunStart()
+        _ = viewModel.runService
         return Fixture(
             viewModel: viewModel,
             workspaceManager: workspaceManager,
@@ -408,7 +408,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         }
         // Host composition installs terminal ownership before dispatch; native execution
         // must not depend on an attached presentation to bootstrap, compact or send.
-        fixture.viewModel.ensureRunServiceMaterializedForRunStart()
+        _ = fixture.viewModel.runService
         fixture.coordinator.attachPresentation(nil)
         let failedStart = Task { await fixture.coordinator.ensureCodexNativeSession(session: fixture.session) }
         addTeardownBlock {
@@ -930,7 +930,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         }
         await vm.toggleComputerUse(tabID: session.tabID, expectedSessionIdentity: ObjectIdentifier(session))
         let request = computerUseRemoteRequest("inspect the screen")
-        let outcome = await vm.agentSessionLinkPerformSend(
+        let outcome = await vm.linkExecutionRuntime.agentSessionLinkPerformSend(
             to: candidate, request: request,
             liveness: { .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false) },
             commitAuthorization: { .committed }
@@ -2080,7 +2080,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             saved = agentSession
             return FileManager.default.temporaryDirectory.appendingPathComponent("codex-wedge-\(UUID().uuidString).json")
         }
-        await fixture.viewModel.flushSave(for: fixture.session.tabID)
+        await fixture.viewModel.persistenceRuntime.flushSave(for: fixture.session.tabID)
         XCTAssertEqual(saved?.codexConversationID, Self.oldThreadID)
         XCTAssertEqual(saved?.codexRolloutPath, Self.oldRolloutPath)
         XCTAssertEqual(saved?.providerCleanupHandle?.conversationID, Self.oldThreadID)

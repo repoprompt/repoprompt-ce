@@ -3288,7 +3288,7 @@ extension MCPServerViewModel {
         }
         let agentModeVM = targetWindow.agentModeViewModel
         guard let sessionID = agentModeVM.mcpSpawnParentSessionID(sourceTabID: sourceTabID),
-              let endpoint = agentModeVM.agentSessionLinkObserverEndpoint(tabID: sourceTabID),
+              let endpoint = agentModeVM.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: sourceTabID),
               endpoint.sessionID == sessionID
         else {
             return nil

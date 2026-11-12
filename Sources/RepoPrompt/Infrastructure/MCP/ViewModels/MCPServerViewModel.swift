@@ -3610,7 +3610,7 @@ final class MCPServerViewModel: ObservableObject {
         let waitCallOrigin: DomainAgentSessionLinkWaitInput? = if name == MCPWindowToolName.agentSessionLink,
                                                                   let context = resolvedContext?.snapshot,
                                                                   let window = try? requireTargetWindow(),
-                                                                  let endpoint = window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: context.tabID)
+                                                                  let endpoint = window.agentModeViewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: context.tabID)
         {
             AgentSessionLinkRuntimeBridge.shared.captureWaitInput(for: endpoint)
         } else {
@@ -3633,7 +3633,7 @@ final class MCPServerViewModel: ObservableObject {
             let runID = context.runID,
             indexedRunID == runID,
             let window = try? requireTargetWindow(),
-            let endpoint = window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: context.tabID),
+            let endpoint = window.agentModeViewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: context.tabID),
             let session = window.agentModeViewModel.sessions[context.tabID],
             session.runID == runID,
             let ownership = session.activeRunOwnership

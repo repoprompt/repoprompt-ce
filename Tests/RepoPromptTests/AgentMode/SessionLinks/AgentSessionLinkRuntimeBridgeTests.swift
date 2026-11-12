@@ -608,7 +608,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             guard promptInventoryHoldsByEndpoint[endpoint] == nil else { return }
             publishedInventoriesByEndpoint[endpoint] = inventory
             publishedPromptInventories[endpoint.sessionID] = inventory
-            promptViewModel?.agentSessionLinkPublishPromptInventory(inventory, to: endpoint)
+            promptViewModel?.linkExecutionRuntime.agentSessionLinkPublishPromptInventory(inventory, to: endpoint)
         }
 
         /// Passive queues recorded per exact endpoint, with a publication counter: a test has to be
@@ -624,7 +624,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         ) {
             passiveNoticePublicationCount += 1
             publishedPassiveNoticesByEndpoint[endpoint] = snapshot
-            promptViewModel?.agentSessionLinkPublishPassiveStatusNotices(snapshot, to: endpoint)
+            promptViewModel?.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(snapshot, to: endpoint)
         }
 
         /// Mirrors the real store's fence, because the bridge's contract is that a publication
@@ -2836,7 +2836,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(viewModel.agentSidebarLaneCreator(tabID: tabID, expectedSessionID: sessionID)?.sessionID, freshCreator)
         let secondTabID = UUID()
         let second = viewModel.session(for: secondTabID)
-        XCTAssertEqual(viewModel.test_bindingRejection(sessionID: sessionID, on: second), .conflictingWriter)
+        XCTAssertEqual(viewModel.runtimeSessionStore.bindingRejection(sessionID, on: second), .conflictingWriter)
         XCTAssertNil(viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: second, updateWorkspaceMetadata: false))
         second.createdByOverseerSessionID = indexedCreator
         // A refused second writer cannot impersonate the first row's provenance.
@@ -2864,7 +2864,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
         session.createdByOverseerSessionID = sessionID
-        let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: tabID))
+        let endpoint = try XCTUnwrap(viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID))
         let creator = makeCandidate(
             windowID: endpoint.windowID,
             sessionID: sessionID,
@@ -9531,7 +9531,7 @@ final class AgentSessionLinkTransportLocalInputFixture {
         // Explicit fixture state prevents a saved default from launching a competing fake run.
         session.oversight.autoWakeOnUpdates = false
         session.oversight.retirePeriodicScheduling()
-        let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: session.tabID))
+        let endpoint = try XCTUnwrap(viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: session.tabID))
         let fixture = AgentSessionLinkTransportLocalInputFixture(viewModel: viewModel, observer: endpoint)
         fixture.bridge.attach(host: fixture.host)
         guard case .added = await fixture.bridge.addMonitorLink(observerSessionID: endpoint.sessionID, rawTargetSessionID: fixture.target.sessionID.uuidString) else {

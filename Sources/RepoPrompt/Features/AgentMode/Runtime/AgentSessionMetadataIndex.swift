@@ -303,24 +303,13 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         )
         lastRunStateRaw = try container.decodeIfPresent(String.self, forKey: .lastRunStateRaw)
         autoEditEnabled = try container.decodeIfPresent(Bool.self, forKey: .autoEditEnabled) ?? true
-        autoWakeOnOversightUpdates = try container.decodeIfPresent(
-            Bool.self,
-            forKey: .autoWakeOnOversightUpdates
-        ) ?? false
-        agentSessionLinkAutoWakeTargetSessionIDs = try container.decodeIfPresent(
-            Set<UUID>.self,
-            forKey: .agentSessionLinkAutoWakeTargetSessionIDs
-        ) ?? []
-        routineWakeIntervalEnabled = try container.decodeIfPresent(Bool.self, forKey: .routineWakeIntervalEnabled) ?? false
-        routineWakeIntervalSeconds = try AgentSessionLinkRoutineWakeInterval.normalized(
-            container.decodeIfPresent(Int.self, forKey: .routineWakeIntervalSeconds)
-                ?? AgentSessionLinkRoutineWakeInterval.defaultSeconds
-        )
-        periodicIdleWakeEnabled = try container.decodeIfPresent(Bool.self, forKey: .periodicIdleWakeEnabled) ?? false
-        periodicIdleWakeIntervalSeconds = try AgentSessionLinkPeriodicWakeInterval.normalized(
-            container.decodeIfPresent(Int.self, forKey: .periodicIdleWakeIntervalSeconds)
-                ?? AgentSessionLinkPeriodicWakeInterval.defaultSeconds
-        )
+        let wakePreferences = try AgentSessionWakePreferences(from: decoder)
+        autoWakeOnOversightUpdates = wakePreferences.autoWakeOnOversightUpdates
+        agentSessionLinkAutoWakeTargetSessionIDs = wakePreferences.agentSessionLinkAutoWakeTargetSessionIDs
+        routineWakeIntervalEnabled = wakePreferences.routineWakeIntervalEnabled
+        routineWakeIntervalSeconds = wakePreferences.routineWakeIntervalSeconds
+        periodicIdleWakeEnabled = wakePreferences.periodicIdleWakeEnabled
+        periodicIdleWakeIntervalSeconds = wakePreferences.periodicIdleWakeIntervalSeconds
         parentSessionID = try container.decodeIfPresent(UUID.self, forKey: .parentSessionID)
         createdByOverseerSessionID = try container.decodeIfPresent(UUID.self, forKey: .createdByOverseerSessionID)
         organizationalParentID = try container.decodeIfPresent(UUID.self, forKey: .organizationalParentID)

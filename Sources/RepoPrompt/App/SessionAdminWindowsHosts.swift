@@ -874,17 +874,9 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         if !(worktree.isMain && GitRepoRootAuthorization.canonicalPath(worktree.path) == normalizedRoot) {
             desired.append(AgentSessionWorktreeBinding(
                 id: previous?.id ?? UUID().uuidString,
-                repositoryID: worktree.repository.repositoryID,
-                repoKey: worktree.repository.repoKey,
+                worktree: worktree,
                 logicalRootPath: logicalRoot.standardizedFullPath,
                 logicalRootName: logicalRoot.name,
-                worktreeID: worktree.worktreeID,
-                worktreeRootPath: worktree.path,
-                commonGitDir: worktree.repository.commonGitDir,
-                isMainWorktree: worktree.isMain,
-                worktreeName: worktree.name,
-                branch: worktree.branch,
-                head: worktree.head,
                 visualLabel: nil,
                 visualColorHex: nil,
                 boundAt: previous?.worktreeID == worktree.worktreeID ? previous?.boundAt ?? Date() : Date(),

@@ -443,7 +443,8 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
                 let attempt = session.activeRunAttemptID
                 if schedule == "managedStop" {
                     window.agentModeViewModel.linkExecutionRuntime.withdrawQueuedWorkForManagedStop(session: session)
-                    let joined = await window.agentModeViewModel.awaitOracleBackgroundDrain(for: session)
+                    let host = window.agentModeViewModel
+                    let joined = await host.runtimeSessionStore.interactions(routeID: host.windowID, approvalStore: host.applyEditsApprovalStore).awaitOracleBackgroundDrain(for: session)
                     XCTAssertTrue(joined, "Claim-time Stop survives subsequent run admission refusal")
                 } else { await window.agentModeViewModel.cancelAgentRun(tabID: session.tabID) }
                 if schedule == "idleStop" || schedule == "managedStop" { XCTAssertEqual(session.activeRunAttemptID, attempt, "Idle Oracle Stop must not manufacture a run") }
@@ -653,12 +654,12 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
         primary.finish()
         let answer = try await oracle.waitForContextBuilderCompletion(query.queryID)
         XCTAssertEqual(answer, "completed answer")
-        await viewModel.test_publishNaturalCompletion(session)
+        await viewModel.runService.test_publishNaturalCompletion(session)
         let old = try XCTUnwrap(viewModel.composerOracleBackgroundCancelTarget(tabID: session.tabID))
         session.installRunID(UUID())
         _ = session.beginRunAttempt(source: "successor after Stop capture")
         session.runState = .running
-        await viewModel.test_publishNaturalCompletion(session)
+        await viewModel.runService.test_publishNaturalCompletion(session)
         XCTAssertEqual(session.runState, .completed)
         let rejected = await viewModel.cancelOracleBackground(target: old)
         XCTAssertFalse(rejected)
@@ -813,7 +814,7 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
             let observation = viewModel.ui.composer.$props.sink { props in
                 if props.backgroundStopTarget(inputText: "") != nil { renderedIdleStop.fulfill() }
             }
-            await viewModel.test_publishNaturalCompletion(session)
+            await viewModel.runService.test_publishNaturalCompletion(session)
             await fulfillment(of: [renderedIdleStop], timeout: 3)
             observation.cancel()
             XCTAssertEqual(session.runState, .completed)

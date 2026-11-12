@@ -260,68 +260,23 @@ struct AgentPermissionCapabilitySummaryBuilder {
     }
 
     private func codexPermissionLevel(profile: AgentProviderPermissionProfile) -> CodexAgentToolPreferences.PermissionLevel {
-        switch profile {
-        case .userConfigured:
-            CodexAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
-        case .mcpSafeDefaults:
-            .autoReview
-        case let .providerOverride(.codex(level)):
-            level
-        case .providerOverride:
-            .defaultPermission
-        }
+        profile.codexPermissionLevel(loadUserConfigured: { CodexAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions) })
     }
 
     private func claudePermissionLevel(profile: AgentProviderPermissionProfile) -> ClaudeAgentToolPreferences.PermissionLevel {
-        switch profile {
-        case .userConfigured:
-            ClaudeAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
-        case .mcpSafeDefaults:
-            .requireApproval
-        case let .providerOverride(.claude(level)):
-            level
-        case .providerOverride:
-            .requireApproval
-        }
+        profile.claudePermissionLevel(loadUserConfigured: { ClaudeAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions) })
     }
 
     private func openCodePermissionLevel(profile: AgentProviderPermissionProfile) -> OpenCodeAgentToolPreferences.PermissionLevel {
-        switch profile {
-        case .userConfigured:
-            OpenCodeAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
-        case .mcpSafeDefaults:
-            .managedDefault
-        case let .providerOverride(.openCode(level)):
-            level
-        case .providerOverride:
-            .managedDefault
-        }
+        profile.openCodePermissionLevel(loadUserConfigured: { OpenCodeAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions) })
     }
 
     private func cursorPermissionLevel(profile: AgentProviderPermissionProfile) -> CursorAgentToolPreferences.PermissionLevel {
-        switch profile {
-        case .userConfigured:
-            CursorAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
-        case .mcpSafeDefaults:
-            .managedDefault
-        case let .providerOverride(.cursor(level)):
-            level
-        case .providerOverride:
-            .managedDefault
-        }
+        profile.cursorPermissionLevel(loadUserConfigured: { CursorAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions) })
     }
 
     private func grokBuildPermissionLevel(profile: AgentProviderPermissionProfile) -> GrokBuildAgentToolPreferences.PermissionLevel {
-        switch profile {
-        case .userConfigured:
-            GrokBuildAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
-        case .mcpSafeDefaults:
-            .managedDefault
-        case let .providerOverride(.grokBuild(level)):
-            level
-        case .providerOverride:
-            .managedDefault
-        }
+        profile.grokBuildPermissionLevel(loadUserConfigured: { GrokBuildAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions) })
     }
 
     private func devinPermissionLevel(profile: AgentProviderPermissionProfile) -> DevinAgentToolPreferences.PermissionLevel {
@@ -334,15 +289,6 @@ struct AgentPermissionCapabilitySummaryBuilder {
     }
 
     private func antigravityPermissionLevel(profile: AgentProviderPermissionProfile) -> AntigravityAgentToolPreferences.PermissionLevel {
-        switch profile {
-        case .userConfigured:
-            AntigravityAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
-        case .mcpSafeDefaults:
-            .autoEdit
-        case let .providerOverride(.antigravity(level)):
-            level
-        case .providerOverride:
-            .autoEdit
-        }
+        profile.antigravityPermissionLevel(loadUserConfigured: { AntigravityAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions) })
     }
 }

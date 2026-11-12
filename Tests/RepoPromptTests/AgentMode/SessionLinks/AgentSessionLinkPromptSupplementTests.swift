@@ -3421,7 +3421,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
             tabID: fixture.tabID
         )
         let runID = try XCTUnwrap(fixture.session.runID)
-        fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkPublishRunCatalogProjection(
             AgentSessionLinkRunCatalogProjection(
                 runID: runID,
                 routeToken: AgentSessionLinkRunCatalogRouteToken(
@@ -3445,7 +3445,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         revision: UInt64,
         targetCount: Int
     ) throws {
-        try fixture.viewModel.agentSessionLinkPublishPromptInventory(
+        try fixture.viewModel.linkExecutionRuntime.agentSessionLinkPublishPromptInventory(
             inventory(sessionID: fixture.sessionID, revision: revision, targetCount: targetCount),
             to: AgentSessionLinkEndpointTestSupport.endpoint(
                 fixture.viewModel,
@@ -3497,7 +3497,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
             fixture.viewModel,
             tabID: fixture.tabID
         )
-        fixture.viewModel.agentSessionLinkPublishPassiveStatusNotices(
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(
             AgentSessionLinkPassiveStatusNotices.Snapshot(
                 observerEndpoint: endpoint,
                 queueEpoch: UUID(uuidString: "0000000F-0000-0000-0000-0000000055AA")!,
@@ -3557,7 +3557,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         XCTAssertFalse(fixture.session.mcpFollowUpRunPending)
 
         // A turn the user started carries it, once.
-        let decorated = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+        let decorated = fixture.viewModel.linkExecutionRuntime.agentSessionLinkDecoratedProviderText(
             "hello",
             session: fixture.session,
             dispatchID: .claudeNativeSend(UUID())
@@ -3565,7 +3565,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         XCTAssertTrue(decorated.text.contains(AgentSessionLinkPrompts.statusChangeEnvelopeTag))
         XCTAssertTrue(decorated.text.hasPrefix("hello"), "user content still leads")
         XCTAssertNotNil(decorated.claim?.passive)
-        fixture.viewModel.acceptAgentSessionLinkPromptClaim(decorated.claim)
+        fixture.viewModel.linkExecutionRuntime.acceptAgentSessionLinkPromptClaim(decorated.claim)
 
         // Nothing the user or the run service owns moved.
         XCTAssertEqual(fixture.session.items.count, itemsBefore)
@@ -3581,7 +3581,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         // not a valid channel for status that changes between turns.
         try publishPassive(fixture, linkSetRevision: 1, queueRevision: 2, targetIndices: [0])
         let message = AgentMessage(systemPrompt: "BASE INSTRUCTIONS", userMessage: "next")
-        let claim = fixture.viewModel.agentSessionLinkPromptClaim(
+        let claim = fixture.viewModel.linkExecutionRuntime.agentSessionLinkPromptClaim(
             for: fixture.session,
             dispatchID: .headlessRun(runID: UUID())
         )
@@ -3597,7 +3597,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         try publish(fixture, revision: 2, targetCount: 1)
         try publishPassive(fixture, linkSetRevision: 1)
 
-        let decorated = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+        let decorated = fixture.viewModel.linkExecutionRuntime.agentSessionLinkDecoratedProviderText(
             "hello",
             session: fixture.session,
             dispatchID: .claudeNativeSend(UUID())
@@ -3626,7 +3626,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         )
 
         let wakeID = UUID()
-        let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+        let claim = try XCTUnwrap(fixture.viewModel.linkExecutionRuntime.agentSessionLinkPromptClaim(
             for: fixture.session,
             dispatchID: .autoWake(wakeID: wakeID)
         ))
@@ -3650,7 +3650,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
             ),
             to: endpoint
         )
-        fixture.viewModel.acceptAgentSessionLinkPromptClaim(claim)
+        fixture.viewModel.linkExecutionRuntime.acceptAgentSessionLinkPromptClaim(claim)
 
         let row = try XCTUnwrap(fixture.session.items.first { $0.id == wakeID })
         XCTAssertEqual(row.text, AgentLaneUpdateDisplayAttribution.canonicalSystemText)
@@ -3691,7 +3691,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
             to: decoyEndpoint
         )
 
-        let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+        let claim = try XCTUnwrap(fixture.viewModel.linkExecutionRuntime.agentSessionLinkPromptClaim(
             for: fixture.session,
             dispatchID: .autoWake(wakeID: UUID())
         ))
@@ -3730,7 +3730,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
             "fixture must corrupt the value stamp while retaining the correct dictionary key"
         )
 
-        let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+        let claim = try XCTUnwrap(fixture.viewModel.linkExecutionRuntime.agentSessionLinkPromptClaim(
             for: fixture.session,
             dispatchID: .autoWake(wakeID: UUID())
         ))
@@ -3795,7 +3795,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
 
         // Same tab, same session UUID, new binding generation.
         let generation = fixture.session.beginPersistentBindingTransition()
-        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        XCTAssertNil(fixture.viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
         fixture.session.finishPersistentBindingTransition(generation: generation)
         let after = try AgentSessionLinkEndpointTestSupport.endpoint(
             fixture.viewModel,
@@ -3889,7 +3889,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         )
 
         let generation = fixture.session.beginPersistentBindingTransition()
-        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        XCTAssertNil(fixture.viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
         fixture.session.finishPersistentBindingTransition(generation: generation)
         let after = try AgentSessionLinkEndpointTestSupport.endpoint(
             fixture.viewModel,
@@ -3920,7 +3920,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
             tabID: fixture.tabID
         )
         try publish(fixture, revision: 1, targetCount: 1)
-        fixture.viewModel.agentSessionLinkPublishPassiveStatusNotices(
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(
             passiveSnapshot(observerEndpoint: before, linkSetRevision: 1),
             to: before
         )
@@ -3931,7 +3931,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         )
 
         let generation = fixture.session.beginPersistentBindingTransition()
-        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        XCTAssertNil(fixture.viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
         fixture.session.finishPersistentBindingTransition(generation: generation)
         let after = try AgentSessionLinkEndpointTestSupport.endpoint(
             fixture.viewModel,
@@ -3944,7 +3944,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         XCTAssertNil(fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID])
 
         // A queue addressed to the retired incarnation cannot be filed again either.
-        fixture.viewModel.agentSessionLinkPublishPassiveStatusNotices(
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(
             passiveSnapshot(observerEndpoint: before, linkSetRevision: 1),
             to: before
         )
@@ -4021,7 +4021,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
 
     func testNoInventoryPublishedMeansNoSupplement() throws {
         let fixture = try makeFixture()
-        let decorated = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+        let decorated = fixture.viewModel.linkExecutionRuntime.agentSessionLinkDecoratedProviderText(
             "hello",
             session: fixture.session,
             dispatchID: .claudeNativeSend(UUID())
@@ -4034,15 +4034,15 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         let fixture = try makeFixture()
         try publish(fixture, revision: 1, targetCount: 1)
 
-        let first = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+        let first = fixture.viewModel.linkExecutionRuntime.agentSessionLinkDecoratedProviderText(
             "hello",
             session: fixture.session,
             dispatchID: .claudeNativeSend(UUID())
         )
         XCTAssertTrue(first.text.contains("<\(AgentSessionLinkPrompts.envelopeTag) "))
-        fixture.viewModel.acceptAgentSessionLinkPromptClaim(first.claim)
+        fixture.viewModel.linkExecutionRuntime.acceptAgentSessionLinkPromptClaim(first.claim)
 
-        let second = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+        let second = fixture.viewModel.linkExecutionRuntime.agentSessionLinkDecoratedProviderText(
             "next",
             session: fixture.session,
             dispatchID: .claudeNativeSend(UUID())
@@ -4076,28 +4076,28 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
 
         // An active inventory the observer accepted, so a later empty one reads as a closing notice.
         try publish(fixture, revision: 1, targetCount: 1)
-        let taught = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+        let taught = fixture.viewModel.linkExecutionRuntime.agentSessionLinkDecoratedProviderText(
             "hello",
             session: fixture.session,
             dispatchID: .claudeNativeSend(UUID())
         )
         XCTAssertEqual(taught.claim?.kind, .inventory, "precondition: the observer was taught a list")
-        fixture.viewModel.acceptAgentSessionLinkPromptClaim(taught.claim)
+        fixture.viewModel.linkExecutionRuntime.acceptAgentSessionLinkPromptClaim(taught.claim)
 
         // The final link is revoked and the refresh publishes the empty inventory. A *second* refresh
         // then reads this same value and suspends on its authority hop still holding it.
         let captured = inventory(sessionID: fixture.sessionID, revision: 2, targetCount: 0)
-        fixture.viewModel.agentSessionLinkPublishPromptInventory(captured, to: endpoint)
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkPublishPromptInventory(captured, to: endpoint)
 
         // The user re-adds oversight. The fence goes up immediately before the activation hop.
-        let hold = fixture.viewModel.agentSessionLinkWithholdPromptInventory(for: endpoint)
+        let hold = fixture.viewModel.linkExecutionRuntime.agentSessionLinkWithholdPromptInventory(for: endpoint)
 
         // The suspended refresh resumes and publishes what it captured, inside the fenced window.
-        fixture.viewModel.agentSessionLinkPublishPromptInventory(captured, to: endpoint)
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkPublishPromptInventory(captured, to: endpoint)
 
         // `activateLink` has committed: the grant is live and callable. A provider dispatch composes
         // its supplement here, before the activation continuation republishes.
-        let inWindow = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+        let inWindow = fixture.viewModel.linkExecutionRuntime.agentSessionLinkDecoratedProviderText(
             "next",
             session: fixture.session,
             dispatchID: .claudeNativeSend(UUID())
@@ -4110,12 +4110,12 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         )
 
         // The activation continuation releases the fence with the inventory the write itself observed.
-        fixture.viewModel.agentSessionLinkReleasePromptInventoryHold(
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkReleasePromptInventoryHold(
             hold,
             for: endpoint,
             publishing: inventory(sessionID: fixture.sessionID, revision: 3, targetCount: 1)
         )
-        let afterRelease = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+        let afterRelease = fixture.viewModel.linkExecutionRuntime.agentSessionLinkDecoratedProviderText(
             "after",
             session: fixture.session,
             dispatchID: .claudeNativeSend(UUID())
@@ -4146,51 +4146,51 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         // that renders as a terminal notice if it reaches a claim while a grant is live.
         try publish(fixture, revision: 1, targetCount: 0)
 
-        let first = fixture.viewModel.agentSessionLinkWithholdPromptInventory(for: endpoint)
-        let second = fixture.viewModel.agentSessionLinkWithholdPromptInventory(for: endpoint)
+        let first = fixture.viewModel.linkExecutionRuntime.agentSessionLinkWithholdPromptInventory(for: endpoint)
+        let second = fixture.viewModel.linkExecutionRuntime.agentSessionLinkWithholdPromptInventory(for: endpoint)
 
         // The first add is rejected. It no longer owns the fence, so it may neither restore the empty
         // inventory nor lower the fence the second add is relying on.
-        fixture.viewModel.agentSessionLinkReleasePromptInventoryHold(
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkReleasePromptInventoryHold(
             first,
             for: endpoint,
             publishing: nil
         )
         XCTAssertNil(
-            fixture.viewModel.agentSessionLinkEffectivePromptInventory(for: fixture.session),
+            fixture.viewModel.linkExecutionRuntime.agentSessionLinkEffectivePromptInventory(for: fixture.session),
             "a superseded rejection must not restore an inventory another write is still fencing"
         )
 
         // The refresh that captured the same empty value before either fence went up is still refused.
-        fixture.viewModel.agentSessionLinkPublishPromptInventory(
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkPublishPromptInventory(
             inventory(sessionID: fixture.sessionID, revision: 1, targetCount: 0),
             to: endpoint
         )
-        XCTAssertNil(fixture.viewModel.agentSessionLinkEffectivePromptInventory(for: fixture.session))
+        XCTAssertNil(fixture.viewModel.linkExecutionRuntime.agentSessionLinkEffectivePromptInventory(for: fixture.session))
 
         // The second add commits at revision 2 and lowers the fence it owns.
-        fixture.viewModel.agentSessionLinkReleasePromptInventoryHold(
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkReleasePromptInventoryHold(
             second,
             for: endpoint,
             publishing: inventory(sessionID: fixture.sessionID, revision: 2, targetCount: 1)
         )
         XCTAssertEqual(
-            fixture.viewModel.agentSessionLinkEffectivePromptInventory(for: fixture.session)?.items.count,
+            fixture.viewModel.linkExecutionRuntime.agentSessionLinkEffectivePromptInventory(for: fixture.session)?.items.count,
             1
         )
 
         // Neither a superseded release nor a stale ordinary publication landing afterwards may move
         // the endpoint back to the membership it saw.
-        fixture.viewModel.agentSessionLinkReleasePromptInventoryHold(
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkReleasePromptInventoryHold(
             first,
             for: endpoint,
             publishing: nil
         )
-        fixture.viewModel.agentSessionLinkPublishPromptInventory(
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkPublishPromptInventory(
             inventory(sessionID: fixture.sessionID, revision: 1, targetCount: 0),
             to: endpoint
         )
-        let settled = fixture.viewModel.agentSessionLinkEffectivePromptInventory(for: fixture.session)
+        let settled = fixture.viewModel.linkExecutionRuntime.agentSessionLinkEffectivePromptInventory(for: fixture.session)
         XCTAssertEqual(settled?.linkSetRevision, 2)
         XCTAssertEqual(settled?.items.count, 1, "the newest committed membership stands")
     }
@@ -4223,33 +4223,33 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         // Earlier exposure the observer accepted, so a later empty inventory reads as a closing notice
         // rather than as nothing worth saying.
         try publish(fixture, revision: 1, targetCount: 1)
-        let taught = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+        let taught = fixture.viewModel.linkExecutionRuntime.agentSessionLinkDecoratedProviderText(
             "hello",
             session: fixture.session,
             dispatchID: .claudeNativeSend(UUID())
         )
         XCTAssertEqual(taught.claim?.kind, .inventory, "precondition: the observer was taught a list")
-        fixture.viewModel.acceptAgentSessionLinkPromptClaim(taught.claim)
+        fixture.viewModel.linkExecutionRuntime.acceptAgentSessionLinkPromptClaim(taught.claim)
 
         // The last link is revoked: the published inventory is empty at revision 2, and that is the
         // value both of the overlapping writes below will have as their pre-fence baseline.
         try publish(fixture, revision: 2, targetCount: 0)
 
-        let committing = fixture.viewModel.agentSessionLinkWithholdPromptInventory(for: endpoint)
-        let rejecting = fixture.viewModel.agentSessionLinkWithholdPromptInventory(for: endpoint)
+        let committing = fixture.viewModel.linkExecutionRuntime.agentSessionLinkWithholdPromptInventory(for: endpoint)
+        let rejecting = fixture.viewModel.linkExecutionRuntime.agentSessionLinkWithholdPromptInventory(for: endpoint)
 
         // The authority commits the first write at revision 3 and then rejects the second. The
         // rejection's continuation resumes first, and it is the fence's newest participant.
-        fixture.viewModel.agentSessionLinkReleasePromptInventoryHold(
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkReleasePromptInventoryHold(
             rejecting,
             for: endpoint,
             publishing: nil
         )
         XCTAssertNil(
-            fixture.viewModel.agentSessionLinkEffectivePromptInventory(for: fixture.session),
+            fixture.viewModel.linkExecutionRuntime.agentSessionLinkEffectivePromptInventory(for: fixture.session),
             "a rejection may not restore the pre-fence inventory while a sibling is unsettled"
         )
-        let inWindow = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+        let inWindow = fixture.viewModel.linkExecutionRuntime.agentSessionLinkDecoratedProviderText(
             "next",
             session: fixture.session,
             dispatchID: .claudeNativeSend(UUID())
@@ -4262,15 +4262,15 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         )
 
         // The committing sibling settles last, so its own membership is what the fence publishes.
-        fixture.viewModel.agentSessionLinkReleasePromptInventoryHold(
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkReleasePromptInventoryHold(
             committing,
             for: endpoint,
             publishing: inventory(sessionID: fixture.sessionID, revision: 3, targetCount: 1)
         )
-        let settled = fixture.viewModel.agentSessionLinkEffectivePromptInventory(for: fixture.session)
+        let settled = fixture.viewModel.linkExecutionRuntime.agentSessionLinkEffectivePromptInventory(for: fixture.session)
         XCTAssertEqual(settled?.linkSetRevision, 3)
         XCTAssertEqual(settled?.items.count, 1, "the committed membership stands")
-        let afterRelease = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+        let afterRelease = fixture.viewModel.linkExecutionRuntime.agentSessionLinkDecoratedProviderText(
             "after",
             session: fixture.session,
             dispatchID: .claudeNativeSend(UUID())
@@ -4300,31 +4300,31 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         )
 
         try publish(fixture, revision: 1, targetCount: 1)
-        let taught = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+        let taught = fixture.viewModel.linkExecutionRuntime.agentSessionLinkDecoratedProviderText(
             "hello",
             session: fixture.session,
             dispatchID: .claudeNativeSend(UUID())
         )
         XCTAssertEqual(taught.claim?.kind, .inventory, "precondition: the observer was taught a list")
-        fixture.viewModel.acceptAgentSessionLinkPromptClaim(taught.claim)
+        fixture.viewModel.linkExecutionRuntime.acceptAgentSessionLinkPromptClaim(taught.claim)
         try publish(fixture, revision: 2, targetCount: 0)
 
-        let committing = fixture.viewModel.agentSessionLinkWithholdPromptInventory(for: endpoint)
-        let rejecting = fixture.viewModel.agentSessionLinkWithholdPromptInventory(for: endpoint)
+        let committing = fixture.viewModel.linkExecutionRuntime.agentSessionLinkWithholdPromptInventory(for: endpoint)
+        let rejecting = fixture.viewModel.linkExecutionRuntime.agentSessionLinkWithholdPromptInventory(for: endpoint)
 
         // The commit settles first. It may not publish yet — a sibling is still unsettled, and its
         // outcome is not yet known — so the endpoint stays withheld and the supplement stays owed.
-        fixture.viewModel.agentSessionLinkReleasePromptInventoryHold(
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkReleasePromptInventoryHold(
             committing,
             for: endpoint,
             publishing: inventory(sessionID: fixture.sessionID, revision: 3, targetCount: 1)
         )
         XCTAssertNil(
-            fixture.viewModel.agentSessionLinkEffectivePromptInventory(for: fixture.session),
+            fixture.viewModel.linkExecutionRuntime.agentSessionLinkEffectivePromptInventory(for: fixture.session),
             "the fence stays up until the last participant settles"
         )
         XCTAssertNil(
-            fixture.viewModel.agentSessionLinkDecoratedProviderText(
+            fixture.viewModel.linkExecutionRuntime.agentSessionLinkDecoratedProviderText(
                 "next",
                 session: fixture.session,
                 dispatchID: .claudeNativeSend(UUID())
@@ -4334,28 +4334,28 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
 
         // A third add joins while the fence is still up, after the commit was recorded. It inherits
         // that record: a writer arriving later cannot un-know a grant that already exists.
-        let joining = fixture.viewModel.agentSessionLinkWithholdPromptInventory(for: endpoint)
+        let joining = fixture.viewModel.linkExecutionRuntime.agentSessionLinkWithholdPromptInventory(for: endpoint)
 
         // Both remaining participants settle without committing. Restoring their pre-fence baseline
         // would publish the empty revision 2 over a live grant; the recorded commit is what lands.
-        fixture.viewModel.agentSessionLinkReleasePromptInventoryHold(
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkReleasePromptInventoryHold(
             rejecting,
             for: endpoint,
             publishing: nil
         )
         XCTAssertNil(
-            fixture.viewModel.agentSessionLinkEffectivePromptInventory(for: fixture.session),
+            fixture.viewModel.linkExecutionRuntime.agentSessionLinkEffectivePromptInventory(for: fixture.session),
             "the late joiner is a participant like any other"
         )
-        fixture.viewModel.agentSessionLinkReleasePromptInventoryHold(
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkReleasePromptInventoryHold(
             joining,
             for: endpoint,
             publishing: nil
         )
-        let settled = fixture.viewModel.agentSessionLinkEffectivePromptInventory(for: fixture.session)
+        let settled = fixture.viewModel.linkExecutionRuntime.agentSessionLinkEffectivePromptInventory(for: fixture.session)
         XCTAssertEqual(settled?.linkSetRevision, 3)
         XCTAssertEqual(settled?.items.count, 1, "the committed membership stands")
-        let afterRelease = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+        let afterRelease = fixture.viewModel.linkExecutionRuntime.agentSessionLinkDecoratedProviderText(
             "after",
             session: fixture.session,
             dispatchID: .claudeNativeSend(UUID())
@@ -4377,7 +4377,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         try publish(fixture, revision: 1, targetCount: 1)
 
         let ordinaryDispatchID = AgentSessionLinkPromptDispatchID.codexNativeSend(UUID())
-        let beforeReady = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+        let beforeReady = fixture.viewModel.linkExecutionRuntime.agentSessionLinkDecoratedProviderText(
             "hello",
             session: fixture.session,
             dispatchID: ordinaryDispatchID
@@ -4385,7 +4385,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         XCTAssertEqual(beforeReady.claim?.kind, .inventory)
         XCTAssertTrue(beforeReady.text.contains(AgentSessionLinkPrompts.envelopeTag))
         XCTAssertEqual(
-            fixture.viewModel.agentSessionLinkPromptClaimOutcome(
+            fixture.viewModel.linkExecutionRuntime.agentSessionLinkPromptClaimOutcome(
                 for: fixture.session,
                 dispatchID: .autoWake(wakeID: UUID())
             ),
@@ -4402,7 +4402,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         )
         try publishCatalogProjection(fixture, revision: 2, hasAgentSessionLink: true)
         XCTAssertEqual(
-            fixture.viewModel.agentSessionLinkPromptClaim(
+            fixture.viewModel.linkExecutionRuntime.agentSessionLinkPromptClaim(
                 for: fixture.session,
                 dispatchID: ordinaryDispatchID
             ), beforeReady.claim,
@@ -4410,15 +4410,15 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         )
 
         try publishCatalogProjection(fixture, revision: 5, hasAgentSessionLink: true)
-        let ready = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+        let ready = fixture.viewModel.linkExecutionRuntime.agentSessionLinkDecoratedProviderText(
             "hello",
             session: fixture.session,
             dispatchID: ordinaryDispatchID
         )
         XCTAssertEqual(ready.claim, beforeReady.claim)
         XCTAssertTrue(ready.text.contains(AgentSessionLinkPrompts.envelopeTag))
-        fixture.viewModel.acceptAgentSessionLinkPromptClaim(ready.claim)
-        let afterAcceptance = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+        fixture.viewModel.linkExecutionRuntime.acceptAgentSessionLinkPromptClaim(ready.claim)
+        let afterAcceptance = fixture.viewModel.linkExecutionRuntime.agentSessionLinkDecoratedProviderText(
             "next", session: fixture.session, dispatchID: .codexNativeSend(UUID())
         )
         XCTAssertNil(afterAcceptance.claim, "a tool refresh must not create duplicate delivery")
@@ -4438,7 +4438,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
             routingAuthorityGeneration: 1,
             connectionLifecycleGeneration: 1
         )
-        fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkPublishRunCatalogProjection(
             AgentSessionLinkRunCatalogProjection(
                 runID: oldRunID,
                 routeToken: oldRoute,
@@ -4464,7 +4464,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
             hasAgentSessionLink: true,
             hasAnyActiveLink: true
         )
-        fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(newProjection, to: endpoint)
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkPublishRunCatalogProjection(newProjection, to: endpoint)
 
         XCTAssertEqual(
             fixture.viewModel.agentSessionLinkRunCatalogProjectionByEndpoint[endpoint],
@@ -4494,9 +4494,9 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
             hasAgentSessionLink: true,
             hasAnyActiveLink: true
         )
-        fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(current, to: endpoint)
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkPublishRunCatalogProjection(current, to: endpoint)
 
-        fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkPublishRunCatalogProjection(
             AgentSessionLinkRunCatalogProjection(
                 runID: oldRunID,
                 routeToken: AgentSessionLinkRunCatalogRouteToken(
@@ -4524,7 +4524,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         fixture.session.selectedAgent = .codexExec
         try publish(fixture, revision: 1, targetCount: 1)
 
-        let decorated = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+        let decorated = fixture.viewModel.linkExecutionRuntime.agentSessionLinkDecoratedProviderText(
             "hello",
             session: fixture.session,
             dispatchID: .codexNativeSend(UUID())
@@ -4542,12 +4542,12 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         )
         fixture.session.pendingInstructions = ["queued instruction"]
 
-        let decorated = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+        let decorated = fixture.viewModel.linkExecutionRuntime.agentSessionLinkDecoratedProviderText(
             "hello",
             session: fixture.session,
             dispatchID: .claudeNativeSend(UUID())
         )
-        fixture.viewModel.acceptAgentSessionLinkPromptClaim(decorated.claim)
+        fixture.viewModel.linkExecutionRuntime.acceptAgentSessionLinkPromptClaim(decorated.claim)
 
         XCTAssertTrue(decorated.text.contains(AgentSessionLinkPrompts.envelopeTag))
         for item in fixture.session.items {
@@ -4565,7 +4565,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
     func testRebindingInPlaceRefusesThePreviousIncarnationsPublishedInventory() throws {
         let fixture = try makeFixture()
         try publish(fixture, revision: 1, targetCount: 1)
-        XCTAssertNotNil(fixture.viewModel.agentSessionLinkEffectivePromptInventory(for: fixture.session))
+        XCTAssertNotNil(fixture.viewModel.linkExecutionRuntime.agentSessionLinkEffectivePromptInventory(for: fixture.session))
 
         // An in-place rebind: same tab, same session UUID, new binding generation.
         let before = try AgentSessionLinkEndpointTestSupport.endpoint(
@@ -4573,7 +4573,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
             tabID: fixture.tabID
         )
         let generation = fixture.session.beginPersistentBindingTransition()
-        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        XCTAssertNil(fixture.viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
         fixture.session.finishPersistentBindingTransition(generation: generation)
         let after = try AgentSessionLinkEndpointTestSupport.endpoint(
             fixture.viewModel,
@@ -4582,10 +4582,10 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         XCTAssertNotEqual(before, after, "the rebind must produce a new incarnation")
 
         XCTAssertNil(
-            fixture.viewModel.agentSessionLinkEffectivePromptInventory(for: fixture.session),
+            fixture.viewModel.linkExecutionRuntime.agentSessionLinkEffectivePromptInventory(for: fixture.session),
             "an inventory published to the previous incarnation must not be served to this one"
         )
-        let decorated = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+        let decorated = fixture.viewModel.linkExecutionRuntime.agentSessionLinkDecoratedProviderText(
             "hello",
             session: fixture.session,
             dispatchID: .claudeNativeSend(UUID())
@@ -4597,26 +4597,26 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
     func testPruningUsesTheExactCurrentEndpointRatherThanSessionUUID() throws {
         let fixture = try makeFixture()
         try publish(fixture, revision: 1, targetCount: 1)
-        let accepted = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+        let accepted = fixture.viewModel.linkExecutionRuntime.agentSessionLinkDecoratedProviderText(
             "hello",
             session: fixture.session,
             dispatchID: .claudeNativeSend(UUID())
         )
-        fixture.viewModel.acceptAgentSessionLinkPromptClaim(accepted.claim)
+        fixture.viewModel.linkExecutionRuntime.acceptAgentSessionLinkPromptClaim(accepted.claim)
         let retiredEndpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
             fixture.viewModel,
             tabID: fixture.tabID
         )
 
         let generation = fixture.session.beginPersistentBindingTransition()
-        XCTAssertNil(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
+        XCTAssertNil(fixture.viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: fixture.tabID))
         fixture.session.finishPersistentBindingTransition(generation: generation)
         let currentEndpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
             fixture.viewModel,
             tabID: fixture.tabID
         )
         XCTAssertNotEqual(retiredEndpoint, currentEndpoint)
-        fixture.viewModel.agentSessionLinkPrunePromptState(liveSessionIDs: [fixture.sessionID])
+        fixture.viewModel.linkExecutionRuntime.agentSessionLinkPrunePromptState(liveSessionIDs: [fixture.sessionID])
         XCTAssertNil(
             fixture.viewModel.agentSessionLinkPromptInventoryBySessionID[fixture.sessionID],
             "the retired endpoint must be pruned even while its session UUID remains live"
@@ -4626,7 +4626,7 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         // The replacement incarnation republishes and must be taught oversight again.
         try publishCatalogProjection(fixture, revision: 1, hasAgentSessionLink: true)
         try publish(fixture, revision: 1, targetCount: 1)
-        let reissued = fixture.viewModel.agentSessionLinkDecoratedProviderText(
+        let reissued = fixture.viewModel.linkExecutionRuntime.agentSessionLinkDecoratedProviderText(
             "hello again",
             session: fixture.session,
             dispatchID: .claudeNativeSend(UUID())

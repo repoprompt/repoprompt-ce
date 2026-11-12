@@ -520,7 +520,7 @@ final class AgentSkillCatalog {
                 let entryURL = directoryURL.appendingPathComponent(rawEntryURL.lastPathComponent)
                 if entryURL.lastPathComponent.caseInsensitiveCompare("SKILL.md") == .orderedSame {
                     guard let fileKey = canonicalExistingFileKey(for: entryURL, fileManager: fileManager),
-                          let definition = parseSkillDefinition(from: entryURL, source: source)
+                          let definition = parseSkillDefinition(from: entryURL, source: source, fallbackName: entryURL.deletingLastPathComponent().lastPathComponent)
                     else { continue }
                     definitions.append(ScannedSkillDefinition(definition: definition, definitionFileKey: fileKey))
                     continue
@@ -576,7 +576,7 @@ final class AgentSkillCatalog {
             // Skip SKILL.md files (those belong to the folder-based format)
             guard fileURL.lastPathComponent.caseInsensitiveCompare("SKILL.md") != .orderedSame else { continue }
             guard let fileKey = canonicalExistingFileKey(for: fileURL, fileManager: fileManager),
-                  let definition = parseLegacyFlatDefinition(from: fileURL, source: source)
+                  let definition = parseSkillDefinition(from: fileURL, source: source, fallbackName: fileURL.deletingPathExtension().lastPathComponent)
             else { continue }
             definitions.append(ScannedSkillDefinition(definition: definition, definitionFileKey: fileKey))
         }
@@ -629,25 +629,12 @@ final class AgentSkillCatalog {
 
     // MARK: - Parsing
 
-    /// Parse a `SKILL.md` file (folder-based skill). Fallback name is the parent directory name.
-    private nonisolated static func parseSkillDefinition(from fileURL: URL, source: AgentSkillDefinition.Source) -> AgentSkillDefinition? {
+    /// Folder skills use the parent directory; legacy flat commands use the filename stem.
+    private nonisolated static func parseSkillDefinition(from fileURL: URL, source: AgentSkillDefinition.Source, fallbackName: String) -> AgentSkillDefinition? {
         guard let content = try? String(contentsOf: fileURL, encoding: .utf8) else {
             return nil
         }
         let frontmatter = parseFrontmatter(from: content)
-
-        let fallbackName = fileURL.deletingLastPathComponent().lastPathComponent
-        return buildDefinition(content: content, frontmatter: frontmatter, fallbackName: fallbackName, fileURL: fileURL, source: source)
-    }
-
-    /// Parse a flat `.md` command file. Fallback name is the filename stem (without extension).
-    private nonisolated static func parseLegacyFlatDefinition(from fileURL: URL, source: AgentSkillDefinition.Source) -> AgentSkillDefinition? {
-        guard let content = try? String(contentsOf: fileURL, encoding: .utf8) else {
-            return nil
-        }
-        let frontmatter = parseFrontmatter(from: content)
-
-        let fallbackName = fileURL.deletingPathExtension().lastPathComponent
         return buildDefinition(content: content, frontmatter: frontmatter, fallbackName: fallbackName, fileURL: fileURL, source: source)
     }
 

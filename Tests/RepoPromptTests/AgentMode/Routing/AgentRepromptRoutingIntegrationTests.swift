@@ -30,7 +30,7 @@ final class AgentRepromptRoutingIntegrationTests: XCTestCase {
             return result
         }
         try await AsyncTestWait.waitUntil("routing suspended", timeout: 5) { await !fixture.backend.requests.isEmpty }
-        XCTAssertEqual(vm.retrieveDraftText(for: tabID), "")
+        XCTAssertEqual(vm.draftRuntime.text(for: tabID), "")
         XCTAssertEqual(vm.ui.composer.pendingSubmissions[attempt.id]?.text, "Send this task")
         XCTAssertFalse(fixture.session.items.contains { $0.kind == .user })
         vm.storeDraftText(for: tabID, "Next draft")
@@ -39,7 +39,7 @@ final class AgentRepromptRoutingIntegrationTests: XCTestCase {
         XCTAssertEqual(result, .submitted)
         XCTAssertTrue(vm.ui.composer.pendingSubmissions.isEmpty)
         XCTAssertEqual(fixture.session.items.count(where: { $0.kind == .user }), 1)
-        XCTAssertEqual(vm.retrieveDraftText(for: tabID), "Next draft")
+        XCTAssertEqual(vm.draftRuntime.text(for: tabID), "Next draft")
     }
 
     func testUsagePeerReconciliationDoesNotInvalidatePreparedSpeculation() async throws {
@@ -117,7 +117,7 @@ final class AgentRepromptRoutingIntegrationTests: XCTestCase {
             session.recordRestorationAuthoritative(.persistedPayloadApplied)
             // Model a restored MCP-origin session, not app-owned resident consent.
             session.isMCPOriginated = true
-            vm.ensureRunServiceMaterializedForRunStart()
+            _ = vm.runService
             let sessionID = try XCTUnwrap(session.activeAgentSessionID)
             let writer = try XCTUnwrap(vm.runtimeCommand(sessionID: sessionID)).writer
             let originalContext = try await vm.mcpActivateControlContext(
@@ -163,14 +163,14 @@ final class AgentRepromptRoutingIntegrationTests: XCTestCase {
                 writer.scope.replaceSessions(members.filter { $0.key != session.tabID })
                 writer.scope.replaceSessions(members)
                 XCTAssertFalse(writer.ownsPersistentClaim)
-                XCTAssertNil(vm.mcpControlledSession(sessionID: sessionID))
+                XCTAssertNil(vm.mcpRuntime.controlledWriter(sessionID: sessionID)?.session)
                 if change == "newContext" {
                     let state = session.runState
                     let task = session.agentTask
                     _ = try await vm.mcpActivateControlContext(
                         forTabID: session.tabID, sessionID: sessionID, originatingConnectionID: nil
                     )
-                    XCTAssertTrue(vm.mcpControlledSession(sessionID: sessionID) === session)
+                    XCTAssertTrue(vm.mcpRuntime.controlledWriter(sessionID: sessionID)?.session === session)
                     XCTAssertNotEqual(session.mcpControlContext?.writerIdentity, writer.identity)
                     XCTAssertEqual(session.runState, state)
                     XCTAssertEqual(session.agentTask, task)
@@ -302,7 +302,7 @@ final class AgentRepromptRoutingIntegrationTests: XCTestCase {
                 XCTAssertFalse(session.isDirty)
             }
             if change == "bind" {
-                XCTAssertTrue(vm.composerSubmitClaimIsCurrent(claim), "First binding is a supported continuation of a local creation claim")
+                XCTAssertTrue(vm.composerSubmitRuntime.isCurrent(claim), "First binding is a supported continuation of a local creation claim")
                 let result = await vm.submitUserTurnAfterAutoEffort(
                     text: claim.attempt.rawDraftSnapshot, claim: claim, session: session,
                     destinationTabID: session.tabID, repromptedText: approved
@@ -452,7 +452,7 @@ final class AgentRepromptTestFixture {
     /// callers still establish (or deliberately withhold) payload restoration themselves.
     func installPersistentWriter() throws {
         let sessionID = UUID()
-        XCTAssertNil(viewModel.test_bindingRejection(sessionID: sessionID, on: session))
+        XCTAssertNil(viewModel.runtimeSessionStore.bindingRejection(sessionID, on: session))
         session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: UUID()))
         guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: sessionID) else {
             throw NSError(domain: "AgentRepromptTestFixture.writer", code: 1)
@@ -487,7 +487,7 @@ final class AgentRepromptTestFixture {
     func cleanUp() {
         viewModel.cancelReprompt()
         for id in Array(viewModel.repromptSpeculations.keys) {
-            viewModel.cancelRepromptSpeculation(claimID: id)
+            viewModel.repromptSpeculations.removeValue(forKey: id)?.cancel(runtime: viewModel.modelRouterRuntime)
         }
         for session in viewModel.sessions.values {
             session.agentTask?.cancel()

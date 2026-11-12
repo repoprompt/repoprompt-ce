@@ -514,15 +514,8 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
                 let lookup: HistoryDirectSessionLookup
                 do {
                     lookup = try await scanner.locateSession(sessionID: id, requestBudget: read.budget)
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch let error as HistorySessionScannerError {
-                    try Task.checkCancellation()
-                    if case .workBudgetExceeded = error { throw AgentSessionInventoryReadFailure.budgetExceeded }
-                    throw AgentSessionInventoryReadFailure.incomplete(.historyLookupFailed)
                 } catch {
-                    try Task.checkCancellation()
-                    throw AgentSessionInventoryReadFailure.incomplete(.historyLookupFailed)
+                    try Self.rejectHistoryLookup(error)
                 }
                 try await Self.projectionCheckpoint(projected: visited.count, budget: read.budget)
                 guard lookup.isComplete else { throw AgentSessionInventoryReadFailure.incomplete(.historyIndexIncomplete) }
@@ -531,17 +524,7 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
                 let record = metadata.record
                 guard record.id == id else { throw AgentSessionInventoryReadFailure.incomplete(.historyRecordMismatch) }
                 historyByID[id] = (record, location.workspaceName)
-                records.append(DomainAgentSessionInventoryRecord(
-                    sessionID: id, name: record.name, workspaceID: metadata.workspaceID,
-                    workspaceName: location.workspaceName, isLoaded: false,
-                    organizationStateIsKnown: false,
-                    runState: .classify(rawValue: record.lastRunStateRaw),
-                    parentSessionID: record.parentSessionID,
-                    createdByOverseerSessionID: record.createdByOverseerSessionID,
-                    organizationalParentID: record.organizationalParentID,
-                    createdAt: record.firstActivityAt, lastActivityAt: record.activityDate,
-                    worktreeCount: record.worktreeBindingSummaries.count
-                ))
+                records.append(Self.historyRecord(record, workspaceID: metadata.workspaceID, workspaceName: location.workspaceName))
                 if let parent = record.organizationalParentID ?? record.parentSessionID ?? record.createdByOverseerSessionID {
                     pending.append(parent)
                 }
@@ -563,7 +546,7 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
                         projected += 1
                         guard read.workspaceID == nil || (record.workspaceID ?? workspace.workspaceID) == read.workspaceID else { continue }
                         historyByID[record.id] = (record, workspace.workspaceName)
-                        records.append(Self.historyRecord(record, workspace: workspace))
+                        records.append(Self.historyRecord(record, workspaceID: record.workspaceID ?? workspace.workspaceID, workspaceName: workspace.workspaceName))
                     }
                 }
             } catch is CancellationError {
@@ -630,15 +613,8 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
             scan = try await scanner.scanWorkspaces(
                 matching: location.workspaceDir.lastPathComponent, requestBudget: budget
             )
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch let error as HistorySessionScannerError {
-            try Task.checkCancellation()
-            if case .workBudgetExceeded = error { throw AgentSessionInventoryReadFailure.budgetExceeded }
-            throw AgentSessionInventoryReadFailure.incomplete(.historyLookupFailed)
         } catch {
-            try Task.checkCancellation()
-            throw AgentSessionInventoryReadFailure.incomplete(.historyLookupFailed)
+            try Self.rejectHistoryLookup(error)
         }
         try await Self.projectionCheckpoint(projected: 0, budget: budget)
         guard Self.isComplete(scan) else { throw AgentSessionInventoryReadFailure.incomplete(.historyIndexIncomplete) }
@@ -657,15 +633,25 @@ final class LiveAgentSessionInventorySource: AgentSessionInventorySource {
         !scan.isTruncated && !scan.workspaces.contains { $0.indexReadFailed || $0.indexSchemaVersion != nil }
     }
 
+    private static func rejectHistoryLookup(_ error: any Error) throws -> Never {
+        if error is CancellationError { throw CancellationError() }
+        try Task.checkCancellation()
+        if let error = error as? HistorySessionScannerError, case .workBudgetExceeded = error {
+            throw AgentSessionInventoryReadFailure.budgetExceeded
+        }
+        throw AgentSessionInventoryReadFailure.incomplete(.historyLookupFailed)
+    }
+
     private static func historyRecord(
         _ record: AgentSessionMetadataRecord,
-        workspace: HistoryWorkspaceScanResult
+        workspaceID: UUID?,
+        workspaceName: String
     ) -> DomainAgentSessionInventoryRecord {
         DomainAgentSessionInventoryRecord(
             sessionID: record.id,
             name: record.name,
-            workspaceID: record.workspaceID ?? workspace.workspaceID,
-            workspaceName: workspace.workspaceName,
+            workspaceID: workspaceID,
+            workspaceName: workspaceName,
             isLoaded: false,
             organizationStateIsKnown: false,
             runState: .classify(rawValue: record.lastRunStateRaw),

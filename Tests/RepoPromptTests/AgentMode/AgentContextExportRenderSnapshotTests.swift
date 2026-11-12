@@ -60,7 +60,7 @@ final class AgentContextExportRenderSnapshotTests: XCTestCase {
         XCTAssertEqual(viewModel.test_bindingResolution(sessionID: sessionID), .unique(tabID: firstTabID))
 
         viewModel.test_installLiveSession(secondSession)
-        XCTAssertEqual(viewModel.test_bindingRejection(sessionID: sessionID, on: secondSession), .conflictingWriter)
+        XCTAssertEqual(viewModel.runtimeSessionStore.bindingRejection(sessionID, on: secondSession), .conflictingWriter)
         XCTAssertNil(viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: secondSession))
         XCTAssertNil(secondSession.persistentSessionBindingIdentity)
         // The read-side conflict test deliberately reconstructs legacy corruption.

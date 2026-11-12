@@ -34,7 +34,7 @@ final class AgentSessionLinkAutoWakePersistenceTests: XCTestCase {
         XCTAssertFalse(live.oversight.periodicIdleWakeEnabled)
         XCTAssertEqual(live.oversight.periodicIdleWakeIntervalSeconds, 1800)
 
-        viewModel.restoreAgentSessionLinkState(from: decodedOff, to: live)
+        AgentSessionHydrationRuntime.restoreLinkState(from: decodedOff, to: live)
 
         XCTAssertFalse(live.oversight.autoWakeOnUpdates, "the durable saved choice wins")
         XCTAssertFalse(live.oversight.routineWakeIntervalEnabled)
@@ -57,7 +57,7 @@ final class AgentSessionLinkAutoWakePersistenceTests: XCTestCase {
             periodicIdleWakeIntervalSeconds: 3600
         )
         let decodedOn = try JSONDecoder().decode(AgentSession.self, from: JSONEncoder().encode(savedOn))
-        viewModel.restoreAgentSessionLinkState(from: decodedOn, to: live)
+        AgentSessionHydrationRuntime.restoreLinkState(from: decodedOn, to: live)
 
         XCTAssertTrue(live.oversight.autoWakeOnUpdates)
         XCTAssertTrue(live.oversight.routineWakeIntervalEnabled)

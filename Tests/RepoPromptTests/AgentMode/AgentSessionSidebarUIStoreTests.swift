@@ -760,9 +760,9 @@ final class AgentSidebarTabFilterTests: XCTestCase {
         viewModel.ui.sessionSidebar.setThreadCollapsed(true, for: .key(sessionID: id(101), tabID: id(1)))
         XCTAssertEqual(projection(viewModel, tabs: tabs).filteredSessions.map(\.tabID), [id(1)], "All keeps the collapse")
 
-        viewModel.setSidebarTab(.pinned)
+        viewModel.ui.sessionSidebar.setSidebarTab(.pinned)
         XCTAssertEqual(projection(viewModel, tabs: tabs).filteredSessions.map(\.tabID), [id(1), id(2)])
-        viewModel.setSidebarTab(.all)
+        viewModel.ui.sessionSidebar.setSidebarTab(.all)
         XCTAssertEqual(projection(viewModel, tabs: tabs).filteredSessions.map(\.tabID), [id(1)])
     }
 
@@ -776,7 +776,7 @@ final class AgentSidebarTabFilterTests: XCTestCase {
         XCTAssertTrue(viewModel.ui.sessionSidebar.markRunStateAttention(tabID: id(1), state: .completed))
         XCTAssertTrue(viewModel.ui.sessionSidebar.markRunStateAttention(tabID: id(2), state: .failed))
 
-        viewModel.setSidebarTab(.active)
+        viewModel.ui.sessionSidebar.setSidebarTab(.active)
         XCTAssertEqual(projection(viewModel, tabs: tabs).filteredSessions.map(\.tabID), [id(2)])
     }
 
@@ -785,16 +785,16 @@ final class AgentSidebarTabFilterTests: XCTestCase {
         let tabs = pinnedThreadTabs()
         installSessions(for: tabs, on: viewModel, childParent: id(101))
 
-        viewModel.setSidebarTab(.pinned)
+        viewModel.ui.sessionSidebar.setSidebarTab(.pinned)
         XCTAssertEqual(collapseState(viewModel, tabs: tabs), .canCollapse)
         viewModel.collapseAllSidebarThreads(for: tabs, currentTabID: nil)
         XCTAssertEqual(projection(viewModel, tabs: tabs).filteredSessions.map(\.tabID), [id(1)])
         XCTAssertEqual(collapseState(viewModel, tabs: tabs), .canExpand)
 
-        viewModel.setSidebarTab(.all)
+        viewModel.ui.sessionSidebar.setSidebarTab(.all)
         XCTAssertEqual(projection(viewModel, tabs: tabs).filteredSessions.map(\.tabID), [id(1), id(2)], "All keeps its own fold")
 
-        viewModel.setSidebarTab(.pinned)
+        viewModel.ui.sessionSidebar.setSidebarTab(.pinned)
         viewModel.expandAllSidebarThreads(for: tabs, currentTabID: nil)
         XCTAssertEqual(projection(viewModel, tabs: tabs).filteredSessions.map(\.tabID), [id(1), id(2)])
     }
@@ -806,7 +806,7 @@ final class AgentSidebarTabFilterTests: XCTestCase {
         let allKey = AgentSidebarThreadKey.key(sessionID: id(101), tabID: id(1))
         viewModel.ui.sessionSidebar.setThreadCollapsed(true, for: allKey)
 
-        viewModel.setSidebarTab(.pinned)
+        viewModel.ui.sessionSidebar.setSidebarTab(.pinned)
         viewModel.collapseAllSidebarThreads(for: tabs, currentTabID: nil)
         viewModel.expandAllSidebarThreads(for: tabs, currentTabID: nil)
 
@@ -818,7 +818,7 @@ final class AgentSidebarTabFilterTests: XCTestCase {
         let tabs = pinnedThreadTabs()
         installSessions(for: tabs, on: viewModel, childCreator: id(101))
 
-        viewModel.setSidebarTab(.overseers)
+        viewModel.ui.sessionSidebar.setSidebarTab(.overseers)
         XCTAssertEqual(collapseState(viewModel, tabs: tabs), .canCollapse)
         viewModel.collapseAllSidebarThreads(for: tabs, currentTabID: nil)
         XCTAssertEqual(projection(viewModel, tabs: tabs).overseerRenderedRows?.map(\.session.tabID), [id(1)])
@@ -832,7 +832,7 @@ final class AgentSidebarTabFilterTests: XCTestCase {
         let tabs = [ComposeTabState(id: id(1), name: "Solo", lastModified: base, activeAgentSessionID: id(101))]
         installSessions(for: tabs, on: viewModel)
         for tab in AgentSidebarTab.allCases {
-            viewModel.setSidebarTab(tab)
+            viewModel.ui.sessionSidebar.setSidebarTab(tab)
             XCTAssertEqual(collapseState(viewModel, tabs: tabs), .unavailable, "\(tab) has nothing to fold")
         }
 
@@ -870,10 +870,10 @@ final class AgentSidebarTabFilterTests: XCTestCase {
         }
         for search in ["", "Archived"] {
             viewModel.setSessionSidebarSearchText(search)
-            viewModel.setSidebarTab(.all)
+            viewModel.ui.sessionSidebar.setSidebarTab(.all)
             XCTAssertEqual(archivedRows(), [id(50)], "All includes archives, search '\(search)'")
             for tab in [AgentSidebarTab.active, .pinned, .overseers] {
-                viewModel.setSidebarTab(tab)
+                viewModel.ui.sessionSidebar.setSidebarTab(tab)
                 XCTAssertTrue(archivedRows().isEmpty, "\(tab) promises only its own sessions, search '\(search)'")
             }
         }
@@ -887,7 +887,7 @@ final class AgentSidebarTabFilterTests: XCTestCase {
         XCTAssertNotNil(viewModel.test_installPersistentSessionBinding(sessionID: tab.activeAgentSessionID, on: session))
         viewModel.test_installLiveSession(session)
         viewModel.ui.sessionSidebar.refresh()
-        viewModel.setSidebarTab(.active)
+        viewModel.ui.sessionSidebar.setSidebarTab(.active)
         XCTAssertTrue(projection(viewModel, tabs: [tab]).filteredSessions.isEmpty)
 
         session.runState = .running
@@ -1092,7 +1092,7 @@ final class AgentSidebarOverseerSectionBuilderTests: XCTestCase {
         XCTAssertNil(all.overseerRenderedRows)
         XCTAssertTrue(all.filteredSessions.allSatisfy { $0.depth == 0 }, "All keeps the ordinary sidebar")
 
-        viewModel.setSidebarTab(.overseers)
+        viewModel.ui.sessionSidebar.setSidebarTab(.overseers)
         let overseers = project()
         XCTAssertEqual(overseers.overseerRenderedRows?.map(\.session.depth), [0, 1, 1])
         XCTAssertEqual(overseers.renderedSelectionOrder, [id(1), id(2), id(3)].map { .active(tabID: $0) })
@@ -1100,9 +1100,9 @@ final class AgentSidebarOverseerSectionBuilderTests: XCTestCase {
             viewModel.adjacentSidebarSessionTabID(from: id(1), forward: true, in: tabs, currentTabID: nil),
             id(2)
         )
-        viewModel.toggleSidebarOverseerGroup(id(1))
+        viewModel.ui.sessionSidebar.toggleThreadCollapse(.overseerGroup(id(1)))
         XCTAssertEqual(project().overseerRenderedRows?.count, 1)
-        viewModel.setSidebarTab(.all)
+        viewModel.ui.sessionSidebar.setSidebarTab(.all)
         XCTAssertNil(project().overseerRenderedRows)
         XCTAssertFalse(viewModel.ui.sessionSidebar.snapshot.collapsedThreadKeys.contains(.session(id(101))))
     }

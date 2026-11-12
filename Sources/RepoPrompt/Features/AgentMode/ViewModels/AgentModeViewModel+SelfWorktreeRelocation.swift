@@ -366,14 +366,14 @@ extension AgentModeViewModel {
         guard reserved, session.selfWorktreeRelocationFollowUpOwner == owner,
               session.mcpFollowUpRunPending, session.scheduledACPFollowUp == nil else { return }
         session.mcpFollowUpRunPending = false
-        handleObservedMCPStateChange(for: session)
+        mcpRuntime.handleObservedMCPStateChange(for: session)
     }
 
     private func appendSelfWorktreeRelocationRow(_ text: String, session: TabSession) {
         session.appendItem(.system(text, sequenceIndex: session.nextSequenceIndex))
         session.isDirty = true
         updateBindingsFromSession(session)
-        scheduleSave(for: session)
+        persistenceRuntime.scheduleSave(for: session)
         requestUIRefresh(tabID: session.tabID, urgent: true)
     }
 

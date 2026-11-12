@@ -794,7 +794,7 @@ final class ClaudeAgentModeCoordinator {
             runtimeWorkspacePath = try workspacePathProvider(session)
         } catch {
             guard intentIsCurrent(intent, for: session) else { return .superseded }
-            return .failed(message: Self.providerStartupFailureMessage(for: error))
+            return .failed(message: AgentRunExecutionContracts.providerStartupFailureMessage(for: error))
         }
 
         if let existingController = session.claudeController,
@@ -1173,17 +1173,6 @@ final class ClaudeAgentModeCoordinator {
         }
     }
 
-    private static func providerStartupFailureMessage(for error: Error) -> String {
-        if let localized = error as? LocalizedError,
-           let description = localized.errorDescription?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !description.isEmpty
-        {
-            return description
-        }
-        let description = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
-        return description.isEmpty ? String(describing: error) : description
-    }
-
     private func shouldRetryFreshStartWithoutResume(
         after error: Error,
         existingSessionID: String?
@@ -1412,6 +1401,76 @@ final class ClaudeAgentModeCoordinator {
             "\(session.selectedAgent.displayName) could not verify the exact RepoPrompt MCP route required for active oversight. No provider message was sent. Retry the run. \(Self.routeVerificationFailureMarkerPrefix)\(code)]"
         }
 
+        @MainActor func prepareClearTurn(_ controller: any NativeAgentRuntimeControlling) async -> NativeSendOutcome? {
+            if let providerControlCommand,
+               let refusal = await controlCommandRefusal(providerControlCommand, controller: controller)
+            {
+                return refusal
+            }
+            // A control command never interrupts: it proceeds only when nothing is in flight.
+            let turnIsClear = if isMaintenance {
+                true
+            } else {
+                await interruptClaudeTurnIfNeeded(
+                    session: session,
+                    controller: controller,
+                    handler: handler
+                )
+            }
+            guard turnIsClear else {
+                guard intentIsCurrent(intent, for: session),
+                      sessionOwnsClaudeController(controller, for: session)
+                else {
+                    return .superseded
+                }
+                return recordSendFailure(
+                    "Claude native send failed because the active turn could not be interrupted safely.",
+                    session: session,
+                    intent: intent
+                )
+            }
+            guard intentIsCurrent(intent, for: session),
+                  sessionOwnsClaudeController(controller, for: session)
+            else {
+                return .superseded
+            }
+            return nil
+        }
+
+        @MainActor func recycleAndRefreshTracking(_ controller: any NativeAgentRuntimeControlling) async -> Bool {
+            await recycleClaudeControllerForLaunchSettingsChange(
+                session: session, existingController: controller,
+                runtimeVariantChanged: effectiveClaudeRuntimeVariantChanged(for: session)
+            )
+            guard intentIsCurrent(intent, for: session) else { return false }
+            await ensureClaudeToolTrackingIfNeeded(for: session, runID: intent.runID)
+            handler = toolHandler(for: session)
+            return true
+        }
+
+        @MainActor func refreshTrackingAfterRouteRetry() async -> Bool {
+            guard intentIsCurrent(intent, for: session) else {
+                hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
+                return false
+            }
+            await ensureClaudeToolTrackingIfNeeded(for: session, runID: intent.runID)
+            handler = toolHandler(for: session)
+            return true
+        }
+
+        @MainActor func acceptSentTurn(_ turnID: UUID, controller: any NativeAgentRuntimeControlling) async -> NativeSendOutcome {
+            guard intentIsCurrent(intent, for: session),
+                  sessionOwnsClaudeController(controller, for: session)
+            else {
+                if !sessionOwnsClaudeController(controller, for: session) {
+                    await controller.shutdown()
+                }
+                return .superseded
+            }
+            session.acceptClaudeHostTurn(turnID)
+            return .sent
+        }
+
         // A controller this send launched (fresh start, or a replacement after a recycle) has a
         // RepoPrompt MCP child that may not have connected and committed its route yet, so its route
         // qualification may wait, boundedly, for the server-owned route token. A reused controller
@@ -1459,46 +1518,8 @@ final class ClaudeAgentModeCoordinator {
             }
 
             if hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session) {
-                if let providerControlCommand,
-                   let refusal = await controlCommandRefusal(providerControlCommand, controller: controller)
-                {
-                    return refusal
-                }
-                // A control command never interrupts: it proceeds only when nothing is in flight.
-                let turnIsClear = if isMaintenance {
-                    true
-                } else {
-                    await interruptClaudeTurnIfNeeded(
-                        session: session,
-                        controller: controller,
-                        handler: handler
-                    )
-                }
-                guard turnIsClear else {
-                    guard intentIsCurrent(intent, for: session),
-                          sessionOwnsClaudeController(controller, for: session)
-                    else {
-                        return .superseded
-                    }
-                    return recordSendFailure(
-                        "Claude native send failed because the active turn could not be interrupted safely.",
-                        session: session,
-                        intent: intent
-                    )
-                }
-                guard intentIsCurrent(intent, for: session),
-                      sessionOwnsClaudeController(controller, for: session)
-                else {
-                    return .superseded
-                }
-                await recycleClaudeControllerForLaunchSettingsChange(
-                    session: session,
-                    existingController: controller,
-                    runtimeVariantChanged: effectiveClaudeRuntimeVariantChanged(for: session)
-                )
-                guard intentIsCurrent(intent, for: session) else { return .superseded }
-                await ensureClaudeToolTrackingIfNeeded(for: session, runID: intent.runID)
-                handler = toolHandler(for: session)
+                if let refusal = await prepareClearTurn(controller) { return refusal }
+                guard await recycleAndRefreshTracking(controller) else { return .superseded }
                 continue
             }
 
@@ -1516,38 +1537,7 @@ final class ClaudeAgentModeCoordinator {
                 )
             }
 
-            if let providerControlCommand,
-               let refusal = await controlCommandRefusal(providerControlCommand, controller: controller)
-            {
-                return refusal
-            }
-            // A control command never interrupts: it proceeds only when nothing is in flight.
-            let turnIsClear = if isMaintenance {
-                true
-            } else {
-                await interruptClaudeTurnIfNeeded(
-                    session: session,
-                    controller: controller,
-                    handler: handler
-                )
-            }
-            guard turnIsClear else {
-                guard intentIsCurrent(intent, for: session),
-                      sessionOwnsClaudeController(controller, for: session)
-                else {
-                    return .superseded
-                }
-                return recordSendFailure(
-                    "Claude native send failed because the active turn could not be interrupted safely.",
-                    session: session,
-                    intent: intent
-                )
-            }
-            guard intentIsCurrent(intent, for: session),
-                  sessionOwnsClaudeController(controller, for: session)
-            else {
-                return .superseded
-            }
+            if let refusal = await prepareClearTurn(controller) { return refusal }
 
             // Reconcile the lifetime reader before sending: an EOF/reset may have replaced
             // its stream even while the attempt's recoverable inbox remains reserved.
@@ -1613,12 +1603,7 @@ final class ClaudeAgentModeCoordinator {
                     if routeWaitTimedOut {
                         hasRecycledAfterRouteWait = true
                     }
-                    guard intentIsCurrent(intent, for: session) else {
-                        hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
-                        return .superseded
-                    }
-                    await ensureClaudeToolTrackingIfNeeded(for: session, runID: intent.runID)
-                    handler = toolHandler(for: session)
+                    guard await refreshTrackingAfterRouteRetry() else { return .superseded }
                     continue
                 }
                 hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
@@ -1632,14 +1617,7 @@ final class ClaudeAgentModeCoordinator {
             // Validate launch settings before ordinary-turn configuration application below.
             // Application can suspend, so the complete snapshot is fenced again before dispatch.
             if hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session) {
-                await recycleClaudeControllerForLaunchSettingsChange(
-                    session: session,
-                    existingController: controller,
-                    runtimeVariantChanged: effectiveClaudeRuntimeVariantChanged(for: session)
-                )
-                guard intentIsCurrent(intent, for: session) else { return .superseded }
-                await ensureClaudeToolTrackingIfNeeded(for: session, runID: intent.runID)
-                handler = toolHandler(for: session)
+                guard await recycleAndRefreshTracking(controller) else { return .superseded }
                 continue
             }
 
@@ -1654,12 +1632,7 @@ final class ClaudeAgentModeCoordinator {
                        reinstallRunRoutingPolicy: reinstallRunRoutingPolicy
                    )
                 {
-                    guard intentIsCurrent(intent, for: session) else {
-                        hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
-                        return .superseded
-                    }
-                    await ensureClaudeToolTrackingIfNeeded(for: session, runID: intent.runID)
-                    handler = toolHandler(for: session)
+                    guard await refreshTrackingAfterRouteRetry() else { return .superseded }
                     continue
                 }
                 hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
@@ -1850,16 +1823,7 @@ final class ClaudeAgentModeCoordinator {
                 }
                 do {
                     let turnID = try await controller.sendUserMessage(providerControlCommand.providerText)
-                    guard intentIsCurrent(intent, for: session),
-                          sessionOwnsClaudeController(controller, for: session)
-                    else {
-                        if !sessionOwnsClaudeController(controller, for: session) {
-                            await controller.shutdown()
-                        }
-                        return .superseded
-                    }
-                    session.acceptClaudeHostTurn(turnID)
-                    return .sent
+                    return await acceptSentTurn(turnID, controller: controller)
                 } catch {
                     guard intentIsCurrent(intent, for: session),
                           sessionOwnsClaudeController(controller, for: session)
@@ -2023,16 +1987,7 @@ final class ClaudeAgentModeCoordinator {
                 // The returned provider turn ID is the acceptance signal. Acknowledge before the
                 // currency guard: even a locally superseded turn delivered this supplement.
                 hostCapabilities.acceptAgentSessionLinkPromptClaim(session, monitoring.dispatchContext, released.claim)
-                guard intentIsCurrent(intent, for: session),
-                      sessionOwnsClaudeController(controller, for: session)
-                else {
-                    if !sessionOwnsClaudeController(controller, for: session) {
-                        await controller.shutdown()
-                    }
-                    return .superseded
-                }
-                session.acceptClaudeHostTurn(turnID)
-                return .sent
+                return await acceptSentTurn(turnID, controller: controller)
             } catch NativeAgentRuntimeControllerError.configurationNotCurrent,
                 NativeAgentRuntimeControllerError.cancelledBeforeWrite
             {

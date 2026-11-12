@@ -159,12 +159,7 @@ private struct AgentUsageLimitsPillContent: View {
             .opacity(presentation.isDimmed ? 0.55 : 1)
             .padding(.horizontal, 7)
             .frame(height: height)
-            .background(.ultraThinMaterial)
-            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(Color.secondary.opacity(0.15), lineWidth: 0.5)
-            )
+            .agentPillSurface(cornerRadius: cornerRadius, strokeColor: Color.secondary.opacity(0.15), lineWidth: 0.5)
         }
         .buttonStyle(.plain)
         .contextMenu {

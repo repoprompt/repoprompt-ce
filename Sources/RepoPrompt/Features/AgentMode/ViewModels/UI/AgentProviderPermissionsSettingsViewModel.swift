@@ -100,7 +100,7 @@ final class AgentProviderPermissionsSettingsViewModel: ObservableObject {
         if let bindingService {
             bindingService.setPermissionLevel(id)
         } else {
-            Self.writePermissionLevelDirect(id, defaults: defaults, securePermissions: securePermissions)
+            AgentProviderPreferenceSnapshotStore.writePermissionLevel(id, defaults: defaults, securePermissions: securePermissions)
         }
         finalizeProviderMutation(for: id.providerID)
     }
@@ -109,35 +109,7 @@ final class AgentProviderPermissionsSettingsViewModel: ObservableObject {
         if let bindingService {
             bindingService.applyCodexToolSettingMutation(mutation)
         } else {
-            switch mutation {
-            case let .bashTool(enabled):
-                CodexAgentToolPreferences.setBashToolEnabled(enabled, defaults: defaults, secureStore: securePermissions)
-            case let .searchTool(enabled):
-                CodexAgentToolPreferences.setSearchToolEnabled(enabled, defaults: defaults)
-            case let .goalSupport(enabled):
-                CodexAgentModeBooleanPreference.goalSupport.setEnabled(enabled, defaults: defaults)
-            case let .computerUse(enabled):
-                CodexAgentModeBooleanPreference.computerUse.setEnabled(enabled, defaults: defaults)
-            case let .reasoningSummaries(enabled):
-                CodexAgentModeBooleanPreference.reasoningSummaries.setEnabled(enabled, defaults: defaults)
-            case let .memories(enabled):
-                CodexAgentModeBooleanPreference.memories.setEnabled(enabled, defaults: defaults)
-            case let .apps(enabled):
-                CodexAgentModeBooleanPreference.apps.setEnabled(enabled, defaults: defaults)
-            case let .plugins(enabled):
-                CodexAgentModeBooleanPreference.plugins.setEnabled(enabled, defaults: defaults)
-            case let .mcpElicitation(enabled):
-                CodexAgentModeBooleanPreference.mcpElicitation.setEnabled(enabled, defaults: defaults)
-            case let .toolSuggestions(enabled):
-                CodexAgentModeBooleanPreference.toolSuggestions.setEnabled(enabled, defaults: defaults)
-            case let .mcpServer(normalizedName, enabled):
-                CodexAgentToolPreferences.setMCPServerEnabled(
-                    normalizedName: normalizedName,
-                    isEnabled: enabled,
-                    defaults: defaults,
-                    secureStore: securePermissions
-                )
-            }
+            AgentProviderPreferenceSnapshotStore.writeCodexToolSettingMutation(mutation, defaults: defaults, securePermissions: securePermissions)
         }
         finalizeProviderMutation(for: .codex)
     }
@@ -146,16 +118,7 @@ final class AgentProviderPermissionsSettingsViewModel: ObservableObject {
         if let bindingService {
             bindingService.applyClaudeToolSettingMutation(mutation)
         } else {
-            switch mutation {
-            case let .bashTool(enabled):
-                ClaudeAgentToolPreferences.setBashToolEnabled(enabled, defaults: defaults, secureStore: securePermissions)
-            case let .mcpStrictMode(enabled):
-                ClaudeAgentToolPreferences.setMCPStrictModeEnabled(enabled, defaults: defaults, secureStore: securePermissions)
-            case let .toolSearch(enabled):
-                ClaudeAgentToolPreferences.setToolSearchEnabled(enabled, defaults: defaults)
-            case let .agentModePromptDelivery(delivery):
-                ClaudeAgentToolPreferences.setAgentModePromptDelivery(delivery, defaults: defaults)
-            }
+            AgentProviderPreferenceSnapshotStore.writeClaudeToolSettingMutation(mutation, defaults: defaults, securePermissions: securePermissions)
         }
         finalizeProviderMutation(for: .claude)
     }
@@ -181,29 +144,6 @@ final class AgentProviderPermissionsSettingsViewModel: ObservableObject {
         // values. When a secure write failed, helpers fail closed to safe/previous values.
         revision &+= 1
         onProviderPreferenceChanged?(providerID)
-    }
-
-    private static func writePermissionLevelDirect(
-        _ id: AgentProviderPermissionLevelID,
-        defaults: UserDefaults,
-        securePermissions: AgentPermissionSecureStore?
-    ) {
-        switch id {
-        case let .codex(level):
-            CodexAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
-        case let .claude(level):
-            ClaudeAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
-        case let .openCode(level):
-            OpenCodeAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
-        case let .antigravity(level):
-            AntigravityAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
-        case let .cursor(level):
-            CursorAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
-        case let .grokBuild(level):
-            GrokBuildAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
-        case let .devin(level):
-            DevinAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
-        }
     }
 
     private func subscribeToSecureStoreChanges() {

@@ -1333,7 +1333,7 @@ struct AgentManageMCPToolService {
             do { live = try agentModeVM.authoritativeLiveSession(for: sessionID) }
             catch { throw CleanupAuthorityFailure(subreason: "target_state_unresolved") }
             if let live {
-                let active = agentModeVM.mcpSnapshot(for: live).map { !$0.status.isTerminal }
+                let active = agentModeVM.mcpRuntime.mcpSnapshot(for: live).map { !$0.status.isTerminal }
                     ?? (live.runState.isActive || live.mcpFollowUpRunPending || live.pendingSupersedingTurnCompletions > 0)
                 guard !active else { throw CleanupAuthorityFailure(subreason: "skipped_active") }
             }
@@ -1382,7 +1382,7 @@ struct AgentManageMCPToolService {
             let candidate: CleanupSessionCandidate?
             do {
                 if let liveSession = try agentModeVM.authoritativeLiveSession(for: sessionID) {
-                    let snapshotStatus = agentModeVM.mcpSnapshot(for: liveSession)?.status
+                    let snapshotStatus = agentModeVM.mcpRuntime.mcpSnapshot(for: liveSession)?.status
                     let isEffectivelyActive = snapshotStatus.map { !$0.isTerminal }
                         ?? (
                             liveSession.runState.isActive

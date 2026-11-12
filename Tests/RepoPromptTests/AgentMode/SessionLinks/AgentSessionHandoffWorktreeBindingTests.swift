@@ -430,7 +430,7 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
                 // The background tab is visible: the existing initial-worktree gate blocks sends,
                 // and an explicit required flush cannot persist the unbound provisional record.
                 gatedDuringInstall = destination.isPreparingInitialWorktree
-                if case .failure = await fixture.viewModel.flushSaveRequired(
+                if case .failure = await fixture.viewModel.persistenceRuntime.flushSaveRequired(
                     for: destination.tabID,
                     workspaceID: workspaceID
                 ) {
@@ -690,7 +690,7 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
                     createdSessionID = sessionID
                     XCTAssertTrue(destination.qualifiedRestorationReadiness.isCreating)
                     XCTAssertNotNil(destination.operationAdmissionFailureMessage, "ordinary operations must be blocked before Oracle cloning suspends")
-                    if case .success = await fixture.viewModel.flushSaveRequired(
+                    if case .success = await fixture.viewModel.persistenceRuntime.flushSaveRequired(
                         for: destination.tabID, workspaceID: workspace.id
                     ) {
                         XCTFail("an external flush must not persist the unconfigured fork")
@@ -828,7 +828,7 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
             XCTAssertTrue(destination.qualifiedRestorationReadiness.isCreating)
             XCTAssertFalse(destination.qualifiedRestorationReadiness.isAuthoritative)
             try await assertRecoveryBlocksSubmission(fixture.viewModel, session: destination)
-            if case .success = await fixture.viewModel.flushSaveRequired(
+            if case .success = await fixture.viewModel.persistenceRuntime.flushSaveRequired(
                 for: destination.tabID, workspaceID: workspace.id
             ) {
                 XCTFail("ordinary persistence must not complete an unconfigured cancelled fork")
@@ -851,7 +851,7 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
             XCTAssertFalse(reopened.qualifiedRestorationReadiness.isCreating)
             XCTAssertEqual(reopened.qualifiedRestorationReadiness.terminalFailure, .missingPayload)
             try await assertRecoveryBlocksSubmission(fixture.viewModel, session: reopened)
-            if case .success = await fixture.viewModel.flushSaveRequired(
+            if case .success = await fixture.viewModel.persistenceRuntime.flushSaveRequired(
                 for: reopened.tabID, workspaceID: workspace.id
             ) {
                 XCTFail("reopening a missing partial fork must not make it saveable")
@@ -1087,7 +1087,7 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
                     let workspaceID = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace?.id)
                     XCTAssertTrue(sawBlockedSave, "the earlier recovery payload must remain the last acknowledged record")
                     let lastAcknowledged = try Data(contentsOf: destinationFile)
-                    let recovery = await fixture.viewModel.flushSaveRequired(for: destination.tabID, workspaceID: workspaceID)
+                    let recovery = await fixture.viewModel.persistenceRuntime.flushSaveRequired(for: destination.tabID, workspaceID: workspaceID)
                     if case .success = recovery { XCTFail("Ordinary flush must not complete or retry a failed creation.") }
                     XCTAssertEqual(try Data(contentsOf: destinationFile), lastAcknowledged)
                     XCTAssertTrue(destination.qualifiedRestorationReadiness.isCreating)
@@ -1344,7 +1344,7 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
 
         // A completed payload retains the execution-location blocker. Incomplete creation and
         // failed restoration must additionally remain blocked when that presentation flag is off.
-        var readiness = AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
+        var readiness = AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
             session: session, endpointMatchesGrant: true, isClosing: false
         )
         if session.qualifiedRestorationReadiness.isAuthoritative {
