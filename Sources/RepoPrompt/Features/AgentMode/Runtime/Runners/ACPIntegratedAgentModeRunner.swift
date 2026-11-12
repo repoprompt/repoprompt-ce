@@ -19,6 +19,9 @@ final class ACPIntegratedAgentModeRunner {
         /// like `.failed`, but the live controller it was addressed to is left in place: nothing about
         /// that session changed, so tearing it down would only discard the target's warm session.
         case refusedBeforeSend(errorText: String)
+        /// The provider failed a dispatched turn but attests its session stayed open. The run fails,
+        /// and the warm controller is kept so the next user message reuses it; the turn is not resent.
+        case failedRetainingController(errorText: String?)
         case superseded
 
         var debugDescription: String {
@@ -33,6 +36,8 @@ final class ACPIntegratedAgentModeRunner {
                 "state=failed error=\(errorText ?? "nil")"
             case let .refusedBeforeSend(errorText):
                 "state=refusedBeforeSend error=\(errorText)"
+            case let .failedRetainingController(errorText):
+                "state=failedRetainingController error=\(errorText ?? "nil")"
             case .superseded:
                 "state=superseded error=nil"
             }
@@ -132,7 +137,7 @@ final class ACPIntegratedAgentModeRunner {
         _ operation: () async throws -> TransientOperationResult
     ) async -> TransientExecutionClassification {
         var explicitFailureText: String??
-        var refusedBeforeSend = false
+        var retainsController = false
         let report = await DomainAgentRunExecutionCore.execute(
             failureText: { error in
                 if let failure = error as? ExplicitTerminalFailure {
@@ -147,13 +152,17 @@ final class ACPIntegratedAgentModeRunner {
             case .cancelled:
                 throw CancellationError()
             case .cancelledBeforeSend:
-                refusedBeforeSend = true
+                retainsController = true
                 throw CancellationError()
             case let .failed(errorText):
                 explicitFailureText = .some(errorText)
                 throw ExplicitTerminalFailure(errorText: errorText)
             case let .refusedBeforeSend(errorText):
-                refusedBeforeSend = true
+                retainsController = true
+                explicitFailureText = .some(errorText)
+                throw ExplicitTerminalFailure(errorText: errorText)
+            case let .failedRetainingController(errorText):
+                retainsController = true
                 explicitFailureText = .some(errorText)
                 throw ExplicitTerminalFailure(errorText: errorText)
             case .superseded:
@@ -171,7 +180,7 @@ final class ACPIntegratedAgentModeRunner {
         return TransientExecutionClassification(
             report: report,
             errorText: errorText,
-            retainsController: refusedBeforeSend
+            retainsController: retainsController
         )
     }
 
@@ -1609,12 +1618,34 @@ final class ACPIntegratedAgentModeRunner {
             let normalizedText = displayText(for: normalizedError)
             log("controller.prompt failed raw=\(String(describing: error)) normalized=\(normalizedText)", runID: runID)
             let outcome = await consumeTask.value
-            return .failed(errorText: promptFailureErrorText(outcome: outcome, fallback: normalizedText))
+            return await retainingPreservedSession(
+                .failed(errorText: promptFailureErrorText(outcome: outcome, fallback: normalizedText)),
+                controller: controller, agentKind: runRequest.agentKind
+            )
         }
 
-        let outcome = await consumeTask.value
+        // A steering prompt's provider failure ends the run here, through the consumer's terminal.
+        let outcome = await retainingPreservedSession(
+            consumeTask.value, controller: controller, agentKind: runRequest.agentKind
+        )
         log("event consumer completed \(outcome.debugDescription)", runID: runID)
         return outcome
+    }
+
+    /// Keeps the controller when the turn's failure left the provider session open, as the provider
+    /// attested; every other outcome passes through unchanged. Only providers whose MCP routing
+    /// settles before the prompt qualify: a deferred lease's failure cleanup would revoke routing for
+    /// the run ID the kept controller goes on using.
+    private func retainingPreservedSession(
+        _ outcome: TransientOperationResult,
+        controller: ACPAgentSessionController,
+        agentKind: AgentProviderKind
+    ) async -> TransientOperationResult {
+        guard case let .failed(errorText) = outcome,
+              agentKind.requiresPrePromptAgentModeMCPRouting,
+              await controller.retainsSessionAfterLastPromptFailure
+        else { return outcome }
+        return .failedRetainingController(errorText: errorText)
     }
 
     /// One provider control command turn: exactly `/<command>` as the whole prompt, sent only while
@@ -1782,10 +1813,15 @@ final class ACPIntegratedAgentModeRunner {
             let normalizedText = await displayText(for: controller.normalizeError(error))
             log("provider control command failed normalized=\(normalizedText)", runID: runID)
             let outcome = await consumeTask.value
-            return .failed(errorText: promptFailureErrorText(outcome: outcome, fallback: normalizedText))
+            return await retainingPreservedSession(
+                .failed(errorText: promptFailureErrorText(outcome: outcome, fallback: normalizedText)),
+                controller: controller, agentKind: runRequest.agentKind
+            )
         }
 
-        let outcome = await consumeTask.value
+        let outcome = await retainingPreservedSession(
+            consumeTask.value, controller: controller, agentKind: runRequest.agentKind
+        )
         if case .completed = outcome,
            command.kind == .compact,
            session.items.count == transcriptItemsAtDispatch,
@@ -2155,7 +2191,8 @@ final class ACPIntegratedAgentModeRunner {
             prepareProviderState: {
                 session.pendingSupersedingTurnCompletions = 0
                 if retainsController {
-                    // Nothing reached the provider; the session's controller and run identity stand.
+                    // Nothing reached the provider, or the provider kept its session open after
+                    // failing the turn; the session's controller and run identity stand.
                 } else if terminalState != .completed {
                     if let controller, session.acpController === controller {
                         session.acpController = nil
