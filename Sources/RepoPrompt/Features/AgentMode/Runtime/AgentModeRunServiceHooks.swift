@@ -115,7 +115,8 @@ extension AgentModeRunService {
             _ attachments: [AgentFileAttachment],
             _ taggedFileAttachments: [AgentTaggedFileAttachment],
             _ session: AgentTabSession?,
-            _ skipsSlashExpansion: Bool
+            _ skipsSlashExpansion: Bool,
+            _ isCurrent: @escaping @MainActor () -> Bool
         ) async -> String
         /// False refuses a fresh-session fallback whose recovery context was superseded or unavailable.
         let stageResumeRecoveryHandoffIfNeeded: (_ session: AgentTabSession) async -> Bool

@@ -16,7 +16,7 @@ extension AgentModeViewModel {
         let workflow: AgentWorkflowDefinition?
         let workflowGeneration: UInt64
         var routingTask: Task<StagedTaskRoutingResult, Never>?
-        var effortTask: Task<(selection: AutoEffortTurnSelection?, audit: AgentAutomationTurnAudit.Feature), Never>?
+        var effortTask: Task<(selection: AutoEffortTurnSelection?, audit: AgentAutomationTurnAudit.Feature)?, Never>?
         var reuse: Reuse = .none
         var balanceIsCurrent: (() -> Bool)?
 
@@ -86,12 +86,21 @@ extension AgentModeViewModel {
         } else if speculation.effortConfiguration.enabled, !session.runState.isActive,
                   let effortBackend = speculation.effortConfiguration.selectedBackendID, runtime.isBackendReady(effortBackend)
         {
+            guard let membership = runtimeMembership(for: session) else { return }
             speculation.effortTask = Task {
-                await chooseAutoEffortForUserTurn(
+                var admitted = true
+                let choice = await chooseAutoEffortForUserTurn(
                     text: Self.automationJudgingText(original: originalText, reprompted: text),
                     session: session, workflow: session.selectedWorkflow,
-                    requestID: speculation.requestID, isSpeculative: true, isRepromptReplacement: true
+                    requestID: speculation.requestID, isSpeculative: true, isRepromptReplacement: true,
+                    isCurrent: {
+                        admitted = admitted && membership.permitsBindingPreparation && sessions[session.tabID] === session
+                        return admitted
+                    }
                 )
+                // A refused speculation is not an ordinary policy fallback. Recompute through
+                // the accepting composer's own claim rather than reusing this stale result.
+                return admitted ? choice : nil
             }
         } else {
             return

@@ -363,7 +363,7 @@ final class AgentSessionLinkACPRunnerPromptAdapterTests: XCTestCase {
         return url
     }
 
-    private func makeFixture(failPromptsContaining: String? = nil, bound: Bool = false) throws -> Fixture {
+    private func makeFixture(failPromptsContaining: String? = nil) throws -> Fixture {
         let workspace = try makeTemporaryDirectory()
         let scriptURL = try AgentSessionLinkACPServerScript.write(to: workspace)
         var environment: [String: String] = [:]
@@ -381,7 +381,7 @@ final class AgentSessionLinkACPRunnerPromptAdapterTests: XCTestCase {
             workspacePath: workspace.path
         )
         harnesses.append(harness)
-        let session = bound ? try harness.makeBoundSession(agent: .openCode) : harness.makeSession(agent: .openCode)
+        let session = try harness.makeBoundSession(agent: .openCode)
         let request = ACPRunRequest(
             agentKind: .openCode,
             modelString: nil,
@@ -400,9 +400,13 @@ final class AgentSessionLinkACPRunnerPromptAdapterTests: XCTestCase {
     }
 
     private func startRun(_ fixture: Fixture, message: String, localComposerCandidate: UUID? = nil) async {
+        guard let origin = try? fixture.harness.startCommand(for: fixture.session) else { XCTFail("Missing restored writer")
+            return
+        }
         _ = await fixture.harness.composition.startRun(
             tabID: fixture.session.tabID,
             session: fixture.session,
+            origin: origin,
             initialUserMessage: message,
             initialMessageForRun: message,
             attachments: [],
@@ -434,7 +438,7 @@ final class AgentSessionLinkACPRunnerPromptAdapterTests: XCTestCase {
     }
 
     func testLocalInputRealAuthorityACPFreshReuseAndActiveSteeringPhysicalPrompts() async throws {
-        let fixture = try makeFixture(bound: true)
+        let fixture = try makeFixture()
         let input = try await AgentSessionLinkTransportLocalInputFixture.install(on: fixture.harness.host, session: fixture.session)
         fixture.harness.localInputFixture = input
         addTeardownBlock { @MainActor in await input.cleanup() }
@@ -542,15 +546,15 @@ final class AgentSessionLinkACPRunnerPromptAdapterTests: XCTestCase {
 
     // MARK: Composition point
 
-    func testMembershipChangeDuringPrepareForNextTurnIsReflectedAtDispatch() async throws {
+    func testMembershipChangeAfterMessageConstructionIsReflectedAtDispatch() async throws {
         let fixture = try makeFixture()
         fixture.harness.publishInventory(revision: 1, targetCount: 1)
         await startRun(fixture, message: "acp initial")
         XCTAssertEqual(fixture.harness.acceptedClaims.count, 1)
 
-        // Fires after the message is built and before `prepareForNextTurn()` suspends — exactly the
-        // window the old composition point sat in. Composing there would ship revision 1 (already
-        // acknowledged, so: nothing at all); composing after the suspension ships revision 2.
+        // Fires after message construction, now downstream of controller preparation. Composing
+        // next to the builder would ship revision 1 (already acknowledged, so: nothing at all);
+        // composition must still observe this later synchronous projection's revision 2.
         fixture.harness.onAttachmentsConsumed = { [weak harness = fixture.harness] in
             harness?.publishInventory(revision: 2, targetCount: 4)
             harness?.onAttachmentsConsumed = nil
@@ -566,7 +570,7 @@ final class AgentSessionLinkACPRunnerPromptAdapterTests: XCTestCase {
         )
         XCTAssertTrue(
             reused.userMessage.contains("count=\"4\""),
-            "membership added while the turn was suspended must reach the provider"
+            "membership added after message construction must reach the provider"
         )
         XCTAssertEqual(fixture.harness.acceptedClaims.count, 2)
     }
@@ -638,10 +642,10 @@ final class AgentSessionLinkACPRunnerPromptAdapterTests: XCTestCase {
         await startRun(fixture, message: "acp initial")
         let session = fixture.session
         let controller = try XCTUnwrap(session.acpController)
-        if session.persistentSessionBindingIdentity == nil {
-            session.testInstallPersistentSessionBinding(sessionID: UUID())
-        }
         let binding = try XCTUnwrap(session.persistentSessionBindingIdentity)
+        // Fresh startup now requires a real restored writer. Reinstall that scoped binding
+        // explicitly to retain this test's separate pre-restoration admission assertion.
+        session.installPersistentSessionBinding(binding)
         XCTAssertNotNil(session.operationAdmissionFailureMessage, "Installing the fixture binding does not restore it")
         // The interrupt race begins with an already restored session that can accept steering.
         session.recordRestorationAuthoritative(.persistedPayloadApplied)

@@ -16,7 +16,7 @@ var packageDependencies: [Package.Dependency] = [
     .package(url: "https://github.com/swiftlang/swift-markdown", exact: "0.6.0"),
     .package(url: "https://github.com/swift-server/swift-service-lifecycle.git", exact: "2.8.0"),
     .package(url: "https://github.com/apple/swift-system.git", exact: "1.6.4"),
-    .package(url: "https://github.com/repoprompt/swift-sdk.git", revision: "5716de85a976a8f70dedc9cb000e50aaa0d8cc5b"),
+    .package(url: "https://github.com/repoprompt/swift-sdk.git", revision: "1b8ca21c560e7678023e524d9a666220e7d7194c"),
     // RepoPromptApp and RepoPromptCodeMapCore share this customized wrapper/runtime graph.
     .package(
         url: "https://github.com/repoprompt/swift-tree-sitter.git",

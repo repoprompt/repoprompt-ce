@@ -546,8 +546,11 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
         session.selectedAgent = .claudeCode
         session.selectedModelRaw = "claude-opus-5-5:high"
         session.hasLoadedPersistedState = true
-        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        let scope = AgentSessionRuntimeStore.shared.makeScope()
+        scope.replaceSessions([session.tabID: session])
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: UUID()))
         session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        addTeardownBlock { @MainActor in scope.replaceSessions([:]) }
         _ = try XCTUnwrap(
             session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
             "The restored conversation must be ready before exercising native Auto fallback."
@@ -578,7 +581,7 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
                 if afterClassification { await controller.test_setBeforeApplicationErrorReturn { await gate.pause() } }
                 let (coordinator, session, intent) = try fixture(controller)
                 let send = Task {
-                    await coordinator.sendClaudeNativeMessage(
+                    await coordinator.test_sendClaudeNativeMessage(
                         session: session, text: "older ordinary turn", attachments: [], intent: intent,
                         allowsCatalogRouteControllerRecovery: false,
                         autoEffortSelection: .init(
@@ -622,7 +625,7 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
             return [:]
         }, write: { writes.append($0) })
         let (coordinator, session, intent) = try fixture(controller)
-        let outcome = await coordinator.sendClaudeNativeMessage(
+        let outcome = await coordinator.test_sendClaudeNativeMessage(
             session: session, text: "current ordinary turn", attachments: [], intent: intent,
             allowsCatalogRouteControllerRecovery: false,
             autoEffortSelection: .init(
@@ -660,14 +663,14 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
             return [:]
         }, write: { writes.append($0) })
         let (coordinator, session, intent) = try fixture(controller)
-        let ensured = await coordinator.ensureClaudeNativeSession(session: session, intent: intent)
+        let ensured = await coordinator.test_ensureClaudeNativeSession(session: session, intent: intent)
         XCTAssertEqual(ensured, .ready)
         let picker = Task { await coordinator.applyCurrentClaudeModelAndEffortIfPossible(for: session, reason: "test.picker") }
         defer { picker.cancel()
             pickerGate.resume()
         }
         try await pickerGate.waitUntilEntered()
-        let auto = await coordinator.sendClaudeNativeMessage(
+        let auto = await coordinator.test_sendClaudeNativeMessage(
             session: session, text: "Auto turn", attachments: [], intent: intent,
             allowsCatalogRouteControllerRecovery: false,
             autoEffortSelection: .init(
@@ -684,7 +687,7 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
         XCTAssertFalse(inFlight)
         pickerGate.resume()
         await picker.value
-        let manual = await coordinator.sendClaudeNativeMessage(
+        let manual = await coordinator.test_sendClaudeNativeMessage(
             session: session, text: "Manual turn", attachments: [], intent: intent,
             allowsCatalogRouteControllerRecovery: false
         )
@@ -716,7 +719,7 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
         }, write: { writes.append($0) })
         let (coordinator, session, intent) = try fixture(controller)
         let auto = Task {
-            await coordinator.sendClaudeNativeMessage(
+            await coordinator.test_sendClaudeNativeMessage(
                 session: session, text: "Superseded Auto turn", attachments: [], intent: intent,
                 allowsCatalogRouteControllerRecovery: false,
                 autoEffortSelection: .init(
@@ -739,7 +742,7 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
         XCTAssertEqual(writes.count, 0)
         pickerGate.resume()
         await picker.value
-        let manual = await coordinator.sendClaudeNativeMessage(
+        let manual = await coordinator.test_sendClaudeNativeMessage(
             session: session, text: "Manual turn", attachments: [], intent: intent,
             allowsCatalogRouteControllerRecovery: false
         )
@@ -767,7 +770,7 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
         }, write: { writes.append($0) })
         let (coordinator, session, intent) = try fixture(controller)
         let auto = Task {
-            await coordinator.sendClaudeNativeMessage(
+            await coordinator.test_sendClaudeNativeMessage(
                 session: session, text: "Superseded Auto turn", attachments: [], intent: intent,
                 allowsCatalogRouteControllerRecovery: false,
                 autoEffortSelection: .init(
@@ -787,7 +790,7 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
         guard case .failed = outcome else { return XCTFail("Superseded Auto must not send: \(outcome)") }
         XCTAssertEqual(writes.count, 0)
         try assertLastAppliedEffort(applied, equals: "low")
-        let manual = await coordinator.sendClaudeNativeMessage(
+        let manual = await coordinator.test_sendClaudeNativeMessage(
             session: session, text: "Manual turn", attachments: [], intent: intent,
             allowsCatalogRouteControllerRecovery: false
         )

@@ -3981,6 +3981,85 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testDeferredHydrationSubmissionCannotAdoptAReacquiredSameObjectWriter() async throws {
+            for change in ["beforeTask", "duringRead", "retire"] {
+                let whileReading = change == "duringRead"
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let session = fixture.sourceSession
+                    let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+                    guard case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(
+                        workspaceID: fixture.workspace.id, sessionID: sessionID
+                    ) else { return XCTFail("Fixture must own its writer") }
+                    let loaded = try await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: fixture.workspace)
+                    var saved = try XCTUnwrap(loaded)
+                    saved.agentKind = AgentProviderKind.openCode.rawValue
+                    saved.agentModel = "unknown-window"
+                    _ = try await AgentSessionDataService.shared.saveAgentSession(saved, for: fixture.workspace)
+                    fixture.window.promptManager.apiSettingsViewModel?.isOpenCodeConnected = true
+                    session.selectedAgent = .openCode
+                    session.selectedModelRaw = "unknown-window"
+                    let file = fixture.rootURL.appendingPathComponent("retained-input.txt")
+                    try "retained input".write(to: file, atomically: true, encoding: .utf8)
+                    let image = AgentFileAttachment(source: .localFile(path: file.path), title: "Retained")
+                    let tagged = AgentTaggedFileAttachment(relativePath: file.path, displayName: "Retained")
+                    let workflow = AgentWorkflowDefinition(customID: UUID(), displayName: "Retained", template: "$ARGUMENTS")
+                    session.pendingFileAttachments = [image]
+                    session.pendingTaggedFileAttachments = [tagged]
+                    vm.selectWorkflow(workflow)
+                    session.hasLoadedPersistedState = false
+                    let entered = AgentSessionLinkStopSignal<Void>()
+                    let release = AgentSessionLinkStopSignal<Void>()
+                    defer { release.finish(()) }
+                    addTeardownBlock { await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook(nil) }
+                    let reads = ProviderSwitchScaleReads()
+                    await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook { id in
+                        guard id == sessionID else { return }
+                        await reads.record(id)
+                        await entered.finish(())
+                        await release.value()
+                    }
+                    var pending: Task<AgentModeViewModel.UserTurnSubmissionResult, Never>?
+                    var starts = 0
+                    vm.test_providerSwitchStart = { _, _, _ in starts += 1 }
+                    XCTAssertEqual(vm.submitUserTurn(
+                        text: "old input", tabID: session.tabID, scheduledProviderSwitchSubmission: { pending = $0 }
+                    ), .submitted)
+                    let deferred = try XCTUnwrap(pending)
+                    if whileReading { await entered.value() }
+                    let binding = session.persistentSessionBindingIdentity
+                    let members = writer.scope.sessions
+                    if change == "retire" {
+                        writer.scope.beginRetirement()
+                        XCTAssertTrue(writer.ownsPersistentClaim)
+                    } else {
+                        writer.scope.replaceSessions(members.filter { $0.key != session.tabID })
+                        writer.scope.replaceSessions(members)
+                        XCTAssertFalse(writer.ownsPersistentClaim)
+                    }
+                    XCTAssertEqual(session.persistentSessionBindingIdentity, binding)
+                    vm.storeDraftText(for: session.tabID, change == "retire" ? "" : "successor draft")
+                    let items = session.items
+                    let saveGeneration = session.saveRequestGeneration
+                    release.finish(())
+                    let result = await deferred.value
+                    guard case .blocked = result else { return XCTFail("Old submission must refuse after reacquisition") }
+                    await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook(nil)
+                    let readIDs = await reads.snapshot()
+                    XCTAssertEqual(readIDs, whileReading ? [sessionID] : [])
+                    XCTAssertEqual(session.items, items)
+                    XCTAssertEqual(vm.retrieveDraftText(for: session.tabID), change == "retire" ? "old input" : "successor draft")
+                    XCTAssertFalse(session.hasLoadedPersistedState, "The hydration runtime must also reject the original stale read")
+                    XCTAssertEqual(session.pendingFileAttachments.map(\.id), [image.id])
+                    XCTAssertEqual(session.pendingTaggedFileAttachments.map(\.id), [tagged.id])
+                    XCTAssertEqual(session.selectedWorkflow, workflow)
+                    XCTAssertTrue(session.pendingClaudeSteeringInstructions.isEmpty)
+                    if change != "retire" { XCTAssertEqual(session.saveRequestGeneration, saveGeneration) }
+                    XCTAssertEqual(starts, 0)
+                }
+            }
+        }
+
         func testOrdinaryUnloadedSubmissionConsumesOnlyCapturedAttachmentsAndWorkflow() async throws {
             try await withFixture { fixture in
                 let vm = fixture.viewModel

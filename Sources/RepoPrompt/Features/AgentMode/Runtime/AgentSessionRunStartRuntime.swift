@@ -55,7 +55,8 @@ final class AgentSessionRunStartRuntime {
             }
         }
         guard let owner = scope, owner.sessions[session.tabID] === session,
-              !owner.isRetiring, !owner.hasReleasedWriterClaims else { return nil }
+              !owner.isRetiring, !owner.hasReleasedWriterClaims,
+              let originalMembership = owner.membership(of: session) else { return nil }
         defer { withExtendedLifetime(owner) {} }
         let tabID = session.tabID
         var writer: AgentSessionRuntimeStore.Writer?
@@ -85,7 +86,10 @@ final class AgentSessionRunStartRuntime {
             guard owner.sessions[tabID] === session, !owner.isRetiring, !owner.hasReleasedWriterClaims,
                   resourcesAreCurrent() else { return false }
             if let writer { return writer.isCurrent }
-            return session.currentRestorationBindingToken == originalBindingToken
+            // A blank draft has no persistent Writer yet. Its slot still has exact provenance:
+            // preparation must not adopt a remove/re-add of the same unbound object.
+            return originalMembership.permitsBindingPreparation
+                && session.currentRestorationBindingToken == originalBindingToken
         }
         if let writer, let originalWorkspaceID, originalWorkspaceID != writer.identity.workspaceID {
             startOutcome?.recordStartFailure(message: "Workspace resources do not belong to the session's runtime writer.")
@@ -338,6 +342,7 @@ final class AgentSessionRunStartRuntime {
         return await environment.composition().startRun(
             tabID: tabID,
             session: session,
+            origin: command,
             initialUserMessage: augmentedInitialMessage,
             initialMessageForRun: initialMessageForRun,
             attachments: attachments,

@@ -13,6 +13,7 @@
 import Dispatch
 import Foundation
 import Logging
+import RepoPromptShared
 
 #if canImport(Darwin)
     import Darwin
@@ -120,7 +121,6 @@ public final class NewlineDelimitedSocketReader {
     private let fd: Int32
     private let queue: DispatchQueue
     private let logger: Logger
-    private let delimiter: UInt8
     private let chunkSize: Int
     private let bufferReservation: Int
     private let maxReadCallsPerEvent: Int
@@ -136,7 +136,7 @@ public final class NewlineDelimitedSocketReader {
 
     private var source: ReadEventSource?
     private var pendingCancelledSources: [ObjectIdentifier: ReadEventSource] = [:]
-    private var buffer = Data()
+    private var buffer = MCPNewlineFrameBuffer()
     private var lifecycle = Lifecycle.idle
     private var generation: UInt64 = 0
     private var pumpRunning = false
@@ -222,7 +222,7 @@ public final class NewlineDelimitedSocketReader {
         self.fd = fd
         self.queue = queue
         self.logger = logger
-        self.delimiter = delimiter
+        buffer = MCPNewlineFrameBuffer(delimiter: delimiter, capacity: bufferReservation)
         self.chunkSize = chunkSize
         self.bufferReservation = bufferReservation
         self.maxReadCallsPerEvent = max(1, maxReadCallsPerEvent)
@@ -234,7 +234,6 @@ public final class NewlineDelimitedSocketReader {
         self.onError = onError
         self.onBytesRead = onBytesRead
         self.onCancel = onCancel
-        buffer.reserveCapacity(bufferReservation)
         queue.setSpecific(key: queueKey, value: 1)
     }
 
@@ -362,11 +361,8 @@ public final class NewlineDelimitedSocketReader {
         while drainedCount < limit,
               pumpGeneration == generation,
               lifecycle == .running,
-              let newlineIndex = buffer.firstIndex(of: delimiter)
+              let frame = buffer.nextFrame()
         {
-            let frame = Data(buffer[..<newlineIndex])
-            let nextStart = buffer.index(after: newlineIndex)
-            buffer.removeSubrange(..<nextStart)
             drainedCount += 1
 
             if !frame.isEmpty {

@@ -7534,6 +7534,114 @@ The index check attempted while validation was active refused to attest freshnes
 source files but freshness unproven); the last successful checkpoint check was 1,254/1,360 wrong-way
 edges and 53/66 largest cycle. This is not recorded as a fresh integrated index pass.
 
+#### M9.2e — unbound startup preparation provenance (local follow-up)
+
+Run start now captures the existing scope membership receipt before any host-preparation await.
+Before persistent binding exists, currency requires that exact slot incarnation, not merely the same
+object and nil restoration token. After synchronous binding installs a persistent writer, the existing
+writer checks take over; unchanged publication of the original tab remains valid. This does not close
+synchronous bind-callback reentry, host-adapter retirement or inner provider/factory/lease dispatch.
+The existing first-save/start test now covers unchanged preparation, adding/removing a sibling tab,
+same-object unbound reacquisition during preparation, and reacquisition after durable acknowledgement.
+The stale preparation cannot bind, request a save or dispatch; the original positive and post-ack
+assertions remain. Oracle review `2026-11-10/2029` approved the fence and requested a meaningful
+sibling-change witness instead of an identical-map no-op; that strengthening and explicit save-request
+assertions are applied. Scoped pinned formatting and strict lint pass. Focused ticket
+`7e24d98f-b809-4095-99dc-fe032af304c1` passed **307 tests**, no failures or skips; the expanded
+four-variant startup witness passed in 0.206s. Actual compilation emitted zero warning occurrences
+in both changed Swift files, matching their baseline. The fresh post-test index check passed at
+**1,254/1,360 wrong-way edges, 53/66 largest cycle**, baseline unchanged. These are local checkpoint
+receipts, not a new full publication gate. #1679 remains at `c10f85830`; the overseer requires no
+further push until its CI result is reported. #1677's merge `7717cb6bf` is noted but not integrated
+in this local checkpoint.
+
+#### M9.2e — restored startup admission and fresh ACP construction (local follow-up)
+
+The existing restored `Command` now crosses run composition and run-service admission instead of
+being discarded at that boundary. Common entry and direct ACP preparation require the exact session
+object and restored command; creating/runtime-only fixtures are not a provider-start authority.
+Fresh ACP resource preparation rechecks that command across provider construction, support lookup,
+controller construction and the expected-run-ID actor hop. An uninstalled controller is shut down;
+the captured, not-yet-acquired lease is cancelled. After claim loss, the old operation does not settle
+composer state, publish terminal state, finalize attachments or schedule a save through the new claim.
+An exclusive original claim suspended for retirement may still settle its own startup via the existing
+terminal barrier. No new manager or ownership registry is introduced, and the strong command remains
+operation-local rather than being captured by `session.agentTask` or terminal-resource closures.
+
+Claim loss does not automatically terminate or adopt the shared run attempt: its payload and reserved
+attachments remain the current claimant's responsibility. The existing Stop path can settle it even
+without an installed task/controller; the new causal witness checks that explicitly. Automatic
+claim-loss lifecycle transfer, existing-controller reuse, physical prompt admission and terminal-barrier
+revalidation after its own awaits remain OPEN. This slice does not claim full ACP/startup closure.
+The common recorder now refuses a lost claim rather than inferring acceptance from shared `.running`
+state when a runner returns without resources.
+
+Oracle review `2026-11-10/2208` requested that outcome correction, immutable actor-owned test snapshots,
+real lease run IDs and a pre-fulfillment loss witness; these are applied. One new test method covers
+queued/provider/support/controller loss and original-claim retirement, including throwing factories/
+support, no successor save/publication, release of captured resources and current-claim Stop.
+Existing runner fixtures now install real scoped/restored bindings; input-only runtime workspace tests
+and all existing assertions/budgets remain. The expected-run-ID hop is source-fenced but no additional
+controller test seam was added for a suspension inside that hop.
+
+Initial ticket `a866f913-db03-49d5-8cb9-f9977fd6816d` failed compilation on 13 missed test-only
+Claude composition calls. They now pass their already restored fixture writer. Ticket
+`c99a8934-8c28-4b65-a026-4ba0539ae0a9` compiled and executed 368 tests with one fixture assertion
+failure: the migrated ACP fixture was already restored, so its conditional nil-binding setup no longer
+invalidated readiness. The test now explicitly reinstalls the same scoped binding before the unchanged
+pre-restoration assertion. Final ticket `88f8819e-d764-4c10-938a-66b95ab0843b` passed **368 tests,
+zero failures or skips**, including the seven-variant resource-loss witness (0.262s), real ACP/Claude
+runner paths, self-compaction, waiting ownership, Auto-wake and restoration admission.
+
+Full lint's first attempt `5a4146df-ae38-44c7-80a1-1184ed974a86` timed out in an unchanged formatter
+rule/file; retry `0b5e26b3-da28-4af8-9cc2-c6e87c3114a8` passed without settings changes. The final
+fixture correction also passed scoped pinned formatting and strict lint. Actual compile logs across
+12 touched Swift files have no positive warning-occurrence deltas versus retained M9.2c/integrated
+baseline compilations: ACP runner 1→1, Claude lifecycle tests 1→1, ACP compact tests 1→1, AutoWake
+11→10, ACP prompt-adapter tests 1→1, other seven 0→0. The fresh post-test index check passed at
+**1,254/1,360 wrong-way edges, 53/66 largest cycle**, baseline unchanged. This is a local checkpoint,
+not a new full SessionLinks/product/live-app publication gate.
+
+The overseer subsequently confirmed fully green CI on #1679's `c10f85830`, including all three under-watch
+cases; its PR note was updated without pushing code. #1679 must stay scoped to the published binding/
+hydration work. This startup follow-up remains local for M9.2g, pending #1679's merge and separately
+instructed squash integration/publication.
+
+#### M9.2g — existing ACP controller probe admission (local follow-up)
+
+Existing-controller compatibility/reusability probes and the detached replacement shutdown now
+revalidate the operation-local restored command, original attempt and exact controller before reuse,
+replacement or provider-control launch. A lost claim records refusal without retiring its shared
+controller, clearing process identity, settling attachments or publishing terminal state. An exclusive
+original claim whose admission is suspended cancels its unsent attempt through the existing barrier,
+reparks the staged handoff and retains its warm controller. Replacement still detaches synchronously
+under current authority before shutting down that captured controller. No persistent task captures
+the strong command. The service also preserves an explicitly recorded refusal instead of inferring
+acceptance from a successor's still-active run state; headless records acceptance only at its existing
+successful installation point, not as a provisional fallback.
+
+Oracle review `2026-11-10/2307-2` requested the missing unsent-handoff notification, service-level
+outcome witness and additional owned-suspended checks; these are applied. One causal test method
+uses real bootstrapped script controllers and a synchronous DEBUG hook at the actual post-await
+checks. Its ten variants cover reacquisition at all probe boundaries, retirement with warm controller
+and process identity preservation, current-owner Stop, unchanged replacement, and a successor attempt
+through the real run service. The returned positive preparation is explicitly settled after Stop.
+The hook adds no suspension or alternate admission path. Controller shutdown remains idempotent;
+test teardown keeps a fallback shutdown for throwing fixture setup and also drains before removing
+its temporary script directory.
+
+The initial focused ticket `02d1f888-6a24-4160-ba11-0d17cb54fc42` was cancelled before heavy admission
+to apply review fixes. Focused ticket `30a604d4-4aac-47d7-ab3a-628ae666a716` passed the ten-variant
+method (one executed test, zero failures, 4.214s). Affected-suite ticket
+`103c86ad-4b3a-4bdc-9b5b-8a1f0933d642` passed **369 tests, zero failures or skips**; full lint
+`ff2cfd0c-38d5-4d37-8322-14148d9be342` passed. Initial scoped lint hit an unwritable sandbox cache;
+non-caching strict scoped lint passed without changing rules. Actual compilation across five touched
+Swift files has no positive warning-occurrence deltas: ACP runner 1→1, other four 0→0.
+The fresh post-test index check passed at **1,254/1,360 wrong-way edges and 53/66 largest cycle**,
+with the baseline unchanged. Persistent task/lease/bootstrap/configuration and
+physical actor-write fences, event-consumer exits and the terminal barrier's own post-await authority
+remain OPEN. This is not a complete ACP execution or publication qualification.
+
 ### M9.4 phase 0: presentation-lifetime groundwork (refs #1406)
 
 Base `534e2c759`. This slice does **not** implement close-preserves-run, host leases,
@@ -7584,6 +7692,771 @@ including the corrected prepared-owner visit case (one), runtime store (16), pre
 notification coordinator (15) and notification planner (12). Full lint
 `fdb3ba6e-3fcd-4566-ad9d-8ea4dba50a45` passed. These tickets survived the host-app restart;
 their terminal state and exact selected cases were reconciled before more work was submitted.
+
+#### M9.2g — local integration of the overseer M9.4 merge
+
+Normal merge `308c469396d19fe896fc40989786db5c7d3f669b` joins local ACP checkpoint
+`9063054cae425a867d0031d2c50822cf59559805` with the overseer's pushed `fb19813cb5f8e8e4f194002f578562aac10c3fea`.
+Only the appended ledger sections conflicted; both are retained. `AgentSessionPresentationRuntime`
+and `AgentModeViewModel` are byte-identical to the incoming resolution, preserving hydration,
+`isAvailable` and detached-sink intent. This merge used `--no-commit` and passed staged commit preflight
+before recording the merge. No startup work was pushed to #1679.
+
+Merged focused ticket `a0c674e9-c5be-4f38-b010-bf620211cfb2` passed **412 tests, zero failures or
+skips**, including the ACP/runner selection plus runtime-store, presentation and notification-planner
+coverage. Full lint `79e5adbe-5417-4a1c-bf63-c793dad45855` passed. Actual merged compilation preserves
+the five probe-checkpoint files' warning counts (ACP runner 1, other four 0). Fresh index check passed
+at **1,261/1,360 wrong-way edges, 53/66 largest cycle** after integration (previous local tree: 1,254;
+ratchet baseline unchanged). This focused integration receipt is not a full publication/product gate.
+
+#### M9.2g — persistent ACP task admission through fresh lease acquisition (local)
+
+`WriterReceipt` retains only a weak scope and exact value writer identity, and accepts restored
+commands only. It reconstitutes the originating claim, never a newly resolved writer. Fresh and
+reused ACP tasks check it at entry and after tool-tracking setup; fresh tasks also check after
+successful lease acquisition and after awaiting the failure outcome. An exclusive but suspended
+original writer cancels through the existing terminal barrier (retaining a warm reused controller).
+A lost claim performs no shared terminal/controller/policy mutation. Its captured bootstrap gate
+alone is released after acquisition; the installed attempt's current-owner Stop retains resource
+cleanup responsibility. Composer-candidate settlement checks claim ownership, not active-attempt
+presence: an ordinary terminal clears the attempt before the task's defer runs.
+
+Two regression methods cover twelve task/lease/reuse/retirement boundaries plus weak scope/session
+lifetime, same-object reacquisition, conflict and creation-command refusal. They assert actual
+scripted-provider request absence, gate release, policy retention until Stop, controller retention,
+and composer-candidate settlement/preservation. Existing creation coverage also asserts receipt
+refusal. Oracle review `untitled-chat-6F1A83`, snapshot `2026-11-11/0010`, completed once; its candidate
+settlement, actor-isolated test-counter and weak-session coverage findings are addressed.
+
+Initial focused ticket `9e7ed0a5-2ecf-40f8-abc4-02e210be8d39` failed compilation because the new test
+used a nonexistent controller process accessor. The test now observes the existing scripted RPC
+log instead; its associated unnecessary-await warning is gone. Focused retry
+`3fe25e78-163a-4b8a-ae81-65a3de31d5f2` passed both methods (4.993s and 0.005s). Full lint
+`425e9e8e-f865-45cd-94a5-6694da464281` passed. The first affected run
+`87d18eef-76bf-4200-a8b7-6a2c16532cbe` ran 397 tests with one new-test failure: it inspected policy
+cleanup after task completion, although terminal publication and terminal teardown are distinct.
+The fixture now joins `awaitTerminalTeardown` for the captured retiring attempt before that assertion;
+no production timeout, cleanup timing or assertion was weakened. Final affected ticket
+`d1d5670d-d77b-4597-8ca1-8ecd03c7fcec` passed **397 tests, zero failures/skips** (107.318s; the new
+boundary matrix 2.159s). Final fixture formatting and strict lint passed. Actual compiled warning
+occurrences remain ACP runner 1 and the other three touched Swift files 0, matching the integrated
+baseline; the corrected test was recompiled without its initial accessor/await diagnostic. Fresh
+index check passed at **1,261/1,360 wrong-way edges and 53/66 largest cycle**, unchanged. These are
+local checkpoint gates, not both-product/full-SessionLinks/live-app or hosted-CI qualification.
+
+This is not full startup closure: reused configuration/deferred acquisition, bootstrap/configuration/
+routing/prompt writes, tool-tracking callbacks, post-dispatch events/terminal work, and barrier-internal
+awaits remain open. Claim loss before a reused dedicated note starts deliberately does not re-park
+successor state; recovery belongs to the current owner. Gate-only release currently uses the existing
+`route_wait_deferred` diagnostic, not a new policy-cleanup operation. No shared lease manager,
+strong-command task cycle, physical actor-write fence, lifecycle-handoff change or push is claimed.
+
+Local process deviation: `e68e94fe31dc8e9487e82019ce699deba11279c8` was committed while its mandatory
+preflight was still running, rather than after the terminal result. The preflight had already scanned
+those staged blobs; `/tmp/m92g-task-receipt-preflight.log` subsequently completed successfully with
+repository guardrails and 55 target placements. No push or history rewrite followed. This does not
+retroactively satisfy the required before-commit sequencing; subsequent commits must wait for the
+preflight process's terminal exit before invoking Git commit.
+
+### M9.2g local prerequisite — no ordinary ACP consumer before dispatch admission
+
+The ordinary ACP prompt path now acquires its buffered stream as before but creates its consumer only
+following all five synchronous/async pre-dispatch refusal checks. The release helper is nonthrowing;
+the prompt exception handler and oracle-reservation lifetime remain unchanged. This removes the
+orphaned consumer on an unsent turn rather than adding a cancellation task owner. The control-command
+path already cancels/joins its consumer and is unchanged. Post-dispatch ownership remains open.
+
+One Oracle review (`0055`, chat `6F1A83`) requested an actual progress-stage witness and a release-time
+refusal case; the real-controller test now covers success, cancellation during proof and an explicit
+handoff refusal, checking consumer creation, `.preparingRuntime` during proof/release, terminal state
+and actual prompt log. The test harness injects only the release result using the existing production
+release constructor; there is no production permission bypass. The proof yields but is not a claim
+that executor scheduling deterministically runs every earlier task; the creation counter remains the
+causal witness, with progress as the additional observable assertion.
+
+Ordering audit: `AgentSessionLinkProviderInputRelease` uses immutable claim/proof data and current
+claim/authorization/consumption checks, and `ReleasedDispatchContext.message` only decorates text;
+it does not read transcript or usage replay. The runtime handoff's extra effect is quiet-ledger
+qualification removal. Production searches found no ACP watchdog branching on `.preparingRuntime`
+versus `.running`; liveness remains available for diagnostics. Buffered replay and the `.running`
+progress transition intentionally occur after input admission, not opportunistically during proof.
+The stored AsyncStream retains events until consumption; this does not claim all post-dispatch
+consumer mutations or provider actor writes have an exact writer fence.
+
+Validation: focused ticket `cec50820-8b09-4c30-b220-bd31c7e9674a` passed the new three-variant method;
+affected ticket `9c5efa51-8c56-4318-afc0-fc59ded0c6c5` passed **398 tests, zero failures/skips**.
+Full lint `6f390d01-e29f-4270-914a-79045f6f32e4` and scoped pinned formatting/strict lint passed.
+Actual compiler warnings on the three touched Swift files: runner 1 (existing), tests/harness 0;
+no positive per-file occurrence delta. Fresh index remained **1,261/1,360 and 53/66**. These are local
+checkpoint receipts, not both-product/full-SessionLinks/live-app or hosted-CI qualification. No push.
+
+### M9.2g local checkpoint — fresh ACP bootstrap/configuration/route ownership
+
+Fresh startup now rechecks its weak originating writer receipt after lease initialization diagnostics,
+bootstrap, resume-recovery staging, every configuration step and route release. Configuration receives
+an explicit admission closure; the fresh route checks the writer and the reused route retains its
+existing run/attempt/controller predicate (reused writer cutover remains open). Cursor discovery has
+an internal interruption sentinel so it cannot silently skip selections and continue a partially
+configured sequence. A temporary refusal that becomes current again cancels its original attempt
+instead of continuing that partial sequence.
+
+The operation-local `promptTurnEntered` boundary limits the final error/diagnostic backstop: before
+prompt entry a lost claim cannot reach terminal publication. Only the captured lease gate is released
+for a lost or superseded operation; installed policy and controller teardown remain with current-owner
+Stop. An installed controller is not shut down merely because a later attempt shares it. A detached
+controller still gets late-bootstrap cleanup: actor `bootstrap` can suspend before process launch,
+and its existing physical actor internals are not a main-actor writer fence. Normal current-claim
+provider errors retain their normalized failure rather than being converted to cancellation. The
+execution core inherits `#isolation`; it is not a nonisolated hidden owner.
+
+One Oracle review (`0120`, chat `6F1A83`) requested preserving detached cleanup, actual Stop-retirement
+assertions, a post-RPC configuration case, temporary-interruption coverage, explicit routing notification
+and complete prior-attempt fixture teardown. These are addressed without widening production admission.
+The successor fixture claims its previous terminal resources before beginning another attempt and
+joins that exact teardown; `AgentRunAttemptLifecycle.beginAttempt` expressly forbids dropping unclaimed
+resources. The raw conflicting-claim fixture clears its conflict at the subsequent admission check,
+proving that the current-again path cancels instead of resuming configuration. Cursor-specific discovery
+interruption is source-reviewed, not yet covered by a Cursor fixture. The error case uses an actual
+rejected `session/new` followed by post-normalization claim loss; it does not claim an in-flight wire
+failure/claim-loss interleaving. All gates keep operation identity, not a newly resolved writer.
+
+Still open: reused setup and deferred acquisition, awaits within resume-recovery helpers, model-parameter
+multi-RPC/controller spawn internals, prompt preparation/proof/physical writes, post-dispatch consumer
+and terminal work, tool-tracking callbacks, and terminal-barrier internal awaits. A temporarily conflicting
+claim that remains refused leaves shared attempt resources for the restored current owner's Stop,
+matching the prior task-entry behavior; this is not a new handoff/recovery lifecycle. No push.
+
+Validation: first focused ticket `d848b337-75ed-4a0f-b8d3-c1a454983b1c` was cancelled after compilation
+to apply review corrections, with no test qualification claimed. Focused
+`f1d5df68-2ead-43bc-b50d-3e255e0263ef` passed the new **18-variant method** (6.671s). Affected
+`cbe527fc-1591-4abe-9d82-a26a29484173` ran 399 tests with one new-fixture failure: gate cleanup was
+checked before joining the owned-error attempt's asynchronous terminal teardown. The fixture now
+joins that existing teardown before its gate assertion; claim-lost checks remain before current-owner
+Stop, with no timeout/assertion relaxation or production cleanup change. Final affected ticket
+`fb185e8d-24f6-4313-8156-3f354a156c0c` passed **399 tests, zero failures/skips** (65.691s).
+Full lint `8577c089-2b10-4b12-9a67-bc7911bbade9` passed, and the final fixture correction passed
+pinned formatting and strict lint. Actual compiler occurrence counts remain runner 1, tests/harness 0,
+matching integrated baseline `a0c674e9-c5be-4f38-b010-bf620211cfb2`; final test recompilation added no
+warning. Fresh index passed at **1,261/1,360 wrong-way edges and 53/66 largest cycle**, unchanged.
+Local checkpoint only: both-product/full-SessionLinks/live-app/hosted-CI qualification is not claimed.
+
+### M9.2g local checkpoint — reused ACP setup and deferred routing (2026-11-11)
+
+Reused `continueRun` now receives the existing weak writer receipt and rechecks it after reusability
+(including the control command's retired probe), each configuration operation, deferred lease acquisition
+and gate release. A lost claim cannot classify a pre-prompt provider error, change terminal lease
+metadata or publish a terminal result. Only its captured serialization gate is released; installed
+policy/controller resources remain with the current owner's Stop. A temporarily conflicting writer
+that becomes current again cancels the interrupted configuration, marks the handoff unsent and retains
+the warm controller rather than dispatching a partially configured turn. Ordinary current provider errors
+keep their normalized failure and existing shutdown policy. No strong command is captured by the task.
+
+Dedicated-note cleanup requires the original active attempt or its exact terminal revision (attempt ID
+and expected run ID), plus the original persistent writer claim. This preserves original Stop cleanup
+without allowing an old task to re-park a new same-claim attempt's note. `beginAttempt` clears the old
+terminal revision. The existing note state machine makes a second same-attempt re-park idempotent.
+There is no new session field, manager, default-true authority or terminal-barrier replacement.
+
+One Oracle review (`0154`, chat `6F1A83`) found the missing unsent-handoff call on the new retained-cancel
+branch; the first focused run `e45d2533-f788-42e5-99f7-bf5e6dd657a2` independently failed precisely that
+assertion. The production call is now present. Review-requested explicit deferred-lease precondition,
+policy/controller teardown assertions and an original-Stop/dedicated-note witness are also added.
+Focused `c3259638-e09d-46b4-ae97-2c53f34072bf` passed both new tests: a 17-variant reused-setup matrix
+and a real held-configuration RPC cancelled by Stop. The matrix covers post-RPC configuration, successful
+and failed deferred acquisition, claim reacquisition, retirement, a current-again conflict, provider error,
+positive dispatch, and same-claim successor note preservation. Lost-claim gate checks remain before
+current-owner Stop; owned terminal checks join their exact teardown first. No test budgets were weakened.
+
+Still open: prompt preparation/proof/physical writes, post-dispatch acceptance/consumer/catch/terminal
+mutations, tool-tracking callbacks, multi-RPC actor internals and terminal-barrier internal awaits.
+This is not a physical actor-write fence or M9.4 handoff implementation. Full lint
+`6db879bf-fbae-4cb6-83b9-d321595ecf05` passed. Affected ticket
+`4fc05b34-6843-46a5-be0f-0a595804cd24` passed **401 tests, zero failures/skips** (75.427s).
+Actual compiler occurrence counts in both focused compiles are runner 1 and tests 0, matching
+integrated baseline `a0c674e9-c5be-4f38-b010-bf620211cfb2`; no new warning occurrence was added.
+Fresh index passed at **1,261/1,360 wrong-way edges and 53/66 largest cycle**, unchanged.
+Both-product/full-SessionLinks/live-app/hosted-CI qualification is not claimed for this local checkpoint.
+No push; #1679 remains untouched.
+
+### M9.2g local prerequisite — control-command consumer placement (2026-11-11)
+
+ACP control commands now create their event consumer only after all synchronous app-side dispatch
+refusals, matching the ordinary prompt path. Attempt/cancellation, controller, binding/conversation
+and defensive self-compaction checks no longer create and cancel a consumer for an unsent command.
+The stream is still acquired after next-turn preparation. Context-count suspension, pre-dispatch
+transcript snapshots and self-compaction item capture still occur before buffered events can run.
+Actor-side command refusals/cancellation still cancel and join their already-created consumer; generic
+transport failures retain their existing terminal-event join. This is placement, not the pending writer
+receipt cutover or a physical actor-write proof.
+
+One Oracle review (`0212`, chat `6F1A83`) approved the mechanical change. Its defensive-check wording
+is added. The new three-variant test exercises a real advertised command, conversation-change refusal
+and cancellation; it checks real prompt RPC presence/absence plus positive/negative consumer creation.
+The DEBUG creation counter is the direct differentiating oracle for unsent-consumer absence; wire and
+terminal assertions alone also passed before this move. No claim of a deterministic old-consumer
+execution race is made, and no extra harness callback was added solely to observe progress. The existing
+compact suites cover real actor-side refusal and context-vouch behavior. Focused
+`dc21bc00-b6f9-4c7c-a5b4-2706e526c936` passed. Affected ticket
+`8bdfa6cd-df50-427c-bc02-5c74f058c730` passed **402 tests, zero failures/skips** (66.375s);
+full lint `a44b7e15-fdfa-4279-8e84-f046fc5e14ee` passed. Actual compiler warning occurrences in
+both focused/affected compiles remain runner 1 and tests 0, matching integrated baseline `a0c674e9`.
+Fresh index passed at **1,261/1,360 wrong-way edges and 53/66 largest cycle**, unchanged.
+Local checkpoint only; both-product/full-SessionLinks/live-app/hosted-CI qualification is not claimed.
+No push.
+
+### M9.2g local prerequisite — ordinary prompt stream-entry admission (2026-11-11)
+
+Ordinary ACP controller preparation and stream acquisition now precede prompt entry. Fresh and
+reused callers revalidate their captured writer after each actor await; the reused preparation
+result is classified only after admission, including the false result. A refused preparation no
+longer clears the handoff or consumes attachments. A current refusal still fails and retires the
+controller; suspended-owned refusal retains it only when preparation actually succeeded. Lost
+claims leave shared state to their current owner. Dedicated-note setup cleanup retains the existing
+exact attempt/terminal-receipt rule. Control-command preparation remains separate and unchanged.
+
+One Oracle review (`0234`, chat `6F1A83`) approved with narrow fixes: refused preparation during
+retirement now retires rather than preserving a known-refusing controller, and dedicated-note
+preparation refusal is covered. Expanded fresh/reused matrices assert no attachment-consumption
+callback, handoff preservation, no RPC/consumer, and original versus successor cleanup. The renamed
+adapter test preserves its wire assertion and accurately describes its synchronous post-message
+construction hook; it is not evidence of an actor suspension. The new writer-boundary cases cover
+authority loss after the real actor awaits. An additional membership-at-await wire test was not added.
+
+Intentional ordering: Thinking status now follows preparation, and rejected preparation leaves the
+attachment reservation unconsumed for existing terminal `.deleteFiles` settlement instead of consumed
+plus deferred cleanup. Harness callbacks witness consumption, not physical attachment-file deletion.
+Provider-input proof awaits after entry, physical controller actor writes, and post-dispatch mutation
+remain OPEN; this prerequisite does not claim to close those boundaries.
+
+Focused `1970386e-69e7-4e32-9ba1-41d2959f24e1` passed 13 tests (two runner matrices
+plus all 11 ACP prompt-adapter cases). Affected `3ed4c0b0-b0b7-404c-9bf9-d7e0b719ba54`
+passed **402 tests, zero failures/skips** (70.078s). Full lint
+`4f76698f-87a9-44cd-9d71-b26fba42ee95` passed. Actual focused compiler warning counts
+match integrated `a0c674e9`: runner 1, prompt-adapter tests 1, execution tests/harness 0.
+Fresh index passed at **1,261/1,360 wrong-way edges and 53/66 largest cycle**, unchanged.
+Local qualification only; no both-product/full-SessionLinks/live-app/hosted-CI claim and no push.
+
+### M9.2g local checkpoint — ACP pre-dispatch proof return (2026-11-11)
+
+An operation-local setup/entered/provider-dispatch phase now keeps the exact weak writer receipt
+backstop active until the call into the controller actor. It is NOT a physical-write receipt: the
+actor hop and all post-dispatch events, errors, acceptance, identity writes and terminal follow-ups
+remain OPEN. Ordinary input-proof return rejects a lost claim before any physical-not-attempted hook.
+A same-claim successor attempt also receives no old hook. Original-attempt cancellation retains its
+hook, and owned-suspended admission cancels the original fresh attempt or retains the reused warm
+controller. Entry handoff/attachment/carry mutations are not rolled back through a new owner.
+
+Control preparation, refusal classification and event acquisition now recheck the receipt. Existing
+orphan-controller cleanup is preserved: only the detached captured controller is shut down, followed
+by another claim/attempt check before terminal publication. The existing dedicated-note defer's
+attempt-only predicate is preserved rather than silently strengthening it with a run-ID condition.
+Captured gate release stays confined to setup; no duplicate route-deferred diagnostic is emitted
+for an already-entered prompt. No new session field, registry, manager, or strong Command capture.
+
+One Oracle review (`0254`, chat `6F1A83`) found an unreachable orphan cleanup path introduced by the
+new generic admission gate. That regression was repaired before qualification, with real detached
+controller cases at both control boundaries. Review also added rejected-control-preparation coverage,
+an exact positive not-attempted-hook count for cancelled proof, and explicit wake-test limits.
+The six-variant ordinary proof test holds a real continuation (fresh/reused × reacquire/retire/successor)
+and asserts no prompt/consumer or stale shared mutation, plus exact cleanup-hook behavior. Expanded
+control cases cover both awaited boundaries, rejected preparation and detached controller retirement.
+The existing Stop-retraction/finalizer test now characterizes identity preservation across same-object
+writer reacquisition without an old physical hook. It does not exercise runner cancelRun wiring or
+claim M9.4 handoff authority; these wake suboperations themselves do not resolve writer identity.
+
+Initial focused `d7df4823-5449-493b-93ac-dbc9faa99d8d` passed. Final affected
+`1162927e-a67a-4e65-87b6-2dcf6a8c6877` passed **403 tests, zero failures/skips** (73.727s),
+including the review-added cases. Full lint `7cf0c8bf-e0b5-42c2-9fbc-7ac908393ca8` passed.
+Actual compiler occurrence counts across both compiles: runner 1 (baseline 1), AutoWake tests 10
+(baseline 11), execution tests/harness 0 (baseline 0); no positive deltas. Fresh index passed at
+**1,261/1,360 wrong-way edges and 53/66 largest cycle**, unchanged. Local qualification only;
+no both-product/full-SessionLinks/live-app/hosted-CI claim. No push to #1679.
+
+### M9.2g local checkpoint — Codex wrapper admission and cleanup (2026-11-11)
+
+The service now passes its actual restored Command to the Codex runner. Persistent work retains only
+an exact weak WriterReceipt, checks it before MCP preparation and after its await, and requires the
+original ACTIVE attempt at coordinator entry. An exact terminal receipt authorizes cleanup only,
+never dispatch. Periodic classification is captured before the await. Lost-claim/successor exits
+cannot publish handoff results, end a successor attempt, re-park its dedicated note, or clear its task.
+The wrapper slot is cleared after joining the send task only if Task identity and the original claim
+still match. Busy/idle readers may observe the slot through that final join rather than its old inner
+defer; the caller still returns only after its own slot cleanup.
+
+Wrapper-owned MCP failure or suspended admission restores ONLY its still-reserved exact attachment ID
+before ending a locally-created attempt. This fixes the former pre-coordinator reservation leak while
+avoiding an extra finalization of idle/already-consumed state. For a matching reservation, the existing
+attachment owner's restore policy still clears deferred-cleanup bookkeeping without deleting files. Real Stop retains its terminal ownership: cancellation/fence
+refusal bypasses local terminal cleanup, and exact original cancelled-terminal return remains
+.cancelled rather than .stale. Dedicated-note re-parking occurs before local endRunAttempt because that
+operation does not create a terminal receipt. Coordinator-entered outcomes remain truthful, but their
+old-writer projections are gated; coordinator-internal awaits and physical dispatch remain OPEN.
+
+One Oracle review (`0323`, chat `6F1A83`) requested proper replaceSessions fixture ABA, preservation of
+Stop outcome/settlement, successful-MCP refusal cases, terminal-note coverage and hook reentrancy
+checks; these were applied. The held-MCP matrix covers ten variants including claim reacquisition,
+retirement with new/existing attempts, same-claim successor, independently replaced task slot, original
+Stop and dedicated notes. It uses real runtime reservation hooks and actual current-owner cancelRun,
+which restored the retained reservation and cleared the task slot after claim loss. The existing note
+test now also proves coordinator entry through its exact malformed-note rejection. No live transport,
+physical-write fence or full coordinator cleanup closure is claimed; no assertions/budgets weakened.
+
+Initial focused jobs `cb312001-22b1-4a0d-821c-803f6a709ba0` and
+`dc9533f5-9cab-49f7-b4af-644fd7317c4f` failed compilation (typed stale reason and optional fixture
+Command respectively); neither is a test qualification. Final focused
+`8750103f-5320-4c3f-bf23-540cbb475153` passed 2 methods (0.714s), and affected
+`45bb14e5-f81b-49df-aa6b-dc1dd7906293` passed **404 tests, zero failures/skips** (86.024s).
+Final full lint `a8cef64a-1d4a-41b9-a285-a9f4631ddd07` passed. Actual compiler warning occurrence
+counts versus integrated `a0c674e9`: Codex runner/service/harness 0, AutoWake tests 11 (baseline 11),
+with no new touched-line diagnostics. Fresh index passed at **1,262/1,360 wrong-way edges and 53/66
+largest cycle**; the baseline was not raised. The added wrong-way file edge is the runner's exact
+`.reserved` match into `AgentModeViewModel+Types.swift` (existing attachment DTO placement); the
+WriterReceipt/Command edge into RuntimeStore is not wrong-way. No M10 extraction is claimed. Local qualification only, not both-product/full-SessionLinks,
+live-app, sanitizer or hosted-CI qualification. Nothing pushed to #1679.
+
+### M9.2g local checkpoint — Codex observer-wait and active-child-wait send admission
+
+The actual native send entry now requires the originating weak WriterReceipt and exact run ownership;
+its sole production caller supplies the originals. Before send-frame running-state writes, entry,
+observer-wait success/catch and active-child-wait completion refuse lost claims or successor attempts
+without restoring attachments, adding errors, saving or dispatching. Original suspended/terminal
+ownership permits only exact still-reserved attachment restoration and returns cancellation. The
+runner re-reads suspended admission for its cleanup label after the coordinator returns. This is
+strictly the early wait slice: ensure/controller construction, computer-use validation, post-ensure
+unsent settlement, physical provider writes and post-dispatch work remain OPEN. In particular,
+endRunAttempt does not clear runState, and the existing general Codex terminal finalizer deletes
+unsent attachments for cancellation; neither was repurposed as a new cleanup policy. The active
+wait drain can still deliver steering to child waits internally before its post-await writer check.
+
+One Oracle review (`0411`, chat `6F1A83`) caught the misplaced discardableResult attribute and asked
+for explicit test attempt setup, original-Stop/attachment coverage and production-path reachability.
+All 77 direct test sends now explicitly supply their existing/new attempt at the call site and use a
+test-only real restored-writer admission helper; no implicit attempt construction or production
+compatibility bypass remains. Only the eight wedge tests that directly send opt into restored
+binding. Other wedge tests retain their deliberately unbound/fresh-creation contracts. The held
+observer/drain matrix covers 12 variants using real suspension, a real attachment, and actual Stop;
+Stop's already-idle reservation must not consume later deferred-cleanup bookkeeping. A separate
+runner-level witness proves an existing active attempt reaches the drain and is preserved on its
+current-owner refusal. Entry suspension now returns cancellation; the ordinary production runner
+already requires current admission at entry. No assertions, budgets or timeouts were weakened.
+
+Initial `41c476b8-a375-494f-b1c8-2afce0dbcd12` compiled successfully but used the file name instead of
+the XCTest class and ran no tests: build evidence only. Corrected focus
+`4ba21310-ac5c-4919-a775-c78d4a50dc0c` passed the 12-variant method (0.578s). First affected
+`a3e0dd28-7b5a-4dbe-99cb-ddca4ddc1b6f` ran 592 tests/4 skips with 98 assertions across two failing
+wedge cases: making the shared fixture bound changed the fresh-composer and deliberately-unbound
+malformed-event contracts. Narrow explicit restored opt-in fixes the fixture, preserving both
+original assertions. Final affected `07691c0a-c470-4417-bb3c-bff976d61d1b` passed **593 tests,
+4 skips, zero failures** (212.356s), including both new witnesses (0.319s/0.030s). Final full lint
+`efc88669-68fb-4bcb-aba3-ed67dd7a0b46` passed, as did scoped pinned formatting/strict lint.
+Actual compiler occurrence counts (initial complete compile plus final test recompile, maximum per
+file) match integrated `a0c674e9`: coordinator/runner/helper 0, wedge 17, AutoWake 11, catalog
+integration 2, prompt-adapter tests 6. No new warning occurrences; this is not a zero-total-warning
+claim. Fresh index passed at **1,262/1,360 wrong-way edges and 53/66 largest cycle**, unchanged
+baseline. Local qualification only; no both-product/full-SessionLinks, live-app, release, sanitizer
+or hosted-CI qualification for this checkpoint. Nothing pushed to #1679.
+
+### M9.2g local Claude task-entry and lease ownership checkpoint (2026-11-11)
+
+Claude startup now requires the existing restored Command, and its persistent task captures only
+its weak WriterReceipt plus exact run/attempt values. Task entry, successful/failed lease acquisition,
+and the acquire-failure-outcome await refuse a lost claim or an attempt that is no longer current
+for its original binding. The exact captured subscription is closed without replay; only the
+captured lease's serialization gate may be released. Installed routing policy and shared attempt
+cleanup remain with current-owner Stop. Owned retirement with an intact binding settles cancellation
+through the existing terminal barrier, retaining the warm controller and existing attachment policy.
+A failed acquisition retains the existing outcome mapping, including gate-timeout errors. Rechecks
+after tail replay and the handoff callback prevent reentrant ownership changes from authorizing a
+later terminal commit. No post-finalize fallback re-reads a controller or revokes a successor route.
+
+Task note cleanup and buffered-tail replay require the originating claim plus the original active
+binding/attempt or its exact terminal with no active successor. Candidate cleanup retains its exact
+UUID and originating-claim guard. Service early refusal also gates prepared-inbox replay on the
+original writer. Stopped/superseded tasks drop their captured tail rather than replaying it into a
+successor. Binding-transition settlement remains its owner's responsibility: the startup task uses
+the same exact-binding predicate as the terminal barrier and does not invent settlement authority.
+Later tool-tracking/coordinator/physical-send awaits, listener idle/adoption callbacks, and barrier
+internal awaits remain OPEN. This is not a controller-lifetime or M9.4 handoff implementation.
+
+One Oracle review (`0457`, chat `6F1A83`) approved the bounded logic with fixture/preservation fixes.
+The real-listener, held-lease regression covers ten entry/acquisition variants, including same-object
+writer ABA, retirement, acquisition refusal, actual Stop then successor, and dedicated-note cleanup.
+It asserts the listener alone still reports current after ABA, no stale buffered replay or terminal
+write, acquired policy retention until current-owner Stop, gate release, warm-controller retention
+on owned cancellation, and parked versus unmodified dedicated notes. Three existing direct runner
+calls now provide their actual restored commands. No production compatibility bypass, budget change,
+or weakened assertion was introduced.
+
+Initial focused `754b329d-da24-4174-8064-4e684444c579` compiled but failed fixture expectations:
+pre-send settlement intentionally retains a warm controller, ordinary enabler refusal maps to
+cancellation, and the fake acquired lease needed the expected-PID grant used by the existing harness.
+Those expectations were corrected; policy counters use a main-actor box. Final focus
+`7146bea8-4d84-4563-8128-b8dd5f812aeb` passed the ten-variant method; full lint
+`998a35a1-f18d-4927-91bc-b03934e2b83b` and scoped pinned formatting/strict lint passed.
+Affected `c4f9f636-9adf-4e63-993d-b889c6287aac` passed **502 tests, zero skips/failures**
+(95.933s), including the existing lease-failure/cancellation and compact-note preservation cases.
+The focused ten-variant method took 0.682s. Actual compiler warning occurrences (maximum per file
+across initial full compile and corrected test recompile) match integrated `a0c674e9`: Claude runner
+3, service 0, AutoWake 11, prompt-adapter tests 6. This is not a zero-total-warning claim. Fresh index
+passed at **1,262/1,360 wrong-way edges and 53/66 largest cycle**, unchanged baseline. Local
+qualification only: no full-SessionLinks/both-product, live-app, release, sanitizer or hosted-CI
+qualification for this checkpoint. Nothing pushed to #1679.
+
+### M9.2g local Claude pre-coordinator suspension checkpoint (2026-11-11)
+
+The existing weak-receipt startup gate now runs after actual tool-tracking registration returns and
+inside the execution operation after provider-initialization diagnostics return. An operation-local
+refusal flag prevents an already-settled/captured-resource-only refusal from entering the old
+post-coordinator tail replay, terminal publication or shared-controller lease-cancellation fallback.
+No extra authority manager, strong persistent Command capture, or optional legacy bypass is added.
+Source verification of DomainAgentRunExecutionCore corrected the plan: it always calls the operation
+and has no pre-operation cancellation check. The nonthrowing diagnostic and gate are the only calls
+before the refusal flag/coordinator entry, so no new pre-entry terminal classification is invented.
+The initialization diagnostic pair records `superseded` for this rejected operation even when its
+original owned attempt was cancelled; this is diagnostic-only, not a provider or terminal outcome.
+
+One Oracle review (`0518`, chat `6F1A83`) found no P0/P1 issue. The positive real fake-controller send
+passed without an oversight catalog requirement. The final matrix includes six post-tracking or
+post-initialization variants, including no-note and dedicated-note retirement. It checks that a
+post-tracking refusal never reaches initialization, lost claims neither replay nor settle shared
+state, current-owner Stop releases retained policy/controller, owned cancellation keeps its warm
+committed route, and ordinary admitted startup sends and completes. The route-authority resolver
+count—not the idempotent policy-clear count—detects a second unsafe cancellation through the old
+post-coordinator path. DEBUG boundary hooks fire synchronously after the real operation returns;
+they prove refusal ordering, not that a particular await suspended. Existing entry/lease tests use
+the renamed boundary hook without changing their assertions.
+
+Tool tracking installs its callbacks before this new gate; callback ownership, coordinator ensure/
+retry/recycle/route/interrupt operations, physical actor writes, and post-coordinator report handling
+remain OPEN. Task cancellation alone is not new refusal authority here; the existing coordinator and
+terminal policies still apply. Binding-transition settlement and listener idle/adoption callbacks
+remain separate owners. Initial focus `2346e695-5bb6-4662-b69a-b118147d4b27` passed the five-variant
+method (0.695s). Final affected `ac7d422f-c5a8-4aa3-8e3e-6f4270eb7d3b` passed **503 tests,
+zero skips/failures** (97.445s), including the strengthened six-variant method (0.236s). Full lint
+`636338a8-5c66-4f98-bfb9-06b4ce192c79` and scoped pinned formatting/strict lint passed. Actual
+compiler warning occurrences (maximum of initial/final compiles) match integrated `a0c674e9`:
+Claude runner 3, AutoWake 11. Fresh index passed at **1,262/1,360 wrong-way edges and 53/66 largest
+cycle**, unchanged baseline. Local qualification only; no both-product/full-SessionLinks, live-app,
+release, sanitizer or hosted-CI qualification for this checkpoint. Nothing pushed to #1679.
+
+### M9.2g local prerequisite — explicit Claude coordinator fixture admission (2026-11-11)
+
+Direct Claude ensure/send tests now use test-only forwarding helpers that require an exact unique
+restored writer. They do not manufacture a binding, restoration proof, scope or run attempt, and
+preserve deliberately stale run intents for the production intent checks. The intentional
+pre-entry rebind refusal test still calls production directly so the positive-fixture helper
+cannot mask that contract. Its future required receipt must be captured before the rebind.
+No production signature or behavior changed; this is preparation for the coupled startup,
+queued-steering and reconnect receipt cutover, not closure of those remaining paths.
+
+Six standalone fixture locations now retain real shared-store scopes with fresh workspace/session
+identities and their existing restoration proof; teardown explicitly removes membership. The
+periodic resume fixture already belongs to its VM scope and now uses a workspace-qualified binding.
+The shared store holds scopes weakly, observes binding changes after membership installation, and
+VM fixtures use that shared store; no fallback or alternate test authority was added. Existing
+configuration, recovery, route, stale-intent and physical-send assertions are retained. No executable
+tests were added, removed or renamed. One Oracle review (`0546`, chat `6F1A83`) found no P0/P1 issue;
+its lifetime/lookup questions were source-checked, teardown made explicit, and the stale-intent
+exception documented. The prior plan's unconditionally clearing a steering task slot was rejected:
+Stop and cancellation can replace that slot, so later work must pin the installed task identity.
+
+Initial affected `c5c1c813-80a9-499a-a7f7-9d8a47c8929d` executed 309 tests with four skips and two
+assertions in one periodic-resume fixture: its binding lacked a workspace, so the new positive
+admission helper refused it. Correcting that fixture, without relaxing either periodic refusal or
+ordinary recovery expectations, yielded final `62d77592-864e-4c56-b87d-65d5cbbc789a`: **309 tests,
+four skips, zero failures** (119.899s). All eight affected suite families ran. Full lint
+`9dd529e8-8102-433f-ac2b-1c1217705e72` and scoped pinned formatting/strict lint passed. Actual compiler
+warning occurrences (maximum of the initial/final compiles) match integrated `a0c674e9`: approval/
+resume tests 1, AutoWake 11, catalog integration 2, prompt adapter 6, other four touched Swift files
+zero. Fresh index passed at **1,262/1,360 wrong-way edges and 53/66 largest cycle**, unchanged baseline.
+These are local fixture gates, not full publication/product/live-app/release/sanitizer or hosted-CI
+qualification. Nothing pushed to #1679.
+
+### M9.2g local prerequisite — exact Claude steering-flush task ownership (2026-11-11)
+
+The existing Claude flush slot now stores an immutable `{ id, task }` record with its cancellation
+operation; the property name and nil/cancel readers remain, without a compatibility setter, sidecar
+registry or second task owner. Installation occurs synchronously before the inherited MainActor task
+can run. The flush rechecks its installed ID at loop entry, after observer/MCP/child waits, after
+augmentation, and before failed-send recovery. Its old cancellation catch can no longer restore a
+replacement's queue, and its defer cannot clear or resubmit through a replacement slot. The three
+current-owner cancel/clear sites discard the same record. This follows ACP's existing flush-ID
+principle while keeping Claude's task and ID in one value; ACP policy is unchanged.
+
+The existing same-attempt settlement recheck is retained when a current-owner withdrawal has already
+cleared the slot. It can produce a redundant settlement event if a replacement has already finished
+and also cleared its slot; the consumer still checks its existing terminal conditions. Delivered-send
+handling and the ownership-guarded uncertain-write notification are unchanged: outcome authority
+after dispatch remains OPEN. This is task-slot ownership, not writer-incarnation admission. Dequeue
+still precedes augmentation, whose host callback defaults to allowing catalog/handoff staging, so
+loss during that operation can still drop the dequeued draft or stage handoff state. No peek/reorder
+or new rollback policy is claimed; that requires an original-admission predicate through the actual
+augmentation hook before the writer-provenance cutover.
+
+One Oracle review (`0608`, chat `6F1A83`) approved the ordering and causal test, with no P0/P1 finding.
+The existing plain MainActor test hook captures an ordinal; no Sendable escape hatch or new seam was
+needed. New `testWithdrawnClaudeFlushCannotRecoverOrClearItsReplacement` runs normal and throwing
+returns from an uncancellable held MCP-idle hook. It uses actual startup, actual synchronous managed-
+Stop withdrawal, and a second held flush on the SAME attempt; old completion must preserve the new
+record, queue, token, composer draft and sent messages. Releasing the new flush sends exactly B once,
+then actual cancellation joins terminal teardown. This characterizes withdrawal, not full Stop or
+writer handoff. Focus `a93b9c2b-ad7f-4471-9be7-7e225abee894` passed both variants (one method, 0.266s).
+Affected selection `70807909-d340-4e93-8b45-77ca9d3068f2` passed **537 tests, zero failures**
+(101.509s). Full lint `3049b4d7-7280-42d8-ba3b-06129aacf562` passed. Actual focused/affected
+compiler-warning occurrence maxima versus integrated baseline `a0c674e9` are unchanged: service and
+session zero, approval/resume test file one. Fresh index passed at **1,262/1,360 wrong-way edges and
+53/66 largest cycle**, without baseline changes. These are local focused/style/index gates, not full
+publication/product/live-app/release/sanitizer or hosted-CI qualification. Nothing pushed.
+
+### M9.2g local prerequisite — admitted steering preparation retains recoverable input (2026-11-11)
+
+Claude now peeks at the queued instruction while skill/context/tagged-file preparation suspends,
+then dequeues the exact head and token only after its original flush and attempt still admit the
+result. The existing shared augmentation hook requires a predicate and the VM forwards it into the
+actual runtime's discovery/publication and handoff-staging checks. Current-owner withdrawal can see
+and restore the queued draft while discovery is held. Preparation refusal is latched locally, so a
+later permissive check cannot promote partially prepared text into a send. If another operation
+removed the head while the attempt stayed current, the drain continues with the remaining queue
+instead of restoring unrelated later instructions. No second queue owner or writer registry exists.
+
+ACP supplies its existing cancellation/flush-ID/controller check to that same hook, with the same
+latched refusal and existing withdraw/restore branch. It does not add a transient run-state condition
+or change ACP's dequeue-before-preparation recovery policy. Writer-incarnation provenance and
+post-dispatch outcome authority remain OPEN; neither this predicate nor the previous task-slot fix
+is claimed as physical provider-write admission. A Claude coordinator `.superseded` result after
+admitted dequeue still has its existing recovery semantics.
+
+One Oracle review (`0623`, chat `6F1A83`) requested guarding against partial augmentation if an
+admission predicate flips back to permissive, and preserving later queue entries on a changed head.
+Both were addressed. New Claude coverage holds the REAL catalog discovery hook for unchanged and
+withdrawn flushes, asserts queue/token retention, no stale handoff staging/send, and a replacement's
+single successful use of retained continuity. Added ACP coverage holds that same discovery boundary,
+tears down the actual controller, and checks draft recovery plus no handoff staging/provider input.
+These use existing fixture/hooks, not a new production test seam. Focus
+`f81304f9-e7ca-444a-b3f2-548c745ba367` passed both methods (Claude two variants 0.082s; ACP 0.990s).
+Affected `232027a6-9482-432e-aa4c-94c15a0d0a2c` passed **569 tests, zero failures** (122.212s),
+including the full ACP steer and MCP Steer/resume selections. Full lint
+`9ef83866-8c02-416c-93c3-84e153a98948` passed. Scoped pinned formatting/strict lint passed.
+Actual focused/affected warning-occurrence maxima versus integrated `a0c674e9` stayed unchanged:
+VM four, approval/resume tests one, other four touched Swift files zero. Fresh index passed
+**1,262/1,360 wrong-way edges, 53/66 largest cycle**, unchanged baseline. These are local focused,
+style and index gates, not full publication/products/live-app/release/sanitizer/hosted-CI qualification.
+Nothing pushed. Changed-head continuation and the refusal latch are source-reviewed; no separate
+injected transient-refusal matrix is claimed.
+
+### M9.2g local prerequisite — original writer through hydration-deferred submit (2026-11-11)
+
+The unloaded, already-bound submission branch captures its exact canonical Writer before its
+self-compact cancellation and before scheduling hydration. The deferred operation requires that
+writer at entry and after preparation, admits restored work only after hydration, and restores
+rejected local input only through the original persistent claim. A same-object remove/re-add can
+no longer authorize the old task via an unchanged binding token. After an awaited provider switch,
+an already-submitted result stays truthful, but a lost writer cannot consume successor workflow or
+attachments. This intentionally leaves those inputs pending rather than mutating the successor;
+subsequent input policy is not a claim that they can never be sent again. The task retains its owner
+only for this operation, not in a persistent session-owned task.
+
+Unscoped, transitioning, absent or conflicting bound writers are refused before this branch's
+shared mutation; no fallback is added. The existing HydrationRuntime.Attempt already refuses those
+unqualified loads and independently fences application/readiness across reacquisition. One Oracle
+review (`0647`, chat `6F1A83`) found no P0/P1 issues, requested retirement coverage and explicit
+hydration-state evidence, and speculated that hydration itself remained unfenced. Source inspection
+of the existing Attempt/read guards rejects that speculation; the new test also asserts that stale
+hydration does not set the loaded latch. Earlier accepted self-compact cancellation is not rolled
+back after later claim loss. MCP auto-effort ingress and steering queue writer provenance remain
+OPEN. The post-switch consumption guard is source-reviewed, not a new injected switch-await test.
+
+New real-submission coverage exercises same-object reacquisition before task entry and during the
+actual held persisted read, plus original-owner retirement before task entry. It checks no stale
+row, queue, draft restoration, snapshot consumption or provider start, and owned retirement draft
+recovery. The existing positive hydrated-send/snapshot-consumption test remains unchanged. Three
+direct callers now pass their actual fixture writer; the replacement-session negative captures it
+before replacement. Initial focused `921edf78-5809-4417-95d4-8a0cf363f4f2` failed compilation
+because the new fixture addressed the session's save counter through the persistence runtime;
+corrected the fixture owner without changing assertions. Final focused
+`a54c56bd-95b2-4fcb-aac7-a6e3b2fa22fd` passed **44 tests, zero failures** (26.942s), including
+three new ABA/retirement variants (0.578s), the unchanged positive hydrated-input case (0.175s),
+and all reprompt submission tests. Affected `b516149e-b7ab-45c7-9aa7-790e5216b5cc` passed
+**751 tests, zero failures** (208.357s), including the full 105-case handoff suite. Full lint
+`338d95db-9b1c-450c-b3fd-1467237cd926` passed; the subsequent fixture-only counter correction
+also passed scoped pinned formatting and strict lint. Actual compile warning occurrence maxima
+versus integrated `a0c674e9` remain VM four and other four touched Swift files zero. Fresh index
+passed **1,262/1,360 wrong-way edges, 53/66 largest cycle**, unchanged baselines. These are local
+focused/affected/style/index receipts, not full publication/product/live-app/release/sanitizer or
+hosted-CI qualification. Nothing pushed.
+
+### M9.2g local prerequisite — retain MCP ingress writer through effort judgment (2026-11-11)
+
+MCP dispatch captures its existing controlled Writer before effort selection and rechecks the exact
+claim/control provenance after judgment and both external initial-start validation callbacks. A
+new context installed on the same object under a reacquired claim can no longer authorize the old
+request. This is not restored-command admission: existing creation/configuration checks remain the
+first-start policy. Original persistent-claim ownership is used deliberately, not Writer.isCurrent:
+a completed restoration retry can advance the restoration generation without rotating the claim,
+and the retained control context must remain usable after the existing readiness checks succeed.
+Retirement rejects new dispatch. The already-present binding-token fence still rejects a transition
+during this operation. No new registry or compatibility bypass was added.
+
+One Oracle review (`0710`, chat `6F1A83`) requested restoration-token preservation, deactivation
+coverage, registration cleanup, and bound-creation coverage. Source confirmed the generation-only
+retry; a positive refresh variant was added. The real backend test also covers unchanged, stale
+context, successor context, deactivation and retirement. Reactivation goes through the production
+control installer, not a fabricated context. Domain registration replaces the prior UUID entry and
+does not invoke its cancellation handler; the test additionally checks no reactivation change to
+run state/task and explicitly cleans the captured predecessor registration. The external MCP
+starter commits configured creation before calling dispatch (AgentExternalMCPRunStarter); this
+patch does not admit an uncommitted creating session. That sequencing remains covered by existing
+creation suites, not a new held-judgment creation fixture. Auto-effort's internal effort-retention writes and judgment-ID/UI cleanup remain
+OPEN, as do post-submission waits, queue starter/wake/acknowledgement and physical dispatch. In
+particular currentClaudeEffortLevel is confirmed to call retainClaudeEffort; this ingress fence is
+not claimed to prevent those internal post-await writes. Initial focused
+`60d9d8d3-2775-438b-8d97-8237fcef106e` compiled but failed a new fixture assertion waiting for a
+connected provider launch. The synthetic fixture qualifies scheduled input admission, so its
+positive oracle now checks the admitted user row and recorded effort feedback; no existing timeout
+or assertion was weakened. Final focused `7371e4ee-83ff-4cfe-a7ce-baeeac49bb60` passed the single
+method's six variants (0.966s). Full lint `4c380fef-312c-42d0-a4a0-636e280e6284` passed; the
+fixture-only positive-oracle correction also passed scoped pinned formatting and strict lint.
+Affected `73482dd8-68d8-4c08-9894-442396fc9f07` passed **818 tests, zero failures** (234.936s),
+including creation/restoration, MCP Steer/resume, routing, Stop, ACP and full handoff selections.
+Actual compile warning occurrence maxima against integrated `a0c674e9` remain VM four and routing
+integration tests zero; no positive touched-file deltas. Fresh index passed **1,262/1,360 wrong-way
+edges, 53/66 largest cycle**, unchanged baseline. These are local focused/affected/style/index
+gates, not full publication/products/live-app/release/sanitizer/hosted-CI qualification. Nothing
+pushed. The successful synthetic MCP cases attest input admission and effort feedback, not physical
+provider launch. Same-writer control reactivation is not separately fenced by activation ID.
+
+### M9.2g local checkpoint — auto-effort preparation keeps its ingress admission
+
+`chooseAutoEffortForUserTurn` now requires a non-escaping MainActor admission predicate, with no
+legacy/default-true overload. Its latched checks guard entry, the first effort normalizer, registry
+lookup completion, decision completion before the second normalizer, and the returned selection.
+The three composer call sites preserve their existing exact claim/destination predicate. MCP uses
+its captured control writer's persistent claim, retirement/control identity and binding token;
+it does not accidentally require a retained registration's old restoration generation to be current.
+Claude's getter can retain effort, dirty the session and schedule a save. Codex's effective-selection
+getter only reads selection policy. This patch qualifies the shared helper's writes, not the later
+submission/queue/provider boundary or every coordinator getter caller.
+
+Speculative effort captures existing runtime membership synchronously before creating its task,
+including legitimate unbound drafts. Membership stays only in the finite task frame, not on the
+speculation record/session or in a new authority registry. A refused speculation returns nil rather
+than an ordinary policy fallback, so the accepting composer recomputes after legitimate first
+binding. A narrow VM membership accessor exposes the existing scope receipt, not save/dispatch
+permission. The model-router speculative task is unchanged. Exact judgment-UUID cleanup remains
+operation-resource release after loss: it cannot clear a different judgment and avoids permanently
+blocking successor MCP turns. Its existing status-pill projection remains; it does not normalize
+effort. Upstream unbound composer-claim ABA provenance remains OPEN: a claim predicate that itself
+recovers could still accept a fallback audit after a latched refusal. No new claim-manager or
+physical-write/cancellation guarantee is inferred from this helper fence.
+
+One Oracle review (`0740`) approved with fixes. Whole Sources/Tests `effortTask` inventory found
+only the migrated optional-result consumer, cancellation/presence checks and the new fixture.
+Added the requested held-composer refusal witness. Existing six-variant MCP coverage now checks
+positive normalization and no stale normalization/dirty/save after loss. New three-variant
+speculation coverage proves task-entry ABA refusal, unchanged unbound success and first-binding
+recomputation (zero old requests then exactly one accepting-claim request). Registry-hop and
+post-normalizer checks are defensive source coverage, not separately injected test seams.
+
+Initial focused `62fb77a4-b8b6-4967-ad24-bd832a8e7beb` and labeled rerun
+`512d8e62-9953-4f75-be95-53594b96400b` compiled but failed three new assertions in the
+reactivated-context variant. Diagnostic jobs `58ff8fcd-0ece-4418-8c42-0027875d6277` and
+`7f342127-70a1-43de-bcee-789ed6f7b2e3` isolated a different call stack: successor approval-sync
+`applyApprovalSnapshot` requested full UI refresh, whose `updatePermissionBindingState` legitimately
+normalized the active tab. The fixture now makes the tab inactive before clearing the raw effort,
+so its no-write oracle isolates the old judgment, not independently admitted successor permission
+projection. Existing outcome/state assertions remain. Both temporary traces were removed, and the
+Claude coordinator is byte-identical to HEAD. No production fallback or weakened budget was added.
+
+Final focused `4ec1e6ad-95d8-4a38-9aef-2d2f431ee403` passed all **10 routing-integration tests**
+(5.231s), including the six MCP, three speculation and released-composer cases. Affected
+`8b6fe746-8321-4302-9943-93bdd36c935d` passed **820 tests, zero failures** (305.017s).
+Full lint `d6d4a555-fde2-4d6e-a042-24d8e0c6fe32` and scoped pinned formatting/strict lint passed.
+Actual compile warning occurrence maxima versus integrated `a0c674e9` remain VM four,
+RepromptAutomation two, Routing and routing-integration tests zero. Fresh index passed
+**1,262/1,360 wrong-way edges, 53/66 largest cycle**, unchanged baseline. These are local
+focused/affected/style/index gates, not full publication/products/live-app/release qualification.
+The overseer subsequently authorized publication after #1679 merged as `99d4e718d`; integrate that
+exact tree-identical squash and revalidate the publication tree before opening M9.2g.
+
+#### M9.2g merged publication gates — isolation and accepted under-watch results
+
+Merged head `1fed775646ad48f19f2580115cabc728fddf40cd` failed focused ticket
+`02997ccf-b3d4-4605-98e2-264a7b828864`: 1,118 executed, four skipped, five assertions in
+`AgentSessionLinkHandoffInheritanceTests.testRestoredPendingSwitchRefusalIsAwaitedAndPreservesLocalOrMCPInputState`
+(lines 4180–4187). The deferred local submission returned `.submitted` instead of the expected
+refusal, omitted draft-restoration feedback, and consumed input/workflow/pending handover state.
+Initially this was treated as a likely M9.2g regression, not classified as the historical
+broad-only intermittent, pending isolation on head and `origin/main` (`c791cd13a`). Publication
+was blocked at that point; the test expectations were retained. Focused test execution took 1,444.026s; other publication
+tickets remained queued/running. Context was compacted before investigation resumed.
+
+Exact-test isolation passed unchanged on head `1fed77564` (ticket
+`d89d6730-e91f-4eb5-9534-98c522451d3b`, 4.785s) and exact main `c791cd13a` (ticket
+`7b0af4d0-d336-4910-983d-4a3390f4a595`, 5.383s). Main's complete HandoffInheritance suite
+also passed 104 tests (ticket `e60b9a19-673f-4aef-bfd6-2186e64177cd`, 127.741s; target case
+4.794s). No source or assertion changes were made. Original unstarted broad/handoff/product
+jobs were cancelled before heavy execution to prioritize isolation; their cancellations are not
+qualification. Restored the feature branch and the exact ledger-only comparison stash, then
+queued head handoff, focused rerun, broad, and products. The original focused failure is still
+unexplained, not classified as inherited or fixed.
+
+The head HandoffInheritance suite subsequently passed **105 tests** (ticket
+`5ca2db1d-32f6-4374-a243-78ef72fceeb6`, 109.521s). Focused rerun
+`842bf038-3d25-4c97-84c1-586217f1b333` ran **1,118 tests, four skipped**, with the pending-switch
+case and all 105 handoff tests passing; it failed one different case:
+`SessionAdminWorktreeRecoveryTests.testUnscopedLiveBindingRequiresExplicitWorkspaceQualificationAndFreshHydration`
+(line 1495), a three-second `foreground drafts published` fixture timeout. Rerun test execution
+was 747.596s. The overseer explicitly authorized publication: pending-switch is “intermittent
+under local load, did not reproduce in rerun or isolation, under watch”; the admin fixture wait
+was independently seen by M9.2h/#1684 and passed suite reruns there. These are accepted under-watch
+results, not a green focused gate or root-cause fix. CI recurrence of either belongs to this lane
+to investigate in production code. The now-unneeded queued admin isolation ticket was cancelled
+before execution after that classification.
+
+Integration was completed before these gates: `fb19813cb` and exact squash `99d4e718d` both have
+tree `754886815bacdb8c80ebf1956e3708c51a7a2ffb`; their diff is empty. Ours merge `2ac8635a4`
+targeted **99d4e718d only**. Normal merge `1fed77564` then brought main `c791cd13a` (#1681/M9.2f)
+without conflicts or dropping incoming changes. Both merges used `--no-commit`, passed staged
+contribution preflight, and were committed only after terminal success. Main-relative delta is
+36 files (35 Swift plus this ledger); `git merge-tree --write-tree HEAD origin/main` was clean,
+tree `7e253a05dcdef14cc20e815ecb0c33f86afc6e18`. Publication uses the new branch
+`runtime/20261111-m9-2g-startup-execution`, not the closed #1679 branch.
+
+Broad ticket `953b6e30-84e3-4d22-8090-573d0867c33e` completed with **2,779 executed, 22 skipped,
+seven assertions/errors across three cases** (app 2,726; Settings 1, SecureStorage 27, Domain 7,
+Providers 18). App execution took 1,802.074s. Five assertions in
+`ConcurrentSameWorkspaceAgentRunAdmissionTests.testTypedAdmissionRejectionLeavesNoIdentityAcrossRestartAndDispatchesNoProvider`
+(lines 1568/1573) reported one extra identity. The other cases were
+`SessionAdminWorktreeRecoveryTests.testCompetingBoundWritersCannotMutateConfigurationOrCreateWorktree`
+(`ambiguousGitTopology`) and `testExistingBranchWithoutCheckoutDoesNotInventBindRecovery`
+(the same three-second foreground-drafts fixture wait). The overseer classified the worktree
+fixture failures as known load intermittents independently observed in M9.2h/#1684.
+
+The requested single identity-isolation pair passed unchanged: head `1fed77564`, ticket
+`f8202139-4dd1-4599-8cd6-eec588d6fcbd`, **0.844s**; exact main `c791cd13a`, ticket
+`1b23f00d-1610-4c6f-8c9c-ee301f8a0797`, **0.818s**. Per the overseer's explicit decision rule,
+classify that case as broad-only intermittent, not root-caused, under watch, and publish.
+Neither the tests nor production code were changed to obtain the isolation passes. CI recurrence
+of any under-watch case belongs to this lane. Both temporary main comparisons preserved only the
+ledger in exact-path stashes, restored the feature branch and reapplied those stashes once; no
+history rewrite or protected-artifact mutation occurred.
+
+Both products `8d4f1c2f-8c86-46a2-864c-ff651cdda0d3` and full lint
+`6fab2162-0383-42e5-8470-c8eeead9e082` passed. Warning occurrence maxima across all 35 changed Swift
+files versus retained integrated compile `a0c674e9` have no positive delta (49 existing total:
+ACP runner 1, Claude runner 3, VM RepromptAutomation 2, VM 4, Claude approval tests 1, Codex wedge
+17, ACP compact tests 1, AutoWake 11, catalog integration 2, prompt adapter 6, runner adapter 1;
+other 24 files zero). This is not a zero-warning claim or an exact-main cold-build comparison.
+An index attempt overlapping the next isolation build refused freshness (zero stale/unindexed);
+it is not a pass. Final restored-head both-product build
+`896ab51f-ab5f-4ed0-83e5-86c38fd1b6c2` passed. The subsequent non-overlapping index check passed
+**1,264/1,360 wrong-way edges and 53/66 largest cycle**, with unchanged ratchet baselines. The
+wrong-way count is two above the last pre-main-merge local receipt (1,262); exact attribution of
+those two integration edges was not audited. Re-auditing warning counts including that final
+product compile still shows no positive per-file delta. All coordinated tickets are terminal
+and collected. No live-app/smoke, release, sanitizer or hosted-CI success is claimed for this
+publication head. The draft PR includes an explicit M9.3b handoff distinguishing runtime-owned
+admission/runner seams from remaining VM orchestration and provider/coordinator internals.
 
 ### M9.2j — persistence and payload-forwarding retirement (in progress)
 
