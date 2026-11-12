@@ -826,10 +826,6 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
 
     private func makePromptMutationFixture(name: String) async throws -> Fixture {
         let fixture = try await makeFixture(name: name)
-        addTeardownBlock { @MainActor in
-            await fixture.window.tearDown()
-            fixture.cleanup()
-        }
         await fixture.window.workspaceManager.waitUntilPostSwitchGitDataLoadComplete()
         return fixture
     }
@@ -849,7 +845,18 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         for file in files {
             try "// \(file.lastPathComponent)".write(to: file, atomically: true, encoding: .utf8)
         }
-        let workspace = window.workspaceManager.createWorkspace(name: name, repoPaths: [root.path], ephemeral: true)
+        let storage = WorkspaceFixtureStorage(root: root)
+        addTeardownBlock { @MainActor in
+            await window.tearDown()
+            await window.workspaceManager.debugDrainScheduledSaves()
+            WindowStatesManager.shared.unregisterWindowState(window)
+            await storage.remove()
+            try? FileManager.default.removeItem(at: root)
+        }
+        let workspace = storage.isolate(
+            window.workspaceManager.createWorkspace(name: name, repoPaths: [root.path], ephemeral: true),
+            in: window.workspaceManager
+        )
         await window.workspaceManager.switchWorkspace(to: workspace, saveState: false, reason: name)
         let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
         let backgroundTab = await window.promptManager.createBackgroundComposeTab(
@@ -966,8 +973,8 @@ private struct Fixture {
     }
 
     func cleanup() {
+        // The shared fixture teardown joins saves before removing roots/sidecars.
         WindowStatesManager.shared.unregisterWindowState(window)
-        try? FileManager.default.removeItem(at: root)
     }
 }
 

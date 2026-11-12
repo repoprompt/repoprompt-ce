@@ -5300,14 +5300,17 @@ import XCTest
         let rootURL: URL
         let contextA: PersistentMCPTestContext
         let contextB: PersistentMCPTestContext
+        private let storage: WorkspaceFixtureStorage
         private var primaryPersistentMCPTestEndpoint: PersistentMCPTestEndpoint?
         private var cleanedUp = false
 
         private init(
             rootURL: URL,
             contextA: PersistentMCPTestContext,
-            contextB: PersistentMCPTestContext
+            contextB: PersistentMCPTestContext,
+            storage: WorkspaceFixtureStorage
         ) {
+            self.storage = storage
             self.rootURL = rootURL
             self.contextA = contextA
             self.contextB = contextB
@@ -5345,6 +5348,7 @@ import XCTest
             await windowA.workspaceManager.awaitInitialized()
             await windowB.workspaceManager.awaitInitialized()
 
+            let storage = WorkspaceFixtureStorage(root: rootURL)
             var contextA: PersistentMCPTestContext?
             var contextB: PersistentMCPTestContext?
             var constructedFixture: PersistentMCPTestFixture?
@@ -5355,6 +5359,7 @@ import XCTest
                     sentinel: "let distinctMCPConnectionSentinelA = \"sentinel-a\"",
                     tabID: UUID(),
                     window: windowA,
+                    storage: storage,
                     label: "A"
                 )
                 contextB = try await makeContext(
@@ -5363,6 +5368,7 @@ import XCTest
                     sentinel: "let distinctMCPConnectionSentinelB = \"sentinel-b\"",
                     tabID: UUID(),
                     window: windowB,
+                    storage: storage,
                     label: "B"
                 )
                 try await ensureRequiredCatalogAndEnableTransport(
@@ -5371,7 +5377,8 @@ import XCTest
                 let fixture = try PersistentMCPTestFixture(
                     rootURL: rootURL,
                     contextA: XCTUnwrap(contextA),
-                    contextB: XCTUnwrap(contextB)
+                    contextB: XCTUnwrap(contextB),
+                    storage: storage
                 )
                 constructedFixture = fixture
                 fixture.primaryPersistentMCPTestEndpoint = try await PersistentMCPTestEndpoint.make(
@@ -5383,10 +5390,14 @@ import XCTest
                 if let constructedFixture {
                     await constructedFixture.cleanup()
                 } else {
+                    // Even a partially constructed context can already own startup/save work.
+                    await windowB.tearDown()
+                    await windowA.tearDown()
                     if let contextB { await cleanupContext(contextB) }
                     if let contextA { await cleanupContext(contextA) }
                     WindowStatesManager.shared.unregisterWindowState(windowB)
                     WindowStatesManager.shared.unregisterWindowState(windowA)
+                    await storage.remove()
                     try? FileManager.default.removeItem(at: rootURL)
                 }
                 throw error
@@ -5430,6 +5441,7 @@ import XCTest
             contextA.window.workspaceManager.workspaces.removeAll { $0.id == contextA.workspaceID }
             WindowStatesManager.shared.unregisterWindowState(contextB.window)
             WindowStatesManager.shared.unregisterWindowState(contextA.window)
+            await storage.remove()
             try? FileManager.default.removeItem(at: rootURL)
         }
 
@@ -5465,6 +5477,7 @@ import XCTest
             sentinel: String,
             tabID: UUID,
             window: WindowState,
+            storage: WorkspaceFixtureStorage,
             label: String
         ) async throws -> PersistentMCPTestContext {
             let sourceDirectory = rootURL.appendingPathComponent("Sources", isDirectory: true)
@@ -5476,6 +5489,7 @@ import XCTest
                 repoPaths: [rootURL.path]
             )
             configuredWorkspace.isEphemeral = true
+            configuredWorkspace = storage.isolate(configuredWorkspace)
             configuredWorkspace.composeTabs = [
                 ComposeTabState(id: tabID, name: "Distinct MCP Connection \(label)")
             ]

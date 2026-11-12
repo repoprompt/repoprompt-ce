@@ -950,12 +950,13 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
         await window.workspaceManager.awaitInitialized()
 
+        let storage = WorkspaceFixtureStorage(root: rootURL)
         do {
-            let workspace = window.workspaceManager.createWorkspace(
+            let workspace = storage.isolate(window.workspaceManager.createWorkspace(
                 name: "Titlebar Safety",
                 repoPaths: [rootURL.path],
                 ephemeral: true
-            )
+            ), in: window.workspaceManager)
             await window.workspaceManager.switchWorkspace(
                 to: workspace,
                 saveState: false,
@@ -1004,6 +1005,7 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             return Fixture(
                 window: window,
                 rootURL: rootURL,
+                storage: storage,
                 workspaceID: workspace.id,
                 viewModel: viewModel,
                 tabAID: tabAID,
@@ -1015,6 +1017,7 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             window.beginClose()
             await window.tearDown()
             WindowStatesManager.shared.unregisterWindowState(window)
+            await storage.remove()
             try? FileManager.default.removeItem(at: rootURL)
             throw error
         }
@@ -1026,6 +1029,7 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         fixture.window.beginClose()
         await fixture.window.tearDown()
         WindowStatesManager.shared.unregisterWindowState(fixture.window)
+        await fixture.storage.remove()
         try? FileManager.default.removeItem(at: fixture.rootURL)
     }
 
@@ -1040,6 +1044,7 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
     private struct Fixture {
         let window: WindowState
         let rootURL: URL
+        let storage: WorkspaceFixtureStorage
         let workspaceID: UUID
         let viewModel: AgentModeViewModel
         let tabAID: UUID
