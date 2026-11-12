@@ -373,8 +373,8 @@ final class AgentSessionLinkACPCompactRunnerTests: XCTestCase {
             workspacePath: workspace.path
         )
         harnesses.append(harness)
-        let session = harness.makeSession(agent: agent)
-        let binding = AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: UUID())
+        let session = try harness.makeBoundSession(agent: agent)
+        let binding = try XCTUnwrap(session.persistentSessionBindingIdentity)
         session.installPersistentSessionBinding(binding)
         XCTAssertNotNil(session.operationAdmissionFailureMessage, "Installing a binding alone does not restore it")
         // This runner fixture begins after payload restoration; creation and loading are separate contracts.
@@ -384,9 +384,13 @@ final class AgentSessionLinkACPCompactRunnerTests: XCTestCase {
     }
 
     private func run(_ fixture: Fixture, message: String) async {
+        guard let origin = try? fixture.harness.startCommand(for: fixture.session) else { XCTFail("Missing restored writer")
+            return
+        }
         _ = await fixture.harness.composition.startRun(
             tabID: fixture.session.tabID,
             session: fixture.session,
+            origin: origin,
             initialUserMessage: message,
             initialMessageForRun: message,
             attachments: []
@@ -404,9 +408,13 @@ final class AgentSessionLinkACPCompactRunnerTests: XCTestCase {
         _ command: AgentProviderControlCommand
     ) async -> AgentRunStartOutcomeRecorder {
         let recorder = AgentRunStartOutcomeRecorder()
+        guard let origin = try? fixture.harness.startCommand(for: fixture.session) else { XCTFail("Missing restored writer")
+            return recorder
+        }
         _ = await fixture.harness.composition.startRun(
             tabID: fixture.session.tabID,
             session: fixture.session,
+            origin: origin,
             initialUserMessage: command.providerText,
             initialMessageForRun: command.providerText,
             attachments: [],
@@ -551,8 +559,8 @@ final class AgentSessionLinkACPCompactRunnerTests: XCTestCase {
             selfCompactDispatchID: .init(requestID: attempt.id, stage: .compact)
         )
         let recorder = AgentRunStartOutcomeRecorder()
-        _ = await fixture.harness.composition.startRun(
-            tabID: fixture.session.tabID, session: fixture.session,
+        _ = try await fixture.harness.composition.startRun(
+            tabID: fixture.session.tabID, session: fixture.session, origin: fixture.harness.startCommand(for: fixture.session),
             initialUserMessage: command.providerText, initialMessageForRun: command.providerText,
             attachments: [], providerControlCommand: command, startOutcome: recorder
         )

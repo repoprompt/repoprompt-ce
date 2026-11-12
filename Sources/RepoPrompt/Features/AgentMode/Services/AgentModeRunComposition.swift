@@ -21,6 +21,7 @@ final class AgentModeRunComposition {
     func startRun(
         tabID: UUID,
         session: AgentTabSession,
+        origin: AgentSessionRuntimeStore.Command,
         initialUserMessage: String,
         initialMessageForRun: String,
         attachments: [AgentFileAttachment],
@@ -37,6 +38,7 @@ final class AgentModeRunComposition {
         switch await execution.prepareRun(
             tabID: tabID,
             session: session,
+            origin: origin,
             workspace: workspace,
             initialUserMessage: initialUserMessage,
             initialMessageForRun: initialMessageForRun,

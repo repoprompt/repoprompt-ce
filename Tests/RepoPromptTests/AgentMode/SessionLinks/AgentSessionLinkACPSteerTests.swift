@@ -917,9 +917,9 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         bridge.attach(host: host)
         defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }
         let before = bridge.captureWaitInput(for: endpoint)
-        await fixture.viewModel.submitUserTurnAfterHydration(
-            tabID: fixture.session.tabID, originalSession: fixture.session,
-            originalBinding: fixture.session.persistentSessionBindingIdentity,
+        try await fixture.viewModel.submitUserTurnAfterHydration(
+            tabID: fixture.session.tabID,
+            originalWriter: XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: XCTUnwrap(fixture.session.activeAgentSessionID))).writer,
             trimmedText: "deferred MCP input", attachmentsToSend: [], taggedFilesToSend: [],
             activeWorkflow: nil, stopFence: AgentRunStartStopFence(session: fixture.session),
             isLocalComposerInput: false
@@ -1136,6 +1136,38 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         XCTAssertTrue(fixture.session.pendingACPSteeringInstructions.isEmpty)
         XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
         XCTAssertTrue(fixture.provider.promptedMessages.isEmpty)
+    }
+
+    func testACPDiscoveryCannotStageHandoffAfterControllerTeardown() async throws {
+        let fixture = try await makeFixture()
+        let entered = AgentSessionLinkStopSignal<Void>()
+        let release = AgentSessionLinkStopSignal<Void>()
+        let catalog = fixture.viewModel.test_providerSwitchSkillCatalog
+        catalog.markDirty()
+        catalog.test_beforePublish = {
+            entered.finish(())
+            await release.value()
+        }
+        defer { release.finish(())
+            catalog.test_beforePublish = nil
+        }
+        fixture.session.pendingHandoff = .init(payload: "<forked_session>Retained ACP continuity</forked_session>", createdAt: Date())
+        fixture.session.pendingACPSteeringInstructions = [localSteeringInstruction(fixture, draft: "local discovery draft")]
+        fixture.session.pendingNonCodexUserInputTokenQueue = [11]
+        let service = fixture.viewModel.test_initializeRunService()
+        let accepted = await service.submitQueuedACPSteeringIfSupported(session: fixture.session)
+        XCTAssertTrue(accepted)
+        let flush = try XCTUnwrap(fixture.session.acpSteeringFlushTask)
+        await entered.value()
+        XCTAssertTrue(fixture.session.pendingACPSteeringInstructions.isEmpty)
+        XCTAssertFalse(fixture.session.pendingHandoff.isStagedForSend)
+        await fixture.session.teardownACPControllerIfPresent()
+        release.finish(())
+        await flush.value
+        XCTAssertFalse(fixture.session.pendingHandoff.isStagedForSend)
+        XCTAssertTrue(fixture.session.pendingHandoff.hasPayload)
+        XCTAssertTrue(fixture.provider.promptedMessages.isEmpty)
+        XCTAssertEqual(fixture.viewModel.draftRuntime.text(for: fixture.session.tabID), "local discovery draft")
     }
 
     func testInterruptedAttributedReplayUsesExactStoredProviderBytes() async throws {

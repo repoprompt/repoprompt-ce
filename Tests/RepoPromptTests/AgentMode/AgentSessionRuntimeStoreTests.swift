@@ -5,6 +5,41 @@ import XCTest
 
 @MainActor
 final class AgentSessionRuntimeStoreTests: XCTestCase {
+    func testPersistentWriterReceiptCannotRetainOrAdoptAnOwner() throws {
+        let store = AgentSessionRuntimeStore()
+        let sessionID = UUID(), workspaceID = UUID()
+        weak var weakScope: AgentSessionRuntimeStore.Scope?
+        weak var weakSession: AgentTabSession?
+        let receipt: AgentSessionRuntimeStore.WriterReceipt
+        do {
+            let session = AgentTabSession(tabID: UUID())
+            weakSession = session
+            session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: workspaceID))
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            let scope = store.makeScope()
+            weakScope = scope
+            scope.replaceSessions([session.tabID: session])
+            guard case let .unique(writer) = store.resolveWriter(sessionID: sessionID) else { return XCTFail("Missing writer") }
+            receipt = try XCTUnwrap(AgentSessionRuntimeStore.WriterReceipt(writer.admitCommand(.restored).get()))
+            XCTAssertEqual(receipt.disposition(for: session), .current)
+            let conflicting = store.makeScope()
+            let duplicate = conflicting.makeSession(tabID: UUID())
+            duplicate.installPersistentSessionBinding(.init(tabID: duplicate.tabID, sessionID: sessionID, workspaceID: workspaceID))
+            conflicting.replaceSessions([duplicate.tabID: duplicate])
+            XCTAssertEqual(receipt.disposition(for: session), .claimLost)
+            conflicting.replaceSessions([:])
+            XCTAssertEqual(receipt.disposition(for: session), .current)
+            scope.beginRetirement()
+            XCTAssertEqual(receipt.disposition(for: session), .ownedSuspended)
+            scope.replaceSessions([:])
+            scope.replaceSessions([session.tabID: session])
+            XCTAssertEqual(receipt.disposition(for: session), .claimLost)
+        }
+        XCTAssertNil(weakScope, "A persistent task's receipt must not retain scope -> session -> task")
+        XCTAssertNil(weakSession, "The value identity must not retain the session either")
+        XCTAssertEqual(receipt.disposition(for: AgentTabSession(tabID: UUID())), .claimLost)
+    }
+
     func testBindingChangesAndDuplicateClaimsStayIndexedWithoutPresentation() {
         let store = AgentSessionRuntimeStore().makeScope()
         let first = AgentTabSession(tabID: UUID())
@@ -222,6 +257,7 @@ final class AgentSessionRuntimeStoreTests: XCTestCase {
             return XCTFail("Exact runtime must admit first configuration without presentation")
         }
         let command = try writer.admitCommand(.creation(creation)).get()
+        XCTAssertNil(AgentSessionRuntimeStore.WriterReceipt(command), "Persistent provider tasks require restored admission")
         XCTAssertTrue(command.isCurrent)
         XCTAssertEqual(command.identity.restoration, session.currentRestorationBindingToken)
         let deletion = try AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: claim.sessionID)

@@ -207,7 +207,10 @@ final class AgentRunStartOutcomeRecorder {
         }
     }
 
-    private(set) var outcome: Outcome = .startFailed(message: nil)
+    private(set) var hasRecordedOutcome = false
+    private(set) var outcome: Outcome = .startFailed(message: nil) {
+        didSet { hasRecordedOutcome = true }
+    }
 
     init() {}
 

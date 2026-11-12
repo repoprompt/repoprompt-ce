@@ -355,13 +355,17 @@ extension AgentModeViewModel {
            let task = speculation.effortTask
         {
             let staged = await task.value
-            if reusableRepromptEffort(claim: claim, approved: repromptedText, session: session, autoWorkflow: autoWorkflow) != nil {
+            if let staged, reusableRepromptEffort(claim: claim, approved: repromptedText, session: session, autoWorkflow: autoWorkflow) != nil {
                 choice = staged
             } else {
-                choice = await chooseAutoEffortForUserTurn(text: judgingText, session: session, workflow: judgedWorkflow, isRepromptReplacement: repromptedText != nil)
+                choice = await chooseAutoEffortForUserTurn(text: judgingText, session: session, workflow: judgedWorkflow, isRepromptReplacement: repromptedText != nil, isCurrent: {
+                    composerSubmitRuntime.isCurrent(claim) && sessions[destinationTabID] === session
+                })
             }
         } else {
-            choice = await chooseAutoEffortForUserTurn(text: judgingText, session: session, workflow: judgedWorkflow, isRepromptReplacement: repromptedText != nil)
+            choice = await chooseAutoEffortForUserTurn(text: judgingText, session: session, workflow: judgedWorkflow, isRepromptReplacement: repromptedText != nil, isCurrent: {
+                composerSubmitRuntime.isCurrent(claim) && sessions[destinationTabID] === session
+            })
         }
         var selection = choice.selection
         var effortAudit = choice.audit
@@ -412,8 +416,15 @@ extension AgentModeViewModel {
         workflow: AgentWorkflowDefinition?,
         requestID: UUID = UUID(),
         isSpeculative: Bool = false,
-        isRepromptReplacement: Bool = false
+        isRepromptReplacement: Bool = false,
+        isCurrent: @MainActor () -> Bool
     ) async -> (selection: AutoEffortTurnSelection?, audit: AgentAutomationTurnAudit.Feature) {
+        var admitted = true
+        func admit() -> Bool {
+            admitted = admitted && isCurrent()
+            return admitted
+        }
+        guard admit() else { return ineligibleAutoEffortChoice() }
         let autoEffortConfiguration = modelRouterSettingsStore.autoEffortConfiguration()
         guard autoEffortConfiguration.enabled else {
             return (nil, .init(configured: false, eligible: false, judgmentRequested: false, decision: .disabled))
@@ -465,7 +476,7 @@ extension AgentModeViewModel {
         default:
             return ineligibleAutoEffortChoice()
         }
-        guard efforts.count >= 2 else { return ineligibleAutoEffortChoice() }
+        guard admit(), efforts.count >= 2 else { return ineligibleAutoEffortChoice() }
         let judgmentID = requestID
         if !isSpeculative {
             session.autoEffortJudgmentID = judgmentID
@@ -474,6 +485,8 @@ extension AgentModeViewModel {
             ui.statusPills.update(makeStatusPillsSnapshot())
         }
         defer {
+            // Release only this operation's marker, even after claim loss. Leaving it would
+            // block successor MCP turns; a different judgment UUID is never cleared.
             if !isSpeculative, session.autoEffortJudgmentID == judgmentID {
                 session.autoEffortJudgmentID = nil
                 if currentTabID == session.tabID {
@@ -482,6 +495,7 @@ extension AgentModeViewModel {
             }
         }
         guard let registration = await runtime.registry.registration(for: backendID),
+              admit(),
               let prepared = try? AutoEffortDecisionPolicy().build(
                   requestID: judgmentID,
                   maskedTaskExcerpt: maskedExcerpt,
@@ -498,7 +512,7 @@ extension AgentModeViewModel {
         )
         let chosen = prepared.effort(for: outcome)
         let currentAutoEffortConfiguration = modelRouterSettingsStore.autoEffortConfiguration()
-        guard currentAutoEffortConfiguration.enabled,
+        guard admit(), currentAutoEffortConfiguration.enabled,
               currentAutoEffortConfiguration.revision == autoEffortConfiguration.revision,
               currentAutoEffortConfiguration.selectedBackendRawValue == autoEffortConfiguration.selectedBackendRawValue,
               currentAutoEffortConfiguration.selectedBackendID == backendID,
@@ -518,7 +532,7 @@ extension AgentModeViewModel {
         case .claudeCode: claudeCoordinator.currentClaudeEffortLevel(for: session).rawValue
         default: nil
         }
-        guard currentManualEffortRaw == manualEffortRaw else {
+        guard admit(), currentManualEffortRaw == manualEffortRaw else {
             return (nil, .init(configured: true, eligible: true, judgmentRequested: true, decision: .fallback, fallbackApplied: true))
         }
         return (

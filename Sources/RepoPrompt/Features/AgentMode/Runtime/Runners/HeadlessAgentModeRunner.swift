@@ -205,8 +205,10 @@ final class HeadlessAgentModeRunner {
         ownership: AgentRunOwnership,
         attachmentReservationID: UUID?
     ) async {
+        let outcome = await lease.acquireFailureOutcome
+        hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await hooks.commitAcquireFailure(
-            session: session, lease: lease, runID: runID, ownership: ownership,
+            session: session, outcome: outcome, runID: runID, ownership: ownership,
             attachmentReservationID: attachmentReservationID,
             source: "headless.acquireFailure", supportsFollowUp: false,
             barrier: terminalCommitBarrier,

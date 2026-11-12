@@ -27,6 +27,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
     }
 
     private func makeFixture(
+        restored: Bool = false,
         _ plans: [[WedgeFakeCodexController.Response]],
         mcpServerEnabler: @escaping @MainActor @Sendable () async -> Bool = { true },
         routeOwnerValidator: @escaping CodexAgentModeCoordinator.CodexRouteOwnerValidator = { _, _, _, _ in true },
@@ -64,6 +65,13 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .codexExec
         session.hasLoadedPersistedState = true
+        if restored {
+            XCTAssertNotNil(viewModel.test_installPersistentSessionBinding(
+                sessionID: UUID(), on: session, updateWorkspaceMetadata: true
+            ))
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            XCTAssertTrue(session.permitsBoundOperationAndSave)
+        }
         if freshSession {
             session.runState = .idle
         } else {
@@ -299,7 +307,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
 
     func testRequiredRepoPromptDiscoveryFailureIsVisibleAndTerminatesBeforeDispatch() async throws {
         for resuming in [false, true] {
-            let fixture = makeFixture([[.discoveryFailure]])
+            let fixture = makeFixture(restored: true, [[.discoveryFailure]])
             if !resuming {
                 fixture.session.codexConversationID = nil
                 fixture.session.codexRolloutPath = nil
@@ -307,8 +315,8 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             }
             var sendFinished = false
             let send = Task {
-                let result = await fixture.coordinator.sendCodexNativeMessage(
-                    session: fixture.session,
+                let result = await fixture.coordinator.test_sendCodexNativeMessage(
+                    session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"),
                     text: "continue",
                     attachments: []
                 )
@@ -380,7 +388,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
     }
 
     func testColdCompactionAfterRouteRevocationInstallsPolicyBeforeDiscovery() async throws {
-        let fixture = makeFixture([
+        let fixture = makeFixture(restored: true, [
             [.success(Self.oldThreadID)],
             [.policyRequiredResume],
             [.policyRequiredResume]
@@ -453,8 +461,8 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         fixture.session.runState = .idle
         fixture.session.beginRunAttempt(source: "send-after-cold-compact")
         let send = Task {
-            await fixture.coordinator.sendCodexNativeMessage(
-                session: fixture.session, text: "continue", attachments: []
+            await fixture.coordinator.test_sendCodexNativeMessage(
+                session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "continue", attachments: []
             )
         }
         addTeardownBlock {
@@ -1182,7 +1190,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
     func testComputerUsePersistsAcrossCompletedLocalUserTurns() async throws {
         CodexComputerUseWorkflow.setEnabledForTesting(true)
         defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
-        let fixture = makeFixture([])
+        let fixture = makeFixture(restored: true, [])
         let responseSessionID = try installRestoredBinding(fixture)
         // This coordinator-level fixture starts its synthetic attempt before binding. Reopen it
         // against the restored binding now required by the real interaction command boundary.
@@ -1238,7 +1246,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         func context(_ local: Bool, origin: AgentTabSession.CodexFallbackOrigin = .manual) -> AgentTabSession.CodexFallbackSubmissionContext {
             .init(queueID: UUID(), providerText: "continue locally", attachments: [], taggedFileAttachments: [], draftText: "continue locally", optimisticUserItemID: nil, origin: origin, dispatchTicket: nil, isLocalUserInput: local)
         }
-        let first = await coordinator.sendCodexNativeMessage(session: session, text: "perform the operation", attachments: [], fallbackContext: context(true))
+        let first = await coordinator.test_sendCodexNativeMessage(session: session, ownership: session.activeRunOwnership ?? session.beginRunAttempt(source: "test.codex.send"), text: "perform the operation", attachments: [], fallbackContext: context(true))
         XCTAssertTrue(first.didSend)
         await coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "computer-use-turn"), session: session, sourceController: controller)
         let permission = AgentApprovalRequest(
@@ -1258,12 +1266,12 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         fixture.viewModel.interactionRuntime.submitApprovalDecision(command: command, requestID: permission.id, decision: .accept)
         try await AsyncTestWait.waitUntil("one explicit permission response", timeout: 4) { controller.qaResponseCount == 1 }
         XCTAssertNil(session.pendingApproval)
-        let followUp = await coordinator.sendCodexNativeMessage(session: session, text: "continue locally", attachments: [], fallbackContext: context(true))
+        let followUp = await coordinator.test_sendCodexNativeMessage(session: session, ownership: session.activeRunOwnership ?? session.beginRunAttempt(source: "test.codex.send"), text: "continue locally", attachments: [], fallbackContext: context(true))
         XCTAssertTrue(followUp.didSend, "Plain local input must steer an active Computer Use operation")
         XCTAssertEqual(controller.startedTurnCount, 1)
         XCTAssertEqual(controller.steeredTexts, ["continue locally"])
         for nonLocal in [nil, context(false), context(true, origin: .mcp(attemptID: UUID()))] {
-            let result = await coordinator.sendCodexNativeMessage(session: session, text: "untrusted input", attachments: [], fallbackContext: nonLocal)
+            let result = await coordinator.test_sendCodexNativeMessage(session: session, ownership: session.activeRunOwnership ?? session.beginRunAttempt(source: "test.codex.send"), text: "untrusted input", attachments: [], fallbackContext: nonLocal)
             XCTAssertTrue(result.didSend, "Local consent authorizes remote turns in the armed chat")
         }
         XCTAssertEqual(controller.steeredTexts, ["continue locally", "untrusted input", "untrusted input", "untrusted input"])
@@ -1278,12 +1286,12 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertEqual(session.codexControllerFeatureState?.computerUseEnabled, true)
         XCTAssertEqual(controller.shutdownCount, 0)
         session.beginRunAttempt(source: "computer-use.next-local-send")
-        let next = await coordinator.sendCodexNativeMessage(session: session, text: "ordinary local follow-up", attachments: [], fallbackContext: context(true))
+        let next = await coordinator.test_sendCodexNativeMessage(session: session, ownership: session.activeRunOwnership ?? session.beginRunAttempt(source: "test.codex.send"), text: "ordinary local follow-up", attachments: [], fallbackContext: context(true))
         XCTAssertTrue(next.didSend)
         XCTAssertEqual(flags, [true], "Later local turns must reuse the armed controller without reconnecting")
         XCTAssertEqual(controller.startedTurnCount, 2)
         XCTAssertEqual(session.pendingCodexComputerUseActivation?.id, activationID)
-        let nonLocal = await coordinator.sendCodexNativeMessage(session: session, text: "non-local second-turn steer", attachments: [], fallbackContext: context(false))
+        let nonLocal = await coordinator.test_sendCodexNativeMessage(session: session, ownership: session.activeRunOwnership ?? session.beginRunAttempt(source: "test.codex.send"), text: "non-local second-turn steer", attachments: [], fallbackContext: context(false))
         XCTAssertTrue(nonLocal.didSend, "Arming authorizes remote input on later turns")
         XCTAssertEqual(controller.startedTurnCount, 2)
         await coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "second-local-turn"), session: session, sourceController: controller)
@@ -1293,7 +1301,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertEqual(session.runState, .completed, "Disarming an idle chat must not overwrite successful completion")
         XCTAssertNil(session.pendingCodexComputerUseActivation)
         session.beginRunAttempt(source: "computer-use.disarmed-local-send")
-        let ordinary = await coordinator.sendCodexNativeMessage(session: session, text: "ordinary after off", attachments: [], fallbackContext: context(true))
+        let ordinary = await coordinator.test_sendCodexNativeMessage(session: session, ownership: session.activeRunOwnership ?? session.beginRunAttempt(source: "test.codex.send"), text: "ordinary after off", attachments: [], fallbackContext: context(true))
         XCTAssertTrue(ordinary.didSend)
         XCTAssertEqual(flags, [true, false], "An ordinary turn after disarming must have no companion")
         await coordinator.shutdownCodexSession(session)
@@ -1918,7 +1926,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
     }
 
     func testResumeTimeoutRejectsSendWithOneActionableFailureAndPreservesThread() async throws {
-        let fixture = makeFixture([[.timeout], [.timeout], [.discoveryFailure]], authRecovery: MonitorStubCodexAuthRecovery())
+        let fixture = makeFixture(restored: true, [[.timeout], [.timeout], [.discoveryFailure]], authRecovery: MonitorStubCodexAuthRecovery())
         var notifications: [String?] = []
         var reasons: [DomainAgentRunSnapshot.FailureReason?] = []
         fixture.session.appendItem(.user("continue the task"))
@@ -1951,8 +1959,8 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             )
         }
         fixture.coordinator.installTerminalCommitBarrier(barrier, terminalSessionBinder: makeBinding)
-        guard case let .failed(message) = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session, text: "continue the task", attachments: []
+        guard case let .failed(message) = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "continue the task", attachments: []
         ) else { return XCTFail("A timed-out resume must reject the send") }
         assertOldTuple(fixture.session)
         XCTAssertTrue(message.contains("No new thread was started"))
@@ -2012,8 +2020,8 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         fixture.session.runState = .running
         fixture.session.beginRunAttempt(source: "retry-after-timeout")
         fixture.session.appendItem(.user("retry the task", sequenceIndex: fixture.session.nextSequenceIndex))
-        guard case let .failed(retryMessage) = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session, text: "retry the task", attachments: []
+        guard case let .failed(retryMessage) = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "retry the task", attachments: []
         ) else { return XCTFail("Discovery failure must reject the retry") }
         XCTAssertTrue(retryMessage.contains("Tool catalog not ready"))
         XCTAssertEqual(notifications, [message, authMessage, retryMessage])
@@ -2164,7 +2172,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
     }
 
     func testOversizedResumeStopsWithoutReplacingTheConversation() async throws {
-        let fixture = makeFixture([
+        let fixture = makeFixture(restored: true, [
             [.oversizedResume],
             [.success("unexpected-replacement")]
         ])
@@ -2199,8 +2207,8 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             )
         })
         let send = Task {
-            await fixture.coordinator.sendCodexNativeMessage(
-                session: fixture.session,
+            await fixture.coordinator.test_sendCodexNativeMessage(
+                session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"),
                 text: "continue the current task",
                 attachments: []
             )
@@ -2251,8 +2259,8 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         fixture.session.runState = .running
         fixture.session.beginRunAttempt(source: "repeat-oversized-send")
         fixture.session.appendItem(.user("continue again", sequenceIndex: fixture.session.nextSequenceIndex))
-        guard case let .failed(repeatedText) = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session, text: "continue again", attachments: []
+        guard case let .failed(repeatedText) = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "continue again", attachments: []
         ) else { return XCTFail("The blocked pair must reject repeat sends") }
         XCTAssertEqual(repeatedText, notice.text)
         XCTAssertEqual(fixture.factory.controllers.count, 1, "a known oversized pair must not launch another app-server")
@@ -2342,7 +2350,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
     }
 
     func testMissingRolloutFreshStartTimeoutPreservesTupleWithoutStoppedResumeClaim() async {
-        let fixture = makeFixture([[.missingRollout, .startTimeout]], shouldManageCodexTooling: false)
+        let fixture = makeFixture(restored: true, [[.missingRollout, .startTimeout]], shouldManageCodexTooling: false)
         var notifications: [String?] = []
         var reasons: [DomainAgentRunSnapshot.FailureReason?] = []
         fixture.session.appendItem(.user("continue the task"))
@@ -2375,8 +2383,8 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             )
         }
         fixture.coordinator.installTerminalCommitBarrier(barrier, terminalSessionBinder: makeBinding)
-        guard case let .failed(message) = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session, text: "continue the task", attachments: []
+        guard case let .failed(message) = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "continue the task", attachments: []
         ) else { return XCTFail("An unconfirmed fresh start must reject the send") }
         assertOldTuple(fixture.session)
         XCTAssertTrue(message.contains("thread/start: Request timed out after 120.0s"))
@@ -2425,7 +2433,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
 
     func testSecondCallerCannotBypassUnpublishedStartup() async throws {
         let gate = TestReleaseFence(name: "first Codex start response")
-        let fixture = makeFixture([[.suspendedSuccess("claimed-thread", gate)]])
+        let fixture = makeFixture(restored: true, [[.suspendedSuccess("claimed-thread", gate)]])
         let startup = Task { await fixture.coordinator.ensureCodexNativeSession(session: fixture.session) }
         defer {
             gate.release()
@@ -2434,8 +2442,8 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         let entered = await gate.waitUntilEntered(timeout: 4)
         XCTAssertTrue(entered)
         await fixture.coordinator.ensureCodexNativeSession(session: fixture.session)
-        let secondSend = await fixture.coordinator.sendCodexNativeMessage(
-            session: fixture.session,
+        let secondSend = await fixture.coordinator.test_sendCodexNativeMessage(
+            session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"),
             text: "duplicate",
             attachments: []
         )
@@ -2560,7 +2568,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
     }
 
     func testSameRunAttemptDriftRetiresOnlyUncommittedControllerBeforeLaterSend() async throws {
-        let fixture = makeFixture([
+        let fixture = makeFixture(restored: true, [
             [.success("drifted-fresh-thread")],
             [.success("later-fresh-thread")]
         ])
@@ -2585,8 +2593,8 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         fixture.session.runState = .idle
         fixture.session.beginRunAttempt(source: "later-send")
         let later = Task {
-            await fixture.coordinator.sendCodexNativeMessage(
-                session: fixture.session,
+            await fixture.coordinator.test_sendCodexNativeMessage(
+                session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"),
                 text: "continue",
                 attachments: []
             )

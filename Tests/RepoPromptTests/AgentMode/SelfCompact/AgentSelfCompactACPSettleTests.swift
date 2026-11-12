@@ -361,7 +361,7 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
             acpProviderFactory: { _, _ in provider },
             workspacePath: directory.path
         )
-        let session = harness.makeSession(agent: .openCode)
+        let session = try harness.makeBoundSession(agent: .openCode)
         let runner = ACPIntegratedAgentModeRunner(
             hooks: harness.hooks,
             terminalCommitBarrier: AgentRunTerminalCommitBarrier(),
@@ -371,8 +371,8 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
             agentKind: .openCode, modelString: nil, workspacePath: directory.path,
             resumeSessionID: nil, attachments: [], taskLabelKind: nil
         )
-        await harness.resources.fulfill(runner.prepareRun(
-            tabID: session.tabID, session: session, workspace: harness.workspace,
+        try await harness.resources.fulfill(runner.prepareRun(
+            tabID: session.tabID, session: session, origin: harness.startCommand(for: session), workspace: harness.workspace,
             initialUserMessage: "prime", initialMessageForRun: "prime", attachments: [],
             runRequest: initialRequest,
             makeLease: { harness.makeLease(runID: $0, tabID: session.tabID) }
@@ -392,8 +392,8 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
             resumeSessionID: nil, attachments: [], taskLabelKind: nil,
             sessionModeID: "auto_edit"
         )
-        await harness.resources.fulfill(runner.prepareRun(
-            tabID: session.tabID, session: session, workspace: harness.workspace,
+        try await harness.resources.fulfill(runner.prepareRun(
+            tabID: session.tabID, session: session, origin: harness.startCommand(for: session), workspace: harness.workspace,
             initialUserMessage: frame, initialMessageForRun: frame, attachments: [],
             runRequest: noteRequest,
             makeLease: { harness.makeLease(runID: $0, tabID: session.tabID) }

@@ -115,7 +115,8 @@ extension AgentModeRunService {
             _ attachments: [AgentFileAttachment],
             _ taggedFileAttachments: [AgentTaggedFileAttachment],
             _ session: AgentTabSession?,
-            _ skipsSlashExpansion: Bool
+            _ skipsSlashExpansion: Bool,
+            _ isCurrent: @escaping @MainActor () -> Bool
         ) async -> String
         /// False refuses a fresh-session fallback whose recovery context was superseded or unavailable.
         let stageResumeRecoveryHandoffIfNeeded: (_ session: AgentTabSession) async -> Bool
@@ -291,7 +292,7 @@ extension AgentModeRunService.Hooks {
     @MainActor
     func commitAcquireFailure(
         session: AgentTabSession,
-        lease: MCPBootstrapLease,
+        outcome: MCPBootstrapLeaseAcquireFailureOutcome,
         runID: UUID,
         ownership: AgentRunOwnership,
         attachmentReservationID: UUID?,
@@ -300,8 +301,7 @@ extension AgentModeRunService.Hooks {
         barrier: AgentRunTerminalCommitBarrier,
         prepareProviderState: @escaping () -> (@MainActor () async -> Void)? = { nil }
     ) async {
-        let outcome = await lease.acquireFailureOutcome
-        providerInput.recordPendingHandoffSendOutcome(session, false)
+        // Acquisition and provider-specific receipt checks stay at the calling boundary.
         await barrier.commit(.init(
             binding: bindTerminalSession(session),
             ownership: ownership,
