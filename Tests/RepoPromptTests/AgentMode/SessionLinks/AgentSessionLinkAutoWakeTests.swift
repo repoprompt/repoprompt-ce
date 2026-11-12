@@ -1547,6 +1547,249 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         }
     }
 
+    func testClaudeLeasePreparationCannotReplayOrSettleThroughAReplacementWriter() async throws {
+        @MainActor final class LeaseCounters {
+            var release: CheckedContinuation<Bool, Never>?
+            var enabler = 0
+            var installs = 0
+            var clears = 0
+        }
+        for variant in ["entryReacquire", "entryRetire", "acquiredReacquire", "acquiredRetire", "failedReacquire", "failedRetire", "currentFailure", "stopSuccessor", "entryReacquireNote", "entryRetireNote"] {
+            let drift = variant.hasSuffix("Note") ? String(variant.dropLast(4)) : variant
+            let fixture = try makeFixture(fenceProviderLaunch: true)
+            let session = fixture.session
+            session.selectedAgent = .claudeCode
+            session.claudeController = fixture.nativeController
+            let stopService = fixture.viewModel.test_initializeRunService()
+            let origin = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
+            let scope = origin.writer.scope
+            let harness = AgentSessionLinkRunnerHarness(
+                headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
+                sessionLinkHost: fixture.viewModel
+            )
+            var handoffResults: [Bool] = []
+            harness.pendingHandoffSendOutcome = { _, sent in handoffResults.append(sent) }
+            let runner = ClaudeIntegratedAgentModeRunner(
+                claudeCoordinator: fixture.viewModel.test_claudeCoordinator, hooks: harness.hooks,
+                terminalCommitBarrier: AgentRunTerminalCommitBarrier()
+            )
+            let events = try XCTUnwrap(fixture.viewModel.test_claudeCoordinator.reserveEvents(for: session))
+            var replayed = 0
+            events.listener.onIdleEvent = { _ in replayed += 1 }
+            events.subscription.append(.native(.error("buffered startup event")))
+            let counters = LeaseCounters()
+            let gateID = UUID()
+            let noteID = variant.hasSuffix("Note") ? try installVerifiedParkedNote(fixture) : nil
+            if noteID != nil { session.selfCompactState.active?.phase = .dispatchingNote }
+            let previousTerminal = session.lastTerminalCommitRevision
+            @MainActor func driftWriter() {
+                if drift.hasSuffix("Reacquire") {
+                    var members = scope.sessions
+                    members.removeValue(forKey: session.tabID)
+                    scope.replaceSessions(members)
+                    members[session.tabID] = session
+                    scope.replaceSessions(members)
+                    XCTAssertFalse(origin.isCurrent, drift)
+                    XCTAssertTrue(events.listener.isCurrent(), "The listener alone cannot detect membership ABA")
+                } else if drift.hasSuffix("Retire") {
+                    scope.beginRetirement()
+                }
+            }
+            runner.testAtClaudeStartupBoundary = { boundary in
+                if boundary == .taskEntry, drift.hasPrefix("entry") { driftWriter() }
+            }
+            await runner.startRun(
+                tabID: fixture.tabID, session: session, origin: origin,
+                initialUserMessage: "held Claude startup", initialMessageForRun: "held Claude startup",
+                attachments: [], makeLease: { runID in
+                    MCPBootstrapLease(
+                        spec: .agentMode(tabID: fixture.tabID, runID: runID, gateID: gateID, windowID: 1, agent: .claudeCode),
+                        mcpServerEnabler: {
+                            counters.enabler += 1
+                            return await withCheckedContinuation { counters.release = $0 }
+                        },
+                        policyInstaller: { spec in
+                            await MainActor.run { counters.installs += 1 }
+                            await MCPRoutingWaiter.notifyRouted(runID: spec.runID)
+                        },
+                        expectedPIDPolicyArmer: { _ in true },
+                        policyClearer: { _ in await MainActor.run { counters.clears += 1 } }
+                    )
+                }, selfCompactDispatchID: noteID, preparedEvents: events
+            )
+            let task = try XCTUnwrap(session.agentTask)
+            let original = try XCTUnwrap(session.activeRunOwnership)
+            var successor: AgentRunOwnership?
+            if !drift.hasPrefix("entry") {
+                try await AsyncTestWait.waitUntil("Claude lease is held before policy installation") { counters.release != nil }
+                if drift == "stopSuccessor" {
+                    await stopService.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+                    XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, original)
+                    successor = session.beginRunAttempt(source: "successor after Stop")
+                    session.runState = .running
+                } else {
+                    driftWriter()
+                }
+                counters.release?.resume(returning: drift.hasPrefix("acquired") || drift == "stopSuccessor")
+                counters.release = nil
+            }
+            await task.value
+            let sent = await fixture.nativeController.sentCount
+            let gate = await HeadlessAgentConnectionGate.snapshot()
+            XCTAssertNotEqual(gate.activeConnectionID, gateID, variant)
+            XCTAssertEqual(sent, 0, drift)
+            XCTAssertTrue(events.subscription.isClosed, drift)
+            XCTAssertNil(events.listener.subscription, drift)
+            XCTAssertEqual(counters.enabler, drift.hasPrefix("entry") ? 0 : 1, variant)
+            if drift.hasSuffix("Reacquire") || drift == "stopSuccessor" {
+                XCTAssertEqual(replayed, 0, drift)
+                XCTAssertTrue(handoffResults.isEmpty, drift)
+                XCTAssertEqual(session.activeRunOwnership, successor ?? original, drift)
+                if successor == nil {
+                    XCTAssertEqual(session.lastTerminalCommitRevision, previousTerminal, variant)
+                    if noteID != nil { XCTAssertEqual(session.selfCompactState.active?.phase, .dispatchingNote, variant) }
+                    XCTAssertEqual(session.agentTask, task, drift)
+                }
+                if drift == "acquiredReacquire" {
+                    XCTAssertEqual(counters.installs, 1)
+                    XCTAssertEqual(counters.clears, 0, "Only the installed attempt's current owner may revoke policy")
+                }
+            } else {
+                XCTAssertEqual(replayed, 1, drift)
+                XCTAssertEqual(handoffResults, noteID == nil ? [false] : [], variant)
+                XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, original, drift)
+                XCTAssertEqual(session.runState, .cancelled, drift)
+                XCTAssertTrue(session.claudeController === fixture.nativeController, "Pre-send settlement preserves the warm controller")
+                if noteID != nil { XCTAssertEqual(session.selfCompactState.active?.phase, .parked, variant) }
+                XCTAssertNil(session.activeRunOwnership, drift)
+                XCTAssertNil(session.agentTask, drift)
+            }
+            await stopService.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+            XCTAssertNil(session.activeRunOwnership, drift)
+            XCTAssertNil(session.agentTask, drift)
+            if drift.hasSuffix("Reacquire") || drift == "stopSuccessor" {
+                XCTAssertNil(session.claudeController, drift)
+            } else {
+                XCTAssertTrue(session.claudeController === fixture.nativeController, drift)
+            }
+            if drift == "acquiredReacquire" { XCTAssertEqual(counters.clears, 1, drift) }
+        }
+    }
+
+    func testClaudePostTrackingPreparationKeepsItsWriterBeforeCoordinatorEntry() async throws {
+        @MainActor final class LeaseCounters {
+            var installs = 0
+            var clears = 0
+            var routeChecks = 0
+        }
+        for variant in ["trackedReacquire", "trackedRetire", "initReacquire", "initRetire", "initRetireNote", "none"] {
+            let fixture = try makeFixture(catalogReady: false)
+            let session = fixture.session
+            session.selectedAgent = .claudeCode
+            session.claudeController = fixture.nativeController
+            await fixture.nativeController.setImmediateReplyDuringSend(true)
+            let stopService = fixture.viewModel.test_initializeRunService()
+            let origin = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
+            let scope = origin.writer.scope
+            let harness = AgentSessionLinkRunnerHarness(
+                headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
+                sessionLinkHost: fixture.viewModel
+            )
+            var handoffs: [Bool] = []
+            harness.pendingHandoffSendOutcome = { _, sent in handoffs.append(sent) }
+            let runner = ClaudeIntegratedAgentModeRunner(
+                claudeCoordinator: fixture.viewModel.test_claudeCoordinator, hooks: harness.hooks,
+                terminalCommitBarrier: AgentRunTerminalCommitBarrier()
+            )
+            let events = try XCTUnwrap(fixture.viewModel.test_claudeCoordinator.reserveEvents(for: session))
+            var replayed = 0
+            events.listener.onIdleEvent = { _ in replayed += 1 }
+            if variant != "none" { events.subscription.append(.native(.error("buffered pre-coordinator event"))) }
+            let noteID = variant.hasSuffix("Note") ? try installVerifiedParkedNote(fixture) : nil
+            if noteID != nil { session.selfCompactState.active?.phase = .dispatchingNote }
+            let previousTerminal = session.lastTerminalCommitRevision
+            let counters = LeaseCounters()
+            let gateID = UUID()
+            var boundaries: [ClaudeIntegratedAgentModeRunner.StartupBoundary] = []
+            runner.testAtClaudeStartupBoundary = { boundary in
+                boundaries.append(boundary)
+                let target: ClaudeIntegratedAgentModeRunner.StartupBoundary = variant.hasPrefix("tracked") ? .toolTrackingCompleted : .providerInitializationStarted
+                guard variant != "none", boundary == target else { return }
+                if variant.hasSuffix("Reacquire") {
+                    var members = scope.sessions
+                    members.removeValue(forKey: session.tabID)
+                    scope.replaceSessions(members)
+                    members[session.tabID] = session
+                    scope.replaceSessions(members)
+                    XCTAssertFalse(origin.isCurrent, variant)
+                    XCTAssertTrue(events.listener.isCurrent(), variant)
+                } else {
+                    scope.beginRetirement()
+                }
+            }
+            await runner.startRun(
+                tabID: fixture.tabID, session: session, origin: origin,
+                initialUserMessage: "Claude boundary", initialMessageForRun: "Claude boundary", attachments: [],
+                makeLease: { runID in
+                    MCPBootstrapLease(
+                        spec: .agentMode(tabID: fixture.tabID, runID: runID, gateID: gateID, windowID: 1, agent: .claudeCode),
+                        mcpServerEnabler: { true },
+                        policyInstaller: { spec in
+                            await MainActor.run { counters.installs += 1 }
+                            await MCPRoutingWaiter.notifyRouted(runID: spec.runID)
+                        }, expectedPIDPolicyArmer: { _ in true },
+                        policyClearer: { _ in await MainActor.run { counters.clears += 1 } },
+                        routeAuthorityResolver: { _ in
+                            await MainActor.run { counters.routeChecks += 1 }
+                            return .committed
+                        }
+                    )
+                }, selfCompactDispatchID: noteID, preparedEvents: events
+            )
+            let task = try XCTUnwrap(session.agentTask)
+            let original = try XCTUnwrap(session.activeRunOwnership)
+            await task.value
+            let sent = await fixture.nativeController.sentCount
+            XCTAssertEqual(sent, variant == "none" ? 1 : 0, variant)
+            XCTAssertEqual(
+                boundaries,
+                variant.hasPrefix("tracked")
+                    ? [.taskEntry, .toolTrackingCompleted]
+                    : [.taskEntry, .toolTrackingCompleted, .providerInitializationStarted],
+                variant
+            )
+            XCTAssertTrue(events.subscription.isClosed, variant)
+            let gate = await HeadlessAgentConnectionGate.snapshot()
+            XCTAssertNotEqual(gate.activeConnectionID, gateID, variant)
+            XCTAssertEqual(counters.installs, 1, variant)
+            if variant.hasSuffix("Reacquire") {
+                XCTAssertEqual(replayed, 0, variant)
+                XCTAssertTrue(handoffs.isEmpty, variant)
+                XCTAssertEqual(session.lastTerminalCommitRevision, previousTerminal, variant)
+                XCTAssertEqual(session.activeRunOwnership, original, variant)
+                XCTAssertEqual(session.agentTask, task, variant)
+                XCTAssertEqual(counters.clears, 0, variant)
+                XCTAssertTrue(session.claudeController === fixture.nativeController, variant)
+                await stopService.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+                XCTAssertEqual(counters.clears, 1, variant)
+                XCTAssertNil(session.claudeController, variant)
+            } else {
+                XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, original, variant)
+                XCTAssertEqual(session.runState, variant == "none" ? .completed : .cancelled, variant)
+                XCTAssertEqual(handoffs, variant == "none" ? [true] : (noteID == nil ? [false] : []), variant)
+                XCTAssertEqual(replayed, variant == "none" ? 0 : 1, variant)
+                if noteID != nil { XCTAssertEqual(session.selfCompactState.active?.phase, .parked, variant) }
+                if variant != "none" {
+                    XCTAssertTrue(session.claudeController === fixture.nativeController, variant)
+                    XCTAssertEqual(counters.clears, 0, "The original cancellation preserves its committed warm route")
+                    XCTAssertEqual(counters.routeChecks, 1, "The refusal must not enter post-coordinator lease cancellation a second time")
+                }
+            }
+            XCTAssertNil(session.activeRunOwnership, variant)
+            XCTAssertNil(session.agentTask, variant)
+        }
+    }
+
     func testClaudeVerifiedCompactPreSendExitReparksAndPendingWakeCarriesNote() async throws {
         for exit in ["entryStop", "leaseFailure", "leaseCancellation"] {
             let fixture = try makeFixture(fenceProviderLaunch: true)
@@ -1566,6 +1809,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             session.selfCompactState.active?.admittedSupport = .claudeCode
             let compactRunID = try XCTUnwrap(session.runID)
             let compactAttemptID = UUID()
+            let origin = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
             let leaseGate = TestReleaseFence(name: "dedicated Claude note bootstrap")
             defer { leaseGate.release() }
             let completion = AgentSelfCompactNativeCompletionCoordinator(
@@ -1577,7 +1821,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                     let fence = AgentRunStartStopFence(session: session)
                     if exit == "entryStop" { session.stopState.invalidateScheduledStarts() }
                     await runner.startRun(
-                        tabID: fixture.tabID, session: session,
+                        tabID: fixture.tabID, session: session, origin: origin,
                         initialUserMessage: "", initialMessageForRun: AgentSelfCompactNoteEnvelope.frame("continue safely"),
                         attachments: [], makeLease: { runID in
                             MCPBootstrapLease(
@@ -1686,7 +1930,9 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             session.selfCompactNativeCompletion = refusal == "missingCoordinator" ? nil : completion
             let dispatchID = AgentSelfCompactionDispatchID(requestID: refusal == "bindRejected" ? UUID() : noteID.requestID, stage: .compact)
             try await runner.startRun(
-                tabID: fixture.tabID, session: session, initialUserMessage: "", initialMessageForRun: "/compact",
+                tabID: fixture.tabID, session: session,
+                origin: XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID)),
+                initialUserMessage: "", initialMessageForRun: "/compact",
                 attachments: [], makeLease: { harness.makeLease(runID: $0, tabID: fixture.tabID) },
                 providerControlCommand: .compact(
                     expectedBinding: XCTUnwrap(session.persistentSessionBindingIdentity),
@@ -1709,7 +1955,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     }
 
     func testCodexDedicatedNoteEarlyExitReparksWithoutProviderTransport() async throws {
-        for exit in ["entryStop", "mcpFailure", "stopAfterMCP"] {
+        for exit in ["entryStop", "mcpFailure", "stopAfterMCP", "coordinatorRefusal"] {
             let fixture = try makeFixture(fenceProviderLaunch: true)
             let session = fixture.session
             session.selectedAgent = .codexExec
@@ -1727,17 +1973,130 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 },
                 codexCoordinator: fixture.viewModel.test_codexCoordinator, hooks: harness.hooks
             )
-            let outcome = await runner.startRun(
-                tabID: fixture.tabID, session: session, initialMessageForRun: AgentSelfCompactNoteEnvelope.frame("continue safely"),
+            let outcome = try await runner.startRun(
+                tabID: fixture.tabID, session: session, origin: XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID)),
+                initialMessageForRun: exit == "coordinatorRefusal" ? "not the required note envelope" : AgentSelfCompactNoteEnvelope.frame("continue safely"),
                 attachments: [], fallbackContext: nil, selfCompactDispatchID: noteID, stopFence: fence
             )
             XCTAssertFalse(outcome.didSend)
+            if exit == "coordinatorRefusal" {
+                guard case let .preDispatchRejected(message) = outcome else { return XCTFail("Expected actual coordinator refusal") }
+                XCTAssertEqual(message, "Continuation note admission changed before Codex dispatch.")
+            }
+            if exit == "stopAfterMCP" { XCTAssertNotNil(session.activeRunOwnership, "Stop still owns terminal settlement") }
             XCTAssertEqual(mcpCalls, exit == "entryStop" ? 0 : 1)
             XCTAssertNil(session.codexController)
             XCTAssertEqual(session.selfCompactState.active?.id, noteID.requestID)
             XCTAssertEqual(session.selfCompactState.active?.phase, .parked)
             XCTAssertEqual(session.selfCompactState.active?.compactTurnSucceeded, true)
             XCTAssertEqual(session.selfCompactState.active?.noteDispatchStarted, false)
+        }
+    }
+
+    func testCodexMCPPreparationKeepsItsWriterAttemptTaskAndReservation() async throws {
+        for drift in ["none", "reacquire", "retire", "successor", "taskReplacement", "stop", "reacquireNote", "successorNote", "stopNote", "retireExisting"] {
+            let fixture = try makeFixture(fenceProviderLaunch: true)
+            let session = fixture.session
+            session.selectedAgent = .codexExec
+            let origin = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
+            let scope = origin.writer.scope
+            let noteID = drift.hasSuffix("Note") ? try installVerifiedParkedNote(fixture) : nil
+            if noteID != nil { session.selfCompactState.active?.phase = .dispatchingNote }
+            let attachment = AgentFileAttachment(source: .localFile(path: "/nonexistent-codex-startup-preservation.png"))
+            let harness = AgentSessionLinkRunnerHarness(
+                headlessProviderFactory: { _, _ in
+                    XCTFail("MCP refusal must not construct a provider")
+                    return AgentSessionLinkCapturingHeadlessProvider()
+                }, attachmentHooks: scope.attachments.makeRunHooks()
+            )
+            var handoffResults: [Bool] = []
+            harness.pendingHandoffSendOutcome = { _, sent in handoffResults.append(sent) }
+            var releaseMCP: CheckedContinuation<Bool, Never>?
+            let runner = CodexIntegratedAgentModeRunner(
+                mcpServerEnabler: { await withCheckedContinuation { releaseMCP = $0 } },
+                codexCoordinator: fixture.viewModel.test_codexCoordinator, hooks: harness.hooks
+            )
+            if drift == "retireExisting" { _ = session.beginRunAttempt(source: "existing") }
+            let task = Task {
+                await runner.startRun(
+                    tabID: fixture.tabID, session: session, origin: origin,
+                    initialMessageForRun: "preserve startup", attachments: [attachment], fallbackContext: nil,
+                    selfCompactDispatchID: noteID
+                )
+            }
+            try await AsyncTestWait.waitUntil("Codex MCP preparation held") { releaseMCP != nil }
+            let originalOwnership = try XCTUnwrap(session.activeRunOwnership)
+            let originalTask = try XCTUnwrap(session.agentTask)
+            let originalReservation = session.attachmentTurnState
+            guard case .reserved = originalReservation else { return XCTFail("Expected a real reservation") }
+            var replacementTask: Task<Void, Never>?
+            var replacementOwnership: AgentRunOwnership?
+            if drift.hasPrefix("reacquire") {
+                var members = scope.sessions
+                members.removeValue(forKey: session.tabID)
+                scope.replaceSessions(members)
+                members[session.tabID] = session
+                scope.replaceSessions(members)
+                XCTAssertFalse(origin.isCurrent)
+            } else if drift.hasPrefix("retire") {
+                scope.beginRetirement()
+            } else if drift.hasPrefix("successor") {
+                replacementOwnership = session.beginRunAttempt(source: "successor")
+                replacementTask = Task {}
+                session.agentTask = replacementTask
+            } else if drift == "taskReplacement" {
+                replacementTask = Task {}
+                session.agentTask = replacementTask
+            } else if drift.hasPrefix("stop") {
+                await harness.service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+                XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, originalOwnership)
+            }
+            let dirty = session.isDirty
+            releaseMCP?.resume(returning: drift.hasPrefix("reacquire") || drift.hasPrefix("successor") || drift.hasPrefix("stop"))
+            releaseMCP = nil
+            let outcome = await task.value
+            XCTAssertFalse(outcome.didSend, drift)
+            XCTAssertNil(session.codexController, drift)
+            let stale = drift.hasPrefix("reacquire") || drift.hasPrefix("successor") || drift.hasPrefix("stop")
+            if stale {
+                if drift.hasPrefix("stop") {
+                    guard case .cancelled = outcome else { return XCTFail("Expected original Stop cancellation") }
+                    if noteID != nil { XCTAssertEqual(session.selfCompactState.active?.phase, .parked, drift) }
+                } else {
+                    guard case .stale = outcome else { return XCTFail("Expected stale origin: \(drift)") }
+                }
+                XCTAssertTrue(handoffResults.isEmpty, drift)
+                if !drift.hasPrefix("stop") {
+                    XCTAssertEqual(session.attachmentTurnState, originalReservation, drift)
+                    XCTAssertEqual(session.isDirty, dirty, drift)
+                    XCTAssertEqual(session.activeRunOwnership, replacementOwnership ?? originalOwnership, drift)
+                    XCTAssertEqual(session.agentTask, replacementTask ?? originalTask, drift)
+                    if noteID != nil { XCTAssertEqual(session.selfCompactState.active?.phase, .dispatchingNote, drift) }
+                }
+            } else {
+                if drift.hasPrefix("retire") {
+                    guard case .cancelled = outcome else { return XCTFail("Expected suspended cancellation") }
+                } else {
+                    guard case .failed = outcome else { return XCTFail("Expected original MCP failure") }
+                }
+                XCTAssertEqual(handoffResults, [false], drift)
+                XCTAssertEqual(session.attachmentTurnState, .idle, drift)
+                XCTAssertTrue(session.pendingFileAttachments.contains { $0.id == attachment.id }, drift)
+                if drift == "retireExisting" {
+                    XCTAssertEqual(session.activeRunOwnership, originalOwnership, drift)
+                } else {
+                    XCTAssertNil(session.activeRunOwnership, drift)
+                }
+                XCTAssertEqual(session.agentTask, replacementTask, drift)
+            }
+            // The old task cannot reclaim its resources through a reacquired writer. The current
+            // owner's real Stop remains responsible for the retained reservation and task slot.
+            await harness.service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+            XCTAssertEqual(session.attachmentTurnState, .idle, drift)
+            XCTAssertNil(session.agentTask, drift)
+            XCTAssertTrue(session.pendingFileAttachments.contains { $0.id == attachment.id }, drift)
+            await originalTask.value
+            await replacementTask?.value
         }
     }
 
@@ -3308,24 +3667,39 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     }
 
     func testPreparationFinalizerReleasesStoppedUnacquiredWakeWhileRunRemainsActive() async throws {
-        let fixture = try makeFixture()
-        try publishInventory(fixture, revision: 1)
-        fixture.session.oversight.autoWakeOnUpdates = true
-        fixture.session.runState = .running
-        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
-        var attempt = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
-        attempt.task?.cancel()
-        attempt.phase = .preparingDispatch
-        attempt.physicalOutcome = .notAttempted
-        fixture.session.oversight.pendingAutoWake = attempt
-        fixture.viewModel.agentSessionLinkRetractAutoWakeForUserStop(fixture.session)
-        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .cancelledBeforeDispatch)
-        // The idle-follow-up caller runs this owner after startAgentRun returns, including
-        // cancellation. It must not require a provider acquisition or an inactive successor.
-        await fixture.viewModel.agentSessionLinkAwaitPhysicalDispatchSettlement(wakeID: attempt.wakeID, endpoint: attempt.observerEndpoint)
-        XCTAssertTrue(fixture.session.runState.isActive)
-        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
-        XCTAssertEqual(fixture.session.oversight.suppressedWakeFingerprint, attempt.wakeFingerprint)
+        for reacquire in [false, true] {
+            let fixture = try makeFixture()
+            let origin = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID))
+            try publishInventory(fixture, revision: 1)
+            fixture.session.oversight.autoWakeOnUpdates = true
+            fixture.session.runState = .running
+            try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+            var attempt = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+            attempt.task?.cancel()
+            attempt.phase = .preparingDispatch
+            attempt.physicalOutcome = .notAttempted
+            fixture.session.oversight.pendingAutoWake = attempt
+            if reacquire {
+                let scope = origin.writer.scope
+                var members = scope.sessions
+                members.removeValue(forKey: fixture.tabID)
+                scope.replaceSessions(members)
+                members[fixture.tabID] = fixture.session
+                scope.replaceSessions(members)
+                XCTAssertFalse(origin.isCurrent)
+                XCTAssertTrue(try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: fixture.sessionID)).isCurrent)
+                XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.wakeID, attempt.wakeID)
+            }
+            // Characterize the existing Stop-retraction/finalizer subpath without invoking
+            // an old physical-dispatch hook. This does not exercise runner cancelRun or prove
+            // its wiring: neither of these wake operations resolves writer authority.
+            fixture.viewModel.agentSessionLinkRetractAutoWakeForUserStop(fixture.session)
+            XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .cancelledBeforeDispatch)
+            await fixture.viewModel.agentSessionLinkAwaitPhysicalDispatchSettlement(wakeID: attempt.wakeID, endpoint: attempt.observerEndpoint)
+            XCTAssertTrue(fixture.session.runState.isActive)
+            XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+            XCTAssertEqual(fixture.session.oversight.suppressedWakeFingerprint, attempt.wakeFingerprint)
+        }
     }
 
     func testUserStopRetractsOnlyPreDispatchAutoWakePhases() throws {
@@ -6437,7 +6811,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             )
             let session = host.session(for: fixture.tabID)
             session.hasLoadedPersistedState = true
-            session.testInstallPersistentSessionBinding(sessionID: UUID())
+            session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: UUID()))
             session.recordRestorationAuthoritative(.persistedPayloadApplied)
             XCTAssertNil(session.operationAdmissionFailureMessage)
             session.oversight.pendingAutoWake = fixture.session.oversight.pendingAutoWake
@@ -6448,7 +6822,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             let runID = UUID()
             session.installRunID(runID)
             let ownership = session.beginRunAttempt(source: "test.periodic.resume")
-            let result = await coordinator.ensureClaudeNativeSession(
+            let result = await coordinator.test_ensureClaudeNativeSession(
                 session: session, intent: .runAttempt(ownership: ownership, runID: runID)
             )
             let originalAttempts = await controller.startOrResumeExistingSessionIDs
@@ -6463,7 +6837,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 XCTAssertEqual(result, .ready)
                 XCTAssertEqual(attempts, ["missing-original-session", nil])
                 XCTAssertEqual(creations, 2)
-                let sent = await coordinator.sendClaudeNativeMessage(
+                let sent = await coordinator.test_sendClaudeNativeMessage(
                     session: session, text: "Continue", attachments: [],
                     intent: .runAttempt(ownership: ownership, runID: runID),
                     allowsCatalogRouteControllerRecovery: false
@@ -6655,9 +7029,10 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         }
         fixture.session.oversight.pendingAutoWake?.phase = .preparingDispatch
         fixture.session.oversight.pendingAutoWake?.periodicComposerAttemptID = submission.id
+        let origin = try XCTUnwrap(fixture.viewModel.runtimeCommand(sessionID: XCTUnwrap(fixture.session.activeAgentSessionID)))
         return Task { @MainActor in
             _ = await harness.composition.startRun(
-                tabID: fixture.tabID, session: fixture.session,
+                tabID: fixture.tabID, session: fixture.session, origin: origin,
                 initialUserMessage: AgentModeViewModel.periodicWakeMessage,
                 initialMessageForRun: AgentModeViewModel.periodicWakeMessage, attachments: []
             )
@@ -7435,7 +7810,7 @@ extension AgentSessionLinkAutoWakeTests {
         addTeardownBlock { await gate.open() }
         let intent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: owner, runID: XCTUnwrap(fixture.session.runID))
         let producer = Task { @MainActor in
-            await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            await fixture.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
                 session: fixture.session, text: "", attachments: [], intent: intent,
                 allowsCatalogRouteControllerRecovery: false
             )
@@ -7621,7 +7996,7 @@ extension AgentSessionLinkAutoWakeTests {
         }
         let firstIntent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: firstOwner, runID: XCTUnwrap(fixture.session.runID))
         let w1 = Task { @MainActor in
-            await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            await fixture.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
                 session: fixture.session, text: "", attachments: [], intent: firstIntent, allowsCatalogRouteControllerRecovery: false
             )
         }
@@ -7636,7 +8011,7 @@ extension AgentSessionLinkAutoWakeTests {
         let secondOwner = try beginAndAcquireQuietWake(fixture, claim: second)
         let secondIntent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: secondOwner, runID: XCTUnwrap(fixture.session.runID))
         let w2 = Task { @MainActor in
-            await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            await fixture.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
                 session: fixture.session, text: "", attachments: [], intent: secondIntent, allowsCatalogRouteControllerRecovery: false
             )
         }
@@ -7879,7 +8254,7 @@ extension AgentSessionLinkAutoWakeTests {
         let claim = try reserveQuietWake(observer)
         let owner = try beginAndAcquireQuietWake(observer, claim: claim)
         let intent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: owner, runID: XCTUnwrap(observer.session.runID))
-        _ = await observer.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+        _ = await observer.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
             session: observer.session, text: "", attachments: [], intent: intent, allowsCatalogRouteControllerRecovery: false
         )
         let physical = await observer.nativeController.sentMessages
@@ -8123,7 +8498,7 @@ extension AgentSessionLinkAutoWakeTests {
                             let owner = fixture.session.beginRunAttempt(source: "test.copy.primer")
                             fixture.session.runState = .running
                             let intent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: owner, runID: XCTUnwrap(fixture.session.runID))
-                            _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+                            _ = await fixture.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
                                 session: fixture.session, text: "primer", attachments: [], intent: intent, allowsCatalogRouteControllerRecovery: false
                             )
                             XCTAssertTrue(fixture.session.endRunAttempt(ifCurrent: owner, source: "test.copy.primer.finished"))
@@ -8141,7 +8516,7 @@ extension AgentSessionLinkAutoWakeTests {
                         XCTAssertFalse(claim.routineQuietCheckIn, "Routine opportunity alone cannot substitute for current returned-definition evidence")
                         let owner = try beginAndAcquireQuietWake(fixture, claim: claim)
                         let intent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: owner, runID: XCTUnwrap(fixture.session.runID))
-                        _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+                        _ = await fixture.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(
                             session: fixture.session, text: "", attachments: [], intent: intent, allowsCatalogRouteControllerRecovery: false
                         )
                         let sent = await fixture.nativeController.sentMessages
@@ -8297,7 +8672,7 @@ extension AgentSessionLinkAutoWakeTests {
                     try await AsyncTestWait.waitUntil("failing ring running frame accepted") { await bridge.test_pairedRunStatus(for: endpoint) == .running }
                     if fixture.session.selectedAgent == .claudeCode {
                         let intent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: owner, runID: XCTUnwrap(fixture.session.runID))
-                        let outcome = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(session: fixture.session, text: "", attachments: [], intent: intent, allowsCatalogRouteControllerRecovery: false)
+                        let outcome = await fixture.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(session: fixture.session, text: "", attachments: [], intent: intent, allowsCatalogRouteControllerRecovery: false)
                         guard case .failed = outcome else { return XCTFail("Expected physical Claude failure, got \(outcome)") }
                         _ = await AgentRunTerminalCommitBarrier().commit(.init(
                             binding: terminal.hooks.bindTerminalSession(fixture.session), ownership: owner, expectedRunID: fixture.session.runID,
@@ -8308,7 +8683,7 @@ extension AgentSessionLinkAutoWakeTests {
                         // The real Codex error path owns failed terminalization; do not insert a
                         // final row or mint a second completion on behalf of the fake provider.
                         fixture.session.runState = .completed
-                        let outcome = await fixture.viewModel.test_codexCoordinator.sendCodexNativeMessage(session: fixture.session, text: "", attachments: [])
+                        let outcome = await fixture.viewModel.test_codexCoordinator.test_sendCodexNativeMessage(session: fixture.session, ownership: fixture.session.activeRunOwnership ?? fixture.session.beginRunAttempt(source: "test.codex.send"), text: "", attachments: [])
                         guard case .failed = outcome else { return XCTFail("Expected physical Codex failure, got \(outcome)") }
                     }
                     XCTAssertEqual(calls.count, callCount + 1, "Exactly one physical fake call per failed producer in this no-retry scenario")
@@ -8365,7 +8740,7 @@ extension AgentSessionLinkAutoWakeTests {
         let owner = try beginAndAcquireQuietWake(fixture, claim: claim)
         await fixture.nativeController.setFailSendAfterRecord(true)
         let intent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: owner, runID: XCTUnwrap(fixture.session.runID))
-        _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(session: fixture.session, text: "", attachments: [], intent: intent, allowsCatalogRouteControllerRecovery: false)
+        _ = await fixture.viewModel.test_claudeCoordinator.test_sendClaudeNativeMessage(session: fixture.session, text: "", attachments: [], intent: intent, allowsCatalogRouteControllerRecovery: false)
         let sendsAfterFailure = await fixture.nativeController.sentMessages.count
         XCTAssertGreaterThan(sendsAfterFailure, 0)
         let suppressed = try XCTUnwrap(fixture.session.oversight.suppressedWakeFingerprint)

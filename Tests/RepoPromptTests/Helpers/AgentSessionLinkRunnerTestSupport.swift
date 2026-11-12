@@ -22,6 +22,100 @@ func controlWriterIdentity(
     return writer.identity
 }
 
+/// Direct coordinator tests bypass the runner, so supply its real restored admission and
+/// attempt setup explicitly. Invalid fixtures fail rather than gaining an unfenced send path.
+@MainActor
+extension CodexAgentModeCoordinator {
+    @discardableResult
+    func test_sendCodexNativeMessage(
+        session: AgentTabSession,
+        ownership: AgentRunOwnership,
+        text: String,
+        attachments: [AgentFileAttachment],
+        fallbackContext: AgentTabSession.CodexFallbackSubmissionContext? = nil,
+        stopFence: AgentRunStartStopFence? = nil,
+        attachmentReservationID: UUID? = nil,
+        policyAlreadyInstalled: Bool = false,
+        terminalizeRejectedSend: Bool = true,
+        autoEffortSelection: AutoEffortTurnSelection? = nil,
+        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async -> NativeSendOutcome {
+        guard let sessionID = session.activeAgentSessionID,
+              case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: sessionID),
+              writer.session === session,
+              case let .success(command) = writer.admitCommand(.restored),
+              let receipt = AgentSessionRuntimeStore.WriterReceipt(command)
+        else {
+            XCTFail("Direct Codex send requires an exact restored writer", file: file, line: line)
+            return .preDispatchRejected(message: "Invalid Codex test fixture admission")
+        }
+        XCTAssertEqual(session.activeRunOwnership, ownership, file: file, line: line)
+        return await sendCodexNativeMessage(
+            session: session, writerReceipt: receipt, ownership: ownership, text: text,
+            attachments: attachments, fallbackContext: fallbackContext, stopFence: stopFence,
+            attachmentReservationID: attachmentReservationID, policyAlreadyInstalled: policyAlreadyInstalled,
+            terminalizeRejectedSend: terminalizeRejectedSend, autoEffortSelection: autoEffortSelection,
+            selfCompactDispatchID: selfCompactDispatchID
+        )
+    }
+}
+
+/// Direct Claude coordinator fixtures bypass runner admission. Require the same real restored
+/// writer here before exercising their existing intent/configuration assertions. This helper does
+/// not create a binding, restore a session, or synthesize an active run attempt. Older-attempt
+/// intents intentionally remain allowed here so the production stale-intent checks are exercised.
+@MainActor
+extension ClaudeAgentModeCoordinator {
+    private func test_hasRestoredWriter(_ session: AgentTabSession, file: StaticString, line: UInt) -> Bool {
+        guard let sessionID = session.activeAgentSessionID,
+              case let .unique(writer) = AgentSessionRuntimeStore.shared.resolveWriter(sessionID: sessionID),
+              writer.session === session,
+              case .success = writer.admitCommand(.restored)
+        else {
+            XCTFail("Direct Claude operation requires an exact restored writer", file: file, line: line)
+            return false
+        }
+        return true
+    }
+
+    func test_ensureClaudeNativeSession(
+        session: AgentTabSession,
+        intent: NativeSessionIntent,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async -> EnsureSessionOutcome {
+        guard test_hasRestoredWriter(session, file: file, line: line) else { return .superseded }
+        return await ensureClaudeNativeSession(session: session, intent: intent)
+    }
+
+    @discardableResult
+    func test_sendClaudeNativeMessage(
+        session: AgentTabSession,
+        text: String,
+        attachments: [AgentFileAttachment],
+        intent: NativeSessionIntent,
+        allowsCatalogRouteControllerRecovery: Bool,
+        autoEffortSelection: AutoEffortTurnSelection? = nil,
+        providerControlCommand: AgentProviderControlCommand? = nil,
+        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
+        reinstallRunRoutingPolicy: (@MainActor () async -> Bool)? = nil,
+        inputAttemptChanged: (@MainActor (Bool) -> Void)? = nil,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async -> NativeSendOutcome {
+        guard test_hasRestoredWriter(session, file: file, line: line) else { return .superseded }
+        return await sendClaudeNativeMessage(
+            session: session, text: text, attachments: attachments, intent: intent,
+            allowsCatalogRouteControllerRecovery: allowsCatalogRouteControllerRecovery,
+            autoEffortSelection: autoEffortSelection, providerControlCommand: providerControlCommand,
+            selfCompactDispatchID: selfCompactDispatchID, reinstallRunRoutingPolicy: reinstallRunRoutingPolicy,
+            inputAttemptChanged: inputAttemptChanged
+        )
+    }
+}
+
 /// Runner-level harness for the cross-window oversight prompt supplement.
 ///
 /// Builds the real `HeadlessAgentModeRunner` / `ACPIntegratedAgentModeRunner` (through
@@ -56,10 +150,9 @@ final class AgentSessionLinkRunnerHarness {
     /// monitor being added or revoked while a dispatch is suspended.
     private(set) var inventory: AgentSessionLinkPromptInventory
 
-    /// Runs immediately before `prepareForNextTurn()` on the ACP path, inside the window the old
-    /// (buggy) composition point sat in. A test uses it to prove composition reads membership *after*
-    /// that suspension.
     var onTurnComplete: (() -> Void)?
+    /// Runs after ACP message construction but before dispatch decoration. Controller preparation
+    /// and stream acquisition now precede prompt entry; this hook tests the later projection window.
     var onAttachmentsConsumed: (@MainActor () -> Void)?
 
     /// Runs while the message is being built, i.e. the last synchronous MainActor point before the
@@ -100,7 +193,10 @@ final class AgentSessionLinkRunnerHarness {
     var forcedAutoWakeID: UUID?
     /// Fake exact-returned support at reservation and final provider handoff.
     var routineQuietCheckIn = false
+    private(set) var physicalNotAttemptedCount = 0
     var beforeProviderInputProof: (() async -> Void)?
+    var providerInputReleaseOverride: (() -> AgentSessionLinkProviderInputRelease.ReleasedDispatchContext)?
+    var pendingHandoffSendOutcome: ((AgentTabSession, Bool) -> Void)?
     var localInputFixture: AgentSessionLinkTransportLocalInputFixture?
     private var workspaces: [WorkspaceManagerViewModel] = []
 
@@ -114,7 +210,8 @@ final class AgentSessionLinkRunnerHarness {
         codexController: (any CodexSessionControlling)? = nil,
         claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory? = nil,
         testWindowID: Int = 1,
-        testMCPServer: MCPServerViewModel? = nil
+        testMCPServer: MCPServerViewModel? = nil,
+        attachmentHooks: AgentModeRunService.AttachmentLifecycleHooks? = nil
     ) {
         self.stubSystemPrompt = stubSystemPrompt
         workspace = AgentRunWorkspaceInput(fallbackWorkspacePath: workspacePath)
@@ -183,7 +280,7 @@ final class AgentSessionLinkRunnerHarness {
                 startNonCodexTurnAccountingIfNeeded: { _, _ in },
                 finalizeNonCodexTurnUsage: { _, _, _, _ in }
             ),
-            attachments: .init(
+            attachments: attachmentHooks ?? .init(
                 reserveAttachmentsForTurn: { _, _ in nil },
                 markAttachmentsConsumed: { _, _ in
                     MainActor.assumeIsolated { harnessBox?.onAttachmentsConsumed?() }
@@ -232,12 +329,12 @@ final class AgentSessionLinkRunnerHarness {
                         )
                     }
                 },
-                augmentUserMessageForProviderSend: { text, _, _, _, _ in text },
+                augmentUserMessageForProviderSend: { text, _, _, _, _, _ in text },
                 stageResumeRecoveryHandoffIfNeeded: { _ in true },
                 prependPendingHandoffIfNeeded: { text, session in
                     sessionLinkHost?.prependPendingHandoffIfNeeded(text, session: session) ?? text
                 },
-                recordPendingHandoffSendOutcome: { _, _ in },
+                recordPendingHandoffSendOutcome: { session, sent in harnessBox?.pendingHandoffSendOutcome?(session, sent) },
                 claimAgentSessionLinkPrompt: { session, dispatchID in
                     MainActor.assumeIsolated {
                         if let sessionLinkHost = harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost {
@@ -268,6 +365,7 @@ final class AgentSessionLinkRunnerHarness {
                     sessionLinkHost?.agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: dispatchID) ?? true
                 },
                 recordAgentSessionLinkPhysicalDispatchNotAttempted: { session, dispatchID in
+                    MainActor.assumeIsolated { harnessBox?.physicalNotAttemptedCount += 1 }
                     sessionLinkHost?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
                 },
                 recordAgentSessionLinkPhysicalDispatchFailure: { session, dispatchID in
@@ -290,6 +388,7 @@ final class AgentSessionLinkRunnerHarness {
                     return await AgentSessionLinkProviderInputRelease.prove(claim) { _ in false }
                 },
                 handoffAgentSessionLinkProviderInput: { session, dispatchID, claim, proof in
+                    if let release = harnessBox?.providerInputReleaseOverride { return release() }
                     if let host = harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost {
                         return host.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatchID, claim: claim, proof: proof)
                     }
@@ -390,6 +489,13 @@ final class AgentSessionLinkRunnerHarness {
         )
     }
 
+    func startCommand(for session: AgentTabSession) throws -> AgentSessionRuntimeStore.Command {
+        let id = try XCTUnwrap(session.activeAgentSessionID)
+        let command = try XCTUnwrap(host.runtimeCommand(sessionID: id))
+        XCTAssertTrue(command.writer.session === session)
+        return command
+    }
+
     func makeBoundSession(agent: AgentProviderKind) throws -> AgentModeViewModel.TabSession {
         let tabID = UUID()
         workspaces.append(AgentSessionLinkEndpointTestSupport.installWorkspace(on: host, tabID: tabID, name: "Positive runner authority"))
@@ -458,12 +564,14 @@ final class AgentSessionLinkCapturingACPProvider: ACPAgentProvider, @unchecked S
     private let lock = NSLock()
     private var captured: [AgentMessage] = []
     private var supportChecks = 0
+    private let supportOperation: (@Sendable () async throws -> ACPSupportResult)?
 
     var supportCallCount: Int {
         lock.withLock { supportChecks }
     }
 
-    init(providerID: ACPProviderID, commandPath: String, environment: [String: String] = [:]) {
+    init(providerID: ACPProviderID, commandPath: String, environment: [String: String] = [:], supportOperation: (@Sendable () async throws -> ACPSupportResult)? = nil) {
+        self.supportOperation = supportOperation
         self.providerID = providerID
         self.commandPath = commandPath
         self.environment = environment
@@ -485,6 +593,7 @@ final class AgentSessionLinkCapturingACPProvider: ACPAgentProvider, @unchecked S
 
     func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
         lock.withLock { supportChecks += 1 }
+        if let supportOperation { return try await supportOperation() }
         return .supported
     }
 
@@ -586,6 +695,7 @@ enum AgentSessionLinkACPServerScript {
     /// - `ACP_ADVERTISE_AFTER_PROMPT` (comma list, may be empty): a replacement list during each prompt.
     /// - `ACP_PROMPT_LOG` (path): each `session/prompt` `prompt` array, one JSON line per prompt.
     /// - `ACP_RPC_LOG` (path): actual JSON-RPC requests and successful responses.
+    /// - `ACP_FAIL_METHOD`: rejects the named RPC after any response gate has released.
     /// - `ACP_DEVIN_FIXTURE` (`1`): advertises SWE-2 with medium/high/max thinking choices.
     /// - `ACP_USAGE_UPDATE_ON_PROMPT` (`used,size`): a `usage_update` during each prompt.
     /// - `ACP_FOREIGN_ADVERTISE_AFTER_PROMPT` (comma list): a list for another session during each prompt.
@@ -695,6 +805,9 @@ enum AgentSessionLinkACPServerScript {
                     pass
                 with open(gate_path, "rb", buffering=0) as gate:
                     gate.read(1)
+            if method == os.environ.get("ACP_FAIL_METHOD"):
+                respond_error(request.get("id"), "injected startup failure")
+                continue
             if method == "initialize":
                 respond(request.get("id"), {"agentCapabilities": {"loadSession": True}, "authMethods": []})
             elif method == "session/load" and os.environ.get("ACP_FAIL_LOAD"):

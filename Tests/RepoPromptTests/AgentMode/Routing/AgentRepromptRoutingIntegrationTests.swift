@@ -2,6 +2,7 @@ import Foundation
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import XCTest
 
@@ -102,6 +103,218 @@ final class AgentRepromptRoutingIntegrationTests: XCTestCase {
         XCTAssertEqual(after.count, before.count)
         XCTAssertEqual(fixture.session.items.last(where: { $0.kind == .user })?.text, approved)
         XCTAssertEqual(fixture.session.automationTurnAudit.last?.reprompt?.routerSpeculation, .reused)
+    }
+
+    func testMCPAutoEffortCannotAdoptAReactivatedSuccessorWriter() async throws {
+        for change in ["none", "restorationRefresh", "staleContext", "newContext", "deactivated", "retire"] {
+            let succeeds = change == "none" || change == "restorationRefresh"
+            let fixture = try await AgentRepromptTestFixture()
+            defer { fixture.cleanUp() }
+            let vm = fixture.viewModel
+            let session = fixture.session
+            try fixture.installPersistentWriter()
+            session.hasLoadedPersistedState = true
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            // Model a restored MCP-origin session, not app-owned resident consent.
+            session.isMCPOriginated = true
+            vm.ensureRunServiceMaterializedForRunStart()
+            let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+            let writer = try XCTUnwrap(vm.runtimeCommand(sessionID: sessionID)).writer
+            let originalContext = try await vm.mcpActivateControlContext(
+                forTabID: session.tabID, sessionID: sessionID, originatingConnectionID: nil
+            )
+            if change == "restorationRefresh" {
+                let generation = session.beginPersistentBindingTransition()
+                session.finishPersistentBindingTransition(generation: generation)
+                session.recordRestorationAuthoritative(.persistedPayloadApplied)
+                XCTAssertTrue(writer.ownsPersistentClaim)
+                XCTAssertFalse(writer.isCurrent, "A retained control registration need not have today's restoration generation")
+            }
+            fixture.store.setModelRouterEnabled(false)
+            fixture.store.setAutoEffortBackendRaw(fixture.backend.id.rawValue)
+            fixture.store.setAutoEffortEnabled(true)
+            await fixture.runtime.reconcileDemand()
+            let option = try XCTUnwrap(AgentModelCatalog.options(for: .claudeCode, availability: vm.modelRouterAvailabilityContext).first {
+                AutoEffortModelPolicy.claudeEfforts(modelRaw: $0.rawValue, advertised: AgentModelCatalog.supportedClaudeEfforts(forSelectedModelRaw: $0.rawValue, agentKind: .claudeCode)).count >= 2
+            })
+            session.selectedModelRaw = option.rawValue
+            session.selectedClaudeEffortRaw = nil
+            let gate = AgentRepromptStartGate()
+            await fixture.backend.setGate(gate)
+            defer { Task { await gate.release() } }
+            var starts = 0
+            vm.test_providerSwitchStart = { _, _, _ in starts += 1 }
+            let dispatch = Task { @MainActor in
+                try await vm.mcpDispatchInstruction(sessionID: sessionID, text: "Inspect the parser behavior", allowStartingRun: true)
+            }
+            defer { dispatch.cancel() }
+            try await AsyncTestWait.waitUntil("MCP judgment is held in the decision backend", timeout: 5) {
+                await fixture.backend.requests.count == 1
+            }
+            XCTAssertNotNil(session.selectedClaudeEffortRaw, "An admitted judgment still normalizes its manual effort")
+            let binding = session.currentRestorationBindingToken
+            if change == "retire" {
+                writer.scope.beginRetirement()
+            } else if change == "deactivated" {
+                await vm.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+                XCTAssertTrue(writer.isCurrent)
+            } else if !succeeds {
+                let members = writer.scope.sessions
+                writer.scope.replaceSessions(members.filter { $0.key != session.tabID })
+                writer.scope.replaceSessions(members)
+                XCTAssertFalse(writer.ownsPersistentClaim)
+                XCTAssertNil(vm.mcpControlledSession(sessionID: sessionID))
+                if change == "newContext" {
+                    let state = session.runState
+                    let task = session.agentTask
+                    _ = try await vm.mcpActivateControlContext(
+                        forTabID: session.tabID, sessionID: sessionID, originatingConnectionID: nil
+                    )
+                    XCTAssertTrue(vm.mcpControlledSession(sessionID: sessionID) === session)
+                    XCTAssertNotEqual(session.mcpControlContext?.writerIdentity, writer.identity)
+                    XCTAssertEqual(session.runState, state)
+                    XCTAssertEqual(session.agentTask, task)
+                }
+            }
+            XCTAssertEqual(session.currentRestorationBindingToken, binding)
+            let context = session.mcpControlContext
+            let items = session.items
+            if !succeeds {
+                // Isolate the old judgment from the successor's independently admitted
+                // approval-sync task, whose active-tab permission projection normalizes effort.
+                vm.test_setCurrentTabIDOverride(nil)
+                session.selectedClaudeEffortRaw = nil
+                session.isDirty = false
+            }
+            let saveGeneration = session.saveRequestGeneration
+            await gate.release()
+            switch await dispatch.result {
+            case let .success(delivery):
+                XCTAssertTrue(succeeds, change)
+                XCTAssertEqual(delivery, .startedRun)
+                XCTAssertEqual(session.items.last(where: { $0.kind == .user })?.text, "Inspect the parser behavior")
+                XCTAssertNotNil(session.autoEffortFeedback, "This synthetic fixture qualifies input admission, not a connected provider launch")
+            case let .failure(error):
+                XCTAssertFalse(succeeds, String(describing: error))
+                XCTAssertTrue(String(describing: error).contains("session changed"), String(describing: error))
+                XCTAssertEqual(session.items, items)
+                XCTAssertTrue(session.pendingClaudeSteeringInstructions.isEmpty)
+                XCTAssertNil(session.agentTask)
+                XCTAssertNil(session.autoEffortFeedback)
+                XCTAssertEqual(session.mcpControlContext, context)
+                XCTAssertEqual(starts, 0)
+                XCTAssertNil(session.selectedClaudeEffortRaw, "\(change): The old judgment must not normalize the successor's selection")
+                XCTAssertFalse(session.isDirty, change)
+                XCTAssertEqual(session.saveRequestGeneration, saveGeneration, change)
+            }
+            XCTAssertNil(session.autoEffortJudgmentID)
+            await fixture.startGate.release()
+            await vm.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+            await AgentRunSessionStore.cleanup(registration: originalContext.registration)
+            let registered = await AgentRunSessionStore.hasActiveRegistration(sessionID: sessionID)
+            XCTAssertFalse(registered)
+            await fixture.runtime.teardown()
+        }
+    }
+
+    func testReleasedComposerCannotNormalizeEffortAfterJudgment() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        let vm = fixture.viewModel
+        let session = fixture.session
+        try fixture.installPersistentWriter()
+        session.hasLoadedPersistedState = true
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        fixture.store.setModelRouterEnabled(false)
+        fixture.store.setAutoEffortBackendRaw(fixture.backend.id.rawValue)
+        fixture.store.setAutoEffortEnabled(true)
+        await fixture.runtime.reconcileDemand()
+        let option = try XCTUnwrap(AgentModelCatalog.options(for: .claudeCode, availability: vm.modelRouterAvailabilityContext).first {
+            AutoEffortModelPolicy.claudeEfforts(modelRaw: $0.rawValue, advertised: AgentModelCatalog.supportedClaudeEfforts(forSelectedModelRaw: $0.rawValue, agentKind: .claudeCode)).count >= 2
+        })
+        session.selectedModelRaw = option.rawValue
+        let claim = try fixture.claim(text: "Inspect the parser behavior")
+        defer { vm.releaseComposerSubmitClaim(claim) }
+        let gate = AgentRepromptStartGate()
+        await fixture.backend.setGate(gate)
+        defer { Task { await gate.release() } }
+        let submit = Task { @MainActor in
+            await vm.submitUserTurnAfterAutoEffort(text: claim.attempt.rawDraftSnapshot, claim: claim, session: session, destinationTabID: session.tabID)
+        }
+        defer { submit.cancel() }
+        try await AsyncTestWait.waitUntil("composer judgment held", timeout: 5) { await fixture.backend.requests.count == 1 }
+        vm.releaseComposerSubmitClaim(claim)
+        session.selectedClaudeEffortRaw = nil
+        session.isDirty = false
+        let generation = session.saveRequestGeneration
+        await gate.release()
+        guard case .blocked = await submit.value else { return XCTFail("Released composer must not submit") }
+        XCTAssertNil(session.selectedClaudeEffortRaw)
+        XCTAssertFalse(session.isDirty)
+        XCTAssertEqual(session.saveRequestGeneration, generation)
+        XCTAssertFalse(session.items.contains { $0.kind == .user })
+        XCTAssertNil(session.autoEffortJudgmentID)
+        await fixture.startGate.release()
+        await fixture.runtime.teardown()
+    }
+
+    func testEffortSpeculationCapturesMembershipBeforeItsTaskAndRecomputesAfterFirstBinding() async throws {
+        for change in ["none", "reacquire", "bind"] {
+            let fixture = try await AgentRepromptTestFixture()
+            defer { fixture.cleanUp() }
+            let vm = fixture.viewModel
+            let session = fixture.session
+            fixture.store.setModelRouterEnabled(false)
+            fixture.store.setAutoEffortBackendRaw(fixture.backend.id.rawValue)
+            fixture.store.setAutoEffortEnabled(true)
+            await fixture.runtime.reconcileDemand()
+            let option = try XCTUnwrap(AgentModelCatalog.options(for: .claudeCode, availability: vm.modelRouterAvailabilityContext).first {
+                AutoEffortModelPolicy.claudeEfforts(modelRaw: $0.rawValue, advertised: AgentModelCatalog.supportedClaudeEfforts(forSelectedModelRaw: $0.rawValue, agentKind: .claudeCode)).count >= 2
+            })
+            session.selectedModelRaw = option.rawValue
+            let claim = try fixture.claim(text: "Original task")
+            defer { vm.releaseComposerSubmitClaim(claim) }
+            let approved = "Inspect the parser behavior"
+            vm.startRepromptSpeculation(session: session, operationID: claim.attempt.id, text: approved, originalText: claim.attempt.rawDraftSnapshot)
+            let speculation = try XCTUnwrap(vm.repromptSpeculations[claim.attempt.id])
+            let task = try XCTUnwrap(speculation.effortTask)
+            // No suspension between task creation and membership drift: the task has not entered.
+            if change == "reacquire" {
+                let members = claim.scope.sessions
+                claim.scope.replaceSessions(members.filter { $0.key != session.tabID })
+                claim.scope.replaceSessions(members)
+            } else if change == "bind" {
+                try fixture.installPersistentWriter()
+                session.hasLoadedPersistedState = true
+                session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            }
+            session.selectedClaudeEffortRaw = nil
+            session.isDirty = false
+            let choice = await task.value
+            let requests = await fixture.backend.requests.count
+            if change == "none" {
+                XCTAssertNotNil(choice?.selection)
+                XCTAssertEqual(requests, 1)
+            } else {
+                XCTAssertNil(choice)
+                XCTAssertEqual(requests, 0)
+                XCTAssertNil(session.selectedClaudeEffortRaw)
+                XCTAssertFalse(session.isDirty)
+            }
+            if change == "bind" {
+                XCTAssertTrue(vm.composerSubmitClaimIsCurrent(claim), "First binding is a supported continuation of a local creation claim")
+                let result = await vm.submitUserTurnAfterAutoEffort(
+                    text: claim.attempt.rawDraftSnapshot, claim: claim, session: session,
+                    destinationTabID: session.tabID, repromptedText: approved
+                )
+                XCTAssertEqual(result, .submitted)
+                let requests = await fixture.backend.requests.count
+                XCTAssertEqual(requests, 1, "A refused speculation is recomputed through the accepting claim")
+                XCTAssertNotNil(session.autoEffortFeedback)
+            }
+            await fixture.startGate.release()
+            await fixture.runtime.teardown()
+        }
     }
 
     func testAutoEffortWrapperJudgesApprovedTextAndOversizedFallback() async throws {

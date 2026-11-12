@@ -501,6 +501,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) async -> AsyncThrowingStream<AgentSessionSidebarBuildBatch, Error>
 
     private let runtimeSessionStore = AgentSessionRuntimeStore.shared.makeScope()
+
+    /// Captured before asynchronous draft preparation; not permission to save or dispatch.
+    func runtimeMembership(for session: TabSession) -> AgentSessionRuntimeStore.Membership? {
+        runtimeSessionStore.membership(of: session)
+    }
+
     private var runPresentationAttachments: [ObjectIdentifier: AgentSessionPresentationRuntime.Attachment] = [:]
     private(set) var sessions: [UUID: TabSession] {
         get { runtimeSessionStore.sessions }
@@ -3855,7 +3861,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         links: links
                     )
                 },
-                augmentUserMessageForProviderSend: { [weak self] text, attachments, taggedFileAttachments, session, skipsSlashExpansion in
+                augmentUserMessageForProviderSend: { [weak self] text, attachments, taggedFileAttachments, session, skipsSlashExpansion, isCurrent in
                     guard let self else { return text }
                     return await augmentUserMessageForProviderSend(
                         text,
@@ -3863,7 +3869,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         taggedFileAttachments: taggedFileAttachments,
                         agent: session?.selectedAgent,
                         session: session,
-                        skipsSlashExpansion: skipsSlashExpansion
+                        skipsSlashExpansion: skipsSlashExpansion,
+                        shouldPublishCatalog: isCurrent
                     )
                 },
                 stageResumeRecoveryHandoffIfNeeded: { [weak self] session in
@@ -11527,13 +11534,24 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         preserveRoutedInitialEffort: Bool = false,
         validateInitialStart: (@MainActor () throws -> Void)? = nil
     ) async throws -> MCPInstructionDispatch {
-        guard let session = mcpControlledSession(sessionID: sessionID) else {
+        guard let originalWriter = mcpRuntime.controlledWriter(sessionID: sessionID),
+              originalWriter.ownsPersistentClaim, !originalWriter.scope.isRetiring
+        else {
             throw MCPError.invalidParams("The requested agent run is no longer active.")
+        }
+        let session = originalWriter.session
+        func requireOriginalDispatchWriter() throws {
+            // Control registration may outlive a restoration retry on the same claim.
+            // Keep that provenance, while the separate binding/admission checks qualify this turn.
+            guard originalWriter.ownsPersistentClaim, !originalWriter.scope.isRetiring,
+                  mcpRuntime.controlledWriter(sessionID: sessionID)?.identity == originalWriter.identity
+            else { throw MCPError.invalidParams("The session changed while choosing effort. Retry the turn.") }
         }
         if let message = session.operationAdmissionFailureMessage {
             throw MCPError.invalidParams(message)
         }
         try validateInitialStart?()
+        try requireOriginalDispatchWriter()
         let dispatchBindingToken = session.currentRestorationBindingToken
         guard session.autoEffortJudgmentID == nil else {
             throw MCPError.invalidParams("Auto effort is already choosing effort for this session. Retry after that turn starts.")
@@ -11562,12 +11580,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             preserveRoutedInitialEffort: preserveRoutedInitialEffort
         )
         let autoEffortChoice = judgesUserTurn
-            ? await chooseAutoEffortForUserTurn(text: trimmedText, session: session, workflow: workflow)
+            ? await chooseAutoEffortForUserTurn(text: trimmedText, session: session, workflow: workflow, isCurrent: {
+                originalWriter.ownsPersistentClaim && !originalWriter.scope.isRetiring
+                    && mcpRuntime.controlledWriter(sessionID: sessionID)?.identity == originalWriter.identity
+                    && session.currentRestorationBindingToken == dispatchBindingToken
+            })
             : nil
         let autoEffortSelection = autoEffortChoice?.selection
         try Task.checkCancellation()
-        guard mcpControlledSession(sessionID: sessionID) === session,
-              session.currentRestorationBindingToken == dispatchBindingToken
+        try requireOriginalDispatchWriter()
+        guard session.currentRestorationBindingToken == dispatchBindingToken
         else {
             throw MCPError.invalidParams("The session changed while choosing effort. Retry the turn.")
         }
@@ -11575,6 +11597,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             throw MCPError.invalidParams(message)
         }
         try validateInitialStart?()
+        try requireOriginalDispatchWriter()
 
         // Classify after the async judgment: a composer turn may have started the run
         // while Jev was deciding. In that case this MCP message is steering, not a
@@ -15271,7 +15294,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             // pending-switch composition while the existing composer owner retains its draft.
             let judgingText = Self.automationJudgingText(original: text, reprompted: repromptedText)
             let choice = modelRouterSettingsStore.autoEffortEnabled()
-                ? await chooseAutoEffortForUserTurn(text: judgingText, session: session, workflow: session.selectedWorkflow, isRepromptReplacement: repromptedText != nil) : nil
+                ? await chooseAutoEffortForUserTurn(text: judgingText, session: session, workflow: session.selectedWorkflow, isRepromptReplacement: repromptedText != nil, isCurrent: {
+                    composerSubmitClaimIsCurrent(claim) && sessions[destinationTabID] === session
+                }) : nil
             guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session else {
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
@@ -15809,15 +15834,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         if session.activeAgentSessionID != nil, !session.hasLoadedPersistedState {
             Self.logCodexDebug("[AgentModeVM][RunID] deferring send until hydration completes for tab \(tabID)")
+            guard let sessionID = session.activeAgentSessionID,
+                  let originalWriter = try? runtimeWriter(sessionID: sessionID),
+                  originalWriter.scope === runtimeSessionStore, originalWriter.session === session,
+                  originalWriter.isCurrent, !originalWriter.scope.isRetiring
+            else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
             agentSelfCompactCancelForAcceptedLocalInput(session)
             let stopFence = AgentRunStartStopFence(session: session)
-            let originalBinding = session.persistentSessionBindingIdentity
+            // This operation-local task retains its original owner until hydration settles;
+            // do not store it as a persistent session-owned task.
             let deferred = Task<UserTurnSubmissionResult, Never> { [weak self] in
                 guard let self else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
                 return await submitUserTurnAfterHydration(
                     tabID: tabID,
-                    originalSession: session,
-                    originalBinding: originalBinding,
+                    originalWriter: originalWriter,
                     trimmedText: trimmedText,
                     attachmentsToSend: attachmentsToSend,
                     taggedFilesToSend: taggedFilesToSend,
@@ -15875,8 +15905,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     @discardableResult
     func submitUserTurnAfterHydration(
         tabID: UUID,
-        originalSession: TabSession,
-        originalBinding: AgentPersistentSessionBindingIdentity?,
+        originalWriter: AgentSessionRuntimeStore.Writer,
         trimmedText: String,
         attachmentsToSend: [AgentFileAttachment],
         taggedFilesToSend: [AgentTaggedFileAttachment],
@@ -15896,12 +15925,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         isLocalComposerInput: Bool = true,
         providerSwitchClaim: AgentComposerSubmitClaim? = nil
     ) async -> UserTurnSubmissionResult {
-        guard sessions[tabID] === originalSession,
-              originalSession.persistentSessionBindingIdentity == originalBinding
+        let session = originalWriter.session
+        guard originalWriter.scope === runtimeSessionStore, sessions[tabID] === session,
+              originalWriter.ownsPersistentClaim
         else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
-        let session = originalSession
         func rejected(_ message: String) -> UserTurnSubmissionResult {
-            if isLocalComposerInput, sessions[tabID] === session, session.persistentSessionBindingIdentity == originalBinding {
+            if isLocalComposerInput, originalWriter.ownsPersistentClaim {
                 let submittedDraft = rawDraftText ?? trimmedText
                 restoreRejectedManualSubmissionComposerState(
                     repromptedText: repromptedText,
@@ -15915,6 +15944,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             return .blocked(message: message)
         }
+        guard originalWriter.isCurrent, !originalWriter.scope.isRetiring else {
+            return rejected(Self.staleComposerSubmitTargetMessage)
+        }
         guard !Task.isCancelled, stopFence.permitsStart(of: session) else {
             return rejected("This scheduled run was cancelled by Stop.")
         }
@@ -15922,11 +15954,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return rejected(CodexManagedSessionFence.blockedMessage)
         }
         await prepareSessionForRunStart(tabID: tabID, session: session)
-        guard let hydratedSession = sessions[tabID], hydratedSession === session,
-              hydratedSession.persistentSessionBindingIdentity == originalBinding,
-              !Task.isCancelled, stopFence.permitsStart(of: hydratedSession)
+        guard originalWriter.isCurrent, sessions[tabID] === session else {
+            return rejected(Self.staleComposerSubmitTargetMessage)
+        }
+        let hydratedSession = session
+        guard !Task.isCancelled, stopFence.permitsStart(of: hydratedSession)
         else { return rejected("This scheduled run was cancelled by Stop.") }
         if let message = hydratedSession.operationAdmissionFailureMessage { return rejected(message) }
+        guard case .success = originalWriter.admitCommand() else {
+            return rejected(Self.staleComposerSubmitTargetMessage)
+        }
         let carriedSwitch = hydratedSession.pendingHandoff.providerSwitchDelivery != nil
         var pending: Task<UserTurnSubmissionResult, Never>?
         let immediate = submitPreparedUserTurn(
@@ -15957,6 +15994,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         } else { immediate }
         if case let .blocked(message) = result { return rejected(message) }
         guard result == .submitted else { return result }
+        guard originalWriter.ownsPersistentClaim else { return result }
         if !carriedSwitch {
             // Consume only the submitted snapshot, never B/W2 added while A/W1 was hydrating.
             if isLocalComposerInput, hydratedSession.userWorkflowSelectionMutationGeneration == restorationSelectedWorkflowMutationGeneration,
