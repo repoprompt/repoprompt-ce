@@ -1157,6 +1157,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         /// Passive: runs synchronously in the real switch listener right after it queues the existing
         /// `handleWorkspaceSwitch` task for `owner`.
         var test_afterWorkspaceSwitchAdoptionQueued: (@MainActor (SessionIndexOwner) -> Void)?
+        /// Suspension before the real adoption's destructive slice, for ordered admission tests.
+        var test_beforeWorkspaceSwitchAdoption: (@MainActor (SessionIndexOwner) async -> Void)?
         /// Passive: runs synchronously when that queued adoption task finishes, on every exit.
         var test_afterWorkspaceSwitchAdoptionCompleted: (@MainActor (SessionIndexOwner) -> Void)?
         /// Passive: runs synchronously when `onTabChanged`'s spawned activation task finishes, on every exit.
@@ -4104,10 +4106,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 guard let self else { return }
                 let owner = sessionIndexStore.receiveWorkspaceSwitchNotification(workspace)
                 queuedWorkspaceSwitchOwner = owner
+                beginDestructiveWorkspaceAdoption(owner)
                 logAgentSessionDiscoveryAdoption(owner: owner, workspace: workspace, stage: 0)
                 Task { @MainActor in
                     #if DEBUG
                         defer { self.test_afterWorkspaceSwitchAdoptionCompleted?(owner) }
+                        await self.test_beforeWorkspaceSwitchAdoption?(owner)
                     #endif
                     await self.handleWorkspaceSwitch(workspace, owner: owner)
                 }
@@ -5673,7 +5677,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         tabID: UUID, sessionID: UUID, workspaceID: UUID,
         isStillAuthorized: @MainActor () -> Bool
     ) async -> Bool {
-        guard !Task.isCancelled, isStillAuthorized(), let workspaceManager,
+        guard !isAwaitingWorkspaceAdoption, !Task.isCancelled, isStillAuthorized(), let workspaceManager,
               workspaceManager.activeWorkspaceID == workspaceID,
               let tab = workspaceManager.modelRoutingTab(workspaceID: workspaceID, tabID: tabID),
               tab.activeAgentSessionID == nil || tab.activeAgentSessionID == sessionID,
@@ -6960,6 +6964,25 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Owner minted by the real switch listener whose existing adoption task has not finished.
     private var queuedWorkspaceSwitchOwner: SessionIndexOwner?
 
+    /// Separate from presentation adoption: installation clears queuedWorkspaceSwitchOwner before
+    /// teardown/discard. Readiness must stay withheld through that entire destructive slice.
+    private var destructiveWorkspaceAdoptionOwner: SessionIndexOwner?
+
+    var isAwaitingWorkspaceAdoption: Bool {
+        runtimeSessionStore.isAwaitingWorkspaceAdoption
+    }
+
+    private func beginDestructiveWorkspaceAdoption(_ owner: SessionIndexOwner) {
+        destructiveWorkspaceAdoptionOwner = owner
+        runtimeSessionStore.setWorkspaceAdoptionPending(true)
+    }
+
+    private func finishDestructiveWorkspaceAdoption(_ owner: SessionIndexOwner) {
+        guard destructiveWorkspaceAdoptionOwner == owner else { return }
+        destructiveWorkspaceAdoptionOwner = nil
+        runtimeSessionStore.setWorkspaceAdoptionPending(false)
+    }
+
     private func clearQueuedWorkspaceSwitchOwner(_ owner: SessionIndexOwner) {
         guard queuedWorkspaceSwitchOwner == owner else { return }
         queuedWorkspaceSwitchOwner = nil
@@ -7373,6 +7396,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Ensures a session exists for the given tab ID and loads any persisted state.
     /// Used by MCP tool handlers to ensure session is ready before accessing it.
     func ensureSessionReady(tabID: UUID, reconnectActiveProviders: Bool = false) async -> TabSession {
+        // Do not join adoption: its teardown can be draining work which called this method.
+        // Return an explicitly not-ready payload, without hydration, handoff or provider effects.
+        if isAwaitingWorkspaceAdoption { return session(for: tabID) }
         let owners = preparedSessionRuntimes
         let visibleSessionID = workspaceManager?.activeAgentSessionID(forTabID: tabID)
         let preparedVisitID = workspaceManager?.isSessionRuntimeProjection != true
@@ -7402,12 +7428,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return session(for: tabID)
         }
         let session = session(for: tabID)
+        if isAwaitingWorkspaceAdoption { return session }
 
         // Load persisted session if we haven't already.
         if !session.hasLoadedPersistedState {
             await loadSessionFromDisk(for: session)
         }
 
+        guard sessions[tabID] === session else { return self.session(for: tabID) }
+        if isAwaitingWorkspaceAdoption { return session }
         // Apply to bindings if this is the active tab
         if tabID == currentTabID {
             applySessionToBindings(session)
@@ -7426,7 +7455,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             await reconnectClaudeNativeSessionIfNeeded(session)
         }
 
-        return session
+        return sessions[tabID] === session ? session : self.session(for: tabID)
     }
 
     func activateRoutedAgentSession(
@@ -8869,6 +8898,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         expectedWorkspaceID: UUID? = nil,
         creationKind: MCPSessionCreationKind = .mcpControlled
     ) async throws -> MCPSessionTarget {
+        guard !isAwaitingWorkspaceAdoption else {
+            throw MCPError.invalidParams(TabSession.loadingAdmissionFailureMessage)
+        }
         let selector = try normalizeMCPSessionSelector(
             tabID: tabID,
             sessionID: sessionID,
@@ -9113,6 +9145,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         expectedWorkspaceID: UUID?,
         creationKind: MCPSessionCreationKind
     ) async throws -> MCPSessionTarget {
+        guard !isAwaitingWorkspaceAdoption else {
+            throw MCPError.invalidParams(TabSession.loadingAdmissionFailureMessage)
+        }
         if let expectedWorkspaceID,
            workspaceManager?.activeWorkspaceID != expectedWorkspaceID
         {
@@ -13295,9 +13330,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         owner: SessionIndexOwner
     ) async {
         // This queued adoption ends here (installed, superseded or bailed); never clears a successor's.
-        defer { clearQueuedWorkspaceSwitchOwner(owner) }
+        defer {
+            clearQueuedWorkspaceSwitchOwner(owner)
+            finishDestructiveWorkspaceAdoption(owner)
+        }
         logAgentSessionDiscoveryAdoption(owner: owner, workspace: workspace, stage: 1)
         guard sessionIndexStore.isWorkspaceActivationCurrent(owner, workspace: workspace) else { return }
+        beginDestructiveWorkspaceAdoption(owner)
         ui.sessionSidebar.invalidateSelectionForWorkspaceChange()
         sessionSidebarArchivedVisibleSessionCount = Self.sessionSidebarArchivedPageSize
         lastKnownWorkspaceSnapshot = workspace
@@ -13412,6 +13451,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             targets: cleanupTargets,
             reason: "workspace_switch"
         )
+        // No session created after this point belongs to this adoption's discard. Release only
+        // our fence; an adoption queued during cancellation owns its own, newer fence.
+        finishDestructiveWorkspaceAdoption(owner)
         // End of the no-await ownership-transfer slice. The awaits below are
         // safe after discard: worktree release is keyed by session ID and does
         // not read `sessions`, and window-scope approval cleanup is
@@ -19005,6 +19047,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ session: TabSession, creationHandle: AgentSessionCreationHandle?
     ) throws {
         try Task.checkCancellation()
+        guard !session.isAwaitingWorkspaceAdoption else {
+            throw MCPError.invalidParams(TabSession.loadingAdmissionFailureMessage)
+        }
         if let creationHandle {
             guard creationHandle.session === session else { throw PersistentBindingMutationError.staleTransition }
             try requireCurrentCreationPreparation(creationHandle)

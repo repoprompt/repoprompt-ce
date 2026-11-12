@@ -86,7 +86,7 @@ extension AgentSessionLinkExecutionRuntime {
         ignoresProviderSwitchStalenessAfterAcceptance: Bool = false
     ) -> AgentSessionLinkDeliveryReadiness.Snapshot {
         AgentSessionLinkDeliveryReadiness.Snapshot(
-            hasLoadedPersistedState: session.hasLoadedPersistedState,
+            hasLoadedPersistedState: session.hasLoadedPersistedState && !session.isAwaitingWorkspaceAdoption,
             restorationReadiness: session.qualifiedRestorationReadiness,
             bindingTransitionInProgress: session.bindingTransitionInProgress,
             isClosing: isClosing,

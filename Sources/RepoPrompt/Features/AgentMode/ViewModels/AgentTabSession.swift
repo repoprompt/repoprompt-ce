@@ -2006,19 +2006,31 @@ final class AgentTabSession: ObservableObject {
         return restorationReadiness
     }
 
+    /// A negative lifecycle fact read from the holding runtime scopes, not another writer or a
+    /// replacement for the earned restoration proof. Installation/removal follows scope membership.
+    var workspaceAdoptionPending: @MainActor () -> Bool = { false }
+
+    var isAwaitingWorkspaceAdoption: Bool {
+        workspaceAdoptionPending()
+    }
+
+    static let loadingAdmissionFailureMessage = "Wait for this session to finish loading."
+
     /// Only a fully restored or configured-and-saved binding admits ordinary operations and saves.
     var permitsBoundOperationAndSave: Bool {
-        !bindingTransitionInProgress && qualifiedRestorationReadiness.permitsBoundOperationAndSave
+        !bindingTransitionInProgress && !isAwaitingWorkspaceAdoption
+            && qualifiedRestorationReadiness.permitsBoundOperationAndSave
     }
 
     var restorationAdmissionFailureMessage: String? {
-        guard !bindingTransitionInProgress else { return "Wait for this session to finish loading." }
+        guard !bindingTransitionInProgress else { return Self.loadingAdmissionFailureMessage }
         return qualifiedRestorationReadiness.operationAdmissionFailureMessage
     }
 
     /// Persisted handoff recovery remains its own blocker after payload restoration succeeds.
     var operationAdmissionFailureMessage: String? {
-        restorationAdmissionFailureMessage ?? pendingHandoff.executionLocationFailure
+        if isAwaitingWorkspaceAdoption { return Self.loadingAdmissionFailureMessage }
+        return restorationAdmissionFailureMessage ?? pendingHandoff.executionLocationFailure
     }
 
     var creationState: AgentSessionRestorationReadiness.CreationState? {
@@ -2037,7 +2049,8 @@ final class AgentTabSession: ObservableObject {
         _ claim: AgentSessionCreationClaim,
         workspaceID: UUID
     ) -> AgentSessionCreationHandle? {
-        guard let token = claim.consume(for: self, workspaceID: workspaceID) else { return nil }
+        guard !isAwaitingWorkspaceAdoption,
+              let token = claim.consume(for: self, workspaceID: workspaceID) else { return nil }
         restorationReadiness = .creating(token, .init(
             workspaceID: workspaceID, ownerID: claim.ownerID, phase: .preparing
         ))
