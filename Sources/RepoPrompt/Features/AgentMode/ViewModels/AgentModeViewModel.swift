@@ -8355,7 +8355,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let paths = manager.activeWorkspace?.repoPaths
             let storageDirectory = manager.activeWorkspace?.customStoragePath
             let fallback = workspacePathProvider()
-            return .init(store: store, fallbackWorkspacePath: fallback, declaredRepoPaths: paths ?? [], storageDirectory: storageDirectory, isCurrent: { [weak self, weak manager] in
+            return .init(store: store, fallbackWorkspacePath: fallback, declaredRepoPaths: paths ?? [], storageDirectory: storageDirectory, awaitRootReadiness: { [weak manager] in
+                guard let manager else { throw AgentSessionWorktreeRuntime.TransitionError.stale }
+                // Visible workspaces retain their existing partial-root command behavior. The cold
+                // private projection is the one whose hydration can precede its initial root load.
+                guard manager.isSessionRuntimeProjection else { return }
+                guard manager.activeWorkspaceID == command.identity.workspaceID,
+                      manager.activeWorkspace?.repoPaths == paths,
+                      let ticket = manager.requestRootReconciliation(workspaceID: command.identity.workspaceID)
+                else { throw AgentSessionWorktreeRuntime.TransitionError.stale }
+                _ = try await manager.awaitRootReconciliationCompletion(ticket: ticket)
+            }, isCurrent: { [weak self, weak manager] in
                 guard let self, let manager else { return false }
                 return workspaceManager === manager
                     && manager.activeWorkspaceID == command.identity.workspaceID

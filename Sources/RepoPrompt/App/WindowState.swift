@@ -773,12 +773,18 @@ class WindowState: ObservableObject {
         agentModeViewModel.beginPreparedOversightRetirement()
         beginClose()
         let task = Task { @MainActor in
+            // beginClose cancels reconciliation; join it before releasing this private owner so a
+            // late root load cannot outlive failed-command cleanup and observe a removed repository.
+            await self.workspaceManager.awaitRootReconciliationShutdown()
             guard await self.agentModeViewModel.finishPreparedOversightRuntime() else { return false }
             await self.mcpServer.unregisterDomainRoutingWindow()
             self.mcpServer.stopServiceObservation()
             await self.promptManager.gitViewModel.shutdownForWindowClose()
             self.aiQueriesService.cancelQuery()
             guard self.agentModeViewModel.releasePreparedOversightWriterAfterDrain() else { return false }
+            // This adapter has no visible window. Retire its private roots/observers as well as
+            // the writer; do not leave metadata reconciliation running until eventual deallocation.
+            await self.workspaceFilesViewModel.unloadAllRootFolders()
             if !self.didReleaseManagedSettings {
                 self.didReleaseManagedSettings = true
                 self.managedSettingsLease?.release()

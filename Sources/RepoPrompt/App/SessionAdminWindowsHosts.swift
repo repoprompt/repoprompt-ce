@@ -504,7 +504,9 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
     }
 
     /// Roots and repositories come from the target's own workspace, never the caller's routing.
-    private func captureTarget(_ command: AgentSessionRuntimeStore.Command) async throws -> TargetCapture {
+    private func captureTarget(
+        _ command: AgentSessionRuntimeStore.Command, isStillAuthorized: @MainActor () -> Bool
+    ) async throws -> TargetCapture {
         guard command.isCurrent,
               let resources = command.writer.scope.worktrees.captureResources?(command), resources.isCurrent(),
               let store = resources.store
@@ -512,10 +514,31 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         let bindingSource = TargetCapture.bindingSource(command)
         func requireCurrent() throws {
             try Task.checkCancellation()
-            guard command.isCurrent, resources.isCurrent(),
+            guard isStillAuthorized(), command.isCurrent, resources.isCurrent(),
                   TargetCapture.bindingSource(command) == bindingSource
             else { throw SessionAdminHostError.authorityEnded }
         }
+        // A prepared writer can finish payload hydration before its private workspace loads roots.
+        // Join the existing reconciliation rather than treating an incomplete projection as no Git repo.
+        do {
+            try await resources.awaitRootReadiness()
+        } catch let failure as WorkspaceRootReadinessFailure {
+            try requireCurrent()
+            let reason = if case let .rootsUnavailable(availability) = failure.reason {
+                availability.rawValue
+            } else {
+                String(describing: failure.reason)
+            }
+            throw SessionAdminHostError.refused(
+                code: "workspace_not_ready",
+                detail: "The target session's workspace roots are not ready (\(reason)). Reconcile the workspace roots and retry.",
+                nextCall: nil
+            )
+        } catch {
+            try requireCurrent()
+            throw error
+        }
+        try requireCurrent()
         let roots = await store.rootRefs(scope: .visibleWorkspace)
         try requireCurrent()
         var repos: [GitRepoDescriptor] = []
@@ -540,8 +563,10 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
 
     /// Create/bind require the target's authoritative, hydrated bindings and their validated projection
     /// (`requiredLookupContext`), even when the selector is explicit; only default election is optional.
-    private func resolveTargetAuthority(_ command: AgentSessionRuntimeStore.Command) async throws -> TargetAuthority {
-        let capture = try await captureTarget(command)
+    private func resolveTargetAuthority(
+        _ command: AgentSessionRuntimeStore.Command, isStillAuthorized: @MainActor () -> Bool
+    ) async throws -> TargetAuthority {
+        let capture = try await captureTarget(command, isStillAuthorized: isStillAuthorized)
         guard !capture.repos.isEmpty else {
             throw SessionAdminHostError.invalid("The target session's workspace has no Git repository.")
         }
@@ -716,7 +741,7 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         manager.beginPreparedOversightPreparation(sessionID)
         defer { manager.endPreparedOversightPreparation(sessionID) }
         let command = try await preparedCommand(sessionID, isStillAuthorized: isStillAuthorized)
-        let authority = try await resolveTargetAuthority(command)
+        let authority = try await resolveTargetAuthority(command, isStillAuthorized: isStillAuthorized)
         let capture = authority.capture
         let target = try await resolveRepository(repoRoot, authority: authority)
         // Placement and the target's bindings must hold until the Git commit fence. A committed worktree is
@@ -855,7 +880,7 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         manager.beginPreparedOversightPreparation(sessionID)
         defer { manager.endPreparedOversightPreparation(sessionID) }
         let command = try await preparedCommand(sessionID, isStillAuthorized: isStillAuthorized)
-        let authority = try await resolveTargetAuthority(command)
+        let authority = try await resolveTargetAuthority(command, isStillAuthorized: isStillAuthorized)
         let capture = authority.capture
         guard isIdle(capture.session) else { throw SessionAdminHostError.notIdle }
         let repository: TargetRepository? = if let repoRoot {
@@ -1098,7 +1123,7 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         // their repositories, as `createWorktree` does; the user still decides in the review prompt.
         // Capture only: the saved operation owns its endpoints, so no default repository is elected.
         let operation = try runtime.statusMerge(command: command, operationID: operationID)
-        let capture = try await captureTarget(command)
+        let capture = try await captureTarget(command, isStillAuthorized: isStillAuthorized)
         guard !capture.repos.isEmpty else {
             throw SessionAdminHostError.invalid("The target session's workspace has no Git repository.")
         }
