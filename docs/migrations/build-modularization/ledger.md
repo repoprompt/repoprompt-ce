@@ -8458,6 +8458,129 @@ and collected. No live-app/smoke, release, sanitizer or hosted-CI success is cla
 publication head. The draft PR includes an explicit M9.3b handoff distinguishing runtime-owned
 admission/runner seams from remaining VM orchestration and provider/coordinator internals.
 
+### M9.2j — persistence and payload-forwarding retirement (in progress)
+
+Started `runtime/20261111-m9-2j-persistence` from exact main `c791cd13a`, separately from draft
+#1687's startup execution branch. No startup, interaction, managed-Steer/self-compaction, or
+saved-host composition cutover is claimed by this lane.
+
+First bounded checkpoint removes five thin private VM forwarders: `makeSaveCommitToken`,
+`isSaveCommitTokenCurrent`, `saveSession`, `saveSessionCore`, and `waitForInFlightSave`, plus the
+dead `SessionCreationSave` alias. Six existing callers now reach the same `persistenceRuntime`
+methods directly. Getter evaluation count, lazy composition timing, arguments/defaults, async
+ordering, save-queue ownership and failure handling are unchanged. Two prepared-owner VM call
+sites and the handoff recovery-save site receive only the necessary runtime qualification; their
+host/handoff policy is not modified. DEBUG token/wait entry points remain stable for existing
+regression tests. Required-save, scheduling and flush forwarders remain for subsequent slices.
+
+One source review (Oracle `untitled-chat-DF9731`, snapshot `2026-11-11/1134`) found no correctness
+regression in this deletion-only checkpoint. Its pre-existing queue-access consistency observation
+is not changed here. Pinned formatting and strict scoped lint passed. Focused ticket
+`29571d71-e9d4-49f4-8cfa-81339bd027ea` passed **78 tests, zero failures** (35.661s): persistence,
+save runtime, quiet-check-in token validation, endpoint resolver, both saved-loader families,
+and the two handoff durable-save/recovery cases. Actual VM compiler warning occurrences were
+four, equal to exact-main `c791cd13a` compile `1b23f00d`; no positive delta. Fresh index passed
+**1,263/1,360 wrong-way edges, 53/66 largest cycle**, baseline unchanged. This is local checkpoint
+validation, not a full publication/product/live-app/release qualification.
+
+Required-save follow-up discovery: the tab/workspace ingress still defaults to `.currentOwner`,
+can survive same-object claim reacquisition during its wait, and can acknowledge dirty suppression
+as `.notRequired`. Do not blindly replace every tab ingress with writer-required failure:
+`preflightComposeTabsRemoval` intentionally includes absent/blank/unbound tabs, and unbound content
+currently obtains binding through the existing core admission. Caller migration must distinguish
+no persistence obligation from acknowledged persistence while preserving legitimate blank-tab
+close behavior. No new compatibility acknowledgement enum, parallel manager, default-true
+admission or legacy-unbound implementation was introduced by this checkpoint. Runtime exact-save
+acknowledgment hardening and remaining caller/forwarder retirement are still open.
+
+#### M9.2j — exact required-save no-op acknowledgment
+
+The exact-writer required-save path no longer treats a suppressed dirty `.notRequired` as a
+successful acknowledgment. Its no-write result requires the same writer to remain current, the
+session to be clean, and restoration to be authoritative/admissible. A clean restored no-op still
+succeeds, and the originating writer can still perform its final retirement save. The legacy
+`.currentOwner` tab ingress is deliberately unchanged in this slice, including its suppressed
+bound-tab acknowledgment gap; absent/unbound close obligations and caller capture need a separate
+migration rather than an invented compatibility acknowledgment enum.
+
+One causal runtime test first performs a real write, then proves clean suppressed no-op success,
+dirty suppressed refusal with the exact error and no durable phase/additional write, and a real
+unsuppressed save after retirement. The normal launch configuration suppresses persistence only
+for deterministic UI-test launches without the stress persistence opt-in; VM test savers can
+explicitly bypass suppression. Exact session-link send failure paths already block dispatch and
+require durable compensation; this checkpoint intentionally refuses suppression rather than
+pretending those obligations were saved. No suppression configuration or caller policy changed.
+
+Oracle review `untitled-chat-DF9731`, snapshot `2026-11-11/1205`, approved with bounded test-message
+and comment-precision fixes, both applied. Synchronous callbacks can still reenter, so absence of
+an `await` is not claimed as atomicity. Focused Conductor `3d2d9a5a-6aad-476c-a021-e054aad332c9`
+passed **213 tests, zero failures** (101.300s), covering persistence/save runtime, send/compact/stop
+transactions, attribution persistence, restoration admission and lane first-save. Pinned scoped
+formatting and strict lint passed; both changed Swift files emitted zero warning occurrences in
+this actual compile, matching exact-main `c791cd13a` compile `1b23f00d`. Full publication gates,
+products and live-app/release validation are not claimed for this local checkpoint. Fresh index
+passed **1,263/1,360 wrong-way edges, 53/66 largest cycle**, baseline unchanged.
+
+#### M9.2j — capture bound tab required-save ingress (in progress)
+
+Bound tab/workspace required-save calls now capture their unique exact writer before the phase
+observer and before the save-queue wait. The captured expectation flows through the existing
+queue, preserved-debounce helper, physical save and final acknowledgment checks. Clean conflicting,
+unscoped or wrong-workspace bindings refuse rather than receiving a no-write success. Existing
+unscoped bindings are not qualified by `ensureSessionBoundToTab` (it returns the existing ID), so
+no legitimate binding-admission path is removed. A bound session with no restoration failure is
+authoritative by the existing readiness enum; no relaxed-readiness escape hatch was added.
+
+Missing/unbound calls retain their existing no-obligation/creation policy, but the phase observer
+cannot insert or bind a new writer and then use the uncaptured branch. Three focused tests cover
+queue ABA and stable success with a held independent debounce; clean observer ABA, conflicting,
+unscoped and wrong-workspace refusals; dirty suppression; clean suppressed/blank/absent no-ops;
+and observer binding of a formerly blank tab. The ABA refusal retains the ordinary debounce,
+which subsequently performs the one real save; the stable required save cancels it without a
+second write. Refusal messages and phase counts are asserted. No test expectations or budgets
+were relaxed.
+
+Oracle review `untitled-chat-DF9731`, snapshot `2026-11-11/1227`, found no correctness defect;
+message assertions and debounce coverage were added as requested. Unbound same-object membership
+ABA, core binding admission for unbound content, capture before callers' earlier awaits,
+close-preflight claim incarnations across multiple tabs, and continuous exclusivity against a
+transient foreign claim remain open. No host/route, interaction or managed-operation files changed.
+
+Expanded focused ticket `a375a820-2c14-4ef2-83d2-501ef3341ba5` passed **391 tests, zero failures**
+(608.659s), including all 104 handoff tests, 39 provider-switch tests and 32 worktree-recovery tests.
+Full lint `91670f1c-d1a6-4feb-90e3-597a68dc073f` passed. Afterwards two test saver stubs were narrowed
+to capture only the root URL rather than retaining their fixtures; scoped pinned formatting and
+strict lint passed for that test-only cleanup.
+
+Publication-gate attempt `b37325c9-2370-428d-8112-cd7138fb7e7a` built successfully but ran no tests:
+Swift's test discovery could not find `RepoPromptMCPServerTests.xctest`. The following coordinated
+job rebuilt the products; isolated handoff `adde2c08-d5af-4a2c-a72d-380e97a3024c` passed all **104**
+tests (161.738s). Both products `d04c9fd1-4d46-4315-854a-5e3f742fc5fd` and final full lint
+`63dcbaed-a066-4a23-84cd-fe2864c28c46` passed.
+
+Broad retry `b7cd16ba-67f5-47e4-b36b-be481a68e1d2` executed **2,800 tests, 22 skipped, five failing
+cases** (app 2,747/22 skipped/four unexpected failures, Settings 1, SecureStorage 27, Domain 7,
+CodexProvider 18/one assertion failure). Failures were resident Steer refusing as busy/changing
+(3.103s), LiveDiscovery schema decoding at `tools[15].inputSchema.properties.op.enum[14]` (5.323s),
+worktree held-resolution `ambiguousGitTopology` (6.701s), invalid-base-ref setup's three-second
+`foreground drafts published` timeout (6.979s), and Codex retry count 2 instead of 3 (5.190s).
+No expectations or budgets were changed. The focused head pair `9b27926a` passed LiveDiscovery
+(2.946s) but resident Steer threw `CancellationError` (3.738s), so it was not classified as a
+broad-only pass. Additional head isolation `42b63c86` passed the two worktree cases (19.409s,
+7.473s) and Codex retry case (0.856s). Exact main `c1e089b33`, ticket `4ebb6086`, passed all five
+(resident 1.320s, discovery 2.591s, worktree 14.259s/5.302s, retry 0.565s). The three-file patch
+was preserved in an exact-path stash and restored byte-identically; protected local artifacts
+were untouched. Resident single-case head isolation `0127fa88` passed unchanged (1.355s). Under
+the overseer's classification rule, these local failures remain **intermittent, not root-caused,
+under watch**; the failed two-case resident run is retained above rather than called broad-only.
+The waiting-instruction path and its provider-input proof contain no required save call; no Steer
+admission or MCP schema/decoding code was modified by this checkpoint. No further broad rerun was
+requested. Per-file actual compiler-warning occurrences across cold/affected compiles remain
+VM **4→4**, persistence runtime **0→0**, persistence tests **0→0**, against exact-base `c791cd13a`
+compile `1b23f00d`; this is no positive delta, not zero total warnings. Fresh post-build index
+passed **1,263/1,360 wrong-way edges, 53/66 largest cycle**, baseline unchanged. No live-app,
+release, sanitizer or hosted-CI success is claimed.
+
 #### M9.2i checkpoint 1 — exact apply-edits caller cancellation
 
 Caller cancellation in `ApplyEditsApprovalStore` now settles the captured review UUID, not whichever
@@ -8847,3 +8970,9 @@ lifecycle tests **5**, with no positive count/signature delta across the 42 audi
 The 2,122-case broad, both-product and full-lint receipts above qualify the pre-integration
 step-4 checkpoint; they are not misrepresented as a new merged-tree full-suite run. No source
 changed after merged-tree execution; this final addition records its integration receipts.
+
+### M9.2j review follow-up: remove clean unowned tabs without a save acknowledgement
+
+PR #1688 review comment 4545107014 correctly identified a removal regression, not a reason to weaken required-save acknowledgement. Removal preflight now skips required persistence only for a clean bound session lacking a unique writer, with no debounce, creation, transition, handoff installation, load, in-flight save or queued follow-up. This path performs no write and returns no durability acknowledgement. It retains the existing session-claim snapshot and rechecks both claim equality and no-save eligibility after other tabs flush. Dirty or pending unowned sessions still refuse; `flushSaveRequired` and its exact-writer tests remain unchanged. Provider switch still dirties its session before requesting the required save.
+
+Focused ticket `fd6a7013-ad97-423a-ba21-9213c4cdbb77` passed all **122 tests** across titlebar/removal, persistence, save, first-save and restoration admission suites. New cases exercise real close of clean conflicting, unscoped and wrong-workspace tabs with zero writes, dirty refusal, pending debounce/in-flight/follow-up refusal, and mutation during another tab's flush. The close fixture activates the surviving tab before measurement: earlier fixture runs first retained a blank carrier through a pinned current-tab override, then counted the surviving tab's activation save; no production behavior or refusal expectations were relaxed to resolve those failures. Both products passed ticket `f36ea853-9a9b-4e61-b655-65c3ebc2f2cc`; all four touched Swift files passed pinned SwiftFormat 0.61.1 and strict uncached SwiftLint (`/tmp/m92j-clean-removal-format3.log`). One source review found no in-scope correctness issue. No broad suite, live-app smoke, release/sanitizer run or hosted CI-log inspection is claimed.
