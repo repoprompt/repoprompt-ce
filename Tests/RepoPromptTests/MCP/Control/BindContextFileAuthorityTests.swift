@@ -1028,7 +1028,7 @@ import XCTest
             await gate.release()
             await fulfillment(of: [dispatched], timeout: 3)
             XCTAssertEqual(server.connectionBindingSnapshot(forConnection: fixture.connectionID).tabID, prior.tabID)
-            XCTAssertNotNil(try vm.mcpRegistration(sessionID: XCTUnwrap(target.sessionID)))
+            XCTAssertNotNil(try vm.mcpRuntime.registration(sessionID: XCTUnwrap(target.sessionID)))
             // Nil tokens preserve the existing manage-session binding policy.
             try await server.bindCurrentRequestToTabIfPossible(tabID: childTabID, metadata: metadata)
             XCTAssertEqual(server.connectionBindingSnapshot(forConnection: fixture.connectionID).tabID, childTabID)

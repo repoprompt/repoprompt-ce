@@ -359,12 +359,7 @@ private struct ModeCard: View {
                     .font(.title3.bold())
 
                 if let badge {
-                    Text(badge)
-                        .font(.caption.bold())
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Capsule().fill(Color.orange))
+                    onboardingBadge(Text(badge), color: .orange)
                 }
             }
 
@@ -430,6 +425,51 @@ private struct FreeFeaturesStepView: View {
     }
 }
 
+@MainActor
+private func onboardingBadge(_ text: Text, color: Color, horizontalPadding: CGFloat = 6) -> some View {
+    text
+        .font(.caption.bold())
+        .foregroundColor(.white)
+        .padding(.horizontal, horizontalPadding)
+        .padding(.vertical, 2)
+        .background(Capsule().fill(color))
+}
+
+@MainActor
+private func onboardingFeatureText(title: String, description: Text) -> some View {
+    VStack(alignment: .leading, spacing: 4) {
+        Text(title)
+            .font(.headline)
+        description
+            .foregroundColor(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+@MainActor
+private func onboardingFeatureContent(
+    title: String,
+    description: String,
+    color: Color,
+    @ViewBuilder icon: () -> some View
+) -> some View {
+    HStack(alignment: .top, spacing: 14) {
+        ZStack {
+            RoundedRectangle(cornerRadius: 10)
+                .fill(color.opacity(0.12))
+                .frame(width: 40, height: 40)
+            icon()
+        }
+        onboardingFeatureText(title: title, description: Text(description))
+    }
+}
+
+@MainActor
+private var onboardingFeatureBackground: some View {
+    RoundedRectangle(cornerRadius: 12)
+        .fill(Color.primary.opacity(0.02))
+}
+
 private struct FreeFeatureCard: View {
     let icon: String
     let title: String
@@ -442,14 +482,7 @@ private struct FreeFeatureCard: View {
                 .foregroundColor(.accentColor)
                 .frame(width: 28)
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text(title)
-                    .font(.headline)
-                Text(description)
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            onboardingFeatureText(title: title, description: Text(description).font(.subheadline))
         }
         .padding(14)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -528,30 +561,14 @@ private struct FeatureShowcaseRow: View {
     let color: Color
 
     var body: some View {
-        HStack(alignment: .top, spacing: 14) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 10)
-                    .fill(color.opacity(0.12))
-                    .frame(width: 40, height: 40)
-                Image(systemName: icon)
-                    .font(.system(size: 18))
-                    .foregroundColor(color)
-            }
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text(title)
-                    .font(.headline)
-                Text(description)
-                    .foregroundColor(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+        onboardingFeatureContent(title: title, description: description, color: color) {
+            Image(systemName: icon)
+                .font(.system(size: 18))
+                .foregroundColor(color)
         }
         .padding(14)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(
-            RoundedRectangle(cornerRadius: 12)
-                .fill(Color.primary.opacity(0.02))
-        )
+        .background(onboardingFeatureBackground)
     }
 }
 
@@ -1007,29 +1024,13 @@ private struct MCPAdvantageRow: View {
     let color: Color
 
     var body: some View {
-        HStack(alignment: .top, spacing: 14) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 10)
-                    .fill(color.opacity(0.12))
-                    .frame(width: 40, height: 40)
-                Image(systemName: icon)
-                    .foregroundColor(color)
-            }
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text(title)
-                    .font(.headline)
-                Text(description)
-                    .foregroundColor(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+        onboardingFeatureContent(title: title, description: description, color: color) {
+            Image(systemName: icon)
+                .foregroundColor(color)
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 12)
-                .fill(Color.primary.opacity(0.02))
-        )
+        .background(onboardingFeatureBackground)
     }
 }
 
@@ -1334,21 +1335,11 @@ private struct CompactProviderRow: View {
                         .font(.headline)
 
                     if isRecommended {
-                        Text("Recommended")
-                            .font(.caption.bold())
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 7)
-                            .padding(.vertical, 2)
-                            .background(Capsule().fill(Color.accentColor))
+                        onboardingBadge(Text("Recommended"), color: .accentColor, horizontalPadding: 7)
                     }
 
                     if requiresPro {
-                        Text("Pro")
-                            .font(.caption.bold())
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Capsule().fill(Color.orange))
+                        onboardingBadge(Text("Pro"), color: .orange)
                     }
                 }
 

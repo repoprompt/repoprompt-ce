@@ -307,14 +307,14 @@ final class AgentSessionLinkRunnerHarness {
                 handleHeadlessStreamResult: { result, session, runID, attemptID in
                     if replayTranscript { await harnessBox?.host.test_handleStreamResult(result, session: session, runID: runID, runAttemptID: attemptID) }
                 },
-                finalizeStreamingItems: { session in if replayTranscript { harnessBox?.host.finalizeStreamingItems(in: session) } },
+                finalizeStreamingItems: { session in if replayTranscript { harnessBox?.host.streamRuntime.finalizeStreamingItems(in: session) } },
                 finalizePendingToolCalls: { _, _ in },
                 finalizePendingToolCallsWithUpperBound: { _, _, _ in },
-                flushPendingAssistantDelta: { session in if replayTranscript { harnessBox?.host.flushPendingAssistantDelta(session) } },
+                flushPendingAssistantDelta: { session in if replayTranscript { harnessBox?.host.streamRuntime.flushPendingAssistantDelta(session) } },
                 beginClaudeProviderOutputSegment: { session in
                     if replayTranscript {
-                        harnessBox?.host.flushPendingAssistantDelta(session)
-                        harnessBox?.host.endActiveAssistantSegment(session)
+                        harnessBox?.host.streamRuntime.flushPendingAssistantDelta(session)
+                        harnessBox?.host.streamRuntime.endActiveAssistantSegment(session)
                     }
                 },
                 clearPendingAssistantDelta: { _ in }
@@ -332,13 +332,13 @@ final class AgentSessionLinkRunnerHarness {
                 augmentUserMessageForProviderSend: { text, _, _, _, _, _ in text },
                 stageResumeRecoveryHandoffIfNeeded: { _ in true },
                 prependPendingHandoffIfNeeded: { text, session in
-                    sessionLinkHost?.prependPendingHandoffIfNeeded(text, session: session) ?? text
+                    sessionLinkHost?.handoffRuntime.prependPendingHandoffIfNeeded(text, session: session) ?? text
                 },
                 recordPendingHandoffSendOutcome: { session, sent in harnessBox?.pendingHandoffSendOutcome?(session, sent) },
                 claimAgentSessionLinkPrompt: { session, dispatchID in
                     MainActor.assumeIsolated {
                         if let sessionLinkHost = harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost {
-                            return sessionLinkHost.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatchID)
+                            return sessionLinkHost.linkExecutionRuntime.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatchID)
                         }
                         guard let harnessBox else {
                             // Family-first, exactly like the production fence: a reserved-family
@@ -362,19 +362,19 @@ final class AgentSessionLinkRunnerHarness {
                     }
                 },
                 acquireAgentSessionLinkPhysicalDispatch: { session, dispatchID in
-                    sessionLinkHost?.agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: dispatchID) ?? true
+                    sessionLinkHost?.linkExecutionRuntime.agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: dispatchID) ?? true
                 },
                 recordAgentSessionLinkPhysicalDispatchNotAttempted: { session, dispatchID in
                     MainActor.assumeIsolated { harnessBox?.physicalNotAttemptedCount += 1 }
-                    sessionLinkHost?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
+                    sessionLinkHost?.linkExecutionRuntime.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
                 },
                 recordAgentSessionLinkPhysicalDispatchFailure: { session, dispatchID in
-                    sessionLinkHost?.agentSessionLinkRecordPhysicalDispatchFailure(for: session, dispatchID: dispatchID)
+                    sessionLinkHost?.linkExecutionRuntime.agentSessionLinkRecordPhysicalDispatchFailure(for: session, dispatchID: dispatchID)
                 },
                 acceptAgentSessionLinkPrompt: { session, context, claim in
                     MainActor.assumeIsolated {
                         harnessBox?.acceptedDispatchCount += 1
-                        (harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost)?.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
+                        (harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost)?.linkExecutionRuntime.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
                         guard let claim else { return }
                         harnessBox?.claimStore.accept(claim)
                         harnessBox?.acceptedClaims.append(claim)
@@ -383,14 +383,14 @@ final class AgentSessionLinkRunnerHarness {
                 proveAgentSessionLinkProviderInput: { session, claim in
                     await harnessBox?.beforeProviderInputProof?()
                     if let host = harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost {
-                        return await host.agentSessionLinkProveProviderInput(for: session, claim: claim)
+                        return await host.linkExecutionRuntime.agentSessionLinkProveProviderInput(for: session, claim: claim)
                     }
                     return await AgentSessionLinkProviderInputRelease.prove(claim) { _ in false }
                 },
                 handoffAgentSessionLinkProviderInput: { session, dispatchID, claim, proof in
                     if let release = harnessBox?.providerInputReleaseOverride { return release() }
                     if let host = harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost {
-                        return host.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatchID, claim: claim, proof: proof)
+                        return host.linkExecutionRuntime.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatchID, claim: claim, proof: proof)
                     }
                     return AgentSessionLinkProviderInputRelease.handoff(
                         original: claim,

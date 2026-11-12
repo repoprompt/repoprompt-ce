@@ -5,15 +5,7 @@ struct OpenAIDecisionsDecisionService: DecisionService {
     let id = DecisionServiceID.openAIDecisions
     let displayName = "Decisions by OpenAI"
     let credentialService: OpenAIDecisionsRouterCredentialService
-    let capabilities = DecisionServiceCapabilities(
-        contextKinds: [.text],
-        finiteChoice: .init(
-            minimumChoices: 2, maximumChoices: 12, maximumContextBytes: 24 * 1024,
-            maximumInstructionsBytes: 16 * 1024, maximumChoiceDescriptionBytes: 8 * 1024,
-            maximumAggregateBytes: 128 * 1024
-        ),
-        evidence: .init(confidence: true, probabilityDistribution: true, usage: true)
-    )
+    let capabilities = DecisionServiceCapabilities.routingBackend
 
     static func settingsRegistration(controller: OpenAIDecisionsRouterCredentialService) -> DecisionServiceConfigurationRegistration {
         .init(presentation: .init(

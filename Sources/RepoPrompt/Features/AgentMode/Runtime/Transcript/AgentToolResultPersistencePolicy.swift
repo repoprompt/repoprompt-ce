@@ -99,7 +99,7 @@ enum AgentToolResultPersistencePolicy {
 
         if normalizedToolName == "agent_run" || normalizedToolName == "agent_explore" {
             let rawObject = jsonObject(from: rawResultJSON, context: context)
-            let statusWord = normalizedAgentRunStatusWord(stringValue(rawObject, keys: ["status"])) ?? "unknown"
+            let statusWord = normalizedAgentRunStatusWord(AgentToolResultProcessingContext.stringValue(rawObject, keys: ["status"])) ?? "unknown"
             let transcriptStatus = transcriptStatusForAgentRunStatusWord(statusWord)
             let summaryJSON = agentRunSummaryJSON(normalizedToolName: normalizedToolName, statusWord: statusWord, rawObject: rawObject)
             let text = summaryJSON ?? minimalResultJSON(statusWord: statusWord)
@@ -117,25 +117,21 @@ enum AgentToolResultPersistencePolicy {
         }
 
         let execution = toolExecution ?? AgentTranscriptToolNormalizer.toolExecution(for: item, context: context)
+        func executionStatusWord(rawObject: [String: Any]?) -> String {
+            if normalizedToolName != "bash", let executionStatus = execution?.status, executionStatus != .unknown {
+                return AgentTranscriptToolStatusSemantics.persistedStatusWord(from: executionStatus)
+            }
+            return derivedStatusWord(
+                normalizedToolName: normalizedToolName, rawResultJSON: rawResultJSON,
+                rawObject: rawObject, executionStatus: execution?.status,
+                toolIsError: item.toolIsError, context: context
+            )
+        }
         if normalizedToolName == "prompt",
            let rawObject = jsonObject(from: rawResultJSON, context: context),
            let promptExportJSON = promptExportMetadataJSON(rawObject: rawObject)
         {
-            let statusWord: String = {
-                if let executionStatus = execution?.status,
-                   executionStatus != .unknown
-                {
-                    return AgentTranscriptToolStatusSemantics.persistedStatusWord(from: executionStatus)
-                }
-                return derivedStatusWord(
-                    normalizedToolName: normalizedToolName,
-                    rawResultJSON: rawResultJSON,
-                    rawObject: rawObject,
-                    executionStatus: execution?.status,
-                    toolIsError: item.toolIsError,
-                    context: context
-                )
-            }()
+            let statusWord = executionStatusWord(rawObject: rawObject)
             let status = AgentTranscriptToolStatusSemantics.transcriptStatus(fromNormalizedStatusWord: statusWord)
             return AgentSanitizedToolResult(
                 text: promptExportJSON,
@@ -185,32 +181,19 @@ enum AgentToolResultPersistencePolicy {
             {
                 return item.toolIsError == true ? "failed" : "completed"
             }
-            if normalizedToolName != "bash",
-               let executionStatus = execution?.status,
-               executionStatus != .unknown
-            {
-                return AgentTranscriptToolStatusSemantics.persistedStatusWord(from: executionStatus)
-            }
-            return derivedStatusWord(
-                normalizedToolName: normalizedToolName,
-                rawResultJSON: rawResultJSON,
-                rawObject: rawObject,
-                executionStatus: execution?.status,
-                toolIsError: item.toolIsError,
-                context: context
-            )
+            return executionStatusWord(rawObject: rawObject)
         }()
         let status = AgentTranscriptToolStatusSemantics.transcriptStatus(fromNormalizedStatusWord: statusWord)
         let rawOutputObject = rawObject?["rawOutput"] as? [String: Any]
         let processID = execution?.processID
             ?? bashMetadata?.processID
-            ?? stringValue(rawObject, keys: ["processId", "process_id"])
-            ?? stringValue(rawOutputObject, keys: ["processId", "process_id"])
+            ?? AgentToolResultProcessingContext.stringValue(rawObject, keys: ["processId", "process_id"])
+            ?? AgentToolResultProcessingContext.stringValue(rawOutputObject, keys: ["processId", "process_id"])
             ?? bashTextProcessID(from: rawResultJSON, context: context)
         let exitCode = execution?.exitCode
             ?? bashMetadata?.exitCode
-            ?? intValue(rawObject, keys: ["exitCode", "exit_code", "code"])
-            ?? intValue(rawOutputObject, keys: ["exitCode", "exit_code", "code"])
+            ?? AgentToolResultProcessingContext.intValue(rawObject, keys: ["exitCode", "exit_code", "code"])
+            ?? AgentToolResultProcessingContext.intValue(rawOutputObject, keys: ["exitCode", "exit_code", "code"])
             ?? bashTextExitCode(from: rawResultJSON, context: context)
         let summaryJSON = sanitizedSummaryJSON(
             normalizedToolName: normalizedToolName,
@@ -437,11 +420,11 @@ enum AgentToolResultPersistencePolicy {
     }
 
     private static func promptExportMetadataJSON(rawObject: [String: Any]) -> String? {
-        guard trimmedStorageString(stringValue(rawObject, keys: ["op"]))?.lowercased() == "export",
+        guard trimmedStorageString(AgentToolResultProcessingContext.stringValue(rawObject, keys: ["op"]))?.lowercased() == "export",
               let rawExport = rawObject["export"] as? [String: Any],
-              let path = storageSafeMetadataString(stringValue(rawExport, keys: ["path"])),
-              let tokens = intValue(rawExport, keys: ["tokens"]),
-              let bytes = intValue(rawExport, keys: ["bytes"])
+              let path = storageSafeMetadataString(AgentToolResultProcessingContext.stringValue(rawExport, keys: ["path"])),
+              let tokens = AgentToolResultProcessingContext.intValue(rawExport, keys: ["tokens"]),
+              let bytes = AgentToolResultProcessingContext.intValue(rawExport, keys: ["bytes"])
         else { return nil }
 
         let coreExportObject: [String: Any] = [
@@ -489,16 +472,16 @@ enum AgentToolResultPersistencePolicy {
 
     private static func promptExportCopyPresetMetadata(_ rawCopyPreset: [String: Any]?) -> [String: Any]? {
         guard let rawCopyPreset,
-              let id = storageSafeMetadataString(stringValue(rawCopyPreset, keys: ["id"])),
-              let name = storageSafeMetadataString(stringValue(rawCopyPreset, keys: ["name"])),
-              let isBuiltIn = boolValue(rawCopyPreset, keys: ["is_built_in", "isBuiltIn"])
+              let id = storageSafeMetadataString(AgentToolResultProcessingContext.stringValue(rawCopyPreset, keys: ["id"])),
+              let name = storageSafeMetadataString(AgentToolResultProcessingContext.stringValue(rawCopyPreset, keys: ["name"])),
+              let isBuiltIn = AgentToolResultProcessingContext.boolValue(rawCopyPreset, keys: ["is_built_in", "isBuiltIn"])
         else { return nil }
         var copyPreset: [String: Any] = [
             "id": id,
             "name": name,
             "is_built_in": isBuiltIn
         ]
-        if let kind = storageSafeMetadataString(stringValue(rawCopyPreset, keys: ["kind"])) {
+        if let kind = storageSafeMetadataString(AgentToolResultProcessingContext.stringValue(rawCopyPreset, keys: ["kind"])) {
             copyPreset["kind"] = kind
         }
         return copyPreset
@@ -513,19 +496,19 @@ enum AgentToolResultPersistencePolicy {
     private static func promptExportFileMetadata(_ rawFiles: [[String: Any]]?, limit: Int) -> [[String: Any]] {
         guard let rawFiles, limit > 0 else { return [] }
         return rawFiles.prefix(limit).compactMap { rawFile in
-            guard let path = storageSafeMetadataString(stringValue(rawFile, keys: ["path"])),
-                  let tokens = intValue(rawFile, keys: ["tokens"])
+            guard let path = storageSafeMetadataString(AgentToolResultProcessingContext.stringValue(rawFile, keys: ["path"])),
+                  let tokens = AgentToolResultProcessingContext.intValue(rawFile, keys: ["tokens"])
             else { return nil }
             var file: [String: Any] = [
                 "path": path,
                 "tokens": tokens,
-                "render_mode": storageSafeMetadataString(stringValue(rawFile, keys: ["render_mode", "renderMode"])) ?? "unknown",
-                "is_auto": boolValue(rawFile, keys: ["is_auto", "isAuto"]) ?? false
+                "render_mode": storageSafeMetadataString(AgentToolResultProcessingContext.stringValue(rawFile, keys: ["render_mode", "renderMode"])) ?? "unknown",
+                "is_auto": AgentToolResultProcessingContext.boolValue(rawFile, keys: ["is_auto", "isAuto"]) ?? false
             ]
-            if let codemapOrigin = storageSafeMetadataString(stringValue(rawFile, keys: ["codemap_origin", "codemapOrigin"])) {
+            if let codemapOrigin = storageSafeMetadataString(AgentToolResultProcessingContext.stringValue(rawFile, keys: ["codemap_origin", "codemapOrigin"])) {
                 file["codemap_origin"] = codemapOrigin
             }
-            if let pathWithinRoot = storageSafeMetadataString(stringValue(rawFile, keys: ["path_within_root", "pathWithinRoot"])) {
+            if let pathWithinRoot = storageSafeMetadataString(AgentToolResultProcessingContext.stringValue(rawFile, keys: ["path_within_root", "pathWithinRoot"])) {
                 file["path_within_root"] = pathWithinRoot
             }
             return file
@@ -543,9 +526,9 @@ enum AgentToolResultPersistencePolicy {
         guard let resultJSON = resultJSON?.trimmingCharacters(in: .whitespacesAndNewlines),
               !resultJSON.isEmpty,
               let object = jsonObject(from: resultJSON, context: context),
-              stringValue(object, keys: ["acp_status"]) != nil
+              AgentToolResultProcessingContext.stringValue(object, keys: ["acp_status"]) != nil
         else { return nil }
-        if boolValue(object, keys: ["summary_only", "summaryOnly"]) == true,
+        if AgentToolResultProcessingContext.boolValue(object, keys: ["summary_only", "summaryOnly"]) == true,
            !exceedsPersistedToolSummaryBudget(resultJSON)
         {
             return resultJSON
@@ -1177,19 +1160,7 @@ enum AgentToolResultPersistencePolicy {
         summaryText: String?,
         renderSummary: AgentToolCardRenderSummary?
     ) -> [String: Any] {
-        var object: [String: Any] = [
-            "status": statusWord,
-            "summary_only": true
-        ]
-        if normalizedToolName == "bash" {
-            object["type"] = "commandExecution"
-        }
-        if let processID, !processID.isEmpty {
-            object["processId"] = processID
-        }
-        if let exitCode {
-            object["exitCode"] = exitCode
-        }
+        var object = genericSummaryObject(normalizedToolName: normalizedToolName, statusWord: statusWord, processID: processID, exitCode: exitCode)
         if let summaryText = smallStorageSummaryText(summaryText) {
             object["summary_text"] = summaryText
         }
@@ -1203,33 +1174,33 @@ enum AgentToolResultPersistencePolicy {
         if let existingSummary = existingGitSummaryOnlyText(rawObject) {
             return existingSummary
         }
-        if boolValue(rawObject, keys: ["summary_only", "summaryOnly"]) == true {
+        if AgentToolResultProcessingContext.boolValue(rawObject, keys: ["summary_only", "summaryOnly"]) == true {
             return nil
         }
         guard rawObject != nil || argsObject != nil else { return nil }
-        let op = trimmedStorageString(stringValue(rawObject, keys: ["op"]))
-            ?? trimmedStorageString(stringValue(argsObject, keys: ["op"]))
+        let op = trimmedStorageString(AgentToolResultProcessingContext.stringValue(rawObject, keys: ["op"]))
+            ?? trimmedStorageString(AgentToolResultProcessingContext.stringValue(argsObject, keys: ["op"]))
             ?? "git"
         let subtitle: String
         let detailText: String?
         switch op.lowercased() {
         case "status":
-            subtitle = joinStorageSummary(op, gitStatusPrimarySummary(rawObject: rawObject))
-            detailText = gitStatusDetailText(rawObject: rawObject)
+            subtitle = joinStorageSummary(op, AgentToolCardRenderSummaryBuilder.gitStatusPrimarySummary(rawObject: rawObject))
+            detailText = AgentToolCardRenderSummaryBuilder.gitStatusDetailText(rawObject: rawObject)
         case "diff":
-            subtitle = joinStorageSummary(op, gitPreferredDiffSummary(rawObject: rawObject))
-            detailText = gitDiffDetailText(rawObject: rawObject, argsObject: argsObject)
+            subtitle = joinStorageSummary(op, AgentToolCardRenderSummaryBuilder.gitPreferredDiffSummary(rawObject: rawObject))
+            detailText = AgentToolCardRenderSummaryBuilder.gitDiffDetailText(rawObject: rawObject, argsObject: argsObject, branchKeys: ["worktree_branch"])
         case "log":
-            subtitle = joinStorageSummary(op, gitLogSummary(rawObject: rawObject) ?? gitRepoCountText(rawObject: rawObject))
+            subtitle = joinStorageSummary(op, AgentToolCardRenderSummaryBuilder.gitLogSummary(rawObject: rawObject) ?? AgentToolCardRenderSummaryBuilder.gitRepoCountText(rawObject: rawObject))
             detailText = nil
         case "show":
-            subtitle = joinStorageSummary(op, gitShowSummary(rawObject: rawObject) ?? gitRepoCountText(rawObject: rawObject))
+            subtitle = joinStorageSummary(op, AgentToolCardRenderSummaryBuilder.gitShowSummary(rawObject: rawObject) ?? AgentToolCardRenderSummaryBuilder.gitRepoCountText(rawObject: rawObject))
             detailText = nil
         case "blame":
-            subtitle = joinStorageSummary(op, gitBlameSummary(rawObject: rawObject) ?? gitRepoCountText(rawObject: rawObject))
+            subtitle = joinStorageSummary(op, AgentToolCardRenderSummaryBuilder.gitBlameSummary(rawObject: rawObject) ?? AgentToolCardRenderSummaryBuilder.gitRepoCountText(rawObject: rawObject))
             detailText = nil
         default:
-            subtitle = joinStorageSummary(op, gitPreferredDiffSummary(rawObject: rawObject) ?? gitRepoCountText(rawObject: rawObject))
+            subtitle = joinStorageSummary(op, AgentToolCardRenderSummaryBuilder.gitPreferredDiffSummary(rawObject: rawObject) ?? AgentToolCardRenderSummaryBuilder.gitRepoCountText(rawObject: rawObject))
             detailText = nil
         }
         return inlineStorageSummary(subtitle, detailText)
@@ -1267,126 +1238,8 @@ enum AgentToolResultPersistencePolicy {
     }
 
     private static func existingGitSummaryOnlyText(_ rawObject: [String: Any]?) -> String? {
-        guard boolValue(rawObject, keys: ["summary_only", "summaryOnly"]) == true else { return nil }
-        return smallStorageSummaryText(stringValue(rawObject, keys: ["summary_text", "summaryText"]))
-    }
-
-    private static func gitStatusPrimarySummary(rawObject: [String: Any]?) -> String? {
-        let status = rawObject?["status"] as? [String: Any]
-        return trimmedStorageString(stringValue(status, keys: ["branch"]))
-            ?? gitRepoCountText(rawObject: rawObject)
-    }
-
-    private static func gitStatusDetailText(rawObject: [String: Any]?) -> String? {
-        guard let status = rawObject?["status"] as? [String: Any] else { return nil }
-        var parts: [String] = []
-        let ahead = intValue(status, keys: ["ahead"])
-        let behind = intValue(status, keys: ["behind"])
-        if let ahead, let behind, ahead > 0 || behind > 0 {
-            parts.append("+\(ahead) -\(behind)")
-        }
-        if let upstream = trimmedStorageString(stringValue(status, keys: ["upstream"])) {
-            parts.append(upstream)
-        }
-        appendArrayCountSummary(&parts, object: status, key: "staged", label: "staged")
-        appendArrayCountSummary(&parts, object: status, key: "modified", label: "modified")
-        appendArrayCountSummary(&parts, object: status, key: "untracked", label: "untracked")
-        return parts.isEmpty ? nil : parts.joined(separator: " • ")
-    }
-
-    private static func gitDiffDetailText(rawObject: [String: Any]?, argsObject: [String: Any]?) -> String? {
-        let inputs = rawObject?["inputs"] as? [String: Any]
-        let diff = rawObject?["diff"] as? [String: Any]
-        let worktree = rawObject?["worktree"] as? [String: Any]
-        var parts: [String] = []
-        if let compare = trimmedStorageString(stringValue(inputs, keys: ["compare"]) ?? stringValue(argsObject, keys: ["compare"])) {
-            parts.append(compare)
-        }
-        if let scope = trimmedStorageString(stringValue(inputs, keys: ["scope"])) {
-            parts.append(scope)
-        }
-        if let detail = trimmedStorageString(stringValue(diff, keys: ["detail"]) ?? stringValue(argsObject, keys: ["detail"])) {
-            parts.append(detail)
-        }
-        if parts.count < 3,
-           let branch = trimmedStorageString(stringValue(worktree, keys: ["worktree_branch"]))
-        {
-            parts.append(branch)
-        }
-        return parts.isEmpty ? nil : parts.joined(separator: " • ")
-    }
-
-    private static func gitPreferredDiffSummary(rawObject: [String: Any]?) -> String? {
-        let aggregate = rawObject?["aggregate"] as? [String: Any]
-        let diff = rawObject?["diff"] as? [String: Any]
-        let summary = rawObject?["summary"] as? [String: Any]
-        return gitTotalsSummaryText(object: aggregate?["totals"] as? [String: Any])
-            ?? gitTotalsSummaryText(object: diff?["totals"] as? [String: Any])
-            ?? gitTotalsSummaryText(object: summary)
-            ?? safeGitDiffOneliner(stringValue(aggregate, keys: ["oneliner"]))
-            ?? safeGitDiffOneliner(stringValue(diff, keys: ["oneliner"]))
-            ?? safeGitDiffOneliner(stringValue(rawObject, keys: ["oneliner"]))
-    }
-
-    private static func safeGitDiffOneliner(_ value: String?) -> String? {
-        guard let value = trimmedStorageString(value) else { return nil }
-        let lowered = value.lowercased()
-        guard !lowered.contains("diff --"),
-              !lowered.contains("@@"),
-              !value.contains("/"),
-              !value.contains("\\"),
-              !value.contains("\n"),
-              !value.contains("+++"),
-              !value.contains("---")
-        else { return nil }
-        if lowered == "no changes" { return value }
-        let pattern = #"^(?:[0-9]+ repos?: )?[0-9]+ files? \(\+[0-9]+ -[0-9]+\)$"#
-        let range = NSRange(value.startIndex ..< value.endIndex, in: value)
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
-        return regex.firstMatch(in: value, range: range) != nil ? value : nil
-    }
-
-    private static func gitTotalsSummaryText(object: [String: Any]?) -> String? {
-        guard let files = intValue(object, keys: ["files"]),
-              let insertions = intValue(object, keys: ["insertions"]),
-              let deletions = intValue(object, keys: ["deletions"])
-        else { return nil }
-        return "\(files) files (+\(insertions) -\(deletions))"
-    }
-
-    private static func gitLogSummary(rawObject: [String: Any]?) -> String? {
-        guard let log = rawObject?["log"] as? [String: Any],
-              let commits = log["commits"] as? [[String: Any]]
-        else { return nil }
-        if commits.count == 1,
-           let first = commits.first,
-           let shortSHA = trimmedStorageString(stringValue(first, keys: ["short_sha", "shortSha"]))
-        {
-            return shortSHA
-        }
-        return "\(commits.count) commits"
-    }
-
-    private static func gitShowSummary(rawObject: [String: Any]?) -> String? {
-        guard let show = rawObject?["show"] as? [String: Any] else { return nil }
-        return trimmedStorageString(stringValue(show, keys: ["short_sha", "shortSha"]))
-    }
-
-    private static func gitBlameSummary(rawObject: [String: Any]?) -> String? {
-        guard let blame = rawObject?["blame"] as? [String: Any],
-              let lines = blame["lines"] as? [Any]
-        else { return nil }
-        return "\(lines.count) lines"
-    }
-
-    private static func gitRepoCountText(rawObject: [String: Any]?) -> String? {
-        guard let repos = rawObject?["repos"] as? [[String: Any]], repos.count > 1 else { return nil }
-        return "\(repos.count) repos"
-    }
-
-    private static func appendArrayCountSummary(_ parts: inout [String], object: [String: Any], key: String, label: String) {
-        guard let array = object[key] as? [Any], !array.isEmpty else { return }
-        parts.append("\(array.count) \(label)")
+        guard AgentToolResultProcessingContext.boolValue(rawObject, keys: ["summary_only", "summaryOnly"]) == true else { return nil }
+        return smallStorageSummaryText(AgentToolResultProcessingContext.stringValue(rawObject, keys: ["summary_text", "summaryText"]))
     }
 
     private static func inlineStorageSummary(_ primary: String?, _ secondary: String?) -> String? {
@@ -1438,7 +1291,7 @@ enum AgentToolResultPersistencePolicy {
             }
         }
         if let rawStatus = AgentTranscriptToolStatusSemantics.normalizedStatusWord(
-            stringValue(rawObject, keys: ["status", "result", "outcome", "state", "subtype"])
+            AgentToolResultProcessingContext.stringValue(rawObject, keys: ["status", "result", "outcome", "state", "subtype"])
         ) {
             return rawStatus
         }
@@ -1481,7 +1334,7 @@ enum AgentToolResultPersistencePolicy {
         argsJSON: String?,
         context: AgentToolResultProcessingContext?
     ) -> String? {
-        let allowExistingRenderSummary = boolValue(rawObject, keys: ["summary_only", "summaryOnly"]) == true
+        let allowExistingRenderSummary = AgentToolResultProcessingContext.boolValue(rawObject, keys: ["summary_only", "summaryOnly"]) == true
         if let renderSummary = AgentToolCardRenderSummaryBuilder.build(
             normalizedToolName: normalizedToolName,
             statusWord: statusWord,
@@ -1620,27 +1473,27 @@ enum AgentToolResultPersistencePolicy {
             processID: nil,
             exitCode: nil
         )
-        if let editsRequested = intValue(rawObject, keys: ["edits_requested"]) {
+        if let editsRequested = AgentToolResultProcessingContext.intValue(rawObject, keys: ["edits_requested"]) {
             object["edits_requested"] = editsRequested
         }
-        if let editsApplied = intValue(rawObject, keys: ["edits_applied"]) {
+        if let editsApplied = AgentToolResultProcessingContext.intValue(rawObject, keys: ["edits_applied"]) {
             object["edits_applied"] = editsApplied
         }
-        if let totalLinesChanged = intValue(rawObject, keys: ["total_lines_changed"]) {
+        if let totalLinesChanged = AgentToolResultProcessingContext.intValue(rawObject, keys: ["total_lines_changed"]) {
             object["total_lines_changed"] = totalLinesChanged
         }
-        if let fileCreated = boolValue(rawObject, keys: ["file_created"]) {
+        if let fileCreated = AgentToolResultProcessingContext.boolValue(rawObject, keys: ["file_created"]) {
             object["file_created"] = fileCreated
         }
-        if let fileOverwritten = boolValue(rawObject, keys: ["file_overwritten"]) {
+        if let fileOverwritten = AgentToolResultProcessingContext.boolValue(rawObject, keys: ["file_overwritten"]) {
             object["file_overwritten"] = fileOverwritten
         }
-        if let reviewStatus = stringValue(rawObject, keys: ["review_status"]),
+        if let reviewStatus = AgentToolResultProcessingContext.stringValue(rawObject, keys: ["review_status"]),
            !reviewStatus.isEmpty
         {
             object["review_status"] = reviewStatus
         }
-        if let requiresUserApproval = boolValue(rawObject, keys: ["requires_user_approval"]) {
+        if let requiresUserApproval = AgentToolResultProcessingContext.boolValue(rawObject, keys: ["requires_user_approval"]) {
             object["requires_user_approval"] = requiresUserApproval
         }
         if let note = smallStringValue(rawObject, keys: ["note"]) {
@@ -1666,9 +1519,9 @@ enum AgentToolResultPersistencePolicy {
         )
         let changes = summarizedPatchChanges(from: rawObject)
         object["changes"] = changes
-        if let changeCount = intValue(rawObject, keys: ["change_count"]) {
+        if let changeCount = AgentToolResultProcessingContext.intValue(rawObject, keys: ["change_count"]) {
             object["change_count"] = max(changeCount, changes.count)
-        } else if let argCount = intValue(jsonObject(from: argsJSON, context: context), keys: ["change_count"]) {
+        } else if let argCount = AgentToolResultProcessingContext.intValue(jsonObject(from: argsJSON, context: context), keys: ["change_count"]) {
             object["change_count"] = max(argCount, changes.count)
         } else {
             object["change_count"] = changes.count
@@ -1679,17 +1532,17 @@ enum AgentToolResultPersistencePolicy {
     private static func summarizedPatchChanges(from rawObject: [String: Any]?) -> [[String: Any]] {
         guard let rawChanges = rawObject?["changes"] as? [[String: Any]] else { return [] }
         return rawChanges.compactMap { change in
-            guard let path = stringValue(change, keys: ["path"]),
+            guard let path = AgentToolResultProcessingContext.stringValue(change, keys: ["path"]),
                   !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             else {
                 return nil
             }
             var summarized: [String: Any] = [
                 "path": path,
-                "kind": stringValue(change, keys: ["kind"]) ?? "update",
+                "kind": AgentToolResultProcessingContext.stringValue(change, keys: ["kind"]) ?? "update",
                 "diff": ""
             ]
-            if let movePath = stringValue(change, keys: ["move_path", "movePath"]),
+            if let movePath = AgentToolResultProcessingContext.stringValue(change, keys: ["move_path", "movePath"]),
                !movePath.isEmpty
             {
                 summarized["move_path"] = movePath
@@ -1706,7 +1559,7 @@ enum AgentToolResultPersistencePolicy {
         rawObject: [String: Any]?
     ) -> String? {
         guard let rawObject,
-              stringValue(rawObject, keys: ["acp_status"]) != nil
+              AgentToolResultProcessingContext.stringValue(rawObject, keys: ["acp_status"]) != nil
         else { return nil }
 
         let isEdit = normalizedToolName == "edit"
@@ -1782,8 +1635,8 @@ enum AgentToolResultPersistencePolicy {
     ) -> [[String: Any]]? {
         guard let rawContent = rawObject["content"] as? [[String: Any]] else { return nil }
         let summaries: [[String: Any]] = rawContent.compactMap { entry in
-            let type = stringValue(entry, keys: ["type"])?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let path = stringValue(entry, keys: ["path"])?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let type = AgentToolResultProcessingContext.stringValue(entry, keys: ["type"])?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let path = AgentToolResultProcessingContext.stringValue(entry, keys: ["path"])?.trimmingCharacters(in: .whitespacesAndNewlines)
             guard type?.isEmpty == false || path?.isEmpty == false else { return nil }
             return isEdit
                 ? cursorACPEditContentSummary(entry: entry, type: type, path: path, diffLimit: diffLimit)
@@ -1801,16 +1654,16 @@ enum AgentToolResultPersistencePolicy {
         var summary: [String: Any] = [:]
         if let type, !type.isEmpty { summary["type"] = type }
         if let path, !path.isEmpty { summary["path"] = path }
-        if let oldTextTruncated = boolValue(entry, keys: ["oldText_truncated", "old_text_truncated", "oldTextTruncated"]) {
+        if let oldTextTruncated = AgentToolResultProcessingContext.boolValue(entry, keys: ["oldText_truncated", "old_text_truncated", "oldTextTruncated"]) {
             summary["oldText_truncated"] = oldTextTruncated
         }
-        if let newTextTruncated = boolValue(entry, keys: ["newText_truncated", "new_text_truncated", "newTextTruncated"]) {
+        if let newTextTruncated = AgentToolResultProcessingContext.boolValue(entry, keys: ["newText_truncated", "new_text_truncated", "newTextTruncated"]) {
             summary["newText_truncated"] = newTextTruncated
         }
-        if let diffTruncated = boolValue(entry, keys: ["diff_truncated", "diffTruncated"]) {
+        if let diffTruncated = AgentToolResultProcessingContext.boolValue(entry, keys: ["diff_truncated", "diffTruncated"]) {
             summary["diff_truncated"] = diffTruncated
         }
-        if let existingDiff = stringValue(entry, keys: ["unified_diff", "card_unified_diff"]),
+        if let existingDiff = AgentToolResultProcessingContext.stringValue(entry, keys: ["unified_diff", "card_unified_diff"]),
            let clipped = clippedCursorACPString(existingDiff, limit: diffLimit)
         {
             summary["unified_diff"] = clipped.value
@@ -1820,8 +1673,8 @@ enum AgentToolResultPersistencePolicy {
             return summary.isEmpty ? nil : summary
         }
         if let path, !path.isEmpty,
-           let oldText = stringValue(entry, keys: ["oldText", "old_text"]),
-           let newText = stringValue(entry, keys: ["newText", "new_text"])
+           let oldText = AgentToolResultProcessingContext.stringValue(entry, keys: ["oldText", "old_text"]),
+           let newText = AgentToolResultProcessingContext.stringValue(entry, keys: ["newText", "new_text"])
         {
             copyCursorACPStringMetrics(from: entry, key: "oldText", into: &summary)
             copyCursorACPStringMetrics(from: entry, key: "newText", into: &summary)
@@ -1897,11 +1750,11 @@ enum AgentToolResultPersistencePolicy {
         key: String,
         into summary: inout [String: Any]
     ) {
-        guard let raw = stringValue(object, keys: [key]),
+        guard let raw = AgentToolResultProcessingContext.stringValue(object, keys: [key]),
               !raw.isEmpty else { return }
         summary["\(key)_bytes"] = raw.utf8.count
         summary["\(key)_line_count"] = raw.isEmpty ? 0 : raw.split(separator: "\n", omittingEmptySubsequences: false).count
-        if boolValue(object, keys: ["\(key)_truncated", "\(key)Truncated"]) == true {
+        if AgentToolResultProcessingContext.boolValue(object, keys: ["\(key)_truncated", "\(key)Truncated"]) == true {
             summary["\(key)_truncated"] = true
         }
     }
@@ -1911,13 +1764,13 @@ enum AgentToolResultPersistencePolicy {
         key: String,
         into summary: inout [String: Any]
     ) {
-        if let bytes = intValue(object, keys: ["\(key)_bytes", "\(key)Bytes"]) {
+        if let bytes = AgentToolResultProcessingContext.intValue(object, keys: ["\(key)_bytes", "\(key)Bytes"]) {
             summary["\(key)_bytes"] = bytes
         }
-        if let lineCount = intValue(object, keys: ["\(key)_line_count", "\(key)LineCount"]) {
+        if let lineCount = AgentToolResultProcessingContext.intValue(object, keys: ["\(key)_line_count", "\(key)LineCount"]) {
             summary["\(key)_line_count"] = lineCount
         }
-        if boolValue(object, keys: ["\(key)_truncated", "\(key)Truncated"]) == true {
+        if AgentToolResultProcessingContext.boolValue(object, keys: ["\(key)_truncated", "\(key)Truncated"]) == true {
             summary["\(key)_truncated"] = true
         }
     }
@@ -1927,7 +1780,7 @@ enum AgentToolResultPersistencePolicy {
         key: String,
         into summary: inout [String: Any]
     ) {
-        guard let raw = stringValue(object, keys: [key]),
+        guard let raw = AgentToolResultProcessingContext.stringValue(object, keys: [key]),
               let clipped = clippedCursorACPString(raw) else { return }
         summary[key] = clipped.value
         if clipped.wasTruncated {
@@ -1970,7 +1823,7 @@ enum AgentToolResultPersistencePolicy {
             if let assistantText = smallStringValue(rawObject, keys: ["assistant_text"]) {
                 object["assistant_text"] = assistantText
             }
-            if let transcriptItemCount = intValue(rawObject, keys: ["transcript_item_count"]) {
+            if let transcriptItemCount = AgentToolResultProcessingContext.intValue(rawObject, keys: ["transcript_item_count"]) {
                 object["transcript_item_count"] = transcriptItemCount
             }
             if let workflowID = smallStringValue(rawObject, keys: ["workflow_id"]) {
@@ -1981,7 +1834,7 @@ enum AgentToolResultPersistencePolicy {
             }
             if let session = rawObject["session"] as? [String: Any] {
                 var sessionObject: [String: Any] = [:]
-                if let id = stringValue(session, keys: ["id"]), !id.isEmpty {
+                if let id = AgentToolResultProcessingContext.stringValue(session, keys: ["id"]), !id.isEmpty {
                     sessionObject["id"] = id
                 }
                 if let name = smallStringValue(session, keys: ["name"]) {
@@ -1991,23 +1844,14 @@ enum AgentToolResultPersistencePolicy {
                     object["session"] = sessionObject
                 }
             }
-            if let sessionID = stringValue(rawObject, keys: ["session_id"])
-                ?? stringValue(rawObject["session"] as? [String: Any], keys: ["id"]),
+            if let sessionID = AgentToolResultProcessingContext.stringValue(rawObject, keys: ["session_id"])
+                ?? AgentToolResultProcessingContext.stringValue(rawObject["session"] as? [String: Any], keys: ["id"]),
                 !sessionID.isEmpty
             {
                 object["session_id"] = sessionID
             }
             if let agent = rawObject["agent"] as? [String: Any] {
-                var agentObject: [String: Any] = [:]
-                if let id = stringValue(agent, keys: ["id"]), !id.isEmpty {
-                    agentObject["id"] = id
-                }
-                if let name = smallStringValue(agent, keys: ["name"]) {
-                    agentObject["name"] = name
-                }
-                if let model = smallStringValue(agent, keys: ["model"]) {
-                    agentObject["model"] = model
-                }
+                var agentObject = agentIdentitySummary(agent)
                 if let reasoningEffort = smallStringValue(agent, keys: ["reasoning_effort"]) {
                     agentObject["reasoning_effort"] = reasoningEffort
                 }
@@ -2017,7 +1861,7 @@ enum AgentToolResultPersistencePolicy {
             }
             if let interaction = rawObject["interaction"] as? [String: Any] {
                 var interactionObject: [String: Any] = [:]
-                if let id = stringValue(interaction, keys: ["id"]), !id.isEmpty {
+                if let id = AgentToolResultProcessingContext.stringValue(interaction, keys: ["id"]), !id.isEmpty {
                     interactionObject["id"] = id
                 }
                 if let kind = smallStringValue(interaction, keys: ["kind"]) {
@@ -2042,6 +1886,14 @@ enum AgentToolResultPersistencePolicy {
         return jsonString(from: object)
     }
 
+    private static func agentIdentitySummary(_ agent: [String: Any]) -> [String: Any] {
+        var object: [String: Any] = [:]
+        if let id = AgentToolResultProcessingContext.stringValue(agent, keys: ["id"]), !id.isEmpty { object["id"] = id }
+        if let name = smallStringValue(agent, keys: ["name"]) { object["name"] = name }
+        if let model = smallStringValue(agent, keys: ["model"]) { object["model"] = model }
+        return object
+    }
+
     private static func agentManageSummaryJSON(
         statusWord: String,
         rawObject: [String: Any]?
@@ -2056,26 +1908,17 @@ enum AgentToolResultPersistencePolicy {
             if let name = smallStringValue(rawObject, keys: ["name"]) {
                 object["name"] = name
             }
-            if let sessionID = stringValue(rawObject, keys: ["session_id"]), !sessionID.isEmpty {
+            if let sessionID = AgentToolResultProcessingContext.stringValue(rawObject, keys: ["session_id"]), !sessionID.isEmpty {
                 object["session_id"] = sessionID
             }
-            if let returnedTurnCount = intValue(rawObject, keys: ["returned_turn_count"]) {
+            if let returnedTurnCount = AgentToolResultProcessingContext.intValue(rawObject, keys: ["returned_turn_count"]) {
                 object["returned_turn_count"] = returnedTurnCount
             }
-            if let totalTurns = intValue(rawObject, keys: ["total_turns"]) {
+            if let totalTurns = AgentToolResultProcessingContext.intValue(rawObject, keys: ["total_turns"]) {
                 object["total_turns"] = totalTurns
             }
             if let agent = rawObject["agent"] as? [String: Any] {
-                var agentObject: [String: Any] = [:]
-                if let id = stringValue(agent, keys: ["id"]), !id.isEmpty {
-                    agentObject["id"] = id
-                }
-                if let name = smallStringValue(agent, keys: ["name"]) {
-                    agentObject["name"] = name
-                }
-                if let model = smallStringValue(agent, keys: ["model"]) {
-                    agentObject["model"] = model
-                }
+                let agentObject = agentIdentitySummary(agent)
                 if !agentObject.isEmpty {
                     object["agent"] = agentObject
                 }
@@ -2086,7 +1929,7 @@ enum AgentToolResultPersistencePolicy {
                 object["agents"] = agents.prefix(10).map { agent in
                     var summary: [String: Any] = [:]
                     if let name = smallStringValue(agent, keys: ["name", "id"]) { summary["name"] = name }
-                    if let available = boolValue(agent, keys: ["available"]) { summary["available"] = available }
+                    if let available = AgentToolResultProcessingContext.boolValue(agent, keys: ["available"]) { summary["available"] = available }
                     return summary
                 }
             }
@@ -2106,13 +1949,13 @@ enum AgentToolResultPersistencePolicy {
                     return summary
                 }
             }
-            if let deletedCount = intValue(rawObject, keys: ["deleted_count", "deletedCount"])
+            if let deletedCount = AgentToolResultProcessingContext.intValue(rawObject, keys: ["deleted_count", "deletedCount"])
                 ?? (rawObject["deleted_sessions"] as? [Any])?.count
                 ?? (rawObject["deletedSessions"] as? [Any])?.count
             {
                 object["deleted_count"] = deletedCount
             }
-            if let skippedCount = intValue(rawObject, keys: ["skipped_count", "skippedCount"])
+            if let skippedCount = AgentToolResultProcessingContext.intValue(rawObject, keys: ["skipped_count", "skippedCount"])
                 ?? (rawObject["skipped_sessions"] as? [Any])?.count
                 ?? (rawObject["skippedSessions"] as? [Any])?.count
             {
@@ -2142,8 +1985,8 @@ enum AgentToolResultPersistencePolicy {
         statusWord: String,
         rawObject: [String: Any]?
     ) -> String? {
-        let deletedCount = intValue(rawObject, keys: ["deleted_count", "deletedCount"])
-        let skippedCount = intValue(rawObject, keys: ["skipped_count", "skippedCount"])
+        let deletedCount = AgentToolResultProcessingContext.intValue(rawObject, keys: ["deleted_count", "deletedCount"])
+        let skippedCount = AgentToolResultProcessingContext.intValue(rawObject, keys: ["skipped_count", "skippedCount"])
         guard deletedCount != nil || skippedCount != nil else { return nil }
         var object = genericSummaryObject(
             normalizedToolName: "agent_manage",
@@ -2212,7 +2055,7 @@ enum AgentToolResultPersistencePolicy {
     static func oracleGroupDigest(from rawObject: [String: Any]?) -> [String: Any]? {
         guard let rawObject,
               let rawLanes = rawObject["oracle_results"] as? [[String: Any]],
-              let oracleCount = intValue(rawObject, keys: ["oracle_count"]),
+              let oracleCount = AgentToolResultProcessingContext.intValue(rawObject, keys: ["oracle_count"]),
               oracleCount == rawLanes.count,
               rawLanes.count > 1,
               rawLanes.count <= 8
@@ -2220,7 +2063,7 @@ enum AgentToolResultPersistencePolicy {
         var lanes: [[String: Any]] = []
         var seenIndices = Set<Int>()
         for rawLane in rawLanes {
-            guard let laneIndex = intValue(rawLane, keys: ["lane_index"]),
+            guard let laneIndex = AgentToolResultProcessingContext.intValue(rawLane, keys: ["lane_index"]),
                   (0 ..< oracleCount).contains(laneIndex),
                   seenIndices.insert(laneIndex).inserted,
                   let role = smallStringValue(rawLane, keys: ["role"]),
@@ -2245,7 +2088,7 @@ enum AgentToolResultPersistencePolicy {
             if let rawError = rawLane["error"] as? [String: Any],
                let code = smallStringValue(rawError, keys: ["code"])
             {
-                let message = trimmedStorageString(stringValue(rawError, keys: ["message"])) ?? code
+                let message = trimmedStorageString(AgentToolResultProcessingContext.stringValue(rawError, keys: ["message"])) ?? code
                 var boundedMessage = message.count <= 96 ? message : String(message.prefix(95)) + "…"
                 if OracleLaneError.indicatesTimeout(code: code, message: message),
                    !OracleLaneError.indicatesTimeout(code: code, message: boundedMessage)
@@ -2291,7 +2134,7 @@ enum AgentToolResultPersistencePolicy {
             if let value = smallStringValue(rawObject, keys: [key]) { object[key] = value }
         }
         for key in ["oracle_count", "count", "open_count", "answer_ready_count", "retention_limit"] {
-            if let value = intValue(rawObject, keys: [key]) { object[key] = value }
+            if let value = AgentToolResultProcessingContext.intValue(rawObject, keys: [key]) { object[key] = value }
         }
         if let truncated = rawObject["history_truncated"] as? Bool { object["history_truncated"] = truncated }
         if let lanes = rawObject["lanes"] as? [[String: Any]] ?? rawObject["oracle_results"] as? [[String: Any]], lanes.count <= 5 {
@@ -2324,29 +2167,29 @@ enum AgentToolResultPersistencePolicy {
         if let mode = smallStringValue(rawObject, keys: ["mode"]) {
             object["mode"] = mode
         }
-        let diffCount = intValue(rawObject, keys: ["diff_count", "diffCount"])
+        let diffCount = AgentToolResultProcessingContext.intValue(rawObject, keys: ["diff_count", "diffCount"])
             ?? (rawObject["diffs"] as? [Any])?.count
             ?? (rawObject["patches"] as? [Any])?.count
         if let diffCount {
             object["diff_count"] = diffCount
         }
-        if let response = stringValue(rawObject, keys: ["response"]),
+        if let response = AgentToolResultProcessingContext.stringValue(rawObject, keys: ["response"]),
            !response.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         {
             object["has_response"] = true
-        } else if let hasResponse = boolValue(rawObject, keys: ["has_response", "hasResponse"]) {
+        } else if let hasResponse = AgentToolResultProcessingContext.boolValue(rawObject, keys: ["has_response", "hasResponse"]) {
             object["has_response"] = hasResponse
         }
         let rawErrors = rawObject["errors"] as? [Any] ?? []
         if !rawErrors.isEmpty {
             object["error_count"] = rawErrors.count
-        } else if let errorCount = intValue(rawObject, keys: ["error_count", "errorCount"]) {
+        } else if let errorCount = AgentToolResultProcessingContext.intValue(rawObject, keys: ["error_count", "errorCount"]) {
             object["error_count"] = errorCount
         }
         if let summaryText = oracleChatSummaryText(from: object) {
             object["summary_text"] = summaryText
         }
-        if stringValue(rawObject, keys: ["status"]) == "partial_failure" {
+        if AgentToolResultProcessingContext.stringValue(rawObject, keys: ["status"]) == "partial_failure" {
             // Keep the canonical incomplete group outcome even if lane detail exceeds the budget.
             object["status"] = "partial_failure"
         }
@@ -2371,11 +2214,11 @@ enum AgentToolResultPersistencePolicy {
 
     private static func oracleChatSummaryText(from object: [String: Any]) -> String? {
         var parts: [String] = []
-        if let mode = stringValue(object, keys: ["mode"]), !mode.isEmpty {
+        if let mode = AgentToolResultProcessingContext.stringValue(object, keys: ["mode"]), !mode.isEmpty {
             parts.append(mode)
         }
-        let diffCount = intValue(object, keys: ["diff_count", "diffCount"])
-        if let chatID = stringValue(object, keys: ["chat_id", "chatID"]),
+        let diffCount = AgentToolResultProcessingContext.intValue(object, keys: ["diff_count", "diffCount"])
+        if let chatID = AgentToolResultProcessingContext.stringValue(object, keys: ["chat_id", "chatID"]),
            !chatID.isEmpty,
            parts.isEmpty || (diffCount ?? 0) == 0
         {
@@ -2385,7 +2228,7 @@ enum AgentToolResultPersistencePolicy {
             parts.append("\(diffCount) \(diffCount == 1 ? "diff" : "diffs")")
         }
         if parts.isEmpty,
-           let errorCount = intValue(object, keys: ["error_count", "errorCount"]),
+           let errorCount = AgentToolResultProcessingContext.intValue(object, keys: ["error_count", "errorCount"]),
            errorCount > 0
         {
             parts.append("\(errorCount) \(errorCount == 1 ? "error" : "errors")")
@@ -2437,7 +2280,7 @@ enum AgentToolResultPersistencePolicy {
     }
 
     private static func smallStringValue(_ object: [String: Any]?, keys: [String]) -> String? {
-        guard let value = stringValue(object, keys: keys)?
+        guard let value = AgentToolResultProcessingContext.stringValue(object, keys: keys)?
             .trimmingCharacters(in: .whitespacesAndNewlines),
             !value.isEmpty,
             value.count <= 240
@@ -2622,49 +2465,5 @@ enum AgentToolResultPersistencePolicy {
             return nil
         }
         return string
-    }
-
-    private static func stringValue(_ object: [String: Any]?, keys: [String]) -> String? {
-        guard let object else { return nil }
-        for key in keys {
-            if let value = object[key] as? String {
-                return value
-            }
-            if let value = object[key] as? NSNumber {
-                return value.stringValue
-            }
-        }
-        return nil
-    }
-
-    private static func boolValue(_ object: [String: Any]?, keys: [String]) -> Bool? {
-        guard let object else { return nil }
-        for key in keys {
-            if let value = object[key] as? Bool {
-                return value
-            }
-            if let value = object[key] as? NSNumber {
-                return value.boolValue
-            }
-        }
-        return nil
-    }
-
-    private static func intValue(_ object: [String: Any]?, keys: [String]) -> Int? {
-        guard let object else { return nil }
-        for key in keys {
-            if let value = object[key] as? Int {
-                return value
-            }
-            if let value = object[key] as? NSNumber {
-                return value.intValue
-            }
-            if let value = object[key] as? String,
-               let intValue = Int(value.trimmingCharacters(in: .whitespacesAndNewlines))
-            {
-                return intValue
-            }
-        }
-        return nil
     }
 }

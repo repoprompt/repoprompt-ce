@@ -345,7 +345,7 @@ final class AgentNotificationCoordinatorTests: XCTestCase {
         }
         writer.scope.removeDetachedNotificationSink()
         writer.scope.installDetachedNotificationSink(routeID: 7, coordinator: coordinator)
-        let hooks = vm.test_runPresentationHooks()
+        let hooks = vm.runtimeSessionStore.presentation.makeRunHooks()
         await vm.prepareForWindowClose()
         XCTAssertNil(writer.scope.presentation.detachedSink)
         XCTAssertNil(coordinator.liveState(tabID: session.tabID))

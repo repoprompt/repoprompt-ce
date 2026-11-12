@@ -19,135 +19,21 @@ struct AgentModeDetailWithSidebarView: View {
 
     @State private var isContextBuilderQuestionPresented = false
 
-    #if DEBUG
-        init(
-            agentModeVM: AgentModeViewModel,
-            runtimeVM: AgentRuntimeSidebarViewModel,
-            statusPillsUI: AgentStatusPillsUIStore,
-            contextBuilderAgentVM: ContextBuilderAgentViewModel,
-            oracleViewModel: OracleViewModel,
-            promptManager: PromptViewModel,
-            workspaceSearchService: WorkspaceSearchService,
-            selectionCoordinator: WorkspaceSelectionCoordinator,
-            stressHarness: AgentChatStressHarness?,
-            windowID: Int,
-            currentTabID: UUID?,
-            codexManagedLoginAction: CodexManagedLoginAction
-        ) {
-            self.agentModeVM = agentModeVM
-            self.runtimeVM = runtimeVM
-            _statusPillsUI = ObservedObject(wrappedValue: statusPillsUI)
-            self.contextBuilderAgentVM = contextBuilderAgentVM
-            self.oracleViewModel = oracleViewModel
-            self.promptManager = promptManager
-            self.workspaceSearchService = workspaceSearchService
-            self.selectionCoordinator = selectionCoordinator
-            self.stressHarness = stressHarness
-            self.windowID = windowID
-            self.currentTabID = currentTabID
-            self.codexManagedLoginAction = codexManagedLoginAction
-        }
-
-        init(
-            agentModeVM: AgentModeViewModel,
-            runtimeMetricsUI: AgentRuntimeMetricsUIStore,
-            statusPillsUI: AgentStatusPillsUIStore,
-            contextBuilderAgentVM: ContextBuilderAgentViewModel,
-            oracleViewModel: OracleViewModel,
-            promptManager: PromptViewModel,
-            workspaceSearchService: WorkspaceSearchService,
-            selectionCoordinator: WorkspaceSelectionCoordinator,
-            stressHarness: AgentChatStressHarness?,
-            windowID: Int,
-            currentTabID: UUID?,
-            codexManagedLoginAction: CodexManagedLoginAction
-        ) {
-            self.init(
-                agentModeVM: agentModeVM,
-                runtimeVM: runtimeMetricsUI.runtimeVM,
-                statusPillsUI: statusPillsUI,
-                contextBuilderAgentVM: contextBuilderAgentVM,
-                oracleViewModel: oracleViewModel,
-                promptManager: promptManager,
-                workspaceSearchService: workspaceSearchService,
-                selectionCoordinator: selectionCoordinator,
-                stressHarness: stressHarness,
-                windowID: windowID,
-                currentTabID: currentTabID,
-                codexManagedLoginAction: codexManagedLoginAction
-            )
-        }
-    #else
-        init(
-            agentModeVM: AgentModeViewModel,
-            runtimeVM: AgentRuntimeSidebarViewModel,
-            statusPillsUI: AgentStatusPillsUIStore,
-            contextBuilderAgentVM: ContextBuilderAgentViewModel,
-            oracleViewModel: OracleViewModel,
-            promptManager: PromptViewModel,
-            workspaceSearchService: WorkspaceSearchService,
-            selectionCoordinator: WorkspaceSelectionCoordinator,
-            windowID: Int,
-            currentTabID: UUID?,
-            codexManagedLoginAction: CodexManagedLoginAction
-        ) {
-            self.agentModeVM = agentModeVM
-            self.runtimeVM = runtimeVM
-            _statusPillsUI = ObservedObject(wrappedValue: statusPillsUI)
-            self.contextBuilderAgentVM = contextBuilderAgentVM
-            self.oracleViewModel = oracleViewModel
-            self.promptManager = promptManager
-            self.workspaceSearchService = workspaceSearchService
-            self.selectionCoordinator = selectionCoordinator
-            self.windowID = windowID
-            self.currentTabID = currentTabID
-            self.codexManagedLoginAction = codexManagedLoginAction
-        }
-
-        init(
-            agentModeVM: AgentModeViewModel,
-            runtimeMetricsUI: AgentRuntimeMetricsUIStore,
-            statusPillsUI: AgentStatusPillsUIStore,
-            contextBuilderAgentVM: ContextBuilderAgentViewModel,
-            oracleViewModel: OracleViewModel,
-            promptManager: PromptViewModel,
-            workspaceSearchService: WorkspaceSearchService,
-            selectionCoordinator: WorkspaceSelectionCoordinator,
-            windowID: Int,
-            currentTabID: UUID?,
-            codexManagedLoginAction: CodexManagedLoginAction
-        ) {
-            self.init(
-                agentModeVM: agentModeVM,
-                runtimeVM: runtimeMetricsUI.runtimeVM,
-                statusPillsUI: statusPillsUI,
-                contextBuilderAgentVM: contextBuilderAgentVM,
-                oracleViewModel: oracleViewModel,
-                promptManager: promptManager,
-                workspaceSearchService: workspaceSearchService,
-                selectionCoordinator: selectionCoordinator,
-                windowID: windowID,
-                currentTabID: currentTabID,
-                codexManagedLoginAction: codexManagedLoginAction
-            )
-        }
-    #endif
-
     var body: some View {
-        #if DEBUG
-            AgentContextInspectorPresenter(
-                drawerStore: agentModeVM.ui.contextDrawer,
-                promptManager: promptManager,
-                runtimeVM: runtimeVM,
-                contextBuilderAgentVM: contextBuilderAgentVM,
-                oracleViewModel: oracleViewModel,
-                selectionCoordinator: selectionCoordinator,
-                workspaceSearchService: workspaceSearchService,
-                activeAgentSessionID: statusPillsUI.snapshot.activeAgentSessionID,
-                agentModeVM: agentModeVM,
-                windowID: windowID,
-                currentTabID: currentTabID
-            ) {
+        AgentContextInspectorPresenter(
+            drawerStore: agentModeVM.ui.contextDrawer,
+            promptManager: promptManager,
+            runtimeVM: runtimeVM,
+            contextBuilderAgentVM: contextBuilderAgentVM,
+            oracleViewModel: oracleViewModel,
+            selectionCoordinator: selectionCoordinator,
+            workspaceSearchService: workspaceSearchService,
+            activeAgentSessionID: statusPillsUI.snapshot.activeAgentSessionID,
+            agentModeVM: agentModeVM,
+            windowID: windowID,
+            currentTabID: currentTabID
+        ) {
+            #if DEBUG
                 AgentModeChatDetailView(
                     agentModeVM: agentModeVM,
                     transcriptUI: agentModeVM.ui.transcript,
@@ -174,49 +60,7 @@ struct AgentModeDetailWithSidebarView: View {
                             .padding(.trailing, 14)
                     }
                 }
-            }
-            .onAppear {
-                syncContextBuilderQuestionPresentation()
-                agentModeVM.syncComposerUIState(tabID: currentTabID)
-                agentModeVM.syncTranscriptUIState()
-                agentModeVM.syncRunInteractionUIState()
-                agentModeVM.syncStatusPillsUIState()
-                syncRuntimeMetricsSelectionCount()
-                stressHarness?.bootstrapIfNeeded(currentTabID: currentTabID)
-            }
-            .onReceive(contextBuilderAgentVM.$pendingAskUser) { _ in
-                syncContextBuilderQuestionPresentation()
-            }
-            .onReceive(promptManager.fileManager.$selectionStateRevision.removeDuplicates()) { _ in
-                syncRuntimeMetricsSelectionCountFromActiveUIIfCurrent()
-            }
-            .onReceive(selectionCoordinator.changes) { change in
-                syncRuntimeMetricsSelectionCount(from: change)
-            }
-            .onChange(of: currentTabID) { _, tabID in
-                syncContextBuilderQuestionPresentation()
-                agentModeVM.syncComposerUIState(tabID: tabID)
-                agentModeVM.syncTranscriptUIState()
-                agentModeVM.syncRunInteractionUIState()
-                agentModeVM.syncStatusPillsUIState()
-                syncRuntimeMetricsSelectionCount()
-                stressHarness?.bootstrapIfNeeded(currentTabID: tabID)
-            }
-            .onDisappear { stressHarness?.pause() }
-        #else
-            AgentContextInspectorPresenter(
-                drawerStore: agentModeVM.ui.contextDrawer,
-                promptManager: promptManager,
-                runtimeVM: runtimeVM,
-                contextBuilderAgentVM: contextBuilderAgentVM,
-                oracleViewModel: oracleViewModel,
-                selectionCoordinator: selectionCoordinator,
-                workspaceSearchService: workspaceSearchService,
-                activeAgentSessionID: statusPillsUI.snapshot.activeAgentSessionID,
-                agentModeVM: agentModeVM,
-                windowID: windowID,
-                currentTabID: currentTabID
-            ) {
+            #else
                 AgentModeChatDetailView(
                     agentModeVM: agentModeVM,
                     transcriptUI: agentModeVM.ui.transcript,
@@ -235,32 +79,35 @@ struct AgentModeDetailWithSidebarView: View {
                     codexManagedLoginAction: codexManagedLoginAction
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-            .onAppear {
-                syncContextBuilderQuestionPresentation()
-                agentModeVM.syncComposerUIState(tabID: currentTabID)
-                agentModeVM.syncTranscriptUIState()
-                agentModeVM.syncRunInteractionUIState()
-                agentModeVM.syncStatusPillsUIState()
-                syncRuntimeMetricsSelectionCount()
-            }
-            .onReceive(contextBuilderAgentVM.$pendingAskUser) { _ in
-                syncContextBuilderQuestionPresentation()
-            }
-            .onReceive(promptManager.fileManager.$selectionStateRevision.removeDuplicates()) { _ in
-                syncRuntimeMetricsSelectionCountFromActiveUIIfCurrent()
-            }
-            .onReceive(selectionCoordinator.changes) { change in
-                syncRuntimeMetricsSelectionCount(from: change)
-            }
-            .onChange(of: currentTabID) { _, tabID in
-                syncContextBuilderQuestionPresentation()
-                agentModeVM.syncComposerUIState(tabID: tabID)
-                agentModeVM.syncTranscriptUIState()
-                agentModeVM.syncRunInteractionUIState()
-                agentModeVM.syncStatusPillsUIState()
-                syncRuntimeMetricsSelectionCount()
-            }
+            #endif
+        }
+        .onAppear { synchronizePresentedTab(currentTabID) }
+        .onReceive(contextBuilderAgentVM.$pendingAskUser) { _ in
+            syncContextBuilderQuestionPresentation()
+        }
+        .onReceive(promptManager.fileManager.$selectionStateRevision.removeDuplicates()) { _ in
+            syncRuntimeMetricsSelectionCountFromActiveUIIfCurrent()
+        }
+        .onReceive(selectionCoordinator.changes) { change in
+            syncRuntimeMetricsSelectionCount(from: change)
+        }
+        .onChange(of: currentTabID) { _, tabID in
+            synchronizePresentedTab(tabID)
+        }
+        #if DEBUG
+        .onDisappear { stressHarness?.pause() }
+        #endif
+    }
+
+    private func synchronizePresentedTab(_ tabID: UUID?) {
+        syncContextBuilderQuestionPresentation()
+        agentModeVM.syncComposerUIState(tabID: tabID)
+        agentModeVM.syncTranscriptUIState()
+        agentModeVM.syncRunInteractionUIState()
+        agentModeVM.ui.statusPills.update(agentModeVM.makeStatusPillsSnapshot())
+        syncRuntimeMetricsSelectionCount()
+        #if DEBUG
+            stressHarness?.bootstrapIfNeeded(currentTabID: tabID)
         #endif
     }
 

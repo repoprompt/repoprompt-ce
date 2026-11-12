@@ -512,25 +512,13 @@ final class AgentWorkspaceRootsSidebarStore: ObservableObject {
         }
     }
 
-    func moveRootUp(rowID: UUID) {
+    func moveRoot(rowID: UUID, direction: WorkspaceRootMoveDirection) {
         guard let projection = currentProjection(for: rowID) else { return }
         let visibleRootOrder = rootProjections().map(\.fullPath)
         Task { [workspaceManager] in
             await workspaceManager.moveActiveWorkspaceRoot(
                 path: projection.fullPath,
-                direction: .up,
-                visibleRootOrder: visibleRootOrder
-            )
-        }
-    }
-
-    func moveRootDown(rowID: UUID) {
-        guard let projection = currentProjection(for: rowID) else { return }
-        let visibleRootOrder = rootProjections().map(\.fullPath)
-        Task { [workspaceManager] in
-            await workspaceManager.moveActiveWorkspaceRoot(
-                path: projection.fullPath,
-                direction: .down,
+                direction: direction,
                 visibleRootOrder: visibleRootOrder
             )
         }

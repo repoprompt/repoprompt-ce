@@ -151,7 +151,7 @@ extension AgentSessionLinkExecutionRuntime {
     }
 
     private func agentSessionLinkModelReadiness(_ session: TabSession) -> AgentSessionLinkSendFailure? {
-        AgentSessionLinkDeliveryReadiness.failure(snapshot: AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
+        AgentSessionLinkDeliveryReadiness.failure(snapshot: AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
             session: session, endpointMatchesGrant: true, isClosing: false
         ))
     }

@@ -9,7 +9,7 @@ extension AgentModeViewModel {
         guard ownerValidatedSessionListCacheReady,
               let promptManager,
               let workspaceID = workspaceManager?.activeWorkspace?.id,
-              sidebarAutoArchiveOwner(workspaceID: workspaceID) != nil
+              sessionIndexStore.sidebarAutoArchiveOwner(workspaceID: workspaceID) != nil
         else {
             return .empty(evaluatedSessionCount: 0)
         }
@@ -36,7 +36,7 @@ extension AgentModeViewModel {
         let currentIndex = ownerValidatedSessionIndex
         for row in sidebarRows {
             let persistedEntry = row.sessionID.flatMap { currentIndex[$0] }
-                ?? preferredSidebarEntry(for: row.tabID, tabName: row.title)
+                ?? AgentModeSidebarSessionBuilder.preferredSidebarEntry(for: row.tabID, tabName: row.title, entries: sessionIndexStore.ownerValidatedEntries(forTabID: row.tabID))
             if isComposeTabProtectedFromSidebarArchiveSuggestion(row.tabID)
                 || row.isMCPControlled
                 || persistedEntry?.isMCPOriginated == true

@@ -115,7 +115,7 @@ extension AgentModeViewModel {
         guard didRestore else { return }
         currentSession.acpModelParameterSelections = ACPModelParameterSelection.normalized(restoredSelections)
         currentSession.isDirty = true
-        scheduleSave(for: currentSession)
+        persistenceRuntime.scheduleSave(for: currentSession)
         if currentSession.tabID == currentTabID {
             syncComposerUIState()
             syncRunInteractionUIState()
@@ -198,7 +198,7 @@ extension AgentModeViewModel {
         session.acpModelParameterSelections = updatedSelections
         session.isDirty = true
         if schedulePersistence {
-            scheduleSave(for: tabID)
+            persistenceRuntime.scheduleSave(for: tabID)
         }
         if tabID == currentTabID {
             syncComposerUIState()

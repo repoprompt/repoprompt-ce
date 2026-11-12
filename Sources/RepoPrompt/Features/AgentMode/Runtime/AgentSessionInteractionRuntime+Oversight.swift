@@ -32,10 +32,7 @@ extension AgentSessionInteractionRuntime {
         authorize: @escaping @MainActor @Sendable () async -> Bool
     ) async -> AgentSessionLinkInteractionResponseOutcome {
         guard let owner = scope, owns(session), endpointIsCurrent(),
-              let sessionID = session.activeAgentSessionID,
-              case let .unique(writer) = owner.resolveWriter(sessionID: sessionID),
-              writer.scope === owner, writer.session === session,
-              case let .success(command) = writer.admitCommand() else { return .unavailable }
+              let command = try? owner.admit(session: session) else { return .unavailable }
         defer { withExtendedLifetime(owner) {} }
         let binding = session.persistentSessionBindingIdentity
         let transition = session.bindingTransitionGeneration

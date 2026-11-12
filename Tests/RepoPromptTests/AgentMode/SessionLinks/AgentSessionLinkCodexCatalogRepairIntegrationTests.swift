@@ -2001,7 +2001,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             _ = target.beginRunAttempt(source: "W3 ordinary reservation cause")
             target.runState = .running
             target.appendItem(.assistant("ordinary reservation cause", sequenceIndex: target.nextSequenceIndex))
-            await vm.test_finishQuietFeasibilityRun(target)
+            await vm.runService.test_publishNaturalCompletion(target)
             XCTAssertEqual(target.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 1))
             let bridge = AgentSessionLinkRuntimeBridge.shared
             await bridge.test_settleTargetPublications()
@@ -2012,9 +2012,9 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             XCTAssertNotNil(reserved.wakeFingerprint)
             let wake = reserved.wakeID
             session.isPreparingInitialWorktree = false
-            let claim = try XCTUnwrap(vm.agentSessionLinkPromptClaim(for: session, dispatchID: .autoWake(wakeID: wake)))
+            let claim = try XCTUnwrap(vm.linkExecutionRuntime.agentSessionLinkPromptClaim(for: session, dispatchID: .autoWake(wakeID: wake)))
             XCTAssertTrue(claim.routineQuietCheckIn)
-            XCTAssertNotNil(vm.agentSessionLinkPrepareAutoWakeDispatch(wakeID: wake, endpoint: endpoint))
+            XCTAssertNotNil(vm.linkExecutionRuntime.agentSessionLinkPrepareAutoWakeDispatch(wakeID: wake, endpoint: endpoint))
             var rebuilds = 0
             AgentTranscriptDebugInstrumentation.configure(.init(rebuildHandler: { _ in rebuilds += 1 }))
             defer { AgentTranscriptDebugInstrumentation.reset() }
@@ -2089,7 +2089,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(sessionID: UUID(), on: session, updateWorkspaceMetadata: true))
                 let revision = session.sourceItemsRevision
                 let rows = session.items
-                vm.agentSessionLinkRecordAcceptedAutoWake(claim)
+                let acceptedAt = Date()
+                vm.linkExecutionRuntime.agentSessionLinkRecordAcceptedAutoWake(claim, acceptedAt: acceptedAt)
                 XCTAssertEqual(session.items, rows, "An old binding's captured acceptance cannot append a marker")
                 XCTAssertEqual(session.sourceItemsRevision, revision)
                 print("W3_LATE_MARKER own=certified foreign=ordinary retired=true staleBinding=rejected")
@@ -2469,7 +2470,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                         print("W4_REPEAT_DISPLAY tools=\(Set(session.items.filter { $0.toolName == "read_file" }.compactMap(\.toolInvocationID)).count) publications=\(repeatPublications) spans=\(session.transcript.turns.last?.responseSpans.count ?? 0)")
                     }
                     XCTAssertEqual(Array(session.items.prefix(w4CanonicalBefore.count)), w4CanonicalBefore, "Local staging cannot rewrite ordinary source")
-                    let expected = AgentModeViewModel.buildTranscriptPresentation(
+                    let expected = AgentSessionTranscriptBuilder.buildTranscriptPresentation(
                         from: session.transcript, sourceItems: session.items, selectedAgent: session.selectedAgent,
                         previousPerformanceSnapshot: .empty
                     )
@@ -2522,10 +2523,10 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             let route = try XCTUnwrap(observedRoute)
             let observedProjection = await manager.debugRunCatalogProjection(for: run)
             let projection = try XCTUnwrap(observedProjection)
-            let positive = await manager.hasCurrentReturnedTool(AgentModeViewModel.selfNoopCatalogDefinition, routeToken: route, projectionRevision: projection.projectionRevision)
+            let positive = await manager.hasCurrentReturnedTool(AgentSessionLinkExecutionRuntime.selfNoopCatalogDefinition, routeToken: route, projectionRevision: projection.projectionRevision)
             guard positive, projection.routeToken == route,
                   vm.agentSessionLinkRunCatalogProjectionByEndpoint[route.observerEndpoint] == projection,
-                  vm.selfNoopHintIsCurrent(for: session)
+                  vm.linkExecutionRuntime.selfNoopHintIsCurrent(for: session)
             else { XCTFail("Steady catalog proof failed without retry: \(label) revision=\(projection.projectionRevision)")
                 throw CancellationError()
             }
@@ -2558,7 +2559,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 XCTAssertEqual(overlapped.routeToken, newer.routeToken)
                 XCTAssertTrue(overlapped.isReady, "Family/route readiness is not exact positive definition evidence")
                 XCTAssertNil(overlapped.returnedCatalog, "The real overlap fence must withhold positive evidence")
-                XCTAssertFalse(vm.selfNoopHintIsCurrent(for: session))
+                XCTAssertFalse(vm.linkExecutionRuntime.selfNoopHintIsCurrent(for: session))
                 print("W3_COLD_OVERLAP before=\(before.projectionRevision) newer=\(newer.projectionRevision) completion=\(overlapped.projectionRevision) exactEvidence=unknown expected=ordinary")
             } catch {
                 await manager.debugSetAfterExpectedCatalogSurfaceForTesting(nil)
@@ -2599,7 +2600,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             _ = target.beginRunAttempt(source: "cold catalog ordinary cause")
             target.runState = .running
             target.appendItem(.assistant("ordinary cause", sequenceIndex: target.nextSequenceIndex))
-            await vm.test_finishQuietFeasibilityRun(target)
+            await vm.runService.test_publishNaturalCompletion(target)
             await bridge.test_settleTargetPublications()
             try await bridge.test_refreshStatus(sessionIDs: [XCTUnwrap(session.activeAgentSessionID)])
             let reserved = try XCTUnwrap(session.oversight.pendingAutoWake)
@@ -2775,7 +2776,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 if label == "initial-restoration" {
                     let observed = try await ServerNetworkManager.shared.debugRunCatalogProjection(for: XCTUnwrap(session.runID))
                     let prior = try XCTUnwrap(observed)
-                    let oldSupport = try await ServerNetworkManager.shared.hasCurrentReturnedTool(AgentModeViewModel.selfNoopCatalogDefinition, routeToken: XCTUnwrap(prior.routeToken), projectionRevision: prior.projectionRevision)
+                    let oldSupport = try await ServerNetworkManager.shared.hasCurrentReturnedTool(AgentSessionLinkExecutionRuntime.selfNoopCatalogDefinition, routeToken: XCTUnwrap(prior.routeToken), projectionRevision: prior.projectionRevision)
                     XCTAssertFalse(oldSupport, "An offer predating restored chats and new links must be invalidated")
                 }
                 // Material setup changes invalidate the earlier offer. Obtain one real list after
@@ -2948,7 +2949,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     _ = target.beginRunAttempt(source: "W3 scale ordinary cause")
                     target.runState = .running
                     target.appendItem(.assistant("ordinary source close", sequenceIndex: target.nextSequenceIndex))
-                    await vm.test_finishQuietFeasibilityRun(target)
+                    await vm.runService.test_publishNaturalCompletion(target)
                     await drain()
                     let reserved = try XCTUnwrap(session.oversight.pendingAutoWake)
                     XCTAssertNotNil(reserved.wakeFingerprint)
@@ -3250,9 +3251,9 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     guard let reserved = session.oversight.pendingAutoWake else { break }
                     reserved.task?.cancel()
                     session.isPreparingInitialWorktree = false
-                    let claim = try XCTUnwrap(vm.agentSessionLinkPromptClaim(for: session, dispatchID: .autoWake(wakeID: reserved.wakeID)))
+                    let claim = try XCTUnwrap(vm.linkExecutionRuntime.agentSessionLinkPromptClaim(for: session, dispatchID: .autoWake(wakeID: reserved.wakeID)))
                     XCTAssertTrue(claim.routineQuietCheckIn, "Actual initially idle claim without attention")
-                    XCTAssertNotNil(vm.agentSessionLinkPrepareAutoWakeDispatch(wakeID: reserved.wakeID, endpoint: reserved.observerEndpoint))
+                    XCTAssertNotNil(vm.linkExecutionRuntime.agentSessionLinkPrepareAutoWakeDispatch(wakeID: reserved.wakeID, endpoint: reserved.observerEndpoint))
                     let snapshot = try XCTUnwrap(vm.agentSessionLinkPassiveNoticesBySessionID[XCTUnwrap(session.activeAgentSessionID)])
                     let edge = try XCTUnwrap(reserved.wakeFingerprint?.edges.first)
                     let entry = try XCTUnwrap(snapshot.entries.first { $0.reference == edge.reference && $0.edgeSequence == edge.edgeSequence && $0.ordinaryThrough == edge.ordinaryThrough })
@@ -3283,7 +3284,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                             mcpStrictMode: runtime.mcpStrictMode
                         ), for: session)
                         session.runState = .running
-                        XCTAssertTrue(vm.agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: claim.dispatchID))
+                        XCTAssertTrue(vm.linkExecutionRuntime.agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: claim.dispatchID))
                         let intent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: owner, runID: XCTUnwrap(session.runID))
                         let outcome = await vm.test_claudeCoordinator.test_sendClaudeNativeMessage(session: session, text: "", attachments: [], intent: intent, allowsCatalogRouteControllerRecovery: false)
                         guard outcome == .sent else {
@@ -3420,7 +3421,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             let inventory = try XCTUnwrap(vm.agentSessionLinkPromptInventoryBySessionID[endpoint.sessionID])
             let wake = UUID()
             let snapshot = AgentSessionLinkPassiveStatusNotices.Snapshot(observerEndpoint: endpoint, queueEpoch: UUID(), queueRevision: 1, linkSetRevision: inventory.inventory.linkSetRevision, isEnabled: true, isDeliverable: true, entries: [], unacknowledgedOverflowCount: 1, overflowProduced: 1)
-            vm.agentSessionLinkPublishPassiveStatusNotices(snapshot, to: endpoint)
+            vm.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(snapshot, to: endpoint)
             session.oversight.pendingAutoWake = .init(wakeID: wake, observerEndpoint: endpoint, queueEpoch: snapshot.queueEpoch, queueRevision: 1, wakeFingerprint: nil, admissionBasis: .routineStatusOrOverflow, attemptedFingerprint: nil, physicalOutcome: .notAttempted, phase: .preparingDispatch, task: nil)
             if localRead {
                 vm.test_agentSessionLinkLocalInputDecoration = { baseline in
@@ -3433,7 +3434,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 session.oversight.pendingAutoWake?.routineQuietCandidate = true
                 vm.agentSessionLinkRunCatalogProjectionByEndpoint[endpoint] = nil
             }
-            let claim = try XCTUnwrap(vm.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatch).claim)
+            let claim = try XCTUnwrap(vm.linkExecutionRuntime.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatch).claim)
             vm.agentSessionLinkRunCatalogProjectionByEndpoint[endpoint] = projection
             XCTAssertEqual(claim.routineQuietCheckIn, !ordinaryCandidate)
             XCTAssertEqual(claim.fragment.contains("Nothing needed? Call self_noop."), !ordinaryCandidate)
@@ -3451,25 +3452,25 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             let vm = window.agentModeViewModel
             let (owner, dispatch, original) = try w2RoutineClaim(window: window, session: session, endpoint: endpoint, localRead: false)
             defer { session.oversight.pendingAutoWake = nil }
-            let proof = await vm.agentSessionLinkProveProviderInput(for: session, claim: original)
+            let proof = await vm.linkExecutionRuntime.agentSessionLinkProveProviderInput(for: session, claim: original)
             XCTAssertFalse(session.quietLedger.hasOrdinaryOccurrence(owner: owner))
             let previous = try XCTUnwrap(vm.agentSessionLinkPassiveNoticesBySessionID[endpoint.sessionID])
             let inventory = try XCTUnwrap(vm.agentSessionLinkPromptInventoryBySessionID[endpoint.sessionID])
             let item = try XCTUnwrap(inventory.inventory.items.first)
             let reference = try XCTUnwrap(item.reference)
-            let targetEndpoint = try XCTUnwrap(vm.agentSessionLinkObserverEndpoint(tabID: target.tabID))
+            let targetEndpoint = try XCTUnwrap(vm.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: target.tabID))
             let attention = AgentSessionLinkPassiveStatusNotices.PendingAttentionRequest(
                 occurrence: .init(queueEpoch: previous.queueEpoch, reference: reference, attentionSequence: 1),
                 targetEndpoint: targetEndpoint, targetSessionID: targetEndpoint.sessionID,
                 requestedAt: .distantPast, status: .idle
             )
-            vm.agentSessionLinkPublishPassiveStatusNotices(.init(
+            vm.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(.init(
                 observerEndpoint: endpoint, queueEpoch: previous.queueEpoch, queueRevision: previous.queueRevision + 1,
                 linkSetRevision: previous.linkSetRevision, isEnabled: true, isDeliverable: true,
                 entries: previous.entries, attentionRequests: [attention],
                 unacknowledgedOverflowCount: previous.unacknowledgedOverflowCount, overflowProduced: previous.overflowProduced
             ), to: endpoint)
-            let released = vm.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatch, claim: original, proof: proof)
+            let released = vm.linkExecutionRuntime.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatch, claim: original, proof: proof)
             XCTAssertFalse(released.mustAbortDispatch)
             XCTAssertFalse(try XCTUnwrap(released.claim).routineQuietCheckIn)
             XCTAssertEqual(released.claim?.passive?.receipt.deliveredAttentionOccurrences, [attention.occurrence])
@@ -3493,7 +3494,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             vm.test_agentSessionLinkLocalInputReadProof = { _ in await gate.enterAndWait()
                 return false
             }
-            let proofTask = Task { await vm.agentSessionLinkProveProviderInput(for: session, claim: original) }
+            let proofTask = Task { await vm.linkExecutionRuntime.agentSessionLinkProveProviderInput(for: session, claim: original) }
             var catalogTask: Task<Set<String>, Error>?
             func cleanup() async {
                 gate.release()
@@ -3520,26 +3521,26 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 if ordinaryCandidate {
                     XCTAssertTrue(session.oversight.pendingAutoWake?.routineQuietCandidate == true)
                     XCTAssertEqual(session.oversight.pendingAutoWake?.phase, .preparingDispatch)
-                    XCTAssertTrue(vm.selfNoopHintIsCurrent(for: session))
+                    XCTAssertTrue(vm.linkExecutionRuntime.selfNoopHintIsCurrent(for: session))
                 }
                 if replaced {
                     if !ordinaryCandidate {
                         let previous = try XCTUnwrap(vm.agentSessionLinkPassiveNoticesBySessionID[endpoint.sessionID])
-                        vm.agentSessionLinkPublishPassiveStatusNotices(.init(
+                        vm.linkExecutionRuntime.agentSessionLinkPublishPassiveStatusNotices(.init(
                             observerEndpoint: endpoint, queueEpoch: previous.queueEpoch, queueRevision: previous.queueRevision + 1,
                             linkSetRevision: previous.linkSetRevision, isEnabled: true, isDeliverable: true,
                             entries: previous.entries, attentionRequests: previous.attentionRequests,
                             unacknowledgedOverflowCount: previous.unacknowledgedOverflowCount, overflowProduced: previous.overflowProduced
                         ), to: endpoint)
                     }
-                    let successor = try XCTUnwrap(vm.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatch).claim)
+                    let successor = try XCTUnwrap(vm.linkExecutionRuntime.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatch).claim)
                     XCTAssertTrue(successor.routineQuietCheckIn, "The mirror still advertises the withdrawn declaration")
                     XCTAssertNotEqual(successor, original)
                     XCTAssertFalse(vm.agentSessionLinkPromptClaimStore.isPending(original))
                 }
                 gate.release()
                 let proof = await proofTask.value
-                let released = vm.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatch, claim: original, proof: proof)
+                let released = vm.linkExecutionRuntime.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatch, claim: original, proof: proof)
                 XCTAssertFalse(released.mustAbortDispatch, "Missing optional noop support never blocks ordinary delivery")
                 let capturing = AgentSessionLinkCapturingHeadlessProvider()
                 _ = try await capturing.streamAgentMessage(released.message(AgentMessage(systemPrompt: "fixture", userMessage: "routine")), runID: runID)
@@ -3619,11 +3620,11 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                         AgentTranscriptDebugInstrumentation.configure(.init(rebuildHandler: { _ in rebuilds += 1 }, projectionBuildHandler: { _ in projectionBuilds += 1 }))
                     }
                     let start = clock.now
-                    let outcome = vm.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatch)
+                    let outcome = vm.linkExecutionRuntime.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatch)
                     let claimedAt = clock.now
-                    let proof = await vm.agentSessionLinkProveProviderInput(for: session, claim: outcome.claim)
+                    let proof = await vm.linkExecutionRuntime.agentSessionLinkProveProviderInput(for: session, claim: outcome.claim)
                     let provedAt = clock.now
-                    let released = vm.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatch, claim: outcome.claim, proof: proof)
+                    let released = vm.linkExecutionRuntime.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatch, claim: outcome.claim, proof: proof)
                     let finished = clock.now
                     XCTAssertFalse(released.mustAbortDispatch)
                     XCTAssertEqual(released.claim, original)
@@ -3661,7 +3662,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     "budget_total_max_ms": 1000
                 ]
                 try print("W2_CATALOG_COST " + (JSONSerialization.data(withJSONObject: record, options: [.sortedKeys])).base64EncodedString())
-                vm.abandonAgentSessionLinkPromptClaim(original)
+                vm.linkExecutionRuntime.abandonAgentSessionLinkPromptClaim(original)
                 _ = session.endRunAttempt(ifCurrent: owner, source: "W2.cost-fixture-end")
             }
             XCTAssertEqual(session.codexSessionLinkCatalogRepairCycle, repairBefore)
@@ -3713,7 +3714,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                       ToolAvailabilityStore.shared.isEnabled(Self.w0fTool().name),
                       sample.hasActiveOutboundLink == true, observer.runID == runID,
                       observer.isCurrentRunAttemptForCurrentBinding(capturedOwner),
-                      window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+                      window.agentModeViewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
                       window.agentModeViewModel.agentSessionLinkRunCatalogProjectionByEndpoint[endpoint]?.projectionRevision == sample.projectionRevision,
                       manager.hasLiveProviderInputConnection(token)
                 else { return nil }
@@ -3755,7 +3756,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 XCTAssertEqual(current.expectedSurface, positive.expectedSurface, label)
                 XCTAssertEqual(current.returnedSurface, positive.returnedSurface, label)
                 XCTAssertTrue(current.isReady, "Quiet support cannot gate ordinary delivery: \(label)")
-                let delivery = await window.agentModeViewModel.qualifyProviderInputRoute(for: observer)
+                let delivery = await window.agentModeViewModel.linkExecutionRuntime.qualifyProviderInputRoute(for: observer)
                 XCTAssertEqual(delivery, .ready(route), "Ordinary route qualification never waits on quiet support")
                 let absentHint = await hint(current, owner: successor)
                 let staleHint = await hint(positive, owner: successor)

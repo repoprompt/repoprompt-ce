@@ -179,7 +179,7 @@ final class LiveAgentNotificationActionDispatcher: AgentNotificationActionDispat
         }
         let window = candidates.first { $0.windowID == route.windowID } ?? candidates.first
         guard let window else { return .windowUnavailable }
-        return window.agentModeViewModel.resolveNotificationAction(request, preferences: preferences)
+        return AgentNotificationActionResolver.resolve(request, target: window.agentModeViewModel, preferences: preferences)
     }
 }
 

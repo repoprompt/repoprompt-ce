@@ -906,33 +906,15 @@ final class AgentModelsSettingsViewModel: ObservableObject {
                 cursorSelections: profileSnapshot.mcpAgentRoleModelParameters?[resolution.role.rawValue] ?? [],
                 onSelectCursorParameter: { [weak self] option, parameter in
                     guard let self else { return }
-                    reloadScopedState()
-                    guard editingScope == expectedScope,
-                          roleDefaultsResolutions.first(where: { $0.role == resolution.role })?.effective == resolution.effective else { return }
-                    let existing = profileSnapshot.mcpAgentRoleModelParameters?[resolution.role.rawValue] ?? []
-                    settingsManager.setAgentModelsRoleModelParameter(
-                        ACPModelParameterSelection.normalized(existing + [parameter]),
-                        roleRawValue: resolution.role.rawValue,
-                        displayedSelectionID: AgentModelSelectionID(agentRaw: AgentProviderKind.cursor.rawValue, modelRaw: option.rawValue),
-                        scope: expectedScope
-                    )
-                    reloadScopedState()
-                    postAgentRoleDefaultsChanged()
+                    updateRoleModelParameters(resolution: resolution, modelRaw: option.rawValue, expectedScope: expectedScope) {
+                        ACPModelParameterSelection.normalized($0 + [parameter])
+                    }
                 },
                 onClearCursorParameter: { [weak self] option, identity in
                     guard let self else { return }
-                    reloadScopedState()
-                    guard editingScope == expectedScope,
-                          roleDefaultsResolutions.first(where: { $0.role == resolution.role })?.effective == resolution.effective else { return }
-                    let existing = profileSnapshot.mcpAgentRoleModelParameters?[resolution.role.rawValue] ?? []
-                    settingsManager.setAgentModelsRoleModelParameter(
-                        existing.filter { $0.identity != identity },
-                        roleRawValue: resolution.role.rawValue,
-                        displayedSelectionID: AgentModelSelectionID(agentRaw: AgentProviderKind.cursor.rawValue, modelRaw: option.rawValue),
-                        scope: expectedScope
-                    )
-                    reloadScopedState()
-                    postAgentRoleDefaultsChanged()
+                    updateRoleModelParameters(resolution: resolution, modelRaw: option.rawValue, expectedScope: expectedScope) {
+                        $0.filter { $0.identity != identity }
+                    }
                 }
             ) { [weak self] selectedAgent, selectedOption in
                 guard let self else { return }
@@ -946,6 +928,26 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     }
 
     // MARK: - Private helpers
+
+    private func updateRoleModelParameters(
+        resolution: MCPAgentRoleDefaultsService.RoleDefaultResolution,
+        modelRaw: String,
+        expectedScope: AgentModelsEditingScope,
+        transform: ([ACPModelParameterSelection]) -> [ACPModelParameterSelection]
+    ) {
+        reloadScopedState()
+        guard editingScope == expectedScope,
+              roleDefaultsResolutions.first(where: { $0.role == resolution.role })?.effective == resolution.effective else { return }
+        let existing = profileSnapshot.mcpAgentRoleModelParameters?[resolution.role.rawValue] ?? []
+        settingsManager.setAgentModelsRoleModelParameter(
+            transform(existing),
+            roleRawValue: resolution.role.rawValue,
+            displayedSelectionID: AgentModelSelectionID(agentRaw: AgentProviderKind.cursor.rawValue, modelRaw: modelRaw),
+            scope: expectedScope
+        )
+        reloadScopedState()
+        postAgentRoleDefaultsChanged()
+    }
 
     private static func inheritanceMode(
         settingsManager: any SettingsManaging,

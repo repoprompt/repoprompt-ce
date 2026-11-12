@@ -8,11 +8,10 @@ extension AgentModeViewModel {
         endpoint: DomainAgentSessionLinkEndpointIdentity,
         origin: AgentSelfMCPCallOrigin
     ) -> AgentSelfContextSnapshot? {
-        guard endpoint == origin.endpoint,
-              let session = sessions[endpoint.tabID],
-              agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
-              session.runID == origin.runID,
-              session.activeRunOwnership?.attemptID == origin.runAttemptID
+        guard let session = origin.matchingSession(
+            endpoint: endpoint, lookup: { sessions[$0] },
+            observerEndpoint: { linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: $0) }
+        )
         else { return nil }
         return AgentSelfContextSnapshot(
             context: Self.observationContextLoad(for: session),
@@ -29,7 +28,7 @@ extension AgentModeViewModel {
         session: TabSession,
         requestID: UUID
     ) -> AgentSessionLinkDeliveryReadiness.Snapshot {
-        var snapshot = agentSessionLinkDeliveryReadinessSnapshot(
+        var snapshot = AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
             session: session,
             endpointMatchesGrant: true,
             isClosing: false,
@@ -80,28 +79,35 @@ extension AgentModeViewModel {
         session.selfCompactNativeCompletion?.supersedeForOrdinaryInput()
     }
 
+    private static func publishSelfCompactStateChange(
+        previous: AgentSelfCompactState, state: AgentSelfCompactState,
+        session: TabSession, viewModel: AgentModeViewModel?, includesCancellation: Bool
+    ) {
+        if previous.active != nil, state.active == nil {
+            let row: AgentChatItem? = switch state.latest?.outcome {
+            case .cancelled where includesCancellation:
+                AgentChatItem.selfCompactionCancelled(sequenceIndex: session.nextSequenceIndex)
+            case .failed:
+                AgentChatItem.selfCompactionCouldNotStart(sequenceIndex: session.nextSequenceIndex)
+            default:
+                nil
+            }
+            if let row {
+                session.appendItem(row)
+                viewModel?.updateBindingsFromSession(session)
+            }
+        }
+        viewModel?.persistenceRuntime.scheduleSave(for: session)
+        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+    }
+
     private func agentSelfCompactScheduler(for session: TabSession) -> AgentSelfCompactTerminalScheduler {
         AgentSelfCompactTerminalScheduler(
             load: { session.selfCompactState },
             store: { [weak self] state in
                 let previous = session.selfCompactState
                 session.selfCompactState = state
-                if previous.active != nil, state.active == nil {
-                    let row: AgentChatItem? = switch state.latest?.outcome {
-                    case .cancelled:
-                        AgentChatItem.selfCompactionCancelled(sequenceIndex: session.nextSequenceIndex)
-                    case .failed:
-                        AgentChatItem.selfCompactionCouldNotStart(sequenceIndex: session.nextSequenceIndex)
-                    default:
-                        nil
-                    }
-                    if let row {
-                        session.appendItem(row)
-                        self?.updateBindingsFromSession(session)
-                    }
-                }
-                self?.scheduleSave(for: session)
-                self?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                Self.publishSelfCompactStateChange(previous: previous, state: state, session: session, viewModel: self, includesCancellation: true)
             },
             isCurrentOwner: { [weak self] owner in
                 self?.agentSelfCompactOwnerIsCurrent(owner, session: session) ?? false
@@ -130,7 +136,7 @@ extension AgentModeViewModel {
         session: TabSession
     ) -> Bool {
         guard sessions[owner.tabID] === session,
-              let endpoint = agentSessionLinkObserverEndpoint(tabID: owner.tabID)
+              let endpoint = linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: owner.tabID)
         else { return false }
         return endpoint.windowID == owner.windowID
             && endpoint.workspaceID == owner.workspaceID
@@ -150,7 +156,7 @@ extension AgentModeViewModel {
         var state = session.selfCompactState
         if state.cancelStaleParkedNote(for: session) {
             session.selfCompactState = state
-            scheduleSave(for: session)
+            persistenceRuntime.scheduleSave(for: session)
             return
         }
         let completion = session.selfCompactNativeCompletion ?? agentSelfCompactNativeCompletion(for: session)
@@ -177,7 +183,7 @@ extension AgentModeViewModel {
               attempt.phase == .scheduled || attempt.phase == .awaitingSettlement,
               attempt.physicalOutcome == .notAttempted,
               attempt.periodicProducerDispatchID == nil, attempt.periodicProducerTask == nil,
-              agentSessionLinkObserverEndpoint(tabID: session.tabID) == attempt.observerEndpoint,
+              linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: session.tabID) == attempt.observerEndpoint,
               agentSessionLinkPromptClaimStore.pendingClaim(
                   dispatchID: .autoWake(wakeID: attempt.wakeID),
                   observerSessionID: attempt.observerEndpoint.sessionID
@@ -229,11 +235,10 @@ extension AgentModeViewModel {
         defer { releaseComposerSubmitClaim(claim) }
 
         let ready: @MainActor () -> Bool = { [weak self] in
-            guard let self, stillAdmissible(), composerSubmitClaimIsCurrent(claim),
-                  !AgentSessionLinkExecutionRuntime.agentSessionLinkCompactHasQueuedProviderWork(session),
+            guard let self, selfCompactClaimIsReady(claim, session: session, stillAdmissible: stillAdmissible),
                   workspaceManager?.activeWorkspace?.id == owner.workspaceID
             else { return false }
-            var snapshot = Self.agentSessionLinkDeliveryReadinessSnapshot(
+            var snapshot = AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
                 session: session,
                 endpointMatchesGrant: agentSelfCompactOwnerIsCurrent(owner, session: session),
                 isClosing: false,
@@ -253,11 +258,11 @@ extension AgentModeViewModel {
         session.appendItem(row)
         updateBindingsFromSession(session)
         requestUIRefresh(tabID: owner.tabID, urgent: true)
-        if case .failure = await flushSaveRequired(for: owner.tabID, workspaceID: owner.workspaceID) {
+        if case .failure = await persistenceRuntime.flushSaveRequired(for: owner.tabID, workspaceID: owner.workspaceID) {
             if let index = session.items.firstIndex(where: { $0.id == row.id }) {
                 _ = session.removeItem(at: index)
             }
-            _ = await flushSaveRequired(for: owner.tabID, workspaceID: owner.workspaceID)
+            _ = await persistenceRuntime.flushSaveRequired(for: owner.tabID, workspaceID: owner.workspaceID)
             return false
         }
         guard ready() else { return false }
@@ -293,20 +298,7 @@ extension AgentModeViewModel {
                     )
                     self?.updateBindingsFromSession(session)
                 }
-                if previous.active != nil, state.active == nil {
-                    let row: AgentChatItem? = switch state.latest?.outcome {
-                    case .failed:
-                        AgentChatItem.selfCompactionCouldNotStart(sequenceIndex: session.nextSequenceIndex)
-                    default:
-                        nil
-                    }
-                    if let row {
-                        session.appendItem(row)
-                        self?.updateBindingsFromSession(session)
-                    }
-                }
-                self?.scheduleSave(for: session)
-                self?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                Self.publishSelfCompactStateChange(previous: previous, state: state, session: session, viewModel: self, includesCancellation: false)
             },
             isCurrentOwner: { [weak self] owner in
                 self?.agentSelfCompactOwnerIsCurrent(owner, session: session) ?? false
@@ -318,6 +310,13 @@ extension AgentModeViewModel {
                 )
             }
         )
+    }
+
+    private func selfCompactClaimIsReady(
+        _ claim: AgentComposerSubmitClaim, session: TabSession, stillAdmissible: @MainActor () -> Bool
+    ) -> Bool {
+        stillAdmissible() && composerSubmitRuntime.isCurrent(claim)
+            && !AgentSessionLinkExecutionRuntime.agentSessionLinkCompactHasQueuedProviderWork(session)
     }
 
     private func agentSelfCompactDispatchNote(
@@ -338,8 +337,7 @@ extension AgentModeViewModel {
         ) else { return false }
         defer { releaseComposerSubmitClaim(claim) }
         let ready: @MainActor () -> Bool = { [weak self] in
-            guard let self, stillAdmissible(), composerSubmitClaimIsCurrent(claim),
-                  !AgentSessionLinkExecutionRuntime.agentSessionLinkCompactHasQueuedProviderWork(session),
+            guard let self, selfCompactClaimIsReady(claim, session: session, stillAdmissible: stillAdmissible),
                   agentSelfCompactOwnerIsCurrent(owner, session: session),
                   workspaceManager?.activeWorkspace?.id == owner.workspaceID
             else { return false }
@@ -351,7 +349,7 @@ extension AgentModeViewModel {
         var state = session.selfCompactState
         state.active?.phase = .dispatchingNote
         session.selfCompactState = state
-        guard case .success = await flushSaveRequired(for: owner.tabID, workspaceID: owner.workspaceID),
+        guard case .success = await persistenceRuntime.flushSaveRequired(for: owner.tabID, workspaceID: owner.workspaceID),
               ready()
         else { return false }
         let recorder = AgentRunStartOutcomeRecorder()

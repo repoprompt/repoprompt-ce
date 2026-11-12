@@ -56,7 +56,7 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
         session.selectedAgent = .customClaudeCompatible
         session.selectedModelRaw = "sonnet"
         let estimator = ClaudeContextUsageEstimator(tokenEstimator: { _ in 0 }, contextUsageBuilder: { usage, window in
-            AgentModeViewModel.contextUsageFromClaudeProviderTokens(usage, modelContextWindow: window)
+            AgentSessionUsageRuntime.contextUsageFromClaudeProviderTokens(usage, modelContextWindow: window)
         })
         _ = estimator.ingestUsageSignal(promptTokens: nil, completionTokens: nil, contextUsedTokens: 250_000, modelContextWindow: nil, session: session)
         XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 262_144)
@@ -94,7 +94,7 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
             session.selectedAgent = .customClaudeCompatible
             session.selectedModelRaw = "sonnet"
             let estimator = ClaudeContextUsageEstimator(tokenEstimator: { _ in 0 }, contextUsageBuilder: { usage, window in
-                AgentModeViewModel.contextUsageFromClaudeProviderTokens(usage, modelContextWindow: window)
+                AgentSessionUsageRuntime.contextUsageFromClaudeProviderTokens(usage, modelContextWindow: window)
             })
             if hasPriorUsage {
                 _ = estimator.ingestUsageSignal(promptTokens: nil, completionTokens: nil, contextUsedTokens: 250_000, modelContextWindow: nil, session: session)
@@ -642,11 +642,11 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
             let rows = try JSONDecoder().decode([AgentTokenUsagePersist].self, from: JSONEncoder().encode([old, fence, unmeasured]))
             XCTAssertEqual(rows, [old, fence, unmeasured])
             XCTAssertEqual(rows.map(\.providerTotalTokens).reduce(0, +), 150_057, "A compaction fence is not billable usage")
-            let pending = AgentModeViewModel.contextUsageFromClaudeProviderTokens(rows, modelContextWindow: nil)
+            let pending = AgentSessionUsageRuntime.contextUsageFromClaudeProviderTokens(rows, modelContextWindow: nil)
             XCTAssertNil(pending?.lastTotalTokens)
             XCTAssertEqual(pending?.awaitingPostCompactionUsage, true, "The fence works even without a known window")
             let fresh = AgentTokenUsagePersist(promptTokens: 1000, completionTokens: 10, contextUsedTokens: 10000)
-            let recovered = AgentModeViewModel.contextUsageFromClaudeProviderTokens(rows + [fresh, unmeasured], modelContextWindow: 200_000)
+            let recovered = AgentSessionUsageRuntime.contextUsageFromClaudeProviderTokens(rows + [fresh, unmeasured], modelContextWindow: 200_000)
             XCTAssertEqual(recovered?.lastTotalTokens, 10000)
             XCTAssertNotEqual(recovered?.awaitingPostCompactionUsage, true)
         }

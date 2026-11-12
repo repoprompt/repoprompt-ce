@@ -385,7 +385,7 @@ final class AgentQuietCheckInDisplayMaskTests: XCTestCase {
         let vm = f.window.agentModeViewModel, session = f.session
         let canonical = session.transcript
         vm.test_setCurrentTabIDOverride(UUID())
-        vm.applyTranscriptPresentation(canonical, to: session)
+        AgentSessionTranscriptRefreshRuntime.applyTranscriptPresentation(canonical, to: session)
         XCTAssertNil(session.quietTranscriptDisplayCache, "Inactive install prepares no display")
         vm.test_setCurrentTabIDOverride(session.tabID)
         _ = vm.test_publishTranscriptPresentation(tabID: session.tabID)
@@ -427,7 +427,7 @@ final class AgentQuietCheckInDisplayMaskTests: XCTestCase {
         let retained = AgentTranscriptCompactor.compact(AgentTranscript(turns: history + [certified] + live.turns, nextSequenceIndex: 10002))
         XCTAssertTrue(AgentTranscriptProjectionBuilder.build(from: retained).archivedRows.contains { $0.text == "Certified closing, not a sentinel" }, "Canonical archived audit retains its synthetic quiet conclusion")
         session.runState = .running
-        vm.applyTranscriptPresentation(retained, to: session)
+        AgentSessionTranscriptRefreshRuntime.applyTranscriptPresentation(retained, to: session)
         session.setItemsSilentlyForRetentionCompaction([request, stream])
         session.nextSequenceIndex = retained.nextSequenceIndex
         _ = vm.test_publishTranscriptPresentation(tabID: session.tabID, forceRevision: true)
@@ -500,7 +500,7 @@ final class AgentQuietCheckInDisplayMaskTests: XCTestCase {
         XCTAssertFalse((vm.ui.transcript.snapshot.presentation.visibleRows + vm.ui.transcript.snapshot.archivedBlocks.flatMap(\.rows)).contains { $0.text == "Certified closing, not a sentinel" || $0.toolName == "self_noop" })
         // Exact source/anchor retirement clears only materialized live membership. It cannot
         // reconstitute a quiet declaration from text after a later unstamped hydration.
-        vm.applyTranscriptPresentation(.empty, to: session)
+        AgentSessionTranscriptRefreshRuntime.applyTranscriptPresentation(.empty, to: session)
         session.setItemsSilently([.assistant("Unstamped ordinary reload")], reason: .persistedSessionHydration)
         vm.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
         _ = vm.test_publishTranscriptPresentation(tabID: session.tabID, forceRevision: true)
@@ -765,7 +765,7 @@ final class AgentQuietRetainedViewFeasibilityTests: XCTestCase {
                         XCTAssertEqual(session.test_quietMetadataVisitedItems, range.count * 2)
                     }
                 }
-                await vm.test_finishQuietFeasibilityRun(session)
+                await vm.runService.test_publishNaturalCompletion(session)
                 session.test_beforeQuietMetadataSeal = nil
                 XCTAssertNotNil(session.runLifecycle.lastTerminalCommitRevision, "Real terminal owner must settle")
                 let terminalMetrics = metrics.snapshot()
@@ -778,7 +778,7 @@ final class AgentQuietRetainedViewFeasibilityTests: XCTestCase {
                     XCTAssertFalse(rows.contains { $0.text.contains("Quiet closing") || $0.toolName == "self_noop" }, "Real terminal projection consumes the injected receipt")
                     XCTAssertTrue(rows.contains { $0.id == ordinaryBaseline.conclusionActivityID })
                 } else { control = terminalMetrics }
-                await vm.flushSave(for: tabID)
+                await vm.persistenceRuntime.flushSave(for: tabID)
                 let saveMetrics = metrics.snapshot().mapValues { $0 }.reduce(into: [String: Int]()) { result, entry in
                     result[entry.key] = entry.value - (terminalMetrics[entry.key] ?? 0)
                 }
@@ -2044,7 +2044,7 @@ final class AgentQuietW0PairedScaleTests: XCTestCase {
             session.appendItem(item)
         }
         let initial = AgentTranscriptIO.buildTranscript(from: session.items, terminalState: .completed)
-        _ = vm.applyTranscriptPresentation(initial, to: session)
+        _ = AgentSessionTranscriptRefreshRuntime.applyTranscriptPresentation(initial, to: session)
         let turnID = try XCTUnwrap(session.transcript.turns.first?.id)
         var allCounts = Counts()
         var currentCounts = Counts()
@@ -2096,7 +2096,7 @@ final class AgentQuietW0PairedScaleTests: XCTestCase {
                 rebuildMS += elapsedMS(since: rebuildStart)
                 QuietW0ScaleAdapter.afterRebuild(quiet: quiet, transcript: &imported)
                 let presentationStart = DispatchTime.now().uptimeNanoseconds
-                let built = AgentModeViewModel.buildTranscriptPresentation(
+                let built = AgentSessionTranscriptBuilder.buildTranscriptPresentation(
                     from: imported, sourceItems: session.items,
                     precomputedEphemeralPayloadByItemID: session.ephemeralToolResultPayloadByItemID,
                     precomputedEphemeralPayloadRevisionByItemID: session.ephemeralToolResultPayloadRevisionByItemID,

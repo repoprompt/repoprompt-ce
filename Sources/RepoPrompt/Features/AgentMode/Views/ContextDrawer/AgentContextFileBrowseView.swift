@@ -113,12 +113,7 @@ struct AgentContextFileBrowseView: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity)
-        .background(Color(NSColor.textBackgroundColor).opacity(0.65))
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(Color.secondary.opacity(0.18), lineWidth: 0.5)
-        )
+        .agentContextDrawerTextInputSurface()
     }
 
     // MARK: - Scope row
@@ -216,7 +211,8 @@ struct AgentContextFileBrowseView: View {
                 unavailableState(reason)
             case .ready:
                 if isSearchMode, model.rows.isEmpty {
-                    emptyState(
+                    agentContextDrawerEmptyState(
+                        fontPreset: fontPreset,
                         icon: "magnifyingglass",
                         title: "No matches",
                         subtitle: "No files match this search."
@@ -313,6 +309,29 @@ struct AgentContextFileBrowseView: View {
             .accessibilityAddTraits(.isHeader)
     }
 
+    private func rowSurface(nodeID: AgentContextFileBrowseNodeID, depth: Int, @ViewBuilder content: () -> some View) -> some View {
+        content()
+            .padding(.vertical, 4)
+            .padding(.horizontal, 7)
+            .padding(.leading, indent(for: depth))
+            .background(focusHighlight(for: nodeID))
+            .contentShape(Rectangle())
+    }
+
+    private func rowKeyboardNavigation(nodeID: AgentContextFileBrowseNodeID, @ViewBuilder content: () -> some View) -> some View {
+        content()
+            .focusable()
+            .focused($focus, equals: .row(nodeID))
+            .onKeyPress(.upArrow) {
+                model.focusPreviousRow()
+                return .handled
+            }
+            .onKeyPress(.downArrow) {
+                model.focusNextRow()
+                return .handled
+            }
+    }
+
     // MARK: - Container rows
 
     private func containerRow(
@@ -325,49 +344,38 @@ struct AgentContextFileBrowseView: View {
         let status = model.containerStatus(for: nodeID)
         let isExpanded = model.expandedNodeIDs.contains(nodeID)
         let estimate = model.tokenEstimate(for: nodeID)
-        return HStack(spacing: 8) {
-            containerCheckbox(nodeID: nodeID, title: title, status: status)
-            Button {
-                model.toggleExpansion(nodeID)
-            } label: {
-                Image(systemName: "chevron.right")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                    .frame(width: 14)
-                    .contentShape(Rectangle())
+        return rowKeyboardNavigation(nodeID: nodeID) {
+            rowSurface(nodeID: nodeID, depth: depth) {
+                HStack(spacing: 8) {
+                    containerCheckbox(nodeID: nodeID, title: title, status: status)
+                    Button {
+                        model.toggleExpansion(nodeID)
+                    } label: {
+                        Image(systemName: "chevron.right")
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                            .frame(width: 14)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("\(isExpanded ? "Collapse" : "Expand") \(title)")
+                    .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
+                    Image(systemName: iconName)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Text(title)
+                        .font(fontPreset.captionFont)
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 8)
+                    tokenEstimateText(estimate)
+                }
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("\(isExpanded ? "Collapse" : "Expand") \(title)")
-            .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
-            Image(systemName: iconName)
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
-                .foregroundStyle(.secondary)
-            Text(title)
-                .font(fontPreset.captionFont)
-                .foregroundStyle(.primary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-            Spacer(minLength: 8)
-            tokenEstimateText(estimate)
-        }
-        .padding(.vertical, 4)
-        .padding(.horizontal, 7)
-        .padding(.leading, indent(for: depth))
-        .background(focusHighlight(for: nodeID))
-        .contentShape(Rectangle())
-        .onTapGesture {
-            model.toggleExpansion(nodeID)
-        }
-        .focusable()
-        .focused($focus, equals: .row(nodeID))
-        .onKeyPress(.upArrow) {
-            model.focusPreviousRow()
-            return .handled
-        }
-        .onKeyPress(.downArrow) {
-            model.focusNextRow()
-            return .handled
+            .onTapGesture {
+                model.toggleExpansion(nodeID)
+            }
         }
         .onKeyPress(.leftArrow) {
             if isExpanded { model.toggleExpansion(nodeID) }
@@ -479,46 +487,35 @@ struct AgentContextFileBrowseView: View {
         let isAutoMapped = status.isAutomaticallyMapped
         let isDisabled = status.toggleEligibility.targetState == nil
         let estimate = model.tokenEstimate(for: nodeID)
-        return HStack(spacing: 8) {
-            CheckboxView(isChecked: heldMode == nil ? .unchecked : .checked) {
-                guard model.toggleFile(file) else { return }
+        return rowKeyboardNavigation(nodeID: nodeID) {
+            rowSurface(nodeID: nodeID, depth: depth) {
+                HStack(spacing: 8) {
+                    CheckboxView(isChecked: heldMode == nil ? .unchecked : .checked) {
+                        guard model.toggleFile(file) else { return }
+                    }
+                    .disabled(isDisabled)
+                    .opacity(isDisabled ? 0.4 : 1)
+                    .hoverTooltip(fileCheckboxTooltip(file: file, heldMode: heldMode, isCodemapBlocked: status.isCodemapBlocked))
+                    .accessibilityLabel(fileCheckboxLabel(file: file, heldMode: heldMode))
+                    .accessibilityValue(fileCheckboxValue(heldMode: heldMode, isAutoMapped: isAutoMapped, estimate: estimate))
+                    .accessibilityHint(status.isCodemapBlocked ? codemapBlockedExplanation(file: file) : "")
+                    Image(systemName: "doc.text")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Text(file.name)
+                        .font(fontPreset.captionFont)
+                        .foregroundStyle(status.isCodemapBlocked ? Color.secondary : Color.primary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 8)
+                    if let heldMode {
+                        heldModeBadge(heldMode)
+                    } else if isAutoMapped {
+                        autoMapBadge
+                    }
+                    tokenEstimateText(estimate)
+                }
             }
-            .disabled(isDisabled)
-            .opacity(isDisabled ? 0.4 : 1)
-            .hoverTooltip(fileCheckboxTooltip(file: file, heldMode: heldMode, isCodemapBlocked: status.isCodemapBlocked))
-            .accessibilityLabel(fileCheckboxLabel(file: file, heldMode: heldMode))
-            .accessibilityValue(fileCheckboxValue(heldMode: heldMode, isAutoMapped: isAutoMapped, estimate: estimate))
-            .accessibilityHint(status.isCodemapBlocked ? codemapBlockedExplanation(file: file) : "")
-            Image(systemName: "doc.text")
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
-                .foregroundStyle(.secondary)
-            Text(file.name)
-                .font(fontPreset.captionFont)
-                .foregroundStyle(status.isCodemapBlocked ? Color.secondary : Color.primary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-            Spacer(minLength: 8)
-            if let heldMode {
-                heldModeBadge(heldMode)
-            } else if isAutoMapped {
-                autoMapBadge
-            }
-            tokenEstimateText(estimate)
-        }
-        .padding(.vertical, 4)
-        .padding(.horizontal, 7)
-        .padding(.leading, indent(for: depth))
-        .background(focusHighlight(for: nodeID))
-        .contentShape(Rectangle())
-        .focusable()
-        .focused($focus, equals: .row(nodeID))
-        .onKeyPress(.upArrow) {
-            model.focusPreviousRow()
-            return .handled
-        }
-        .onKeyPress(.downArrow) {
-            model.focusNextRow()
-            return .handled
         }
         .onKeyPress(.space) {
             model.toggleFile(file) ? .handled : .ignored
@@ -656,47 +653,34 @@ struct AgentContextFileBrowseView: View {
     private func unavailableState(_ reason: AgentContextFileBrowseUnavailableReason) -> some View {
         switch reason {
         case .noRoots:
-            emptyState(
+            agentContextDrawerEmptyState(
+                fontPreset: fontPreset,
                 icon: "folder.badge.questionmark",
                 title: "No workspace roots",
                 subtitle: "Add a folder to the workspace to browse files."
             )
         case .sessionRootsUnavailable:
-            emptyState(
+            agentContextDrawerEmptyState(
+                fontPreset: fontPreset,
                 icon: "externaldrive.badge.questionmark",
                 title: "Workspace unavailable",
                 subtitle: "The Agent worktree roots for this chat are no longer available."
             )
         case .catalogChanged:
-            emptyState(
+            agentContextDrawerEmptyState(
+                fontPreset: fontPreset,
                 icon: "arrow.clockwise",
                 title: "Workspace changed",
                 subtitle: "Select Done, then browse again to refresh files."
             )
         case .selectionTargetUnavailable:
-            emptyState(
+            agentContextDrawerEmptyState(
+                fontPreset: fontPreset,
                 icon: "doc.text.magnifyingglass",
                 title: "Selection unavailable",
                 subtitle: "Selection is no longer available."
             )
         }
-    }
-
-    private func emptyState(icon: String, title: String, subtitle: String) -> some View {
-        VStack(spacing: 10) {
-            Image(systemName: icon)
-                .font(.system(size: 34))
-                .foregroundStyle(.secondary.opacity(0.45))
-            Text(title)
-                .font(fontPreset.standardFont.weight(.semibold))
-                .foregroundStyle(.secondary)
-            Text(subtitle)
-                .font(fontPreset.captionFont)
-                .foregroundStyle(.tertiary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 320)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func pluralFiles(_ count: Int) -> String {

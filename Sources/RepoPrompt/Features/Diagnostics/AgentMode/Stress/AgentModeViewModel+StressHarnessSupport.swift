@@ -146,7 +146,7 @@
         ) {
             let session = session(for: tabID)
             let fullBindingSyncCount = test_updateBindingsCallCount
-            guard applyAssistantDelta(delta, session: session) else { return }
+            guard streamRuntime.applyAssistantDelta(delta, session: session) else { return }
             session.assistantDeltaFlushGeneration &+= 1
             requestAssistantPresentationRefresh(
                 session: session,
@@ -165,7 +165,7 @@
         ) {
             let session = session(for: tabID)
             let fullBindingSyncCount = test_updateBindingsCallCount
-            endActiveAssistantSegment(session)
+            streamRuntime.endActiveAssistantSegment(session)
             session.assistantDeltaFlushGeneration &+= 1
             requestAssistantPresentationRefresh(
                 session: session,

@@ -272,6 +272,52 @@ extension AgentModeRunService {
 // MARK: - Exact session partial application for terminal settlement
 
 extension AgentModeRunService.Hooks {
+    @MainActor
+    func prepareNonCodexTurnInputs(
+        session: AgentTabSession,
+        attachments turnAttachments: [AgentFileAttachment],
+        initialUserMessage: String,
+        initialMessageForRun: String
+    ) -> UUID? {
+        let reservationID = attachments.reserveAttachmentsForTurn(turnAttachments, session)
+        if initialMessageForRun != initialUserMessage,
+           !session.pendingNonCodexUserInputTokenQueue.isEmpty
+        {
+            session.pendingNonCodexUserInputTokenQueue[0] = usage.estimateRuntimeTokens(initialMessageForRun)
+        }
+        usage.startNonCodexTurnAccountingIfNeeded(session, initialMessageForRun)
+        return reservationID
+    }
+
+    @MainActor
+    func commitAcquireFailure(
+        session: AgentTabSession,
+        outcome: MCPBootstrapLeaseAcquireFailureOutcome,
+        runID: UUID,
+        ownership: AgentRunOwnership,
+        attachmentReservationID: UUID?,
+        source: String,
+        supportsFollowUp: Bool,
+        barrier: AgentRunTerminalCommitBarrier,
+        prepareProviderState: @escaping () -> (@MainActor () async -> Void)? = { nil }
+    ) async {
+        // Acquisition and provider-specific receipt checks stay at the calling boundary.
+        await barrier.commit(.init(
+            binding: bindTerminalSession(session),
+            ownership: ownership,
+            expectedRunID: runID,
+            terminalState: outcome.terminalState,
+            source: source,
+            errorText: outcome.errorText,
+            attachmentReservationID: attachmentReservationID,
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: supportsFollowUp,
+            notifyTurnComplete: false,
+            prepareProviderState: prepareProviderState
+        ))
+    }
+
     /// Binds the terminal settlement surface to the exact originating object.
     ///
     /// This is the app-host composition edge: the returned value retains that

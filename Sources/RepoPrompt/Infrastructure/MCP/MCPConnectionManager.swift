@@ -508,7 +508,7 @@ final class MCPBecomeOverseerActivationProof: @unchecked Sendable {
               window.mcpServer.hasCurrentRunRouteMapping(
                   runID: routeToken.runID, connectionID: routeToken.connectionID, expectedTabID: endpoint.tabID
               ),
-              window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint
+              window.agentModeViewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint
         else {
             valid = false
             return false
@@ -4162,7 +4162,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                       connectionID: connectionID,
                       expectedTabID: tabID
                   ),
-                  let endpoint = window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: tabID)
+                  let endpoint = window.agentModeViewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID)
             else { return nil }
             return (connectionID, endpoint)
         }
@@ -4185,7 +4185,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                       expectedTabID: tabID
                   )
             else { return false }
-            return window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: tabID) == endpoint
+            return window.agentModeViewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID) == endpoint
         }
         guard mappingIsStillCurrent,
               let revalidatedActorSnapshot = authoritativeRunRouteActorSnapshot(

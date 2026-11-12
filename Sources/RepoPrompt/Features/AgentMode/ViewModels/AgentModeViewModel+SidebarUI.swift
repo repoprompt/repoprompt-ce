@@ -401,18 +401,6 @@ extension AgentModeViewModel {
         ui.sessionSidebar.expandAllSidebarThreads(eligibleKeys: keys)
     }
 
-    func isSidebarThreadCollapsed(_ key: AgentSidebarThreadKey) -> Bool {
-        ui.sessionSidebar.isThreadCollapsed(key)
-    }
-
-    func setSidebarThreadCollapsed(_ collapsed: Bool, for key: AgentSidebarThreadKey) {
-        ui.sessionSidebar.setThreadCollapsed(collapsed, for: key)
-    }
-
-    func toggleSidebarThreadCollapse(_ key: AgentSidebarThreadKey) {
-        ui.sessionSidebar.toggleThreadCollapse(key)
-    }
-
     func requestSidebarThreadDisclosureToggle(for row: SidebarSession) {
         guard row.hasThreadChildren, let key = row.threadKey else { return }
         ui.sessionSidebar.setThreadCollapsed(!row.isThreadCollapsed, for: key)

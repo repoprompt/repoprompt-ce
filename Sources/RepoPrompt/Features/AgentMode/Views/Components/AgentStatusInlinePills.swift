@@ -46,12 +46,7 @@ struct AgentStagedSlashCommandPill: View {
         .foregroundStyle(accentColor)
         .padding(.horizontal, AgentPillMetrics.horizontalPadding())
         .frame(height: AgentPillMetrics.height())
-        .background(.ultraThinMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                .stroke(accentColor.opacity(staged.action == .setObjective ? 0.35 : 0.18), lineWidth: staged.action == .setObjective ? 0.8 : 0.5)
-        )
+        .agentPillSurface(cornerRadius: cornerRadius, strokeColor: accentColor.opacity(staged.action == .setObjective ? 0.35 : 0.18), lineWidth: staged.action == .setObjective ? 0.8 : 0.5)
         .hoverTooltip(tooltipText, .top)
     }
 }

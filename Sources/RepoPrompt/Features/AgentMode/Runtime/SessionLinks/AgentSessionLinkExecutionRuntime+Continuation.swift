@@ -34,10 +34,7 @@ final class AgentInstructionWait {
 
 extension AgentSessionLinkExecutionRuntime {
     func instructionCommand(for session: AgentTabSession) -> AgentSessionRuntimeStore.Command? {
-        guard let scope, let sessionID = session.activeAgentSessionID,
-              case let .unique(writer) = scope.resolveWriter(sessionID: sessionID),
-              writer.scope === scope, writer.session === session else { return nil }
-        return try? writer.admitCommand().get()
+        try? scope?.admit(session: session)
     }
 
     func ownsInstructionWait(command: AgentSessionRuntimeStore.Command, waitID: UUID) -> Bool {

@@ -2020,7 +2020,7 @@ final class DelegationMembershipCensusTests: XCTestCase {
         }
         // Normal installation refuses a second writer without changing the valid creator.
         let contender = AgentModeViewModel.TabSession(tabID: tab.id)
-        XCTAssertEqual(replica.agentModeViewModel.test_bindingRejection(sessionID: creator, on: contender), .conflictingWriter)
+        XCTAssertEqual(replica.agentModeViewModel.runtimeSessionStore.bindingRejection(creator, on: contender), .conflictingWriter)
         XCTAssertNil(replica.agentModeViewModel.test_installPersistentSessionBinding(sessionID: creator, on: contender))
         XCTAssertNil(contender.persistentSessionBindingIdentity)
         XCTAssertNil(replica.agentModeViewModel.sessions[tab.id])
@@ -2226,7 +2226,7 @@ final class DelegationMembershipCensusTests: XCTestCase {
         _ sessionID: UUID, on session: AgentTabSession, in viewModel: AgentModeViewModel, conflicting: Bool
     ) throws {
         if conflicting {
-            XCTAssertEqual(viewModel.test_bindingRejection(sessionID: sessionID, on: session), .conflictingWriter)
+            XCTAssertEqual(viewModel.runtimeSessionStore.bindingRejection(sessionID, on: session), .conflictingWriter)
             XCTAssertNil(viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session))
             XCTAssertNil(session.persistentSessionBindingIdentity)
             // These read-only census cases deliberately retain evidence of legacy corruption.
@@ -2239,7 +2239,7 @@ final class DelegationMembershipCensusTests: XCTestCase {
     private func installIdleCarrier(_ sessionID: UUID, tabID: UUID, on window: WindowState, injectConflictingWriter: Bool = false) {
         let live = AgentModeViewModel.TabSession(tabID: tabID)
         if injectConflictingWriter {
-            XCTAssertEqual(window.agentModeViewModel.test_bindingRejection(sessionID: sessionID, on: live), .conflictingWriter)
+            XCTAssertEqual(window.agentModeViewModel.runtimeSessionStore.bindingRejection(sessionID, on: live), .conflictingWriter)
             XCTAssertNil(window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: live))
             XCTAssertNil(live.persistentSessionBindingIdentity)
             live.testInstallPersistentSessionBinding(sessionID: sessionID)
@@ -2651,7 +2651,7 @@ final class AgentSessionPointReadScalingTests: XCTestCase {
             XCTAssertNil(organizer.state(of: fixture.newerID), "A live rebind does not erase the other physical claimants")
             XCTAssertEqual(viewModel.boundSessionID(for: fixture.targetID), fixture.olderID)
             // Archived fallback keeps its own metadata preference; active shadowing is separate.
-            XCTAssertEqual(viewModel.preferredSidebarEntry(for: fixture.targetID)?.id, fixture.newerID)
+            XCTAssertEqual(AgentModeSidebarSessionBuilder.preferredSidebarEntry(for: fixture.targetID, tabName: nil, entries: viewModel.sessionIndexStore.ownerValidatedEntries(forTabID: fixture.targetID))?.id, fixture.newerID)
 
             other.testInstallPersistentSessionBinding(sessionID: nil)
             XCTAssertEqual(viewModel.preferredActiveSidebarEntry(for: fixture.targetID, workspaceID: fixture.workspaceID)?.id, fixture.olderID)

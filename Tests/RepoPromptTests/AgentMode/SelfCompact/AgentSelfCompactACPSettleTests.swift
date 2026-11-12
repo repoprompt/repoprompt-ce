@@ -453,7 +453,7 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
 
         // Nobody else inherits the exemption: another request's note and ordinary overseer delivery.
         XCTAssertTrue(noteSnapshot(for: UUID()).backgroundCompactionSettling)
-        let overseer = AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
+        let overseer = AgentSessionLinkExecutionRuntime.agentSessionLinkDeliveryReadinessSnapshot(
             session: session, endpointMatchesGrant: true, isClosing: false
         )
         XCTAssertTrue(overseer.backgroundCompactionSettling)

@@ -68,7 +68,7 @@ final class AgentSessionPresentationRuntimeTests: XCTestCase {
         )
         let first = AgentTabSession(tabID: UUID())
         vm?.test_installLiveSession(first)
-        let hooks = try XCTUnwrap(vm?.test_runPresentationHooks())
+        let hooks = try XCTUnwrap(vm?.runtimeSessionStore.presentation.makeRunHooks())
         hooks.setAgentRunActive(first, true)
         XCTAssertEqual(vm?.tabsWithActiveAgentRun, [first.tabID])
         let replacement = AgentTabSession(tabID: first.tabID)

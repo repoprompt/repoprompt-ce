@@ -797,7 +797,7 @@ extension AgentComposerSubmissionAttemptTests {
         // Claude keeps its manual effort separately from the Codex-oriented selection field.
         session.selectedReasoningEffortRaw = nil
         session.selectedClaudeEffortRaw = ClaudeCodeEffortLevel.high.rawValue
-        viewModel.syncStatusPillsUIState()
+        viewModel.ui.statusPills.update(viewModel.makeStatusPillsSnapshot())
         XCTAssertEqual(
             viewModel.ui.statusPills.snapshot.modelRouter.routedModelDisplayName,
             "\(viewModel.selectedModelDisplayName) High"
@@ -820,7 +820,7 @@ extension AgentComposerSubmissionAttemptTests {
             acceptedModelRaw: session.selectedModelRaw,
             acceptedEffortRaw: session.selectedReasoningEffortRaw
         ))
-        viewModel.syncStatusPillsUIState()
+        viewModel.ui.statusPills.update(viewModel.makeStatusPillsSnapshot())
         XCTAssertNil(viewModel.ui.statusPills.snapshot.modelRouter.routedModelDisplayName)
     }
 
@@ -845,7 +845,7 @@ extension AgentComposerSubmissionAttemptTests {
             acceptedModelRaw: session.selectedModelRaw,
             acceptedEffortRaw: "high"
         ))
-        viewModel.syncStatusPillsUIState()
+        viewModel.ui.statusPills.update(viewModel.makeStatusPillsSnapshot())
         XCTAssertEqual(
             viewModel.ui.statusPills.snapshot.modelRouter.routedModelDisplayName,
             "\(viewModel.selectedModelDisplayName) High"
@@ -1314,7 +1314,7 @@ extension AgentComposerSubmissionAttemptTests {
         var reply = AgentChatItem.assistant("W1 sent", sequenceIndex: session.nextSequenceIndex)
         reply.isStreaming = true
         session.appendItem(reply)
-        viewModel.endActiveAssistantSegment(session)
+        viewModel.streamRuntime.endActiveAssistantSegment(session)
 
         XCTAssertEqual(
             session.localInputIndex.epoch,
@@ -1605,7 +1605,7 @@ extension AgentComposerSubmissionAttemptTests {
         session: AgentModeViewModel.TabSession
     ) throws {
         let sessionID = UUID()
-        XCTAssertNil(viewModel.test_bindingRejection(sessionID: sessionID, on: session))
+        XCTAssertNil(viewModel.runtimeSessionStore.bindingRejection(sessionID, on: session))
         session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID, workspaceID: UUID()))
         session.hasLoadedPersistedState = true
         session.recordRestorationAuthoritative(.persistedPayloadApplied)
@@ -1975,21 +1975,21 @@ final class AgentSlashCommandSuggestionsTests: XCTestCase {
 
         let suggestions = await viewModel.slashSkillSuggestions(for: "compact")
         XCTAssertEqual(suggestions.map(\.relativePath), ["compact", "skill:compact"])
-        XCTAssertTrue(viewModel.resolvedSlashSkillInvocations(in: "/compact", agentKind: .claudeCode).isEmpty)
-        XCTAssertEqual(viewModel.resolvedSlashSkillInvocations(in: "/skill:compact", agentKind: .claudeCode).first?.definition.name, "compact")
+        XCTAssertTrue(viewModel.providerInputRuntime.resolvedSlashSkillInvocations(in: "/compact", agentKind: .claudeCode).isEmpty)
+        XCTAssertEqual(viewModel.providerInputRuntime.resolvedSlashSkillInvocations(in: "/skill:compact", agentKind: .claudeCode).first?.definition.name, "compact")
         let explicit = await viewModel.slashSkillSuggestions(for: "skill:compact")
         XCTAssertEqual(explicit.map(\.relativePath), ["skill:compact"])
-        XCTAssertEqual(viewModel.resolvedSlashSkillInvocations(in: "/compact", agentKind: .cursor).first?.definition.name, "compact")
+        XCTAssertEqual(viewModel.providerInputRuntime.resolvedSlashSkillInvocations(in: "/compact", agentKind: .cursor).first?.definition.name, "compact")
         // Deliberate compatibility policy: a local skill shadows even an advertised
         // non-compact built-in. The displayed local row must match actual expansion.
         let context = await viewModel.slashSkillSuggestions(for: "context")
         XCTAssertEqual(context.map(\.relativePath), ["context"])
         XCTAssertEqual(context.first?.subtitle, "Local context skill")
-        XCTAssertEqual(viewModel.resolvedSlashSkillInvocations(in: "/context", agentKind: .claudeCode).first?.definition.name, "context")
+        XCTAssertEqual(viewModel.providerInputRuntime.resolvedSlashSkillInvocations(in: "/context", agentKind: .claudeCode).first?.definition.name, "context")
         XCTAssertFalse(context.first?.submitsOnExactEnter ?? true)
         session.selectedAgent = .cursor
-        XCTAssertTrue(viewModel.resolvedSlashSkillInvocations(in: "/compact", agentKind: .claudeCode).isEmpty)
-        XCTAssertEqual(viewModel.resolvedSlashSkillInvocations(in: "/compact", agentKind: .cursor).first?.definition.name, "compact")
+        XCTAssertTrue(viewModel.providerInputRuntime.resolvedSlashSkillInvocations(in: "/compact", agentKind: .claudeCode).isEmpty)
+        XCTAssertEqual(viewModel.providerInputRuntime.resolvedSlashSkillInvocations(in: "/compact", agentKind: .cursor).first?.definition.name, "compact")
     }
 
     func testLargeRuntimeMenuRetainsLocalSkillAfterDeduplication() async throws {
@@ -2283,8 +2283,8 @@ final class AutoWorkflowSubmissionTests: XCTestCase {
         await fixture.viewModel.cancelPresentedComposerSubmission(id: fixture.claim.attempt.id)
         let selection = await choosing.value
         XCTAssertNil(selection)
-        XCTAssertFalse(fixture.viewModel.composerSubmitClaimIsCurrent(fixture.claim))
-        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.session.tabID), Self.text)
+        XCTAssertFalse(fixture.viewModel.composerSubmitRuntime.isCurrent(fixture.claim))
+        XCTAssertEqual(fixture.viewModel.draftRuntime.text(for: fixture.session.tabID), Self.text)
         XCTAssertTrue(fixture.session.items.isEmpty)
         await fixture.backend.release()
         XCTAssertTrue(fixture.viewModel.autoWorkflowJudgments.isEmpty)

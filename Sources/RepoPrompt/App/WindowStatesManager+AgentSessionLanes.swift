@@ -155,7 +155,7 @@ extension WindowStatesManager {
               let window = window(withID: endpoint.windowID),
               !window.isClosing,
               window.workspaceManager.activeWorkspace?.id == endpoint.workspaceID,
-              window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint
+              window.agentModeViewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint
         else { return nil }
         return workspaceActivityCoordinator.claimLaneRetirement(workspaceID: endpoint.workspaceID)
     }
@@ -204,7 +204,7 @@ extension WindowStatesManager {
               let window = window(withID: endpoint.windowID),
               !window.isClosing,
               window.workspaceManager.activeWorkspaceID == endpoint.workspaceID,
-              window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint
+              window.agentModeViewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint
         else { return false }
         let persisted: [AgentSessionLaneChildRetirementRecord]
         do { persisted = try await agentSessionLinkPersistedChildRetirementRecords() }

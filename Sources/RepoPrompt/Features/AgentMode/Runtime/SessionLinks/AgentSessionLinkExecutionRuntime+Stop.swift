@@ -216,6 +216,36 @@ extension AgentSessionLinkExecutionRuntime {
         let accepted = if case .accepted? = recorder.publicationResult { true } else { false }
         let itemID = session.items.contains(where: { $0.id == request.requestID })
             ? request.requestID : nil
+        @MainActor func settledTerminalWithoutPublication(requireOracleDrain: Bool) -> AgentSessionLinkStopTransactionOutcome? {
+            if recorder.initiatedCancellation, recorder.teardownCompleted, !requireOracleDrain || oracleDrained,
+               recorder.publicationResult == nil, let terminalState = matchedTerminalRunState()
+            {
+                return .settled(Self.agentSessionLinkStopReceipt(
+                    request: request, targetSessionID: candidate.sessionID,
+                    result: .notRunning, stopRequested: true,
+                    teardownCompleted: true, audit: .notRequired,
+                    runState: terminalState
+                ))
+            }
+            return nil
+        }
+        @MainActor func settledStop(auditStatus: DomainAgentSessionLinkStopReceipt.AuditStatus) -> AgentSessionLinkStopTransactionOutcome {
+            let failure: DomainAgentSessionLinkStopReceipt.FailureReason? = switch recorder.publicationResult {
+            case .accepted?: nil
+            case .stale?: .terminalPublicationStale
+            case .rejected?: .terminalPublicationRejected
+            case nil: recorder.initiatedCancellation ? .cancellationUnconfirmed : .targetChanged
+            }
+            return .settled(Self.agentSessionLinkStopReceipt(
+                request: request, targetSessionID: candidate.sessionID,
+                result: accepted ? .stopped : .stopFailed,
+                failure: failure,
+                stopRequested: recorder.initiatedCancellation,
+                teardownCompleted: recorder.teardownCompleted,
+                itemID: itemID, audit: auditStatus,
+                runState: recorder.primaryRevision?.terminalState.rawValue
+            ))
+        }
         if !recorder.initiatedCancellation, oracleHadWork {
             return .settled(Self.agentSessionLinkStopReceipt(
                 request: request,
@@ -236,63 +266,17 @@ extension AgentSessionLinkExecutionRuntime {
                     audit: .notRequired, runState: terminalState
                 ))
             }
-            if recorder.initiatedCancellation, recorder.teardownCompleted, oracleDrained,
-               recorder.publicationResult == nil, let terminalState = matchedTerminalRunState()
-            {
-                return .settled(Self.agentSessionLinkStopReceipt(
-                    request: request, targetSessionID: candidate.sessionID,
-                    result: .notRunning, stopRequested: true,
-                    teardownCompleted: true, audit: .notRequired,
-                    runState: terminalState
-                ))
-            }
-            // An accepted cancellation publication means the run was stopped; only local
-            // teardown is unconfirmed, which `teardownCompleted: false` reports as a warning.
-            let failure: DomainAgentSessionLinkStopReceipt.FailureReason? = switch recorder.publicationResult {
-            case .accepted?: nil
-            case .stale?: .terminalPublicationStale
-            case .rejected?: .terminalPublicationRejected
-            case nil: recorder.initiatedCancellation ? .cancellationUnconfirmed : .targetChanged
-            }
-            return .settled(Self.agentSessionLinkStopReceipt(
-                request: request, targetSessionID: candidate.sessionID,
-                result: accepted ? .stopped : .stopFailed, failure: failure,
-                stopRequested: recorder.initiatedCancellation,
-                teardownCompleted: recorder.teardownCompleted,
-                itemID: itemID, audit: itemID == nil ? .notRequired : .unknown,
-                runState: recorder.primaryRevision?.terminalState.rawValue
-            ))
+            if let settled = settledTerminalWithoutPublication(requireOracleDrain: true) { return settled }
+            // Publication and local teardown remain independent receipts.
+            return settledStop(auditStatus: itemID == nil ? .notRequired : .unknown)
         }
         Task {
             await deadlineSleep(auditDeadlineSeconds)
             audit.finish(.unknown)
         }
         let auditStatus = await audit.value()
-        if recorder.initiatedCancellation, recorder.teardownCompleted,
-           recorder.publicationResult == nil, let terminalState = matchedTerminalRunState()
-        {
-            return .settled(Self.agentSessionLinkStopReceipt(
-                request: request, targetSessionID: candidate.sessionID,
-                result: .notRunning, stopRequested: true,
-                teardownCompleted: true, audit: .notRequired,
-                runState: terminalState
-            ))
-        }
-        let failure: DomainAgentSessionLinkStopReceipt.FailureReason? = switch recorder.publicationResult {
-        case .accepted?: nil
-        case .stale?: .terminalPublicationStale
-        case .rejected?: .terminalPublicationRejected
-        case nil: recorder.initiatedCancellation ? .cancellationUnconfirmed : .targetChanged
-        }
-        return .settled(Self.agentSessionLinkStopReceipt(
-            request: request, targetSessionID: candidate.sessionID,
-            result: accepted ? .stopped : .stopFailed,
-            failure: failure,
-            stopRequested: recorder.initiatedCancellation,
-            teardownCompleted: recorder.teardownCompleted,
-            itemID: itemID, audit: auditStatus,
-            runState: recorder.primaryRevision?.terminalState.rawValue
-        ))
+        if let settled = settledTerminalWithoutPublication(requireOracleDrain: false) { return settled }
+        return settledStop(auditStatus: auditStatus)
     }
 
     private func agentSessionLinkAppendStopRow(

@@ -11,51 +11,11 @@ enum AgentProviderContextBuilder {
         showCodeMapMarkers: Bool = true
     ) async -> String {
         let physicalSelection = lookupContext.physicalizeSelection(logicalSelection)
-        let presentationPlan = await AgentContextExportResolver.codemapPresentationPlan(
-            codeMapUsage: .auto,
-            selection: physicalSelection,
-            store: store,
-            rootScope: lookupContext.rootScope,
-            profile: .uiAssisted
-        )
-        do {
-            return try await WorkspaceCodemapPresentationCoordinator(store: store).withPresentation(
-                for: presentationPlan.intent,
-                rootScope: lookupContext.rootScope,
-                logicalRootDisplayNamesByRootID: lookupContext.logicalRootDisplayNamesByRootID(
-                    store: store
-                )
-            ) { presentation in
-                await makeInitialFileTree(
-                    physicalSelection: physicalSelection,
-                    store: store,
-                    lookupContext: lookupContext,
-                    filePathDisplay: filePathDisplay,
-                    onlyIncludeRootsWithSelectedFiles: onlyIncludeRootsWithSelectedFiles,
-                    showCodeMapMarkers: showCodeMapMarkers,
-                    codemapPresentation: AgentContextExportResolver.merging(
-                        presentation,
-                        preflightIssues: presentationPlan.preflightIssues
-                    )
-                )
-            }
-        } catch {
-            let issue: WorkspaceCodemapOperationIssue = if Task.isCancelled || error is CancellationError {
-                .cancelled
-            } else {
-                .coordinationUnavailable
-            }
-            return await makeInitialFileTree(
-                physicalSelection: physicalSelection,
-                store: store,
-                lookupContext: lookupContext,
-                filePathDisplay: filePathDisplay,
-                onlyIncludeRootsWithSelectedFiles: onlyIncludeRootsWithSelectedFiles,
-                showCodeMapMarkers: showCodeMapMarkers,
-                codemapPresentation: AgentContextExportResolver.merging(
-                    AgentContextExportResolver.unavailablePresentation(issue),
-                    preflightIssues: presentationPlan.preflightIssues
-                )
+        return await withCodemapPresentation(physicalSelection: physicalSelection, store: store, lookupContext: lookupContext) { presentation in
+            await makeInitialFileTree(
+                physicalSelection: physicalSelection, store: store, lookupContext: lookupContext,
+                filePathDisplay: filePathDisplay, onlyIncludeRootsWithSelectedFiles: onlyIncludeRootsWithSelectedFiles,
+                showCodeMapMarkers: showCodeMapMarkers, codemapPresentation: presentation
             )
         }
     }
@@ -108,35 +68,32 @@ enum AgentProviderContextBuilder {
                 overTokenCapSummaryWillBegin: overTokenCapSummaryWillBegin
             )
         }
-        let presentationPlan = await AgentContextExportResolver.codemapPresentationPlan(
-            codeMapUsage: .auto,
-            selection: physicalSelection,
-            store: store,
-            rootScope: lookupContext.rootScope,
-            profile: .uiAssisted
+        return await withCodemapPresentation(physicalSelection: physicalSelection, store: store, lookupContext: lookupContext) { presentation in
+            await makeForkFileContentsBlock(
+                logicalSelection: logicalSelection, physicalSelection: physicalSelection,
+                tokenCap: tokenCap, store: store, lookupContext: lookupContext,
+                codemapPresentation: presentation, overTokenCapSummaryProvider: overTokenCapSummaryProvider,
+                overTokenCapSummaryWillBegin: overTokenCapSummaryWillBegin
+            )
+        }
+    }
+
+    private static func withCodemapPresentation(
+        physicalSelection: StoredSelection,
+        store: WorkspaceFileContextStore,
+        lookupContext: WorkspaceLookupContext,
+        render: (WorkspaceCodemapOperationPresentation) async -> String
+    ) async -> String {
+        let plan = await AgentContextExportResolver.codemapPresentationPlan(
+            codeMapUsage: .auto, selection: physicalSelection, store: store,
+            rootScope: lookupContext.rootScope, profile: .uiAssisted
         )
         do {
             return try await WorkspaceCodemapPresentationCoordinator(store: store).withPresentation(
-                for: presentationPlan.intent,
-                rootScope: lookupContext.rootScope,
-                logicalRootDisplayNamesByRootID: lookupContext.logicalRootDisplayNamesByRootID(
-                    store: store
-                )
+                for: plan.intent, rootScope: lookupContext.rootScope,
+                logicalRootDisplayNamesByRootID: lookupContext.logicalRootDisplayNamesByRootID(store: store)
             ) { presentation in
-                let presentation = AgentContextExportResolver.merging(
-                    presentation,
-                    preflightIssues: presentationPlan.preflightIssues
-                )
-                return await makeForkFileContentsBlock(
-                    logicalSelection: logicalSelection,
-                    physicalSelection: physicalSelection,
-                    tokenCap: tokenCap,
-                    store: store,
-                    lookupContext: lookupContext,
-                    codemapPresentation: presentation,
-                    overTokenCapSummaryProvider: overTokenCapSummaryProvider,
-                    overTokenCapSummaryWillBegin: overTokenCapSummaryWillBegin
-                )
+                await render(AgentContextExportResolver.merging(presentation, preflightIssues: plan.preflightIssues))
             }
         } catch {
             let issue: WorkspaceCodemapOperationIssue = if Task.isCancelled || error is CancellationError {
@@ -144,19 +101,9 @@ enum AgentProviderContextBuilder {
             } else {
                 .coordinationUnavailable
             }
-            return await makeForkFileContentsBlock(
-                logicalSelection: logicalSelection,
-                physicalSelection: physicalSelection,
-                tokenCap: tokenCap,
-                store: store,
-                lookupContext: lookupContext,
-                codemapPresentation: AgentContextExportResolver.merging(
-                    AgentContextExportResolver.unavailablePresentation(issue),
-                    preflightIssues: presentationPlan.preflightIssues
-                ),
-                overTokenCapSummaryProvider: overTokenCapSummaryProvider,
-                overTokenCapSummaryWillBegin: overTokenCapSummaryWillBegin
-            )
+            return await render(AgentContextExportResolver.merging(
+                AgentContextExportResolver.unavailablePresentation(issue), preflightIssues: plan.preflightIssues
+            ))
         }
     }
 

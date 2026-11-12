@@ -24,7 +24,7 @@ extension AgentModeViewModel {
         // Move recovery ownership into the pending send, rather than discarding it.
         repromptUIStore.clearSubmittedDraft(submittedRepromptDraft)
         // claim captured the exact original before this clear. Any later typing is a new draft.
-        if composerSubmitClaimIsCurrent(claim) {
+        if composerSubmitRuntime.isCurrent(claim) {
             claim.cancellation.oweDraftRestoration(attempt.rawDraftSnapshot)
             storeDraftText(for: attempt.sourceTabID, "")
         }
@@ -60,7 +60,7 @@ extension AgentModeViewModel {
     /// Idempotent cleanup also covers cancellation before the asynchronous executor starts.
     func clearRepromptSubmissionState(claimID: UUID) {
         autoWorkflowJudgments.removeValue(forKey: claimID)?.cancel()
-        cancelRepromptSpeculation(claimID: claimID)
+        repromptSpeculations.removeValue(forKey: claimID)?.cancel(runtime: modelRouterRuntime)
         repromptAudits[claimID] = nil
         repromptDispatchTexts[claimID] = nil
         repromptDispatchOriginals[claimID] = nil
@@ -77,13 +77,13 @@ extension AgentModeViewModel {
     private func restorePendingComposerRepromptMetadata(_ pending: AgentComposerPendingSubmission, message: String) {
         repromptUIStore.restoreCancelledDraft(
             pending.repromptDraft.cancelledDraft, tabID: pending.sourceTabID,
-            currentDraft: retrieveDraftText(for: pending.sourceTabID)
+            currentDraft: draftRuntime.text(for: pending.sourceTabID)
         )
         if repromptUIStore.recoveries[pending.sourceTabID] == nil {
             if let original = pending.originalDraft, pending.text != original {
                 repromptUIStore.recover(
                     tabID: pending.sourceTabID, text: pending.text, originalDraft: original,
-                    reason: message, currentDraft: retrieveDraftText(for: pending.sourceTabID), requiresDecision: true
+                    reason: message, currentDraft: draftRuntime.text(for: pending.sourceTabID), requiresDecision: true
                 )
             } else {
                 repromptUIStore.recoveries[pending.sourceTabID] = pending.repromptDraft.recovery

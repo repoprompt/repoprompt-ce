@@ -300,11 +300,7 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         var items: [SessionAdminItemResult] = []
         var authorityLost = false
         for lease in batch.leases {
-            guard !authorityLost, context.scopes.isCurrent(lease) else {
-                authorityLost = true
-                items.append(.revoked(lease.targetSessionID))
-                continue
-            }
+            if context.appendRevocationIfNeeded(lease, authorityLost: &authorityLost, items: &items) { continue }
             if batch.request.preview {
                 let idle = host.isIdleForWorktreeTransition(sessionID: lease.targetSessionID)
                 items.append(SessionAdminItemResult(
@@ -628,11 +624,7 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         var authorityLost = false
         for lease in batch.leases {
             let target = lease.targetSessionID
-            guard !authorityLost, context.scopes.isCurrent(lease) else {
-                authorityLost = true
-                items.append(.revoked(target))
-                continue
-            }
+            if context.appendRevocationIfNeeded(lease, authorityLost: &authorityLost, items: &items) { continue }
             let allBound = host.boundWorktrees(sessionID: target)
             let bound = allBound.filter { worktreeID == nil || $0.worktreeID == worktreeID }
             if let approvedBindings, approvedBindings[target] != Set(bound.map(\.worktreeID)) {

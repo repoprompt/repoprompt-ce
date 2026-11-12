@@ -1515,7 +1515,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         // A live provider conversation already has a persistent runtime writer, whether or
         // not its turn is MCP-controlled. Unbound local creation is covered separately.
         let persistentSessionID = UUID()
-        XCTAssertNil(harness.host.test_bindingRejection(sessionID: persistentSessionID, on: session))
+        XCTAssertNil(harness.host.runtimeSessionStore.bindingRejection(persistentSessionID, on: session))
         session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: persistentSessionID, workspaceID: UUID()))
         session.recordRestorationAuthoritative(.persistedPayloadApplied)
         XCTAssertNotNil(try harness.host.runtimeCommand(sessionID: persistentSessionID))
@@ -1559,7 +1559,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
     private func cleanup(_ fixture: Fixture) async {
         await fixture.harness.host.claudeCoordinator.shutdownClaudeSession(fixture.session)
         if let context = fixture.session.mcpControlContext { await AgentRunSessionStore.cleanup(registration: context.registration) }
-        fixture.harness.host.test_setAfterMCPStoreEpochBegan(nil)
+        fixture.harness.host.mcpRuntime.test_afterEpochBegan = nil
     }
 
     private func feed(_ payload: [String: Any], _ controller: ClaudeNativeProcessSessionController) async throws {
@@ -2250,7 +2250,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         // A live provider conversation already has a persistent runtime writer, whether or
         // not its turn is MCP-controlled. Unbound local creation is covered separately.
         let persistentSessionID = UUID()
-        XCTAssertNil(harness.host.test_bindingRejection(sessionID: persistentSessionID, on: session))
+        XCTAssertNil(harness.host.runtimeSessionStore.bindingRejection(persistentSessionID, on: session))
         session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: persistentSessionID, workspaceID: UUID()))
         session.recordRestorationAuthoritative(.persistedPayloadApplied)
         XCTAssertNotNil(try harness.host.runtimeCommand(sessionID: persistentSessionID))
@@ -2298,7 +2298,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
     func testViewModelAdoptionRaceAugmentsLocalAttachmentOnceAndDoesNotConvertLaneWake() async throws {
         let (h, session, controller, _) = try await spyFixture(mcp: true)
         let gate = Gate()
-        h.host.test_setAfterMCPStoreEpochBegan { await gate.wait() }
+        h.host.mcpRuntime.test_afterEpochBegan = { await gate.wait() }
         let providerID = UUID()
         await controller.setTurnInFlight(true)
         await controller.emit(.providerTurnStarted(turnID: providerID))
@@ -2338,7 +2338,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         XCTAssertEqual(session.items.count { $0.kind == .user }, 1, "The lane wake must not create a synthetic input")
         let owner = try XCTUnwrap(session.lastTerminalCommitRevision?.ownership)
         if case let .exact(id) = session.terminalAnchor(for: owner) { XCTAssertEqual(id, row.id) } else { XCTFail("The transferred real user row owns the terminal anchor") }
-        h.host.test_setAfterMCPStoreEpochBegan(nil)
+        h.host.mcpRuntime.test_afterEpochBegan = nil
         await h.host.claudeCoordinator.shutdownClaudeSession(session)
         if let context = session.mcpControlContext { await AgentRunSessionStore.cleanup(registration: context.registration) }
     }
@@ -2379,9 +2379,9 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
             let writer = command.writer
             let binding = f.session.currentRestorationBindingToken
             let gate = Gate()
-            f.harness.host.test_setAfterMCPStoreEpochBegan { await gate.wait() }
+            f.harness.host.mcpRuntime.test_afterEpochBegan = { await gate.wait() }
             defer { gate.open()
-                f.harness.host.test_setAfterMCPStoreEpochBegan(nil)
+                f.harness.host.mcpRuntime.test_afterEpochBegan = nil
             }
             try await feed(assistant("provider work held at epoch acknowledgement"), f.controller)
             await until("provider epoch preparation is held") { gate.isWaiting }
@@ -2487,7 +2487,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
     func testInternalCancellationDuringPendingAdoptionPreservesQueuedLocalWork() async throws {
         let f = try await fixture(mcp: true)
         let gate = Gate()
-        f.harness.host.test_setAfterMCPStoreEpochBegan { await gate.wait() }
+        f.harness.host.mcpRuntime.test_afterEpochBegan = { await gate.wait() }
         try await feed(assistant("pending provider"), f.controller)
         await until("provider epoch preparation is held") { gate.isWaiting }
         f.session.pendingInstructions.append("queued local input")
@@ -2990,7 +2990,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         let transcript = AgentTranscriptProjectionBuilder.normalizedFrozenDetailedToolTailLimits(in: saved)
         let canonicalItems = AgentTranscriptIO.workingSourceItems(from: transcript)
         session.setItemsSilently(canonicalItems, reason: .persistedSessionHydration)
-        harness.host.applyTranscriptPresentation(transcript, sourceItems: canonicalItems, to: session, isColdLoad: true)
+        AgentSessionTranscriptRefreshRuntime.applyTranscriptPresentation(transcript, sourceItems: canonicalItems, to: session, isColdLoad: true)
         session.nextSequenceIndex = transcript.nextSequenceIndex
         session.hasSentFirstMessage = transcript.turns.contains { $0.request != nil }
         XCTAssertEqual(session.transcript, transcript)
@@ -3081,7 +3081,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
             print("C2 routing fixture ready seed=\(seedCount) setup=\(setupStarted.duration(to: .now))")
             var resume: CheckedContinuation<Void, Never>?
             var preparationCount = 0
-            f.harness.host.test_setAfterMCPStoreEpochBegan {
+            f.harness.host.mcpRuntime.test_afterEpochBegan = {
                 preparationCount += 1
                 if preparationCount == 2, let terminalStarted { terminalDurations.append(terminalStarted.duration(to: .now)) }
                 if preparationCount == 1 { await withCheckedContinuation { resume = $0 } }
@@ -3241,15 +3241,15 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
                 }
                 XCTAssertNotEqual(epochs[0], epochs[1])
                 let preparation = Gate()
-                vm.test_setAfterMCPStoreEpochBegan { await preparation.wait() }
+                vm.mcpRuntime.test_afterEpochBegan = { await preparation.wait() }
                 defer { preparation.open()
-                    vm.test_setAfterMCPStoreEpochBegan(nil)
+                    vm.mcpRuntime.test_afterEpochBegan = nil
                 }
                 let installedListener = await vm.claudeCoordinator.test_installEventListener(for: live)
                 let listener = try XCTUnwrap(installedListener)
                 await controller.emit(.providerTurnStarted(turnID: UUID()))
                 await until("third turn waits in fresh epoch preparation") { preparation.isWaiting }
-                XCTAssertEqual(vm.mcpSnapshot(for: live)?.status, .running)
+                XCTAssertEqual(vm.mcpRuntime.mcpSnapshot(for: live)?.status, .running)
                 let adoption = listener.adoptionTask
                 let candidate = try XCTUnwrap(vm.agentSessionLinkCandidate(tabID: tabID, sessionID: sessionID, tabName: "Claude route", isWindowClosing: false))
                 let observer = DomainAgentSessionLinkEndpointIdentity(windowID: 2, workspaceID: UUID(), tabID: UUID(), sessionID: UUID(), persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1)
@@ -3298,7 +3298,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         await until("first attempt starts") { f.session.runState == .running }
         let first = try XCTUnwrap(f.session.activeRunOwnership)
         let epochPreparation = Gate()
-        f.harness.host.test_setAfterMCPStoreEpochBegan { await epochPreparation.wait() }
+        f.harness.host.mcpRuntime.test_afterEpochBegan = { await epochPreparation.wait() }
         let bytes = try [result("first-final"), assistant("second")].map { try JSONSerialization.data(withJSONObject: $0) + Data([10]) }.reduce(Data(), +)
         await f.controller.test_handleConfigurationStdoutChunk(bytes)
         await until("prior publication is held") { gate.isWaiting && f.listener.pendingProviderTurnID != nil }
@@ -3308,7 +3308,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         gate.open()
         await until("handed-back turn is preparing its fresh epoch") { epochPreparation.isWaiting }
         XCTAssertTrue(f.session.mcpFollowUpRunPending)
-        XCTAssertEqual(f.harness.host.mcpSnapshot(for: f.session)?.status, .running)
+        XCTAssertEqual(f.harness.host.mcpRuntime.mcpSnapshot(for: f.session)?.status, .running)
         epochPreparation.open()
         await until("second starts after publication") { f.session.runState == .running && f.session.activeRunOwnership?.attemptID != first.attemptID }
         XCTAssertNotEqual(f.session.activeRunOwnership?.turnEpoch, first.turnEpoch)
@@ -3392,7 +3392,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         await f.harness.host.mcpRuntime.prepareWaitTrackingForRunStart(session: f.session, stopFence: .init(session: f.session))
         let prepared = try XCTUnwrap(f.session.mcpControlContext?.preparedEpoch)
         var preparations = 0
-        f.harness.host.test_setAfterMCPStoreEpochBegan { preparations += 1 }
+        f.harness.host.mcpRuntime.test_afterEpochBegan = { preparations += 1 }
         try await feed(assistant("prepared successor"), f.controller)
         await until("successor is adopted") { f.session.runState == .running }
         XCTAssertEqual(f.session.activeRunOwnership?.turnEpoch, prepared)
@@ -3408,7 +3408,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         let f = try await fixture(mcp: true)
         let other = try await fixture()
         let gate = Gate()
-        f.harness.host.test_setAfterMCPStoreEpochBegan { await gate.wait() }
+        f.harness.host.mcpRuntime.test_afterEpochBegan = { await gate.wait() }
         try await feed(assistant("old binding"), f.controller)
         await until("old epoch preparation is held") { gate.isWaiting }
         let adoption = f.listener.adoptionTask
@@ -3431,14 +3431,14 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
     func testStopDuringEpochPreparationCannotReadoptOrRetainRunningMask() async throws {
         let f = try await fixture(mcp: true)
         var resume: CheckedContinuation<Void, Never>?
-        f.harness.host.test_setAfterMCPStoreEpochBegan {
+        f.harness.host.mcpRuntime.test_afterEpochBegan = {
             await withCheckedContinuation { resume = $0 }
         }
         try await feed(assistant("pending adoption"), f.controller)
         await until("epoch preparation is suspended") { resume != nil }
         XCTAssertTrue(f.listener.isBusy)
         XCTAssertTrue(f.session.mcpFollowUpRunPending)
-        XCTAssertEqual(f.harness.host.mcpSnapshot(for: f.session)?.status, .running)
+        XCTAssertEqual(f.harness.host.mcpRuntime.mcpSnapshot(for: f.session)?.status, .running)
         let busy = await f.harness.host.preparedOversightRuntimeIsBusy()
         XCTAssertTrue(busy)
         let adoption = f.listener.adoptionTask

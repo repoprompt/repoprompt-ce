@@ -242,7 +242,7 @@ extension AgentModeViewModel {
     func agentSessionLinkLaneProvenance(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> UUID? {
-        guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+        guard linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
               let session = session(for: endpoint.tabID, createIfNeeded: false),
               session.activeAgentSessionID == endpoint.sessionID
         else { return nil }
@@ -305,7 +305,7 @@ extension AgentModeViewModel {
         let canRetire: @MainActor () -> Bool = { [weak self] in
             guard let self,
                   isStillRetirable(),
-                  agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+                  linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
                   let session = session(for: endpoint.tabID, createIfNeeded: false),
                   session.activeAgentSessionID == endpoint.sessionID,
                   agentSessionLinkLaneSessionIsQuiescent(session),
@@ -352,7 +352,7 @@ extension AgentModeViewModel {
     /// The synchronous slice of the retire CAS run immediately before unlinking: endpoint
     /// currentness, target quiescence, live subtree settlement, and the save-admission probe.
     func agentSessionLinkRetirementReadiness(endpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool {
-        guard agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+        guard linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
               let session = session(for: endpoint.tabID, createIfNeeded: false),
               session.activeAgentSessionID == endpoint.sessionID,
               agentSessionLinkLaneSessionIsQuiescent(session),

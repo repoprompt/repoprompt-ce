@@ -160,7 +160,7 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
             ))
             fixture.session.recordRestorationAuthoritative(.persistedPayloadApplied)
             fixture.session.isDirty = true
-            let result = await viewModel.flushSaveRequired(for: fixture.session.tabID, workspaceID: fixture.workspaceID)
+            let result = await viewModel.persistenceRuntime.flushSaveRequired(for: fixture.session.tabID, workspaceID: fixture.workspaceID)
             guard case let .failure(failure) = result else { return XCTFail("An unscoped binding cannot write") }
             XCTAssertEqual(failure.message, "The session does not have a unique runtime writer for this workspace.")
             XCTAssertEqual(writes, 0)
@@ -186,12 +186,12 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
             ))
             competitorScope?.replaceSessions([competitor.tabID: competitor])
             fixture.session.isDirty = true
-            let refused = await viewModel.flushSaveRequired(for: fixture.session.tabID, workspaceID: fixture.workspaceID)
+            let refused = await viewModel.persistenceRuntime.flushSaveRequired(for: fixture.session.tabID, workspaceID: fixture.workspaceID)
             if case .success = refused { XCTFail("Conflicting identities must never authorize a durable write") }
             XCTAssertEqual(writes, 0)
             XCTAssertTrue(fixture.session.isDirty)
             competitorScope = nil
-            try await viewModel.flushSaveRequired(for: fixture.session.tabID, workspaceID: fixture.workspaceID).get()
+            try await viewModel.persistenceRuntime.flushSaveRequired(for: fixture.session.tabID, workspaceID: fixture.workspaceID).get()
             XCTAssertEqual(writes, 1)
             XCTAssertFalse(fixture.session.isDirty)
             let saved = try await fixture.savedSession()
@@ -248,7 +248,7 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
                 XCTAssertEqual(repeatedEffort["result"], .string("applied"), String(describing: repeatedEffort))
                 XCTAssertEqual(repeatedEffort["changed_count"], .int(0))
                 XCTAssertEqual(repeatedEffort["state_satisfied"], .bool(true))
-                try await fixture.window.agentModeViewModel.flushSaveRequired(
+                try await fixture.window.agentModeViewModel.persistenceRuntime.flushSaveRequired(
                     for: fixture.session.tabID, workspaceID: fixture.workspaceID
                 ).get()
                 let saved = try await fixture.savedSession()
@@ -346,7 +346,7 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
                 peer.parentSessionID = fixture.session.parentSessionID
                 peer.createdByOverseerSessionID = fixture.session.createdByOverseerSessionID
                 peer.hasLoadedPersistedState = peerReady
-                XCTAssertEqual(fixture.replica.agentModeViewModel.test_bindingRejection(sessionID: fixture.sessionID, on: peer), .conflictingWriter)
+                XCTAssertEqual(fixture.replica.agentModeViewModel.runtimeSessionStore.bindingRejection(fixture.sessionID, on: peer), .conflictingWriter)
                 XCTAssertNil(fixture.replica.agentModeViewModel.test_installPersistentSessionBinding(
                     sessionID: fixture.sessionID, on: peer
                 ))
@@ -1453,7 +1453,7 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
                 try await dataService.saveAgentSession(payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count)
             }
             session.isDirty = true
-            try await viewModel.flushSaveRequired(for: targetTab.id, workspaceID: workspace.id).get()
+            try await viewModel.persistenceRuntime.flushSaveRequired(for: targetTab.id, workspaceID: workspace.id).get()
             XCTAssertTrue(try viewModel.authoritativeLiveSession(for: sessionID) === session)
             workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
             if replicaHoldsTarget {
@@ -1528,7 +1528,7 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
             var service = SessionAdminMCPToolService(
                 captureRequestMetadata: { .init(connectionID: UUID(), clientName: "worktree-recovery-test", windowID: window.windowID) },
                 requireTargetWindow: { window },
-                resolveObserverEndpoint: { _, _ in viewModel.agentSessionLinkObserverEndpoint(tabID: foregroundTabID) },
+                resolveObserverEndpoint: { _, _ in viewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: foregroundTabID) },
                 scopes: { scopes }, administration: { door }
             )
             service.isToolEnabled = { true }

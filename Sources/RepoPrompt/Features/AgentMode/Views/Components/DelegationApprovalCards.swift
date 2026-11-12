@@ -371,13 +371,7 @@ struct DelegationScopeApprovalCard: View {
                 .disabled(selected.isEmpty || authorityUnavailableReason != nil)
             }
         }
-        .padding(12)
-        .background(Color.orange.opacity(0.06))
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(Color.orange.opacity(0.32), lineWidth: 1)
-        )
+        .agentApprovalSurface(strokeOpacity: 0.32)
     }
 
     private func binding(for capability: DomainDelegationScopeCapability) -> Binding<Bool> {

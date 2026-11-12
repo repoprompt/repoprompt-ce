@@ -1,5 +1,67 @@
 import SwiftUI
 
+enum AgentSelectedFilesTab {
+    case files
+    case codemaps
+}
+
+extension AgentSelectedFilesRowSplit {
+    func rows(for tab: AgentSelectedFilesTab) -> [AgentContextExportRow] {
+        switch tab {
+        case .files: fileRows
+        case .codemaps: codemapRows
+        }
+    }
+}
+
+@MainActor
+func adjustAgentSelectedFilesTab(_ activeTab: Binding<AgentSelectedFilesTab>, fileCount: Int, codemapCount: Int) {
+    if activeTab.wrappedValue == .files, fileCount == 0, codemapCount > 0 {
+        activeTab.wrappedValue = .codemaps
+    } else if activeTab.wrappedValue == .codemaps, codemapCount == 0, fileCount > 0 {
+        activeTab.wrappedValue = .files
+    }
+}
+
+@MainActor
+func agentSelectedFilesEmptyState(title: String, fontPreset: FontScalePreset) -> some View {
+    VStack(spacing: 12) {
+        Image(systemName: "doc.text")
+            .font(.system(size: 34))
+            .foregroundColor(.secondary.opacity(0.4))
+        Text(title)
+            .font(fontPreset.standardFont)
+            .foregroundColor(.secondary)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+}
+
+@MainActor
+func agentSelectedFilesTabButton(icon: String, label: String, count: Int, isActive: Bool, fontPreset: FontScalePreset, padding: CGSize, minHeight: CGFloat, inactiveLineOpacity: Double, action: @escaping () -> Void) -> some View {
+    Button(action: action) {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+            Text(label)
+                .font(fontPreset.captionFont.weight(.semibold))
+            Text("\(count)")
+                .font(fontPreset.captionFont.weight(.medium))
+        }
+        .padding(.horizontal, padding.width)
+        .padding(.vertical, padding.height)
+        .frame(maxWidth: .infinity, minHeight: minHeight)
+        .foregroundColor(isActive ? Color.accentColor : Color.secondary)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(isActive ? Color.accentColor : Color.secondary.opacity(inactiveLineOpacity))
+                .frame(height: isActive ? 2 : 1)
+        }
+        .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .disabled(isActive)
+}
+
 enum AgentContextSelectedFilesLayout: Equatable {
     case list
     case adaptiveGrid(minimumWidth: CGFloat)
@@ -17,45 +79,10 @@ struct AgentContextSelectedFilesContent: View {
 
     @ObservedObject private var fontScale = FontScaleManager.shared
     @StateObject private var previewCoordinator = AgentSelectedFilePreviewLoadCoordinator()
-    @State private var activeTab: Tab = .files
-
-    private enum Tab {
-        case files
-        case codemaps
-    }
+    @State private var activeTab: AgentSelectedFilesTab = .files
 
     private var fontPreset: FontScalePreset {
         fontScale.preset
-    }
-
-    private struct RowSplit {
-        let rows: [AgentContextExportRow]
-        let fileRows: [AgentContextExportRow]
-        let codemapRows: [AgentContextExportRow]
-
-        init(rows: [AgentContextExportRow]) {
-            self.rows = rows
-            var fileRows: [AgentContextExportRow] = []
-            var codemapRows: [AgentContextExportRow] = []
-            fileRows.reserveCapacity(rows.count)
-            codemapRows.reserveCapacity(rows.count)
-            for row in rows {
-                if row.kind == .codemap {
-                    codemapRows.append(row)
-                } else {
-                    fileRows.append(row)
-                }
-            }
-            self.fileRows = fileRows
-            self.codemapRows = codemapRows
-        }
-
-        func rows(for tab: Tab) -> [AgentContextExportRow] {
-            switch tab {
-            case .files: fileRows
-            case .codemaps: codemapRows
-            }
-        }
     }
 
     private var rows: [AgentContextExportRow] {
@@ -63,7 +90,7 @@ struct AgentContextSelectedFilesContent: View {
     }
 
     var body: some View {
-        let split = RowSplit(rows: rows)
+        let split = AgentSelectedFilesRowSplit(rows: rows)
 
         VStack(alignment: .leading, spacing: 6) {
             header(split: split)
@@ -74,11 +101,11 @@ struct AgentContextSelectedFilesContent: View {
                 ProgressView()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if split.rows.isEmpty {
-                emptyState(title: "No files selected")
+                agentSelectedFilesEmptyState(title: "No files selected", fontPreset: fontPreset)
             } else {
                 let activeRows = split.rows(for: activeTab)
                 if activeRows.isEmpty {
-                    emptyState(title: activeTab == .files ? "No files in Agent context" : "No codemaps in Agent context")
+                    agentSelectedFilesEmptyState(title: activeTab == .files ? "No files in Agent context" : "No codemaps in Agent context", fontPreset: fontPreset)
                 } else {
                     rowList(activeRows)
                 }
@@ -87,13 +114,13 @@ struct AgentContextSelectedFilesContent: View {
         .padding(8)
         .onAppear {
             onRefresh()
-            adjustActiveTab(fileCount: split.fileRows.count, codemapCount: split.codemapRows.count)
+            adjustAgentSelectedFilesTab($activeTab, fileCount: split.fileRows.count, codemapCount: split.codemapRows.count)
         }
         .onChange(of: split.fileRows.count) { _, _ in
-            adjustActiveTab(fileCount: split.fileRows.count, codemapCount: split.codemapRows.count)
+            adjustAgentSelectedFilesTab($activeTab, fileCount: split.fileRows.count, codemapCount: split.codemapRows.count)
         }
         .onChange(of: split.codemapRows.count) { _, _ in
-            adjustActiveTab(fileCount: split.fileRows.count, codemapCount: split.codemapRows.count)
+            adjustAgentSelectedFilesTab($activeTab, fileCount: split.fileRows.count, codemapCount: split.codemapRows.count)
         }
         .onChange(of: activeTab) { _, _ in
             previewCoordinator.reconcileVisibleRows(split.rows(for: activeTab))
@@ -103,7 +130,7 @@ struct AgentContextSelectedFilesContent: View {
         }
     }
 
-    private func header(split: RowSplit) -> some View {
+    private func header(split: AgentSelectedFilesRowSplit) -> some View {
         HStack(alignment: .center) {
             Text("Agent Files")
                 .font(fontPreset.standardFont.weight(.medium))
@@ -133,50 +160,18 @@ struct AgentContextSelectedFilesContent: View {
         }
     }
 
-    private func tabSwitcher(split: RowSplit) -> some View {
+    private func tabSwitcher(split: AgentSelectedFilesRowSplit) -> some View {
         HStack(spacing: 0) {
-            tabButton(icon: "doc.text", label: "Files", count: split.fileRows.count, tab: .files) {
+            agentSelectedFilesTabButton(icon: "doc.text", label: "Files", count: split.fileRows.count, isActive: activeTab == .files, fontPreset: fontPreset, padding: CGSize(width: 14, height: 8), minHeight: 34, inactiveLineOpacity: 0.2) {
                 activeTab = .files
             }
-            tabButton(icon: "square.grid.2x2", label: "Codemaps", count: split.codemapRows.count, tab: .codemaps) {
+            agentSelectedFilesTabButton(icon: "square.grid.2x2", label: "Codemaps", count: split.codemapRows.count, isActive: activeTab == .codemaps, fontPreset: fontPreset, padding: CGSize(width: 14, height: 8), minHeight: 34, inactiveLineOpacity: 0.2) {
                 activeTab = .codemaps
             }
         }
         .frame(maxWidth: .infinity)
         .padding(.horizontal, -12)
         .padding(.vertical, -6)
-    }
-
-    private func tabButton(
-        icon: String,
-        label: String,
-        count: Int,
-        tab: Tab,
-        action: @escaping () -> Void
-    ) -> some View {
-        let isActive = activeTab == tab
-        return Button(action: action) {
-            HStack(spacing: 6) {
-                Image(systemName: icon)
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-                Text(label)
-                    .font(fontPreset.captionFont.weight(.semibold))
-                Text("\(count)")
-                    .font(fontPreset.captionFont.weight(.medium))
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            .frame(maxWidth: .infinity, minHeight: 34)
-            .foregroundColor(isActive ? Color.accentColor : Color.secondary)
-            .overlay(alignment: .bottom) {
-                Rectangle()
-                    .fill(isActive ? Color.accentColor : Color.secondary.opacity(0.2))
-                    .frame(height: isActive ? 2 : 1)
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .disabled(isActive)
     }
 
     private func rowList(_ activeRows: [AgentContextExportRow]) -> some View {
@@ -219,25 +214,5 @@ struct AgentContextSelectedFilesContent: View {
                 onRemove(row, model)
             }
         )
-    }
-
-    private func emptyState(title: String) -> some View {
-        VStack(spacing: 12) {
-            Image(systemName: "doc.text")
-                .font(.system(size: 34))
-                .foregroundColor(.secondary.opacity(0.4))
-            Text(title)
-                .font(fontPreset.standardFont)
-                .foregroundColor(.secondary)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private func adjustActiveTab(fileCount: Int, codemapCount: Int) {
-        if activeTab == .files, fileCount == 0, codemapCount > 0 {
-            activeTab = .codemaps
-        } else if activeTab == .codemaps, codemapCount == 0, fileCount > 0 {
-            activeTab = .files
-        }
     }
 }
