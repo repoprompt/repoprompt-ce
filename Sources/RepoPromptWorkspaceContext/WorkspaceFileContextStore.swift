@@ -19800,6 +19800,8 @@ package actor WorkspaceFileContextStore {
             case catalogValidation
             case catalogValidationResult
             case candidateEligibility
+            case candidateObservation
+            case explicitMaterializationEligibility
             case candidateMissingFilePrune
             case missingFilePruneFence
             case explicitManagedRegistration
@@ -19964,8 +19966,7 @@ package actor WorkspaceFileContextStore {
             try Task.checkCancellation()
             guard let currentState = rootStatesByID[binding.lookupRoot.id],
                   currentState.lifetimeID == expectedLifetimeID,
-                  currentState.service === state.service,
-                  file(rootID: binding.lookupRoot.id, relativePath: relativePath) == nil
+                  currentState.service === state.service
             else {
                 hasUnavailableBinding = true
                 EditFlowPerf.lifecycleEvent(
@@ -19999,7 +20000,7 @@ package actor WorkspaceFileContextStore {
             )
             switch eligibility {
             case .eligible:
-                guard let observation = try await exactFileBindingObservation(
+                guard let probed = try await exactFileCandidateAfterEligibility(
                     binding: binding,
                     relativePath: relativePath,
                     state: currentState
@@ -20007,19 +20008,14 @@ package actor WorkspaceFileContextStore {
                     hasUnavailableBinding = true
                     continue
                 }
-                bindingObservations.append(observation)
-                matches.append(ExactFileCandidate(
-                    binding: binding,
-                    rootLifetimeID: expectedLifetimeID,
-                    rootService: state.service,
-                    file: nil
-                ))
+                bindingObservations.append(probed.observation)
+                matches.append(probed.candidate)
                 endBindingProbe(
                     outcome: "eligible",
                     rootToken: currentState.service.diagnosticRootToken.uuidString
                 )
             case .ineligible(.ignored):
-                guard let observation = try await exactFileBindingObservation(
+                guard let probed = try await exactFileCandidateAfterEligibility(
                     binding: binding,
                     relativePath: relativePath,
                     state: currentState
@@ -20027,18 +20023,17 @@ package actor WorkspaceFileContextStore {
                     hasUnavailableBinding = true
                     continue
                 }
-                bindingObservations.append(observation)
-                matches.append(ExactFileCandidate(
-                    binding: binding,
-                    rootLifetimeID: expectedLifetimeID,
-                    rootService: state.service,
-                    file: nil
-                ))
+                bindingObservations.append(probed.observation)
+                matches.append(probed.candidate)
                 endBindingProbe(
                     outcome: "ignored",
                     rootToken: currentState.service.diagnosticRootToken.uuidString
                 )
             case .ineligible(.missingOrDirectory):
+                guard file(rootID: binding.lookupRoot.id, relativePath: relativePath) == nil else {
+                    hasUnavailableBinding = true
+                    continue
+                }
                 EditFlowPerf.lifecycleEvent(
                     EditFlowPerf.Lifecycle.WorkspaceExactResolution.checkpoint,
                     EditFlowPerf.Dimensions(
@@ -20101,6 +20096,10 @@ package actor WorkspaceFileContextStore {
                     rootToken: stateAfterPrune?.service.diagnosticRootToken.uuidString
                 )
             case .ineligible:
+                guard file(rootID: binding.lookupRoot.id, relativePath: relativePath) == nil else {
+                    hasUnavailableBinding = true
+                    continue
+                }
                 guard let observation = try await exactFileBindingObservation(
                     binding: binding,
                     relativePath: relativePath,
@@ -20126,6 +20125,62 @@ package actor WorkspaceFileContextStore {
         )
     }
 
+    /// A catalog publication while probing an uncatalogued path is progress, not a root
+    /// replacement. Adopt it only after the ordinary catalog-present disk validation, under
+    /// the original root lifetime/service. There is no retry across record or root turnover.
+    private func publishedExactFileCandidate(
+        binding: WorkspaceExactFileNamespace.RootBinding,
+        relativePath: String,
+        state: RootState
+    ) async throws -> (candidate: ExactFileCandidate, observation: ExactFileBindingObservation)? {
+        guard let currentState = rootStatesByID[binding.lookupRoot.id],
+              currentState.lifetimeID == state.lifetimeID,
+              currentState.service === state.service,
+              let published = file(rootID: binding.lookupRoot.id, relativePath: relativePath)
+        else { return nil }
+        let validation = try await validateCatalogFileStillPresent(published)
+        try Task.checkCancellation()
+        guard case let .current(validated, lifetimeID, service) = validation,
+              lifetimeID == state.lifetimeID,
+              service === state.service,
+              let observation = try await exactFileBindingObservation(
+                  binding: binding, relativePath: relativePath, state: state
+              ),
+              observation.catalogFileID == validated.id,
+              observation.catalogFileFullPath == validated.standardizedFullPath,
+              observation.diskPathState == .regularFile
+        else { return nil }
+        EditFlowPerf.lifecycleEvent(
+            EditFlowPerf.Lifecycle.WorkspaceExactResolution.checkpoint,
+            correlation: EditFlowPerf.currentLifecycleCorrelation,
+            EditFlowPerf.Dimensions(runPurpose: "catalogPublicationValidation", status: "catalogPublishedDuringProbe", rootToken: service.diagnosticRootToken.uuidString)
+        )
+        return (
+            ExactFileCandidate(binding: binding, rootLifetimeID: lifetimeID, rootService: service, file: validated),
+            observation
+        )
+    }
+
+    private func exactFileCandidateAfterEligibility(
+        binding: WorkspaceExactFileNamespace.RootBinding,
+        relativePath: String,
+        state: RootState
+    ) async throws -> (candidate: ExactFileCandidate, observation: ExactFileBindingObservation)? {
+        if file(rootID: binding.lookupRoot.id, relativePath: relativePath) != nil {
+            return try await publishedExactFileCandidate(binding: binding, relativePath: relativePath, state: state)
+        }
+        let observation = try await exactFileBindingObservation(binding: binding, relativePath: relativePath, state: state)
+        // Publication may also arrive during the observation's physical path-state read.
+        if file(rootID: binding.lookupRoot.id, relativePath: relativePath) != nil {
+            return try await publishedExactFileCandidate(binding: binding, relativePath: relativePath, state: state)
+        }
+        guard let observation, observation.catalogFileID == nil else { return nil }
+        return (
+            ExactFileCandidate(binding: binding, rootLifetimeID: state.lifetimeID, rootService: state.service, file: nil),
+            observation
+        )
+    }
+
     private func exactFileBindingObservation(
         binding: WorkspaceExactFileNamespace.RootBinding,
         relativePath: String,
@@ -20133,6 +20188,9 @@ package actor WorkspaceFileContextStore {
     ) async throws -> ExactFileBindingObservation? {
         let catalogFile = file(rootID: binding.lookupRoot.id, relativePath: relativePath)
         let physicalState = try await state.service.cancellationResponsiveCatalogPathState(relativePath: relativePath)
+        #if DEBUG
+            await awaitExactFileSuspensionGateForTesting(point: .candidateObservation, rootID: binding.lookupRoot.id)
+        #endif
         try Task.checkCancellation()
         let currentFile = file(rootID: binding.lookupRoot.id, relativePath: relativePath)
         guard let currentState = rootStatesByID[binding.lookupRoot.id],
@@ -20255,7 +20313,13 @@ package actor WorkspaceFileContextStore {
         case .ambiguous:
             return .ambiguous
         case .unavailable:
-            return .unavailable
+            // Materialization also suspends with an absent-catalog precondition. If a
+            // watcher or another explicit reader published the file meanwhile, validate
+            // that record instead of treating benign publication as lost authority.
+            guard let published = try await publishedExactFileCandidate(
+                binding: candidate.binding, relativePath: relativePath, state: currentState
+            ), let file = published.candidate.file else { return .unavailable }
+            return .materialized(file)
         }
     }
 
@@ -20486,6 +20550,9 @@ package actor WorkspaceFileContextStore {
             let expectedLifetimeID = state.lifetimeID
             let evidence = try await state.service.cancellationResponsiveCatalogRegularFileEligibilityWithPolicy(relativePath: candidate.relativePath)
             let eligibility = evidence.eligibility
+            #if DEBUG
+                await awaitExactFileSuspensionGateForTesting(point: .explicitMaterializationEligibility, rootID: candidate.rootID)
+            #endif
             try Task.checkCancellation()
             guard let currentState = rootStatesByID[candidate.rootID],
                   currentState.lifetimeID == expectedLifetimeID,
