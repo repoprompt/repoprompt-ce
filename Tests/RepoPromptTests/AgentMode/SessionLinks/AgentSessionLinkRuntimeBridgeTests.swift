@@ -740,7 +740,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         }
 
         var stopRequests: [(AgentSessionLinkEndpointCandidate, AgentSessionLinkStopRequest)] = []
-        var routeStopToInteractionViewModel = false
+        var routeStopToInteractionRuntime = false
         var stopResult: DomainAgentSessionLinkStopReceipt.Result = .notRunning
         var stopTeardownCompleted: Bool?
         var currentStopRunID: UUID?
@@ -759,8 +759,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             let admissionLiveness = liveness()
             stopLivenessReadings.append(admissionLiveness)
             guard admissionLiveness.permitsDelivery else { return .blocked(.endpointInvalidated) }
-            if routeStopToInteractionViewModel, let interactionViewModel {
-                return await interactionViewModel.linkExecutionRuntime.agentSessionLinkPerformStop(
+            if routeStopToInteractionRuntime, let interactionRuntime {
+                return await interactionRuntime.agentSessionLinkPerformStop(
                     to: candidate, request: request, liveness: liveness,
                     queueHasCommittedDrain: queueHasCommittedDrain,
                     withdrawInbound: withdrawInbound, commitAuthorization: commitAuthorization
@@ -846,14 +846,14 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         // MARK: Management
 
         /// Real target view model the interaction calls route to, standing in for the window host.
-        weak var interactionViewModel: AgentModeViewModel?
+        var interactionRuntime: AgentSessionLinkExecutionRuntime?
         /// Runs just before the bridge's final authority fence, so a test can revoke exactly there.
         var beforeInteractionAuthorize: (@MainActor @Sendable () async -> Void)?
 
         func agentSessionLinkPendingInteraction(
             for candidate: AgentSessionLinkEndpointCandidate
         ) -> AgentSessionLinkPendingInteractionInspection {
-            interactionViewModel?.agentSessionLinkPendingInteraction(for: candidate) ?? .none
+            interactionRuntime?.agentSessionLinkPendingInteraction(for: candidate) ?? .none
         }
 
         func agentSessionLinkRespondToPendingInteraction(
@@ -861,9 +861,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             request: AgentSessionLinkInteractionResponseRequest,
             authorize: @escaping @MainActor @Sendable () async -> Bool
         ) async -> AgentSessionLinkInteractionResponseOutcome {
-            guard let interactionViewModel else { return .unavailable }
+            guard let interactionRuntime else { return .unavailable }
             let beforeAuthorize = beforeInteractionAuthorize
-            return await interactionViewModel.agentSessionLinkRespondToPendingInteraction(
+            return await interactionRuntime.agentSessionLinkRespondToPendingInteraction(
                 for: candidate,
                 request: request,
                 authorize: {
@@ -1121,7 +1121,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let observer = makeCandidate(windowID: 91, displayName: "Overseer")
         let host = FakeEndpointHost()
         host.candidates = [observer, target]
-        host.interactionViewModel = viewModel
+        host.interactionRuntime = viewModel.linkExecutionRuntime
         let bridge = AgentSessionLinkRuntimeBridge.shared
         bridge.attach(host: host)
         defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }
@@ -1280,35 +1280,42 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     func testManagedRespondAnswersOnlyTheExactCurrentInteractionWithOneTimeDecisions() async throws {
         let tabID = UUID()
         let controller = ApprovalRecordingCodexController()
-        let viewModel = AgentModeViewModel(
-            testWindowID: 94,
-            testWorkspacePath: FileManager.default.currentDirectoryPath,
-            codexControllerFactory: { _, _, _, _, _, _ in
-                LifecycleNoopCodexController(recorder: LifecycleRecorder())
-            },
-            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
-            mcpServerEnabler: { true }
-        )
-        let workspaceManager = AgentSessionLinkEndpointTestSupport.installWorkspace(
-            on: viewModel,
-            tabID: tabID,
-            name: "Managed target"
-        )
-        defer { withExtendedLifetime(workspaceManager) {} }
-        let session = viewModel.session(for: tabID)
-        session.selectedAgent = .codexExec
-        session.codexController = controller
-        let sessionID = try installRestoredFixtureBinding(session, in: viewModel)
-        let target = try XCTUnwrap(viewModel.agentSessionLinkCandidate(
-            tabID: tabID,
-            sessionID: sessionID,
-            tabName: "Target",
-            isWindowClosing: false
-        ))
+        weak var presenter: AgentModeViewModel?
+        let (runtimeHost, workspaceManager, session, target) = try { () -> (AgentSessionRuntimeHost, WorkspaceManagerViewModel, AgentTabSession, AgentSessionLinkEndpointCandidate) in
+            let viewModel = AgentModeViewModel(
+                testWindowID: 94,
+                testWorkspacePath: FileManager.default.currentDirectoryPath,
+                codexControllerFactory: { _, _, _, _, _, _ in
+                    LifecycleNoopCodexController(recorder: LifecycleRecorder())
+                },
+                connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+                mcpServerEnabler: { true }
+            )
+            let workspaceManager = AgentSessionLinkEndpointTestSupport.installWorkspace(
+                on: viewModel,
+                tabID: tabID,
+                name: "Managed target"
+            )
+            defer { withExtendedLifetime(workspaceManager) {} }
+            let session = viewModel.session(for: tabID)
+            session.selectedAgent = .codexExec
+            session.codexController = controller
+            let sessionID = try installRestoredFixtureBinding(session, in: viewModel)
+            let target = try XCTUnwrap(viewModel.agentSessionLinkCandidate(
+                tabID: tabID,
+                sessionID: sessionID,
+                tabName: "Target",
+                isWindowClosing: false
+            ))
+            presenter = viewModel
+            return (viewModel.runtimeHost, workspaceManager, session, target)
+        }()
+        defer { withExtendedLifetime((runtimeHost, workspaceManager)) {} }
+        XCTAssertNil(presenter, "Managed input must not retain or call a presenter")
         let observer = makeCandidate(windowID: 93, displayName: "Overseer")
         let host = FakeEndpointHost()
         host.candidates = [observer, target]
-        host.interactionViewModel = viewModel
+        host.interactionRuntime = runtimeHost.scope.linkExecution
         let bridge = AgentSessionLinkRuntimeBridge.shared
         bridge.attach(host: host)
         defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }
@@ -1465,7 +1472,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let observer = makeCandidate(windowID: 97, displayName: "Overseer")
         let host = FakeEndpointHost()
         host.candidates = [observer, target]
-        host.interactionViewModel = viewModel
+        host.interactionRuntime = viewModel.linkExecutionRuntime
         let bridge = AgentSessionLinkRuntimeBridge.shared
         bridge.attach(host: host)
         defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }
@@ -1550,7 +1557,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let observer = makeCandidate(windowID: 95, displayName: "Overseer")
         let host = FakeEndpointHost()
         host.candidates = [observer, target]
-        host.interactionViewModel = viewModel
+        host.interactionRuntime = viewModel.linkExecutionRuntime
         let bridge = AgentSessionLinkRuntimeBridge.shared
         bridge.attach(host: host)
         defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }
@@ -6129,8 +6136,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let observer = makeCandidate(windowID: 91, displayName: "Overseer")
         let host = FakeEndpointHost()
         host.candidates = [observer, target]
-        host.interactionViewModel = viewModel
-        host.routeStopToInteractionViewModel = true
+        host.interactionRuntime = viewModel.linkExecutionRuntime
+        host.routeStopToInteractionRuntime = true
         let bridge = AgentSessionLinkRuntimeBridge.shared
         bridge.attach(host: host)
         defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }

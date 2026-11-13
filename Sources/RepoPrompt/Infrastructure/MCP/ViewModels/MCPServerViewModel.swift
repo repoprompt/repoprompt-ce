@@ -59,32 +59,6 @@ enum ReadFileAutoSelectionCoverageCertificateLookup: Equatable {
     case miss(ReadFileAutoSelectionCoverageCertificateMissReason)
 }
 
-private actor MCPRunToolStartGate {
-    private var isOpen = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
-
-    func wait() async {
-        if isOpen { return }
-        await withCheckedContinuation { continuation in
-            if isOpen {
-                continuation.resume()
-            } else {
-                waiters.append(continuation)
-            }
-        }
-    }
-
-    func open() {
-        guard !isOpen else { return }
-        isOpen = true
-        let pending = waiters
-        waiters.removeAll()
-        for waiter in pending {
-            waiter.resume()
-        }
-    }
-}
-
 // MARK: - Selection Debug Logging
 
 #if DEBUG
@@ -2198,51 +2172,20 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     private lazy var windowToolCatalogService = MCPAppToolCatalogRegistration(
         windowID: windowID,
-        providers: [
-            MCPSelectionToolProvider(
-                runtime: windowToolRuntime,
-                context: windowToolContextCapabilities,
-                selection: windowToolSelectionCapabilities,
-                files: windowToolFileCapabilities
-            ),
-            fileToolProvider,
-            MCPApplyEditsToolProvider(
-                runtime: windowToolRuntime,
-                context: windowToolContextCapabilities,
-                selection: windowToolSelectionCapabilities
-            ),
-            oracleToolProvider,
-            MCPWorktreeToolProvider(
-                runtime: windowToolRuntime,
-                execution: windowToolExecutionCapabilities,
-                context: windowToolContextCapabilities,
-                selection: windowToolSelectionCapabilities,
-                resolveSpawnParentSessionID: { [weak self] metadata, targetWindow in
-                    await self?.resolveSpawnParentSessionID(metadata: metadata, targetWindow: targetWindow)
-                },
-                resolveObserverEndpoint: { [weak self] metadata, targetWindow in
-                    await self?.resolveAgentSessionLinkObserverEndpoint(
-                        metadata: metadata,
-                        targetWindow: targetWindow
-                    )
-                }
-            ),
-            MCPContextBuilderToolProvider(
-                runtime: windowToolRuntime,
-                execution: windowToolExecutionCapabilities,
-                context: windowToolContextCapabilities,
-                files: windowToolFileCapabilities
-            ),
-            MCPAskUserToolProvider(runtime: windowToolRuntime, execution: windowToolExecutionCapabilities),
-            MCPAgentControlToolProvider(runtime: windowToolRuntime, execution: windowToolExecutionCapabilities),
-            MCPSessionAdminToolProvider(runtime: windowToolRuntime, execution: windowToolExecutionCapabilities),
-            MCPAgentSessionControlToolProvider(
-                runtime: windowToolRuntime,
-                execution: windowToolExecutionCapabilities
-            )
-        ],
+        runtime: windowToolRuntime,
+        context: windowToolContextCapabilities,
+        selection: windowToolSelectionCapabilities,
+        files: windowToolFileCapabilities,
+        execution: windowToolExecutionCapabilities,
+        fileProvider: fileToolProvider,
+        oracleProvider: oracleToolProvider,
         sharedBindings: domainReadToolProvider.bindings,
-        runtime: windowToolRuntime
+        resolveSpawnParentSessionID: { [weak self] metadata, targetWindow in
+            await self?.resolveSpawnParentSessionID(metadata: metadata, targetWindow: targetWindow)
+        },
+        resolveObserverEndpoint: { [weak self] metadata, targetWindow in
+            await self?.resolveAgentSessionLinkObserverEndpoint(metadata: metadata, targetWindow: targetWindow)
+        }
     )
     private var cancellables: Set<AnyCancellable> = []
 
@@ -3643,175 +3586,31 @@ final class MCPServerViewModel: ObservableObject {
             nil
         }
 
-        // Generate a unique token for this tool execution to prevent cleanup races
-        let toolToken = UUID()
-        let capturedConnectionID = metadata.connectionID
-        let serverViewModelIdentity = ObjectIdentifier(self)
-        let validateInvocation = validateInvocation
-        guard await validateInvocation(invocationContext, windowID, serverViewModelIdentity) else {
-            throw ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal
-        }
         EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.runToolSetup, runToolSetupState)
-
-        let runToolRegistrationState = EditFlowPerf.begin(
-            EditFlowPerf.Stage.MCPToolCall.runToolRegistration,
-            EditFlowPerf.Dimensions(toolName: name)
-        )
-        EditFlowPerf.lifecycleEvent(
-            EditFlowPerf.Lifecycle.MCPRunTool.registrationScheduled,
-            correlation: lifecycleCorrelation,
-            EditFlowPerf.Dimensions(toolName: name)
-        )
-        if shouldTrackActiveTool {
-            await MainActor.run {
-                EditFlowPerf.lifecycleEvent(
-                    EditFlowPerf.Lifecycle.MCPRunTool.registrationMainActorEntered,
-                    correlation: lifecycleCorrelation,
-                    EditFlowPerf.Dimensions(toolName: name)
-                )
-                self.activeToolToken = toolToken
-                self.activeToolConnectionID = capturedConnectionID
-                self.activeToolName = name
-                self.cancelCurrentTool = nil
-            }
-        }
-
-        let startGate = MCPRunToolStartGate()
-        // 🔑 run work completely off the UI thread, but do not let the provider begin
-        // until token registration and final exact dispatch validation are complete.
-        let task = Task {
-            await startGate.wait()
-            try Task.checkCancellation()
-            guard await validateInvocation(invocationContext, windowID, serverViewModelIdentity) else {
-                throw ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal
-            }
-            return try await ServerNetworkManager.withConnectionID(capturedConnectionID) {
-                EditFlowPerf.lifecycleEvent(
-                    EditFlowPerf.Lifecycle.MCPRunTool.providerBegan,
-                    correlation: lifecycleCorrelation,
-                    EditFlowPerf.Dimensions(toolName: name)
-                )
-                do {
-                    let result = try await EditFlowPerf.measure(
-                        EditFlowPerf.Stage.MCPToolCall.providerExecution,
-                        EditFlowPerf.Dimensions(toolName: name)
-                    ) {
-                        try await AgentSelfMCPCallOrigin.currentTaskLocal.withValue(selfCallOrigin) {
-                            // Explicitly captured before this Task/start-gate hop; compatibility
-                            // helpers project this same packet rather than a successor live route.
-                            try await MCPInvocationContextBridge.withInvocation(invocationContext) {
-                                try await AgentSessionLinkWaitCallOrigin.currentTaskLocal.withValue(waitCallOrigin) {
-                                    try await body()
-                                }
-                            }
-                        }
-                    }
-                    EditFlowPerf.lifecycleEvent(
-                        EditFlowPerf.Lifecycle.MCPRunTool.providerEnded,
-                        correlation: lifecycleCorrelation,
-                        EditFlowPerf.Dimensions(toolName: name, outcome: "success")
-                    )
-                    return result
-                } catch {
-                    let wasCancelled = error is CancellationError || MCPToolExecutionCancelledError.matches(error)
-                    EditFlowPerf.lifecycleEvent(
-                        EditFlowPerf.Lifecycle.MCPRunTool.providerEnded,
-                        correlation: lifecycleCorrelation,
-                        EditFlowPerf.Dimensions(
-                            toolName: name,
-                            outcome: wasCancelled ? "cancelled" : "error"
-                        )
-                    )
-                    throw error
-                }
-            }
-        }
-
-        await MainActor.run {
-            if !shouldTrackActiveTool {
-                EditFlowPerf.lifecycleEvent(
-                    EditFlowPerf.Lifecycle.MCPRunTool.registrationMainActorEntered,
-                    correlation: lifecycleCorrelation,
-                    EditFlowPerf.Dimensions(toolName: name)
-                )
-            }
-            if shouldTrackActiveTool {
-                self.cancelCurrentTool = { task.cancel() }
-            }
-            self.registerToolExecution(
-                executionID: toolToken,
-                runID: indexedRunID,
-                connectionID: capturedConnectionID,
-                toolName: name,
-                lifecycleCorrelation: lifecycleCorrelation,
-                cancel: { task.cancel() }
-            )
-        }
-
-        if await !validateInvocation(invocationContext, windowID, serverViewModelIdentity) {
-            task.cancel()
-            await startGate.open()
-            await MainActor.run {
-                self.unregisterToolExecution(executionID: toolToken, countAsEnded: false)
-                if shouldTrackActiveTool, self.activeToolToken == toolToken {
-                    self.clearActiveToolSlot()
-                }
-            }
-            throw ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal
-        }
-        await startGate.open()
-
-        EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.runToolRegistration, runToolRegistrationState)
-        EditFlowPerf.lifecycleEvent(
-            EditFlowPerf.Lifecycle.MCPRunTool.registrationEnded,
-            correlation: lifecycleCorrelation,
-            EditFlowPerf.Dimensions(toolName: name)
-        )
-
-        let cleanupExecution = toolExecutionRuntime.makeCompletionHandler(
-            executionID: toolToken, toolName: name, lifecycleCorrelation: lifecycleCorrelation,
-            didFinish: { [weak self] in
-                guard let self else { return }
-                if shouldTrackActiveTool, activeToolToken == toolToken {
+        return try await toolExecutionRuntime.execute(
+            .init(toolName: name, windowID: windowID, context: invocationContext),
+            ownerIdentity: ObjectIdentifier(self), indexedRunID: indexedRunID,
+            waitCallOrigin: waitCallOrigin, selfCallOrigin: selfCallOrigin,
+            lifecycleCorrelation: lifecycleCorrelation, validateInvocation: validateInvocation,
+            presentation: .init(
+                began: { [weak self] token in
+                    guard let self, shouldTrackActiveTool else { return }
+                    activeToolToken = token
+                    activeToolConnectionID = metadata.connectionID
+                    activeToolName = name
+                    cancelCurrentTool = nil
+                },
+                registered: { [weak self] token, cancel in
+                    guard let self, shouldTrackActiveTool, activeToolToken == token else { return }
+                    cancelCurrentTool = cancel
+                },
+                finished: { [weak self] token in
+                    guard let self, shouldTrackActiveTool, activeToolToken == token else { return }
                     clearActiveToolSlot()
                 }
-            }
+            ),
+            body: body
         )
-
-        let cancellationEnvelopeState = EditFlowPerf.begin(
-            EditFlowPerf.Stage.MCPToolCall.runToolTimeoutEnvelope,
-            EditFlowPerf.Dimensions(toolName: name)
-        )
-        do {
-            let result = try await withTaskCancellationHandler {
-                try await task.value
-            } onCancel: {
-                task.cancel()
-                Task { await cleanupExecution("cancelled") }
-            }
-            EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.runToolTimeoutEnvelope, cancellationEnvelopeState)
-            await cleanupExecution("success")
-            EditFlowPerf.lifecycleEvent(
-                EditFlowPerf.Lifecycle.MCPRunTool.returned,
-                correlation: lifecycleCorrelation,
-                EditFlowPerf.Dimensions(toolName: name, outcome: "success")
-            )
-            return result
-        } catch {
-            EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.runToolTimeoutEnvelope, cancellationEnvelopeState)
-            task.cancel()
-            let outcome = MCPToolExecutionCancelledError.matches(error) ? "cancelled" : "error"
-            await cleanupExecution(outcome)
-            EditFlowPerf.lifecycleEvent(
-                EditFlowPerf.Lifecycle.MCPRunTool.returned,
-                correlation: lifecycleCorrelation,
-                EditFlowPerf.Dimensions(toolName: name, outcome: outcome)
-            )
-            if error is CancellationError {
-                throw MCPToolExecutionCancelledError()
-            }
-            throw error
-        }
     }
 
     // -----------------------------------------------------------------

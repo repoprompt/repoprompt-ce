@@ -92,21 +92,22 @@ final class MCPHostRouteResourceTests: XCTestCase {
             let owner = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: runtime.routingCoordinator, runtime: runtime)
             let routeID = owner.identity.routeID
             let executions = owner.toolExecutionRuntime
-            let executionID = UUID()
             let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: "read_file"))
             let binding = MCPDomainToolBinding(definition: definition) { _ in
-                await .bool(executions.containsExecution(executionID))
+                await .bool(executions.activeExecutionCount == 1)
             }
             let binder = MCPAppToolBinder(windowID: routeID) { name, _, arguments, implementation in
-                await executions.registerToolExecution(executionID: executionID, runID: nil, connectionID: nil, toolName: name, cancel: {})
-                do {
-                    let result = try await implementation(.init(toolName: name, windowID: routeID, context: .trustedLocal(toolName: name, metadata: .init(connectionID: nil, clientName: nil, windowID: routeID))), arguments)
-                    await executions.unregisterToolExecution(executionID: executionID)
-                    return result
-                } catch {
-                    await executions.unregisterToolExecution(executionID: executionID)
-                    throw error
-                }
+                let invocation = MCPAppToolInvocation(toolName: name, windowID: routeID, context: .trustedLocal(
+                    toolName: name, metadata: .init(connectionID: nil, clientName: nil, windowID: routeID)
+                ))
+                return try await executions.execute(
+                    invocation, ownerIdentity: ObjectIdentifier(owner), indexedRunID: nil,
+                    validateInvocation: { context, routeID, identity in
+                        await ServerNetworkManager.shared.validateToolInvocationContext(
+                            context, expectedWindowID: routeID, expectedServerViewModelIdentity: identity
+                        )
+                    }
+                ) { try await implementation(invocation, arguments) }
             }
             func catalog(required: Set<String>) -> MCPAppToolCatalogRegistration {
                 MCPAppToolCatalogRegistration(
@@ -137,6 +138,24 @@ final class MCPHostRouteResourceTests: XCTestCase {
             XCTAssertEqual(result, .bool(true), "The real catalog/binder dispatch uses the host-owned execution tracker without a window")
             XCTAssertEqual(executions.activeExecutionCount, 0)
             XCTAssertEqual(WindowState.windowCounter, before)
+            // Retire admission after registration but before opening the provider gate. The same
+            // window-free execution path must withdraw tracking without dispatch or an ended count.
+            let rejectedRun = UUID()
+            do {
+                _ = try await executions.execute(
+                    .init(toolName: "read_file", windowID: routeID, context: .trustedLocal(
+                        toolName: "read_file", metadata: .init(connectionID: nil, clientName: nil, windowID: routeID)
+                    )),
+                    ownerIdentity: ObjectIdentifier(owner), indexedRunID: rejectedRun,
+                    validateInvocation: { _, _, _ in await !owner.isClosing },
+                    presentation: .init(registered: { _, _ in owner.closeDomainAdmission() })
+                ) { XCTFail("A retired route cannot dispatch its provider")
+                    return false
+                }
+                XCTFail("Retired invocation must be refused")
+            } catch ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal {}
+            XCTAssertEqual(executions.activeExecutionCount, 0)
+            XCTAssertEqual(executions.toolEndedCount(runID: rejectedRun), 0)
             await owner.close()
             let retired = await owner.hasActiveCatalog()
             XCTAssertFalse(retired)

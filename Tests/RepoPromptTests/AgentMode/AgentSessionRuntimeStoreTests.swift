@@ -554,7 +554,13 @@ final class AgentSessionRuntimeStoreTests: XCTestCase {
             testWindowID: -1406,
             codexControllerFactory: { _, _, _, _, _, _ in preconditionFailure("Store publication must not launch a provider") }
         )
-        let session = AgentTabSession(tabID: UUID())
+        XCTAssertTrue(vm.runtimeSessionStore === vm.runtimeHost.scope)
+        XCTAssertTrue(vm.codexCoordinator === vm.runtimeHost.codexCoordinator)
+        XCTAssertTrue(vm.claudeCoordinator === vm.runtimeHost.claudeCoordinator)
+        XCTAssertNotNil(vm.runtimeHost.scope.execution, "Compose execution before creating a visible session")
+        XCTAssertNotNil(vm.runtimeHost.scope.linkExecution)
+        XCTAssertTrue(vm.runtimeHost.scope.sessions.isEmpty)
+        let session = vm.runtimeHost.scope.makeSession(tabID: UUID())
         let sessionID = UUID()
         session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: sessionID))
         var observedPresence: [Bool] = []

@@ -78,6 +78,19 @@ final class AgentRunProviderComposition {
         self.controller = controller
     }
 
+    static func live() -> AgentRunProviderComposition {
+        .init(
+            headless: makeHeadlessProvider,
+            acp: { try await ACPAgentProviderFactory.makeProvider(for: $0, modelString: $1) },
+            controller: { try ACPAgentSessionController(provider: $0, runRequest: $1) }
+        )
+    }
+
+    nonisolated static func makeHeadlessProvider(agent: AgentProviderKind, modelString: String?) -> HeadlessAgentProvider {
+        assert(agent != .codexExec, "Codex native runs must not use headless provider factory.")
+        return AgentRuntimeProviderService.shared.makeProvider(for: agent, modelString: modelString)
+    }
+
     func fulfill(_ first: AgentRunResourceRequest?) async {
         var next = first
         while let request = next {
