@@ -257,7 +257,9 @@ extension AgentSessionLinkExecutionRuntime {
                 outcome = await coordinator.sendCodexNativeMessage(
                     session: session, writerReceipt: receipt, ownership: ownership, text: augmented,
                     attachments: [], fallbackContext: fallback, stopFence: stopFence, terminalizeRejectedSend: false,
-                    inputResourcesAreCurrent: environment.resourcesAreCurrent,
+                    // Carry the admitted command through native route/read-proof awaits. Resource
+                    // currency alone can survive same-object writer claim reacquisition.
+                    inputResourcesAreCurrent: isCurrent,
                     inputAttemptChanged: { inputWasAttempted = $0 }
                 )
             } else { outcome = .preDispatchRejected(message: "The originating Codex writer or attempt changed before dispatch.") }

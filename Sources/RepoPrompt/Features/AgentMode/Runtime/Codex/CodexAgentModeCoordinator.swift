@@ -7556,6 +7556,14 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             }
         }
         if case let .fallback(decision) = dispatchPlan {
+            // Native preparation above can suspend. Queue only for the originally admitted writer.
+            if let refusal = codexEarlySendRefusal(
+                session: session, writerReceipt: writerReceipt, ownership: ownership,
+                attachmentReservationID: attachmentReservationID
+            ) { return refusal }
+            guard inputResourcesAreCurrent() else {
+                return .preDispatchRejected(message: "The input admission changed before Codex fallback.")
+            }
             if isSelfNote {
                 return .preDispatchRejected(message: "Codex did not send the continuation note because a direct turn was unavailable.")
             }
@@ -8024,6 +8032,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                         )
                     }
                 } catch let mismatch as CodexTurnSteerError {
+                    guard writerReceipt.disposition(for: session) != .claimLost else { throw mismatch }
                     session.oracleBackgroundAwareness.release(oracleAwareness)
                     oracleAwareness = nil
                     if let parkedNote {
@@ -8095,6 +8104,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                             session.codexPendingSteerLifecycleReconciliation = nil
                         }
                     } catch {
+                        guard writerReceipt.disposition(for: session) != .claimLost else { throw error }
                         if session.codexPendingSteerLifecycleReconciliation == reconciliation {
                             session.codexPendingSteerLifecycleReconciliation = nil
                         }
@@ -8105,6 +8115,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                         )
                     }
                 } catch {
+                    guard writerReceipt.disposition(for: session) != .claimLost else { throw error }
                     if let parkedNote {
                         var state = session.selfCompactState
                         _ = state.noteTransportFailed(parkedNote.dispatchID)
@@ -8168,6 +8179,9 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             await acknowledgeAcceptedDispatch()
             return .sent
         } catch let steerError as CodexTurnSteerError {
+            guard writerReceipt.disposition(for: session) != .claimLost else {
+                return .stale(reason: "The originating Codex writer changed before steer rejection settlement.")
+            }
             if acquiredAgentSessionLinkPhysicalDispatch {
                 linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchFailure(
                     for: session,
@@ -8212,6 +8226,14 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 stopFence: effectiveStopFence
             )
         } catch {
+            // A final input proof can suspend after this send's preparation. The same object,
+            // binding, run and controller may now belong to a successor writer. No originating
+            // cleanup (or auth recovery) may mutate that claim, even when no write was attempted.
+            // This includes wake-ledger settlement: it reads the session's current pending wake,
+            // not a receipt of this send's acquisition. Ordinary managed input has no wake to settle.
+            guard writerReceipt.disposition(for: session) != .claimLost else {
+                return .stale(reason: "The originating Codex writer changed before send settlement.")
+            }
             if acquiredAgentSessionLinkPhysicalDispatch {
                 linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchFailure(
                     for: session,

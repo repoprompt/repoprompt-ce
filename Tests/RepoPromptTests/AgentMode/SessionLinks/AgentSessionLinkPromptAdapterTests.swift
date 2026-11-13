@@ -954,6 +954,162 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         #endif
     }
 
+    func testManagedCodexFinalProofPreservesCurrentWriterDispatch() async throws {
+        try await assertManagedCodexFinalWriterFence(reacquire: false)
+    }
+
+    func testManagedCodexFinalProofRejectsSameObjectReacquiredWriterWithoutSuccessorCleanup() async throws {
+        try await assertManagedCodexFinalWriterFence(reacquire: true)
+    }
+
+    func testManagedCodexAttemptedRejectionCannotReplayIntoReacquiredWriter() async throws {
+        try await assertManagedCodexFinalWriterFence(reacquire: true, rejectAfterAttempt: true)
+    }
+
+    private func assertManagedCodexFinalWriterFence(reacquire: Bool, rejectAfterAttempt: Bool = false) async throws {
+        let fixture = try makeFixture()
+        let vm = fixture.viewModel
+        let session = fixture.session
+        let links = vm.linkExecutionRuntime
+        await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+        let runID = try XCTUnwrap(session.runID)
+        let ownership = session.beginRunAttempt(source: "test.managedCodex.finalWriterFence")
+        _ = try await fixture.controller.startOrResume(
+            existing: nil, baseInstructions: "test", model: nil, reasoningEffort: nil, serviceTier: nil
+        )
+        session.runState = .running
+        session.codexController = fixture.controller
+        session.codexControllerPermissionProfile = session.permissionProfile
+        session.codexControllerTaskLabelKind = session.mcpControlContext?.taskLabelKind
+        session.codexControllerWorkspacePaths = .uniform(FileManager.default.temporaryDirectory.path)
+        session.codexControllerFeatureState = .init(
+            computerUseEnabled: false, goalSupportEnabled: CodexGoalSupport.isEnabled,
+            reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled, memoriesEnabled: CodexMemories.isEnabled
+        )
+        session.codexConversationID = "monitor-thread"
+        session.codexAuthoritativeActiveTurn = try .init(
+            threadID: "monitor-thread", turnID: "active-turn", turnKind: .user,
+            controllerInstanceID: ObjectIdentifier(fixture.controller), controllerGeneration: session.codexControllerGeneration,
+            runID: runID, runAttemptID: XCTUnwrap(session.activeRunAttemptID)
+        )
+        session.codexRoutingObservedTurnID = "active-turn"
+        let candidate = try XCTUnwrap(vm.agentSessionLinkCandidate(
+            tabID: session.tabID, sessionID: fixture.sessionID, tabName: "Managed Codex", isWindowClosing: false
+        ))
+        let endpoint = try XCTUnwrap(links.agentSessionLinkObserverEndpoint(tabID: session.tabID))
+        let original = try XCTUnwrap(vm.runtimeCommand(sessionID: fixture.sessionID))
+        let receipt = try XCTUnwrap(AgentSessionRuntimeStore.WriterReceipt(original))
+        let stopFence = AgentRunStartStopFence(session: session)
+        let originalBinding = session.persistentSessionBindingIdentity
+        let originalIdentity = session.codexAuthoritativeActiveTurn
+        let gate = TestReleaseFence(name: "managed Codex final provider input proof")
+        var proofCalls = 0
+        var physicalAttempts = 0
+        if rejectAfterAttempt {
+            fixture.controller.steerHandler = { _, _ in
+                physicalAttempts += 1
+                await gate.enterAndWait()
+                throw CodexTurnSteerError.noActiveTurn(.init(
+                    method: "turn/steer", code: nil, message: "definitive rejection after writer loss", data: nil
+                ))
+            }
+        }
+        links.test_agentSessionLinkLocalInputDecoration = { rendered in
+            .init(fragment: rendered.fragment + "\n<user_input>proof fixture</user_input>", markupDeltaBytes: 45, requirements: [])
+        }
+        links.test_agentSessionLinkLocalInputReadProof = { _ in
+            proofCalls += 1
+            if !rejectAfterAttempt { await gate.enterAndWait() }
+            return true
+        }
+        let request = AgentSessionLinkSendRequest(
+            linkID: UUID(), linkGeneration: 1,
+            observerEndpoint: .init(
+                windowID: 402,
+                workspaceID: UUID(),
+                tabID: UUID(),
+                sessionID: UUID(),
+                persistentBindingGeneration: UUID(),
+                bindingTransitionGeneration: 1
+            ),
+            observerDisplayName: "Manager", message: "Managed late writer fence", workflow: nil
+        )
+        let environment = vm.managedInputEnvironment()
+        let send = Task { @MainActor in
+            await links.agentSessionLinkPerformSteer(
+                to: candidate, request: request,
+                liveness: { .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false) },
+                commitAuthorization: { .committed }, environment: environment
+            )
+        }
+        defer {
+            gate.release()
+            send.cancel()
+            links.test_agentSessionLinkLocalInputReadProof = nil
+            links.test_agentSessionLinkLocalInputDecoration = nil
+            fixture.controller.steerHandler = nil
+        }
+        let entered = await gate.waitUntilEntered()
+        XCTAssertTrue(entered, "Managed active Codex must reach the actual final provider-input proof")
+        guard entered else { return }
+        XCTAssertEqual(proofCalls, 1)
+        XCTAssertEqual(physicalAttempts, rejectAfterAttempt ? 1 : 0)
+        XCTAssertTrue(environment.resourcesAreCurrent())
+        XCTAssertEqual(receipt.disposition(for: session), .current)
+        XCTAssertTrue(fixture.startedTurns.isEmpty)
+        XCTAssertTrue(fixture.controller.steeredTurns.isEmpty)
+        XCTAssertEqual(session.items.filter { $0.kind == .user }.map(\.text), [request.message])
+        if reacquire {
+            let scope = original.writer.scope
+            var members = scope.sessions
+            members.removeValue(forKey: session.tabID)
+            scope.replaceSessions(members)
+            members[session.tabID] = session
+            scope.replaceSessions(members)
+        }
+        let successor = try XCTUnwrap(vm.runtimeCommand(sessionID: fixture.sessionID))
+        XCTAssertTrue(successor.isCurrent)
+        XCTAssertEqual(receipt.disposition(for: session), reacquire ? .claimLost : .current)
+        XCTAssertEqual(original.isCurrent, !reacquire)
+        XCTAssertTrue(environment.resourcesAreCurrent(), "Resource currency deliberately survives writer reacquisition")
+        XCTAssertTrue(stopFence.permitsStart(of: session), "Stop is unchanged; it cannot substitute for writer currency")
+        XCTAssertEqual(session.persistentSessionBindingIdentity, originalBinding)
+        XCTAssertEqual(session.activeRunOwnership, ownership)
+        XCTAssertEqual(session.codexAuthoritativeActiveTurn, originalIdentity)
+        XCTAssertTrue(session.codexController === fixture.controller)
+        XCTAssertEqual(links.agentSessionLinkObserverEndpoint(tabID: session.tabID), endpoint)
+        let items = session.items
+        let saveGeneration = session.saveRequestGeneration
+        let retryTurn = session.codexPendingAuthRetryTurn
+        let pendingKind = session.codexPendingTurnKind
+        gate.release()
+        let outcome = await send.value
+        await links.drainPendingManagedInputEffects(for: session)
+        if reacquire {
+            XCTAssertEqual(outcome, .blocked(.steerUnconfirmed))
+            XCTAssertTrue(fixture.startedTurns.isEmpty, "A stale producer must not start/fallback into its successor")
+            XCTAssertTrue(fixture.controller.steeredTurns.isEmpty, "No accepted steer may cross writer incarnations")
+            XCTAssertEqual(physicalAttempts, rejectAfterAttempt ? 1 : 0, "No physical replay after writer loss")
+            XCTAssertEqual(session.items, items, "Originating cleanup must not withdraw a successor's transcript row")
+            XCTAssertEqual(session.saveRequestGeneration, saveGeneration)
+            XCTAssertEqual(session.codexPendingAuthRetryTurn, retryTurn, "No auth replay/cleanup may mutate the successor")
+            XCTAssertEqual(session.codexPendingTurnKind, pendingKind)
+            XCTAssertTrue(session.codexFallbackQueue.isEmpty)
+            XCTAssertNil(session.codexFallbackDispatchInFlight)
+        } else {
+            guard case let .delivered(delivery) = outcome else { return XCTFail("Current writer failed: \(outcome)") }
+            XCTAssertEqual(delivery.deliveryState, .steered)
+            XCTAssertEqual(fixture.controller.steeredTurns.count, 1)
+            XCTAssertTrue(fixture.controller.steeredTurns[0].contains(request.message))
+            XCTAssertTrue(fixture.controller.steeredTurns[0].contains(AgentSessionLinkMessageEnvelope.managementDelegation))
+            XCTAssertTrue(fixture.startedTurns.isEmpty)
+        }
+        XCTAssertTrue(successor.isCurrent)
+        XCTAssertEqual(session.activeRunOwnership, ownership)
+        XCTAssertEqual(session.codexAuthoritativeActiveTurn, originalIdentity)
+        XCTAssertTrue(session.codexController === fixture.controller)
+    }
+
     func testFreshStartRouteLossTerminalizesEmptyRun() async throws {
         #if DEBUG
             let fixture = try makeFixture()
