@@ -6,6 +6,7 @@ extension MCPServerViewModel {
     @MainActor
     @discardableResult
     func updateCurrentTabPrompt(
+        route routeResources: MCPHostRouteResources,
         toolName: String,
         mutation: (inout String) -> Void
     ) async throws -> String {

@@ -600,7 +600,7 @@ import XCTest
             tab.selection = StoredSelection(selectedPaths: [], codemapAutoEnabled: true)
             XCTAssertTrue(manager.updateComposeTabStoredOnly(tab, inWorkspaceID: fixture.workspace.id))
             let prior = tab.selection
-            let coordinator = server.readFileAutoSelectionCoordinator
+            let coordinator = server.readFileAutoSelectionCoordinator(route: server.routeResources)
             let gate = RootHydrationSuspensionGate()
             if atCommitBoundary {
                 let selectionCoordinator = try XCTUnwrap(server.selectionCoordinator)
@@ -619,7 +619,7 @@ import XCTest
             ))
             await gate.waitUntilHeld()
             manager.republishReadyRootCatalogWithNextGenerationForTesting()
-            XCTAssertTrue(server.isReadFileAutoSelectionContextCurrent(key), "Tab identity deliberately stays unchanged")
+            XCTAssertTrue(server.isReadFileAutoSelectionContextCurrent(route: server.routeResources, key), "Tab identity deliberately stays unchanged")
             await gate.release()
             let result = await coordinator.drain(.canonicalSelection, for: key)
             XCTAssertEqual(result, .completed)
@@ -704,7 +704,7 @@ import XCTest
             }
             await gate.waitUntilHeld()
             await store.unloadRoot(id: physicalRecord.id)
-            XCTAssertTrue(server.isReadFileAutoSelectionContextCurrent(key))
+            XCTAssertTrue(server.isReadFileAutoSelectionContextCurrent(route: server.routeResources, key))
             await gate.release()
             let result = await apply.value
             XCTAssertNil(result)
@@ -1057,7 +1057,7 @@ import XCTest
                     let result = try await AgentExternalMCPRunStarter.startApplyingRequestBindingPolicy(
                         target: target, message: "test", metadata: metadata,
                         bindCurrentRequestToTab: { tab, metadata, expiry in
-                            try await server.bindCurrentRequestToTabIfPossible(tabID: tab, metadata: metadata, startExpiry: expiry)
+                            try await server.bindCurrentRequestToTabIfPossible(route: server.routeResources, tabID: tab, metadata: metadata, startExpiry: expiry)
                         }, agentModeVM: vm, agentRaw: nil, modelRaw: nil, reasoningEffortRaw: nil,
                         dispatchInstruction: { _, _, _, _, _ in dispatched.fulfill()
                             return .startedRun
@@ -1079,7 +1079,7 @@ import XCTest
             XCTAssertEqual(server.connectionBindingSnapshot(route: server.routeResources, forConnection: fixture.connectionID).tabID, prior.tabID)
             XCTAssertNotNil(try vm.mcpRuntime.registration(sessionID: XCTUnwrap(target.sessionID)))
             // Nil tokens preserve the existing manage-session binding policy.
-            try await server.bindCurrentRequestToTabIfPossible(tabID: childTabID, metadata: metadata)
+            try await server.bindCurrentRequestToTabIfPossible(route: server.routeResources, tabID: childTabID, metadata: metadata)
             XCTAssertEqual(server.connectionBindingSnapshot(route: server.routeResources, forConnection: fixture.connectionID).tabID, childTabID)
         }
 

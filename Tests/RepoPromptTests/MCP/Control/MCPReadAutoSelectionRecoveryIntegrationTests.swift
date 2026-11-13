@@ -180,7 +180,11 @@ import XCTest
                     let originalSelection = try XCTUnwrap(manager.composeTab(for: originalIdentity)).selection
                     let replacementSelection = try XCTUnwrap(manager.composeTab(for: replacementIdentity)).selection
                     let warning = await server.selectCreatedFile(
-                        file, resolvedContext: resolved, metadata: metadata, lookupContext: lookup
+                        route: server.routeResources,
+                        file,
+                        resolvedContext: resolved,
+                        metadata: metadata,
+                        lookupContext: lookup
                     )
                     XCTAssertTrue(try XCTUnwrap(warning).contains("selection was not confirmed"))
                     XCTAssertEqual(try String(contentsOf: createdPath, encoding: .utf8), "let durable = true\n")
@@ -229,7 +233,7 @@ import XCTest
                     let metadata = MCPServerViewModel.RequestMetadata(
                         connectionID: caller.connectionID, clientName: nil, windowID: context.window.windowID
                     )
-                    let firstDrain = try await server.drainReadFileAutoSelection(metadata: metadata, requirement: .mirroredSelectionAndMetrics)
+                    let firstDrain = try await server.drainReadFileAutoSelection(route: server.routeResources, metadata: metadata, requirement: .mirroredSelectionAndMetrics)
                     XCTAssertEqual(firstDrain, .completed)
                     let identity = WorkspaceSelectionIdentity(workspaceID: context.workspaceID, tabID: context.tabID)
                     XCTAssertTrue(try XCTUnwrap(manager.composeTab(for: identity)).selection.selectedPaths.contains(context.fileURL.path))

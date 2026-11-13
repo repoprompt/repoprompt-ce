@@ -200,6 +200,7 @@ extension MCPServerViewModel {
 
     @MainActor
     private func resolvedContextForExportSelectedFiles(
+        route routeResources: MCPHostRouteResources,
         _ resolvedContext: MCPResolvedTabContextSnapshot?
     ) async throws -> MCPResolvedTabContextSnapshot? {
         if let resolvedContext { return resolvedContext }
@@ -213,6 +214,7 @@ extension MCPServerViewModel {
 
     @MainActor
     func buildExportSelectedFileInfos(
+        route routeResources: MCPHostRouteResources,
         resolvedContext: MCPResolvedTabContextSnapshot? = nil,
         cfg: PromptContextResolved,
         selectionOverride: StoredSelection? = nil,
@@ -221,7 +223,7 @@ extension MCPServerViewModel {
         guard cfg.includeFiles else { return [] }
         let tokens = TokenServices(owner: self)
         let effectiveCodeMapUsage = effectiveMCPCodeMapUsage(cfg.codeMapUsage)
-        let resolved = try await resolvedContextForExportSelectedFiles(resolvedContext)
+        let resolved = try await resolvedContextForExportSelectedFiles(route: routeResources, resolvedContext)
 
         let lookupContext = if let snapshot = resolved?.snapshot {
             await lookupContext(for: snapshot)

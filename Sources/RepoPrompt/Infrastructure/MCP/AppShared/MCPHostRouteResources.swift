@@ -16,6 +16,7 @@ final class MCPHostRouteResources {
     private let logger = Logger(label: "com.repoprompt.mcp.host-route")
     let runRouteBindings: MCPRunRouteBindings
     let toolExecutionRuntime = MCPToolExecutionRuntime()
+    var readFileAutoSelectionCoordinator: MCPReadFileAutoSelectionCoordinator?
     private var ownerLifetime: MCPRunRouteBindings.OwnerLifetime?
     private(set) var isClosing = false
     var descriptor: DomainWindowDescriptor?

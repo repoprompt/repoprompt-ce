@@ -4501,9 +4501,12 @@ actor ServerNetworkManager: MCPServerConnectionHost {
     private func cachedModelCatalogRouteToken(connectionID: UUID) async -> AgentSessionLinkRunCatalogRouteToken? {
         guard let route = cachedModelRunRoute(connectionID: connectionID) else { return nil }
         let admittedModelRouteToken = MCPInvocationContextBridge.current?.dispatchAuthorization?.windowIdentity?.modelRouteToken
-        let endpoint = await MainActor.run {
-            WindowStatesManager.shared.modelRoutingWindow(withID: route.windowID)?.mcpServer
-                .cachedModelObserverEndpoint(connectionID: connectionID, route: route, modelRouteToken: admittedModelRouteToken)
+        let endpoint = await MainActor.run { () -> DomainAgentSessionLinkEndpointIdentity? in
+            guard let server = WindowStatesManager.shared.modelRoutingWindow(withID: route.windowID)?.mcpServer else { return nil }
+            return server.cachedModelObserverEndpoint(
+                resources: server.routeResources, connectionID: connectionID,
+                route: route, modelRouteToken: admittedModelRouteToken
+            )
         }
         guard let endpoint, cachedModelRunRoute(connectionID: connectionID) == route else { return nil }
         return AgentSessionLinkRunCatalogRouteToken(

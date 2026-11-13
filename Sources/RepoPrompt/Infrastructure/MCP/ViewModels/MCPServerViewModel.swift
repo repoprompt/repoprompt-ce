@@ -554,14 +554,14 @@ final class MCPServerViewModel: ObservableObject {
         func executeAgentRunForTesting(args: [String: Value]) async throws -> Value {
             let context = await trustedLocalInvocationForTesting(toolName: MCPWindowToolName.agentRun)
             return try await MCPInvocationContextBridge.withInvocation(context) {
-                try await agentRunToolService.execute(args: args)
+                try await agentRunToolService(route: routeResources).execute(args: args)
             }
         }
 
         func executeAskOracleForTesting(args: [String: Value]) async throws -> Value {
             let context = await trustedLocalInvocationForTesting(toolName: MCPWindowToolName.askOracle)
             return try await MCPInvocationContextBridge.withInvocation(context) {
-                try await oracleToolService.executeAskOracle(args: args, invocationContext: context)
+                try await oracleToolService(route: routeResources).executeAskOracle(args: args, invocationContext: context)
             }
         }
 
@@ -569,6 +569,7 @@ final class MCPServerViewModel: ObservableObject {
             connectionID: UUID?
         ) async throws -> AgentSessionLifecycleAuthority.MutationTarget {
             try await resolveAgentSessionLifecycleMutationTarget(
+                route: routeResources,
                 args: [:],
                 connectionID: connectionID,
                 intent: .setStatus
@@ -608,7 +609,7 @@ final class MCPServerViewModel: ObservableObject {
         }
     #endif
 
-    private var oracleToolService: MCPOracleToolService {
+    private func oracleToolService(route routeResources: MCPHostRouteResources) -> MCPOracleToolService {
         MCPOracleToolService(
             askOracleToolName: MCPWindowToolName.askOracle,
             oracleSendToolName: MCPWindowToolName.oracleSend,
@@ -648,10 +649,10 @@ final class MCPServerViewModel: ObservableObject {
                 return try OracleViewModel.OracleSendPackagingContext(delegated: context)
             },
             rebindChatSessionIfNeeded: { [self] metadata, chatIDString in
-                try rebindOracleChatSessionIfNeeded(metadata: metadata, chatIDString: chatIDString)
+                try rebindOracleChatSessionIfNeeded(route: routeResources, metadata: metadata, chatIDString: chatIDString)
             },
             resolveTabIDForAgentMode: { [self] args, connectionID in
-                try await resolveTabIDForAgentMode(args: args, connectionID: connectionID)
+                try await resolveTabIDForAgentMode(route: routeResources, args: args, connectionID: connectionID)
             },
             requireTargetWindow: { [self] in try requireTargetWindow() },
             rawExplicitTabID: { [self] args in rawExplicitTabID(args: args) },
@@ -685,7 +686,7 @@ final class MCPServerViewModel: ObservableObject {
         )
     }
 
-    private var agentRunToolService: AgentRunMCPToolService {
+    private func agentRunToolService(route routeResources: MCPHostRouteResources) -> AgentRunMCPToolService {
         var toolService = AgentRunMCPToolService(
             toolName: MCPWindowToolName.agentRun,
             captureRequestMetadata: { [self] in await captureRequestMetadata() },
@@ -698,6 +699,7 @@ final class MCPServerViewModel: ObservableObject {
             },
             resolveOracleReviewLaunchSource: { [self] metadata, targetWindow in
                 try await resolveAgentRunOracleReviewLaunchSource(
+                    route: routeResources,
                     metadata: metadata,
                     targetWindow: targetWindow
                 )
@@ -721,7 +723,7 @@ final class MCPServerViewModel: ObservableObject {
                 )
             },
             beginAgentRunWait: { [self] metadata, sessionIDs, timeoutSeconds in
-                await beginAgentRunWaitScope(metadata: metadata, sessionIDs: sessionIDs, timeoutSeconds: timeoutSeconds)
+                await beginAgentRunWaitScope(route: routeResources, metadata: metadata, sessionIDs: sessionIDs, timeoutSeconds: timeoutSeconds)
             },
             endAgentRunWait: { [self] token, completion in
                 endAgentRunWaitScope(token, completion: completion)
@@ -763,12 +765,13 @@ final class MCPServerViewModel: ObservableObject {
             ]
             forwarded["session_id"] = args["session_id"]
             forwarded["message"] = args["message"]
-            return try await makeAgentSessionLinkToolService(metadata: metadata).execute(args: forwarded)
+            return try await makeAgentSessionLinkToolService(route: routeResources, metadata: metadata).execute(args: forwarded)
         }
         return toolService
     }
 
     private func resolveAgentRunOracleReviewLaunchSource(
+        route routeResources: MCPHostRouteResources,
         metadata: RequestMetadata,
         targetWindow: WindowState
     ) async throws -> ResolvedAgentRunOracleReviewLaunchSource {
@@ -973,7 +976,7 @@ final class MCPServerViewModel: ObservableObject {
         }
     #endif
 
-    private var agentExploreToolService: AgentExploreMCPToolService {
+    private func agentExploreToolService(route routeResources: MCPHostRouteResources) -> AgentExploreMCPToolService {
         var toolService = AgentExploreMCPToolService(
             toolName: MCPWindowToolName.agentExplore,
             captureRequestMetadata: { [self] in await captureRequestMetadata() },
@@ -994,7 +997,7 @@ final class MCPServerViewModel: ObservableObject {
                 )
             },
             beginAgentRunWait: { [self] metadata, sessionIDs, timeoutSeconds in
-                await beginAgentRunWaitScope(metadata: metadata, sessionIDs: sessionIDs, timeoutSeconds: timeoutSeconds)
+                await beginAgentRunWaitScope(route: routeResources, metadata: metadata, sessionIDs: sessionIDs, timeoutSeconds: timeoutSeconds)
             },
             endAgentRunWait: { [self] token, completion in
                 endAgentRunWaitScope(token, completion: completion)
@@ -1005,7 +1008,7 @@ final class MCPServerViewModel: ObservableObject {
                     message: message,
                     metadata: metadata,
                     bindCurrentRequestToTab: { tabID, requestMetadata, startExpiry in
-                        try await bindCurrentRequestToTabIfPossible(tabID: tabID, metadata: requestMetadata, startExpiry: startExpiry)
+                        try await bindCurrentRequestToTabIfPossible(route: routeResources, tabID: tabID, metadata: requestMetadata, startExpiry: startExpiry)
                     },
                     agentModeVM: agentModeVM,
                     agentRaw: agentRaw,
@@ -1022,7 +1025,7 @@ final class MCPServerViewModel: ObservableObject {
         return toolService
     }
 
-    private var agentManageToolService: AgentManageMCPToolService {
+    private func agentManageToolService(route routeResources: MCPHostRouteResources) -> AgentManageMCPToolService {
         AgentManageMCPToolService(
             toolName: MCPWindowToolName.agentManage,
             perfRecorder: perfRecorder,
@@ -1035,12 +1038,12 @@ final class MCPServerViewModel: ObservableObject {
                 await resolveSpawnParentSessionID(route: routeResources, metadata: metadata, targetWindow: targetWindow)
             },
             bindCurrentRequestToTab: { [self] tabID, metadata in
-                try await bindCurrentRequestToTabIfPossible(tabID: tabID, metadata: metadata)
+                try await bindCurrentRequestToTabIfPossible(route: routeResources, tabID: tabID, metadata: metadata)
             }
         )
     }
 
-    private var agentSelfToolService: AgentSelfMCPToolService {
+    private func agentSelfToolService(route routeResources: MCPHostRouteResources) -> AgentSelfMCPToolService {
         AgentSelfMCPToolService(
             captureRequestMetadata: { [self] in await captureRequestMetadata() },
             requireTargetWindow: { [self] in try requireTargetWindow() },
@@ -1067,7 +1070,7 @@ final class MCPServerViewModel: ObservableObject {
         )
     }
 
-    private var becomeOverseerToolService: BecomeOverseerMCPToolService {
+    private func becomeOverseerToolService(route routeResources: MCPHostRouteResources) -> BecomeOverseerMCPToolService {
         BecomeOverseerMCPToolService(
             captureRequestMetadata: { [self] in await captureRequestMetadata() },
             resolveObserverEndpoint: { [self] metadata in
@@ -1075,6 +1078,7 @@ final class MCPServerViewModel: ObservableObject {
                     toolName: MCPWindowToolName.becomeOverseer, expectedWindowID: windowID
                 ), let connectionID = metadata.connectionID,
                 let endpoint = await resolveAgentSessionLinkModelObserverEndpoint(
+                    route: routeResources,
                     metadata: metadata,
                     modelRouteToken: invocation.dispatchAuthorization?.windowIdentity?.modelRouteToken
                 ), await ServerNetworkManager.shared.isBecomeOverseerAvailable(connectionID: connectionID, endpoint: endpoint)
@@ -1086,6 +1090,7 @@ final class MCPServerViewModel: ObservableObject {
                     toolName: MCPWindowToolName.becomeOverseer, expectedWindowID: windowID
                 ) else { return nil }
                 return await resolveAgentSessionLinkModelObserverEndpoint(
+                    route: routeResources,
                     metadata: metadata,
                     modelRouteToken: invocation.dispatchAuthorization?.windowIdentity?.modelRouteToken
                 )
@@ -1093,11 +1098,11 @@ final class MCPServerViewModel: ObservableObject {
         )
     }
 
-    private var agentSessionLinkToolService: AgentSessionLinkMCPToolService {
-        makeAgentSessionLinkToolService()
+    private func agentSessionLinkToolService(route routeResources: MCPHostRouteResources) -> AgentSessionLinkMCPToolService {
+        makeAgentSessionLinkToolService(route: routeResources)
     }
 
-    private func makeAgentSessionLinkToolService(metadata: RequestMetadata? = nil) -> AgentSessionLinkMCPToolService {
+    private func makeAgentSessionLinkToolService(route routeResources: MCPHostRouteResources, metadata: RequestMetadata? = nil) -> AgentSessionLinkMCPToolService {
         AgentSessionLinkMCPToolService(
             toolName: MCPWindowToolName.agentSessionLink,
             captureRequestMetadata: { [self] in
@@ -1128,6 +1133,7 @@ final class MCPServerViewModel: ObservableObject {
                     toolName: MCPWindowToolName.agentSessionLink, expectedWindowID: windowID
                 ) else { return nil }
                 return await resolveAgentSessionLinkModelObserverEndpoint(
+                    route: routeResources,
                     metadata: metadata,
                     modelRouteToken: invocationContext.dispatchAuthorization?.windowIdentity?.modelRouteToken
                 )
@@ -1332,703 +1338,747 @@ final class MCPServerViewModel: ObservableObject {
     @Published var isApprovalOverlayVisible: Bool = false
 
     @MainActor
-    private lazy var windowToolRuntime = MCPAppToolBinder(windowID: windowID) { [weak self, service = self.service, windowID = self.windowID] name, freshnessPolicy, args, implementation in
-        guard let self else {
-            throw MCPError.internalError("Window deallocated while executing \(name)")
-        }
-        // Capture the one app-binding ingress before runTool or provider work can suspend.
-        let invocationContext = try service.captureInvocationContext(toolName: name, expectedWindowID: windowID)
-        return try await runTool(
-            name, freshnessPolicy: freshnessPolicy, invocationContext: invocationContext,
-            modelOnly: ServerNetworkManager.isMemoryOnlyModelCall(toolName: name, arguments: args)
-        ) { [weak self] in
+    private lazy var windowToolRuntime = makeWindowToolRuntime(route: routeResources)
+
+    @MainActor
+    private func makeWindowToolRuntime(route routeResources: MCPHostRouteResources) -> MCPAppToolBinder {
+        MCPAppToolBinder(windowID: routeResources.identity.routeID) { [weak self, service = self.service, windowID = routeResources.identity.routeID] name, freshnessPolicy, args, implementation in
             guard let self else {
-                throw MCPError.internalError("Window deallocated during \(name)")
+                throw MCPError.internalError("Window deallocated while executing \(name)")
             }
-            return try await implementation(MCPAppToolInvocation(toolName: name, windowID: windowID, context: invocationContext), args)
+            // Capture the one app-binding ingress before runTool or provider work can suspend.
+            let invocationContext = try service.captureInvocationContext(toolName: name, expectedWindowID: windowID)
+            return try await runTool(
+                route: routeResources,
+                name,
+                freshnessPolicy: freshnessPolicy,
+                invocationContext: invocationContext,
+                modelOnly: ServerNetworkManager.isMemoryOnlyModelCall(toolName: name, arguments: args)
+            ) { [weak self] in
+                guard let self else {
+                    throw MCPError.internalError("Window deallocated during \(name)")
+                }
+                return try await implementation(MCPAppToolInvocation(toolName: name, windowID: windowID, context: invocationContext), args)
+            }
         }
     }
 
     @MainActor
-    private lazy var windowToolExecutionCapabilities = MCPAppPhysicalCapabilityAdapters.Execution(
-        executeOracleUtils: { [weak self] args in
-            guard let self else { throw MCPError.internalError("Window deallocated while executing oracle_utils") }
-            return try await oracleToolService.executeOracleUtils(args: args)
-        },
-        executeAskOracle: { [weak self, service = self.service, windowID = self.windowID] args in
-            guard let self else { throw MCPError.internalError("Window deallocated while executing ask_oracle") }
-            let invocationContext = try service.captureInvocationContext(toolName: MCPWindowToolName.askOracle, expectedWindowID: windowID)
-            let metadata = invocationContext.metadata
-            try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite {
-                try await self.drainReadFileAutoSelection(
-                    metadata: metadata,
-                    requirement: .mirroredSelectionAndMetrics
-                )
-            }
-            return try await oracleToolService.executeAskOracle(args: args, invocationContext: invocationContext)
-        },
-        executeOracleSend: { [weak self, service = self.service, windowID = self.windowID] args in
-            guard let self else { throw MCPError.internalError("Window deallocated while executing oracle_send") }
-            let invocationContext = try service.captureInvocationContext(toolName: MCPWindowToolName.oracleSend, expectedWindowID: windowID)
-            let metadata = invocationContext.metadata
-            try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite {
-                try await self.drainReadFileAutoSelection(
-                    metadata: metadata,
-                    requirement: .mirroredSelectionAndMetrics
-                )
-            }
-            return try await oracleToolService.executeOracleSend(args: args, invocationContext: invocationContext)
-        },
-        executeOracleChatLog: { [weak self, service = self.service, windowID = self.windowID] args in
-            guard let self else { throw MCPError.internalError("Window deallocated while executing oracle_chat_log") }
-            let invocationContext = try service.captureInvocationContext(toolName: MCPWindowToolName.oracleChatLog, expectedWindowID: windowID)
-            return try await oracleToolService.executeOracleChatLog(args: args, invocationContext: invocationContext)
-        },
-        executeAgentExplore: { [weak self] args in
-            guard let self else { throw MCPError.internalError("Window deallocated while executing agent_explore") }
-            return try await agentExploreToolService.execute(args: args)
-        },
-        executeAgentRun: { [weak self] args in
-            guard let self else { throw MCPError.internalError("Window deallocated while executing agent_run") }
-            return try await agentRunToolService.execute(args: args)
-        },
-        executeAgentManage: { [weak self] args in
-            guard let self else { throw MCPError.internalError("Window deallocated while executing agent_manage") }
-            return try await agentManageToolService.execute(args: args)
-        },
-        executeAgentSessionLink: { [weak self] args in
-            guard let self else {
-                throw MCPError.internalError("Window deallocated while executing agent_session_link")
-            }
-            return try await agentSessionLinkToolService.execute(args: args)
-        },
-        executeBecomeOverseer: { [weak self] args in
-            guard let self else { throw MCPError.internalError("Window deallocated while executing become_overseer") }
-            return try await becomeOverseerToolService.execute(args: args)
-        },
-        executeAgentSelf: { [weak self] args in
-            guard let self else {
-                if MCPInvocationContextBridge.current?.toolName == MCPWindowToolName.selfNoop {
-                    throw ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal
-                }
-                throw MCPError.internalError("Window deallocated while executing self_compact")
-            }
-            if MCPInvocationContextBridge.current?.toolName == MCPWindowToolName.selfNoop {
-                return try await agentSelfToolService.executeNoop(args: args)
-            }
-            return try await agentSelfToolService.execute(args: args)
-        },
-        executeSessionAdmin: { [weak self] args in
-            guard let self else { throw MCPError.internalError("Window deallocated while executing session_admin") }
-            return try await sessionAdminToolService(requireTargetWindow: { [weak self] in
-                guard let self else { throw MCPError.internalError("Window deallocated while resolving target window") }
-                return try requireTargetWindow()
-            })
-            .execute(args: args)
-        },
-        requireTargetWindow: { [weak self] in
-            guard let self else { throw MCPError.internalError("Window deallocated while resolving target window") }
-            return try requireTargetWindow()
-        },
-        requireCurrentTabContext: { [weak self] toolName in
-            guard let self else { throw MCPError.internalError("Window deallocated while resolving tab context") }
-            return try await requireCurrentTabContext(route: routeResources, toolName: toolName)
-        },
-        requireAgentModeConnection: { invocationContext, toolName in
-            guard let connectionID = invocationContext.connectionID else {
-                throw MCPError.invalidParams("\(toolName) requires an active MCP connection")
-            }
-            let purpose = await ServerNetworkManager.shared.runPurpose(for: connectionID)
-            guard purpose == .agentModeRun else {
-                throw MCPError.invalidParams("\(toolName) is only available during agent mode runs")
-            }
-            return connectionID
-        },
-        liveRunPurpose: { connectionID in
-            await ServerNetworkManager.shared.runPurpose(for: connectionID)
-        },
-        supportsProgressNotifications: { connectionID in
-            await ServerNetworkManager.shared.supportsProgressNotifications(connectionID: connectionID)
-        },
-        sendHeartbeatProgress: { connectionID, tool, stage, message in
-            await ServerNetworkManager.shared.sendProgress(
-                for: connectionID, tool: tool, kind: .heartbeat, stage: stage, message: message
-            )
-        },
-        resolveAgentModeTabID: { [weak self] args, connectionID, intent in
-            guard let self else { throw MCPError.internalError("Window deallocated while resolving agent mode tab") }
-            return try await resolveAgentSessionLifecycleMutationTarget(
-                args: args,
-                connectionID: connectionID,
-                intent: intent
-            )
-        },
-        resolveContextBuilderTab: { [weak self] args, targetWindow, connectionID in
-            guard let self else { throw MCPError.internalError("Window deallocated while resolving context_builder tab") }
-            let resolution = try await resolveContextBuilderTab(
-                args: args,
-                targetWindow: targetWindow,
-                connectionID: connectionID
-            )
-            return MCPAppPhysicalCapabilityAdapters.ContextBuilderTabResolution(
-                identity: resolution.identity,
-                nestedTabContext: resolution.nestedTabContext,
-                agentModeSessionID: resolution.agentModeSessionID,
-                agentModeRunID: resolution.agentModeRunID,
-                bindCaller: resolution.bindCaller,
-                lookupContext: resolution.lookupContext,
-                workspaceContext: resolution.workspaceContext,
-                reviewGitContext: resolution.reviewGitContext
-            )
-        },
-        bindTabForConnection: { [weak self] connectionID, clientName, tabID, workspaceID, windowID in
-            guard let self else { throw MCPError.internalError("Window deallocated while binding tab context") }
-            try bindTabForConnection(
-                route: routeResources,
-                connectionID: connectionID,
-                clientName: clientName,
-                tabID: tabID,
-                workspaceID: workspaceID,
-                windowID: windowID
-            )
-        },
-        buildTabSelectionReply: { [weak self] resultTab, resultWorkspaceID, includeBlocks, display, codeMapUsageOverride, lookupContextOverride, reviewGitContextOverride in
-            guard let self else { throw MCPError.internalError("Window deallocated while building context_builder selection reply") }
-            // The window token counter describes only the active compose tab. Any other result tab is
-            // accounted from its own prompt, stored prompts, and selection. Lookup and review-git
-            // overrides are always supplied here, so this context selects only the token accounting.
-            let resultTabIsActive = workspaceManager?.activeWorkspaceID == resultWorkspaceID
-                && promptVM.activeComposeTabID == resultTab.id
-            let accountingContext: MCPTabContextSnapshot? = resultTabIsActive ? nil : MCPTabContextSnapshot(
-                tabID: resultTab.id,
-                windowID: windowID,
-                workspaceID: resultWorkspaceID,
-                promptText: resultTab.promptText,
-                selection: resultTab.selection,
-                selectedMetaPromptIDs: resultTab.selectedMetaPromptIDs,
-                tabName: resultTab.name,
-                runID: nil,
-                explicitlyBound: false
-            )
-            let reply = await buildTabSelectionReply(
-                from: resultTab.selection,
-                includeBlocks: includeBlocks,
-                display: display,
-                codeMapUsageOverride: codeMapUsageOverride,
-                virtualContext: accountingContext,
-                lookupContextOverride: lookupContextOverride,
-                // Context Builder owns the selection authority before rendering: a completed run has
-                // already validated the exact committed snapshot revision, while a cancelled or failed
-                // pre-commit run deliberately reports its immutable captured initial snapshot as
-                // informational context. Joining later filesystem ingress cannot improve either
-                // snapshot's authority. Codemap/token freshness remains explicit in the reply metadata.
-                ingressPolicy: .alreadyAwaited,
-                reviewGitContextOverride: reviewGitContextOverride
-            )
-            #if DEBUG
-                contextBuilderSelectionReplyObserverForTesting?(resultTab.selection, lookupContextOverride, reply)
-            #endif
-            return reply
-        },
-        sendStageProgress: { [weak self] connectionID, tool, stage, message in
-            guard let self else { return }
-            await sendStageProgress(connectionID: connectionID, tool: tool, stage: stage, message: message)
-        },
-        makeOracleExportDestination: { workspace, windowID, tabID, lookupContext in
-            try MCPServerViewModel.makeOracleExportDestination(
-                workspace: workspace,
-                windowID: windowID,
-                tabID: tabID,
-                lookupContext: lookupContext
-            )
-        },
-        resolveDefaultOracleExportPath: { [weak self] mode, chatID, destination in
-            guard let self else { throw MCPError.internalError("Window deallocated while resolving Oracle export path") }
-            return try resolvedDefaultOracleExportPath(mode: mode, chatID: chatID, destination: destination)
-        },
-        writeGeneratedOracleExportFile: { [weak self] path, content, destination in
-            guard let self else { throw MCPError.internalError("Window deallocated while writing Oracle export") }
-            return try await writeGeneratedOracleExportFile(path: path, content: content, destination: destination)
-        },
-        beforeContextBuilderFinalReviewAuthorization: { [weak self] in
-            #if DEBUG
-                await self?.contextBuilderBeforeFinalReviewAuthorizationForTesting?()
-            #endif
-        },
-        didFinalizeContextBuilderReview: { [weak self] authorization in
-            #if DEBUG
-                await self?.contextBuilderDidFinalizeReviewForTesting?(authorization)
-            #else
-                _ = authorization
-            #endif
-        },
-        runMCPPlanOrQuestion: { [weak self] contextBuilderVM, identity, agentModeSessionID, agentModeRunID, mode, execution, prompt, selection, lookupContext, reviewGitContext, finalReviewAuthorization, progressReporter, activityReporter in
-            guard let self else { throw MCPError.internalError("Window deallocated while generating context_builder response") }
-            #if DEBUG
-                if let override = contextBuilderFollowUpOverrideForTesting {
-                    return try await override(
-                        contextBuilderVM,
-                        identity,
-                        agentModeSessionID,
-                        agentModeRunID,
-                        mode,
-                        execution,
-                        prompt,
-                        selection,
-                        lookupContext,
-                        reviewGitContext,
-                        finalReviewAuthorization,
-                        progressReporter,
-                        activityReporter
+    private lazy var windowToolExecutionCapabilities = makeWindowToolExecutionCapabilities(route: routeResources)
+
+    @MainActor
+    private func makeWindowToolExecutionCapabilities(route routeResources: MCPHostRouteResources) -> MCPAppPhysicalCapabilityAdapters.Execution {
+        MCPAppPhysicalCapabilityAdapters.Execution(
+            executeOracleUtils: { [weak self] args in
+                guard let self else { throw MCPError.internalError("Window deallocated while executing oracle_utils") }
+                return try await oracleToolService(route: routeResources).executeOracleUtils(args: args)
+            },
+            executeAskOracle: { [weak self, service = self.service, windowID = routeResources.identity.routeID] args in
+                guard let self else { throw MCPError.internalError("Window deallocated while executing ask_oracle") }
+                let invocationContext = try service.captureInvocationContext(toolName: MCPWindowToolName.askOracle, expectedWindowID: windowID)
+                let metadata = invocationContext.metadata
+                try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite {
+                    try await self.drainReadFileAutoSelection(
+                        route: routeResources,
+                        metadata: metadata,
+                        requirement: .mirroredSelectionAndMetrics
                     )
                 }
-            #endif
-            return try await contextBuilderVM.runMCPPlanOrQuestion(
-                for: identity,
-                oracleViewModel: oracleVM,
-                agentModeSessionID: agentModeSessionID,
-                agentModeRunID: agentModeRunID,
-                mode: mode,
-                execution: execution,
-                prompt: prompt,
-                selection: selection,
-                lookupContext: lookupContext,
-                reviewGitContext: reviewGitContext,
-                finalReviewAuthorization: finalReviewAuthorization,
-                progressReporter: progressReporter,
-                activityReporter: activityReporter
-            )
-        }
-    )
-
-    @MainActor
-    private lazy var windowToolContextCapabilities = MCPAppPhysicalCapabilityAdapters.Context(
-        windowID: windowID,
-        promptVM: promptVM,
-        workspaceManager: workspaceManager,
-        selectionCoordinator: selectionCoordinator,
-        applyEditsApprovalStore: applyEditsApprovalStore,
-        captureRequestMetadata: { [weak self] in
-            guard let self else { return MCPServerViewModel.RequestMetadata(connectionID: nil, clientName: nil, windowID: nil) }
-            return await captureRequestMetadata()
-        },
-        resolveImplicitContextBuilderGitTarget: { [weak self] metadata in
-            guard let self else {
-                throw MCPError.internalError("Window deallocated while resolving the Context Builder Git target")
-            }
-            return try await resolveImplicitContextBuilderGitTarget(route: routeResources, metadata: metadata)
-        },
-        validateContextBuilderGitArtifactSelection: { [weak self] metadata, target in
-            guard let self else {
-                throw MCPError.internalError("Window deallocated while validating Context Builder Git publication")
-            }
-            try await validateContextBuilderGitArtifactSelection(route: routeResources, metadata: metadata, target: target)
-        },
-        resolveTabContextSnapshot: { [weak self] metadata, toolName in
-            guard let self else { throw MCPError.internalError("Window deallocated while resolving tab context") }
-            return try resolveTabContextSnapshot(
-                route: routeResources,
-                from: metadata,
-                toolName: toolName
-            )
-        },
-        updateCurrentTabPrompt: { [weak self] toolName, mutation in
-            guard let self else { throw MCPError.internalError("Window deallocated while updating tab prompt") }
-            return try await updateCurrentTabPrompt(toolName: toolName, mutation: mutation)
-        },
-        selectedRecordsForCurrentTabContext: { [weak self] metadata, lookupContextOverride in
-            guard let self else { throw MCPError.internalError("Window deallocated while resolving selected files") }
-            return try await selectedRecordsForCurrentTabContext(
-                metadataOverride: metadata,
-                lookupContextOverride: lookupContextOverride
-            )
-        },
-        physicalSelectionForCurrentTabContext: { [weak self] metadata, lookupContextOverride in
-            guard let self else { throw MCPError.internalError("Window deallocated while resolving selected files") }
-            return try await physicalSelectionForCurrentTabContext(
-                metadataOverride: metadata,
-                lookupContextOverride: lookupContextOverride
-            )
-        },
-        resolveSelectedFilesForCodeStructure: { [weak self] metadata, lookupContext, maximumSeedCount in
-            guard let self else { throw MCPError.internalError("Window deallocated while resolving selected code structure files") }
-            return try await resolveSelectedFilesForCodeStructure(
-                metadata: metadata,
-                lookupContext: lookupContext,
-                maximumSeedCount: maximumSeedCount
-            )
-        },
-        boundTabID: { [weak self] connectionID in
-            guard let self, let connectionID else { return nil }
-            return boundTabID(route: routeResources, forConnection: connectionID)
-        },
-        mapFileManagerErrorToMCP: { [weak self] error, action, path in
-            guard let self else { return MCPError.internalError("Window deallocated while mapping file manager error") }
-            return await mapFileManagerErrorToMCP(error, action: action, path: path)
-        },
-        ensureGitDataRootLoaded: { [weak self] workspace, workspaceManager in
-            guard let self else {
-                throw MCPError.internalError("Window deallocated while loading the Git-data root")
-            }
-            return try await ensureGitDataRootLoaded(workspace, workspaceManager)
-        },
-        logDebug: { message in
-            mcpServerViewModelDebugLog(message)
-        },
-        commitPrimaryGitDiffArtifactsToCurrentTab: { [weak self] toolName, candidates, sourceSelection, capturedContext in
-            guard let self else {
-                throw MCPError.internalError("Window deallocated while committing Git artifacts")
-            }
-            return try await commitPrimaryGitArtifactsToCurrentTab(
-                route: routeResources,
-                toolName: toolName,
-                candidates: candidates,
-                sourceSelection: sourceSelection,
-                capturedContext: capturedContext
-            )
-        },
-        replaceAdvertisedGitArtifactsForCurrentTab: { [weak self] toolName, artifacts, expectedSelectionRevision, capturedContext in
-            guard let self else {
-                throw MCPError.internalError("Window deallocated while registering Git artifact aliases")
-            }
-            return try await replaceAdvertisedGitArtifactsForCurrentTab(
-                route: routeResources,
-                toolName: toolName,
-                artifacts: artifacts,
-                expectedSelectionRevision: expectedSelectionRevision,
-                capturedContext: capturedContext
-            )
-        },
-        invalidateAdvertisedGitArtifactsForCurrentTab: { [weak self] toolName, capturedContext in
-            guard let self else { return }
-            await invalidateAdvertisedGitArtifactsForCurrentTab(
-                route: routeResources,
-                toolName: toolName,
-                capturedContext: capturedContext
-            )
-        }
-    )
-
-    @MainActor
-    private lazy var windowToolSelectionCapabilities = MCPAppPhysicalCapabilityAdapters.Selection(
-        workspaceSearch: workspaceSearch,
-        parseManageSelectionInputs: { [weak self] rawPaths, slicesValue in
-            guard let self else {
-                return MCPServerViewModel.ManageSelectionInputs(paths: [], sliceInputs: [], sliceErrors: [], hadExplicitSliceSpec: false)
-            }
-            return parseManageSelectionInputs(rawPaths: rawPaths, slicesValue: slicesValue)
-        },
-        resolveFileToolLookupContext: { [weak self] metadata in
-            guard let self else { return .visibleWorkspace }
-            return await resolveFileToolLookupContext(route: routeResources, from: metadata)
-        },
-        requiredFileToolLookupContext: { [weak self] metadata in
-            guard let self else {
-                throw MCPError.internalError("Window deallocated while resolving file-tool authority")
-            }
-            return try await requiredFileToolLookupContext(route: routeResources, from: metadata)
-        },
-        resolveMutationFileToolContext: { [weak self] metadata, toolName in
-            guard let self else {
-                throw MCPError.internalError("Window deallocated while resolving mutation worktree scope")
-            }
-            return try await resolveMutationFileToolContext(route: routeResources, from: metadata, toolName: toolName)
-        },
-        stabilizedVirtualSelection: { [weak self] context in
-            guard let self else { return context.selection }
-            return await stabilizedVirtualSelection(for: context)
-        },
-        freezePromptGitReviewContext: { [weak self] context in
-            guard let self else { return .automaticOnly(base: "HEAD") }
-            return await promptVM.freezePromptGitReviewContext(
-                workspaceID: context.workspaceID,
-                tabID: context.tabID,
-                sessionID: context.activeAgentSessionID,
-                bindings: context.worktreeBindings,
-                base: "HEAD"
-            )
-        },
-        buildCurrentSelectionReply: { [weak self] includeBlocks, display, extraInvalid, viewMode, resolvedContext, lookupContext in
-            guard let self else { throw MCPError.internalError("Window deallocated while building selection reply") }
-            return await buildCurrentSelectionReply(
-                includeBlocks: includeBlocks,
-                display: display,
-                extraInvalid: extraInvalid,
-                viewMode: viewMode,
-                resolvedContext: resolvedContext,
-                lookupContext: lookupContext
-            )
-        },
-        buildSelectionPreviewReply: { [weak self] selection, includeBlocks, display, extraInvalid, viewMode, codeMapUsageOverride, lookupContext, virtualContext, reviewGitContext in
-            guard let self else { throw MCPError.internalError("Window deallocated while building selection preview") }
-            return await buildSelectionPreviewReply(
-                selection: selection,
-                includeBlocks: includeBlocks,
-                display: display,
-                extraInvalid: extraInvalid,
-                viewMode: viewMode,
-                codeMapUsageOverride: codeMapUsageOverride,
-                lookupContext: lookupContext,
-                virtualContext: virtualContext,
-                reviewGitContext: reviewGitContext
-            )
-        },
-        buildSelectionMutationReply: { [weak self] selection, includeBlocks, display, extraInvalid, viewMode, codeMapUsageOverride, virtualContext, lookupContext, reviewGitContext in
-            guard let self else { throw MCPError.internalError("Window deallocated while building selection mutation reply") }
-            return await buildSelectionMutationReply(
-                from: selection,
-                includeBlocks: includeBlocks,
-                display: display,
-                extraInvalid: extraInvalid,
-                viewMode: viewMode,
-                codeMapUsageOverride: codeMapUsageOverride,
-                virtualContext: virtualContext,
-                lookupContext: lookupContext,
-                reviewGitContext: reviewGitContext
-            )
-        },
-        buildManageSelectionSetSelection: { [weak self] inputs, mode, existing, hasFullFileArtifactInputs, lookupRootScope in
-            guard let self else { return MCPServerViewModel.BuildStoredSelectionResult(selection: existing, invalidPaths: [], codemapUnavailable: []) }
-            return await buildManageSelectionSetSelection(
-                from: inputs,
-                mode: mode,
-                existing: existing,
-                hasFullFileArtifactInputs: hasFullFileArtifactInputs,
-                lookupRootScope: lookupRootScope
-            )
-        },
-        resolveManageSelectionArtifactInputs: { [weak self] request in
-            guard let self else {
-                return MCPManageSelectionArtifactResolution(
-                    ordinaryPaths: request.paths,
-                    ordinarySliceInputs: request.sliceInputs,
-                    artifacts: [],
-                    invalidDiagnostics: [],
-                    fence: nil
+                return try await oracleToolService(route: routeResources).executeAskOracle(args: args, invocationContext: invocationContext)
+            },
+            executeOracleSend: { [weak self, service = self.service, windowID = routeResources.identity.routeID] args in
+                guard let self else { throw MCPError.internalError("Window deallocated while executing oracle_send") }
+                let invocationContext = try service.captureInvocationContext(toolName: MCPWindowToolName.oracleSend, expectedWindowID: windowID)
+                let metadata = invocationContext.metadata
+                try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite {
+                    try await self.drainReadFileAutoSelection(
+                        route: routeResources,
+                        metadata: metadata,
+                        requirement: .mirroredSelectionAndMetrics
+                    )
+                }
+                return try await oracleToolService(route: routeResources).executeOracleSend(args: args, invocationContext: invocationContext)
+            },
+            executeOracleChatLog: { [weak self, service = self.service, windowID = routeResources.identity.routeID] args in
+                guard let self else { throw MCPError.internalError("Window deallocated while executing oracle_chat_log") }
+                let invocationContext = try service.captureInvocationContext(toolName: MCPWindowToolName.oracleChatLog, expectedWindowID: windowID)
+                return try await oracleToolService(route: routeResources).executeOracleChatLog(args: args, invocationContext: invocationContext)
+            },
+            executeAgentExplore: { [weak self] args in
+                guard let self else { throw MCPError.internalError("Window deallocated while executing agent_explore") }
+                return try await agentExploreToolService(route: routeResources).execute(args: args)
+            },
+            executeAgentRun: { [weak self] args in
+                guard let self else { throw MCPError.internalError("Window deallocated while executing agent_run") }
+                return try await agentRunToolService(route: routeResources).execute(args: args)
+            },
+            executeAgentManage: { [weak self] args in
+                guard let self else { throw MCPError.internalError("Window deallocated while executing agent_manage") }
+                return try await agentManageToolService(route: routeResources).execute(args: args)
+            },
+            executeAgentSessionLink: { [weak self] args in
+                guard let self else {
+                    throw MCPError.internalError("Window deallocated while executing agent_session_link")
+                }
+                return try await agentSessionLinkToolService(route: routeResources).execute(args: args)
+            },
+            executeBecomeOverseer: { [weak self] args in
+                guard let self else { throw MCPError.internalError("Window deallocated while executing become_overseer") }
+                return try await becomeOverseerToolService(route: routeResources).execute(args: args)
+            },
+            executeAgentSelf: { [weak self] args in
+                guard let self else {
+                    if MCPInvocationContextBridge.current?.toolName == MCPWindowToolName.selfNoop {
+                        throw ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal
+                    }
+                    throw MCPError.internalError("Window deallocated while executing self_compact")
+                }
+                if MCPInvocationContextBridge.current?.toolName == MCPWindowToolName.selfNoop {
+                    return try await agentSelfToolService(route: routeResources).executeNoop(args: args)
+                }
+                return try await agentSelfToolService(route: routeResources).execute(args: args)
+            },
+            executeSessionAdmin: { [weak self] args in
+                guard let self else { throw MCPError.internalError("Window deallocated while executing session_admin") }
+                return try await sessionAdminToolService(route: routeResources, requireTargetWindow: { [weak self] in
+                    guard let self else { throw MCPError.internalError("Window deallocated while resolving target window") }
+                    return try requireTargetWindow()
+                })
+                .execute(args: args)
+            },
+            requireTargetWindow: { [weak self] in
+                guard let self else { throw MCPError.internalError("Window deallocated while resolving target window") }
+                return try requireTargetWindow()
+            },
+            requireCurrentTabContext: { [weak self] toolName in
+                guard let self else { throw MCPError.internalError("Window deallocated while resolving tab context") }
+                return try await requireCurrentTabContext(route: routeResources, toolName: toolName)
+            },
+            requireAgentModeConnection: { invocationContext, toolName in
+                guard let connectionID = invocationContext.connectionID else {
+                    throw MCPError.invalidParams("\(toolName) requires an active MCP connection")
+                }
+                let purpose = await ServerNetworkManager.shared.runPurpose(for: connectionID)
+                guard purpose == .agentModeRun else {
+                    throw MCPError.invalidParams("\(toolName) is only available during agent mode runs")
+                }
+                return connectionID
+            },
+            liveRunPurpose: { connectionID in
+                await ServerNetworkManager.shared.runPurpose(for: connectionID)
+            },
+            supportsProgressNotifications: { connectionID in
+                await ServerNetworkManager.shared.supportsProgressNotifications(connectionID: connectionID)
+            },
+            sendHeartbeatProgress: { connectionID, tool, stage, message in
+                await ServerNetworkManager.shared.sendProgress(
+                    for: connectionID, tool: tool, kind: .heartbeat, stage: stage, message: message
+                )
+            },
+            resolveAgentModeTabID: { [weak self] args, connectionID, intent in
+                guard let self else { throw MCPError.internalError("Window deallocated while resolving agent mode tab") }
+                return try await resolveAgentSessionLifecycleMutationTarget(
+                    route: routeResources,
+                    args: args,
+                    connectionID: connectionID,
+                    intent: intent
+                )
+            },
+            resolveContextBuilderTab: { [weak self] args, targetWindow, connectionID in
+                guard let self else { throw MCPError.internalError("Window deallocated while resolving context_builder tab") }
+                let resolution = try await resolveContextBuilderTab(
+                    route: routeResources,
+                    args: args,
+                    targetWindow: targetWindow,
+                    connectionID: connectionID
+                )
+                return MCPAppPhysicalCapabilityAdapters.ContextBuilderTabResolution(
+                    identity: resolution.identity,
+                    nestedTabContext: resolution.nestedTabContext,
+                    agentModeSessionID: resolution.agentModeSessionID,
+                    agentModeRunID: resolution.agentModeRunID,
+                    bindCaller: resolution.bindCaller,
+                    lookupContext: resolution.lookupContext,
+                    workspaceContext: resolution.workspaceContext,
+                    reviewGitContext: resolution.reviewGitContext
+                )
+            },
+            bindTabForConnection: { [weak self] connectionID, clientName, tabID, workspaceID, windowID in
+                guard let self else { throw MCPError.internalError("Window deallocated while binding tab context") }
+                try bindTabForConnection(
+                    route: routeResources,
+                    connectionID: connectionID,
+                    clientName: clientName,
+                    tabID: tabID,
+                    workspaceID: workspaceID,
+                    windowID: windowID
+                )
+            },
+            buildTabSelectionReply: { [weak self] resultTab, resultWorkspaceID, includeBlocks, display, codeMapUsageOverride, lookupContextOverride, reviewGitContextOverride in
+                guard let self else { throw MCPError.internalError("Window deallocated while building context_builder selection reply") }
+                // The window token counter describes only the active compose tab. Any other result tab is
+                // accounted from its own prompt, stored prompts, and selection. Lookup and review-git
+                // overrides are always supplied here, so this context selects only the token accounting.
+                let resultTabIsActive = workspaceManager?.activeWorkspaceID == resultWorkspaceID
+                    && promptVM.activeComposeTabID == resultTab.id
+                let accountingContext: MCPTabContextSnapshot? = resultTabIsActive ? nil : MCPTabContextSnapshot(
+                    tabID: resultTab.id,
+                    windowID: windowID,
+                    workspaceID: resultWorkspaceID,
+                    promptText: resultTab.promptText,
+                    selection: resultTab.selection,
+                    selectedMetaPromptIDs: resultTab.selectedMetaPromptIDs,
+                    tabName: resultTab.name,
+                    runID: nil,
+                    explicitlyBound: false
+                )
+                let reply = await buildTabSelectionReply(
+                    from: resultTab.selection,
+                    includeBlocks: includeBlocks,
+                    display: display,
+                    codeMapUsageOverride: codeMapUsageOverride,
+                    virtualContext: accountingContext,
+                    lookupContextOverride: lookupContextOverride,
+                    // Context Builder owns the selection authority before rendering: a completed run has
+                    // already validated the exact committed snapshot revision, while a cancelled or failed
+                    // pre-commit run deliberately reports its immutable captured initial snapshot as
+                    // informational context. Joining later filesystem ingress cannot improve either
+                    // snapshot's authority. Codemap/token freshness remains explicit in the reply metadata.
+                    ingressPolicy: .alreadyAwaited,
+                    reviewGitContextOverride: reviewGitContextOverride
+                )
+                #if DEBUG
+                    contextBuilderSelectionReplyObserverForTesting?(resultTab.selection, lookupContextOverride, reply)
+                #endif
+                return reply
+            },
+            sendStageProgress: { [weak self] connectionID, tool, stage, message in
+                guard let self else { return }
+                await sendStageProgress(connectionID: connectionID, tool: tool, stage: stage, message: message)
+            },
+            makeOracleExportDestination: { workspace, windowID, tabID, lookupContext in
+                try MCPServerViewModel.makeOracleExportDestination(
+                    workspace: workspace,
+                    windowID: windowID,
+                    tabID: tabID,
+                    lookupContext: lookupContext
+                )
+            },
+            resolveDefaultOracleExportPath: { [weak self] mode, chatID, destination in
+                guard let self else { throw MCPError.internalError("Window deallocated while resolving Oracle export path") }
+                return try resolvedDefaultOracleExportPath(mode: mode, chatID: chatID, destination: destination)
+            },
+            writeGeneratedOracleExportFile: { [weak self] path, content, destination in
+                guard let self else { throw MCPError.internalError("Window deallocated while writing Oracle export") }
+                return try await writeGeneratedOracleExportFile(path: path, content: content, destination: destination)
+            },
+            beforeContextBuilderFinalReviewAuthorization: { [weak self] in
+                #if DEBUG
+                    await self?.contextBuilderBeforeFinalReviewAuthorizationForTesting?()
+                #endif
+            },
+            didFinalizeContextBuilderReview: { [weak self] authorization in
+                #if DEBUG
+                    await self?.contextBuilderDidFinalizeReviewForTesting?(authorization)
+                #else
+                    _ = authorization
+                #endif
+            },
+            runMCPPlanOrQuestion: { [weak self] contextBuilderVM, identity, agentModeSessionID, agentModeRunID, mode, execution, prompt, selection, lookupContext, reviewGitContext, finalReviewAuthorization, progressReporter, activityReporter in
+                guard let self else { throw MCPError.internalError("Window deallocated while generating context_builder response") }
+                #if DEBUG
+                    if let override = contextBuilderFollowUpOverrideForTesting {
+                        return try await override(
+                            contextBuilderVM,
+                            identity,
+                            agentModeSessionID,
+                            agentModeRunID,
+                            mode,
+                            execution,
+                            prompt,
+                            selection,
+                            lookupContext,
+                            reviewGitContext,
+                            finalReviewAuthorization,
+                            progressReporter,
+                            activityReporter
+                        )
+                    }
+                #endif
+                return try await contextBuilderVM.runMCPPlanOrQuestion(
+                    for: identity,
+                    oracleViewModel: oracleVM,
+                    agentModeSessionID: agentModeSessionID,
+                    agentModeRunID: agentModeRunID,
+                    mode: mode,
+                    execution: execution,
+                    prompt: prompt,
+                    selection: selection,
+                    lookupContext: lookupContext,
+                    reviewGitContext: reviewGitContext,
+                    finalReviewAuthorization: finalReviewAuthorization,
+                    progressReporter: progressReporter,
+                    activityReporter: activityReporter
                 )
             }
-            return await MCPManageSelectionArtifactResolver(
-                store: promptVM.workspaceFileContextStore,
-                registry: gitArtifactAdvertisementRegistry
-            ).resolve(request)
-        },
-        validateManageSelectionArtifactFence: { [weak self] fence in
-            guard let self else { return false }
-            return await validateManageSelectionArtifactFence(fence)
-        },
-        mutatePreResolvedFullFilePaths: { [weak self] base, absolutePaths, mode in
-            guard let self else { return base }
-            return mutatePreResolvedFullFilePaths(
-                base: base,
-                absolutePaths: absolutePaths,
-                mode: mode
-            )
-        },
-        commitManageSelectionArtifactMutation: { [weak self] resolvedContext, metadata, expectedPhysicalSelection, requestedPhysicalSelection, lookupContext, fence in
-            guard let self else {
-                return .unavailable(reason: "window deallocated during selection commit")
-            }
-            return await commitManageSelectionArtifactMutation(
-                route: routeResources,
-                resolvedContext: resolvedContext,
-                metadata: metadata,
-                expectedPhysicalSelection: expectedPhysicalSelection,
-                requestedPhysicalSelection: requestedPhysicalSelection,
-                lookupContext: lookupContext,
-                fence: fence
-            )
-        },
-        addStoredSelectionPaths: { [weak self] existing, paths, rawPaths, mode, lookupRootScope in
-            guard let self else { return MCPServerViewModel.AddStoredSelectionResult(selection: existing, invalidPaths: [], resolvedMap: [:], mutated: false, codemapUnavailable: []) }
-            return await addStoredSelectionPaths(existing: existing, paths: paths, rawPaths: rawPaths, mode: mode, lookupRootScope: lookupRootScope)
-        },
-        removeStoredSelectionPaths: { [weak self] existing, paths, rawPaths, mode, lookupRootScope in
-            guard let self else { return (existing, [], [:], false) }
-            return await removeStoredSelectionPaths(existing: existing, paths: paths, rawPaths: rawPaths, mode: mode, lookupRootScope: lookupRootScope)
-        },
-        promoteStoredSelectionPaths: { [weak self] existing, paths, rawPaths, strict, lookupRootScope in
-            guard let self else { return (existing, [], false, 0) }
-            return await promoteStoredSelectionPaths(existing: existing, paths: paths, rawPaths: rawPaths, strict: strict, lookupRootScope: lookupRootScope)
-        },
-        demoteStoredSelectionPaths: { [weak self] existing, paths, rawPaths, strict, lookupRootScope in
-            guard let self else {
-                return MCPServerViewModel.DemoteStoredSelectionResult(
-                    selection: existing,
-                    invalidPaths: [],
-                    codemapUnavailable: [],
-                    mutated: false,
-                    validCandidateCount: 0
+        )
+    }
+
+    @MainActor
+    private lazy var windowToolContextCapabilities = makeWindowToolContextCapabilities(route: routeResources)
+
+    @MainActor
+    private func makeWindowToolContextCapabilities(route routeResources: MCPHostRouteResources) -> MCPAppPhysicalCapabilityAdapters.Context {
+        MCPAppPhysicalCapabilityAdapters.Context(
+            windowID: routeResources.identity.routeID,
+            promptVM: promptVM,
+            workspaceManager: workspaceManager,
+            selectionCoordinator: selectionCoordinator,
+            applyEditsApprovalStore: applyEditsApprovalStore,
+            captureRequestMetadata: { [weak self] in
+                guard let self else { return MCPServerViewModel.RequestMetadata(connectionID: nil, clientName: nil, windowID: nil) }
+                return await captureRequestMetadata()
+            },
+            resolveImplicitContextBuilderGitTarget: { [weak self] metadata in
+                guard let self else {
+                    throw MCPError.internalError("Window deallocated while resolving the Context Builder Git target")
+                }
+                return try await resolveImplicitContextBuilderGitTarget(route: routeResources, metadata: metadata)
+            },
+            validateContextBuilderGitArtifactSelection: { [weak self] metadata, target in
+                guard let self else {
+                    throw MCPError.internalError("Window deallocated while validating Context Builder Git publication")
+                }
+                try await validateContextBuilderGitArtifactSelection(route: routeResources, metadata: metadata, target: target)
+            },
+            resolveTabContextSnapshot: { [weak self] metadata, toolName in
+                guard let self else { throw MCPError.internalError("Window deallocated while resolving tab context") }
+                return try resolveTabContextSnapshot(
+                    route: routeResources,
+                    from: metadata,
+                    toolName: toolName
+                )
+            },
+            updateCurrentTabPrompt: { [weak self] toolName, mutation in
+                guard let self else { throw MCPError.internalError("Window deallocated while updating tab prompt") }
+                return try await updateCurrentTabPrompt(route: routeResources, toolName: toolName, mutation: mutation)
+            },
+            selectedRecordsForCurrentTabContext: { [weak self] metadata, lookupContextOverride in
+                guard let self else { throw MCPError.internalError("Window deallocated while resolving selected files") }
+                return try await selectedRecordsForCurrentTabContext(
+                    route: routeResources,
+                    metadataOverride: metadata,
+                    lookupContextOverride: lookupContextOverride
+                )
+            },
+            physicalSelectionForCurrentTabContext: { [weak self] metadata, lookupContextOverride in
+                guard let self else { throw MCPError.internalError("Window deallocated while resolving selected files") }
+                return try await physicalSelectionForCurrentTabContext(
+                    route: routeResources,
+                    metadataOverride: metadata,
+                    lookupContextOverride: lookupContextOverride
+                )
+            },
+            resolveSelectedFilesForCodeStructure: { [weak self] metadata, lookupContext, maximumSeedCount in
+                guard let self else { throw MCPError.internalError("Window deallocated while resolving selected code structure files") }
+                return try await resolveSelectedFilesForCodeStructure(
+                    route: routeResources,
+                    metadata: metadata,
+                    lookupContext: lookupContext,
+                    maximumSeedCount: maximumSeedCount
+                )
+            },
+            boundTabID: { [weak self] connectionID in
+                guard let self, let connectionID else { return nil }
+                return boundTabID(route: routeResources, forConnection: connectionID)
+            },
+            mapFileManagerErrorToMCP: { [weak self] error, action, path in
+                guard let self else { return MCPError.internalError("Window deallocated while mapping file manager error") }
+                return await mapFileManagerErrorToMCP(error, action: action, path: path)
+            },
+            ensureGitDataRootLoaded: { [weak self] workspace, workspaceManager in
+                guard let self else {
+                    throw MCPError.internalError("Window deallocated while loading the Git-data root")
+                }
+                return try await ensureGitDataRootLoaded(workspace, workspaceManager)
+            },
+            logDebug: { message in
+                mcpServerViewModelDebugLog(message)
+            },
+            commitPrimaryGitDiffArtifactsToCurrentTab: { [weak self] toolName, candidates, sourceSelection, capturedContext in
+                guard let self else {
+                    throw MCPError.internalError("Window deallocated while committing Git artifacts")
+                }
+                return try await commitPrimaryGitArtifactsToCurrentTab(
+                    route: routeResources,
+                    toolName: toolName,
+                    candidates: candidates,
+                    sourceSelection: sourceSelection,
+                    capturedContext: capturedContext
+                )
+            },
+            replaceAdvertisedGitArtifactsForCurrentTab: { [weak self] toolName, artifacts, expectedSelectionRevision, capturedContext in
+                guard let self else {
+                    throw MCPError.internalError("Window deallocated while registering Git artifact aliases")
+                }
+                return try await replaceAdvertisedGitArtifactsForCurrentTab(
+                    route: routeResources,
+                    toolName: toolName,
+                    artifacts: artifacts,
+                    expectedSelectionRevision: expectedSelectionRevision,
+                    capturedContext: capturedContext
+                )
+            },
+            invalidateAdvertisedGitArtifactsForCurrentTab: { [weak self] toolName, capturedContext in
+                guard let self else { return }
+                await invalidateAdvertisedGitArtifactsForCurrentTab(
+                    route: routeResources,
+                    toolName: toolName,
+                    capturedContext: capturedContext
                 )
             }
-            return await demoteStoredSelectionPaths(existing: existing, paths: paths, rawPaths: rawPaths, strict: strict, lookupRootScope: lookupRootScope)
-        },
-        computeSelectionSlicesVirtual: { [weak self] base, entries, mode, lookupRootScope in
-            guard let self else {
-                return (base, MCPServerViewModel.MCPSelectionSlicesMutationResult(invalidPaths: [], resolvedMap: [:], snapshot: [:]), false)
-            }
-            return await computeSelectionSlicesVirtual(base: base, entries: entries, mode: mode, lookupRootScope: lookupRootScope)
-        },
-        persistResolvedTabContextSnapshot: { [weak self] resolvedContext, metadata, mutated in
-            guard let self else { return nil }
-            return await persistResolvedTabContextSnapshot(route: routeResources, resolvedContext, metadata: metadata, mutated: mutated)
-        },
-        selectCreatedFile: { [weak self] file, resolvedContext, metadata, lookupContext in
-            guard let self else { return "The file was created, but its selection was not confirmed because the window closed." }
-            return await selectCreatedFile(
-                file,
-                resolvedContext: resolvedContext,
-                metadata: metadata,
-                lookupContext: lookupContext
-            )
-        },
-        makeSelectionHintError: { [weak self] paths, operation, lookupContext in
-            guard let self else { return "Window deallocated while resolving selection inputs." }
-            return await makeSelectionHintError(paths: paths, operation: operation, lookupContext: lookupContext)
-        }
-    )
+        )
+    }
 
     @MainActor
-    private lazy var windowToolFileCapabilities = MCPAppPhysicalCapabilityAdapters.Files(
-        performFileAction: { [weak self] action, path, content, newPath, ifExists, operationID in
-            guard let self else { throw MCPError.internalError("Window deallocated while performing file action") }
-            return try await performFileAction(action: action, path: path, content: content, newPath: newPath, ifExists: ifExists, operationID: operationID)
-        },
-        buildCodeStructureDTO: { [weak self] files, request, includePathNotFoundIssue, requestedPaths, lookupContext in
-            guard let self else { throw MCPError.internalError("Window deallocated while building code structure") }
-            return try await buildCodeStructureDTO(
-                fromRecords: files,
-                request: request,
-                includePathNotFoundIssue: includePathNotFoundIssue,
-                requestedPaths: requestedPaths,
-                lookupContext: lookupContext
-            )
-        },
-        resolveFilesForCodeStructure: { [weak self] paths, lookupRootScope, maximumSeedCount in
-            guard let self else { throw MCPError.internalError("Window deallocated while resolving code structure files") }
-            return try await resolveFilesForCodeStructure(
-                paths: paths,
-                lookupRootScope: lookupRootScope,
-                maximumSeedCount: maximumSeedCount
-            )
-        },
-        buildStoreBackedFileTreeResult: { [weak self] mode, maxDepth, startPath, lookupContext in
-            guard let self else { throw MCPError.internalError("Window deallocated while building file tree") }
-            return try await buildStoreBackedFileTreeResult(mode: mode, maxDepth: maxDepth, startPath: startPath, lookupContext: lookupContext)
-        },
-        readSelectedAuthorizedGitArtifact: { [weak self] requestedPath, translatedLookupPath, startLine1Based, lineCount, metadata, lookupContext in
-            guard let self else { throw MCPError.internalError("Window deallocated while reading selected Git artifact") }
-            return try await readSelectedAuthorizedGitArtifact(
-                requestedPath: requestedPath,
-                translatedLookupPath: translatedLookupPath,
-                startLine1Based: startLine1Based,
-                lineCount: lineCount,
-                metadata: metadata,
-                lookupContext: lookupContext
-            )
-        },
-        readFile: { [weak self] input, startLine1Based, lineCount, lookupContext in
-            guard let self else { throw MCPError.internalError("Window deallocated while reading file") }
-            return try await readFile(
-                input: input,
-                startLine1Based: startLine1Based,
-                lineCount: lineCount,
-                lookupContext: lookupContext
-            )
-        },
-        enqueueReadFileAutoSelection: { [weak self] reply, requestedPath, absolutePhysicalPath, metadata, authority in
-            guard let self else { throw MCPError.internalError("Window deallocated while enqueuing read_file auto-selection") }
-            return try await enqueueReadFileAutoSelection(
-                reply: reply,
-                requestedPath: requestedPath,
-                absolutePhysicalPath: absolutePhysicalPath,
-                metadata: metadata,
-                authority: authority
-            )
-        },
-        drainReadFileAutoSelection: { [weak self] metadata, requirement in
-            guard let self else { throw MCPError.internalError("Window deallocated while draining read_file auto-selection") }
-            return try await drainReadFileAutoSelection(metadata: metadata, requirement: requirement)
-        },
-        enqueueFileSearchAutoSelection: { [weak self] mode, contextLines, reply, resolvedPhysicalPaths, metadata, authority in
-            guard let self else { throw MCPError.internalError("Window deallocated while enqueuing file_search auto-selection") }
-            return try await enqueueFileSearchAutoSelection(
-                mode: mode,
-                contextLines: contextLines,
-                reply: reply,
-                resolvedPhysicalPaths: resolvedPhysicalPaths,
-                metadata: metadata,
-                authority: authority
-            )
-        },
-        workspaceContextMessage: { [weak self] operation, path in
-            guard let self else { return "Window deallocated while resolving workspace context." }
-            return await workspaceContextMessage(forOperation: operation, path: path)
-        }
-    )
+    private lazy var windowToolSelectionCapabilities = makeWindowToolSelectionCapabilities(route: routeResources)
 
     @MainActor
-    private lazy var windowToolPromptCapabilities = MCPAppPhysicalCapabilityAdapters.Prompt(
-        parseCopyPresetSelector: { [weak self] value in
-            guard let self else { return nil }
-            return parseCopyPresetSelector(from: value)
-        },
-        resolveCopyPreset: { [weak self] selector in
-            guard let self else { return nil }
-            return resolveCopyPreset(from: selector)
-        },
-        buildTabWorkspaceContext: { [weak self] context, include, display, copyPresetOverride, presentationActiveContext in
-            guard let self else { throw MCPError.internalError("Window deallocated while building workspace context") }
-            return try await buildTabWorkspaceContext(
-                context: context,
-                include: include,
-                display: display,
-                copyPresetOverride: copyPresetOverride,
-                presentationActiveContext: presentationActiveContext
-            )
-        },
-        selectedFilesWithStats: { [weak self] resolvedContext in
-            guard let self else { throw MCPError.internalError("Window deallocated while resolving selected files") }
-            return await selectedFilesWithStats(resolvedContext: resolvedContext)
-        },
-        selectionCollectionsForCurrentTabContext: { [weak self] in
-            guard let self else { throw MCPError.internalError("Window deallocated while resolving selection collections") }
-            return try await selectionCollectionsForCurrentTabContext()
-        },
-        buildCopyPresetContextDTO: { [weak self] active, effective in
-            guard let self else {
-                return ToolResultDTOs.CopyPresetContextDTO(active: ToolResultDTOs.CopyPresetDescriptorDTO(id: active.id.uuidString, name: active.name, kind: active.builtInKind?.rawValue, isBuiltIn: active.isBuiltIn), effective: ToolResultDTOs.CopyPresetDescriptorDTO(id: effective.id.uuidString, name: effective.name, kind: effective.builtInKind?.rawValue, isBuiltIn: effective.isBuiltIn), isOverridden: active.id != effective.id)
+    private func makeWindowToolSelectionCapabilities(route routeResources: MCPHostRouteResources) -> MCPAppPhysicalCapabilityAdapters.Selection {
+        MCPAppPhysicalCapabilityAdapters.Selection(
+            workspaceSearch: workspaceSearch,
+            parseManageSelectionInputs: { [weak self] rawPaths, slicesValue in
+                guard let self else {
+                    return MCPServerViewModel.ManageSelectionInputs(paths: [], sliceInputs: [], sliceErrors: [], hadExplicitSliceSpec: false)
+                }
+                return parseManageSelectionInputs(rawPaths: rawPaths, slicesValue: slicesValue)
+            },
+            resolveFileToolLookupContext: { [weak self] metadata in
+                guard let self else { return .visibleWorkspace }
+                return await resolveFileToolLookupContext(route: routeResources, from: metadata)
+            },
+            requiredFileToolLookupContext: { [weak self] metadata in
+                guard let self else {
+                    throw MCPError.internalError("Window deallocated while resolving file-tool authority")
+                }
+                return try await requiredFileToolLookupContext(route: routeResources, from: metadata)
+            },
+            resolveMutationFileToolContext: { [weak self] metadata, toolName in
+                guard let self else {
+                    throw MCPError.internalError("Window deallocated while resolving mutation worktree scope")
+                }
+                return try await resolveMutationFileToolContext(route: routeResources, from: metadata, toolName: toolName)
+            },
+            stabilizedVirtualSelection: { [weak self] context in
+                guard let self else { return context.selection }
+                return await stabilizedVirtualSelection(for: context)
+            },
+            freezePromptGitReviewContext: { [weak self] context in
+                guard let self else { return .automaticOnly(base: "HEAD") }
+                return await promptVM.freezePromptGitReviewContext(
+                    workspaceID: context.workspaceID,
+                    tabID: context.tabID,
+                    sessionID: context.activeAgentSessionID,
+                    bindings: context.worktreeBindings,
+                    base: "HEAD"
+                )
+            },
+            buildCurrentSelectionReply: { [weak self] includeBlocks, display, extraInvalid, viewMode, resolvedContext, lookupContext in
+                guard let self else { throw MCPError.internalError("Window deallocated while building selection reply") }
+                return await buildCurrentSelectionReply(
+                    includeBlocks: includeBlocks,
+                    display: display,
+                    extraInvalid: extraInvalid,
+                    viewMode: viewMode,
+                    resolvedContext: resolvedContext,
+                    lookupContext: lookupContext
+                )
+            },
+            buildSelectionPreviewReply: { [weak self] selection, includeBlocks, display, extraInvalid, viewMode, codeMapUsageOverride, lookupContext, virtualContext, reviewGitContext in
+                guard let self else { throw MCPError.internalError("Window deallocated while building selection preview") }
+                return await buildSelectionPreviewReply(
+                    selection: selection,
+                    includeBlocks: includeBlocks,
+                    display: display,
+                    extraInvalid: extraInvalid,
+                    viewMode: viewMode,
+                    codeMapUsageOverride: codeMapUsageOverride,
+                    lookupContext: lookupContext,
+                    virtualContext: virtualContext,
+                    reviewGitContext: reviewGitContext
+                )
+            },
+            buildSelectionMutationReply: { [weak self] selection, includeBlocks, display, extraInvalid, viewMode, codeMapUsageOverride, virtualContext, lookupContext, reviewGitContext in
+                guard let self else { throw MCPError.internalError("Window deallocated while building selection mutation reply") }
+                return await buildSelectionMutationReply(
+                    from: selection,
+                    includeBlocks: includeBlocks,
+                    display: display,
+                    extraInvalid: extraInvalid,
+                    viewMode: viewMode,
+                    codeMapUsageOverride: codeMapUsageOverride,
+                    virtualContext: virtualContext,
+                    lookupContext: lookupContext,
+                    reviewGitContext: reviewGitContext
+                )
+            },
+            buildManageSelectionSetSelection: { [weak self] inputs, mode, existing, hasFullFileArtifactInputs, lookupRootScope in
+                guard let self else { return MCPServerViewModel.BuildStoredSelectionResult(selection: existing, invalidPaths: [], codemapUnavailable: []) }
+                return await buildManageSelectionSetSelection(
+                    from: inputs,
+                    mode: mode,
+                    existing: existing,
+                    hasFullFileArtifactInputs: hasFullFileArtifactInputs,
+                    lookupRootScope: lookupRootScope
+                )
+            },
+            resolveManageSelectionArtifactInputs: { [weak self] request in
+                guard let self else {
+                    return MCPManageSelectionArtifactResolution(
+                        ordinaryPaths: request.paths,
+                        ordinarySliceInputs: request.sliceInputs,
+                        artifacts: [],
+                        invalidDiagnostics: [],
+                        fence: nil
+                    )
+                }
+                return await MCPManageSelectionArtifactResolver(
+                    store: promptVM.workspaceFileContextStore,
+                    registry: gitArtifactAdvertisementRegistry
+                ).resolve(request)
+            },
+            validateManageSelectionArtifactFence: { [weak self] fence in
+                guard let self else { return false }
+                return await validateManageSelectionArtifactFence(fence)
+            },
+            mutatePreResolvedFullFilePaths: { [weak self] base, absolutePaths, mode in
+                guard let self else { return base }
+                return mutatePreResolvedFullFilePaths(
+                    base: base,
+                    absolutePaths: absolutePaths,
+                    mode: mode
+                )
+            },
+            commitManageSelectionArtifactMutation: { [weak self] resolvedContext, metadata, expectedPhysicalSelection, requestedPhysicalSelection, lookupContext, fence in
+                guard let self else {
+                    return .unavailable(reason: "window deallocated during selection commit")
+                }
+                return await commitManageSelectionArtifactMutation(
+                    route: routeResources,
+                    resolvedContext: resolvedContext,
+                    metadata: metadata,
+                    expectedPhysicalSelection: expectedPhysicalSelection,
+                    requestedPhysicalSelection: requestedPhysicalSelection,
+                    lookupContext: lookupContext,
+                    fence: fence
+                )
+            },
+            addStoredSelectionPaths: { [weak self] existing, paths, rawPaths, mode, lookupRootScope in
+                guard let self else { return MCPServerViewModel.AddStoredSelectionResult(selection: existing, invalidPaths: [], resolvedMap: [:], mutated: false, codemapUnavailable: []) }
+                return await addStoredSelectionPaths(existing: existing, paths: paths, rawPaths: rawPaths, mode: mode, lookupRootScope: lookupRootScope)
+            },
+            removeStoredSelectionPaths: { [weak self] existing, paths, rawPaths, mode, lookupRootScope in
+                guard let self else { return (existing, [], [:], false) }
+                return await removeStoredSelectionPaths(existing: existing, paths: paths, rawPaths: rawPaths, mode: mode, lookupRootScope: lookupRootScope)
+            },
+            promoteStoredSelectionPaths: { [weak self] existing, paths, rawPaths, strict, lookupRootScope in
+                guard let self else { return (existing, [], false, 0) }
+                return await promoteStoredSelectionPaths(existing: existing, paths: paths, rawPaths: rawPaths, strict: strict, lookupRootScope: lookupRootScope)
+            },
+            demoteStoredSelectionPaths: { [weak self] existing, paths, rawPaths, strict, lookupRootScope in
+                guard let self else {
+                    return MCPServerViewModel.DemoteStoredSelectionResult(
+                        selection: existing,
+                        invalidPaths: [],
+                        codemapUnavailable: [],
+                        mutated: false,
+                        validCandidateCount: 0
+                    )
+                }
+                return await demoteStoredSelectionPaths(existing: existing, paths: paths, rawPaths: rawPaths, strict: strict, lookupRootScope: lookupRootScope)
+            },
+            computeSelectionSlicesVirtual: { [weak self] base, entries, mode, lookupRootScope in
+                guard let self else {
+                    return (base, MCPServerViewModel.MCPSelectionSlicesMutationResult(invalidPaths: [], resolvedMap: [:], snapshot: [:]), false)
+                }
+                return await computeSelectionSlicesVirtual(base: base, entries: entries, mode: mode, lookupRootScope: lookupRootScope)
+            },
+            persistResolvedTabContextSnapshot: { [weak self] resolvedContext, metadata, mutated in
+                guard let self else { return nil }
+                return await persistResolvedTabContextSnapshot(route: routeResources, resolvedContext, metadata: metadata, mutated: mutated)
+            },
+            selectCreatedFile: { [weak self] file, resolvedContext, metadata, lookupContext in
+                guard let self else { return "The file was created, but its selection was not confirmed because the window closed." }
+                return await selectCreatedFile(
+                    route: routeResources,
+                    file,
+                    resolvedContext: resolvedContext,
+                    metadata: metadata,
+                    lookupContext: lookupContext
+                )
+            },
+            makeSelectionHintError: { [weak self] paths, operation, lookupContext in
+                guard let self else { return "Window deallocated while resolving selection inputs." }
+                return await makeSelectionHintError(paths: paths, operation: operation, lookupContext: lookupContext)
             }
-            return buildCopyPresetContextDTO(active: active, effective: effective)
-        },
-        buildCopyPresetsListDTO: { [weak self] in
-            guard let self else { return [] }
-            return buildCopyPresetsListDTO()
-        },
-        copyPresetDescriptorDTO: { [weak self] preset in
-            guard let self else { return ToolResultDTOs.CopyPresetDescriptorDTO(id: preset.id.uuidString, name: preset.name, kind: preset.builtInKind?.rawValue, isBuiltIn: preset.isBuiltIn) }
-            return toDescriptorDTO(preset)
-        },
-        buildExportSelectedFileInfos: { [weak self] resolvedContext, cfg, selectionOverride, display in
-            guard let self else { throw MCPError.internalError("Window deallocated while building export file info") }
-            return try await buildExportSelectedFileInfos(resolvedContext: resolvedContext, cfg: cfg, selectionOverride: selectionOverride, display: display)
-        },
-        buildTabClipboardContent: { [weak self] cfg, context in
-            guard let self else { return "" }
-            return await buildTabClipboardContent(cfg: cfg, context: context)
-        },
-        writePromptExportFile: { [weak self] path, content, mutationRootMappings in
-            guard let self else { throw MCPError.internalError("Window deallocated while exporting prompt") }
-            return try await writePromptExportFile(
-                path: path,
-                content: content,
-                mutationRootMappings: mutationRootMappings
-            )
-        },
-        latestTokenBreakdown: { [weak self] in
-            guard let self else { return TokenCountingViewModel.TokenBreakdown(total: 0, files: 0, prompt: 0, meta: 0, fileTree: 0, git: 0, other: 0) }
-            return latestTokenBreakdown()
-        }
-    )
+        )
+    }
+
+    @MainActor
+    private lazy var windowToolFileCapabilities = makeWindowToolFileCapabilities(route: routeResources)
+
+    @MainActor
+    private func makeWindowToolFileCapabilities(route routeResources: MCPHostRouteResources) -> MCPAppPhysicalCapabilityAdapters.Files {
+        MCPAppPhysicalCapabilityAdapters.Files(
+            performFileAction: { [weak self] action, path, content, newPath, ifExists, operationID in
+                guard let self else { throw MCPError.internalError("Window deallocated while performing file action") }
+                return try await performFileAction(route: routeResources, action: action, path: path, content: content, newPath: newPath, ifExists: ifExists, operationID: operationID)
+            },
+            buildCodeStructureDTO: { [weak self] files, request, includePathNotFoundIssue, requestedPaths, lookupContext in
+                guard let self else { throw MCPError.internalError("Window deallocated while building code structure") }
+                return try await buildCodeStructureDTO(
+                    fromRecords: files,
+                    request: request,
+                    includePathNotFoundIssue: includePathNotFoundIssue,
+                    requestedPaths: requestedPaths,
+                    lookupContext: lookupContext
+                )
+            },
+            resolveFilesForCodeStructure: { [weak self] paths, lookupRootScope, maximumSeedCount in
+                guard let self else { throw MCPError.internalError("Window deallocated while resolving code structure files") }
+                return try await resolveFilesForCodeStructure(
+                    paths: paths,
+                    lookupRootScope: lookupRootScope,
+                    maximumSeedCount: maximumSeedCount
+                )
+            },
+            buildStoreBackedFileTreeResult: { [weak self] mode, maxDepth, startPath, lookupContext in
+                guard let self else { throw MCPError.internalError("Window deallocated while building file tree") }
+                return try await buildStoreBackedFileTreeResult(route: routeResources, mode: mode, maxDepth: maxDepth, startPath: startPath, lookupContext: lookupContext)
+            },
+            readSelectedAuthorizedGitArtifact: { [weak self] requestedPath, translatedLookupPath, startLine1Based, lineCount, metadata, lookupContext in
+                guard let self else { throw MCPError.internalError("Window deallocated while reading selected Git artifact") }
+                return try await readSelectedAuthorizedGitArtifact(
+                    route: routeResources,
+                    requestedPath: requestedPath,
+                    translatedLookupPath: translatedLookupPath,
+                    startLine1Based: startLine1Based,
+                    lineCount: lineCount,
+                    metadata: metadata,
+                    lookupContext: lookupContext
+                )
+            },
+            readFile: { [weak self] input, startLine1Based, lineCount, lookupContext in
+                guard let self else { throw MCPError.internalError("Window deallocated while reading file") }
+                return try await readFile(
+                    input: input,
+                    startLine1Based: startLine1Based,
+                    lineCount: lineCount,
+                    lookupContext: lookupContext
+                )
+            },
+            enqueueReadFileAutoSelection: { [weak self] reply, requestedPath, absolutePhysicalPath, metadata, authority in
+                guard let self else { throw MCPError.internalError("Window deallocated while enqueuing read_file auto-selection") }
+                return try await enqueueReadFileAutoSelection(
+                    route: routeResources,
+                    reply: reply,
+                    requestedPath: requestedPath,
+                    absolutePhysicalPath: absolutePhysicalPath,
+                    metadata: metadata,
+                    authority: authority
+                )
+            },
+            drainReadFileAutoSelection: { [weak self] metadata, requirement in
+                guard let self else { throw MCPError.internalError("Window deallocated while draining read_file auto-selection") }
+                return try await drainReadFileAutoSelection(route: routeResources, metadata: metadata, requirement: requirement)
+            },
+            enqueueFileSearchAutoSelection: { [weak self] mode, contextLines, reply, resolvedPhysicalPaths, metadata, authority in
+                guard let self else { throw MCPError.internalError("Window deallocated while enqueuing file_search auto-selection") }
+                return try await enqueueFileSearchAutoSelection(
+                    route: routeResources,
+                    mode: mode,
+                    contextLines: contextLines,
+                    reply: reply,
+                    resolvedPhysicalPaths: resolvedPhysicalPaths,
+                    metadata: metadata,
+                    authority: authority
+                )
+            },
+            workspaceContextMessage: { [weak self] operation, path in
+                guard let self else { return "Window deallocated while resolving workspace context." }
+                return await workspaceContextMessage(forOperation: operation, path: path)
+            }
+        )
+    }
+
+    @MainActor
+    private lazy var windowToolPromptCapabilities = makeWindowToolPromptCapabilities(route: routeResources)
+
+    @MainActor
+    private func makeWindowToolPromptCapabilities(route routeResources: MCPHostRouteResources) -> MCPAppPhysicalCapabilityAdapters.Prompt {
+        MCPAppPhysicalCapabilityAdapters.Prompt(
+            parseCopyPresetSelector: { [weak self] value in
+                guard let self else { return nil }
+                return parseCopyPresetSelector(from: value)
+            },
+            resolveCopyPreset: { [weak self] selector in
+                guard let self else { return nil }
+                return resolveCopyPreset(from: selector)
+            },
+            buildTabWorkspaceContext: { [weak self] context, include, display, copyPresetOverride, presentationActiveContext in
+                guard let self else { throw MCPError.internalError("Window deallocated while building workspace context") }
+                return try await buildTabWorkspaceContext(
+                    context: context,
+                    include: include,
+                    display: display,
+                    copyPresetOverride: copyPresetOverride,
+                    presentationActiveContext: presentationActiveContext
+                )
+            },
+            selectedFilesWithStats: { [weak self] resolvedContext in
+                guard let self else { throw MCPError.internalError("Window deallocated while resolving selected files") }
+                return await selectedFilesWithStats(resolvedContext: resolvedContext)
+            },
+            selectionCollectionsForCurrentTabContext: { [weak self] in
+                guard let self else { throw MCPError.internalError("Window deallocated while resolving selection collections") }
+                return try await selectionCollectionsForCurrentTabContext(route: routeResources)
+            },
+            buildCopyPresetContextDTO: { [weak self] active, effective in
+                guard let self else {
+                    return ToolResultDTOs.CopyPresetContextDTO(active: ToolResultDTOs.CopyPresetDescriptorDTO(id: active.id.uuidString, name: active.name, kind: active.builtInKind?.rawValue, isBuiltIn: active.isBuiltIn), effective: ToolResultDTOs.CopyPresetDescriptorDTO(id: effective.id.uuidString, name: effective.name, kind: effective.builtInKind?.rawValue, isBuiltIn: effective.isBuiltIn), isOverridden: active.id != effective.id)
+                }
+                return buildCopyPresetContextDTO(active: active, effective: effective)
+            },
+            buildCopyPresetsListDTO: { [weak self] in
+                guard let self else { return [] }
+                return buildCopyPresetsListDTO()
+            },
+            copyPresetDescriptorDTO: { [weak self] preset in
+                guard let self else { return ToolResultDTOs.CopyPresetDescriptorDTO(id: preset.id.uuidString, name: preset.name, kind: preset.builtInKind?.rawValue, isBuiltIn: preset.isBuiltIn) }
+                return toDescriptorDTO(preset)
+            },
+            buildExportSelectedFileInfos: { [weak self] resolvedContext, cfg, selectionOverride, display in
+                guard let self else { throw MCPError.internalError("Window deallocated while building export file info") }
+                return try await buildExportSelectedFileInfos(route: routeResources, resolvedContext: resolvedContext, cfg: cfg, selectionOverride: selectionOverride, display: display)
+            },
+            buildTabClipboardContent: { [weak self] cfg, context in
+                guard let self else { return "" }
+                return await buildTabClipboardContent(cfg: cfg, context: context)
+            },
+            writePromptExportFile: { [weak self] path, content, mutationRootMappings in
+                guard let self else { throw MCPError.internalError("Window deallocated while exporting prompt") }
+                return try await writePromptExportFile(
+                    path: path,
+                    content: content,
+                    mutationRootMappings: mutationRootMappings
+                )
+            },
+            latestTokenBreakdown: { [weak self] in
+                guard let self else { return TokenCountingViewModel.TokenBreakdown(total: 0, files: 0, prompt: 0, meta: 0, fileTree: 0, git: 0, other: 0) }
+                return latestTokenBreakdown()
+            }
+        )
+    }
 
     @MainActor
     private lazy var fileToolProvider = MCPFileToolProvider(
@@ -2072,132 +2122,147 @@ final class MCPServerViewModel: ObservableObject {
         runtime: windowToolRuntime, workspaceStore: domainWorkspaceAuthorityClient?.store
     )
     @MainActor
-    private lazy var domainReadToolProvider = MCPDomainReadToolProvider(
-        resolveContext: { [weak self] toolName, requirement in
-            guard let self else {
-                throw MCPError.internalError("Window deallocated while resolving \(toolName) context")
-            }
-            let invocationContext = try MCPInvocationContextBridge.require(toolName: toolName)
-            #if DEBUG
-                if let hook = await debugBeforeDomainReadContextResolutionForTesting {
-                    await hook(invocationContext)
+    private func makeDomainReadToolProvider(route routeResources: MCPHostRouteResources) -> MCPDomainReadToolProvider {
+        MCPDomainReadToolProvider(
+            resolveContext: { [weak self] toolName, requirement in
+                guard let self else {
+                    throw MCPError.internalError("Window deallocated while resolving \(toolName) context")
                 }
-            #endif
-            return try await resolveDomainReadContext(
-                toolName: toolName,
-                requirement: requirement,
-                invocationContext: invocationContext
-            )
-        },
-        refreshContext: { [domainRoutingCoordinator] handle in
-            guard let domainRoutingCoordinator else { return handle }
-            return try await domainRoutingCoordinator.refreshReadContext(handle)
-        },
-        releaseContext: { [weak self] context in
-            await self?.releaseDomainReadAppExecutionContext(for: context)
-        },
-        resolveFailure: { toolName, arguments, error in
-            guard let failure = error as? FileToolAuthorityFailure
-            else { return nil }
-            return try MCPFileToolProvider.authorityFailureValue(
-                toolName: toolName,
-                args: arguments,
-                failure: failure
-            )
-        },
-        backend: MCPDomainReadToolBackend { [weak self] toolName, context, args, sideEffects in
-            guard let self else {
-                throw MCPError.internalError("Window deallocated while executing \(toolName)")
-            }
-            // Capture before the app-context/MainActor lookup. Read-context IDs and host
-            // invocation IDs are distinct; retain both rather than substituting one for the other.
-            let invocationContext = try MCPInvocationContextBridge.require(toolName: toolName)
-            let appContext = await domainReadAppExecutionContext(for: context)
-            let executionServer: MCPServerViewModel
-            if let appContext {
-                guard let targetServer = await MainActor.run(body: {
-                    WindowStatesManager.shared.window(withID: appContext.targetWindowID)?.mcpServer
-                }) else {
-                    throw MCPError.internalError("Domain read target window changed before execution")
-                }
-                executionServer = targetServer
-            } else {
-                executionServer = self
-            }
-            switch toolName {
-            case "get_code_structure", "get_file_tree", "read_file", "file_search":
-                return try await executionServer.fileToolProvider.executeDomainRead(
-                    toolName: toolName,
-                    context: context,
-                    appContext: appContext,
-                    args: args,
-                    sideEffects: sideEffects
-                )
-            case "workspace_context", "prompt":
-                return try await executionServer.promptContextToolProvider.executeDomainRead(
-                    toolName: toolName,
-                    context: context,
-                    appContext: appContext,
-                    args: args
-                )
-            case "oracle_chat_log":
-                let oracleExecutionServer: MCPServerViewModel
-                if let targetWindowID = invocationContext.dispatchAuthorization?
-                    .windowIdentity?.windowID
-                {
-                    guard let targetServer = await MainActor.run(body: {
-                        WindowStatesManager.shared.window(withID: targetWindowID)?.mcpServer
-                    }) else {
-                        throw MCPError.internalError("Oracle log target window changed before execution")
+                let invocationContext = try MCPInvocationContextBridge.require(toolName: toolName)
+                #if DEBUG
+                    if let hook = await debugBeforeDomainReadContextResolutionForTesting {
+                        await hook(invocationContext)
                     }
-                    oracleExecutionServer = targetServer
-                } else {
-                    oracleExecutionServer = self
+                #endif
+                return try await resolveDomainReadContext(
+                    route: routeResources,
+                    toolName: toolName,
+                    requirement: requirement,
+                    invocationContext: invocationContext
+                )
+            },
+            refreshContext: { [domainRoutingCoordinator] handle in
+                guard let domainRoutingCoordinator else { return handle }
+                return try await domainRoutingCoordinator.refreshReadContext(handle)
+            },
+            releaseContext: { [weak self] context in
+                await self?.releaseDomainReadAppExecutionContext(for: context)
+            },
+            resolveFailure: { toolName, arguments, error in
+                guard let failure = error as? FileToolAuthorityFailure
+                else { return nil }
+                return try MCPFileToolProvider.authorityFailureValue(
+                    toolName: toolName,
+                    args: arguments,
+                    failure: failure
+                )
+            },
+            backend: MCPDomainReadToolBackend { [weak self] toolName, context, args, sideEffects in
+                guard let self else {
+                    throw MCPError.internalError("Window deallocated while executing \(toolName)")
                 }
-                return try await oracleExecutionServer.oracleToolProvider.executeDomainOracleChatLog(
-                    context: context,
-                    args: args
-                )
-            case "history":
-                return try await historyToolProvider.executeDomainRead(
-                    context: context,
-                    args: args
-                )
-            case "git":
-                return try await executionServer.gitToolProvider.executeDomainRead(
-                    context: context,
-                    appContext: appContext,
-                    args: args,
-                    sideEffects: sideEffects
-                )
-            default:
-                throw MCPError.internalError("Unsupported domain read tool: \(toolName)")
-            }
-        },
-        sideEffects: domainReadSideEffectCoordinator
-    )
+                // Capture before the app-context/MainActor lookup. Read-context IDs and host
+                // invocation IDs are distinct; retain both rather than substituting one for the other.
+                let invocationContext = try MCPInvocationContextBridge.require(toolName: toolName)
+                let appContext = await domainReadAppExecutionContext(for: context)
+                let executionServer: MCPServerViewModel
+                if let appContext {
+                    guard let targetServer = await MainActor.run(body: {
+                        WindowStatesManager.shared.window(withID: appContext.targetWindowID)?.mcpServer
+                    }) else {
+                        throw MCPError.internalError("Domain read target window changed before execution")
+                    }
+                    executionServer = targetServer
+                } else {
+                    executionServer = self
+                }
+                switch toolName {
+                case "get_code_structure", "get_file_tree", "read_file", "file_search":
+                    return try await executionServer.fileToolProvider.executeDomainRead(
+                        toolName: toolName,
+                        context: context,
+                        appContext: appContext,
+                        args: args,
+                        sideEffects: sideEffects
+                    )
+                case "workspace_context", "prompt":
+                    return try await executionServer.promptContextToolProvider.executeDomainRead(
+                        toolName: toolName,
+                        context: context,
+                        appContext: appContext,
+                        args: args
+                    )
+                case "oracle_chat_log":
+                    let oracleExecutionServer: MCPServerViewModel
+                    if let targetWindowID = invocationContext.dispatchAuthorization?
+                        .windowIdentity?.windowID
+                    {
+                        guard let targetServer = await MainActor.run(body: {
+                            WindowStatesManager.shared.window(withID: targetWindowID)?.mcpServer
+                        }) else {
+                            throw MCPError.internalError("Oracle log target window changed before execution")
+                        }
+                        oracleExecutionServer = targetServer
+                    } else {
+                        oracleExecutionServer = self
+                    }
+                    return try await oracleExecutionServer.oracleToolProvider.executeDomainOracleChatLog(
+                        context: context,
+                        args: args
+                    )
+                case "history":
+                    return try await historyToolProvider.executeDomainRead(
+                        context: context,
+                        args: args
+                    )
+                case "git":
+                    return try await executionServer.gitToolProvider.executeDomainRead(
+                        context: context,
+                        appContext: appContext,
+                        args: args,
+                        sideEffects: sideEffects
+                    )
+                default:
+                    throw MCPError.internalError("Unsupported domain read tool: \(toolName)")
+                }
+            },
+            sideEffects: domainReadSideEffectCoordinator
+        )
+    }
 
-    /// Window-scoped app tool registration installed in the domain runtime catalog.
     @MainActor
-    private lazy var windowToolCatalogService = MCPAppToolCatalogRegistration(
-        windowID: windowID,
-        runtime: windowToolRuntime,
-        context: windowToolContextCapabilities,
-        selection: windowToolSelectionCapabilities,
-        files: windowToolFileCapabilities,
-        execution: windowToolExecutionCapabilities,
-        fileProvider: fileToolProvider,
-        oracleProvider: oracleToolProvider,
-        sharedBindings: domainReadToolProvider.bindings,
-        resolveSpawnParentSessionID: { [weak self] metadata, targetWindow in
-            guard let self else { return nil }
-            return await resolveSpawnParentSessionID(route: routeResources, metadata: metadata, targetWindow: targetWindow)
-        },
-        resolveObserverEndpoint: { [weak self] metadata, targetWindow in
-            guard let self else { return nil }
-            return await resolveAgentSessionLinkObserverEndpoint(route: routeResources, metadata: metadata, targetWindow: targetWindow)
-        }
-    )
+    private lazy var windowToolCatalogService = makeToolCatalog(route: routeResources)
+
+    /// The physical route and executable hosts use the same complete catalog factory.
+    /// Capabilities capture the supplied route; the physical window only supplies their operations.
+    @MainActor
+    func makeToolCatalog(route routeResources: MCPHostRouteResources) -> MCPAppToolCatalogRegistration {
+        let runtime = makeWindowToolRuntime(route: routeResources)
+        let context = makeWindowToolContextCapabilities(route: routeResources)
+        let selection = makeWindowToolSelectionCapabilities(route: routeResources)
+        let files = makeWindowToolFileCapabilities(route: routeResources)
+        let execution = makeWindowToolExecutionCapabilities(route: routeResources)
+        return MCPAppToolCatalogRegistration(
+            windowID: routeResources.identity.routeID,
+            runtime: runtime,
+            context: context,
+            selection: selection,
+            files: files,
+            execution: execution,
+            fileProvider: MCPFileToolProvider(runtime: runtime, context: context, selection: selection, files: files),
+            oracleProvider: MCPOracleToolProvider(runtime: runtime, execution: execution),
+            sharedBindings: makeDomainReadToolProvider(route: routeResources).bindings,
+            resolveSpawnParentSessionID: { [weak self] metadata, targetWindow in
+                guard let self else { return nil }
+                return await resolveSpawnParentSessionID(route: routeResources, metadata: metadata, targetWindow: targetWindow)
+            },
+            resolveObserverEndpoint: { [weak self] metadata, targetWindow in
+                guard let self else { return nil }
+                return await resolveAgentSessionLinkObserverEndpoint(route: routeResources, metadata: metadata, targetWindow: targetWindow)
+            }
+        )
+    }
+
     private var cancellables: Set<AnyCancellable> = []
 
     @MainActor
@@ -2214,19 +2279,26 @@ final class MCPServerViewModel: ObservableObject {
     #endif
 
     @MainActor
-    lazy var readFileAutoSelectionCoordinator = MCPReadFileAutoSelectionCoordinator(
-        isContextCurrent: { [weak self] key in
-            self?.isReadFileAutoSelectionContextCurrent(key) ?? false
-        },
-        applyCanonical: { [weak self] key, batch in
-            guard let self else { return .unchanged }
-            return await applyReadFileAutoSelectionBatch(batch, for: key)
-        },
-        applyMirror: { [weak self] key in
-            guard let self else { return .invalidated }
-            return await applyReadFileAutoSelectionMirror(for: key)
-        }
-    )
+    func readFileAutoSelectionCoordinator(route routeResources: MCPHostRouteResources) -> MCPReadFileAutoSelectionCoordinator {
+        if let coordinator = routeResources.readFileAutoSelectionCoordinator { return coordinator }
+        let coordinator = MCPReadFileAutoSelectionCoordinator(
+            isContextCurrent: { [weak self, weak routeResources] key in
+                guard let self, let routeResources else { return false }
+                return isReadFileAutoSelectionContextCurrent(route: routeResources, key)
+            },
+            applyCanonical: { [weak self, weak routeResources] key, batch in
+                guard let self, let routeResources else { return .unchanged }
+                return await applyReadFileAutoSelectionBatch(route: routeResources, batch, for: key)
+            },
+            applyMirror: { [weak self] key in
+                guard let self else { return .invalidated }
+                return await applyReadFileAutoSelectionMirror(for: key)
+            }
+        )
+        routeResources.readFileAutoSelectionCoordinator = coordinator
+        return coordinator
+    }
+
     @MainActor
     private func applyReadFileAutoSelectionMirror(
         for key: MCPReadFileAutoSelectionCoordinator.TabMirrorKey
@@ -2485,6 +2557,7 @@ final class MCPServerViewModel: ObservableObject {
 
     @MainActor
     private func managerRunIDFallbackIsCompatibleWithThisWindow(
+        route routeResources: MCPHostRouteResources,
         connectionID: UUID,
         metadata: RequestMetadata,
         managerWindowID: Int?
@@ -2505,6 +2578,7 @@ final class MCPServerViewModel: ObservableObject {
 
     @MainActor
     private func beginAgentRunWaitScope(
+        route routeResources: MCPHostRouteResources,
         metadata: RequestMetadata,
         sessionIDs: Set<UUID>,
         timeoutSeconds: TimeInterval
@@ -2516,7 +2590,7 @@ final class MCPServerViewModel: ObservableObject {
             from: metadata,
             toolName: "agent_run_wait_scope"
         )
-        guard let parentRunID = await resolveRunIDForExecution(metadata: metadata, resolvedContext: resolvedContext) else {
+        guard let parentRunID = await resolveRunIDForExecution(route: routeResources, metadata: metadata, resolvedContext: resolvedContext) else {
             steeringDebugLog("[AgentRunSteeringWake] agent_run wait scope skipped: no parent runID childSessions=\(sessionIDs.map(\.uuidString).sorted().joined(separator: ","))")
             return nil
         }
@@ -2556,6 +2630,7 @@ final class MCPServerViewModel: ObservableObject {
 
     @MainActor
     private func resolveRunIDForExecution(
+        route routeResources: MCPHostRouteResources,
         metadata: RequestMetadata,
         resolvedContext: ResolvedTabContextSnapshot?
     ) async -> UUID? {
@@ -2587,6 +2662,7 @@ final class MCPServerViewModel: ObservableObject {
         let manager = ServerNetworkManager.shared
         let managerWindowID = await manager.selectedWindow(for: connectionID)
         guard managerRunIDFallbackIsCompatibleWithThisWindow(
+            route: routeResources,
             connectionID: connectionID,
             metadata: metadata,
             managerWindowID: managerWindowID
@@ -2600,6 +2676,7 @@ final class MCPServerViewModel: ObservableObject {
 
         let resolvedManagerWindowID = await manager.selectedWindow(for: connectionID)
         guard managerRunIDFallbackIsCompatibleWithThisWindow(
+            route: routeResources,
             connectionID: connectionID,
             metadata: metadata,
             managerWindowID: resolvedManagerWindowID
@@ -2623,6 +2700,7 @@ final class MCPServerViewModel: ObservableObject {
             }
 
             let resolvedRunID = await resolveRunIDForExecution(
+                route: routeResources,
                 metadata: metadata,
                 resolvedContext: resolvedContext
             )
@@ -2660,6 +2738,7 @@ final class MCPServerViewModel: ObservableObject {
             timeoutSeconds: TimeInterval
         ) async -> AgentRunWaitScopeRegistration? {
             await beginAgentRunWaitScope(
+                route: routeResources,
                 metadata: metadata,
                 sessionIDs: sessionIDs,
                 timeoutSeconds: timeoutSeconds
@@ -3427,6 +3506,7 @@ final class MCPServerViewModel: ObservableObject {
     /// - Throws:      Rethrows any error from `body`.
     @inline(__always)
     private func runTool<T>(
+        route routeResources: MCPHostRouteResources,
         _ name: String,
         freshnessPolicy: MCPToolFreshnessPolicy,
         invocationContext: ToolInvocationContext,
@@ -3495,7 +3575,10 @@ final class MCPServerViewModel: ObservableObject {
                   let route = await ServerNetworkManager.shared.cachedModelRunRoute(connectionID: connectionID),
                   metadata.windowID == route.windowID,
                   cachedModelObserverEndpoint(
-                      connectionID: connectionID, route: route, hint: metadata.tabContextHint,
+                      resources: routeResources,
+                      connectionID: connectionID,
+                      route: route,
+                      hint: metadata.tabContextHint,
                       modelRouteToken: invocationContext.dispatchAuthorization?.windowIdentity?.modelRouteToken
                   ) != nil
             else { throw MCPError.invalidParams(ServerNetworkManager.modelRouteUnavailableMessage) }
@@ -3526,7 +3609,7 @@ final class MCPServerViewModel: ObservableObject {
         }
         let shouldTrackActiveTool = await shouldTrackActiveTool(for: metadata)
         let executionRunID = modelOnly ? modelRoute?.runID
-            : await resolveRunIDForExecution(metadata: metadata, resolvedContext: resolvedContext)
+            : await resolveRunIDForExecution(route: routeResources, metadata: metadata, resolvedContext: resolvedContext)
         let indexedRunID = shouldRegisterRunToolExecution(toolName: name)
             ? executionRunID
             : nil
@@ -3552,8 +3635,8 @@ final class MCPServerViewModel: ObservableObject {
         }
 
         EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.runToolSetup, runToolSetupState)
-        return try await toolExecutionRuntime.execute(
-            .init(toolName: name, windowID: windowID, context: invocationContext),
+        return try await routeResources.toolExecutionRuntime.execute(
+            .init(toolName: name, windowID: routeResources.identity.routeID, context: invocationContext),
             ownerIdentity: ObjectIdentifier(self), indexedRunID: indexedRunID,
             waitCallOrigin: waitCallOrigin, selfCallOrigin: selfCallOrigin,
             lifecycleCorrelation: lifecycleCorrelation, validateInvocation: validateInvocation,
@@ -3595,6 +3678,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     private func rebindOracleChatSessionIfNeeded(
+        route routeResources: MCPHostRouteResources,
         metadata: RequestMetadata,
         chatIDString: String
     ) throws {
@@ -3619,6 +3703,7 @@ final class MCPServerViewModel: ObservableObject {
     /// Resolve the tab ID for agent mode MCP tool calls.
     /// Uses explicit _tabID arg, then MCP tab context binding, then falls back to active compose tab.
     private func resolveTabIDForAgentMode(
+        route routeResources: MCPHostRouteResources,
         args: [String: Value],
         connectionID: UUID?
     ) async throws -> UUID {
@@ -3666,6 +3751,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     private func resolveAgentSessionLifecycleMutationTarget(
+        route routeResources: MCPHostRouteResources,
         args: [String: Value],
         connectionID: UUID?,
         intent: AgentSessionLifecycleAuthority.Intent
@@ -3786,6 +3872,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     func bindCurrentRequestToTabIfPossible(
+        route routeResources: MCPHostRouteResources,
         tabID: UUID,
         metadata: RequestMetadata,
         startExpiry: AgentRunStartExpiry? = nil
@@ -3795,7 +3882,7 @@ final class MCPServerViewModel: ObservableObject {
         else {
             return
         }
-        let preserve = await shouldPreserveAgentRunSourceBinding(connectionID: connectionID, metadata: metadata)
+        let preserve = await shouldPreserveAgentRunSourceBinding(route: routeResources, connectionID: connectionID, metadata: metadata)
         if startExpiry?.hasExpired == true {
             return
         }
@@ -3818,6 +3905,7 @@ final class MCPServerViewModel: ObservableObject {
     #endif
 
     private func shouldPreserveAgentRunSourceBinding(
+        route routeResources: MCPHostRouteResources,
         connectionID: UUID,
         metadata: RequestMetadata
     ) async -> Bool {
@@ -3922,6 +4010,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     private func resolveContextBuilderTab(
+        route routeResources: MCPHostRouteResources,
         args: [String: Value],
         targetWindow: WindowState,
         connectionID: UUID?
@@ -4217,7 +4306,7 @@ final class MCPServerViewModel: ObservableObject {
         return (resolved, invalid)
     }
 
-    private func applyAutoSelectedFullFiles(_ paths: [String]) async {
+    private func applyAutoSelectedFullFiles(route routeResources: MCPHostRouteResources, _ paths: [String]) async {
         let normalizedPaths = paths
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
@@ -4314,6 +4403,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     private func enqueueReadFileAutoSelection(
+        route routeResources: MCPHostRouteResources,
         reply: ToolResultDTOs.ReadFileReply,
         requestedPath: String,
         absolutePhysicalPath: String,
@@ -4414,7 +4504,7 @@ final class MCPServerViewModel: ObservableObject {
             toolName: "enqueueReadFileAutoSelection"
         )
         let key = try readFileAutoSelectionContextKey(resolvedContext: currentResolvedContext, metadata: metadata)
-        guard readFileAutoSelectionCoordinator.enqueue(
+        guard readFileAutoSelectionCoordinator(route: routeResources).enqueue(
             intent: intent,
             authority: authority,
             coverageIdentity: coverageIdentity,
@@ -4426,13 +4516,14 @@ final class MCPServerViewModel: ObservableObject {
             // Interactive CLI requests have no run policy and commonly disconnect after one call.
             // Make the successful read response their selection durability boundary while preserving
             // Agent Mode's asynchronous response path.
-            _ = await readFileAutoSelectionCoordinator.drain(.mirroredSelectionAndMetrics, for: key)
+            _ = await readFileAutoSelectionCoordinator(route: routeResources).drain(.mirroredSelectionAndMetrics, for: key)
         }
         return true
     }
 
     @MainActor
     func drainReadFileAutoSelection(
+        route routeResources: MCPHostRouteResources,
         metadata: RequestMetadata,
         requirement: MCPReadFileAutoSelectionCoordinator.DrainRequirement
     ) async throws -> MCPReadFileAutoSelectionCoordinator.DrainResult {
@@ -4444,17 +4535,18 @@ final class MCPServerViewModel: ObservableObject {
         if resolvedContext.isRunlessOneShotHint { return .completed }
         let key = try readFileAutoSelectionContextKey(resolvedContext: resolvedContext, metadata: metadata)
         for predecessorKey in readFileAutoSelectionPredecessorContextKeys(
+            route: routeResources,
             metadata: metadata,
             successorKey: key
         ) {
-            let predecessorResult = await readFileAutoSelectionCoordinator.drain(
+            let predecessorResult = await readFileAutoSelectionCoordinator(route: routeResources).drain(
                 requirement,
                 for: predecessorKey,
                 onCanonicalWaiterRegistered: readFileAutoSelectionPredecessorDrainWaiterRegisteredHandlerForTesting
             )
             guard predecessorResult == .completed else { return predecessorResult }
         }
-        return await readFileAutoSelectionCoordinator.drain(requirement, for: key)
+        return await readFileAutoSelectionCoordinator(route: routeResources).drain(requirement, for: key)
     }
 
     /// Runs one read-file auto-selection drain, which also covers eligible `file_search` selections,
@@ -4484,11 +4576,12 @@ final class MCPServerViewModel: ObservableObject {
 
     @MainActor
     private func readFileAutoSelectionPredecessorContextKeys(
+        route routeResources: MCPHostRouteResources,
         metadata: RequestMetadata,
         successorKey: MCPReadFileAutoSelectionCoordinator.ContextKey
     ) -> [MCPReadFileAutoSelectionCoordinator.ContextKey] {
         guard let connectionID = metadata.connectionID,
-              let lineage = runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID[connectionID],
+              let lineage = routeResources.runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID[connectionID],
               lineage.successorKey == successorKey,
               case let .bound(successorConnectionID, successorRunID) = successorKey.route,
               successorConnectionID == connectionID,
@@ -4521,7 +4614,7 @@ final class MCPServerViewModel: ObservableObject {
 
         @MainActor
         func setReadFileAutoSelectionCanonicalApplyGateForTesting(_ gate: (() async -> Void)?) {
-            readFileAutoSelectionCoordinator.setCanonicalApplyGateForTesting(gate)
+            readFileAutoSelectionCoordinator(route: routeResources).setCanonicalApplyGateForTesting(gate)
         }
 
         struct DebugFileSearchAutoSelectionTrace: Equatable {
@@ -4596,7 +4689,7 @@ final class MCPServerViewModel: ObservableObject {
                     route: .bound(connectionID: connectionID, runID: context.runID),
                     bindingGeneration: context.readFileAutoSelectionGeneration
                 )
-                guard isReadFileAutoSelectionContextCurrent(key) else { return nil }
+                guard isReadFileAutoSelectionContextCurrent(route: routeResources, key) else { return nil }
                 return DebugReadFileAutoSelectionTarget(
                     connectionID: connectionID,
                     runID: context.runID,
@@ -4614,16 +4707,16 @@ final class MCPServerViewModel: ObservableObject {
         func debugReadFileAutoSelectionContextSnapshot(
             for target: DebugReadFileAutoSelectionTarget
         ) -> MCPReadFileAutoSelectionCoordinator.DebugContextSnapshot? {
-            guard isReadFileAutoSelectionContextCurrent(target.contextKey) else { return nil }
-            return readFileAutoSelectionCoordinator.debugContextSnapshot(for: target.contextKey)
+            guard isReadFileAutoSelectionContextCurrent(route: routeResources, target.contextKey) else { return nil }
+            return readFileAutoSelectionCoordinator(route: routeResources).debugContextSnapshot(for: target.contextKey)
         }
 
         @MainActor
         func debugApplyEditsRebaseProbeLookupContext(
             for target: DebugReadFileAutoSelectionTarget
         ) async -> WorkspaceLookupContext? {
-            guard isReadFileAutoSelectionContextCurrent(target.contextKey),
-                  let context = readFileAutoSelectionContext(for: target.contextKey),
+            guard isReadFileAutoSelectionContextCurrent(route: routeResources, target.contextKey),
+                  let context = readFileAutoSelectionContext(route: routeResources, for: target.contextKey),
                   context.activeAgentSessionID == target.agentSessionID
             else { return nil }
             return await resolveFileToolLookupContext(route: routeResources, from: RequestMetadata(
@@ -4640,13 +4733,13 @@ final class MCPServerViewModel: ObservableObject {
             forceAuthoritative: Bool,
             for target: DebugReadFileAutoSelectionTarget
         ) -> MCPReadFileAutoSelectionCoordinator.DebugContextSnapshot? {
-            guard isReadFileAutoSelectionContextCurrent(target.contextKey),
+            guard isReadFileAutoSelectionContextCurrent(route: routeResources, target.contextKey),
                   target.contextKey.workspaceID == target.workspaceID,
                   target.contextKey.tabID == target.tabID,
                   target.contextKey.bindingGeneration == target.bindingGeneration,
-                  let context = readFileAutoSelectionContext(for: target.contextKey),
+                  let context = readFileAutoSelectionContext(route: routeResources, for: target.contextKey),
                   context.activeAgentSessionID == target.agentSessionID,
-                  let baseline = readFileAutoSelectionCoordinator.debugContextSnapshot(for: target.contextKey)
+                  let baseline = readFileAutoSelectionCoordinator(route: routeResources).debugContextSnapshot(for: target.contextKey)
             else { return nil }
             if forceAuthoritative {
                 readFileAutoSelectionForcedAuthoritativeProbeIDsByContext[target.contextKey, default: []].insert(probeID)
@@ -4706,13 +4799,13 @@ final class MCPServerViewModel: ObservableObject {
         func debugDrainReadFileAutoSelection(
             for target: DebugReadFileAutoSelectionTarget
         ) async -> MCPReadFileAutoSelectionCoordinator.DebugDrainResult? {
-            guard isReadFileAutoSelectionContextCurrent(target.contextKey) else { return nil }
-            return await readFileAutoSelectionCoordinator.debugDrainCanonical(for: target.contextKey)
+            guard isReadFileAutoSelectionContextCurrent(route: routeResources, target.contextKey) else { return nil }
+            return await readFileAutoSelectionCoordinator(route: routeResources).debugDrainCanonical(for: target.contextKey)
         }
 
         @MainActor
         func readFileAutoSelectionDiagnosticsSnapshot() -> MCPReadFileAutoSelectionCoordinator.DebugSnapshot {
-            readFileAutoSelectionCoordinator.debugSnapshot()
+            readFileAutoSelectionCoordinator(route: routeResources).debugSnapshot()
         }
     #endif
 
@@ -4738,7 +4831,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     @MainActor
-    func isReadFileAutoSelectionContextCurrent(_ key: MCPReadFileAutoSelectionCoordinator.ContextKey) -> Bool {
+    func isReadFileAutoSelectionContextCurrent(route routeResources: MCPHostRouteResources, _ key: MCPReadFileAutoSelectionCoordinator.ContextKey) -> Bool {
         guard case let .bound(connectionID, runID) = key.route,
               let context = routeResources.runRouteBindings.tabContextByConnectionID[connectionID]
         else { return false }
@@ -4767,6 +4860,7 @@ final class MCPServerViewModel: ObservableObject {
 
     @MainActor
     private func lookupReadFileAutoSelectionCoverageCertificate(
+        route routeResources: MCPHostRouteResources,
         batch: MCPReadFileAutoSelectionCoordinator.CanonicalBatch,
         for key: MCPReadFileAutoSelectionCoordinator.ContextKey
     ) async -> ReadFileAutoSelectionCoverageCertificateLookup {
@@ -4787,8 +4881,8 @@ final class MCPServerViewModel: ObservableObject {
         guard certificate.batchIdentity == batchIdentity else {
             return readFileAutoSelectionCoverageCertificateMiss(.batchMismatch, for: key)
         }
-        guard isReadFileAutoSelectionContextCurrent(key),
-              let context = readFileAutoSelectionContext(for: key)
+        guard isReadFileAutoSelectionContextCurrent(route: routeResources, key),
+              let context = readFileAutoSelectionContext(route: routeResources, for: key)
         else {
             return readFileAutoSelectionCoverageCertificateMiss(.staleContext, for: key)
         }
@@ -4819,7 +4913,7 @@ final class MCPServerViewModel: ObservableObject {
         let catalog = await promptVM.workspaceFileContextStore.readFileAutoSelectionCatalogValidationSnapshot(
             rootScope: certificate.rootScope
         )
-        guard !Task.isCancelled, isReadFileAutoSelectionContextCurrent(key) else {
+        guard !Task.isCancelled, isReadFileAutoSelectionContextCurrent(route: routeResources, key) else {
             return readFileAutoSelectionCoverageCertificateMiss(
                 Task.isCancelled ? .cancelled : .staleContext,
                 for: key
@@ -4834,7 +4928,7 @@ final class MCPServerViewModel: ObservableObject {
         guard catalog.rootScopeCatalogGeneration == certificate.rootScopeCatalogGeneration else {
             return readFileAutoSelectionCoverageCertificateMiss(.rootScopeCatalogGenerationMismatch, for: key)
         }
-        guard let finalContext = readFileAutoSelectionContext(for: key),
+        guard let finalContext = readFileAutoSelectionContext(route: routeResources, for: key),
               finalContext.activeAgentSessionID == certificate.agentSessionID,
               case let .hydrated(finalBindings) = finalContext.worktreeBindingState,
               !finalBindings.isEmpty,
@@ -4856,6 +4950,7 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     @discardableResult
     private func mintReadFileAutoSelectionCoverageCertificate(
+        route routeResources: MCPHostRouteResources,
         batch: MCPReadFileAutoSelectionCoordinator.CanonicalBatch,
         authoritativeResult: ReadFileAutoSelectionAuthoritativeResult,
         authoritativeLookupContext: WorkspaceLookupContext,
@@ -4863,10 +4958,10 @@ final class MCPServerViewModel: ObservableObject {
         for key: MCPReadFileAutoSelectionCoordinator.ContextKey
     ) async -> Bool {
         guard !Task.isCancelled,
-              isReadFileAutoSelectionContextCurrent(key),
+              isReadFileAutoSelectionContextCurrent(route: routeResources, key),
               authoritativeResult.coordinatorVerified,
               let batchIdentity = batch.coverageIdentity,
-              let context = readFileAutoSelectionContext(for: key),
+              let context = readFileAutoSelectionContext(route: routeResources, for: key),
               let agentSessionID = context.activeAgentSessionID,
               case let .hydrated(bindings) = context.worktreeBindingState,
               !bindings.isEmpty,
@@ -4902,8 +4997,8 @@ final class MCPServerViewModel: ObservableObject {
         )
         guard !Task.isCancelled,
               catalog.rootScopeAvailability == .available,
-              isReadFileAutoSelectionContextCurrent(key),
-              let finalContext = readFileAutoSelectionContext(for: key),
+              isReadFileAutoSelectionContextCurrent(route: routeResources, key),
+              let finalContext = readFileAutoSelectionContext(route: routeResources, for: key),
               finalContext.activeAgentSessionID == agentSessionID,
               case let .hydrated(finalBindings) = finalContext.worktreeBindingState,
               !finalBindings.isEmpty,
@@ -4963,6 +5058,7 @@ final class MCPServerViewModel: ObservableObject {
 
     @MainActor
     private func readFileAutoSelectionCandidate(
+        route routeResources: MCPHostRouteResources,
         batch: MCPReadFileAutoSelectionCoordinator.CanonicalBatch,
         base: StoredSelection,
         lookupRootScope: WorkspaceLookupRootScope
@@ -5013,6 +5109,7 @@ final class MCPServerViewModel: ObservableObject {
                 }
             #endif
             let existingFullPaths = await autoSelectedFullFilePaths(
+                route: routeResources,
                 selection: selection,
                 lookupRootScope: lookupRootScope
             )
@@ -5041,10 +5138,11 @@ final class MCPServerViewModel: ObservableObject {
 
     @MainActor
     private func applyReadFileAutoSelectionBatch(
+        route routeResources: MCPHostRouteResources,
         _ batch: MCPReadFileAutoSelectionCoordinator.CanonicalBatch,
         for key: MCPReadFileAutoSelectionCoordinator.ContextKey
     ) async -> MCPReadFileAutoSelectionCoordinator.CanonicalApplyResult {
-        let certificateLookup = await lookupReadFileAutoSelectionCoverageCertificate(batch: batch, for: key)
+        let certificateLookup = await lookupReadFileAutoSelectionCoverageCertificate(route: routeResources, batch: batch, for: key)
         if certificateLookup == .hit {
             return MCPReadFileAutoSelectionCoordinator.CanonicalApplyResult(
                 mirrorKey: nil,
@@ -5053,7 +5151,7 @@ final class MCPServerViewModel: ObservableObject {
             )
         }
         guard case let .miss(missReason) = certificateLookup else { return .unchanged }
-        guard isReadFileAutoSelectionContextCurrent(key), readFileAutoSelectionContext(for: key) != nil else {
+        guard isReadFileAutoSelectionContextCurrent(route: routeResources, key), readFileAutoSelectionContext(route: routeResources, for: key) != nil else {
             return authoritativeReadFileAutoSelectionResult(
                 changed: false,
                 key: key,
@@ -5092,7 +5190,7 @@ final class MCPServerViewModel: ObservableObject {
             )
             guard fileManager.isSliceRebaseFenceCurrent(sliceRebaseFence) else { continue }
             guard !Task.isCancelled,
-                  isReadFileAutoSelectionContextCurrent(key),
+                  isReadFileAutoSelectionContextCurrent(route: routeResources, key),
                   let workspaceID = key.workspaceID,
                   let manager = workspaceManager,
                   let initialSelection = manager.composeTab(
@@ -5100,6 +5198,7 @@ final class MCPServerViewModel: ObservableObject {
                   )?.selection
             else { break }
             var selection = await readFileAutoSelectionCandidate(
+                route: routeResources,
                 batch: batch,
                 base: initialSelection,
                 lookupRootScope: lookupRootScope
@@ -5117,7 +5216,7 @@ final class MCPServerViewModel: ObservableObject {
                 selection = initialSelection
             }
             guard !Task.isCancelled,
-                  isReadFileAutoSelectionContextCurrent(key),
+                  isReadFileAutoSelectionContextCurrent(route: routeResources, key),
                   manager.composeTab(
                       for: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: key.tabID)
                   )?.selection == initialSelection
@@ -5135,6 +5234,7 @@ final class MCPServerViewModel: ObservableObject {
 
             verifiedCanonicalChange = verifiedCanonicalChange || !authoritativeResult.canonicalUnchanged
             let minted = await mintReadFileAutoSelectionCoverageCertificate(
+                route: routeResources,
                 batch: batch,
                 authoritativeResult: authoritativeResult,
                 authoritativeLookupContext: authoritativeLookupContext,
@@ -5154,7 +5254,7 @@ final class MCPServerViewModel: ObservableObject {
                 tabID: key.tabID
             )
             guard !Task.isCancelled,
-                  isReadFileAutoSelectionContextCurrent(key),
+                  isReadFileAutoSelectionContextCurrent(route: routeResources, key),
                   fileManager.isSliceRebaseFenceCurrent(sliceRebaseFence),
                   let finalSelection = manager.composeTab(
                       for: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: key.tabID)
@@ -5187,13 +5287,14 @@ final class MCPServerViewModel: ObservableObject {
 
     @MainActor
     func readFileAutoSelectionContext(
+        route routeResources: MCPHostRouteResources,
         for key: MCPReadFileAutoSelectionCoordinator.ContextKey
     ) -> TabContextSnapshot? {
         guard case let .bound(connectionID, _) = key.route else { return nil }
         return routeResources.runRouteBindings.tabContextByConnectionID[connectionID]
     }
 
-    private func autoSelectedFullFilePaths() async -> [String] {
+    private func autoSelectedFullFilePaths(route routeResources: MCPHostRouteResources) async -> [String] {
         let metadata = await captureRequestMetadata()
         let lookupRootScope = await resolveFileToolLookupContext(route: routeResources, from: metadata).rootScope
         guard let resolvedContext = try? resolveTabContextSnapshot(
@@ -5202,12 +5303,14 @@ final class MCPServerViewModel: ObservableObject {
             toolName: "autoSelectedFullFilePaths"
         ) else { return [] }
         return await autoSelectedFullFilePaths(
+            route: routeResources,
             selection: resolvedContext.snapshot.selection,
             lookupRootScope: lookupRootScope
         )
     }
 
     private func autoSelectedFullFilePaths(
+        route routeResources: MCPHostRouteResources,
         selection: StoredSelection,
         lookupRootScope: WorkspaceLookupRootScope
     ) async -> [String] {
@@ -5223,6 +5326,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     private func enqueueFileSearchAutoSelection(
+        route routeResources: MCPHostRouteResources,
         mode: SearchMode,
         contextLines: Int,
         reply: ToolResultDTOs.SearchResultDTO,
@@ -5325,7 +5429,7 @@ final class MCPServerViewModel: ObservableObject {
             resolvedPaths: resolvedPhysicalPaths
         )
         let key = try readFileAutoSelectionContextKey(resolvedContext: resolvedContext, metadata: metadata)
-        let accepted = readFileAutoSelectionCoordinator.enqueue(
+        let accepted = readFileAutoSelectionCoordinator(route: routeResources).enqueue(
             intent: intent,
             authority: authority,
             coverageIdentity: coverageIdentity,
@@ -5349,6 +5453,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     private func applySelectionSlices(
+        route routeResources: MCPHostRouteResources,
         entries: [WorkspaceSelectionSliceInput],
         mode: SliceMutationMode
     ) async throws -> MCPSelectionSlicesMutationResult {
@@ -5362,6 +5467,7 @@ final class MCPServerViewModel: ObservableObject {
                 toolName: "applySelectionSlices"
             )
             return try await applySelectionSlicesVirtual(
+                route: routeResources,
                 resolvedContext: resolvedContext,
                 metadata: metadata,
                 entries: entries,
@@ -5398,6 +5504,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     private func applySelectionSlicesVirtual(
+        route routeResources: MCPHostRouteResources,
         resolvedContext: ResolvedTabContextSnapshot,
         metadata: RequestMetadata,
         entries: [WorkspaceSelectionSliceInput],
@@ -5500,6 +5607,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     private func resolveSelectedFilesForCodeStructure(
+        route routeResources: MCPHostRouteResources,
         metadata: RequestMetadata,
         lookupContext: WorkspaceLookupContext,
         maximumSeedCount: Int
@@ -6056,6 +6164,7 @@ final class MCPServerViewModel: ObservableObject {
     /// for bottom-origin reads (start_line = -N reads the last N lines).
     /// Returns both the content slice and metadata about the shown range.
     private func readSelectedAuthorizedGitArtifact(
+        route routeResources: MCPHostRouteResources,
         requestedPath: String,
         translatedLookupPath: String,
         startLine1Based: Int?,
@@ -6379,6 +6488,7 @@ final class MCPServerViewModel: ObservableObject {
 
     /// Performs a file action (create, delete, or move/rename)
     private func performFileAction(
+        route routeResources: MCPHostRouteResources,
         action: String,
         path: String,
         content: String? = nil,
@@ -6510,6 +6620,7 @@ final class MCPServerViewModel: ObservableObject {
         if action.lowercased() == "create" {
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection)
             if let warning = await selectCreatedFile(
+                route: routeResources,
                 writtenFile,
                 resolvedContext: resolvedContext,
                 metadata: metadata,
@@ -6857,6 +6968,7 @@ final class MCPServerViewModel: ObservableObject {
 
     /// Uses the headless store snapshot for get_file_tree requests.
     private func buildStoreBackedFileTreeResult(
+        route routeResources: MCPHostRouteResources,
         mode: String,
         maxDepth: Int?,
         startPath: String?,
@@ -6873,7 +6985,7 @@ final class MCPServerViewModel: ObservableObject {
 
         let filePathDisplay = await MainActor.run { promptVM.filePathDisplayOption }
         let showCodeMapMarkers = await MainActor.run { !promptVM.codeMapsGloballyDisabled }
-        let selection = try await lookupContext.physicalizeSelection(storedSelectionForCurrentTabContext(includeCodemapPathsWhenSelectedUsage: true))
+        let selection = try await lookupContext.physicalizeSelection(storedSelectionForCurrentTabContext(route: routeResources, includeCodemapPathsWhenSelectedUsage: true))
         if presentationMode == .selected,
            selection.isEmptyForSelectedFileTree
         {
@@ -6956,7 +7068,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     @MainActor
-    private func storedSelectionForCurrentTabContext(includeCodemapPathsWhenSelectedUsage: Bool) async throws -> StoredSelection {
+    private func storedSelectionForCurrentTabContext(route routeResources: MCPHostRouteResources, includeCodemapPathsWhenSelectedUsage: Bool) async throws -> StoredSelection {
         let metadata = await captureRequestMetadata()
         let resolved = try resolveTabContextSnapshot(
             route: routeResources,
@@ -7114,20 +7226,20 @@ final class MCPServerViewModel: ObservableObject {
 
     var selectionCodemapAutoEnabled: Bool {
         get async {
-            let selection = try? await storedSelectionForCurrentTabContext(includeCodemapPathsWhenSelectedUsage: false)
+            let selection = try? await storedSelectionForCurrentTabContext(route: routeResources, includeCodemapPathsWhenSelectedUsage: false)
             return selection?.codemapAutoEnabled ?? false
         }
     }
 
-    func selectedFiles() async throws -> [WorkspaceFileRecord] {
-        let selection = try await storedSelectionForCurrentTabContext(includeCodemapPathsWhenSelectedUsage: false)
+    func selectedFiles(route routeResources: MCPHostRouteResources) async throws -> [WorkspaceFileRecord] {
+        let selection = try await storedSelectionForCurrentTabContext(route: routeResources, includeCodemapPathsWhenSelectedUsage: false)
         let paths = StoredSelectionPathNormalization.standardizedPaths(selection.selectedPaths)
         let resolved = await promptVM.workspaceFileContextStore.lookupFiles(atPaths: paths, profile: .mcpSelection, rootScope: .allLoaded)
         return paths.compactMap { resolved[$0] }
     }
 
-    func selectionSnapshot() async throws -> (selected: [WorkspaceFileRecord], codemap: [WorkspaceFileRecord], slices: [UUID: [LineRange]], autoEnabled: Bool) {
-        let selection = try await storedSelectionForCurrentTabContext(includeCodemapPathsWhenSelectedUsage: false)
+    func selectionSnapshot(route routeResources: MCPHostRouteResources) async throws -> (selected: [WorkspaceFileRecord], codemap: [WorkspaceFileRecord], slices: [UUID: [LineRange]], autoEnabled: Bool) {
+        let selection = try await storedSelectionForCurrentTabContext(route: routeResources, includeCodemapPathsWhenSelectedUsage: false)
         let selectedPaths = StoredSelectionPathNormalization.standardizedPaths(selection.selectedPaths)
         let manualCodemapPaths = StoredSelectionPathNormalization.standardizedPaths(
             selection.manualCodemapPaths
@@ -7277,6 +7389,7 @@ extension MCPServerViewModel {
     /// or persistence. Only an already-installed exact run route may identify its caller.
     @MainActor
     func resolveAgentSessionLinkModelObserverEndpoint(
+        route routeResources: MCPHostRouteResources,
         metadata: RequestMetadata,
         network: ServerNetworkManager = .shared,
         modelRouteToken: AgentSessionLinkRunCatalogRouteToken? = nil
@@ -7285,12 +7398,17 @@ extension MCPServerViewModel {
               let route = await network.cachedModelRunRoute(connectionID: connectionID),
               metadata.windowID == route.windowID else { return nil }
         return cachedModelObserverEndpoint(
-            connectionID: connectionID, route: route, hint: metadata.tabContextHint, modelRouteToken: modelRouteToken
+            resources: routeResources,
+            connectionID: connectionID,
+            route: route,
+            hint: metadata.tabContextHint,
+            modelRouteToken: modelRouteToken
         )
     }
 
     @MainActor
     func cachedModelObserverEndpoint(
+        resources routeResources: MCPHostRouteResources,
         connectionID: UUID,
         route: ServerNetworkManager.CachedModelRunRoute,
         hint: TabContextHint? = nil,

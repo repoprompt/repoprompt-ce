@@ -351,7 +351,7 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    private func invalidateReadFileAutoSelection(connectionID: UUID, context: MCPTabContextSnapshot) {
+    private func invalidateReadFileAutoSelection(route routeResources: MCPHostRouteResources, connectionID: UUID, context: MCPTabContextSnapshot) {
         let key = readFileAutoSelectionContextKey(connectionID: connectionID, context: context)
         evictReadFileAutoSelectionCoverageCertificate(for: key)
         #if DEBUG
@@ -368,7 +368,7 @@ extension MCPServerViewModel {
                 )
             }
         #endif
-        readFileAutoSelectionCoordinator.invalidate(context: key)
+        readFileAutoSelectionCoordinator(route: routeResources).invalidate(context: key)
     }
 
     @MainActor
@@ -378,7 +378,7 @@ extension MCPServerViewModel {
         pendingFileToolLookupContextResolutionByConnectionID.removeValue(forKey: connectionID)?.task.cancel()
         guard let context = routeResources.runRouteBindings.tabContextByConnectionID.removeValue(forKey: connectionID) else { return }
         routeResources.publishRelease(connectionID: connectionID)
-        invalidateReadFileAutoSelection(connectionID: connectionID, context: context)
+        invalidateReadFileAutoSelection(route: routeResources, connectionID: connectionID, context: context)
         endMirroringForConnection(connectionID)
         routeResources.runRouteBindings.presentationWindowByConnection.removeValue(forKey: connectionID)
         let updatedMappings = Self.runMappingsAfterBindingRelease(
@@ -649,7 +649,7 @@ extension MCPServerViewModel {
             fileToolLookupContextCacheByConnectionID.removeValue(forKey: connectionID)
             pendingFileToolLookupContextResolutionByConnectionID.removeValue(forKey: connectionID)?.task.cancel()
             guard let context = routeResources.runRouteBindings.tabContextByConnectionID.removeValue(forKey: connectionID) else { continue }
-            invalidateReadFileAutoSelection(connectionID: connectionID, context: context)
+            invalidateReadFileAutoSelection(route: routeResources, connectionID: connectionID, context: context)
             endMirroringForConnection(connectionID)
             if let runID = context.runID {
                 cleanupRunIDMapping(route: routeResources, runID: runID, connectionID: connectionID)
@@ -1023,7 +1023,7 @@ extension MCPServerViewModel {
             tabContextLog("installTabContext immediate bind connectionID=\(uuid)")
             routeResources.runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: uuid)
             if let previous = routeResources.runRouteBindings.tabContextByConnectionID[uuid] {
-                invalidateReadFileAutoSelection(connectionID: uuid, context: previous)
+                invalidateReadFileAutoSelection(route: routeResources, connectionID: uuid, context: previous)
                 endMirroringForConnection(uuid)
             }
             activateReadFileAutoSelection(route: routeResources, &context)
@@ -1110,7 +1110,7 @@ extension MCPServerViewModel {
                 fileToolLookupContextCacheByConnectionID.removeValue(forKey: previousConnection)
                 pendingFileToolLookupContextResolutionByConnectionID.removeValue(forKey: previousConnection)?.task.cancel()
                 routeResources.runRouteBindings.tabContextByConnectionID.removeValue(forKey: previousConnection)
-                invalidateReadFileAutoSelection(connectionID: previousConnection, context: existing)
+                invalidateReadFileAutoSelection(route: routeResources, connectionID: previousConnection, context: existing)
                 endMirroringForConnection(previousConnection)
                 routeResources.runRouteBindings.connectionIDToRunID.removeValue(forKey: previousConnection)
                 routeResources.runRouteBindings.presentationWindowByConnection.removeValue(forKey: previousConnection)
@@ -1596,9 +1596,10 @@ extension MCPServerViewModel {
 
     @MainActor
     private func currentReadFileAutoSelectionTab(
+        route routeResources: MCPHostRouteResources,
         for contextKey: MCPReadFileAutoSelectionCoordinator.ContextKey
     ) -> (manager: WorkspaceManagerViewModel, identity: WorkspaceSelectionIdentity, tab: ComposeTabState)? {
-        guard isReadFileAutoSelectionContextCurrent(contextKey),
+        guard isReadFileAutoSelectionContextCurrent(route: routeResources, contextKey),
               let manager = workspaceManager,
               let workspaceID = contextKey.workspaceID,
               let workspace = manager.workspaces.first(where: { $0.id == workspaceID }),
@@ -1621,15 +1622,15 @@ extension MCPServerViewModel {
         automaticCodemapDisposition: MCPReadFileAutoSelectionCoordinator.AutomaticCodemapDisposition,
         authority: MCPFrozenFileToolAuthority
     ) async -> ReadFileAutoSelectionAuthoritativeResult? {
-        guard isReadFileAutoSelectionContextCurrent(contextKey) else { return nil }
+        guard isReadFileAutoSelectionContextCurrent(route: routeResources, contextKey) else { return nil }
 
         #if DEBUG
             if let handler = readFileAutoSelectionPersistenceWillResolveHandlerForTesting {
                 await handler()
             }
         #endif
-        guard isReadFileAutoSelectionContextCurrent(contextKey),
-              let currentTarget = currentReadFileAutoSelectionTab(for: contextKey),
+        guard isReadFileAutoSelectionContextCurrent(route: routeResources, contextKey),
+              let currentTarget = currentReadFileAutoSelectionTab(route: routeResources, for: contextKey),
               currentTarget.tab.selection == expectedBaseSelection
         else { return nil }
 
@@ -1639,8 +1640,8 @@ extension MCPServerViewModel {
         } catch { return nil }
         let commitAuthorization: WorkspaceSelectionCoordinator.CommitAuthorization = { [weak self] commit in
             guard let self, !Task.isCancelled,
-                  isReadFileAutoSelectionContextCurrent(contextKey),
-                  let context = readFileAutoSelectionContext(for: contextKey)
+                  isReadFileAutoSelectionContextCurrent(route: routeResources, contextKey),
+                  let context = readFileAutoSelectionContext(route: routeResources, for: contextKey)
             else { return false }
             if context.runID == nil {
                 guard let workspaceID = contextKey.workspaceID,
@@ -1685,7 +1686,7 @@ extension MCPServerViewModel {
             isPreservedBy: persistedSelection,
             automaticCodemapDisposition: automaticCodemapDisposition
         ),
-            let target = currentReadFileAutoSelectionTab(for: contextKey)
+            let target = currentReadFileAutoSelectionTab(route: routeResources, for: contextKey)
         else { return nil }
         let canonicalUnchanged = target.tab.selection == persistedSelection
         var coordinatorVerified = canonicalUnchanged
@@ -1702,7 +1703,7 @@ extension MCPServerViewModel {
                     commitAuthorization: commitAuthorization
                 )
             }
-            guard let refreshedTarget = currentReadFileAutoSelectionTab(for: contextKey) else { return nil }
+            guard let refreshedTarget = currentReadFileAutoSelectionTab(route: routeResources, for: contextKey) else { return nil }
             if verification.outcome == .unavailable {
                 guard refreshedTarget.tab.selection == expectedBaseSelection else { return nil }
                 var updatedTab = refreshedTarget.tab
@@ -1719,14 +1720,14 @@ extension MCPServerViewModel {
                 verification = MCPSelectionPersistenceVerification(
                     outcome: .unavailable,
                     expectedSelection: persistedSelection,
-                    canonicalSelection: currentReadFileAutoSelectionTab(for: contextKey)?.tab.selection
+                    canonicalSelection: currentReadFileAutoSelectionTab(route: routeResources, for: contextKey)?.tab.selection
                 )
             }
             coordinatorVerified = verification.isVerified
         }
 
         guard coordinatorVerified, commitAuthorization({}),
-              let finalTarget = currentReadFileAutoSelectionTab(for: contextKey),
+              let finalTarget = currentReadFileAutoSelectionTab(route: routeResources, for: contextKey),
               finalTarget.tab.selection == persistedSelection
         else { return nil }
         if canonicalUnchanged {
@@ -2531,7 +2532,7 @@ extension MCPServerViewModel {
         ).identity
         guard currentIdentity != replacementIdentity else { return }
 
-        invalidateReadFileAutoSelection(connectionID: connectionID, context: context)
+        invalidateReadFileAutoSelection(route: routeResources, connectionID: connectionID, context: context)
         context.frozenFileToolAuthority = nil
         context.activeAgentSessionID = activeAgentSessionID
         context.worktreeBindingState = worktreeBindingState
@@ -3236,7 +3237,7 @@ extension MCPServerViewModel {
         fileToolLookupContextCacheByConnectionID.removeValue(forKey: previousConnection)
         supersedePendingFileToolLookupContextResolution(connectionID: previousConnection)
         routeResources.runRouteBindings.tabContextByConnectionID.removeValue(forKey: previousConnection)
-        invalidateReadFileAutoSelection(connectionID: previousConnection, context: existing)
+        invalidateReadFileAutoSelection(route: routeResources, connectionID: previousConnection, context: existing)
         endMirroringForConnection(previousConnection)
         routeResources.runRouteBindings.connectionIDToRunID.removeValue(forKey: previousConnection)
         routeResources.runRouteBindings.presentationWindowByConnection.removeValue(forKey: previousConnection)
@@ -4129,7 +4130,7 @@ extension MCPServerViewModel {
             connectionID: connectionID,
             context: context
         )
-        invalidateReadFileAutoSelection(connectionID: connectionID, context: context)
+        invalidateReadFileAutoSelection(route: routeResources, connectionID: connectionID, context: context)
         endMirroringForConnection(connectionID)
         routeResources.runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
         fileToolLookupContextCacheByConnectionID.removeValue(forKey: connectionID)
@@ -4302,7 +4303,7 @@ extension MCPServerViewModel {
         if shouldCommit, !readFileAutoSelectionAlreadyFinished {
             let key = readFileAutoSelectionContextKey(connectionID: connectionID, context: commitOwnedContext)
             await progressReporter?(.readFileAutoSelectionFinish)
-            let finishResult = await readFileAutoSelectionCoordinator.finish(context: key)
+            let finishResult = await readFileAutoSelectionCoordinator(route: routeResources).finish(context: key)
             evictReadFileAutoSelectionCoverageCertificate(for: key)
             #if DEBUG
                 readFileAutoSelectionForcedAuthoritativeProbeIDsByContext.removeValue(forKey: key)
@@ -4314,7 +4315,7 @@ extension MCPServerViewModel {
                 shouldCommit = false
             }
         } else if !shouldCommit {
-            invalidateReadFileAutoSelection(connectionID: connectionID, context: commitOwnedContext)
+            invalidateReadFileAutoSelection(route: routeResources, connectionID: connectionID, context: commitOwnedContext)
         }
 
         // Clear the mutable tab snapshot regardless of mismatch so future calls cannot
@@ -4388,7 +4389,7 @@ extension MCPServerViewModel {
     func finishReadFileAutoSelectionForConnectionTeardown(route routeResources: MCPHostRouteResources, connectionID: UUID) async {
         guard let context = routeResources.runRouteBindings.tabContextByConnectionID[connectionID] else { return }
         let key = readFileAutoSelectionContextKey(connectionID: connectionID, context: context)
-        _ = await readFileAutoSelectionCoordinator.finish(context: key)
+        _ = await readFileAutoSelectionCoordinator(route: routeResources).finish(context: key)
         evictReadFileAutoSelectionCoverageCertificate(for: key)
         #if DEBUG
             readFileAutoSelectionForcedAuthoritativeProbeIDsByContext.removeValue(forKey: key)
@@ -4417,7 +4418,7 @@ extension MCPServerViewModel {
             if let context = routeResources.runRouteBindings.tabContextByConnectionID[connectionID],
                runID == nil || context.runID == runID
             {
-                invalidateReadFileAutoSelection(connectionID: connectionID, context: context)
+                invalidateReadFileAutoSelection(route: routeResources, connectionID: connectionID, context: context)
                 endMirroringForConnection(connectionID)
                 fileToolLookupContextCacheByConnectionID.removeValue(forKey: connectionID)
                 pendingFileToolLookupContextResolutionByConnectionID.removeValue(forKey: connectionID)?.task.cancel()

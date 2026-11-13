@@ -481,6 +481,12 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
 
         let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil)
         XCTAssertNotEqual(route.identity.routeID, fixture.window.windowID)
+        let catalog = server.makeToolCatalog(route: route)
+        XCTAssertEqual(catalog.windowID, route.identity.routeID)
+        XCTAssertEqual(
+            try Set(catalog.materializeTools().map(\.name)),
+            try Set(server.windowMCPToolCatalogService.materializeTools().map(\.name))
+        )
         // Queue through the provider hint, then promote with Cursor's observed initialize name.
         // The real physical operations must use the supplied host route, not the window's maps.
         try server.installFrozenTabContext(
@@ -513,6 +519,17 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
             toolName: "host-context-test"
         )
         XCTAssertEqual(resolved.snapshot.windowID, route.identity.routeID)
+        let invocation = ToolInvocationContext.trustedLocal(
+            toolName: "prompt",
+            metadata: MCPRequestMetadata(connectionID: fixture.connectionID, clientName: "Cursor", windowID: route.identity.routeID)
+        )
+        let updatedPrompt = try await MCPInvocationContextBridge.withInvocation(invocation) {
+            try await server.updateCurrentTabPrompt(route: route, toolName: "prompt") { $0 = "Host-owned prompt" }
+        }
+        XCTAssertEqual(updatedPrompt, "Host-owned prompt")
+        XCTAssertEqual(route.runRouteBindings.tabContextByConnectionID[fixture.connectionID]?.promptText, updatedPrompt)
+        XCTAssertNil(fixture.boundContext)
+        XCTAssertFalse(server.readFileAutoSelectionCoordinator(route: route) === server.readFileAutoSelectionCoordinator(route: server.routeResources))
         server.removeTabContext(route: route, forConnectionID: fixture.connectionID, clientName: "Cursor", windowID: route.identity.routeID, runID: fixture.runID)
         await route.close()
         XCTAssertNil(route.runRouteBindings.tabContextByConnectionID[fixture.connectionID])
@@ -534,7 +551,7 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
                 metadata: fixture.metadata
             )
             _ = try await MCPInvocationContextBridge.withInvocation(invocation) {
-                try await fixture.window.mcpServer.updateCurrentTabPrompt(toolName: "prompt") {
+                try await fixture.window.mcpServer.updateCurrentTabPrompt(route: fixture.window.mcpServer.routeResources, toolName: "prompt") {
                     $0 = prompt
                 }
             }
@@ -568,7 +585,7 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
                 metadata: fixture.metadata
             )
             _ = try await MCPInvocationContextBridge.withInvocation(invocation) {
-                try await fixture.window.mcpServer.updateCurrentTabPrompt(toolName: "prompt") {
+                try await fixture.window.mcpServer.updateCurrentTabPrompt(route: fixture.window.mcpServer.routeResources, toolName: "prompt") {
                     $0 = prompt
                 }
             }
@@ -1010,7 +1027,7 @@ private struct Fixture {
             metadata: .init(connectionID: connectionID, clientName: "prompt-mutation-test", windowID: window.windowID)
         )
         return try await MCPInvocationContextBridge.withInvocation(invocation) {
-            try await window.mcpServer.updateCurrentTabPrompt(toolName: "prompt", mutation: mutation)
+            try await window.mcpServer.updateCurrentTabPrompt(route: window.mcpServer.routeResources, toolName: "prompt", mutation: mutation)
         }
     }
 

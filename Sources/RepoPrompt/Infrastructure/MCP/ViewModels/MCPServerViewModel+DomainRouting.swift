@@ -75,6 +75,7 @@ extension MCPServerViewModel {
 
     @MainActor
     func resolveDomainReadContext(
+        route routeResources: MCPHostRouteResources,
         toolName: String,
         requirement: DomainReadContextRequirement,
         invocationContext explicitInvocationContext: ToolInvocationContext? = nil
@@ -124,6 +125,7 @@ extension MCPServerViewModel {
             || domainWorkspaceAuthorityClient == nil
         {
             return try await registerFallbackDomainReadContext(
+                route: routeResources,
                 toolName: toolName,
                 requirement: requirement,
                 metadata: metadata,
@@ -342,6 +344,7 @@ extension MCPServerViewModel {
 
     @MainActor
     private func registerFallbackDomainReadContext(
+        route routeResources: MCPHostRouteResources,
         toolName: String,
         requirement: DomainReadContextRequirement,
         metadata: RequestMetadata,

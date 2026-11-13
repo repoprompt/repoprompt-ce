@@ -46,6 +46,7 @@ struct WorkspaceGitDiffArtifactSelectionService {
 extension MCPServerViewModel {
     @MainActor
     func selectCreatedFile(
+        route routeResources: MCPHostRouteResources,
         _ file: WorkspaceFileRecord?,
         resolvedContext: MCPResolvedTabContextSnapshot,
         metadata: MCPRequestMetadata,

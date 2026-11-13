@@ -3760,7 +3760,10 @@ import XCTest
                             )
                         )
                         let firstRead = try await window.mcpServer.resolveDomainReadContext(
-                            toolName: "workspace_context", requirement: .workspaceRequired, invocationContext: invocation
+                            route: window.mcpServer.routeResources,
+                            toolName: "workspace_context",
+                            requirement: .workspaceRequired,
+                            invocationContext: invocation
                         )
                         window.mcpServer.releaseDomainReadAppExecutionContext(for: firstRead)
                         XCTAssertTrue(manager.debugDomainReadRegistrationStateExistsForWorkspace(retained.id))
@@ -3800,7 +3803,10 @@ import XCTest
                         if let pending { manager.confirmDomainReadRegistration(pending) }
                         XCTAssertFalse(manager.debugDomainReadRegistrationStateExistsForWorkspace(retained.id), "old pending token cannot re-confirm after projection invalidation")
                         let nextRead = try await window.mcpServer.resolveDomainReadContext(
-                            toolName: "workspace_context", requirement: .workspaceRequired, invocationContext: invocation
+                            route: window.mcpServer.routeResources,
+                            toolName: "workspace_context",
+                            requirement: .workspaceRequired,
+                            invocationContext: invocation
                         )
                         defer { window.mcpServer.releaseDomainReadAppExecutionContext(for: nextRead) }
                         let handle = try XCTUnwrap(nextRead.handle)
