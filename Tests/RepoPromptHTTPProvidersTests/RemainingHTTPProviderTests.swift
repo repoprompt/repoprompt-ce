@@ -433,6 +433,41 @@ final class RemainingHTTPExecutionTests: XCTestCase {
         XCTAssertEqual(request.headers.first { $0.key.lowercased() == "x-fixture" }?.value, "2")
     }
 
+    func testOpenRouterReusesTransportUntilEffectiveHeadersChange() async throws {
+        let host = RemainingHTTPTestHost()
+        host.routerConfiguration = .init(maxTokens: 111, customHeaders: ["X-Fixture": "first"])
+        let fixture = RemainingWireFixture(aliasHost: "openrouter.ai") { _, _ in (200, Self.chatJSON) }
+        defer { fixture.dispose() }
+        var sessionCount = 0
+        let provider = OpenRouterProvider(apiKey: "fixture-key", host: host, sessionConfigurationFactory: {
+            sessionCount += 1
+            return fixture.configuration()
+        })
+        let message = AIMessage(systemPrompt: "system", userMessage: "question")
+        for _ in 0 ..< 2 {
+            _ = try await provider.completeMessage(message, model: .openrouterGpt5, maxTokens: nil)
+        }
+        XCTAssertEqual(sessionCount, 1, "Repeated requests must retain the SDK's connection pool")
+
+        // Parameter-only changes remain request-local and must not replace the transport.
+        host.routerConfiguration = .init(maxTokens: 333, customHeaders: ["X-Fixture": "first"])
+        _ = try await provider.completeMessage(message, model: .openrouterGpt5, maxTokens: nil)
+        XCTAssertEqual(sessionCount, 1)
+        let thirdRequest = try XCTUnwrap(fixture.requests.last)
+        let thirdBody = try XCTUnwrap(try JSONSerialization.jsonObject(with: thirdRequest.body) as? [String: Any])
+        XCTAssertEqual(thirdBody["max_tokens"] as? Int, 333)
+        XCTAssertEqual(fixture.requests.map { request in
+            request.headers.first { $0.key.lowercased() == "x-fixture" }?.value
+        }, ["first", "first", "first"])
+
+        host.routerConfiguration = .init(maxTokens: 333, customHeaders: ["X-Fixture": "second"])
+        _ = try await provider.completeMessage(message, model: .openrouterGpt5, maxTokens: nil)
+        XCTAssertEqual(sessionCount, 2, "Changed headers must invalidate the cached service")
+        let last = try XCTUnwrap(fixture.requests.last)
+        XCTAssertEqual(last.headers.first { $0.key.lowercased() == "x-fixture" }?.value, "second")
+        XCTAssertEqual(host.calls.count(where: { $0 == "configuration" }), 8)
+    }
+
     func testCustomRetryReadsCurrentPolicyInsideEachAttemptWithoutWallClockSleep() async throws {
         let host = RemainingHTTPTestHost()
         host.name = "before-retry"
@@ -547,6 +582,7 @@ private final class RemainingHTTPTestHost: AnthropicHTTPHost, OpenRouterHTTPHost
     private let lock = NSLock()
     private var recorded: [String] = []
     private var configurationCount = 0
+    var routerConfiguration: OpenRouterConfiguration?
     var calls: [String] {
         lock.lock()
         defer { lock.unlock() }
@@ -610,7 +646,7 @@ private final class RemainingHTTPTestHost: AnthropicHTTPHost, OpenRouterHTTPHost
         let count = configurationCount
         recorded.append("configuration")
         lock.unlock()
-        return .init(maxTokens: count == 1 ? 111 : 222, customHeaders: ["X-Fixture": String(count)])
+        return routerConfiguration ?? .init(maxTokens: count == 1 ? 111 : 222, customHeaders: ["X-Fixture": String(count)])
     }
 
     func validateEndpoint(_: URL, apiKey _: String, customHeaders _: [String: String], consentEndpoint _: String?) throws {

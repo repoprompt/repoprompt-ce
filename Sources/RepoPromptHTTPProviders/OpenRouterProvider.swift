@@ -8,6 +8,8 @@ package class OpenRouterProvider: AIProvider {
     private let cachedApiKey: String
     private let host: any OpenRouterHTTPHost
     private let sessionConfigurationFactory: (() -> URLSessionConfiguration)?
+    private let serviceLock = NSLock()
+    private var cachedService: (headers: [String: String], service: OpenAIService)?
 
     package init(apiKey: String, host: any OpenRouterHTTPHost, sessionConfigurationFactory: (() -> URLSessionConfiguration)? = nil) {
         cachedApiKey = apiKey
@@ -35,18 +37,25 @@ package class OpenRouterProvider: AIProvider {
             }
         }
 
-        let configuration = sessionConfigurationFactory?() ?? URLSessionConfiguration.default
-        configuration.timeoutIntervalForRequest = 21600 // 6 hours
-        configuration.timeoutIntervalForResource = 21600 // 6 hours
+        // Headers are request-time policy. Reuse the connection pool only while they match;
+        // changing custom headers must not keep sending stale credentials or routing policy.
+        return serviceLock.withLock {
+            if let cachedService, cachedService.headers == headers { return cachedService.service }
+            let configuration = sessionConfigurationFactory?() ?? URLSessionConfiguration.default
+            configuration.timeoutIntervalForRequest = 21600 // 6 hours
+            configuration.timeoutIntervalForResource = 21600 // 6 hours
 
-        return OpenAIServiceFactory.service(
-            apiKey: cachedApiKey,
-            overrideBaseURL: "https://openrouter.ai",
-            configuration: configuration,
-            proxyPath: "api",
-            extraHeaders: headers,
-            debugEnabled: false
-        )
+            let service = OpenAIServiceFactory.service(
+                apiKey: cachedApiKey,
+                overrideBaseURL: "https://openrouter.ai",
+                configuration: configuration,
+                proxyPath: "api",
+                extraHeaders: headers,
+                debugEnabled: false
+            )
+            cachedService = (headers, service)
+            return service
+        }
     }
 
     package func streamMessage(_ aiMessage: RepoPromptDomainRuntime.AIMessage, model: AIModel, maxTokens: Int?) async throws -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {

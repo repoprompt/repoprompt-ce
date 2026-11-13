@@ -94,19 +94,21 @@ package enum FileSystemDeltaCoalescer {
             }
         }
 
-        let removedFolders = chosen.compactMap { pair -> String? in
+        let removedFolders = Set(chosen.compactMap { pair -> String? in
             if case .folderRemoved = pair.delta {
                 return pair.rel
             }
             return nil
-        }
+        })
 
         if !removedFolders.isEmpty {
             chosen.removeAll { pair in
-                for folder in removedFolders where pair.rel != folder {
-                    if StandardizedPath.isDescendant(pair.rel, of: folder) {
-                        return true
-                    }
+                // Walk strict ancestors instead of comparing against every removed folder.
+                // Large deletion batches must scale with path depth, not batch size squared.
+                var ancestor = pair.rel[...]
+                while let slash = ancestor.lastIndex(of: "/") {
+                    ancestor = ancestor[..<slash]
+                    if removedFolders.contains(String(ancestor)) { return true }
                 }
                 return false
             }

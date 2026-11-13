@@ -319,6 +319,18 @@ final class OpenAIHTTPExecutionTests: XCTestCase {
         XCTAssertEqual(fixture.requests.count, 1)
     }
 
+    func testServiceReusesURLSessionWithoutSharingAcrossProviders() throws {
+        let firstProvider = OpenAIProvider(host: HTTPTestHost(), apiKey: "first-fixture-key")
+        let secondProvider = OpenAIProvider(host: HTTPTestHost(), apiKey: "second-fixture-key")
+        let session = try firstProvider.getService().session
+        for _ in 0 ..< 20 {
+            XCTAssertTrue(try firstProvider.getService().session === session)
+        }
+        XCTAssertFalse(try secondProvider.getService().session === session)
+        XCTAssertEqual(session.configuration.timeoutIntervalForRequest, 21600)
+        XCTAssertEqual(session.configuration.timeoutIntervalForResource, 21600)
+    }
+
     func testEndpointConsentPortRunsBeforeServiceConstructionAndIsNotCached() throws {
         let host = HTTPTestHost()
         host.endpointDenied = true
@@ -328,8 +340,15 @@ final class OpenAIHTTPExecutionTests: XCTestCase {
             XCTAssertEqual(error as? HTTPFixtureError, .endpointDenied)
         }
         host.endpointDenied = false
-        XCTAssertNoThrow(try provider.getService()) // Constructs a service, never performs a request.
-        XCTAssertEqual(host.calls, ["validateEndpoint", "validateEndpoint"])
+        let session = try provider.getService().session // Constructs a service, never performs a request.
+        XCTAssertTrue(try provider.getService().session === session)
+        host.endpointDenied = true
+        XCTAssertThrowsError(try provider.getService(), "Cached transport must not bypass revoked consent") { error in
+            XCTAssertEqual(error as? HTTPFixtureError, .endpointDenied)
+        }
+        host.endpointDenied = false
+        XCTAssertTrue(try provider.getService().session === session)
+        XCTAssertEqual(host.calls, Array(repeating: "validateEndpoint", count: 5))
     }
 
     private func json(_ value: some Encodable) throws -> [String: Any] {

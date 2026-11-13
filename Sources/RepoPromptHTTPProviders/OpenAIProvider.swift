@@ -27,6 +27,8 @@ package class OpenAIProvider: AIProvider {
     private let overrideVersion: String? // Add property for API version override
     private let includeUsageInStream: Bool // Whether to include usage in streamed responses
     private let serviceTier: String? // Service tier for Responses API (auto/default/flex/priority)
+    private let serviceLock = NSLock()
+    private var cachedService: OpenAIService?
 
     package init(host: any OpenAIProviderHost, apiKey: String? = nil, baseURL: URL? = nil, configuredMaxTokens: Int? = nil, overrideVersion: String? = nil, includeUsageInStream: Bool = true, serviceTier: String? = nil, httpCredentialConsentEndpoint: String? = nil) {
         self.host = host
@@ -47,34 +49,37 @@ package class OpenAIProvider: AIProvider {
         nil
     }
 
-    /// Get service using cached values
+    /// Reuse the SDK's URLSession/connection pool, but never cache endpoint consent.
     open func getService() throws -> OpenAIService {
         let apiKey = cachedApiKey ?? ""
-
         if let baseURL = cachedBaseURL {
             try host.validateEndpoint(baseURL, apiKey: apiKey, consentEndpoint: httpCredentialConsentEndpoint)
+        }
+
+        return serviceLock.withLock {
+            if let cachedService { return cachedService }
             let configuration = URLSessionConfiguration.default
             configuration.timeoutIntervalForRequest = 21600 // 6 hours
             configuration.timeoutIntervalForResource = 21600 // 6 hours
 
-            return OpenAIServiceFactory.service(
-                apiKey: apiKey,
-                overrideBaseURL: baseURL.absoluteString,
-                configuration: configuration,
-                overrideVersion: overrideVersion,
-                includeUsageInStream: includeUsageInStream,
-                debugEnabled: false
-            )
+            let service: OpenAIService = if let baseURL = cachedBaseURL {
+                OpenAIServiceFactory.service(
+                    apiKey: apiKey,
+                    overrideBaseURL: baseURL.absoluteString,
+                    configuration: configuration,
+                    overrideVersion: overrideVersion,
+                    includeUsageInStream: includeUsageInStream,
+                    debugEnabled: false
+                )
+            } else {
+                OpenAIServiceFactory.service(
+                    apiKey: apiKey,
+                    configuration: configuration
+                )
+            }
+            cachedService = service
+            return service
         }
-
-        let configuration = URLSessionConfiguration.default
-        configuration.timeoutIntervalForRequest = 21600 // 6 hours
-        configuration.timeoutIntervalForResource = 21600 // 6 hours
-
-        return OpenAIServiceFactory.service(
-            apiKey: apiKey,
-            configuration: configuration
-        )
     }
 
     /// Returns a sensible default max token limit if caller has not provided one.
