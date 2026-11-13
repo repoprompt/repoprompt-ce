@@ -257,6 +257,7 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
                     store: resources.store,
                     fallbackWorkspacePath: resources.fallbackWorkspacePath,
                     declaredRepoPaths: resources.declaredRepoPaths,
+                    awaitRootReadiness: resources.awaitRootReadiness,
                     isCurrent: { resourcesCurrent && resources.isCurrent() }
                 )
             }
@@ -1941,7 +1942,7 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
             // These unit cases stop before materialization. Only resources are substituted;
             // canonical claim/restoration admission and production provider probes remain real.
             writer.scope.worktrees.captureResources = { _ in
-                .init(store: nil, fallbackWorkspacePath: workspacePath, declaredRepoPaths: [], isCurrent: { true })
+                .init(store: nil, fallbackWorkspacePath: workspacePath, declaredRepoPaths: [], awaitRootReadiness: {}, isCurrent: { true })
             }
         }
         session.worktreeBindings = [.init(

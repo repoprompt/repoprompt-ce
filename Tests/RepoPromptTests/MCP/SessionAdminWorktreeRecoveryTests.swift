@@ -24,17 +24,75 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
     }
 
     func testColdSavedTargetCreatesBindsMergesAndUnbindsThroughPreparedCanonicalWriter() async throws {
-        try await withFixture { fixture in
+        try await exerciseColdSavedTarget(holdingRootReconciliation: false)
+    }
+
+    func testColdSavedTargetWaitsForRootReconciliationBeforeRepositoryDiscovery() async throws {
+        try await exerciseColdSavedTarget(holdingRootReconciliation: true)
+    }
+
+    func testColdSavedTargetRetainsAuthorizationRefusalAfterRootReconciliation() async throws {
+        try await exerciseColdSavedTarget(holdingRootReconciliation: true, revokeAuthorization: true)
+    }
+
+    func testColdSavedTargetReportsReadinessFailureUnlessAuthorityEnded() async throws {
+        for revoked in [false, true] {
+            try await exerciseColdSavedTarget(holdingRootReconciliation: true, revokeAuthorization: revoked, rootFailure: .accessDenied)
+        }
+    }
+
+    func testColdSavedTargetWithoutRepositoryRootsReportsNoGitRepository() async throws {
+        try await exerciseColdSavedTarget(holdingRootReconciliation: false, withoutRepositoryRoots: true)
+    }
+
+    private func exerciseColdSavedTarget(
+        holdingRootReconciliation: Bool, revokeAuthorization: Bool = false,
+        rootFailure: WorkspaceRootReadinessFailure.Availability? = nil,
+        withoutRepositoryRoots: Bool = false
+    ) async throws {
+        try await withFixture(withoutRepositoryRoots: withoutRepositoryRoots) { fixture in
             let manager = WindowStatesManager.shared
+            let rootGate = WorkspaceAuthorityRootTestFixture.Gate()
+            let rootEntered = XCTestExpectation(description: "prepared root reconciliation held before load")
+            let admissionSettled = XCTestExpectation(description: "root readiness waiter or premature command completion")
+            admissionSettled.assertForOverFulfill = false
+            var hasRootWaiter = false
+            let originalFactory = manager.test_preparedOversightOwnerFactory
+            if holdingRootReconciliation {
+                manager.test_preparedOversightOwnerFactory = { workspace, source in
+                    let owner = WindowState.makePreparedSessionOwner(workspace: workspace, borrowing: source)
+                    owner.workspaceManager.rootProbeFailureForTesting = rootFailure
+                    var held = false
+                    owner.workspaceManager.rootReconciliationGateForTesting = { event in
+                        guard event.phase == .beforeLoad, !held else { return }
+                        held = true
+                        rootEntered.fulfill()
+                        await rootGate.wait()
+                    }
+                    owner.workspaceManager.rootReconciliationWaiterCountDidChangeForTesting = { count in
+                        if count > 0 {
+                            hasRootWaiter = true
+                            admissionSettled.fulfill()
+                        }
+                    }
+                    return owner
+                }
+            }
+            defer {
+                rootGate.release()
+                manager.test_preparedOversightOwnerFactory = originalFactory
+            }
             // Keep the production prepared owner available across the three separate commands
             // and their durable reads. The host must release its own nested hold each time;
             // otherwise normal idle retirement may legitimately refuse the next command.
             manager.beginPreparedOversightPreparation(fixture.sessionID)
             @MainActor func cleanupPreparedOwner() async {
                 manager.endPreparedOversightPreparation(fixture.sessionID)
-                if manager.preparedOversightWindows[fixture.sessionID] != nil {
+                if let owner = manager.preparedOversightWindows[fixture.sessionID] {
                     let released = await manager.releasePreparedOversightOwnerForVisit(sessionID: fixture.sessionID)
                     XCTAssertTrue(released)
+                    let remainingRoots = await owner.workspaceFilesViewModel.workspaceFileContextStore.rootRefs()
+                    XCTAssertTrue(remainingRoots.isEmpty, "Retired prepared owners must not keep repository observers alive through fixture deletion")
                 }
             }
             do {
@@ -53,10 +111,52 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
                 viewModel.test_removeSession(tabID: fixture.session.tabID)
                 XCTAssertNil(try SessionAdminWindows.command(for: fixture.sessionID))
                 let host = SessionAdminWindowsWorktreeHost()
-                let created = try await host.createWorktree(
-                    forSession: fixture.sessionID, repoRoot: nil, branch: "e2e/cold-target", baseRef: nil,
-                    isStillAuthorized: { true }
-                )
+                var authorized = true
+                let creating = Task { @MainActor in
+                    defer { admissionSettled.fulfill() }
+                    return try await host.createWorktree(
+                        forSession: fixture.sessionID, repoRoot: nil, branch: "e2e/cold-target", baseRef: nil,
+                        isStillAuthorized: { authorized }
+                    )
+                }
+                if holdingRootReconciliation {
+                    await fulfillment(of: [rootEntered, admissionSettled], timeout: 10)
+                    XCTAssertTrue(hasRootWaiter, "Repository discovery must join reconciliation, not report an unloaded repository as absent")
+                    if revokeAuthorization {
+                        authorized = false
+                    }
+                    rootGate.release()
+                }
+                if revokeAuthorization || rootFailure != nil || withoutRepositoryRoots {
+                    var refusal: SessionAdminHostError?
+                    do {
+                        _ = try await creating.value
+                        XCTFail("Unavailable repository roots or revoked authorization must prevent worktree creation")
+                    } catch let error as SessionAdminHostError {
+                        refusal = error
+                    }
+                    let expected: SessionAdminHostError = if revokeAuthorization {
+                        .authorityEnded
+                    } else if withoutRepositoryRoots {
+                        .invalid("The target session's workspace has no Git repository.")
+                    } else {
+                        .refused(
+                            code: "workspace_not_ready",
+                            detail: "The target session's workspace roots are not ready (accessDenied). Reconcile the workspace roots and retry.",
+                            nextCall: nil
+                        )
+                    }
+                    XCTAssertEqual(refusal, expected)
+                    if withoutRepositoryRoots {
+                        let owner = try XCTUnwrap(manager.preparedOversightWindows[fixture.sessionID])
+                        XCTAssertEqual(owner.workspaceManager.activeWorkspace?.repoPaths, [])
+                    }
+                    await cleanupPreparedOwner()
+                    XCTAssertNil(manager.preparedOversightPreparationInFlight[fixture.sessionID])
+                    fixture.assertForegroundUnchanged()
+                    return
+                }
+                let created = try await creating.value
                 XCTAssertEqual(manager.preparedOversightPreparationInFlight[fixture.sessionID], 1)
                 let sourcePath = URL(fileURLWithPath: created.path)
                 try fixture.git.write("cold merge\n", to: "cold-merge.txt", at: sourcePath)
@@ -116,6 +216,7 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
                 XCTAssertEqual(manager.preparedOversightPreparationInFlight[fixture.sessionID], 1)
                 fixture.assertForegroundUnchanged()
             } catch {
+                rootGate.release()
                 await cleanupPreparedOwner()
                 throw error
             }
@@ -1359,6 +1460,7 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
         electionRepositoryNames: (alpha: String, beta: String) = ("alpha", "beta"),
         electionRoots: ElectionRoots? = nil,
         replicaHoldsTarget: Bool = true,
+        withoutRepositoryRoots: Bool = false,
         resolver: GitRepoTargetResolver = GitRepoTargetResolver(),
         _ body: (Fixture) async throws -> Void
     ) async throws {
@@ -1396,14 +1498,14 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
             let electionRepositories = try election ? Self.makeElectionRepositories(git, names: electionRepositoryNames, roots: electionRoots) : nil
             let repository = try electionRepositories?.alpha
                 ?? git.makeRepository(named: "repository", files: ["README.md": "fixture\n"])
-            let declared = electionRepositories?.declared ?? [repository]
+            let declared = withoutRepositoryRoots ? [] : electionRepositories?.declared ?? [repository]
             await replica.workspaceManager.awaitInitialized()
             await window.workspaceManager.awaitInitialized()
             let created = window.workspaceManager.createWorkspace(name: "Worktree recovery", repoPaths: declared.map(\.path), ephemeral: true)
             await window.workspaceManager.switchWorkspace(to: created, saveState: false, reason: "worktreeRecoveryTest")
             if let electionRepositories {
                 try await Self.installAdversarialOrder(electionRepositories, store: window.promptManager.workspaceFileContextStore)
-            } else {
+            } else if !withoutRepositoryRoots {
                 _ = try await window.promptManager.workspaceFileContextStore.loadRoot(path: repository.path)
             }
             var workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)

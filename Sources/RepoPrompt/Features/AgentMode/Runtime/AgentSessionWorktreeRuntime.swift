@@ -50,16 +50,21 @@ final class AgentSessionWorktreeRuntime {
         let fallbackWorkspacePath: String?
         let declaredRepoPaths: [String]
         let storageDirectory: URL?
+        /// Hydrating a saved session does not imply its workspace roots have finished loading.
+        let awaitRootReadiness: @MainActor () async throws -> Void
         let isCurrent: @MainActor () -> Bool
 
         init(
             store: WorkspaceFileContextStore?, fallbackWorkspacePath: String?,
-            declaredRepoPaths: [String], storageDirectory: URL? = nil, isCurrent: @escaping @MainActor () -> Bool
+            declaredRepoPaths: [String], storageDirectory: URL? = nil,
+            awaitRootReadiness: @escaping @MainActor () async throws -> Void,
+            isCurrent: @escaping @MainActor () -> Bool
         ) {
             self.store = store
             self.fallbackWorkspacePath = fallbackWorkspacePath
             self.declaredRepoPaths = declaredRepoPaths
             self.storageDirectory = storageDirectory
+            self.awaitRootReadiness = awaitRootReadiness
             self.isCurrent = isCurrent
         }
     }
