@@ -3,9 +3,26 @@ import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 extension AgentSessionProviderInputRuntime {
+    /// Ephemeral proof over existing command and resource authorities, not another admission store.
+    final class Admission: Equatable {
+        let isCurrent: @MainActor () -> Bool
+        let ownsCleanup: @MainActor () -> Bool
+        init(isCurrent: @escaping @MainActor () -> Bool, ownsCleanup: @escaping @MainActor () -> Bool) {
+            self.isCurrent = isCurrent
+            self.ownsCleanup = ownsCleanup
+        }
+
+        nonisolated static func == (lhs: Admission, rhs: Admission) -> Bool {
+            lhs === rhs
+        }
+    }
+
     struct ProviderMessage {
         let text: String
         var failures: [ExplicitFileFailure] = []
+        /// Runtime-composed input retains the exact command/resource proof through provider awaits.
+        /// Legacy/local assembly has no additional resource receipt beyond its existing fences.
+        var dispatchIsCurrent: @MainActor () -> Bool = { true }
     }
 
     struct ExplicitFileFailure: Equatable {

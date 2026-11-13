@@ -1764,6 +1764,41 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         await h.host.claudeCoordinator.shutdownClaudeSession(session)
     }
 
+    func testStaleManagedResourceAdmissionDoesNotRestoreTheLocalClaudeSibling() async throws {
+        let (h, session, controller, _) = try await spyFixture()
+        let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+        let initial = AgentChatItem.user("host input", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(initial)
+        try await h.host.test_composeRunService(service).startRun(
+            tabID: session.tabID, session: session, origin: h.startCommand(for: session), initialUserMessage: initial.text,
+            initialMessageForRun: initial.text, attachments: [], initialUserItemID: initial.id
+        )
+        await until("host input is registered") { !session.claudeExpectedTurnIDs.isEmpty }
+        let originalMessages = await controller.sentMessages
+        h.host.storeDraftText(for: session.tabID, "private composer")
+        let managedRow = AgentChatItem.user("managed recovery witness", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(managedRow)
+        session.pendingClaudeSteeringInstructions.append(.init(
+            id: UUID(), targetRunID: session.runID, targetRunAttemptID: session.activeRunAttemptID,
+            providerText: managedRow.text, attachments: [], taggedFileAttachments: [], draftText: "",
+            optimisticUserItemID: managedRow.id, createdAt: Date(),
+            runtimeInputAdmission: .init(isCurrent: { false }, ownsCleanup: { true })
+        ))
+        try queueSteer("healthy local sibling", in: session, service: service)
+        session.pendingNonCodexUserInputTokenQueue = [11, 17]
+        let accepted = await service.submitQueuedClaudeSteeringIfSupported(session: session)
+        XCTAssertTrue(accepted)
+        await session.claudeSteeringFlushTask?.task.value
+        let sent = await controller.sentMessages
+        XCTAssertEqual(sent, originalMessages + ["healthy local sibling"])
+        XCTAssertEqual(h.host.draftRuntime.text(for: session.tabID), "private composer")
+        XCTAssertTrue(session.pendingClaudeSteeringInstructions.isEmpty)
+        XCTAssertTrue(session.pendingNonCodexUserInputTokenQueue.isEmpty)
+        XCTAssertTrue(session.items.contains { $0.id == managedRow.id }, "The accepted managed row remains the recovery witness, never a composer draft")
+        await service.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+    }
+
     func testWithdrawnClaudeFlushCannotRecoverOrClearItsReplacement() async throws {
         for releaseThrows in [false, true] {
             let (h, session, controller, _) = try await spyFixture()

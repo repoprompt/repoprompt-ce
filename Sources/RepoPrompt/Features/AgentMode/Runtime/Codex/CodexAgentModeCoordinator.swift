@@ -7240,8 +7240,11 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         policyAlreadyInstalled: Bool = false,
         terminalizeRejectedSend: Bool = true,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
-        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil
+        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
+        inputResourcesAreCurrent: @escaping @MainActor () -> Bool = { true },
+        inputAttemptChanged: (@MainActor (Bool) -> Void)? = nil
     ) async -> NativeSendOutcome {
+        guard inputResourcesAreCurrent() else { return .preDispatchRejected(message: "The input resource generation changed before Codex dispatch.") }
         if let refusal = codexEarlySendRefusal(
             session: session, writerReceipt: writerReceipt, ownership: ownership,
             attachmentReservationID: attachmentReservationID
@@ -7286,7 +7289,9 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         let auditTurnID = fallbackContext?.optimisticUserItemID
             ?? session.pendingTurnRuntimeAnchors.first?.userItemID
         let wasRunAlreadyActive = session.runState.isActive
-        var attemptedPhysicalSend = false
+        var attemptedPhysicalSend = false {
+            didSet { inputAttemptChanged?(attemptedPhysicalSend) }
+        }
         let priorAuthRetryTurn = session.codexPendingAuthRetryTurn
         var preparedSteerAuthRetryTurn: AgentTabSession.CodexPendingAuthRetryTurn?
         let sendRunAttemptIDAtEntry = session.activeRunAttemptID
@@ -7796,7 +7801,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         }
 
         @MainActor func ownsPhysicalSendAfterProof(allowSelfNote: Bool) -> Bool {
-            !Task.isCancelled && effectiveStopFence.permitsStart(of: session)
+            inputResourcesAreCurrent() && !Task.isCancelled && effectiveStopFence.permitsStart(of: session)
                 && session.runID == sendRunID && session.activeRunAttemptID == sendRunAttemptIDAtEntry
                 && session.codexController.map(ObjectIdentifier.init) == expectedControllerID
                 && session.pendingCodexComputerUseActivation?.id == computerUseActivationID
@@ -7806,10 +7811,11 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         }
 
         func computerUsePhysicalDispatchIsCurrent() async -> Bool {
+            guard inputResourcesAreCurrent() else { return false }
             guard await validateCodexComputerUseScope(session: session, controller: controller, activationID: computerUseActivationID) else { return false }
-            guard computerUseActivationID != nil else { return true }
+            guard computerUseActivationID != nil else { return inputResourcesAreCurrent() }
             // The scope check suspends. Reapply the original physical route/Stop fences after it.
-            return !Task.isCancelled
+            return inputResourcesAreCurrent() && !Task.isCancelled
                 && effectiveStopFence.permitsStart(of: session)
                 && session.runID == sendRunID
                 && session.activeRunAttemptID == sendRunAttemptIDAtEntry

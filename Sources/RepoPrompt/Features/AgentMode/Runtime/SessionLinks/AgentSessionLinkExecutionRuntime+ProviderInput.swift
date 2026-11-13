@@ -1,0 +1,104 @@
+import Foundation
+import RepoPromptAIContracts
+
+extension AgentSessionLinkExecutionRuntime {
+    /// Host composition supplies concrete resource snapshots and labels, not an implementation of
+    /// augmentation or recovery. The returned hooks retain this scope's existing input/handoff owners.
+    func makeProviderInputHooks(
+        environmentForSession: @escaping @MainActor (AgentTabSession) -> ManagedInputEnvironment,
+        sessionTitle: @escaping @MainActor (AgentTabSession) -> String
+    ) -> AgentModeRunService.ProviderInputAssemblyHooks {
+        .init(
+            buildHeadlessAgentMessage: { [self] session, text, _, attachments in
+                commands.input.buildHeadlessAgentMessage(session: session, initialMessageForRun: text, attachments: attachments, links: self)
+            },
+            augmentUserMessageForProviderSend: { [self] text, attachments, taggedFiles, session, skipsSlashExpansion, isCurrent in
+                guard let session else { return .init(text: text, dispatchIsCurrent: { false }) }
+                return await prepareProviderMessage(
+                    text, session: session, attachments: attachments, taggedFiles: taggedFiles,
+                    skipsSlashExpansion: skipsSlashExpansion, environment: environmentForSession(session), isCurrent: isCurrent
+                )
+            },
+            recordTaggedFileFailures: { [weak scope] failures, session in
+                guard let scope else { return }
+                AgentSessionProviderInputRuntime.recordTaggedFileFailures(failures, session: session, scope: scope)
+            },
+            stageResumeRecoveryHandoffIfNeeded: { [self] session in
+                await prepareResumeRecoveryHandoff(
+                    for: session, sourceTitle: sessionTitle(session), environment: environmentForSession(session)
+                ).permitsFreshSession
+            },
+            prependPendingHandoffIfNeeded: { [weak scope] text, session in scope?.handoff.prependPendingHandoffIfNeeded(text, session: session) ?? text },
+            recordPendingHandoffSendOutcome: { [weak scope] session, sent in scope?.handoff.recordSendOutcome(for: session, didSend: sent) },
+            claimAgentSessionLinkPrompt: { [self] session, dispatch in agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatch) },
+            acquireAgentSessionLinkPhysicalDispatch: { [self] session, dispatch in agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: dispatch) },
+            recordAgentSessionLinkPhysicalDispatchNotAttempted: { [self] session, dispatch in agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatch) },
+            recordAgentSessionLinkPhysicalDispatchFailure: { [self] session, dispatch in agentSessionLinkRecordPhysicalDispatchFailure(for: session, dispatchID: dispatch) },
+            acceptAgentSessionLinkPrompt: { [self] session, context, claim in acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim) },
+            proveAgentSessionLinkProviderInput: { [self] session, claim in await agentSessionLinkProveProviderInput(for: session, claim: claim) },
+            handoffAgentSessionLinkProviderInput: { [self] session, dispatch, claim, proof in agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatch, claim: claim, proof: proof) }
+        )
+    }
+
+    func prepareProviderMessage(
+        _ text: String, session: AgentTabSession, attachments: [AgentFileAttachment],
+        taggedFiles: [AgentTaggedFileAttachment], skipsSlashExpansion: Bool,
+        environment: ManagedInputEnvironment, isCurrent: @escaping @MainActor () -> Bool
+    ) async -> AgentSessionProviderInputRuntime.ProviderMessage {
+        guard let owner = scope, let command = try? owner.admit(session: session) else {
+            return .init(text: text, dispatchIsCurrent: { false })
+        }
+        let resources: @MainActor () -> Bool = {
+            command.isCurrent && environment.workspaceID == command.identity.workspaceID
+                && environment.resourcesAreCurrent() && !Task.isCancelled
+        }
+        let admission: @MainActor () -> Bool = { resources() && isCurrent() }
+        guard admission() else { return .init(text: text, dispatchIsCurrent: { false }) }
+        var failures: [AgentSessionProviderInputRuntime.ExplicitFileFailure] = []
+        let prepared = await commands.input.augmentUserMessage(
+            text, attachments: attachments, taggedFileAttachments: taggedFiles, agent: session.selectedAgent,
+            workspacePaths: commands.workspacePaths(), workspace: { self.commands.inputWorkspace(session) },
+            session: session, handoff: owner.handoff, ignoresPendingHandoff: false,
+            skipsSlashExpansion: skipsSlashExpansion, isCurrent: admission, onTaggedFileFailures: { failures = $0 }
+        )
+        return .init(text: prepared, failures: admission() ? failures : [], dispatchIsCurrent: resources)
+    }
+
+    func prepareResumeRecoveryHandoff(
+        for session: AgentTabSession, sourceTitle: String, environment: ManagedInputEnvironment
+    ) async -> AgentSessionHandoffRuntime.RecoveryResult {
+        guard let owner = scope, let membership = owner.membership(of: session),
+              environment.resourcesAreCurrent() else { return .refused }
+        // Recovery also serves a legacy unbound local draft. That path retains its exact slot;
+        // a restored, workspace-bound session must retain its full admitted writer instead.
+        let command = try? owner.admit(session: session)
+        if let workspaceID = session.persistentSessionBindingIdentity?.workspaceID {
+            guard command != nil, environment.workspaceID == workspaceID else { return .refused }
+        }
+        if owner.handoff.canReuseRecovery(for: session) { return .unchanged }
+        let cutoff = session.items.last(where: { $0.kind != .thinking })?.id
+        let transcript: AgentTranscript = if !session.transcript.turns.isEmpty { session.transcript }
+        else {
+            AgentTranscriptIO.buildTranscript(
+                from: session.items, nextSequenceIndex: (session.items.map(\.sequenceIndex).max() ?? -1) + 1,
+                policy: .canonical, compact: false
+            )
+        }
+        let valid = cutoff.map { AgentTranscriptIO.isValidHandoffExportCutoffRowID($0, in: transcript) } ?? true
+        guard let preparation = owner.handoff.prepareRecovery(
+            for: session, sourceTabName: AgentSessionRestoreSupport.normalizedSessionTitle(sourceTitle),
+            transcriptXML: AgentTranscriptIO.buildForkTranscriptXML(from: valid ? transcript : .empty, upToRowID: valid ? cutoff : nil)
+        ) else { return .refused }
+        let context: String?
+        if let input = commands.initialThreadInput(session) {
+            let values = await commands.input.initialThreadContext(input)
+            let block = AgentSessionProviderInputRuntime.composeInitialThreadMessage(
+                initialMessage: "", fileTree: values.fileTree, promptText: values.promptText
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+            context = block.isEmpty ? nil : block
+        } else { context = nil }
+        guard command?.isCurrent ?? membership.permitsBindingPreparation, environment.resourcesAreCurrent(),
+              let staged = owner.handoff.stageRecovery(preparation, initialThreadContextBlock: context) else { return .refused }
+        return .staged(staged)
+    }
+}

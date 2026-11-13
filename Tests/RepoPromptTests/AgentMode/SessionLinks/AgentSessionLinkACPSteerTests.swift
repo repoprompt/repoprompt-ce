@@ -239,6 +239,35 @@ final class AgentSessionLinkACPSteerTests: XCTestCase {
         XCTAssertEqual(fixture.provider.promptedMessages.count, before)
     }
 
+    func testManagedResourceRevocationDuringAugmentationDoesNotDemoteTheLocalSibling() async throws {
+        let fixture = try await makeFixture()
+        let session = fixture.session
+        let service = fixture.viewModel.test_initializeRunService()
+        fixture.viewModel.storeDraftText(for: session.tabID, "private composer")
+        var resourcesAreCurrent = true
+        let (originalBatch, sink) = mixedSteeringBatch(fixture)
+        var batch = originalBatch
+        batch[1].runtimeInputAdmission = .init(isCurrent: { resourcesAreCurrent }, ownsCleanup: { true })
+        session.pendingACPSteeringInstructions = batch
+        session.pendingNonCodexUserInputTokenQueue = [11, 17]
+        fixture.viewModel.test_afterProviderInputAugmentation = { resourcesAreCurrent = false }
+        defer { fixture.viewModel.test_afterProviderInputAugmentation = nil }
+
+        let accepted = await service.submitQueuedACPSteeringIfSupported(session: session)
+        XCTAssertTrue(accepted)
+        await session.acpSteeringFlushTask?.value
+        let outcome = await sink.awaitOutcome(timeoutSeconds: 1)
+
+        guard case .notAccepted = outcome else { return XCTFail("The stale managed entry was not withdrawn: \(outcome)") }
+        XCTAssertEqual(fixture.provider.promptedMessages.count, 1)
+        XCTAssertTrue(fixture.provider.promptedMessages[0].userMessage.contains("local provider text"))
+        XCTAssertFalse(fixture.provider.promptedMessages[0].userMessage.contains("managed scheduled direction"))
+        XCTAssertTrue(session.pendingACPSteeringInstructions.isEmpty)
+        XCTAssertTrue(session.pendingInstructions.isEmpty, "A stale managed sibling must not turn healthy local steering into a follow-up")
+        XCTAssertTrue(session.pendingNonCodexUserInputTokenQueue.isEmpty)
+        XCTAssertEqual(fixture.viewModel.draftRuntime.text(for: session.tabID), "private composer")
+    }
+
     func testMissingWorkspaceAdmissionRequeuesMixedBatchWithoutLosingReceiptOrLocalDraft() async throws {
         let fixture = try await makeFixture()
         let session = fixture.session

@@ -1339,8 +1339,10 @@ final class ClaudeAgentModeCoordinator {
         providerControlCommand: AgentProviderControlCommand? = nil,
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
         reinstallRunRoutingPolicy: (@MainActor () async -> Bool)? = nil,
-        inputAttemptChanged: (@MainActor (Bool) -> Void)? = nil
+        inputAttemptChanged: (@MainActor (Bool) -> Void)? = nil,
+        inputResourcesAreCurrent: @escaping @MainActor () -> Bool = { true }
     ) async -> NativeSendOutcome {
+        guard inputResourcesAreCurrent() else { return .failed(message: "The input resource generation changed before Claude dispatch.") }
         guard intentIsCurrent(intent, for: session) else { return .superseded }
         let isSelfNote = selfCompactDispatchID?.stage == .note
         let isMaintenance = providerControlCommand != nil || isSelfNote
@@ -1920,6 +1922,10 @@ final class ClaudeAgentModeCoordinator {
                     return .superseded
                 }
                 let inputProof = await hostCapabilities.proveLocalInput(session, monitoring.claim)
+                guard inputResourcesAreCurrent() else {
+                    hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
+                    return .failed(message: "The input resource generation changed before Claude dispatch.")
+                }
                 guard !Task.isCancelled, intentIsCurrent(intent, for: session),
                       sessionOwnsClaudeController(controller, for: session)
                 else {

@@ -51,6 +51,7 @@ extension AgentSessionRuntimeStore.Scope {
         if session.activeAgentSessionID.map({ saveQueue.inFlightSessionIDs.contains($0) }) == true
             || attachments.hasPendingRetention(for: session) || installedInteractions?.hasPendingEffects(for: session) == true
             || linkExecution?.pendingSendEffects.values.contains(where: { $0.sessionIdentity == identity }) == true
+            || linkExecution?.pendingManagedInputEffects.values.contains(where: { $0.sessionIdentity == identity }) == true
             || linkExecution?.pendingStopEffects.values.contains(where: { $0.sessionIdentity == identity }) == true
         {
             blockers.insert(.effects)

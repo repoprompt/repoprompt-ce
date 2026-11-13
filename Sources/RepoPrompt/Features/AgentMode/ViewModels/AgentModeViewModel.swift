@@ -15685,6 +15685,21 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     // MARK: - Managed cross-session steer
 
+    func managedInputEnvironment() -> AgentSessionLinkExecutionRuntime.ManagedInputEnvironment {
+        let manager = workspaceManager
+        let workspaceID = manager?.activeWorkspaceID
+        let hadWorkspaceOwner = manager != nil
+        return .init(
+            workspaceID: workspaceID,
+            resourcesAreCurrent: { [weak manager] in
+                if let manager { return manager.activeWorkspaceID == workspaceID }
+                return !hadWorkspaceOwner && workspaceID == nil
+            },
+            settings: modelRouterSettingsStore,
+            server: mcpServer
+        )
+    }
+
     /// The provider route a managed cross-session steer would take right now, following
     /// `submitPreparedUserTurn`'s own branch order, or `nil` when no managed route exists.
     ///
@@ -15692,21 +15707,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// An idle target uses the durable send transaction. ACP's serialized queue carries managed
     /// context through flush and follow-up, and only local draft text can return to the composer.
     func agentSessionLinkManagedSteerRoute(for session: TabSession) -> AgentSessionLinkManagedSteerRoute? {
-        if session.runState == .waitingForUser, session.instructionContinuation != nil {
-            return .waitingInstruction
-        }
-        guard session.runState.isActive else { return nil }
-        if session.selectedAgent == .codexExec {
-            return .codex
-        }
-        switch activeProviderSteeringRoute(for: session) {
-        case .claudeNativeInterrupt:
-            return .claudeInterrupt
-        case .acpPrompt:
-            return .acpQueued
-        case nil:
-            return nil
-        }
+        linkExecutionRuntime.agentSessionLinkManagedSteerRoute(for: session)
     }
 
     /// Withdraws a managed turn whose live state no longer matches the route it was classified onto.
@@ -15856,64 +15857,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         route: AgentSessionLinkManagedSteerRoute,
         workflow: AgentWorkflowDefinition? = nil
     ) -> Bool {
-        // Codex reports its terminal state through the acknowledgement tracker `agent_run` uses. The
-        // `.mcp` fallback origin that an attempt ID selects is the programmatic-dispatch origin,
-        // which never restores a composer draft on failure.
-        guard agentSessionLinkManagedSteerRoute(for: session) == route else { return false }
-        let codexAttemptID = route == .codex ? session.codexSteerAckTracker.beginAttempt() : nil
-        let submission = submitPreparedUserTurn(
-            tabID: tabID,
-            session: session,
-            trimmedText: displayText,
-            attachmentsToSend: [],
-            taggedFilesToSend: [],
-            activeWorkflow: workflow,
-            codexAttemptID: codexAttemptID,
-            managedTurn: turn
+        linkExecutionRuntime.submitNoncomposerSteer(
+            tabID: tabID, session: session, displayText: displayText,
+            turn: turn, route: route, workflow: workflow, environment: managedInputEnvironment()
         )
-        guard case .submitted = submission else {
-            if let codexAttemptID {
-                session.codexSteerAckTracker.cancel(attemptID: codexAttemptID)
-            }
-            return false
-        }
-        if let codexAttemptID {
-            session.codexSteerAckTracker.authorizeDispatch(attemptID: codexAttemptID)
-            let sink = turn.sink
-            // A separate task on purpose: the tracker cancels an attempt whose awaiting task is
-            // cancelled, and a committed steer must settle on its own terms rather than on whether
-            // the observer's tool call is still listening.
-            Task { @MainActor [weak session] in
-                guard let session else {
-                    sink.resolve(.unconfirmed(message: "The overseen session closed before Codex confirmed the steer."))
-                    return
-                }
-                let state = await session.codexSteerAckTracker.awaitTerminalState(attemptID: codexAttemptID)
-                sink.resolve(Self.agentSessionLinkManagedSteerOutcome(for: state))
-            }
-        }
-        return true
     }
 
     static func agentSessionLinkManagedSteerOutcome(
         for state: CodexSteerAckTracker.TerminalState
     ) -> AgentSessionLinkManagedSteerOutcome {
-        switch state {
-        case .steerAccepted, .controlAccepted:
-            .delivered(.steered)
-        case .startAccepted:
-            .delivered(.runStarted)
-        case .durablyQueued:
-            .delivered(.queuedFollowUp)
-        case let .failed(message):
-            .notAccepted(message: message)
-        case .cancelled:
-            .notAccepted(message: "Codex cancelled the steer before it reached the session.")
-        case let .stale(reason):
-            .notAccepted(message: reason)
-        case .timedOut:
-            .unconfirmed(message: "Codex did not confirm the steer in time.")
-        }
+        AgentSessionLinkExecutionRuntime.agentSessionLinkManagedSteerOutcome(for: state)
     }
 
     /// Non-mutating ordinary text composition, shared by submission and destination preview.
@@ -17362,17 +17315,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// The host supplies workspace context; exact-incarnation staging and consumption belong
     /// to the runtime. Capture before the context read, not after its suspension.
     private func prepareResumeRecoveryHandoff(for session: TabSession) async -> AgentSessionHandoffRuntime.RecoveryResult {
-        let handoff = handoffRuntime
-        if handoff.canReuseRecovery(for: session) { return .unchanged }
-        let cutoffItemID = session.items.last(where: { $0.kind != .thinking })?.id
-        guard let preparation = handoff.prepareRecovery(
+        await linkExecutionRuntime.prepareResumeRecoveryHandoff(
             for: session,
-            sourceTabName: normalizedSessionTitle(workspaceManager?.composeTabName(with: session.tabID)),
-            transcriptXML: buildForkTranscriptXML(from: session, upToItemID: cutoffItemID)
-        ) else { return .refused }
-        let context = await buildInitialThreadContextBlock(tabID: session.tabID)
-        guard let staged = handoff.stageRecovery(preparation, initialThreadContextBlock: context) else { return .refused }
-        return .staged(staged)
+            sourceTitle: normalizedSessionTitle(workspaceManager?.composeTabName(with: session.tabID)),
+            environment: managedInputEnvironment()
+        )
     }
 
     @MainActor
