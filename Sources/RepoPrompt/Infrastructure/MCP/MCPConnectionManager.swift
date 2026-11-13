@@ -505,7 +505,7 @@ final class MCPBecomeOverseerActivationProof: @unchecked Sendable {
               let window = WindowStatesManager.shared.modelRoutingWindow(withID: endpoint.windowID),
               ObjectIdentifier(window) == windowIdentity.windowStateIdentity,
               ObjectIdentifier(window.mcpServer) == windowIdentity.serverViewModelIdentity,
-              window.mcpServer.hasCurrentRunRouteMapping(
+              window.mcpServer.runRouteBindings.hasCurrentMapping(
                   runID: routeToken.runID, connectionID: routeToken.connectionID, expectedTabID: endpoint.tabID
               ),
               window.agentModeViewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint
@@ -631,7 +631,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             return policyWindowID
         }
         let resolvedWindowID = await MainActor.run {
-            WindowStatesManager.shared.allWindows.first { $0.mcpServer.hasLiveRunID(runID) }?.windowID
+            WindowStatesManager.shared.allWindows.first { $0.mcpServer.runRouteBindings.connectionID(forRunID: runID) != nil }?.windowID
         }
         if let resolvedWindowID {
             presentationWindowByRun[runID] = resolvedWindowID
@@ -4095,7 +4095,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         let connectionID = await MainActor.run { () -> UUID? in
             guard let window = WindowStatesManager.shared.window(withID: windowID),
                   let connectionID = window.mcpServer.connectionIDByRunID[runID],
-                  window.mcpServer.hasCurrentRunRouteMapping(
+                  window.mcpServer.runRouteBindings.hasCurrentMapping(
                       runID: runID,
                       connectionID: connectionID,
                       expectedTabID: tabID
@@ -4121,7 +4121,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             guard let window = WindowStatesManager.shared.window(withID: windowID) else {
                 return false
             }
-            return window.mcpServer.hasCurrentRunRouteMapping(
+            return window.mcpServer.runRouteBindings.hasCurrentMapping(
                 runID: runID,
                 connectionID: connectionID,
                 expectedTabID: tabID
@@ -4157,7 +4157,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         let candidate = await MainActor.run { () -> (UUID, DomainAgentSessionLinkEndpointIdentity)? in
             guard let window = WindowStatesManager.shared.window(withID: windowID),
                   let connectionID = window.mcpServer.connectionIDByRunID[runID],
-                  window.mcpServer.hasCurrentRunRouteMapping(
+                  window.mcpServer.runRouteBindings.hasCurrentMapping(
                       runID: runID,
                       connectionID: connectionID,
                       expectedTabID: tabID
@@ -4179,7 +4179,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
 
         let mappingIsStillCurrent = await MainActor.run {
             guard let window = WindowStatesManager.shared.window(withID: windowID),
-                  window.mcpServer.hasCurrentRunRouteMapping(
+                  window.mcpServer.runRouteBindings.hasCurrentMapping(
                       runID: runID,
                       connectionID: connectionID,
                       expectedTabID: tabID
@@ -4332,7 +4332,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         let connectionID = await MainActor.run { () -> UUID? in
             guard let window = WindowStatesManager.shared.window(withID: windowID),
                   let connectionID = window.mcpServer.connectionIDByRunID[runID],
-                  window.mcpServer.hasCurrentRunRouteMapping(
+                  window.mcpServer.runRouteBindings.hasCurrentMapping(
                       runID: runID,
                       connectionID: connectionID,
                       expectedTabID: tabID
@@ -4353,7 +4353,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 guard let window = WindowStatesManager.shared.window(withID: windowID) else {
                     return false
                 }
-                return window.mcpServer.hasCurrentRunRouteMapping(
+                return window.mcpServer.runRouteBindings.hasCurrentMapping(
                     runID: runID,
                     connectionID: connectionID,
                     expectedTabID: tabID
@@ -4656,7 +4656,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 return false
             }
             let mappedRun = window.mcpServer.connectionIDToRunID[connectionID]
-            let mappedConnection = window.mcpServer.connectionID(forRunID: runID)
+            let mappedConnection = window.mcpServer.runRouteBindings.connectionID(forRunID: runID)
             return mappedRun == runID && mappedConnection == connectionID
         }
         if alreadyMapped {
@@ -5189,7 +5189,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 return window.windowID == windowID
             }
             for window in windows {
-                if let connectionID = window.mcpServer.connectionID(forRunID: runID) {
+                if let connectionID = window.mcpServer.runRouteBindings.connectionID(forRunID: runID) {
                     window.mcpServer.cleanupRunIDMapping(
                         runID: runID, connectionID: connectionID,
                         signalRoutingFailure: routingWaitGeneration != nil,

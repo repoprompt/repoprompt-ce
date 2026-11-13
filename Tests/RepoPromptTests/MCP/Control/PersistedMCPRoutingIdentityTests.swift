@@ -88,7 +88,7 @@ import RepoPromptSettingsCore
             XCTAssertFalse(contenderCompleted, "Consumed policy must not degrade automatic approval to unrestricted fallback")
             let contenderRun = await manager.debugCachedRunID(for: contender.connectionID)
             XCTAssertNil(contenderRun)
-            XCTAssertEqual(window.mcpServer.connectionID(forRunID: runID), initial.connectionID)
+            XCTAssertEqual(window.mcpServer.runRouteBindings.connectionID(forRunID: runID), initial.connectionID)
             let pendingAfter = await manager.debugPendingPolicySnapshot(for: clientName)
             XCTAssertTrue(pendingAfter.isEmpty)
 
@@ -174,7 +174,7 @@ import RepoPromptSettingsCore
                 clientPid: Int(getpid()), sessionKey: sessionKey
             )
             XCTAssertEqual(initial.outcome, "applied")
-            XCTAssertEqual(window.mcpServer.connectionID(forRunID: runID), initialConnectionID)
+            XCTAssertEqual(window.mcpServer.runRouteBindings.connectionID(forRunID: runID), initialConnectionID)
             let pending = await manager.debugPendingPolicySnapshot(for: clientName)
             XCTAssertTrue(pending.isEmpty, "The initial one-shot policy must be consumed")
 
@@ -190,7 +190,7 @@ import RepoPromptSettingsCore
             XCTAssertEqual(second.purpose, .unknown)
             XCTAssertTrue(second.restrictedTools.isEmpty)
             XCTAssertNil(window.mcpServer.connectionIDToRunID[secondConnectionID])
-            XCTAssertEqual(window.mcpServer.connectionID(forRunID: runID), initialConnectionID)
+            XCTAssertEqual(window.mcpServer.runRouteBindings.connectionID(forRunID: runID), initialConnectionID)
 
             // The original capability token still authorizes a reconnect handover.
             let reconnect = await manager.debugApplyPendingPolicy(
@@ -202,7 +202,7 @@ import RepoPromptSettingsCore
             XCTAssertEqual(reconnect.windowID, window.windowID)
             XCTAssertEqual(reconnect.purpose, .agentModeRun)
             XCTAssertEqual(reconnect.restrictedTools, restrictedTools)
-            XCTAssertEqual(window.mcpServer.connectionID(forRunID: runID), reconnectConnectionID)
+            XCTAssertEqual(window.mcpServer.runRouteBindings.connectionID(forRunID: runID), reconnectConnectionID)
 
             // An explicit new run-owned policy authorizes the second token too.
             await installPolicy()
@@ -215,7 +215,7 @@ import RepoPromptSettingsCore
             XCTAssertEqual(explicitRunID, runID)
             XCTAssertEqual(explicit.purpose, .agentModeRun)
             XCTAssertEqual(explicit.restrictedTools, restrictedTools)
-            XCTAssertEqual(window.mcpServer.connectionID(forRunID: runID), secondConnectionID)
+            XCTAssertEqual(window.mcpServer.runRouteBindings.connectionID(forRunID: runID), secondConnectionID)
         }
 
         @MainActor
@@ -277,8 +277,8 @@ import RepoPromptSettingsCore
             )
             XCTAssertEqual(reconnected.outcome, "applied")
             XCTAssertEqual(reconnected.runID, runB, "Older A must not capture or deny B's reconnect")
-            XCTAssertEqual(window.mcpServer.connectionID(forRunID: runA), firstA)
-            XCTAssertEqual(window.mcpServer.connectionID(forRunID: runB), reconnectB)
+            XCTAssertEqual(window.mcpServer.runRouteBindings.connectionID(forRunID: runA), firstA)
+            XCTAssertEqual(window.mcpServer.runRouteBindings.connectionID(forRunID: runB), reconnectB)
             let remaining = await manager.debugPendingPolicySnapshot(for: client)
             XCTAssertEqual(remaining.compactMap(\.runID), [runA])
 
@@ -290,7 +290,7 @@ import RepoPromptSettingsCore
             XCTAssertEqual(again.outcome, "fallback")
             let againRun = await manager.debugCachedRunID(for: reconnectAgain)
             XCTAssertEqual(againRun, runB)
-            XCTAssertEqual(window.mcpServer.connectionID(forRunID: runA), firstA)
+            XCTAssertEqual(window.mcpServer.runRouteBindings.connectionID(forRunID: runA), firstA)
 
             // A sole pending B policy is still ambiguous for a fresh token whose PID
             // also owns active A. Dropping a reconnect token must never capture B.
@@ -341,7 +341,7 @@ import RepoPromptSettingsCore
             )
             XCTAssertEqual(admitted.outcome, "applied")
             XCTAssertEqual(admitted.runID, next)
-            XCTAssertNil(window.mcpServer.connectionID(forRunID: retired))
+            XCTAssertNil(window.mcpServer.runRouteBindings.connectionID(forRunID: retired))
         }
 
         @MainActor

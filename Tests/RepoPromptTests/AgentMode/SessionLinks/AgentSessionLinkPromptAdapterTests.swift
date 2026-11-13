@@ -3121,7 +3121,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
             await removalGate.waitUntilEntered()
             let removalHasBegun = await manager.debugHasConnectionRemovalOperation(for: connectionID)
             XCTAssertTrue(removalHasBegun, "Removal must be committed before transport termination is observable")
-            XCTAssertTrue(server.hasCurrentRunRouteMapping(
+            XCTAssertTrue(server.runRouteBindings.hasCurrentMapping(
                 runID: runID, connectionID: connectionID, expectedTabID: fixture.tabID
             ), "retained mappings must reproduce the unsafe cleanup interval")
             XCTAssertFalse(fixture.viewModel.hasCurrentRunCatalogRouteTokenInCurrentMCPServer(token, tabID: fixture.tabID))

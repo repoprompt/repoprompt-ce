@@ -271,8 +271,13 @@ final class MCPRunRouteBindingsTests: XCTestCase {
         XCTAssertFalse(routes.hasCurrentMapping(runID: runID, connectionID: replacement, expectedTabID: tabID), "A mapping without its exact context is insufficient")
         routes.tabContextByConnectionID[replacement] = context(runID: runID, tabID: tabID)
         XCTAssertTrue(routes.hasCurrentMapping(runID: runID, connectionID: replacement, expectedTabID: tabID))
+        XCTAssertEqual(routes.connectionID(forRunID: runID), replacement)
+        XCTAssertEqual(routes.connectionIDs(forRunID: runID), [replacement])
+        XCTAssertEqual(routes.liveRunIDsBound(toTabID: tabID), [runID])
         routes.connectionIDToRunID[replacement] = otherRun
         XCTAssertFalse(routes.hasCurrentMapping(runID: runID, connectionID: replacement, expectedTabID: tabID), "Both mapping directions remain required")
+        XCTAssertNil(routes.connectionID(forRunID: runID))
+        XCTAssertTrue(routes.liveRunIDsBound(toTabID: tabID).isEmpty)
     }
 
     func testPendingReplacementRestoresCommittedPredecessorButNeverPendingPredecessor() throws {

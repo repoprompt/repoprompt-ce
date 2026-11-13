@@ -634,43 +634,6 @@ extension MCPServerViewModel {
         return snapshot
     }
 
-    /// Returns live run IDs currently bound to a tab in this window.
-    @MainActor
-    func liveRunIDsBound(toTabID tabID: UUID) -> [UUID] {
-        let runIDs = tabContextByConnectionID.values.compactMap { context -> UUID? in
-            guard context.tabID == tabID, let runID = context.runID else { return nil }
-            return liveConnectionID(forRunID: runID) != nil ? runID : nil
-        }
-        return Array(Set(runIDs)).sorted { $0.uuidString < $1.uuidString }
-    }
-
-    /// Returns true only for the current bidirectional run mapping.
-    ///
-    /// Pending-policy mapping tokens identify rollback/replacement generations; they do not own
-    /// application commit authority. ServerNetworkManager composes this mapping with its
-    /// actor-owned application, policy, window/tab, and live-connection state.
-    @MainActor
-    func hasCurrentRunRouteMapping(
-        runID: UUID,
-        connectionID: UUID,
-        expectedTabID: UUID?
-    ) -> Bool {
-        runRouteBindings.hasCurrentMapping(runID: runID, connectionID: connectionID, expectedTabID: expectedTabID)
-    }
-
-    /// Final synchronous mapping fence for an actor-qualified provider dispatch.
-    ///
-    /// Recheck the actor's live lifecycle/removal state synchronously as well as both mapping
-    /// directions: cleanup can suspend after removal starts but before mappings are retracted.
-    /// Neither this fence nor its lifecycle read depends on catalog/tool-list freshness.
-    @MainActor
-    func hasCurrentRunCatalogRouteToken(
-        _ token: AgentSessionLinkRunCatalogRouteToken,
-        expectedTabID: UUID
-    ) -> Bool {
-        runRouteBindings.hasCurrentCatalogRouteToken(token, expectedTabID: expectedTabID)
-    }
-
     /// Proactively removes all cached tab-context state for a closing tab while preserving window affinity.
     @MainActor
     func purgeClosedTabContext(tabID: UUID) {
@@ -3796,51 +3759,6 @@ extension MCPServerViewModel {
         return gitArtifactAdvertisementRegistry.isCurrent(snapshot)
     }
 
-    private nonisolated static func resolveLiveConnectionID(
-        forRunID runID: UUID,
-        connectionIDByRunID: [UUID: UUID],
-        connectionIDToRunID: [UUID: UUID]
-    ) -> UUID? {
-        guard let connectionID = connectionIDByRunID[runID] else {
-            return nil
-        }
-        guard connectionIDToRunID[connectionID] == runID else {
-            return nil
-        }
-        return connectionID
-    }
-
-    @MainActor
-    func connectionID(forRunID runID: UUID) -> UUID? {
-        liveConnectionID(forRunID: runID)
-    }
-
-    @MainActor
-    func liveConnectionID(forRunID runID: UUID) -> UUID? {
-        Self.resolveLiveConnectionID(
-            forRunID: runID,
-            connectionIDByRunID: connectionIDByRunID,
-            connectionIDToRunID: connectionIDToRunID
-        )
-    }
-
-    @MainActor
-    func hasLiveRunID(_ runID: UUID) -> Bool {
-        liveConnectionID(forRunID: runID) != nil
-    }
-
-    nonisolated static func test_liveConnectionID(
-        forRunID runID: UUID,
-        connectionIDByRunID: [UUID: UUID],
-        connectionIDToRunID: [UUID: UUID]
-    ) -> UUID? {
-        resolveLiveConnectionID(
-            forRunID: runID,
-            connectionIDByRunID: connectionIDByRunID,
-            connectionIDToRunID: connectionIDToRunID
-        )
-    }
-
     @MainActor
     static func test_popPendingContextForBinding(
         from store: inout MCPRunRouteBindings.PendingRunScopedContextStore,
@@ -3863,29 +3781,6 @@ extension MCPServerViewModel {
         resolveFileToolLookupRootScope(purpose: purpose, resolvedContext: resolvedContext)
     }
 
-    /// Returns all connection IDs associated with a runID.
-    /// This includes both the primary mapping (connectionIDByRunID) and any reverse mappings
-    /// (connectionIDToRunID). Used by ContextBuilderAgentViewModel to find agent connections
-    /// while avoiding termination of host MCP connections that may share the same runID.
-    @MainActor
-    func connectionIDs(forRunID runID: UUID) -> [UUID] {
-        var ids: [UUID] = []
-        if let primary = connectionIDByRunID[runID] {
-            ids.append(primary)
-        }
-        for (connectionID, mappedRun) in connectionIDToRunID where mappedRun == runID {
-            if !ids.contains(connectionID) {
-                ids.append(connectionID)
-            }
-        }
-        return ids
-    }
-
-    @MainActor
-    func hasRunID(_ runID: UUID) -> Bool {
-        hasLiveRunID(runID)
-    }
-
     @MainActor
     func cleanupRunIDMapping(
         runID: UUID,
@@ -3904,7 +3799,7 @@ extension MCPServerViewModel {
         tabContextLog("cleanupRunIDMapping removed runID=\(runID) connectionID=\(connectionID)")
 
         // A stale generation must not fail routing for a newer replacement connection.
-        if signalRoutingFailure, liveConnectionID(forRunID: runID) == nil {
+        if signalRoutingFailure, runRouteBindings.connectionID(forRunID: runID) == nil {
             MCPRoutingWaiter.signalFailed(runID, generation: routingWaitGeneration)
         }
     }
@@ -4077,7 +3972,7 @@ extension MCPServerViewModel {
                     removeQueuedPendingContext: false
                 )
             }
-            if signalRoutingFailure, liveConnectionID(forRunID: token.runID) == nil {
+            if signalRoutingFailure, runRouteBindings.connectionID(forRunID: token.runID) == nil {
                 MCPRoutingWaiter.signalFailed(token.runID, generation: routingWaitGeneration)
             }
             return supersededBySameConnection
@@ -4121,7 +4016,7 @@ extension MCPServerViewModel {
             }
         }
 
-        if signalRoutingFailure, liveConnectionID(forRunID: token.runID) == nil {
+        if signalRoutingFailure, runRouteBindings.connectionID(forRunID: token.runID) == nil {
             MCPRoutingWaiter.signalFailed(token.runID, generation: routingWaitGeneration)
         }
         return .restored

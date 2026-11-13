@@ -3545,7 +3545,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         guard let agentClientName = agent.mcpClientNameHint else { return [] }
 
         // Get all connection candidates for a run
-        let candidateIDs = mcpServer.connectionIDs(forRunID: runID)
+        let candidateIDs = mcpServer.runRouteBindings.connectionIDs(forRunID: runID)
         guard !candidateIDs.isEmpty else { return [] }
 
         // Filter by client name via ServerNetworkManager

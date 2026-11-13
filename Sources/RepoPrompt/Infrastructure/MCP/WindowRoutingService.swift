@@ -3071,7 +3071,7 @@ final class WindowRoutingService: Service {
                     }
 
                     let liveRunIDs = await MainActor.run {
-                        targetWindow.mcpServer.liveRunIDsBound(toTabID: tab.id)
+                        targetWindow.mcpServer.runRouteBindings.liveRunIDsBound(toTabID: tab.id)
                     }
                     if !liveRunIDs.isEmpty {
                         let joined = liveRunIDs.map(\.uuidString).joined(separator: ", ")
