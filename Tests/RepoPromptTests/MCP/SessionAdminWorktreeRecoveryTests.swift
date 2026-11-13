@@ -41,11 +41,16 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
         }
     }
 
+    func testColdSavedTargetWithoutRepositoryRootsReportsNoGitRepository() async throws {
+        try await exerciseColdSavedTarget(holdingRootReconciliation: false, withoutRepositoryRoots: true)
+    }
+
     private func exerciseColdSavedTarget(
         holdingRootReconciliation: Bool, revokeAuthorization: Bool = false,
-        rootFailure: WorkspaceRootReadinessFailure.Availability? = nil
+        rootFailure: WorkspaceRootReadinessFailure.Availability? = nil,
+        withoutRepositoryRoots: Bool = false
     ) async throws {
-        try await withFixture { fixture in
+        try await withFixture(withoutRepositoryRoots: withoutRepositoryRoots) { fixture in
             let manager = WindowStatesManager.shared
             let rootGate = WorkspaceAuthorityRootTestFixture.Gate()
             let rootEntered = XCTestExpectation(description: "prepared root reconciliation held before load")
@@ -122,16 +127,18 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
                     }
                     rootGate.release()
                 }
-                if revokeAuthorization || rootFailure != nil {
+                if revokeAuthorization || rootFailure != nil || withoutRepositoryRoots {
                     var refusal: SessionAdminHostError?
                     do {
                         _ = try await creating.value
-                        XCTFail("Failed readiness or revoked authorization must prevent worktree creation")
+                        XCTFail("Unavailable repository roots or revoked authorization must prevent worktree creation")
                     } catch let error as SessionAdminHostError {
                         refusal = error
                     }
                     let expected: SessionAdminHostError = if revokeAuthorization {
                         .authorityEnded
+                    } else if withoutRepositoryRoots {
+                        .invalid("The target session's workspace has no Git repository.")
                     } else {
                         .refused(
                             code: "workspace_not_ready",
@@ -140,6 +147,10 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
                         )
                     }
                     XCTAssertEqual(refusal, expected)
+                    if withoutRepositoryRoots {
+                        let owner = try XCTUnwrap(manager.preparedOversightWindows[fixture.sessionID])
+                        XCTAssertEqual(owner.workspaceManager.activeWorkspace?.repoPaths, [])
+                    }
                     await cleanupPreparedOwner()
                     XCTAssertNil(manager.preparedOversightPreparationInFlight[fixture.sessionID])
                     fixture.assertForegroundUnchanged()
@@ -1449,6 +1460,7 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
         electionRepositoryNames: (alpha: String, beta: String) = ("alpha", "beta"),
         electionRoots: ElectionRoots? = nil,
         replicaHoldsTarget: Bool = true,
+        withoutRepositoryRoots: Bool = false,
         resolver: GitRepoTargetResolver = GitRepoTargetResolver(),
         _ body: (Fixture) async throws -> Void
     ) async throws {
@@ -1486,14 +1498,14 @@ final class SessionAdminWorktreeRecoveryTests: XCTestCase {
             let electionRepositories = try election ? Self.makeElectionRepositories(git, names: electionRepositoryNames, roots: electionRoots) : nil
             let repository = try electionRepositories?.alpha
                 ?? git.makeRepository(named: "repository", files: ["README.md": "fixture\n"])
-            let declared = electionRepositories?.declared ?? [repository]
+            let declared = withoutRepositoryRoots ? [] : electionRepositories?.declared ?? [repository]
             await replica.workspaceManager.awaitInitialized()
             await window.workspaceManager.awaitInitialized()
             let created = window.workspaceManager.createWorkspace(name: "Worktree recovery", repoPaths: declared.map(\.path), ephemeral: true)
             await window.workspaceManager.switchWorkspace(to: created, saveState: false, reason: "worktreeRecoveryTest")
             if let electionRepositories {
                 try await Self.installAdversarialOrder(electionRepositories, store: window.promptManager.workspaceFileContextStore)
-            } else {
+            } else if !withoutRepositoryRoots {
                 _ = try await window.promptManager.workspaceFileContextStore.loadRoot(path: repository.path)
             }
             var workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)

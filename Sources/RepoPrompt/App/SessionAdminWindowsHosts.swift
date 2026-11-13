@@ -524,10 +524,16 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
             try await resources.awaitRootReadiness()
         } catch let failure as WorkspaceRootReadinessFailure {
             try requireCurrent()
+            if failure.reason == .emptyConfiguration {
+                throw SessionAdminHostError.invalid("The target session's workspace has no Git repository.")
+            }
             let reason = if case let .rootsUnavailable(availability) = failure.reason {
                 availability.rawValue
             } else {
                 String(describing: failure.reason)
+            }
+            guard failure.retryable else {
+                throw SessionAdminHostError.invalid("The target session's workspace roots cannot be used (\(reason)). Correct the workspace configuration.")
             }
             throw SessionAdminHostError.refused(
                 code: "workspace_not_ready",
