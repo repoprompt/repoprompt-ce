@@ -177,6 +177,24 @@ package struct DevinACPAgentProvider: ACPAgentProvider {
         return line.range(of: suppressedPattern, options: .regularExpression) == nil
     }
 
+    package static let emptyResponseUserMessage =
+        "Devin ended this turn without a response. The session is still open; send a message to continue."
+
+    /// Devin's `EmptyResponse` agent error (`-32021`, `cognition.ai/errorKind = empty_response`,
+    /// `cognition.ai/retryable = true`) ends only the turn; its ACP process and session stay usable.
+    /// Other Devin error kinds keep the ordinary failure until their session state is verified.
+    package func sessionPreservingPromptFailure(forResponseError error: [String: Any]) -> ACPSessionPreservingPromptFailure? {
+        guard error["code"] as? Int == -32021,
+              let data = error["data"] as? [String: Any],
+              data["cognition.ai/errorKind"] as? String == "empty_response",
+              // A JSON boolean only: Foundation also bridges the number `1` to `true`.
+              let retryable = data["cognition.ai/retryable"] as? NSNumber,
+              CFGetTypeID(retryable) == CFBooleanGetTypeID(),
+              retryable.boolValue
+        else { return nil }
+        return ACPSessionPreservingPromptFailure(userMessage: Self.emptyResponseUserMessage)
+    }
+
     package func normalizeError(_ error: Error) -> Error {
         if error is AIProviderError { return error }
         if let runnerError = error as? CLIProcessRunnerError,

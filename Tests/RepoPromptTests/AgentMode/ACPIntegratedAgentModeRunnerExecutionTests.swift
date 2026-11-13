@@ -1567,6 +1567,84 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
     }
 
+    /// #1699: Devin's retryable `EmptyResponse` fails the run with readable text but keeps the live
+    /// controller, process run, and provider session, whether it ends a fresh or a reused turn, so the
+    /// next message runs in that session. The failed turn is never resent. An unclassified prompt
+    /// error, or one from a provider whose MCP routing is deferred past the prompt, still retires the
+    /// controller, so the next message launches a new process.
+    func testDevinEmptyResponseKeepsTheLiveSessionForTheNextMessage() async throws {
+        let emptyResponse = #"{"code": -32021, "message": "The model ended its turn without a response. Send a message to continue.", "data": {"cognition.ai/errorKind": "empty_response", "cognition.ai/retryable": true}}"#
+        let cases: [(agent: AgentProviderKind, failingPrompt: Int, classifies: Bool)] = [
+            (.devin, 1, true), (.devin, 2, true), (.devin, 1, false), (.antigravity, 1, true)
+        ]
+        for (agent, failingPrompt, classifies) in cases {
+            let retains = classifies && agent.requiresPrePromptAgentModeMCPRouting
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let script = try AgentSessionLinkACPServerScript.write(to: directory)
+            let rpcLog = directory.appendingPathComponent("requests.jsonl")
+            let provider = try AgentSessionLinkCapturingACPProvider(providerID: XCTUnwrap(agent.acpProviderID), commandPath: script.path, environment: [
+                "ACP_RPC_LOG": rpcLog.path, "ACP_PROMPT_ERROR": emptyResponse, "ACP_PROMPT_ERROR_AT": String(failingPrompt)
+            ])
+            if classifies { provider.promptErrorClassifier = DevinACPAgentProvider(config: DevinAgentConfig()) }
+            let harness = AgentSessionLinkRunnerHarness(
+                headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
+                acpProviderFactory: { _, _ in provider },
+                workspacePath: directory.path
+            )
+            let session = try harness.makeBoundSession(agent: agent)
+            func run(_ message: String) async throws {
+                let origin = try harness.startCommand(for: session)
+                _ = await harness.composition.startRun(
+                    tabID: session.tabID, session: session, origin: origin,
+                    initialUserMessage: message, initialMessageForRun: message, attachments: []
+                )
+                await session.agentTask?.value
+            }
+            func requests(_ method: String) throws -> Int {
+                try String(contentsOf: rpcLog, encoding: .utf8).split(separator: "\n").count(where: { line in
+                    let entry = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+                    let payload = entry?["payload"] as? [String: Any]
+                    return entry?["direction"] as? String == "request" && payload?["method"] as? String == method
+                })
+            }
+            let label = "agent=\(agent.rawValue) failingPrompt=\(failingPrompt) classifies=\(classifies)"
+
+            for turn in 1 ..< failingPrompt {
+                try await run("turn \(turn)")
+                XCTAssertEqual(session.runState, .completed, label)
+            }
+            let controller = session.acpController
+            try await run("turn \(failingPrompt)")
+            XCTAssertEqual(session.runState, .failed, label)
+            let errorText = AgentTranscriptIO.latestErrorText(from: session.transcript, latestTurnOnly: true)
+            XCTAssertEqual(try requests("session/prompt"), failingPrompt, "The failed turn must never be resent: \(label)")
+            if classifies {
+                XCTAssertEqual(errorText, DevinACPAgentProvider.emptyResponseUserMessage, label)
+            }
+            if retains {
+                let retained = try XCTUnwrap(session.acpController, label)
+                if let controller { XCTAssertTrue(retained === controller, label) }
+                XCTAssertNotNil(AgentModeProcessRunIdentity.existingProcessRunID(for: session), label)
+                let reusable = await retained.hasReusableSession
+                XCTAssertTrue(reusable, label)
+            } else {
+                XCTAssertNil(session.acpController, label)
+            }
+
+            try await run("continue")
+            XCTAssertEqual(session.runState, .completed, label)
+            XCTAssertEqual(try requests("session/prompt"), failingPrompt + 1, label)
+            XCTAssertEqual(provider.promptedMessages.last?.userMessage, "continue", "Only the user's new message is sent: \(label)")
+            XCTAssertEqual(try requests("initialize"), retains ? 1 : 2, "Only a retired session relaunches: \(label)")
+            XCTAssertEqual(try requests("session/new") + requests("session/load"), retains ? 1 : 2, label)
+            if retains { XCTAssertEqual(try requests("session/cancel"), 0, label) }
+            await session.acpController?.shutdown()
+            session.saveDebounceTask?.cancel()
+        }
+    }
+
     func testCompletedTerminalUsesSharedExecutionClassification() async {
         let classification = await ACPIntegratedAgentModeRunner.testClassifyTransientTerminal(
             state: .completed,

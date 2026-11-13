@@ -359,6 +359,7 @@ package actor ACPAgentSessionController {
     private var sessionID: String?
     private var providerSessionIdentity: ACPProviderSessionIdentity
     private var didEmitTerminal = false
+    private var lastPromptFailurePreservedSession = false
     private var eventStreamFinished = false
     private var loadSessionSupported = false
     private var promptImagesSupported = false
@@ -474,6 +475,12 @@ package actor ACPAgentSessionController {
 
     package var hasReusableSession: Bool {
         state == .sessionOpen && process != nil && sessionID != nil
+    }
+
+    /// Whether the latest prompt turn failed with an error the provider attests left its session
+    /// open, and the session is still reusable now.
+    package var retainsSessionAfterLastPromptFailure: Bool {
+        lastPromptFailurePreservedSession && hasReusableSession
     }
 
     /// Whether a provider session is live right now — open or running a turn — as opposed to
@@ -600,6 +607,7 @@ package actor ACPAgentSessionController {
         #endif
         guard state == .sessionOpen, process != nil, sessionID != nil else { return false }
         didEmitTerminal = false
+        lastPromptFailurePreservedSession = false
         eventStreamFinished = false
         resetEventsStreamForNextTurn()
         return true
@@ -858,6 +866,7 @@ package actor ACPAgentSessionController {
         recentDevinToolCallIDs.removeAll()
         let promptTurnID = UUID()
         activePromptTurnID = promptTurnID
+        lastPromptFailurePreservedSession = false
         resetActivePromptTrace()
         state = .promptRunning
         log("Submitting ACP prompt")
@@ -936,12 +945,26 @@ package actor ACPAgentSessionController {
                 }
             #endif
             settlePromptTurn(promptTurnID, result: .failure(error))
+            // Latched when the response arrived; only the preserved branch below sets it again.
+            lastPromptFailurePreservedSession = false
             // Local admission refused before construction or transport; the connection is intact.
             if refusedUnsupportedImages {
                 if state == .promptRunning { state = .sessionOpen }
                 throw error
             }
             if error is CancellationError {
+                throw error
+            }
+            // The provider ended only this turn and keeps its session: fail the turn without
+            // cancelling or retiring the session, so the next user message reuses it. Never resent.
+            if let preserved = error as? ACPSessionPreservingPromptFailure,
+               state == .promptRunning, process != nil, self.sessionID == sessionID
+            {
+                log("ACP prompt failed; provider session stays open: \(preserved.userMessage)")
+                cancelPendingPermissionRequestsLocally()
+                emitTerminal(state: .failed, errorText: preserved.userMessage)
+                state = .sessionOpen
+                lastPromptFailurePreservedSession = true
                 throw error
             }
             let message = displayText(for: provider.normalizeError(error))
@@ -1640,6 +1663,11 @@ package actor ACPAgentSessionController {
         guard sessionID != nil else {
             throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
         }
+        // A turn the provider failed while keeping its session has already ended its run; steering
+        // into that run is refused, as after any failed turn. The next run's turn clears this.
+        guard !lastPromptFailurePreservedSession else {
+            throw ControllerError.invalidState(expected: "a turn still in progress", actual: state)
+        }
         #if DEBUG
             if testHoldNextSteeringInterrupt {
                 testHoldNextSteeringInterrupt = false
@@ -2013,7 +2041,16 @@ package actor ACPAgentSessionController {
                     let code = Self.responseErrorCode(from: error)
                     let codeText = code.map { " code=\($0)" } ?? ""
                     diagnose(.info("ACP request \(pendingRequest.method) failed\(codeText): \(message)"))
-                    pendingRequest.continuation.resume(throwing: ControllerError.requestFailed(message, code: code))
+                    if pendingRequest.method == "session/prompt",
+                       let preserved = provider.sessionPreservingPromptFailure(forResponseError: error)
+                    {
+                        // Latched before the prompt's catch runs, so a steer arriving in between
+                        // cannot send session/cancel for a turn the provider already ended.
+                        lastPromptFailurePreservedSession = true
+                        pendingRequest.continuation.resume(throwing: preserved)
+                    } else {
+                        pendingRequest.continuation.resume(throwing: ControllerError.requestFailed(message, code: code))
+                    }
                 } else {
                     pendingRequest.continuation.resume(throwing: ControllerError.protocolViolation("Missing result/error for request \(id.displayValue)"))
                 }

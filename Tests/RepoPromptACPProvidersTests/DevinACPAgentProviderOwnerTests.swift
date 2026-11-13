@@ -22,6 +22,38 @@ final class DevinACPAgentProviderOwnerTests: XCTestCase {
         }
     }
 
+    func testOnlyRetryableEmptyResponseKeepsTheSessionOpen() throws {
+        let (provider, _) = try makeProvider()
+        func error(code: Any = -32021, data: Any?) -> [String: Any] {
+            var error: [String: Any] = ["code": code, "message": "The model ended its turn without a response."]
+            error["data"] = data
+            return error
+        }
+        let emptyResponse: [String: Any] = ["cognition.ai/errorKind": "empty_response", "cognition.ai/retryable": true]
+        XCTAssertEqual(
+            provider.sessionPreservingPromptFailure(forResponseError: error(data: emptyResponse))?.userMessage,
+            DevinACPAgentProvider.emptyResponseUserMessage
+        )
+        let ordinary: [[String: Any]] = [
+            error(code: -32000, data: emptyResponse),
+            error(data: emptyResponse.merging(["cognition.ai/errorKind": "unavailable"]) { $1 }),
+            error(data: emptyResponse.merging(["cognition.ai/retryable": false]) { $1 }),
+            error(data: emptyResponse.merging(["cognition.ai/retryable": "true"]) { $1 }),
+            error(data: ["cognition.ai/errorKind": "empty_response"]),
+            error(data: "empty_response"),
+            error(data: nil)
+        ]
+        for value in ordinary {
+            XCTAssertNil(provider.sessionPreservingPromptFailure(forResponseError: value), "\(value)")
+        }
+        // Decoded from the wire, where Foundation bridges the number `1` to `true`.
+        for (retryable, preserves) in [("true", true), ("1", false)] {
+            let wire = #"{"code": -32021, "message": "m", "data": {"cognition.ai/errorKind": "empty_response", "cognition.ai/retryable": \#(retryable)}}"#
+            let decoded = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(wire.utf8)) as? [String: Any])
+            XCTAssertEqual(provider.sessionPreservingPromptFailure(forResponseError: decoded) != nil, preserves, retryable)
+        }
+    }
+
     func testRoutineInfoStderrIsHiddenWhileActionableOutputRemainsVisible() throws {
         let (provider, _) = try makeProvider()
 

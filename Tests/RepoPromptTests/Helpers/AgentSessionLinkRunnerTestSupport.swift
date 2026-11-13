@@ -560,6 +560,8 @@ final class AgentSessionLinkCapturingACPProvider: ACPAgentProvider, @unchecked S
     /// Normalizes session updates with the shipped default normalizer instead of dropping them, so
     /// `usage_update` reaches the usage estimator in view-model-level suites.
     var usesDefaultNormalizer = false
+    /// Classifies `session/prompt` errors with this provider's shipped rules (for example Devin's).
+    var promptErrorClassifier: (any ACPAgentProvider)?
 
     private let lock = NSLock()
     private var captured: [AgentMessage] = []
@@ -643,6 +645,10 @@ final class AgentSessionLinkCapturingACPProvider: ACPAgentProvider, @unchecked S
     func normalizeError(_ error: Error) -> Error {
         error
     }
+
+    func sessionPreservingPromptFailure(forResponseError error: [String: Any]) -> ACPSessionPreservingPromptFailure? {
+        promptErrorClassifier?.sessionPreservingPromptFailure(forResponseError: error)
+    }
 }
 
 // MARK: - Fake ACP server
@@ -704,6 +710,9 @@ enum AgentSessionLinkACPServerScript {
     /// - `ACP_ADVERTISE_ON_CANCEL` (comma list): a list for the cancelled session on each `session/cancel`.
     /// - `ACP_LOAD` (`1`): open the request's `resumeSessionID` with a successful `session/load`, which
     ///   also advertises `ACP_ADVERTISE_COMMANDS`.
+    /// - `ACP_PROMPT_ERROR` (JSON-RPC error object): returned instead of a result for a process's
+    ///   `ACP_PROMPT_ERROR_AT`-th `session/prompt` (default the first), once per script directory,
+    ///   after its prompt is logged.
     static func write(to directory: URL) throws -> URL {
         let scriptURL = directory.appendingPathComponent("monitor_acp_server.py")
         let script = #"""
@@ -718,6 +727,7 @@ enum AgentSessionLinkACPServerScript {
         current_model = "swe-2-high" if devin_fixture else "model-a"
         current_thinking = "high"
         current_mode = "ask"
+        prompt_count = 0
 
         def trace(direction, payload):
             path = os.environ.get("ACP_RPC_LOG")
@@ -840,6 +850,17 @@ enum AgentSessionLinkACPServerScript {
                 if prompt_log:
                     with open(prompt_log, "a") as log:
                         log.write(json.dumps(params.get("prompt")) + "\n")
+                prompt_count += 1
+                error_sent = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompt-error-sent")
+                if (os.environ.get("ACP_PROMPT_ERROR") and not os.path.exists(error_sent)
+                        and prompt_count == int(os.environ.get("ACP_PROMPT_ERROR_AT", "1"))):
+                    open(error_sent, "w").close()
+                    print(json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": request.get("id"),
+                        "error": json.loads(os.environ["ACP_PROMPT_ERROR"])
+                    }), flush=True)
+                    continue
                 if os.environ.get("ACP_UNMATCHED_RESPONSE_ON_PROMPT"):
                     respond(987654, {})
                 if os.environ.get("ACP_ADVERTISE_AFTER_PROMPT") is not None:
