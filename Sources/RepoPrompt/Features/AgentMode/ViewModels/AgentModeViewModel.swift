@@ -17671,6 +17671,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ attempt: AgentComposerSubmitAttempt,
         requireActiveTabOwnership: Bool,
         awaitsExecutor: Bool = false,
+        adoptsLocalReprompt: Bool = false,
         allowsPendingStartWithdrawal: Bool = true
     ) -> AgentComposerSubmitClaimResult {
         let target = attempt.target
@@ -17699,7 +17700,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
         switch result {
         case let .claimed(claim):
-            if requireActiveTabOwnership { adoptRepromptPreparation(into: claim) }
+            if requireActiveTabOwnership || adoptsLocalReprompt { adoptRepromptPreparation(into: claim) }
             // Transfer local preparation before publishing the rotated submission token. An
             // earlier UI refresh would invalidate and discard that still-unadopted preparation.
             runtimeSessionStore.presentation.composerClaimChanged(claim.sourceSession)

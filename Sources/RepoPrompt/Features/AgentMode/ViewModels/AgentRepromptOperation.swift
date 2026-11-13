@@ -22,6 +22,7 @@ final class AgentRepromptOperation {
     private var task: Task<Void, Never>?
     private var publicationTask: Task<Void, Never>?
     private var validationTask: Task<Void, Never>?
+    private var autoSendTask: Task<Void, Never>?
     private(set) var hasUserEdits = false
     private var pendingBody: String?
     private var callRevision: UInt64 = 0
@@ -40,6 +41,7 @@ final class AgentRepromptOperation {
     var onComplete: ((String) -> Void)?
     var onClose: (() -> Void)?
     var onEdit: (() -> Void)?
+    var onAutoSendReady: (() -> Void)?
     var phase: AgentRepromptUIStore.Phase {
         presentation?.phase ?? .failed
     }
@@ -102,7 +104,18 @@ final class AgentRepromptOperation {
             await Task.yield()
             guard let self, !Task.isCancelled else { return }
             validationTask = nil
-            _ = validate()
+            if validate() { scheduleAutoSend() }
+        }
+    }
+
+    /// Also retried after source-session publications (for example a busy session becoming idle).
+    private func scheduleAutoSend() {
+        guard !isClosed, autoSendRequest != nil, !autoSendConsumed, autoSendTask == nil else { return }
+        autoSendTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self, !Task.isCancelled else { return }
+            autoSendTask = nil
+            onAutoSendReady?()
         }
     }
 
@@ -176,7 +189,9 @@ final class AgentRepromptOperation {
 
     private func receive(_ body: String, callRevision: UInt64) throws {
         guard !Task.isCancelled, !isClosed, self.callRevision == callRevision,
-              phase == .generating || phase == .refining, validate() else { throw CancellationError() }
+              phase == .generating || phase == .refining else { throw CancellationError() }
+        // Context validation and draft publication are coalesced below, not repeated per token.
+        // Revision/cancellation fences still reject late transport callbacks synchronously.
         guard !body.isEmpty, body != lastGeneratedText else { return }
         pendingBody = body
         lastGeneratedText = body
@@ -297,6 +312,7 @@ final class AgentRepromptOperation {
         onComplete?(expectedDraft)
         if mode == .sendAutomatically, !hadQuestions, !Self.startsWithProviderCommand(expectedDraft), !isClosed {
             autoSendRequest = .init(operationID: id, tabID: sourceTabID, text: expectedDraft, generation: expectedDraftGeneration)
+            scheduleAutoSend()
         }
     }
 
@@ -361,6 +377,8 @@ final class AgentRepromptOperation {
         publicationTask?.cancel()
         validationTask?.cancel()
         validationTask = nil
+        autoSendTask?.cancel()
+        autoSendTask = nil
         if restoreOriginal, candidate == expectedDraft { install(rawDraft) }
         if recover { store.rememberCancelledDraft(tabID: sourceTabID, text: currentDraft()) }
         task = nil
