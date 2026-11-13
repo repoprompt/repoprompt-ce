@@ -14,6 +14,7 @@ import XCTest
         private var originalMCPAutoStart = false
         private var originalStoragePath: String?
         private var storageRoot: URL!
+        private var fixtureStorage: WorkspaceFixtureStorage!
         private var managers: [WorkspaceManagerViewModel] = []
 
         override func setUp() async throws {
@@ -26,6 +27,7 @@ import XCTest
             storageRoot = AppProfileLocations.current.customWorkspaceDirectory(selectedDirectory: storageRoot)
             try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
             UserDefaults.standard.set(storageRoot.path, forKey: "GlobalCustomStorageURL")
+            fixtureStorage = WorkspaceFixtureStorage(root: storageRoot)
             await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
         }
 
@@ -33,6 +35,8 @@ import XCTest
             managers.forEach { $0.prepareForWindowClose() }
             managers.removeAll()
             await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
+            await fixtureStorage.remove()
+            fixtureStorage = nil
             try? FileManager.default.removeItem(at: storageRoot)
             if let originalStoragePath {
                 UserDefaults.standard.set(originalStoragePath, forKey: "GlobalCustomStorageURL")
@@ -538,6 +542,107 @@ import XCTest
             XCTAssertFalse(saved.isTemporaryWorkspace)
         }
 
+        func testEphemeralActivationAndTeardownCreatesNoWorkspaceStorage() async throws {
+            let window = WindowState(automaticProviderModelDiscoveryEnabled: false)
+            addTeardownBlock { @MainActor in
+                if !window.isClosing { await window.tearDown() }
+            }
+            await window.workspaceManager.awaitInitialized()
+            await window.workspaceManager.awaitInitialWorkspaceActivationCompletion()
+            await window.workspaceManager.debugDrainScheduledSaves()
+            let before = try Set(FileManager.default.contentsOfDirectory(atPath: storageRoot.path))
+            let workspace = fixtureStorage.isolate(window.workspaceManager.createEphemeralWorkspace(
+                name: "Ephemeral storage regression", repoPaths: []
+            ), in: window.workspaceManager)
+            let scratch = window.workspaceManager.workspaceDirectory(for: workspace)
+            let result = await window.workspaceManager.switchWorkspace(to: workspace, saveState: false)
+            XCTAssertTrue(result.didSwitch)
+            let agentRows = try await AgentSessionDataService.shared.sidebarStreamMetadataRecords(for: workspace)
+            let chatRows = try await ChatDataService().listChatSessions(for: workspace)
+            XCTAssertTrue(agentRows.isEmpty)
+            XCTAssertTrue(chatRows.isEmpty)
+            window.beginClose()
+            await window.tearDown()
+            await window.workspaceManager.debugDrainScheduledSaves()
+            let after = try Set(FileManager.default.contentsOfDirectory(atPath: storageRoot.path))
+            XCTAssertEqual(after, before, "Activation/teardown must not add any profile workspace folder")
+            // Activation can legitimately capture git data in scratch. History reads must still
+            // be non-creating, and none of those transient artifacts may reach the profile root.
+            for component in ["AgentSessions", "Chats", "workspace.json"] {
+                XCTAssertFalse(FileManager.default.fileExists(atPath: scratch.appendingPathComponent(component).path))
+            }
+        }
+
+        func testEphemeralSessionSidecarsStayTemporaryAndReadableAcrossProjections() async throws {
+            let workspace = fixtureStorage.isolate(WorkspaceModel(
+                name: "Ephemeral with real history", repoPaths: [], ephemeralFlag: true
+            ))
+            let scratch = WorkspaceEphemeralStorage.directory(for: workspace.id)
+            let agent = AgentSession(workspaceID: workspace.id, name: "Agent scratch", autoEditEnabled: false)
+            let agents = AgentSessionDataService.shared
+            let chatService = ChatDataService()
+            let emptyAgents = try await agents.sidebarStreamMetadataRecords(for: workspace)
+            let emptyChats = try await chatService.listChatSessions(for: workspace)
+            XCTAssertTrue(emptyAgents.isEmpty)
+            XCTAssertTrue(emptyChats.isEmpty)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: scratch.path), "History reads alone must not create scratch")
+            let agentURL = try await agents.saveAgentSession(agent, for: workspace)
+            let chat = ChatSession(name: "Chat scratch", messages: [])
+            let chatURL = try await chatService.saveChatSession(chat, for: workspace)
+            XCTAssertEqual(agentURL.deletingLastPathComponent().deletingLastPathComponent(), scratch)
+            XCTAssertEqual(chatURL.deletingLastPathComponent().deletingLastPathComponent(), scratch)
+            XCTAssertFalse(try FileManager.default.fileExists(atPath: XCTUnwrap(workspace.customStoragePath).path))
+            XCTAssertTrue(scratch.resolvingSymlinksInPath().pathComponents.starts(
+                with: FileManager.default.temporaryDirectory.resolvingSymlinksInPath().pathComponents
+            ))
+
+            // A separately constructed same-ID projection and a rename must retain in-process history.
+            let projection = WorkspaceModel(id: workspace.id, name: "Renamed", repoPaths: [], ephemeralFlag: true)
+            let restored = try await agents.loadAgentSession(id: agent.id, for: projection)
+            let chats = try await chatService.listChatSessions(for: projection)
+            let restoredChat = try await chatService.loadChatSession(from: chatURL)
+            XCTAssertEqual(restored?.id, agent.id)
+            XCTAssertEqual(
+                chats.map { $0.resolvingSymlinksInPath().standardizedFileURL },
+                [chatURL.resolvingSymlinksInPath().standardizedFileURL]
+            )
+            XCTAssertEqual(restoredChat.id, chat.id)
+            await fixtureStorage.remove()
+            XCTAssertFalse(FileManager.default.fileExists(atPath: scratch.path))
+        }
+
+        func testEmptyDurableHistoryReadsAndDeletesDoNotCreateSidecars() async throws {
+            let workspace = fixtureStorage.isolate(WorkspaceModel(name: "No saved history", repoPaths: []))
+            let directory = try XCTUnwrap(workspace.customStoragePath)
+            let agents = AgentSessionDataService.shared
+            let files = try await agents.listAgentSessions(for: workspace)
+            let rows = try await agents.indexedAgentSessionMetadataRecords(for: workspace)
+            let sidebarRows = try await agents.sidebarStreamMetadataRecords(for: workspace)
+            let fastRows = try await agents.fastMetadataRecordsIfAvailable(for: workspace)
+            let missing = try await agents.loadAgentSession(id: UUID(), for: workspace)
+            let chats = try await ChatDataService().listChatSessions(for: workspace)
+            let missingSessionID = UUID()
+            try await agents.deleteAgentSession(id: missingSessionID, for: workspace)
+            let tombstones = await agents.deletedSessionFileURLs
+            XCTAssertTrue(
+                tombstones.contains(
+                    directory
+                        .appendingPathComponent("AgentSessions")
+                        .appendingPathComponent("AgentSession-\(missingSessionID.uuidString).json").standardizedFileURL
+                ),
+                "Absent-file deletion must still fence a concurrent first save"
+            )
+            let failures = await agents.deleteAgentSessions(forComposeTabIDs: [UUID()], for: workspace)
+            XCTAssertTrue(files.isEmpty)
+            XCTAssertTrue(rows.isEmpty)
+            XCTAssertTrue(sidebarRows.isEmpty)
+            XCTAssertNil(fastRows)
+            XCTAssertNil(missing)
+            XCTAssertTrue(chats.isEmpty)
+            XCTAssertTrue(failures.isEmpty)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+        }
+
         func testExplicitSaveAPIsRejectEphemeralWorkspaceWithoutSideEffects() async throws {
             let manager = makeManager(windowID: -772)
             await manager.awaitInitialized()
@@ -608,7 +713,9 @@ import XCTest
             )
 
             func materializeLocalArtifacts(for workspace: WorkspaceModel) throws -> URL {
-                let directory = manager.workspaceFileURL(for: workspace).deletingLastPathComponent()
+                // Git data is a sidecar, not a legacy workspace document. Keep this fixture
+                // on the production sidecar path even for an ephemeral document identity.
+                let directory = manager.workspaceDirectory(for: workspace)
                 let gitData = directory.appendingPathComponent("_git_data", isDirectory: true)
                 try FileManager.default.createDirectory(at: gitData, withIntermediateDirectories: true)
                 try Data("artifact".utf8).write(to: gitData.appendingPathComponent("marker"))
@@ -1410,23 +1517,54 @@ import XCTest
         }
 
         func testSaveCaptureIncludesBeforeSaveEditsBeforeDecidingItIsUnchanged() async throws {
+            let flushedText = "Pending editor text flushed by its owner"
+            let observed = expectation(description: "real deferred prompt observation completed")
+            let observationGate = WorkspaceDeleteSuspensionGate()
             try await withProjectionSaveFixture { fixture in
                 let manager = fixture.manager
                 let baseline = try await self.establishActiveCaptureBaseline(fixture)
+                let workspaceID = baseline.id
+                // Hold after the save captures its version, not before the capture. The real
+                // observation must finish before prepared bytes can authorize the write.
+                manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { id, _, _ in
+                    guard id == workspaceID else { return }
+                    await observationGate.wait()
+                }
+                var conflicts: [[String: String]] = []
+                manager.setWorkspaceSaveConflictHandlerForTesting { conflicts.append($0) }
+                manager.deferredPromptObservationDidFinishForTesting = { text in
+                    guard text == flushedText else { return }
+                    observed.fulfill()
+                    Task { await observationGate.open() }
+                }
                 var callbackCount = 0
                 let listener = manager.addBeforeSaveListener { workspace in
                     XCTAssertEqual(workspace.id, baseline.id)
                     callbackCount += 1
-                    manager.promptViewModel.promptText = "Pending editor text flushed by its owner"
+                    manager.promptViewModel.promptText = flushedText
                 }
-                defer { manager.removeBeforeSaveListener(listener) }
+                defer {
+                    manager.removeBeforeSaveListener(listener)
+                    manager.deferredPromptObservationDidFinishForTesting = nil
+                    manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
+                    manager.setWorkspaceSaveConflictHandlerForTesting(nil)
+                    Task { await observationGate.open() }
+                }
                 manager.markWorkspaceDirty(workspaceID: baseline.id)
                 manager.resetWorkspaceSaveDiagnosticsForTesting()
 
-                let result = await manager.pollAndSaveStateWithOutcomeAsync()
+                let saving = Task { await manager.pollAndSaveStateWithOutcomeAsync() }
+                do {
+                    try await self.awaitSaveCheckpoint(observed)
+                } catch {
+                    await observationGate.open()
+                    _ = await saving.value
+                    throw error
+                }
+                let result = await saving.value
 
                 XCTAssertTrue(result.acceptedForLifecycleAdmission, "\(result)")
-                XCTAssertEqual(callbackCount, 1)
+                XCTAssertEqual(callbackCount, 1, "Value-only save conflicts: \(conflicts)")
                 let afterValue = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(baseline.id)
                 let after = try XCTUnwrap(afterValue)
                 let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: after.document.documentBytes)
@@ -2532,7 +2670,7 @@ import XCTest
         }
 
         private func leakedFixtureWorkspace(id: UUID = UUID()) -> WorkspaceModel {
-            WorkspaceModel(
+            fixtureStorage.track(WorkspaceModel(
                 id: id,
                 name: "Agent Mode Chat Switch \(UUID().uuidString.prefix(8))",
                 repoPaths: [
@@ -2542,11 +2680,11 @@ import XCTest
                         .path
                 ],
                 ephemeralFlag: true
-            )
+            ))
         }
 
         private func persistentReadFixtureWorkspace(id: UUID = UUID()) -> WorkspaceModel {
-            WorkspaceModel(
+            fixtureStorage.track(WorkspaceModel(
                 id: id,
                 name: "Persistent Agent Mode MCP Read",
                 repoPaths: [
@@ -2556,7 +2694,7 @@ import XCTest
                         .path
                 ],
                 ephemeralFlag: true
-            )
+            ))
         }
 
         private func makeRuntime(profileIdentifier: String) async throws -> MCPDomainRuntime {

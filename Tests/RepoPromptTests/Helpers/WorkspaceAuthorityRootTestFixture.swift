@@ -10,6 +10,72 @@ import RepoPromptVCS
 import XCTest
 
 #if DEBUG
+    /// One fixture owns all of its workspace sidecars. Explicit durable overrides stay under the
+    /// fixture root; ephemeral IDs use production scratch storage, never the Debug profile.
+    /// Call remove() only after tearing down the fixture's windows and joining their saves.
+    @MainActor
+    final class WorkspaceFixtureStorage {
+        private let root: URL
+        private var directories: Set<URL> = []
+
+        init(root: URL) {
+            precondition(root.resolvingSymlinksInPath().pathComponents.starts(
+                with: FileManager.default.temporaryDirectory.resolvingSymlinksInPath().pathComponents
+            ), "Fixture storage must be temporary, never a user profile")
+            self.root = AppProfileLocations.current.customWorkspaceDirectory(
+                selectedDirectory: root.appendingPathComponent("WorkspaceStorage", isDirectory: true)
+            )
+        }
+
+        func isolate(_ workspace: WorkspaceModel) -> WorkspaceModel {
+            var workspace = workspace
+            workspace.customStoragePath = root.appendingPathComponent(workspace.id.uuidString, isDirectory: true)
+            return track(workspace)
+        }
+
+        func track(_ workspace: WorkspaceModel) -> WorkspaceModel {
+            let directory = WorkspaceSessionSidecarMigration.workspaceDirectory(for: workspace, root: root)
+            precondition(directory.resolvingSymlinksInPath().pathComponents.starts(
+                with: FileManager.default.temporaryDirectory.resolvingSymlinksInPath().pathComponents
+            ), "Never track a user profile for fixture cleanup")
+            directories.insert(directory)
+            return workspace
+        }
+
+        func isolate(_ workspace: WorkspaceModel, in manager: WorkspaceManagerViewModel) -> WorkspaceModel {
+            precondition(workspace.isEphemeral, "Durable fixtures must set storage before manager creation starts")
+            let isolated = isolate(workspace)
+            if let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id }) {
+                manager.workspaces[index] = isolated
+            } else {
+                XCTFail("Created fixture workspace is missing from its manager")
+            }
+            return isolated
+        }
+
+        func remove() async {
+            for directory in directories {
+                await AgentSessionDataService.shared.test_drainWorkspaceSidecarIO(
+                    forAgentSessionsFolder: directory.appendingPathComponent("AgentSessions", isDirectory: true)
+                )
+                await ChatDataService.test_drainFileSaveQueue()
+                removeIfPresent(directory)
+            }
+            directories.removeAll()
+            removeIfPresent(root)
+        }
+
+        private func removeIfPresent(_ directory: URL) {
+            guard FileManager.default.fileExists(atPath: directory.path) else { return }
+            do {
+                try AppProfileLocations.current.validateMetadataFile(directory)
+                try FileManager.default.removeItem(at: directory)
+            } catch {
+                XCTFail("Remove fixture workspace storage \(directory.path): \(error)")
+            }
+        }
+    }
+
     /// Real lifecycle/authority fixture. Requires the checked-in CI runner sandbox contract.
     /// `withFixture` owns setup-failure cleanup as well as normal and throwing test exits.
     @MainActor

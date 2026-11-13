@@ -48,6 +48,84 @@ final class DomainWorkspaceActivationTests: XCTestCase {
         XCTAssertNil(result.workspace)
     }
 
+    func testDeletionPrunesAllTombstonedLegacyIndexRowsAndPreservesOpaqueSurvivors() async throws {
+        let fixture = try ActivationFixture()
+        defer { fixture.remove() }
+        let authority = fixture.authority()
+        let old = try fixture.document(name: "Earlier deletion", workspaceID: UUID())
+        let oldCreated = await authority.execute(.init(operationID: UUID(), origin: .appPresentation(windowID: 1), command: .createWorkspace(old)))
+        let oldDeleted = await authority.execute(.init(
+            operationID: UUID(), expectedWorkspaceRevision: oldCreated.after?.workingRevision,
+            origin: .appPresentation(windowID: 1), command: .deleteWorkspace(workspaceID: old.workspaceID)
+        ))
+        XCTAssertEqual(oldDeleted.disposition, .applied)
+        let indexURL = fixture.root.appendingPathComponent("Workspaces/workspacesIndex.json")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: indexURL.path), "Deletion must not create an absent compatibility index")
+
+        let target = try fixture.document(name: "Delete now")
+        let survivor = try fixture.document(name: "Keep", workspaceID: UUID())
+        let created = await authority.execute(.init(operationID: UUID(), origin: .appPresentation(windowID: 1), command: .createWorkspace(target)))
+        let kept = await authority.execute(.init(operationID: UUID(), origin: .appPresentation(windowID: 1), command: .createWorkspace(survivor)))
+        XCTAssertEqual(created.disposition, .applied)
+        XCTAssertEqual(kept.disposition, .applied)
+        func row(_ document: DomainWorkspaceDocument) -> [String: Any] {
+            [
+                "id": document.workspaceID.uuidString,
+                "name": document.metadata.name,
+                "customStoragePath": document.fileURL.deletingLastPathComponent().absoluteString,
+                "isSystemWorkspace": false,
+                "isHiddenInMenus": false
+            ]
+        }
+        var survivorRow = row(survivor)
+        survivorRow["futureMetadata"] = ["opaque": ["keep"]]
+        survivorRow["isSavedWorkspace"] = false
+        try JSONSerialization.data(withJSONObject: [row(old), row(target), survivorRow, row(target)]).write(to: indexURL)
+        let survivorBytes = try Data(contentsOf: survivor.fileURL)
+        let deleted = await authority.execute(.init(
+            operationID: UUID(), expectedWorkspaceRevision: created.after?.workingRevision,
+            origin: .appPresentation(windowID: 1), command: .deleteWorkspace(workspaceID: target.workspaceID)
+        ))
+        XCTAssertEqual(deleted.disposition, .applied)
+        XCTAssertNil(deleted.diagnostic)
+        let remaining = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: indexURL)) as? [[String: Any]])
+        XCTAssertEqual(remaining.count, 1)
+        XCTAssertEqual(remaining.first?["id"] as? String, survivor.workspaceID.uuidString)
+        XCTAssertEqual(remaining.first?["futureMetadata"] as? [String: [String]], ["opaque": ["keep"]])
+        XCTAssertEqual(remaining.first?["isSavedWorkspace"] as? Bool, false)
+        XCTAssertEqual(try Data(contentsOf: survivor.fileURL), survivorBytes)
+
+        // The compatibility index remains a live bootstrap fallback, not dead migration state.
+        let catalogURL = fixture.root
+            .appendingPathComponent(DomainPersistenceCoordinator.runtimeDirectoryName(profileIdentifier: "activation-tests"))
+            .appendingPathComponent("workspace-catalog.json")
+        try FileManager.default.removeItem(at: catalogURL)
+        let cold = fixture.authority()
+        await cold.bootstrap()
+        let restored = await cold.snapshot()
+        XCTAssertEqual(restored.workspaces.map(\.document.workspaceID), [survivor.workspaceID])
+    }
+
+    func testDeletionPreservesUnrecognizedLegacyIndexAndReportsCleanupWarning() async throws {
+        let fixture = try ActivationFixture()
+        defer { fixture.remove() }
+        let authority = fixture.authority()
+        let document = try fixture.document(name: "Deleted")
+        let created = await authority.execute(.init(operationID: UUID(), origin: .appPresentation(windowID: 1), command: .createWorkspace(document)))
+        let indexURL = fixture.root.appendingPathComponent("Workspaces/workspacesIndex.json")
+        let future = Data(#"{"version":999,"entries":[{"future":"preserve exactly"}]}"#.utf8)
+        try future.write(to: indexURL)
+        let deleted = await authority.execute(.init(
+            operationID: UUID(), expectedWorkspaceRevision: created.after?.workingRevision,
+            origin: .appPresentation(windowID: 1), command: .deleteWorkspace(workspaceID: document.workspaceID)
+        ))
+        XCTAssertEqual(deleted.disposition, .applied, "Index cleanup cannot undo an authoritative deletion")
+        XCTAssertTrue(deleted.diagnostic?.contains("legacy workspace index") == true)
+        XCTAssertEqual(try Data(contentsOf: indexURL), future)
+        let cold = await fixture.authority().activationSnapshot(workspaceID: document.workspaceID, fileURL: document.fileURL)
+        XCTAssertNil(cold.workspace)
+    }
+
     func testWarmActivationUsesCurrentAuthorityInsteadOfStaleSavedBytes() async throws {
         let fixture = try ActivationFixture()
         defer { fixture.remove() }

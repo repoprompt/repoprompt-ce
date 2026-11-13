@@ -49,6 +49,38 @@ the original identity survives the visit, and one queued visit hydrates after th
 managed turn settles. These are characterization tests, not close-preserves-run
 qualification.
 
+## Workspace sidecar isolation
+
+`isEphemeral` means no durable workspace document or profile sidecars. Empty agent/chat
+history reads do not create directories or metadata indexes. Actual ephemeral session
+saves use a process-unique directory under `FileManager.default.temporaryDirectory`,
+keyed by workspace UUID (not its mutable name). This preserves file-backed sessions,
+attachments and workspace-switch history during the process without advertising
+restart persistence. Normal process exit removes that private scratch tree best-effort;
+a killed process can leave temporary files for OS reclamation. No existing profile
+folders are swept or migrated. A workspace merely classified as **Temporary** in the
+library (for example a worktree with `isEphemeral == false`) retains durable history.
+
+Shared fixture builders should use `WorkspaceFixtureStorage(root: perTestTemporaryRoot)`
+and `storage.isolate(workspace)` before installing/activating a model. Only for an ephemeral
+model already created by a manager, use `storage.isolate(workspace, in: manager)`. A durable
+creation may already have captured its path: configure the manager's custom storage root
+before starting creation, or install a model whose custom path was isolated first. The helper
+gives durable models an explicit per-fixture custom storage path and tracks ephemeral scratch
+paths. After window teardown and producer/save joins, call `await storage.remove()` to drain
+session/metadata publications, attachment work, index reconciliation and the chat file queue,
+then remove only the fixture's sidecars. `track(workspace)` is for
+legacy on-disk fixtures whose original path metadata is itself under test. Never point
+these helpers at a real profile; the constructor requires a temporary root. The coordinated
+test runner's process sandbox remains an additional boundary, not a substitute for
+per-fixture ownership.
+
+`workspacesIndex.json` remains a live compatibility/bootstrap input. Authoritative deletion
+prunes rows for catalog-tombstoned UUIDs under the existing catalog lock, after the deletion
+commit. Surviving rows retain unknown fields; an unrecognized index is left byte-for-byte
+unchanged and reported as an artifact-cleanup warning, never as a failed/rolled-back deletion.
+No bootstrap read or profile-directory sweep performs this cleanup.
+
 ## Fast local feedback and CI escalation
 
 Start with `make check-fast` while iterating. It checks unstaged/staged whitespace,

@@ -2046,6 +2046,8 @@ class WorkspaceManagerViewModel: ObservableObject {
             (@Sendable (UUID) async -> Void)?
         private var workspaceSaveAttemptCountByWorkspaceIDForTesting: [UUID: Int] = [:]
         private var workspaceSaveCapturePublicationCountByWorkspaceIDForTesting: [UUID: Int] = [:]
+        /// Passive completion of the real debounced prompt observation, including no-op observations.
+        var deferredPromptObservationDidFinishForTesting: ((String) -> Void)?
         private var cancelWorkingCommitAfterOutcomeWorkspaceIDsForTesting: Set<UUID> = []
         private var savePathComposeTabReloadCountForTesting = 0
         private var workspaceDeleteWillExecuteHandlerForTesting:
@@ -4778,13 +4780,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     nonisolated func workspaceDirectory(for workspace: WorkspaceModel, baseRoot: URL) -> URL {
-        // ➊ Honour per-workspace override first
-        if let customRoot = workspace.customStoragePath {
-            return customRoot
-        }
-
-        // ➋ Fall back to global custom storage set by the user or the default location
-        return baseRoot.appendingPathComponent(directoryName(for: workspace))
+        WorkspaceSessionSidecarMigration.workspaceDirectory(for: workspace, root: baseRoot)
     }
 
     func workspaceFileURL(for workspace: WorkspaceModel) -> URL {
@@ -4797,7 +4793,10 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     nonisolated func workspaceFileURL(for workspace: WorkspaceModel, baseRoot: URL) -> URL {
-        workspaceDirectory(for: workspace, baseRoot: baseRoot).appendingPathComponent("workspace.json")
+        // Keep document identity separate from transient sidecars, including read-only lookup
+        // of legacy ephemeral documents. Save admission still rejects ephemeral workspaces.
+        let directory = workspace.customStoragePath ?? baseRoot.appendingPathComponent(directoryName(for: workspace))
+        return directory.appendingPathComponent("workspace.json")
     }
 
     nonisolated func chatsFolder(for workspace: WorkspaceModel, baseRoot: URL) -> URL {
@@ -4919,9 +4918,20 @@ class WorkspaceManagerViewModel: ObservableObject {
             .debounce(for: .milliseconds(120), scheduler: DispatchQueue.main)
             .sink { [weak self] observation in
                 guard let self, acceptsDeferredWorkspaceObservation(observation) else { return }
-                bumpStateVersion(for: observation.workspaceID)
+                // A before-save capture can materialize this edit before its debounced
+                // notification arrives. Do not invalidate prepared bytes for that no-op.
+                let (_, storedTab) = activeComposeTabContext()
+                let alreadyCaptured = storedTab?.promptText == observation.value
+                    && activeWorkspace?.currentPromptText == observation.value
+                    && promptViewModel.promptText == observation.value
+                if !alreadyCaptured {
+                    bumpStateVersion(for: observation.workspaceID)
+                }
                 // No disk save here - publish in-memory snapshot for mirroring
                 publishActiveComposeTabSnapshot(commitToMemory: true)
+                #if DEBUG
+                    deferredPromptObservationDidFinishForTesting?(observation.value)
+                #endif
             }
             .store(in: &cancellables)
 
