@@ -5732,13 +5732,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
 
-        let workspaceID = workspaceManager.activeWorkspaceID
-            ?? sessionIndexOwner?.workspaceID
-            ?? lastKnownWorkspaceSnapshot?.id
-            ?? workspaceManager.workspaces.first(where: { workspace in
+        let workspaceID: UUID? = if let activeWorkspaceID = workspaceManager.activeWorkspaceID {
+            activeWorkspaceID
+        } else if let ownerWorkspaceID = sessionIndexOwner?.workspaceID {
+            ownerWorkspaceID
+        } else if let snapshotWorkspaceID = lastKnownWorkspaceSnapshot?.id {
+            snapshotWorkspaceID
+        } else {
+            workspaceManager.workspaces.first(where: { workspace in
                 workspace.composeTabs.contains(where: { $0.id == session.tabID })
                     || workspace.stashedTabs.contains(where: { $0.tab.id == session.tabID })
             })?.id
+        }
         guard let workspaceID else { return nil }
         return installPersistentSessionBinding(
             sessionID: sessionID,

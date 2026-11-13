@@ -207,12 +207,14 @@ pattern_parts_t* pattern_decompose(const char* pattern) {
         out += strlen(pattern);
         *out = '\0';
     } else {
-        // Original single-pattern logic
-        // If pattern has no wildcards, search for it as a substring
-        if (!parts->is_wildcard) {
+        // regexec is already unanchored, and both callers need only a boolean match.
+        // Wrapping a literal in .* adds redundant span alternatives for every path.
+        // Keep wildcard anchoring and literal escaping unchanged.
+        if (!parts->is_wildcard && len == 0) {
+            // Darwin rejects an empty ERE. Preserve the empty query's match-all semantics.
             *out++ = '.';
             *out++ = '*';
-        } else {
+        } else if (parts->is_wildcard) {
             // For wildcard patterns, check if pattern starts with *
             // If so, we want to match anywhere in the path
             if (pattern[0] == '*') {
@@ -223,7 +225,10 @@ pattern_parts_t* pattern_decompose(const char* pattern) {
             }
         }
         
-        for (size_t i = 0; i < len; i++) {
+        // The leading .* already absorbs any run of leading glob stars.
+        size_t pattern_start = 0;
+        while (pattern[pattern_start] == '*') pattern_start++;
+        for (size_t i = pattern_start; i < len; i++) {
             char c = pattern[i];
             
             if (c == '*') {
@@ -252,10 +257,7 @@ pattern_parts_t* pattern_decompose(const char* pattern) {
             }
         }
         
-        if (!parts->is_wildcard) {
-            *out++ = '.';
-            *out++ = '*';
-        } else {
+        if (parts->is_wildcard) {
             *out++ = '$';
         }
         *out = '\0';

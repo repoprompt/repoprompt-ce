@@ -1616,10 +1616,13 @@ actor HistorySessionScanner: HistorySessionScanning {
             let entryTarget = max(1, inventoryBudget.maxIndexCacheEntries * 3 / 4)
             let byteTarget = inventoryBudget.maxIndexCacheBytes - inventoryBudget.maxIndexCacheBytes / 4
             indexCacheEvictionVisitsForTesting += cache.entries.count
-            let oldest = cache.entries.map { (key: $0.key, ordinal: $0.value.accessOrdinal) }
-                .sorted {
-                    $0.ordinal != $1.ordinal ? $0.ordinal < $1.ordinal : $0.key < $1.key
-                }
+            let candidates: [(key: String, ordinal: UInt64)] = cache.entries.map {
+                (key: $0.key, ordinal: $0.value.accessOrdinal)
+            }
+            let oldest = candidates.sorted { lhs, rhs in
+                if lhs.ordinal != rhs.ordinal { return lhs.ordinal < rhs.ordinal }
+                return lhs.key < rhs.key
+            }
             for candidate in oldest {
                 guard cache.entries.count > entryTarget || cache.estimatedByteCount > byteTarget else { break }
                 // Low water is an amortization target, not an admission cap. Retain the newest
