@@ -3271,6 +3271,7 @@ final class MCPReadMutationPathContractTests: XCTestCase {
         )
         let connectionID = UUID()
         try server.bindTabForConnection(
+            route: server.routeResources,
             connectionID: connectionID,
             clientName: nil,
             tabID: XCTUnwrap(workspace.activeComposeTabID),

@@ -53,8 +53,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     typealias ACPControllerFactory = AgentRunExecutionContracts.ACPControllerFactory
     typealias ConnectionPolicyInstaller = AgentRunExecutionContracts.ConnectionPolicyInstaller
     typealias MCPServerEnabler = AgentRunExecutionContracts.MCPServerEnabler
-    typealias MCPRunRoutingCleaner = (_ runID: UUID, _ windowID: Int, _ reason: String) async -> Void
-    typealias MCPRunToolCanceller = (_ runID: UUID, _ reason: String?) -> Int
+    typealias MCPRunRoutingCleaner = AgentSessionRuntimeHost.RunRoutingCleaner
+    typealias MCPRunToolCanceller = AgentSessionRuntimeHost.RunToolCanceller
     typealias ProviderConversationCleaner = ProviderConversationCleanupRegistry.Cleaner
     typealias PersistedProviderConversationCleaner = ProviderConversationCleaner
     typealias CodexActiveToolQuery = (_ runID: UUID) -> Bool
@@ -501,7 +501,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         Int
     ) async -> AsyncThrowingStream<AgentSessionSidebarBuildBatch, Error>
 
-    let runtimeSessionStore = AgentSessionRuntimeStore.shared.makeScope()
+    let runtimeHost: AgentSessionRuntimeHost
+    var runtimeSessionStore: AgentSessionRuntimeStore.Scope {
+        runtimeHost.scope
+    }
+
     private var runPresentationAttachments: [ObjectIdentifier: AgentSessionPresentationRuntime.Attachment] = [:]
     private(set) var sessions: [UUID: TabSession] {
         get { runtimeSessionStore.sessions }
@@ -869,20 +873,28 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// picker tests never touch a live ACP process.
     private let openCodeModelParameterStreamProvider: (String?, String) async -> AsyncStream<OpenCodeACPModelParameterSnapshot>
     private let skillCatalog: AgentSkillCatalog
-    private let headlessProviderFactory: HeadlessProviderFactory
-    private let acpProviderFactory: ACPProviderFactory
-    private let acpControllerFactory: ACPControllerFactory
     private let connectionPolicyInstaller: ConnectionPolicyInstaller
     private let mcpServerEnabler: MCPServerEnabler
-    private let mcpRunRoutingCleaner: MCPRunRoutingCleaner
-    private let mcpRunToolCanceller: MCPRunToolCanceller
+    private var mcpRunToolCanceller: MCPRunToolCanceller {
+        runtimeHost.runToolCanceller
+    }
+
     private var providerConversationCleanupRegistry: ProviderConversationCleanupRegistry
-    let codexCoordinator: CodexAgentModeCoordinator
+    var codexCoordinator: CodexAgentModeCoordinator {
+        runtimeHost.codexCoordinator
+    }
+
     let catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink
     let restorePerfRecorder: any WorkspaceRestorePerfRecording
     let perfRecorder: any AgentModePerfRecording
-    let claudeCoordinator: ClaudeAgentModeCoordinator
-    let providerBindingService: AgentModeProviderBindingService
+    var claudeCoordinator: ClaudeAgentModeCoordinator {
+        runtimeHost.claudeCoordinator
+    }
+
+    var providerBindingService: AgentModeProviderBindingService {
+        runtimeHost.providerBindingService
+    }
+
     private let shouldManageCodexTooling: Bool
     private let usesProductionAgentDefaultsAndModelPolling: Bool
     let clearConsumedAttachmentsAfterProviderConsumption: Bool
@@ -894,11 +906,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return execution
     }
 
-    private lazy var runProviderComposition = AgentRunProviderComposition(
-        headless: headlessProviderFactory, acp: acpProviderFactory, controller: acpControllerFactory
-    )
     private var runComposition: AgentModeRunComposition {
-        AgentModeRunComposition(execution: runService, resources: runProviderComposition, workspace: .init(fallbackWorkspacePath: workspacePathProvider()))
+        AgentModeRunComposition(execution: runService, resources: runtimeHost.providerResources, workspace: .init(fallbackWorkspacePath: workspacePathProvider()))
     }
 
     private let sessionLifecycleAuthority = AgentSessionLifecycleAuthority()
@@ -1383,7 +1392,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         func test_composeRunService(_ execution: AgentModeRunService) -> AgentModeRunComposition {
-            AgentModeRunComposition(execution: execution, resources: runProviderComposition, workspace: .init(fallbackWorkspacePath: workspacePathProvider()))
+            AgentModeRunComposition(execution: execution, resources: runtimeHost.providerResources, workspace: .init(fallbackWorkspacePath: workspacePathProvider()))
         }
 
         func test_consumeClaudeTerminalEvents(
@@ -2638,14 +2647,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     #endif
 
-    private nonisolated static func defaultHeadlessProviderFactory(
-        agent: AgentProviderKind,
-        modelString: String?
-    ) -> HeadlessAgentProvider {
-        assert(agent != .codexExec, "Codex native runs must not use headless provider factory.")
-        return AgentRuntimeProviderService.shared.makeProvider(for: agent, modelString: modelString)
-    }
-
     private nonisolated static func defaultConnectionPolicyInstaller(
         clientName: String,
         windowID: Int,
@@ -2678,17 +2679,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
-    private nonisolated static func defaultMCPRunRoutingCleaner(
-        runID: UUID,
-        windowID: Int,
-        reason: String
-    ) async {
-        _ = reason
-        await ServerNetworkManager.shared.unregisterToolObservers(for: runID)
-        await ServerNetworkManager.shared.cleanupRunRoutingState(for: runID, windowID: windowID)
-        await AgentRunCoordinator.shared.cleanupRouting(runID: runID)
-    }
-
     // MARK: - Initialization
 
     private weak var oracleViewModel: OracleViewModel?
@@ -2711,78 +2701,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     var repromptDefaultModel: (provider: AgentProviderKind?, model: AIModel)?
 
     private func makeClaudeCoordinatorHostCapabilities() -> ClaudeAgentModeCoordinator.HostCapabilities {
-        var capabilities = ClaudeAgentModeCoordinator.HostCapabilities(
-            isSessionCurrent: { [weak self] session in
-                guard let self else { return false }
-                return sessions[session.tabID] === session
-            },
-            requestUIRefresh: { [weak self] session, urgent in
-                guard let self, sessions[session.tabID] === session else { return }
-                session.noteMonitorObservationInputsChanged()
-                mcpRuntime.handleObservedMCPStateChange(for: session)
-                requestUIRefresh(tabID: session.tabID, urgent: urgent)
-            },
-            scheduleSave: { [weak self] session in
-                self?.persistenceRuntime.scheduleSave(for: session)
-            },
-            stageClaudeResumeRecoveryHandoff: { [weak self] session in
+        _ = persistenceRuntime
+        _ = mcpRuntime
+        return runtimeHost.makeClaudeCapabilities(
+            links: linkExecutionRuntime,
+            stageRecovery: { [weak self] session in
                 await self?.stageClaudeResumeRecoveryHandoffIfNeeded(for: session) ?? false
-            },
-            prependPendingHandoff: { [handoff = handoffRuntime] text, session in
-                handoff.prependPendingHandoffIfNeeded(text, session: session)
-            },
-            qualifyAgentSessionLinkProviderInputRoute: { [weak self] session, routeWait in
-                guard let self else { return .unavailable }
-                return await linkExecutionRuntime.qualifyProviderInputRoute(for: session, routeWait: routeWait)
-            },
-            hasCurrentAgentSessionLinkProviderInputRoute: { [weak self] session, qualification in
-                guard let self else { return false }
-                return linkExecutionRuntime.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: qualification)
-            },
-            decorateAgentSessionLinkPrompt: { [weak self] text, session, dispatchID in
-                guard let self else {
-                    return .init(
-                        text: text,
-                        claim: nil,
-                        mustAbortDispatch: AgentSessionLinkExecutionRuntime.dispatchRequiresLaneBatch(session, dispatchID)
-                    )
-                }
-                return linkExecutionRuntime.agentSessionLinkDecoratedProviderText(
-                    text,
-                    session: session,
-                    dispatchID: dispatchID
-                )
-            },
-            acquireAgentSessionLinkPhysicalDispatch: { [weak self] session, dispatchID in
-                guard let self else {
-                    return !AgentSessionLinkExecutionRuntime.dispatchRequiresLaneBatch(session, dispatchID)
-                }
-                return linkExecutionRuntime.agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: dispatchID)
-            },
-            recordAgentSessionLinkPhysicalDispatchNotAttempted: { [weak self] session, dispatchID in
-                self?.linkExecutionRuntime.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
-            },
-            recordAgentSessionLinkPhysicalDispatchFailure: { [weak self] session, dispatchID in
-                self?.linkExecutionRuntime.agentSessionLinkRecordPhysicalDispatchFailure(for: session, dispatchID: dispatchID)
-            },
-            proveLocalInput: { [weak self] session, claim in
-                guard let self else { return await AgentSessionLinkProviderInputRelease.prove(claim) { _ in false } }
-                return await linkExecutionRuntime.agentSessionLinkProveProviderInput(for: session, claim: claim)
-            },
-            handoffLocalInput: { [weak self] session, dispatchID, claim, proof in
-                guard let self else { return AgentSessionLinkProviderInputRelease.handoff(original: claim, proof: proof, current: { .nothingOwed }, isPending: { _ in false }, consume: { _ in false }) }
-                return linkExecutionRuntime.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatchID, claim: claim, proof: proof)
-            },
-            acceptAgentSessionLinkPromptClaim: { [weak self] session, context, claim in
-                self?.linkExecutionRuntime.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
             }
         )
-        capabilities.sessionRuntime = runtimeSessionStore
-        capabilities.cleanupProviderRun = { [weak self] session, runID in
-            guard let self else { return }
-            await cleanupMCPRunRoutingIfPresent(boundSessionID: boundSessionID(for: session.tabID), liveSession: session, explicitRunID: runID, reason: "claudeNative.providerInitiated")
-        }
-        return capabilities
     }
 
     var preparedOversightSessionsAreIdle: Bool {
@@ -2853,105 +2779,29 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             return FileManager.default.temporaryDirectory
         }
-        let providerBindingService = AgentModeProviderBindingService()
-        let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePaths, permissionProfile, _, computerUseEnabled, capabilities, contextWindowSelection in
-            let client = CodexAppServerClient(provisionsRepoPromptMCPOnStart: false)
-            let options = CodexNativeSessionController.Options.agentModeDefault(
-                approvalPolicyProvider: { permissionProfile.codexApprovalPolicy },
-                sandboxModeProvider: { permissionProfile.codexSandboxMode },
-                approvalReviewerProvider: { permissionProfile.codexApprovalReviewer },
-                shellToolEnabled: permissionProfile.codexBashToolEnabled(),
-                suppressThirdPartyMCPServers: permissionProfile.codexSuppressesThirdPartyMCPServers,
-                capabilitiesProvider: { capabilities },
-                goalSupportEnabledProvider: { CodexGoalSupport.isEnabled },
-                reasoningSummariesEnabledProvider: { CodexReasoningSummaries.isEnabled },
-                memoriesEnabledProvider: { CodexMemories.isEnabled },
-                computerUseEnabledProvider: { computerUseEnabled },
-                contextWindowSelection: contextWindowSelection
-            )
-            return CodexNativeSessionController(
-                client: client,
-                runID: runID,
-                tabID: tabID,
-                windowID: windowID,
-                workspacePaths: workspacePaths,
-                options: options,
-                clientShutdownBehavior: .stopOnShutdown,
-                expectedMCPClientName: AgentProviderKind.codexExec.mcpClientNameHint,
-                perfRecorder: perfRecorder
-            )
-        }
-        headlessProviderFactory = Self.defaultHeadlessProviderFactory
-        acpProviderFactory = { agent, modelString in
-            try await ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
-        }
-        acpControllerFactory = { provider, runRequest in
-            try ACPAgentSessionController(provider: provider, runRequest: runRequest)
-        }
         connectionPolicyInstaller = Self.defaultConnectionPolicyInstaller
         mcpServerEnabler = { [weak mcpServer] in
             guard let mcpServer else { return false }
             return await mcpServer.ensureServerReadyForAgentBootstrap()
         }
-        mcpRunRoutingCleaner = { runID, windowID, reason in
-            await Self.defaultMCPRunRoutingCleaner(
-                runID: runID,
-                windowID: windowID,
-                reason: reason
-            )
-        }
-        mcpRunToolCanceller = { [tools = mcpServer.toolExecutionRuntime] runID, reason in
-            tools.cancelActiveToolsForRun(runID: runID, reason: reason)
-        }
         providerConversationCleanupRegistry = ProviderConversationCleanupRegistry()
         shouldManageCodexTooling = true
         self.usesProductionAgentDefaultsAndModelPolling = usesProductionAgentDefaultsAndModelPolling
-        codexCoordinator = CodexAgentModeCoordinator(
-            windowID: windowID,
-            runtimeWorkspacePathsProvider: codexRuntimeWorkspacePathsProvider,
-            codexControllerFactory: codexControllerFactory,
+        runtimeHost = AgentSessionRuntimeHost(
+            routeID: windowID,
+            tools: mcpServer.toolExecutionRuntime,
+            workspacePath: sessionWorkspacePathProvider,
+            runtimeWorkspacePaths: codexRuntimeWorkspacePathsProvider,
             connectionPolicyInstaller: connectionPolicyInstaller,
-            shouldManageCodexTooling: true,
-            codexCapabilitiesForLaunch: { isMCPRelated in
-                providerBindingService.codexCapabilitiesForLaunch(isMCPRelated: isMCPRelated)
-            },
-            codexHookApprovalSettings: GlobalSettingsStore.shared,
-            activeToolQuery: { [tools = mcpServer.toolExecutionRuntime] runID in
-                tools.hasActiveToolExecutions(runID: runID)
-            },
-            activeAgentRunWaitQuery: { [tools = mcpServer.toolExecutionRuntime] runID in
-                tools.hasActiveChildAgentRunWaits(runID: runID)
-            },
-            stallWatchdogProbeThreshold: 90,
-            stallWatchdogRecoveryThreshold: 300,
+            modelRouterSettingsStore: modelRouterSettingsStore,
             catalogDiagnosticsSink: catalogDiagnosticsSink,
-            perfRecorder: perfRecorder,
-            initialLastUsedReasoningEffort: CodexAgentToolPreferences.lastUsedReasoningEffort(),
-            initialLastUsedReasoningEffortsByModelSlug: CodexAgentToolPreferences.lastUsedReasoningEffortsByModelSlug()
-        )
-        claudeCoordinator = ClaudeAgentModeCoordinator(
-            windowID: windowID,
-            workspacePathProvider: sessionWorkspacePathProvider,
-            awaitNoActiveMCPTools: { [tools = mcpServer.toolExecutionRuntime] runID in
-                try await tools.awaitNoActiveToolExecutions(runID: runID)
-            },
-            toolEndedCount: { [tools = mcpServer.toolExecutionRuntime] runID in
-                tools.toolEndedCount(runID: runID)
-            },
-            hasActiveMCPTools: { [tools = mcpServer.toolExecutionRuntime] runID in
-                tools.hasActiveToolExecutions(runID: runID)
-            },
-            hasActiveChildAgentRunWaits: { [tools = mcpServer.toolExecutionRuntime] runID in
-                tools.hasActiveChildAgentRunWaits(runID: runID)
-            },
-            autoEffortConfigurationProvider: { [modelRouterSettingsStore] in modelRouterSettingsStore.autoEffortConfiguration() }
+            perfRecorder: perfRecorder
         )
         self.clearConsumedAttachmentsAfterProviderConsumption = clearConsumedAttachmentsAfterProviderConsumption
         workspaceSwitchProvider = AgentModeWorkspaceSwitchCleanupProvider(
-            codexCoordinator: codexCoordinator,
-            claudeCoordinator: claudeCoordinator
+            codexCoordinator: runtimeHost.codexCoordinator,
+            claudeCoordinator: runtimeHost.claudeCoordinator
         )
-        self.providerBindingService = providerBindingService
         codexCoordinator.setActiveAgentRunWaitDrain { [weak self] runID, runAttemptID, source, steeringMessage in
             guard let self, let mcpServer = self.mcpServer else { return true }
             return await mcpServer.wakeAndDrainAgentRunWaitersOwnedByActiveRun(
@@ -3034,7 +2884,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             codexControllerFactoryWithComputerUse: CodexControllerFactoryWithComputerUse? = nil,
             claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory? = nil,
             headlessProviderFactory: @escaping HeadlessProviderFactory = { agent, modelString in
-                AgentModeViewModel.defaultHeadlessProviderFactory(agent: agent, modelString: modelString)
+                AgentRunProviderComposition.makeHeadlessProvider(agent: agent, modelString: modelString)
             },
             acpProviderFactory: @escaping ACPProviderFactory = { agent, modelString in
                 try await ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
@@ -3044,9 +2894,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             },
             connectionPolicyInstaller: @escaping ConnectionPolicyInstaller = AgentModeViewModel.defaultConnectionPolicyInstaller,
             mcpRunRoutingCleaner: @escaping MCPRunRoutingCleaner = { runID, windowID, reason in
-                await AgentModeViewModel.defaultMCPRunRoutingCleaner(
+                await AgentSessionRuntimeHost.cleanRunRouting(
                     runID: runID,
-                    windowID: windowID,
+                    routeID: windowID,
                     reason: reason
                 )
             },
@@ -3112,16 +2962,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 ?? { runID, tabID, windowID, workspacePaths, permissionProfile, taskLabelKind, _, _, _ in
                     codexControllerFactory(runID, tabID, windowID, workspacePaths, permissionProfile, taskLabelKind)
                 }
-            self.headlessProviderFactory = headlessProviderFactory
-            self.acpProviderFactory = acpProviderFactory
-            self.acpControllerFactory = acpControllerFactory
             self.connectionPolicyInstaller = connectionPolicyInstaller
             self.mcpServerEnabler = mcpServerEnabler
-            self.mcpRunRoutingCleaner = mcpRunRoutingCleaner
-            self.mcpRunToolCanceller = mcpRunToolCanceller
-                ?? { [tools = testMCPServer?.toolExecutionRuntime] runID, reason in
-                    tools?.cancelActiveToolsForRun(runID: runID, reason: reason) ?? 0
-                }
             self.providerConversationCleanupRegistry = providerConversationCleanupRegistry
             self.shouldManageCodexTooling = shouldManageCodexTooling
             usesProductionAgentDefaultsAndModelPolling = testUsesProductionAgentDefaultsAndModelPolling
@@ -3134,7 +2976,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             } else {
                 max(testWatchdogProbeThreshold, legacyWatchdogThreshold ?? 0)
             }
-            codexCoordinator = CodexAgentModeCoordinator(
+            let codexCoordinator = CodexAgentModeCoordinator(
                 windowID: testWindowID,
                 runtimeWorkspacePathsProvider: codexRuntimeWorkspacePathsProvider,
                 codexControllerFactory: codexControllerFactory,
@@ -3178,7 +3020,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 initialLastUsedReasoningEffort: CodexAgentToolPreferences.lastUsedReasoningEffort(),
                 initialLastUsedReasoningEffortsByModelSlug: CodexAgentToolPreferences.lastUsedReasoningEffortsByModelSlug()
             )
-            claudeCoordinator = ClaudeAgentModeCoordinator(
+            let claudeCoordinator = ClaudeAgentModeCoordinator(
                 windowID: testWindowID,
                 workspacePathProvider: sessionWorkspacePathProvider,
                 claudeControllerFactory: claudeControllerFactory,
@@ -3193,12 +3035,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 },
                 autoEffortConfigurationProvider: { [testModelRouterSettingsStore] in testModelRouterSettingsStore.autoEffortConfiguration() }
             )
+            runtimeHost = AgentSessionRuntimeHost(
+                routeID: testWindowID, codexCoordinator: codexCoordinator, claudeCoordinator: claudeCoordinator,
+                providerResources: .init(headless: headlessProviderFactory, acp: acpProviderFactory, controller: acpControllerFactory),
+                runRoutingCleaner: mcpRunRoutingCleaner,
+                runToolCanceller: mcpRunToolCanceller ?? { [tools = testMCPServer?.toolExecutionRuntime] runID, reason in
+                    tools?.cancelActiveToolsForRun(runID: runID, reason: reason) ?? 0
+                }
+            )
             self.clearConsumedAttachmentsAfterProviderConsumption = clearConsumedAttachmentsAfterProviderConsumption
             workspaceSwitchProvider = AgentModeWorkspaceSwitchCleanupProvider(
                 codexCoordinator: codexCoordinator,
                 claudeCoordinator: claudeCoordinator
             )
-            providerBindingService = AgentModeProviderBindingService()
             installAdministrationComposition(runtimeSessionStore.administration)
             installWorktreeComposition(runtimeSessionStore.worktrees)
             configureCodexRuntime(codexCoordinator)
@@ -3687,17 +3536,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     /// Composition installs concrete execution services independently of the optional UI attachment.
     func configureCodexRuntime(_ coordinator: CodexAgentModeCoordinator) {
-        let interactions = runtimeSessionStore.interactions(routeID: windowID, approvalStore: applyEditsApprovalStore)
-        coordinator.installInteractionRuntime(interactions)
-        interactions.observer = coordinator
-        coordinator.installPersistenceRuntime(persistenceRuntime)
-        coordinator.installAttachmentRuntime(attachmentRuntime)
-        coordinator.installMCPRuntime(mcpRuntime)
-        coordinator.installUsageRuntime(usageRuntime)
-        coordinator.installPresentationRuntime(presentationRuntime)
-        coordinator.installLinkExecutionRuntime(linkExecutionRuntime)
-        coordinator.installExecutionServices(
-            drafts: draftRuntime, mcpServerEnabler: mcpServerEnabler,
+        _ = persistenceRuntime
+        _ = attachmentRuntime
+        _ = mcpRuntime
+        _ = draftRuntime
+        runtimeHost.installCodexRuntime(
+            coordinator, routeID: windowID, approvalStore: applyEditsApprovalStore,
+            links: linkExecutionRuntime, mcpServerEnabler: mcpServerEnabler,
             modelRouterSettingsStore: modelRouterSettingsStore
         )
         coordinator.attachPresentation(self)
@@ -3709,7 +3554,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         expectedPIDPolicyArmer: ((MCPBootstrapLeaseSpec) async -> Bool)? = nil
     ) -> AgentModeRunService {
         let publication = mcpRuntime
-        let observation = runtimeSessionStore.observation
         let dependencies = AgentModeRunService.Dependencies(
             windowID: windowID,
             connectionPolicyInstaller: connectionPolicyInstaller ?? self.connectionPolicyInstaller,
@@ -3750,17 +3594,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             },
             childAgentRunWaitDrainTimeoutSeconds: Self.childAgentRunWaitDrainTimeoutSeconds
         )
-        let persistence = persistenceRuntime
-        let hooks = AgentModeRunService.Hooks(
-            usage: usageRuntime.makeRunHooks(scheduleSave: { session in
-                persistence.scheduleSave(for: session)
-            }),
-            attachments: attachmentRuntime.makeRunHooks(),
-            presentation: runtimeSessionStore.presentation.makeRunHooks(),
-            bindingObservation: mcpRuntime.makeBindingObservationHooks(),
-            queuedWorkRecovery: draftRuntime.makeRunHooks(),
-            persistence: persistence.makeRunHooks(),
-            transcript: streamRuntime.makeRunHooks(),
+        _ = persistenceRuntime
+        _ = attachmentRuntime
+        _ = draftRuntime
+        _ = interactionRuntime
+        return runtimeHost.makeExecution(
+            dependencies: dependencies,
             providerInput: .init(
                 buildHeadlessAgentMessage: { [input = providerInputRuntime, links = linkExecutionRuntime] session, initialMessage, _, attachments in
                     input.buildHeadlessAgentMessage(
@@ -3820,62 +3659,27 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     links.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatchID, claim: claim, proof: proof)
                 }
             ),
-            interactions: interactionRuntime.makeRunHooks(),
-            terminalSettlement: .init(
-                prepareTerminalPublication: { session in
-                    observation.prepareTerminalPublication(for: session)
-                },
-                makeTerminalPublicationEnvelope: { session, ownership, terminalState, providerRunID, failureReason in
-                    publication.makeTerminalPublicationEnvelope(
-                        for: session,
-                        ownership: ownership,
-                        terminalState: terminalState,
-                        providerRunID: providerRunID,
-                        failureReason: failureReason
-                    )
-                },
-                publishTerminalCommit: { [links = linkExecutionRuntime] session, revision, successorKind in
-                    await links.drainPendingSendEffects(for: session)
-                    return await publication.publishTerminalCommit(revision, successorKind: successorKind, for: session)
-                },
-                onSelfCompactTerminalSettled: { [weak self, links = linkExecutionRuntime] session, revision, result, teardownSettled in
-                    self?.agentSelfCompactTerminalSettled(
-                        session: session,
-                        revision: revision,
-                        publication: result,
-                        teardownSettled: teardownSettled
-                    )
-                    links.providerSwitchRunSettled(session, revision: revision, publication: result)
-                    self?.providerSwitchGenerationSettled(session)
-                    // Same post-publication seam: a session's own worktree switch applies only
-                    // at its origin turn's settled terminal boundary.
-                    self?.selfWorktreeRelocationTerminalSettled(
-                        session: session,
-                        revision: revision,
-                        publication: result,
-                        teardownSettled: teardownSettled
-                    )
-                }
-            ),
-            continuation: runtimeSessionStore.continuation.makeRunHooks(prepareLaunch: { [weak self] in
-                self?.makeFollowUpLaunch()
-            }),
-            prepareForCancellation: { [interactions = interactionRuntime, links = linkExecutionRuntime] session, intent, origin in
-                interactions.prepareRunCancellation(session: session, intent: intent, origin: origin, links: links)
+            onTerminalSettled: { [weak self, links = linkExecutionRuntime] session, revision, result, teardownSettled in
+                self?.agentSelfCompactTerminalSettled(
+                    session: session,
+                    revision: revision,
+                    publication: result,
+                    teardownSettled: teardownSettled
+                )
+                links.providerSwitchRunSettled(session, revision: revision, publication: result)
+                self?.providerSwitchGenerationSettled(session)
+                // Same post-publication seam: a session's own worktree switch applies only
+                // at its origin turn's settled terminal boundary.
+                self?.selfWorktreeRelocationTerminalSettled(
+                    session: session,
+                    revision: revision,
+                    publication: result,
+                    teardownSettled: teardownSettled
+                )
             },
-            oracleCancellationDrain: { $0.oracleBackgroundDrain }
-        )
-        let toolTrackingHooks = streamRuntime.makeToolTrackingHooks()
-        // Tool application is owned by the same runtime scope as streaming and persistence.
-        claudeCoordinator.toolTrackingHooks = toolTrackingHooks
-        let service = AgentModeRunService(
-            dependencies: dependencies,
-            hooks: hooks,
-            toolTrackingHooks: toolTrackingHooks,
+            prepareLaunch: { [weak self] in self?.makeFollowUpLaunch() },
             perfRecorder: perfRecorder
         )
-        streamRuntime.codexCoordinator = codexCoordinator
-        return service
     }
 
     private func scheduleTypedACPFollowUpRun(
@@ -4007,8 +3811,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func observeCodexComputerUseSetting() {
-        NotificationCenter.default.publisher(for: .agentSessionLinkOverseerProjectionDidChange, object: self)
-            .sink { [weak self] _ in self?.syncComposerUIState() }
+        // The subscription is owned by this presenter. Passing self as the publisher's
+        // object filter would retain it even after its presentation lease is released.
+        NotificationCenter.default.publisher(for: .agentSessionLinkOverseerProjectionDidChange)
+            .sink { [weak self] notification in
+                guard let self, notification.object as? AgentModeViewModel === self else { return }
+                syncComposerUIState()
+            }
             .store(in: &cancellables)
         // This notification is emitted synchronously by the MainActor settings setters. Take
         // admission holds now, so a rapid off/on cannot re-arm while teardown is suspended.
@@ -13074,8 +12883,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) async {
         _ = boundSessionID
         guard let runID = explicitRunID ?? liveSession?.runID else { return }
-        _ = mcpRunToolCanceller(runID, reason)
-        await mcpRunRoutingCleaner(runID, windowID, reason)
+        await runtimeHost.cleanupRunRouting(runID: runID, reason: reason)
     }
 
     func removeSessionIndex(sessionID: UUID) {

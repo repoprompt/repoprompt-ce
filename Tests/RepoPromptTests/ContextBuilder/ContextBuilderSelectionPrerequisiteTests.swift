@@ -34,7 +34,9 @@ import XCTest
                 }
                 try await prerequisite.awaitPendingWaiter()
                 prerequisite.server.removeTabContext(
-                    forConnectionID: prerequisite.connection.connectionID, clientName: nil,
+                    route: prerequisite.server.routeResources,
+                    forConnectionID: prerequisite.connection.connectionID,
+                    clientName: nil,
                     windowID: prerequisite.owner.windowID
                 )
                 try await prerequisite.driver.fixture.awaitGateEvent(completed)
@@ -43,7 +45,7 @@ import XCTest
                 XCTAssertFalse(MCPToolExecutionCancelledError.matches(error))
                 XCTAssertEqual(String(describing: error), Self.invalidatedDescription)
                 XCTAssertEqual(error.localizedDescription, Self.invalidatedDescription)
-                XCTAssertNil(prerequisite.server.tabContextByConnectionID[prerequisite.connection.connectionID])
+                XCTAssertNil(prerequisite.server.runRouteBindings.tabContextByConnectionID[prerequisite.connection.connectionID])
                 prerequisite.assertRejectedWithoutRollback(bindingPreserved: false)
             }
         }
@@ -175,7 +177,7 @@ import XCTest
             }
 
             var coordinator: MCPReadFileAutoSelectionCoordinator {
-                server.readFileAutoSelectionCoordinator
+                server.readFileAutoSelectionCoordinator(route: server.routeResources)
             }
 
             init(
@@ -235,7 +237,7 @@ import XCTest
                 XCTAssertNotEqual(acceptedSelection, before)
                 XCTAssertEqual(coordinator.debugSnapshot().mirrorWaiterCount, 0)
                 XCTAssertEqual(coordinator.debugSnapshot().mirrorWorkerCount, 1)
-                XCTAssertTrue(server.isReadFileAutoSelectionContextCurrent(owner))
+                XCTAssertTrue(server.isReadFileAutoSelectionContextCurrent(route: server.routeResources, owner))
             }
 
             func invokeFailure() async -> Error {
@@ -275,7 +277,7 @@ import XCTest
                 let waiter = try XCTUnwrap(probe.events().last { $0.lane == .mirror && $0.kind == .waiterRegistered })
                 XCTAssertEqual(waiter.target, requiredTicket)
                 XCTAssertNotNil(waiter.waiterID)
-                XCTAssertTrue(server.isReadFileAutoSelectionContextCurrent(owner))
+                XCTAssertTrue(server.isReadFileAutoSelectionContextCurrent(route: server.routeResources, owner))
                 XCTAssertEqual(coordinator.debugSnapshot().mirrorWaiterCount, 1)
                 XCTAssertEqual(coordinator.debugSnapshot().liveMirrorDeadlineCount, 1)
             }
@@ -294,7 +296,7 @@ import XCTest
                     for: .init(workspaceID: driver.fixture.workspace.id, tabID: owner.tabID)
                 )?.selection, acceptedSelection)
                 if bindingPreserved {
-                    XCTAssertTrue(server.isReadFileAutoSelectionContextCurrent(owner))
+                    XCTAssertTrue(server.isReadFileAutoSelectionContextCurrent(route: server.routeResources, owner))
                 }
                 let waiter = probe.events().last { $0.lane == .mirror && $0.kind == .waiterRegistered }
                 XCTAssertEqual(waiter?.target, requiredTicket)
@@ -313,7 +315,10 @@ import XCTest
                 coordinator.setMirrorWaitTimeoutForTesting(.seconds(10))
                 server.setReadFileAutoSelectionMirrorGateForTesting(nil)
                 server.removeTabContext(
-                    forConnectionID: connection.connectionID, clientName: nil, windowID: owner.windowID
+                    route: server.routeResources,
+                    forConnectionID: connection.connectionID,
+                    clientName: nil,
+                    windowID: owner.windowID
                 )
                 mirrorGate.release()
                 if !mirrorJoined, probe.events().contains(where: { $0.lane == .mirror && $0.kind == .workerStarted }) {

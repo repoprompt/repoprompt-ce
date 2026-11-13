@@ -1315,7 +1315,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 let route = try XCTUnwrap(routeBefore)
                 XCTAssertEqual(route.connectionID, connection.connectionID)
                 XCTAssertEqual(route.observerEndpoint, endpoint)
-                XCTAssertEqual(window.mcpServer.connectionIDByRunID[runID], connection.connectionID)
+                XCTAssertEqual(window.mcpServer.runRouteBindings.connectionIDByRunID[runID], connection.connectionID)
 
                 if contractJourney {
                     XCTAssertEqual(window.workspaceManager.activeWorkspaceID, workspace.id)

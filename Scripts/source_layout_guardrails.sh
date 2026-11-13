@@ -572,7 +572,7 @@ PY
     fail "M3 read path reintroduced repeated MainActor authority capture"
   fi
   m3_read_resolver="$(sed -n '/func resolveDomainReadContext/,/Runs before the server is stopped/p' "$m3_app_read_routing")"
-  if grep -q -E 'registerWindow|publishDomainRoutingBinding' <<<"$m3_read_resolver"; then
+  if grep -q -E 'registerWindow|publishDomainRoutingBinding|publishBinding' <<<"$m3_read_resolver"; then
     fail "M3 read resolution mutates shared presentation routing"
   fi
   m3_host_routes="Sources/RepoPrompt/Infrastructure/MCP/AppShared/MCPHostRouteResources.swift"
@@ -580,7 +580,8 @@ PY
     || ! grep -q 'releaseDomainReadAppExecutionContext' "$m3_app_read_routing" \
     || ! grep -q 'registerFallbackDomainReadContext' "$m3_app_read_routing" \
     || ! grep -Fq 'routeResources.retainConnection(registration)' "$m3_app_read_routing" \
-    || ! grep -Fq 'resources.releaseDisconnectedConnection(connectionID)' "$m3_app_read_routing" \
+    || ! grep -Fq 'self.releaseDisconnectedConnection(connectionID)' "$m3_host_routes" \
+    || ! grep -Fq 'await self.routingPublicationTail?.value' "$m3_host_routes" \
     || ! grep -Fq 'routeResources.closeDomainRoute()' "$m3_app_read_routing" \
     || ! grep -Fq '[UUID: DomainConnectionRegistration]' "$m3_host_routes" \
     || ! grep -Fq 'connections.removeValue(forKey: connectionID)' "$m3_host_routes" \

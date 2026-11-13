@@ -4691,8 +4691,8 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 server.debugSetDashboardForTesting(nil)
                 let connectionID = UUID()
                 let runID = UUID()
-                server.connectionIDToRunID[connectionID] = runID
-                defer { server.connectionIDToRunID.removeValue(forKey: connectionID) }
+                server.runRouteBindings.connectionIDToRunID[connectionID] = runID
+                defer { server.runRouteBindings.connectionIDToRunID.removeValue(forKey: connectionID) }
                 let metadata = MCPServerViewModel.RequestMetadata(connectionID: connectionID, clientName: "close-safety", windowID: fixture.contextA.window.windowID)
                 let first = await server.test_beginResolvedToolExecution(metadata: metadata, resolvedContext: nil, toolName: "agent_session_link")
                 let firstID = try XCTUnwrap(first?.executionID)
@@ -4791,7 +4791,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             )
             XCTAssertEqual(applied.outcome, "applied")
             _ = try await manager.debugListToolNames(for: transport.connectionID)
-            let installed = try XCTUnwrap(window.mcpServer.tabContextByConnectionID[transport.connectionID])
+            let installed = try XCTUnwrap(window.mcpServer.runRouteBindings.tabContextByConnectionID[transport.connectionID])
             // Use the ordinary in-memory producer before the request; concurrent UI publications
             // may legitimately replace a synthetic test-only catalogue entry.
             let options = AgentModelCatalog.options(for: .claudeCode, availability: host.agentSessionLinkModelAvailability(windowID: window.windowID))
@@ -4844,29 +4844,29 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 mismatched["_windowID"] = fixture.contextB.window.windowID
                 let wrongWindow = try await transport.callTool(name: MCPWindowToolName.agentSessionLink, arguments: mismatched)
                 XCTAssertTrue(wrongWindow.rawJSON.contains("already-installed"), wrongWindow.rawJSON)
-                window.mcpServer.tabContextByConnectionID.removeValue(forKey: transport.connectionID)
+                window.mcpServer.runRouteBindings.tabContextByConnectionID.removeValue(forKey: transport.connectionID)
                 let cold = try await transport.callTool(name: MCPWindowToolName.agentSessionLink, arguments: args)
                 XCTAssertTrue(cold.rawJSON.contains("already-installed"), cold.rawJSON)
-                XCTAssertNil(window.mcpServer.tabContextByConnectionID[transport.connectionID], "tools/call must not repair cold routing")
-                window.mcpServer.tabContextByConnectionID[transport.connectionID] = installed
-                window.mcpServer.connectionIDByRunID[runID] = UUID()
+                XCTAssertNil(window.mcpServer.runRouteBindings.tabContextByConnectionID[transport.connectionID], "tools/call must not repair cold routing")
+                window.mcpServer.runRouteBindings.tabContextByConnectionID[transport.connectionID] = installed
+                window.mcpServer.runRouteBindings.connectionIDByRunID[runID] = UUID()
                 let stale = try await transport.callTool(name: MCPWindowToolName.agentSessionLink, arguments: args)
                 XCTAssertTrue(stale.rawJSON.contains("already-installed"), stale.rawJSON)
-                XCTAssertNotEqual(window.mcpServer.connectionIDByRunID[runID], transport.connectionID)
-                window.mcpServer.connectionIDByRunID[runID] = transport.connectionID
+                XCTAssertNotEqual(window.mcpServer.runRouteBindings.connectionIDByRunID[runID], transport.connectionID)
+                window.mcpServer.runRouteBindings.connectionIDByRunID[runID] = transport.connectionID
                 host.allWindows.append(window)
                 let ambiguous = try await transport.callTool(name: MCPWindowToolName.agentSessionLink, arguments: args)
                 XCTAssertTrue(ambiguous.rawJSON.contains("already-installed"), ambiguous.rawJSON)
                 host.allWindows.removeLast()
                 await AppDomainRuntimeComposition.shared.runtime.domainHost.debugSetBeforeProviderActivationForTesting { _, tool, _ in
                     if tool == MCPWindowToolName.agentSessionLink {
-                        await MainActor.run { window.mcpServer.connectionIDByRunID[runID] = UUID() }
+                        await MainActor.run { window.mcpServer.runRouteBindings.connectionIDByRunID[runID] = UUID() }
                     }
                 }
                 let displacedAtEntry = try await transport.callTool(name: MCPWindowToolName.agentSessionLink, arguments: args)
                 XCTAssertTrue(displacedAtEntry.rawJSON.contains("already-installed"), displacedAtEntry.rawJSON)
-                XCTAssertNotEqual(window.mcpServer.connectionIDByRunID[runID], transport.connectionID)
-                window.mcpServer.connectionIDByRunID[runID] = transport.connectionID
+                XCTAssertNotEqual(window.mcpServer.runRouteBindings.connectionIDByRunID[runID], transport.connectionID)
+                window.mcpServer.runRouteBindings.connectionIDByRunID[runID] = transport.connectionID
             }
             XCTAssertEqual(target.saveRequestGeneration, before + 1, "Every denied call must leave target configuration untouched")
             await manager.cleanupRunRoutingState(for: runID, windowID: window.windowID)

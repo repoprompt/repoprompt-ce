@@ -848,10 +848,10 @@ import XCTest
                     MCPLifecycleDiagnostics.shared.beginCapture(connectionID: endpointA.connectionID)
                     MCPLifecycleDiagnostics.shared.beginCapture(connectionID: sibling.connectionID)
                     let authorityA = try XCTUnwrap(
-                        fixture.contextA.window.mcpServer.tabContextByConnectionID[endpointA.connectionID]?.frozenFileToolAuthority
+                        fixture.contextA.window.mcpServer.runRouteBindings.tabContextByConnectionID[endpointA.connectionID]?.frozenFileToolAuthority
                     )
                     let authorityB = try XCTUnwrap(
-                        fixture.contextB.window.mcpServer.tabContextByConnectionID[sibling.connectionID]?.frozenFileToolAuthority
+                        fixture.contextB.window.mcpServer.runRouteBindings.tabContextByConnectionID[sibling.connectionID]?.frozenFileToolAuthority
                     )
                     let rootsA = await fixture.contextA.window.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace)
                     let rootsB = await fixture.contextB.window.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace)
@@ -967,13 +967,13 @@ import XCTest
             do {
                 let connectionID = try XCTUnwrap(packet.connectionID, file: file, line: line)
                 let bound = try XCTUnwrap(
-                    context.window.mcpServer.tabContextByConnectionID[connectionID]?.frozenFileToolAuthority,
+                    context.window.mcpServer.runRouteBindings.tabContextByConnectionID[connectionID]?.frozenFileToolAuthority,
                     file: file, line: line
                 )
                 XCTAssertTrue(bound.hasSameRoutingAuthority(as: expected), file: file, line: line)
                 // Exercise the existing frozen-authority consumer with the captured
                 // packet metadata; no cache-miss path or synthetic local scope.
-                let consumed = try await context.window.mcpServer.requiredFileToolLookupContext(from: packet.metadata)
+                let consumed = try await context.window.mcpServer.requiredFileToolLookupContext(route: context.window.mcpServer.routeResources, from: packet.metadata)
                 XCTAssertTrue(consumed.hasSameRoutingAuthority(as: expected), file: file, line: line)
                 XCTAssertEqual(consumed.rootCatalogSnapshot, expected.rootCatalogSnapshot, file: file, line: line)
                 XCTAssertEqual(consumed.canonicalRoots, expected.canonicalRoots, file: file, line: line)
@@ -1361,7 +1361,7 @@ import XCTest
                         XCTAssertFalse(scopes.hasLiveScope(grantedTo: a.sessionID))
                     }
                     if change != .removed {
-                        XCTAssertEqual(a.context.window.mcpServer.connectionIDByRunID[a.runID], a.endpoint.connectionID)
+                        XCTAssertEqual(a.context.window.mcpServer.runRouteBindings.connectionIDByRunID[a.runID], a.endpoint.connectionID)
                         let current = await manager.debugRunPolicyState(for: a.runID)
                         XCTAssertEqual(try XCTUnwrap(current).purpose, .agentModeRun)
                     }
@@ -1417,7 +1417,7 @@ import XCTest
                             name: MCPWindowToolName.readFile, arguments: ["path": a.context.fileURL.path]
                         )
                         XCTAssertTrue(try Self.toolResultText(read).contains(a.context.sentinel), "Policy denial must preserve this connection's allowed reads")
-                        XCTAssertEqual(a.context.window.mcpServer.connectionIDByRunID[a.runID], a.endpoint.connectionID)
+                        XCTAssertEqual(a.context.window.mcpServer.runRouteBindings.connectionIDByRunID[a.runID], a.endpoint.connectionID)
                     }
                 } catch {
                     failure = error
@@ -1498,7 +1498,7 @@ import XCTest
                 label: "queued-policy", networkManager: fixture.networkManager, clientName: clientName,
                 requiredToolNames: [MCPWindowToolName.sessionAdmin, MCPWindowToolName.readFile]
             )
-            XCTAssertEqual(window.mcpServer.connectionIDByRunID[runID], endpoint.connectionID)
+            XCTAssertEqual(window.mcpServer.runRouteBindings.connectionIDByRunID[runID], endpoint.connectionID)
             let resolved = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: context.tabID)
             XCTAssertEqual(resolved.sessionID, sessionID)
             // Scope admission needs owner-valid placement, not the sidebar's UI restore join.
@@ -2586,9 +2586,10 @@ import XCTest
                     )
                     XCTAssertFalse(bindResponse.rawJSON.contains("\"isError\":true"), bindResponse.rawJSON)
                     let authority = try XCTUnwrap(
-                        server.tabContextByConnectionID[createdEndpoint.connectionID]?.frozenFileToolAuthority
+                        server.runRouteBindings.tabContextByConnectionID[createdEndpoint.connectionID]?.frozenFileToolAuthority
                     )
                     try server.bindTabForConnection(
+                        route: server.routeResources,
                         connectionID: createdEndpoint.connectionID,
                         clientName: clientName,
                         tabID: fixture.contextA.tabID,
@@ -2821,7 +2822,7 @@ import XCTest
                     XCTAssertTrue(getText.contains(secondURL.lastPathComponent), getText)
 
                     let canonical = try XCTUnwrap(
-                        server.tabContextByConnectionID[createdEndpoint.connectionID]?.selection
+                        server.runRouteBindings.tabContextByConnectionID[createdEndpoint.connectionID]?.selection
                     )
                     XCTAssertEqual(
                         Set(canonical.selectedPaths),
@@ -4541,7 +4542,7 @@ import XCTest
             let object = try responseObject(from: bind)
             let result = try XCTUnwrap(object["result"] as? [String: Any])
             XCTAssertNotEqual(result["isError"] as? Bool, true)
-            await context.window.mcpServer.domainRoutingPublishTask?.value
+            await context.window.mcpServer.routeResources.settleRoutingPublications()
         }
 
         private static func prepareProtectedExportFixture(
@@ -4574,7 +4575,7 @@ import XCTest
             )
             let bindText = try toolResultText(bindResponse)
             XCTAssertFalse(bindText.contains("Error:"), bindText)
-            await context.window.mcpServer.domainRoutingPublishTask?.value
+            await context.window.mcpServer.routeResources.settleRoutingPublications()
         }
 
         private static func assertPromptExportDelayedWatchdogCompletion(
@@ -5418,12 +5419,14 @@ import XCTest
                 await networkManager.clearClientConnectionPolicy(for: endpoint.clientName)
                 await networkManager.debugClearPersistedRoutingState(for: endpoint.clientName)
                 contextA.window.mcpServer.removeTabContext(
+                    route: contextA.window.mcpServer.routeResources,
                     forConnectionID: endpoint.connectionID,
                     clientName: endpoint.clientName,
                     windowID: nil,
                     runID: nil
                 )
                 contextB.window.mcpServer.removeTabContext(
+                    route: contextB.window.mcpServer.routeResources,
                     forConnectionID: endpoint.connectionID,
                     clientName: endpoint.clientName,
                     windowID: nil,
@@ -5458,8 +5461,8 @@ import XCTest
                 XCTAssertNil(policy.windowID)
                 let pendingPolicies = await networkManager.debugPendingPolicySnapshot(for: endpoint.clientName)
                 XCTAssertTrue(pendingPolicies.isEmpty)
-                XCTAssertEqual(contextA.window.mcpServer.connectionBindingSnapshot(forConnection: endpoint.connectionID).bindingKind, .unbound)
-                XCTAssertEqual(contextB.window.mcpServer.connectionBindingSnapshot(forConnection: endpoint.connectionID).bindingKind, .unbound)
+                XCTAssertEqual(contextA.window.mcpServer.connectionBindingSnapshot(route: contextA.window.mcpServer.routeResources, forConnection: endpoint.connectionID).bindingKind, .unbound)
+                XCTAssertEqual(contextB.window.mcpServer.connectionBindingSnapshot(route: contextB.window.mcpServer.routeResources, forConnection: endpoint.connectionID).bindingKind, .unbound)
                 do {
                     _ = try await endpoint.client.request(method: "tools/list", params: [:])
                     XCTFail("closed socket unexpectedly accepted a request")

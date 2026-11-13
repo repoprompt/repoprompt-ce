@@ -42,11 +42,51 @@ final class MCPRunRouteBindings {
         case refusedOwnerUnavailable
     }
 
+    struct DetachedContextBuilderTabContext {
+        let connectionID: UUID
+        let context: MCPTabContextSnapshot
+    }
+
+    /// Immutable predecessor lanes retain the exact connection and selection generation.
+    struct ReadFileAutoSelectionHandoverLineage {
+        let successorKey: MCPReadFileAutoSelectionCoordinator.ContextKey
+        let predecessorKeys: [MCPReadFileAutoSelectionCoordinator.ContextKey]
+    }
+
+    var pendingRunScopedTabContexts = PendingRunScopedContextStore()
+    var lastContextByClientAndWindow: [String: [Int: MCPTabContextSnapshot]] = [:]
+    var readFileAutoSelectionHandoverLineageByConnectionID: [UUID: ReadFileAutoSelectionHandoverLineage] = [:]
+    var nextReadFileAutoSelectionBindingGeneration: UInt64 = 0
+    var detachedContextBuilderTabContextByRunID: [UUID: DetachedContextBuilderTabContext] = [:]
     var tabContextByConnectionID: [UUID: MCPTabContextSnapshot] = [:]
     var connectionIDByRunID: [UUID: UUID] = [:]
     var connectionIDToRunID: [UUID: UUID] = [:]
     var pendingPolicyTokenIDByRunID: [UUID: UUID] = [:]
     var presentationWindowByConnection: [UUID: Int] = [:]
+
+    func connectionID(forRunID runID: UUID) -> UUID? {
+        guard let connectionID = connectionIDByRunID[runID],
+              connectionIDToRunID[connectionID] == runID else { return nil }
+        return connectionID
+    }
+
+    /// Includes displaced reverse mappings so teardown finds only this run's connections.
+    func connectionIDs(forRunID runID: UUID) -> [UUID] {
+        var ids: [UUID] = []
+        if let primary = connectionIDByRunID[runID] { ids.append(primary) }
+        for (connectionID, mappedRun) in connectionIDToRunID where mappedRun == runID {
+            if !ids.contains(connectionID) { ids.append(connectionID) }
+        }
+        return ids
+    }
+
+    func liveRunIDsBound(toTabID tabID: UUID) -> [UUID] {
+        let runIDs = tabContextByConnectionID.values.compactMap { context -> UUID? in
+            guard context.tabID == tabID, let runID = context.runID else { return nil }
+            return connectionID(forRunID: runID) != nil ? runID : nil
+        }
+        return Array(Set(runIDs)).sorted { $0.uuidString < $1.uuidString }
+    }
 
     func hasCurrentMapping(runID: UUID, connectionID: UUID, expectedTabID: UUID? = nil) -> Bool {
         guard ownerLifetime != nil,

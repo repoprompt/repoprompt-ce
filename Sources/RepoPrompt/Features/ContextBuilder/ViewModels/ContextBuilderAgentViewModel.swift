@@ -2863,6 +2863,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     return .failed("Failed to identify the nested Context Builder MCP client.")
                 }
                 _ = mcpServer.installFrozenTabContext(
+                    route: mcpServer.routeResources,
                     clientID: nil,
                     clientName: clientName,
                     context: workspaceContext.nestedDiscoveryTabContext(runID: runID)
@@ -2876,6 +2877,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 nestedContext.runID = runID
                 nestedContext.frozenLookupContext = configuration.nestedTabContext.frozenLookupContext
                 _ = mcpServer.installFrozenTabContext(
+                    route: mcpServer.routeResources,
                     clientID: nil,
                     clientName: clientName,
                     context: nestedContext
@@ -3289,7 +3291,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             reportDiscoveryActivity: true
         )
         record.finalContextConnectionIDForDiagnostics =
-            mcpServer.contextBuilderFinalContextConnectionID(runID: record.runID)
+            mcpServer.contextBuilderFinalContextConnectionID(route: mcpServer.routeResources, runID: record.runID)
         record.session.appendLogEntry(
             AgentLogEntry(
                 timestamp: Date(),
@@ -3545,7 +3547,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         guard let agentClientName = agent.mcpClientNameHint else { return [] }
 
         // Get all connection candidates for a run
-        let candidateIDs = mcpServer.connectionIDs(forRunID: runID)
+        let candidateIDs = mcpServer.runRouteBindings.connectionIDs(forRunID: runID)
         guard !candidateIDs.isEmpty else { return [] }
 
         // Filter by client name via ServerNetworkManager
@@ -3615,7 +3617,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         let windowID = mcpServer.windowID
         let agentClientName = agent.mcpClientNameHint
-        guard let finalContextConnectionID = mcpServer.contextBuilderFinalContextConnectionID(runID: runID) else {
+        guard let finalContextConnectionID = mcpServer.contextBuilderFinalContextConnectionID(route: mcpServer.routeResources, runID: runID) else {
             #if DEBUG
                 if runTestHooks?.allowSyntheticRoutingWithoutFinalContext == true {
                     guard let manager = workspaceManager else {
@@ -3694,11 +3696,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
         record.finalContextConnectionIDForDiagnostics = finalContextConnectionID
         let initiallyDetached = mcpServer.isDetachedContextBuilderConnection(
+            route: mcpServer.routeResources,
             connectionID: finalContextConnectionID,
             runID: runID
         )
         guard activeAgentRuns.contains(runID), acceptsEvents(from: record) else {
-            mcpServer.discardDetachedContextBuilderTabContext(runID: runID)
+            mcpServer.discardDetachedContextBuilderTabContext(route: mcpServer.routeResources, runID: runID)
             return MCPServerViewModel.ContextBuilderTabContextCommitResult(
                 outcome: .staleOrNoLongerCurrent,
                 committedTab: nil
@@ -3744,6 +3747,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     },
                     isAuthoritativeDetached: {
                         mcpServer.isDetachedContextBuilderConnection(
+                            route: mcpServer.routeResources,
                             connectionID: cid,
                             runID: runID
                         )
@@ -3843,6 +3847,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     return false
                 }
                 let result = await mcpServer.commitContextBuilderTabContext(
+                    route: mcpServer.routeResources,
                     connectionID: cid,
                     expectedRunID: runID,
                     isStillCurrent: { [weak self, weak record] in
@@ -3891,6 +3896,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             cleanupMapping: { [weak self] cid in
                 guard let self else { return }
                 mcpServer.removeTabContext(
+                    route: mcpServer.routeResources,
                     forConnectionID: cid,
                     clientName: agentClientName,
                     windowID: nil,
@@ -3920,6 +3926,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
         if let clientName = agentClientName {
             mcpServer.removeTabContext(
+                route: mcpServer.routeResources,
                 forConnectionID: nil,
                 clientName: clientName,
                 windowID: windowID,
@@ -3933,7 +3940,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     }
 
     private func clearTabContextForAgent(agent: AgentProviderKind, runID: UUID) async {
-        mcpServer.discardDetachedContextBuilderTabContext(runID: runID)
+        mcpServer.discardDetachedContextBuilderTabContext(route: mcpServer.routeResources, runID: runID)
         guard activeAgentRuns.remove(runID) != nil else {
             debugLog("clearTabContextForAgent: runID=\(runID) not tracked, skipping")
             return
@@ -3955,6 +3962,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             )
 
             mcpServer.removeTabContext(
+                route: mcpServer.routeResources,
                 forConnectionID: cid,
                 clientName: agentClientName,
                 windowID: nil,
@@ -3965,6 +3973,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         // Run-level cleanup: ensure runID mappings & pending contexts are dropped
         if let clientName = agentClientName {
             mcpServer.removeTabContext(
+                route: mcpServer.routeResources,
                 forConnectionID: nil,
                 clientName: clientName,
                 windowID: windowID,

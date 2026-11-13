@@ -46,6 +46,7 @@ struct WorkspaceGitDiffArtifactSelectionService {
 extension MCPServerViewModel {
     @MainActor
     func selectCreatedFile(
+        route routeResources: MCPHostRouteResources,
         _ file: WorkspaceFileRecord?,
         resolvedContext: MCPResolvedTabContextSnapshot,
         metadata: MCPRequestMetadata,
@@ -75,7 +76,7 @@ extension MCPServerViewModel {
             mirrorToUIIfActive: context.worktreeBindings.isEmpty,
             { latestSelection in
                 guard !Task.isCancelled,
-                      fileToolLookupSnapshotIsCurrent(context, connectionID: connectionID),
+                      fileToolLookupSnapshotIsCurrent(route: routeResources, context, connectionID: connectionID),
                       fileToolBindingSourceIsCurrent(source, for: context)
                 else { return latestSelection }
                 accepted = true
@@ -98,7 +99,7 @@ extension MCPServerViewModel {
         }
 
         if let connectionID,
-           var latest = tabContextByConnectionID[connectionID],
+           var latest = routeResources.runRouteBindings.tabContextByConnectionID[connectionID],
            fileToolLookupSnapshotMatches(latest, context)
         {
             latest.selection = canonical
@@ -106,7 +107,7 @@ extension MCPServerViewModel {
                 workspaceID: workspaceID,
                 tabID: context.tabID
             ) ?? transaction.revision
-            tabContextByConnectionID[connectionID] = latest
+            routeResources.runRouteBindings.tabContextByConnectionID[connectionID] = latest
         }
         return nil
     }

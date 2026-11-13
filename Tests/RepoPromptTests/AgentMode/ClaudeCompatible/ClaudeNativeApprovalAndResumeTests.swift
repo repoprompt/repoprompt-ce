@@ -3223,7 +3223,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
                     XCTAssertNotEqual(result["isError"] as? Bool, true)
                     let routed = await manager.debugCachedRunID(for: connection.connectionID)
                     XCTAssertEqual(routed, runID)
-                    XCTAssertEqual(window.mcpServer.connectionID(forRunID: runID), connection.connectionID)
+                    XCTAssertEqual(window.mcpServer.runRouteBindings.connectionID(forRunID: runID), connection.connectionID)
                 }
                 let connection = try await connect(runID)
                 var epochs: [AgentRunTurnEpoch] = []
@@ -3237,7 +3237,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
                     await controller.emit(.stream(.init(type: "content", text: "route answer \(index)")))
                     await controller.emit(.turnsCompleted(turnIDs: [turnID], status: .completed))
                     await until("real-route terminal publishes") { live.runState == .completed && !live.runLifecycle.terminalCommitInProgress }
-                    XCTAssertEqual(window.mcpServer.connectionID(forRunID: runID), connection.connectionID)
+                    XCTAssertEqual(window.mcpServer.runRouteBindings.connectionID(forRunID: runID), connection.connectionID)
                 }
                 XCTAssertNotEqual(epochs[0], epochs[1])
                 let preparation = Gate()
@@ -3271,7 +3271,7 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
                 try await AsyncTestWait.waitUntil("Stop retires the process route", timeout: 3) {
                     await manager.debugCachedRunID(for: connection.connectionID) == nil
                 }
-                XCTAssertNil(window.mcpServer.connectionID(forRunID: runID))
+                XCTAssertNil(window.mcpServer.runRouteBindings.connectionID(forRunID: runID))
                 let successorID = UUID()
                 runIDs.append(successorID)
                 live.installRunID(successorID)

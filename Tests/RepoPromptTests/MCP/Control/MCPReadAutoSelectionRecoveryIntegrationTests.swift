@@ -82,7 +82,7 @@ import XCTest
                     )
                     XCTAssertTrue(manager.updateComposeTabStoredOnly(latest, inWorkspaceID: context.workspaceID))
                     XCTAssertFalse(try XCTUnwrap(
-                        server.tabContextByConnectionID[caller.connectionID]
+                        server.runRouteBindings.tabContextByConnectionID[caller.connectionID]
                     ).selection.selectedPaths.contains(addedElsewhere.path))
 
                     let arguments: [String: Any] = toolName == MCPWindowToolName.fileActions
@@ -110,7 +110,7 @@ import XCTest
                         foregroundUIPaths
                     )
                     XCTAssertEqual(
-                        server.tabContextByConnectionID[caller.connectionID]?.selection,
+                        server.runRouteBindings.tabContextByConnectionID[caller.connectionID]?.selection,
                         expected
                     )
                     await Self.cleanupEndpoint(caller, manager: fixture.networkManager)
@@ -144,7 +144,9 @@ import XCTest
                         connectionID: caller.connectionID, clientName: nil, windowID: context.window.windowID
                     )
                     let (resolved, lookup) = try await server.resolveMutationFileToolContext(
-                        from: metadata, toolName: MCPWindowToolName.fileActions
+                        route: server.routeResources,
+                        from: metadata,
+                        toolName: MCPWindowToolName.fileActions
                     )
                     let createdPath = context.rootURL.appendingPathComponent("CreatedBeforeRebind.swift")
                     _ = try await context.window.workspaceFileContextStore.createFile(
@@ -162,6 +164,7 @@ import XCTest
                     let replacement = try XCTUnwrap(createdTab)
                     await context.window.promptManager.switchComposeTab(replacement.id)
                     try server.bindTabForConnection(
+                        route: server.routeResources,
                         connectionID: caller.connectionID,
                         clientName: caller.clientName,
                         tabID: replacement.id,
@@ -177,7 +180,11 @@ import XCTest
                     let originalSelection = try XCTUnwrap(manager.composeTab(for: originalIdentity)).selection
                     let replacementSelection = try XCTUnwrap(manager.composeTab(for: replacementIdentity)).selection
                     let warning = await server.selectCreatedFile(
-                        file, resolvedContext: resolved, metadata: metadata, lookupContext: lookup
+                        route: server.routeResources,
+                        file,
+                        resolvedContext: resolved,
+                        metadata: metadata,
+                        lookupContext: lookup
                     )
                     XCTAssertTrue(try XCTUnwrap(warning).contains("selection was not confirmed"))
                     XCTAssertEqual(try String(contentsOf: createdPath, encoding: .utf8), "let durable = true\n")
@@ -226,7 +233,7 @@ import XCTest
                     let metadata = MCPServerViewModel.RequestMetadata(
                         connectionID: caller.connectionID, clientName: nil, windowID: context.window.windowID
                     )
-                    let firstDrain = try await server.drainReadFileAutoSelection(metadata: metadata, requirement: .mirroredSelectionAndMetrics)
+                    let firstDrain = try await server.drainReadFileAutoSelection(route: server.routeResources, metadata: metadata, requirement: .mirroredSelectionAndMetrics)
                     XCTAssertEqual(firstDrain, .completed)
                     let identity = WorkspaceSelectionIdentity(workspaceID: context.workspaceID, tabID: context.tabID)
                     XCTAssertTrue(try XCTUnwrap(manager.composeTab(for: identity)).selection.selectedPaths.contains(context.fileURL.path))
@@ -310,9 +317,9 @@ import XCTest
                     _ = try? await activeFirstReadTask.value
                     firstReadTask = nil
                     removedEndpoint = nil
-                    XCTAssertNil(server.tabContextByConnectionID[first.connectionID])
+                    XCTAssertNil(server.runRouteBindings.tabContextByConnectionID[first.connectionID])
                     XCTAssertEqual(
-                        server.tabContextByConnectionID[survivor.connectionID]?.tabID,
+                        server.runRouteBindings.tabContextByConnectionID[survivor.connectionID]?.tabID,
                         fixture.contextA.tabID
                     )
 
@@ -334,7 +341,7 @@ import XCTest
                     XCTAssertTrue(text.contains(fixture.contextA.fileURL.lastPathComponent), text)
                     XCTAssertTrue(text.contains(secondURL.lastPathComponent), text)
                     XCTAssertEqual(
-                        Set(server.tabContextByConnectionID[survivor.connectionID]?.selection.selectedPaths ?? []),
+                        Set(server.runRouteBindings.tabContextByConnectionID[survivor.connectionID]?.selection.selectedPaths ?? []),
                         Set([fixture.contextA.fileURL.path, secondURL.path])
                     )
 
@@ -380,7 +387,7 @@ import XCTest
                 arguments: ["op": "bind", "context_id": fixture.contextA.tabID.uuidString]
             )
             XCTAssertFalse(bind.rawJSON.contains("\"isError\":true"), bind.rawJSON)
-            await fixture.contextA.window.mcpServer.domainRoutingPublishTask?.value
+            await fixture.contextA.window.mcpServer.routeResources.settleRoutingPublications()
             return endpoint
         }
 

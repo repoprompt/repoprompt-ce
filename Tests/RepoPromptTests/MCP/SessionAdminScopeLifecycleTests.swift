@@ -9575,7 +9575,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     await network.debugRemoveConnection(predecessor.connectionID)
                     let reconnectedRun = await network.debugCachedRunID(for: initialConnection.connectionID)
                     XCTAssertEqual(reconnectedRun, runID)
-                    XCTAssertEqual(observerFixture.window.mcpServer.connectionID(forRunID: runID), initialConnection.connectionID)
+                    XCTAssertEqual(observerFixture.window.mcpServer.runRouteBindings.connectionID(forRunID: runID), initialConnection.connectionID)
                 }
                 connections[runID] = initialConnection
                 initialConnection.client.observeNotifications { data in

@@ -6,10 +6,11 @@ extension MCPServerViewModel {
     @MainActor
     @discardableResult
     func updateCurrentTabPrompt(
+        route routeResources: MCPHostRouteResources,
         toolName: String,
         mutation: (inout String) -> Void
     ) async throws -> String {
-        var (connectionID, context) = try await contextForCurrentRequest(toolName: toolName)
+        var (connectionID, context) = try await contextForCurrentRequest(route: routeResources, toolName: toolName)
         try Task.checkCancellation()
         if context.runID == nil {
             // A binding caches presentation, not write authority. Background-tab commits do not
@@ -58,7 +59,7 @@ extension MCPServerViewModel {
                 throw MCPError.invalidParams("The bound tab is no longer available for \(toolName)")
             }
             context.selectedMetaPromptIDs = tab.selectedMetaPromptIDs
-            tabContextByConnectionID[connectionID] = context
+            routeResources.runRouteBindings.tabContextByConnectionID[connectionID] = context
             if manager.activeWorkspace?.id == workspaceID,
                manager.activeWorkspace?.activeComposeTabID == tab.id,
                promptVM.activeComposeTabID == tab.id
@@ -68,7 +69,7 @@ extension MCPServerViewModel {
         } else {
             // Run-scoped Context Builder edits keep their existing snapshot-based commit behavior.
             // Ordinary prompt reads also retain their current snapshot policy.
-            tabContextByConnectionID[connectionID] = context
+            routeResources.runRouteBindings.tabContextByConnectionID[connectionID] = context
             await pushVirtualContextToUI(context)
         }
         return context.promptText

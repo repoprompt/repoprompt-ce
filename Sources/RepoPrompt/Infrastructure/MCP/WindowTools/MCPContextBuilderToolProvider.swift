@@ -430,7 +430,7 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
 
         let targetWindow = try dependencies.execution.requireTargetWindow()
         #if DEBUG
-            let invokingBinding = connectionID.map { targetWindow.mcpServer.connectionBindingSnapshot(forConnection: $0) }
+            let invokingBinding = connectionID.map { targetWindow.mcpServer.connectionBindingSnapshot(route: targetWindow.mcpServer.routeResources, forConnection: $0) }
             let startupObservation = targetWindow.contextBuilderAgentViewModel.startupObservationForTesting(
                 workspaceID: invokingBinding?.workspaceID, tabID: invokingBinding?.tabID,
                 invokingRunID: invokingBinding?.runID

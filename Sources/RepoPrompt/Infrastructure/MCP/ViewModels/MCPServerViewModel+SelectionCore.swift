@@ -61,11 +61,13 @@ extension MCPServerViewModel {
     /// Returns selection-aware workspace records for the resolved tab context snapshot.
     @MainActor
     func selectedRecordsForCurrentTabContext(
+        route routeResources: MCPHostRouteResources,
         metadataOverride: MCPRequestMetadata? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil
     ) async throws -> [WorkspaceFileRecord] {
         do {
             let collections = try await selectionCollectionsForCurrentTabContext(
+                route: routeResources,
                 metadataOverride: metadataOverride,
                 lookupContextOverride: lookupContextOverride
             )
@@ -77,8 +79,8 @@ extension MCPServerViewModel {
 
     /// Returns the identifiers of files selected in the resolved tab context snapshot.
     @MainActor
-    func selectedRecordIDsForCurrentTabContext() async throws -> Set<UUID> {
-        let collections = try await selectionCollectionsForCurrentTabContext()
+    func selectedRecordIDsForCurrentTabContext(route routeResources: MCPHostRouteResources) async throws -> Set<UUID> {
+        let collections = try await selectionCollectionsForCurrentTabContext(route: routeResources)
         var ids = Set(collections.selected.map(\.entry.file.id))
         if effectiveMCPCodeMapUsage(promptVM.codeMapUsage) == .selected {
             ids.formUnion(collections.codemap.map(\.entry.file.id))
@@ -136,6 +138,7 @@ extension MCPServerViewModel {
 
     @MainActor
     func selectionCollectionsForCurrentTabContext(
+        route routeResources: MCPHostRouteResources,
         metadataOverride: MCPRequestMetadata? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil
     ) async throws -> SelectionReplyAssembler.SelectionCollections {
@@ -145,6 +148,7 @@ extension MCPServerViewModel {
             await captureRequestMetadata()
         }
         let resolved = try resolveTabContextSnapshot(
+            route: routeResources,
             from: metadata,
             toolName: "selection",
             startMirroring: false
@@ -158,6 +162,7 @@ extension MCPServerViewModel {
 
     @MainActor
     func physicalSelectionForCurrentTabContext(
+        route routeResources: MCPHostRouteResources,
         metadataOverride: MCPRequestMetadata? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil
     ) async throws -> StoredSelection {
@@ -168,6 +173,7 @@ extension MCPServerViewModel {
                 await captureRequestMetadata()
             }
             let resolved = try resolveTabContextSnapshot(
+                route: routeResources,
                 from: metadata,
                 toolName: "selection",
                 startMirroring: false

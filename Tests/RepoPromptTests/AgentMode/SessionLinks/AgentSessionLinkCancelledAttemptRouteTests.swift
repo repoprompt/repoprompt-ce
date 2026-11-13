@@ -903,30 +903,30 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
                 connectionID: fixture.connectionID, clientName: clientName,
                 windowID: fixture.window.windowID, runPurpose: .agentModeRun
             )
-            let original = try XCTUnwrap(server.tabContextByConnectionID[fixture.connectionID])
+            let original = try XCTUnwrap(server.runRouteBindings.tabContextByConnectionID[fixture.connectionID])
             let binding = fixture.session.persistentSessionBindingIdentity
             let sessionCount = fixture.window.agentModeViewModel.sessions.count
-            let pendingCount = server.pendingPolicyRunIDMappingTokenIDByRunID.count
+            let pendingCount = server.runRouteBindings.pendingPolicyTokenIDByRunID.count
             let contextGeneration = original.readFileAutoSelectionGeneration
-            let live = await server.resolveAgentSessionLinkModelObserverEndpoint(metadata: metadata, network: fixture.manager)
+            let live = await server.resolveAgentSessionLinkModelObserverEndpoint(route: server.routeResources, metadata: metadata, network: fixture.manager)
             XCTAssertEqual(live, fixture.endpoint)
 
-            server.tabContextByConnectionID.removeValue(forKey: fixture.connectionID)
-            let cold = await server.resolveAgentSessionLinkModelObserverEndpoint(metadata: metadata, network: fixture.manager)
+            server.runRouteBindings.tabContextByConnectionID.removeValue(forKey: fixture.connectionID)
+            let cold = await server.resolveAgentSessionLinkModelObserverEndpoint(route: server.routeResources, metadata: metadata, network: fixture.manager)
             XCTAssertNil(cold)
-            XCTAssertNil(server.tabContextByConnectionID[fixture.connectionID], "Must not rehydrate a missing context")
-            server.tabContextByConnectionID[fixture.connectionID] = original
-            server.connectionIDByRunID[fixture.runID] = UUID()
-            let stale = await server.resolveAgentSessionLinkModelObserverEndpoint(metadata: metadata, network: fixture.manager)
+            XCTAssertNil(server.runRouteBindings.tabContextByConnectionID[fixture.connectionID], "Must not rehydrate a missing context")
+            server.runRouteBindings.tabContextByConnectionID[fixture.connectionID] = original
+            server.runRouteBindings.connectionIDByRunID[fixture.runID] = UUID()
+            let stale = await server.resolveAgentSessionLinkModelObserverEndpoint(route: server.routeResources, metadata: metadata, network: fixture.manager)
             XCTAssertNil(stale, "A displaced connection must not claim the successor's route")
-            server.connectionIDByRunID[fixture.runID] = fixture.connectionID
+            server.runRouteBindings.connectionIDByRunID[fixture.runID] = fixture.connectionID
             XCTAssertEqual(fixture.session.persistentSessionBindingIdentity, binding)
             XCTAssertEqual(fixture.window.agentModeViewModel.sessions.count, sessionCount)
-            XCTAssertEqual(server.pendingPolicyRunIDMappingTokenIDByRunID.count, pendingCount)
-            XCTAssertEqual(server.tabContextByConnectionID[fixture.connectionID]?.readFileAutoSelectionGeneration, contextGeneration)
-            XCTAssertEqual(server.connectionIDToRunID[fixture.connectionID], fixture.runID)
+            XCTAssertEqual(server.runRouteBindings.pendingPolicyTokenIDByRunID.count, pendingCount)
+            XCTAssertEqual(server.runRouteBindings.tabContextByConnectionID[fixture.connectionID]?.readFileAutoSelectionGeneration, contextGeneration)
+            XCTAssertEqual(server.runRouteBindings.connectionIDToRunID[fixture.connectionID], fixture.runID)
             await fixture.manager.removeConnection(fixture.connectionID)
-            let terminal = await server.resolveAgentSessionLinkModelObserverEndpoint(metadata: metadata, network: fixture.manager)
+            let terminal = await server.resolveAgentSessionLinkModelObserverEndpoint(route: server.routeResources, metadata: metadata, network: fixture.manager)
             XCTAssertNil(terminal, "A retained presentation snapshot cannot revive a terminal connection")
         }
 
@@ -980,7 +980,7 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
                 },
                 withHeartbeat: { _, _, _, _, operation in try await operation() },
                 resolveModelObserverEndpoint: { metadata in
-                    await window.mcpServer.resolveAgentSessionLinkModelObserverEndpoint(metadata: metadata, network: fixture.manager)
+                    await window.mcpServer.resolveAgentSessionLinkModelObserverEndpoint(route: window.mcpServer.routeResources, metadata: metadata, network: fixture.manager)
                 }, bridge: bridge
             )
             let args: [String: Value] = [
@@ -996,12 +996,12 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             XCTAssertNil(target.runID)
             XCTAssertTrue(target.items.isEmpty)
             target.saveDebounceTask?.cancel()
-            window.mcpServer.tabContextByConnectionID.removeValue(forKey: fixture.connectionID)
+            window.mcpServer.runRouteBindings.tabContextByConnectionID.removeValue(forKey: fixture.connectionID)
             do {
                 _ = try await service.execute(args: args)
                 XCTFail("Cold caller must fail closed")
             } catch { XCTAssertTrue(String(describing: error).contains("already-installed")) }
-            XCTAssertNil(window.mcpServer.tabContextByConnectionID[fixture.connectionID])
+            XCTAssertNil(window.mcpServer.runRouteBindings.tabContextByConnectionID[fixture.connectionID])
             XCTAssertEqual(target.saveRequestGeneration, before + 1)
         }
 

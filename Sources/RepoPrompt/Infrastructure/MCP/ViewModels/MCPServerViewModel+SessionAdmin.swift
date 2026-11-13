@@ -7,6 +7,7 @@ extension MCPServerViewModel {
     /// The caller endpoint resolver is the same exact run-routing resolver `agent_session_link` and
     /// `self_compact` use: it can never be supplied, hinted, or explicitly bound by the caller.
     func sessionAdminToolService(
+        route routeResources: MCPHostRouteResources,
         requireTargetWindow: @escaping @MainActor () throws -> WindowState
     ) -> SessionAdminMCPToolService {
         let scopes = AgentSessionLinkRuntimeBridge.shared.delegationScopes
@@ -14,7 +15,7 @@ extension MCPServerViewModel {
             captureRequestMetadata: { [self] in await captureRequestMetadata() },
             requireTargetWindow: requireTargetWindow,
             resolveObserverEndpoint: { [self] metadata, targetWindow in
-                await resolveAgentSessionLinkObserverEndpoint(metadata: metadata, targetWindow: targetWindow)
+                await resolveAgentSessionLinkObserverEndpoint(route: routeResources, metadata: metadata, targetWindow: targetWindow)
             },
             scopes: { scopes },
             administration: { AgentSessionLinkRuntimeBridge.shared.sessionAdministrationFrontDoor }

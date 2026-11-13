@@ -29,7 +29,7 @@ import XCTest
                 prerequisite.assertPrerequisiteError(error, outcome: "deferred")
                 prerequisite.assertMirrorWaiterSettled()
                 prerequisite.assertSelectionUnchanged()
-                XCTAssertTrue(prerequisite.server.isReadFileAutoSelectionContextCurrent(prerequisite.owner))
+                XCTAssertTrue(prerequisite.server.isReadFileAutoSelectionContextCurrent(route: prerequisite.server.routeResources, prerequisite.owner))
             }
         }
 
@@ -194,7 +194,7 @@ import XCTest
                 XCTAssertTrue(MCPToolExecutionCancelledError.matches(error))
                 prerequisite.assertMirrorWaiterSettled()
                 prerequisite.assertSelectionUnchanged()
-                XCTAssertTrue(prerequisite.server.isReadFileAutoSelectionContextCurrent(prerequisite.owner))
+                XCTAssertTrue(prerequisite.server.isReadFileAutoSelectionContextCurrent(route: prerequisite.server.routeResources, prerequisite.owner))
             }
         }
 
@@ -385,7 +385,7 @@ import XCTest
             }
 
             var coordinator: MCPReadFileAutoSelectionCoordinator {
-                server.readFileAutoSelectionCoordinator
+                server.readFileAutoSelectionCoordinator(route: server.routeResources)
             }
 
             var currentSelection: StoredSelection? {
@@ -469,7 +469,7 @@ import XCTest
                 XCTAssertNotEqual(acceptedSelection, before)
                 XCTAssertEqual(coordinator.debugSnapshot().mirrorWaiterCount, 0)
                 XCTAssertEqual(coordinator.debugSnapshot().mirrorWorkerCount, 1)
-                XCTAssertTrue(server.isReadFileAutoSelectionContextCurrent(owner))
+                XCTAssertTrue(server.isReadFileAutoSelectionContextCurrent(route: server.routeResources, owner))
             }
 
             /// Accepts a real read whose canonical apply is held before it mutates the selection.
@@ -490,7 +490,7 @@ import XCTest
                 acceptedSelection = before
                 XCTAssertEqual(currentSelection, before, "The held canonical apply must not have landed")
                 XCTAssertEqual(coordinator.debugSnapshot().canonicalWaiterCount, 0)
-                XCTAssertTrue(server.isReadFileAutoSelectionContextCurrent(owner))
+                XCTAssertTrue(server.isReadFileAutoSelectionContextCurrent(route: server.routeResources, owner))
             }
 
             func call(_ toolName: String, _ arguments: [String: MCP.Value]) async throws -> ToolReply {
@@ -532,7 +532,7 @@ import XCTest
                 let waiter = try XCTUnwrap(probe.events().last { $0.lane == .mirror && $0.kind == .waiterRegistered })
                 XCTAssertEqual(waiter.target, requiredTicket)
                 XCTAssertNotNil(waiter.waiterID)
-                XCTAssertTrue(server.isReadFileAutoSelectionContextCurrent(owner))
+                XCTAssertTrue(server.isReadFileAutoSelectionContextCurrent(route: server.routeResources, owner))
                 XCTAssertEqual(coordinator.debugSnapshot().mirrorWaiterCount, 1)
                 XCTAssertEqual(coordinator.debugSnapshot().liveMirrorDeadlineCount, 1)
             }
@@ -542,15 +542,15 @@ import XCTest
                 let waiter = try XCTUnwrap(probe.events().last { $0.lane == .canonical && $0.kind == .waiterRegistered })
                 XCTAssertEqual(waiter.target, acceptedSequence)
                 XCTAssertNotNil(waiter.waiterID)
-                XCTAssertTrue(server.isReadFileAutoSelectionContextCurrent(owner))
+                XCTAssertTrue(server.isReadFileAutoSelectionContextCurrent(route: server.routeResources, owner))
                 XCTAssertEqual(coordinator.debugSnapshot().canonicalWaiterCount, 1)
             }
 
             /// Releases the exact binding while the tool waits, which invalidates its drain context.
             func invalidateBinding() {
-                server.removeTabContext(forConnectionID: connection.connectionID, clientName: nil, windowID: owner.windowID)
-                XCTAssertNil(server.tabContextByConnectionID[connection.connectionID])
-                XCTAssertFalse(server.isReadFileAutoSelectionContextCurrent(owner))
+                server.removeTabContext(route: server.routeResources, forConnectionID: connection.connectionID, clientName: nil, windowID: owner.windowID)
+                XCTAssertNil(server.runRouteBindings.tabContextByConnectionID[connection.connectionID])
+                XCTAssertFalse(server.isReadFileAutoSelectionContextCurrent(route: server.routeResources, owner))
             }
 
             func releaseMirror() async throws {
@@ -671,7 +671,10 @@ import XCTest
                 server.setReadFileAutoSelectionMirrorGateForTesting(nil)
                 server.setReadFileAutoSelectionCanonicalApplyGateForTesting(nil)
                 server.removeTabContext(
-                    forConnectionID: connection.connectionID, clientName: nil, windowID: owner.windowID
+                    route: server.routeResources,
+                    forConnectionID: connection.connectionID,
+                    clientName: nil,
+                    windowID: owner.windowID
                 )
                 if canonicalGate != nil, probe.events().contains(where: { $0.lane == .canonical && $0.kind == .workerStarted }) {
                     let result = await XCTWaiter.fulfillment(of: [probe.canonicalStopped], timeout: 5)

@@ -1094,28 +1094,26 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         )
     }
 
-    /// Routes a read-only interaction inspection to the exact owning window. Never focuses it.
+    /// Inspects the canonical writer's interaction runtime without activating presentation.
     func agentSessionLinkPendingInteraction(
         for candidate: AgentSessionLinkEndpointCandidate
     ) -> AgentSessionLinkPendingInteractionInspection {
-        guard !isTerminating,
-              let window = window(withID: candidate.windowID),
-              !window.isClosing
+        guard !isTerminating, window(withID: candidate.windowID)?.isClosing == false,
+              let runtime = agentSessionLinkCommandRuntime(for: candidate)
         else { return .none }
-        return window.agentModeViewModel.agentSessionLinkPendingInteraction(for: candidate)
+        return runtime.agentSessionLinkPendingInteraction(for: candidate)
     }
 
-    /// Routes one observer answer to the exact owning window, refusing during teardown.
+    /// Routes an observer answer through the target writer, retaining request-scoped authority.
     func agentSessionLinkRespondToPendingInteraction(
         for candidate: AgentSessionLinkEndpointCandidate,
         request: AgentSessionLinkInteractionResponseRequest,
         authorize: @escaping @MainActor @Sendable () async -> Bool
     ) async -> AgentSessionLinkInteractionResponseOutcome {
-        guard !isTerminating,
-              let window = window(withID: candidate.windowID),
-              !window.isClosing
+        guard !isTerminating, window(withID: candidate.windowID)?.isClosing == false,
+              let runtime = agentSessionLinkCommandRuntime(for: candidate)
         else { return .unavailable }
-        return await window.agentModeViewModel.agentSessionLinkRespondToPendingInteraction(
+        return await runtime.agentSessionLinkRespondToPendingInteraction(
             for: candidate,
             request: request,
             authorize: authorize
