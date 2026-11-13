@@ -660,7 +660,21 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
         XCTAssertNil(missing, "a missing index reads as unavailable")
         XCTAssertFalse(indexFileExists(), "the poll/wait census path must never backfill the index")
 
-        // The full listing path does backfill, which is exactly what the hot path avoids.
+        let folder = WorkspaceSessionSidecarMigration.workspaceDirectory(for: workspace, root: root)
+            .appendingPathComponent("AgentSessions", isDirectory: true)
+        // Neither reader may create an absent history. Backfill applies only to an existing store.
+        let absent = try await AgentSessionDataService.shared.listAgentSessionsMeta(for: workspace)
+        XCTAssertTrue(absent.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.deletingLastPathComponent().path))
+        XCTAssertFalse(indexFileExists())
+
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let unindexed = await viewModel.agentSessionLinkPersistedSubagentMetaLoader(workspace)
+        XCTAssertNil(unindexed)
+        XCTAssertFalse(indexFileExists(), "the census must not backfill even an existing store")
+
+        // Only the full listing path backfills the explicitly seeded empty store.
         _ = try await AgentSessionDataService.shared.listAgentSessionsMeta(for: workspace)
         XCTAssertTrue(indexFileExists())
         let cached = await viewModel.agentSessionLinkPersistedSubagentMetaLoader(workspace)

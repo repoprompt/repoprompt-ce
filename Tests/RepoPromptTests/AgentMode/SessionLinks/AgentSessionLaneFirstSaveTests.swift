@@ -2473,37 +2473,58 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
     }
 
     func testUnreadablePersistedChildAncestorCannotProveRetirementSafe() async throws {
-        try await withFixture { fixture in
-            let dataService = AgentSessionDataService.shared
-            let protectedRoot = fixture.root.appendingPathComponent("protected", isDirectory: true)
-            try FileManager.default.createDirectory(at: protectedRoot, withIntermediateDirectories: true)
-            await dataService.test_setWorkspaceRootOverride(protectedRoot)
-            do {
-                let parentID = UUID()
-                var child = AgentSession(id: UUID(), name: "Unindexed child", savedAt: Date())
-                child.parentSessionID = parentID
-                child.lastRunState = AgentSessionRunState.running.rawValue
-                let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
-                _ = try await dataService.saveAgentSession(child, for: workspace)
-                try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: protectedRoot.path)
-                defer {
-                    try? FileManager.default.setAttributes(
-                        [.posixPermissions: 0o700], ofItemAtPath: protectedRoot.path
-                    )
-                }
+        for ephemeral in [true, false] {
+            try await withFixture(ephemeral: ephemeral) { fixture in
+                let dataService = AgentSessionDataService.shared
+                let protectedRoot = fixture.root.appendingPathComponent("protected", isDirectory: true)
+                try FileManager.default.createDirectory(at: protectedRoot, withIntermediateDirectories: true)
+                await dataService.test_setWorkspaceRootOverride(protectedRoot)
                 do {
-                    _ = try await dataService.persistedChildRetirementRecords(workspace: workspace)
-                    XCTFail("inaccessible inventory was treated as child-free")
-                } catch {}
-                let retirementBlocked = await WindowStatesManager.shared.agentSessionLinkHasPersistedActiveChildSessions(
-                    parentSessionID: parentID
-                )
-                XCTAssertTrue(retirementBlocked)
-            } catch {
+                    let parentID = UUID()
+                    var child = AgentSession(id: UUID(), name: "Unindexed child", savedAt: Date())
+                    child.parentSessionID = parentID
+                    child.lastRunState = AgentSessionRunState.running.rawValue
+                    let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+                    let saved = try await dataService.saveAgentSession(child, for: workspace)
+                    let sessions = WorkspaceSessionSidecarMigration.workspaceDirectory(for: workspace, root: protectedRoot)
+                        .appendingPathComponent("AgentSessions", isDirectory: true)
+                    XCTAssertEqual(
+                        saved.deletingLastPathComponent().resolvingSymlinksInPath(),
+                        sessions.resolvingSymlinksInPath()
+                    )
+                    XCTAssertTrue(FileManager.default.fileExists(atPath: saved.path))
+                    let insideFixtureRoot = sessions.resolvingSymlinksInPath().pathComponents.starts(
+                        with: fixture.root.resolvingSymlinksInPath().pathComponents
+                    )
+                    XCTAssertEqual(insideFixtureRoot, !ephemeral, "Exercise both temporary and durable placement")
+                    let readable = try await dataService.persistedChildRetirementRecords(workspace: workspace)
+                    XCTAssertTrue(readable.contains {
+                        $0.sessionID == child.id && $0.parentSessionID == parentID && $0.blocksRetirement
+                    })
+                    // Ephemeral sidecars deliberately ignore the profile/custom-root override.
+                    // Protect the actual inventory ancestor, never the shared process scratch root.
+                    let ancestor = sessions.deletingLastPathComponent()
+                    defer {
+                        try? FileManager.default.setAttributes(
+                            [.posixPermissions: 0o700], ofItemAtPath: ancestor.path
+                        )
+                    }
+                    try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: ancestor.path)
+                    XCTAssertThrowsError(try FileManager.default.contentsOfDirectory(at: sessions, includingPropertiesForKeys: nil))
+                    do {
+                        _ = try await dataService.persistedChildRetirementRecords(workspace: workspace)
+                        XCTFail("inaccessible inventory was treated as child-free")
+                    } catch {}
+                    let retirementBlocked = await WindowStatesManager.shared.agentSessionLinkHasPersistedActiveChildSessions(
+                        parentSessionID: parentID
+                    )
+                    XCTAssertTrue(retirementBlocked)
+                } catch {
+                    await dataService.test_setWorkspaceRootOverride(nil)
+                    throw error
+                }
                 await dataService.test_setWorkspaceRootOverride(nil)
-                throw error
             }
-            await dataService.test_setWorkspaceRootOverride(nil)
         }
     }
 

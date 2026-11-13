@@ -167,9 +167,15 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
     }
 
     func testHandoffRejectsStorageRootChangeDuringImageCopyWithoutRebindingTheChild() async throws {
-        try await withFixture(bindSource: false) { fixture in
+        // Only durable placement follows custom storage changes. Ephemeral placement is
+        // intentionally stable outside all profile/custom roots for the process lifetime.
+        try await withFixture(bindSource: false, ephemeral: false) { fixture in
             let (store, attachment, parentImage) = try await installHandoffImage(fixture)
             let manager = fixture.window.workspaceManager
+            XCTAssertFalse(try XCTUnwrap(manager.activeWorkspace).isEphemeral)
+            XCTAssertTrue(store.rootURL.resolvingSymlinksInPath().pathComponents.starts(
+                with: fixture.git.sandbox.resolvingSymlinksInPath().pathComponents
+            ))
             // Keep the test persistence override, but resolve it from the live workspace just as
             // production does. A custom storage update does not replace the session binding.
             fixture.viewModel.sessionAttachmentsRootOverride = { [weak manager] in
@@ -1133,10 +1139,13 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
         let sourceTabID: UUID
         let sourceSessionID: UUID
         let sourceSession: AgentModeViewModel.TabSession
+        let sidecarStorage: WorkspaceFixtureStorage
+        let ephemeral: Bool
+        let previousStoragePreference: Any?
     }
 
-    private func withFixture(bindSource: Bool, _ body: (Fixture) async throws -> Void) async throws {
-        let fixture = try await makeFixture(bindSource: bindSource)
+    private func withFixture(bindSource: Bool, ephemeral: Bool = true, _ body: (Fixture) async throws -> Void) async throws {
+        let fixture = try await makeFixture(bindSource: bindSource, ephemeral: ephemeral)
         do {
             try await body(fixture)
         } catch {
@@ -1146,13 +1155,19 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
         await cleanup(fixture)
     }
 
-    private func makeFixture(bindSource: Bool) async throws -> Fixture {
+    private func makeFixture(bindSource: Bool, ephemeral: Bool) async throws -> Fixture {
         let git = try ReviewGitRepositoryFixture(name: "AgentSessionHandoffWorktreeBindingTests")
         let logicalRootURL = try git.makeRepository(named: "logical", files: ["README.md": "fixture\n"])
         let linkedWorktreeURL = git.sandbox.appendingPathComponent("linked", isDirectory: true)
         try git.runGit(["worktree", "add", "--detach", linkedWorktreeURL.path, "HEAD"], at: logicalRootURL)
         let identity = try XCTUnwrap(GitWorktreeIdentityResolver.resolve(atWorkTreeRoot: linkedWorktreeURL))
 
+        let sidecarStorage = WorkspaceFixtureStorage(root: git.sandbox)
+        let previousStoragePreference = UserDefaults.standard.object(forKey: "GlobalCustomStorageURL")
+        if !ephemeral {
+            // Durable creation captures its document root: isolate it before building the manager.
+            UserDefaults.standard.set(git.sandbox.appendingPathComponent("workspace-storage").path, forKey: "GlobalCustomStorageURL")
+        }
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
         let window = WindowState()
@@ -1161,11 +1176,12 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
         await window.workspaceManager.awaitInitialized()
 
         do {
-            let workspace = window.workspaceManager.createWorkspace(
+            let created = window.workspaceManager.createWorkspace(
                 name: "Handoff worktree \(UUID().uuidString.prefix(8))",
                 repoPaths: [logicalRootURL.path],
-                ephemeral: true
+                ephemeral: ephemeral
             )
+            let workspace = ephemeral ? sidecarStorage.isolate(created, in: window.workspaceManager) : created
             await window.workspaceManager.switchWorkspace(
                 to: workspace,
                 saveState: false,
@@ -1179,6 +1195,7 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
                 window.workspaceManager.workspaces.firstIndex(where: { $0.id == activeWorkspace.id })
             )
             window.workspaceManager.workspaces[workspaceIndex].customStoragePath = git.sandbox.appendingPathComponent("sessions", isDirectory: true)
+            _ = sidecarStorage.track(window.workspaceManager.workspaces[workspaceIndex])
             let sourceBindings: [AgentSessionWorktreeBinding] = bindSource ? [AgentSessionWorktreeBinding(
                 id: "primary",
                 repositoryID: identity.repository.repositoryID,
@@ -1248,12 +1265,19 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
                 store: store,
                 sourceTabID: sourceTabID,
                 sourceSessionID: sourceSessionID,
-                sourceSession: sourceSession
+                sourceSession: sourceSession,
+                sidecarStorage: sidecarStorage,
+                ephemeral: ephemeral,
+                previousStoragePreference: previousStoragePreference
             )
         } catch {
             window.beginClose()
             await window.tearDown()
             WindowStatesManager.shared.unregisterWindowState(window)
+            await sidecarStorage.remove()
+            if !ephemeral {
+                await restoreStoragePreference(previousStoragePreference)
+            }
             git.cleanup()
             throw error
         }
@@ -1418,6 +1442,19 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
         await fixture.window.tearDown()
         await drainFixtureSaves(fixture.viewModel)
         WindowStatesManager.shared.unregisterWindowState(fixture.window)
+        await fixture.sidecarStorage.remove()
+        if !fixture.ephemeral {
+            await restoreStoragePreference(fixture.previousStoragePreference)
+        }
         fixture.git.cleanup()
+    }
+
+    private func restoreStoragePreference(_ previous: Any?) async {
+        await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
+        if let previous {
+            UserDefaults.standard.set(previous, forKey: "GlobalCustomStorageURL")
+        } else {
+            UserDefaults.standard.removeObject(forKey: "GlobalCustomStorageURL")
+        }
     }
 }
