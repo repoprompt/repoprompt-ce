@@ -95,6 +95,37 @@ final class PathSearchIndexRecoveryTests: XCTestCase {
         XCTAssertEqual(compositeHits.map(\.index), [6])
         assertMappings(compositeHits, in: index, paths: paths, expectedFilenames: expectedFilenames)
 
+        // Literal queries remain unanchored, case-insensitive substring matches.
+        let caseInsensitiveHits = await index.search("alpha.SWIFT", limit: 20)
+        XCTAssertEqual(caseInsensitiveHits.map(\.index), [2, 3])
+        assertMappings(caseInsensitiveHits, in: index, paths: paths, expectedFilenames: expectedFilenames)
+        let missingHits = await index.search("does-not-exist", limit: 20)
+        XCTAssertEqual(missingHits, [])
+        let punctuationIndex = PathSearchIndex(paths: ["Alpha.swift", "AlphaXswift", "dir/a+b", "dir/ab"])
+        XCTAssertEqual(punctuationIndex.searchSynchronously("Alpha.swift", limit: 10).map(\.index), [0])
+        XCTAssertEqual(punctuationIndex.searchSynchronously("a+b", limit: 10).map(\.index), [2])
+
+        // Darwin rejects an empty ERE; the empty query must still match every key,
+        // including duplicate paths, in the authoritative lexical order at every limit.
+        let allIndices = [0, 4, 2, 3, 1, 6, 5]
+        for limit in [0, 1, 3, paths.count, paths.count + 1] {
+            let hits = await index.search("", limit: limit)
+            XCTAssertEqual(hits.map(\.index), Array(allIndices.prefix(limit)))
+            assertMappings(hits, in: index, paths: paths, expectedFilenames: expectedFilenames)
+        }
+
+        let wildcardCases: [(String, [Int])] = [
+            ("*", allIndices), ("**", allIndices), ("***", allIndices), ("****", allIndices),
+            ("*.swift", [0, 4, 2, 3, 1]), ("**/*.swift", [0, 4, 2, 3, 1]),
+            ("*?swift", [0, 4, 2, 3, 1]), ("*Alpha.swift", [2, 3]),
+            ("*/Sources/*", [6]), ("Sources/*", []), ("Sources/**", [4, 2, 3, 1])
+        ]
+        for (query, expected) in wildcardCases {
+            let hits = await index.search(query, limit: paths.count + 1)
+            XCTAssertEqual(hits.map(\.index), expected, query)
+            assertMappings(hits, in: index, paths: paths, expectedFilenames: expectedFilenames)
+        }
+
         let zeroLimitHits = await index.search("swift", limit: 0)
         XCTAssertEqual(zeroLimitHits, [])
         XCTAssertEqual(wildcardHits.count, 5)

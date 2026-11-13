@@ -588,6 +588,7 @@ final class WorkspaceCodemapGraphIncrementalIndexOwningTests: XCTestCase {
         let decomposed = "Sources/Cafe\u{301}.swift"
         var strings = [
             "", "a", "ab", "abc", "b", "Sources/A.swift", "Sources/A.swift.bak", "Sources/a.swift",
+            "a\0b", "a\0c", NSString(string: composed) as String,
             composed, decomposed, "\u{E9}", "e\u{301}", "\u{1E9B}\u{323}", "\u{17F}\u{323}\u{307}"
         ]
         for _ in 0 ..< 200 {
@@ -603,6 +604,14 @@ final class WorkspaceCodemapGraphIncrementalIndexOwningTests: XCTestCase {
                     lhs.utf8.lexicographicallyPrecedes(rhs.utf8),
                     "\(lhs) vs \(rhs)"
                 )
+                let expected: ComparisonResult = if lhs.utf8.elementsEqual(rhs.utf8) {
+                    .orderedSame
+                } else if lhs.utf8.lexicographicallyPrecedes(rhs.utf8) {
+                    .orderedAscending
+                } else {
+                    .orderedDescending
+                }
+                XCTAssertEqual(WorkspaceFileContextStore.compareUTF8Binary(lhs, rhs), expected, "\(lhs) vs \(rhs)")
             }
         }
         XCTAssertEqual(composed, decomposed)

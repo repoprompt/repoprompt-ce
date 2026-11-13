@@ -10138,21 +10138,11 @@ package actor WorkspaceFileContextStore {
     }
 
     static func compareUTF8Binary(_ lhs: String, _ rhs: String) -> ComparisonResult {
-        var lhsIterator = lhs.utf8.makeIterator()
-        var rhsIterator = rhs.utf8.makeIterator()
-        while true {
-            switch (lhsIterator.next(), rhsIterator.next()) {
-            case let (lhsByte?, rhsByte?):
-                if lhsByte < rhsByte { return .orderedAscending }
-                if lhsByte > rhsByte { return .orderedDescending }
-            case (nil, nil):
-                return .orderedSame
-            case (nil, _?):
-                return .orderedAscending
-            case (_?, nil):
-                return .orderedDescending
-            }
-        }
+        // Reuse the contiguous-byte fast path and its non-contiguous fallback.
+        // String equality is not a valid shortcut: NFC and NFD can have different bytes.
+        if WorkspaceCodemapGraphOrdering.utf8Precedes(lhs, rhs) { return .orderedAscending }
+        if WorkspaceCodemapGraphOrdering.utf8Precedes(rhs, lhs) { return .orderedDescending }
+        return .orderedSame
     }
 
     private static func searchCatalogFilePrecedes(_ lhs: WorkspaceFileRecord, _ rhs: WorkspaceFileRecord) -> Bool {

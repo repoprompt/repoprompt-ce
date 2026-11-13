@@ -60,8 +60,11 @@ extension AIModel {
     static func openAICustomResponsesVariants(for customModelName: String) -> [AIModel] {
         let baseName = customModelName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !baseName.isEmpty else { return [] }
-        return [.openaiCustomResponses(name: baseName)]
-            + openAICustomReasoningEfforts.map { .openaiCustomReasoning(name: baseName, effort: $0) }
+        var variants: [AIModel] = [.openaiCustomResponses(name: baseName)]
+        for effort in openAICustomReasoningEfforts {
+            variants.append(.openaiCustomReasoning(name: baseName, effort: effort))
+        }
+        return variants
     }
 
     private static let baseModelDefinitions: [ModelInfo] = [
