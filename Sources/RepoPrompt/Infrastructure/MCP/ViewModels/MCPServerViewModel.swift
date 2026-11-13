@@ -1355,7 +1355,7 @@ final class MCPServerViewModel: ObservableObject {
                 invocationContext: invocationContext,
                 modelOnly: ServerNetworkManager.isMemoryOnlyModelCall(toolName: name, arguments: args)
             ) { [weak self] in
-                guard let self else {
+                guard self != nil else {
                     throw MCPError.internalError("Window deallocated during \(name)")
                 }
                 return try await implementation(MCPAppToolInvocation(toolName: name, windowID: windowID, context: invocationContext), args)

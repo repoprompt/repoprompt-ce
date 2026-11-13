@@ -99,7 +99,7 @@ final class MCPHostRouteResources {
             )
             let updated = await coordinator.registerWindow(updatedDescriptor, operationID: UUID())
             guard !isClosing, updated.disposition != .staleGeneration else { return }
-            self.descriptor = updated.snapshot.windows.first { $0.windowID == identity.routeID }
+            self.descriptor = updated.snapshot.windows.first { $0.windowID == self.identity.routeID }
             var registration = updated.snapshot.connections.first {
                 $0.registration.connectionID == connectionID
             }?.registration
