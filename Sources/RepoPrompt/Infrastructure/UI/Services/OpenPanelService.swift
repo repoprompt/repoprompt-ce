@@ -27,18 +27,8 @@ final class OpenPanelService {
         if let message { panel.message = message }
         if let startingDirectory { panel.directoryURL = startingDirectory }
 
-        // Prefer sheet modal to avoid runModal() blocking the main run loop.
-        if let window = NSApp.keyWindow ?? NSApp.mainWindow {
-            return await withCheckedContinuation { cont in
-                panel.beginSheetModal(for: window) { response in
-                    cont.resume(returning: response == .OK ? panel.url : nil)
-                }
-            }
-        } else {
-            // Fallback: no window available.
-            let response = panel.runModal()
-            return response == .OK ? panel.url : nil
-        }
+        let response = await present(panel, attachedTo: nil)
+        return response == .OK ? panel.url : nil
     }
 
     func pickFiles(
@@ -62,15 +52,31 @@ final class OpenPanelService {
         if let message { panel.message = message }
         if let startingDirectory { panel.directoryURL = startingDirectory }
 
+        let response = await present(panel, attachedTo: window)
+        return response == .OK ? panel.urls : []
+    }
+
+    /// Presents the panel without blocking the main actor.
+    ///
+    /// Never use `runModal()` here: it spins a nested modal run loop inside the current
+    /// MainActor job, so the main queue (and every other MainActor task) stalls until the
+    /// user dismisses the panel, which the app-hang watchdog reports as a hang.
+    private func present(_ panel: NSOpenPanel, attachedTo window: NSWindow?) async -> NSApplication.ModalResponse {
         if let window = window ?? NSApp.keyWindow ?? NSApp.mainWindow {
             return await withCheckedContinuation { cont in
                 panel.beginSheetModal(for: window) { response in
-                    cont.resume(returning: response == .OK ? panel.urls : [])
+                    cont.resume(returning: response)
                 }
             }
         }
 
-        let response = panel.runModal()
-        return response == .OK ? panel.urls : []
+        // No window to attach a sheet to: present the panel as a standalone window
+        // asynchronously instead of running a blocking modal loop.
+        NSApp.activate(ignoringOtherApps: true)
+        return await withCheckedContinuation { cont in
+            panel.begin { response in
+                cont.resume(returning: response)
+            }
+        }
     }
 }
