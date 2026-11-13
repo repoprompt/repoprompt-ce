@@ -42,6 +42,22 @@ final class MCPRunRouteBindings {
         case refusedOwnerUnavailable
     }
 
+    struct DetachedContextBuilderTabContext {
+        let connectionID: UUID
+        let context: MCPTabContextSnapshot
+    }
+
+    /// Immutable predecessor lanes retain the exact connection and selection generation.
+    struct ReadFileAutoSelectionHandoverLineage {
+        let successorKey: MCPReadFileAutoSelectionCoordinator.ContextKey
+        let predecessorKeys: [MCPReadFileAutoSelectionCoordinator.ContextKey]
+    }
+
+    var pendingRunScopedTabContexts = PendingRunScopedContextStore()
+    var lastContextByClientAndWindow: [String: [Int: MCPTabContextSnapshot]] = [:]
+    var readFileAutoSelectionHandoverLineageByConnectionID: [UUID: ReadFileAutoSelectionHandoverLineage] = [:]
+    var nextReadFileAutoSelectionBindingGeneration: UInt64 = 0
+    var detachedContextBuilderTabContextByRunID: [UUID: DetachedContextBuilderTabContext] = [:]
     var tabContextByConnectionID: [UUID: MCPTabContextSnapshot] = [:]
     var connectionIDByRunID: [UUID: UUID] = [:]
     var connectionIDToRunID: [UUID: UUID] = [:]

@@ -32,104 +32,6 @@ extension MCPServerViewModel {
         )
     }
 
-    @MainActor
-    private func ensureDomainWindowRegistered(
-        activeWorkspaceID: UUID?,
-        activeContextID: UUID?,
-        presentationRevision: UInt64
-    ) async -> DomainWindowDescriptor? {
-        await routeResources.ensureRegistered(
-            workspaceID: activeWorkspaceID, contextID: activeContextID, revision: presentationRevision
-        )
-    }
-
-    /// Publishes a presentation-cache transition to the runtime routing authority.
-    /// M3 read providers may continue reading the local cache, but new binding decisions
-    /// and run launch reservations must use the coordinator snapshot/token APIs.
-    @MainActor
-    func publishDomainRoutingBinding(connectionID: UUID, context: TabContextSnapshot) {
-        guard let coordinator = domainRoutingCoordinator else { return }
-        if domainWindowPresentationRevision < .max {
-            domainWindowPresentationRevision += 1
-        }
-        let presentationRevision = domainWindowPresentationRevision
-        let binding: DomainBinding = if let workspaceID = context.workspaceID {
-            if let runID = context.runID {
-                .runScoped(
-                    runID: runID,
-                    context: DomainContextIdentity(workspaceID: workspaceID, contextID: context.tabID)
-                )
-            } else {
-                .context(
-                    DomainContextIdentity(workspaceID: workspaceID, contextID: context.tabID),
-                    explicit: context.explicitlyBound
-                )
-            }
-        } else {
-            .appPresentationWindow(context.windowID)
-        }
-        let previousPublish = domainRoutingPublishTask
-        domainRoutingPublishTask = Task { @MainActor [weak self] in
-            await previousPublish?.value
-            guard let self, !self.domainRoutingWindowIsClosing else { return }
-            guard let descriptor = await ensureDomainWindowRegistered(
-                activeWorkspaceID: context.workspaceID,
-                activeContextID: context.tabID,
-                presentationRevision: presentationRevision
-            ),
-                !domainRoutingWindowIsClosing
-            else { return }
-            let updatedDescriptor = DomainWindowDescriptor(
-                windowID: descriptor.windowID,
-                generation: descriptor.generation,
-                activeWorkspaceID: context.workspaceID,
-                activeContextID: context.tabID,
-                isClosing: false,
-                presentationRevision: presentationRevision
-            )
-            let updated = await coordinator.registerWindow(updatedDescriptor, operationID: UUID())
-            guard !domainRoutingWindowIsClosing, updated.disposition != .staleGeneration else { return }
-            domainWindowDescriptor = updated.snapshot.windows.first {
-                $0.windowID == context.windowID
-            }
-
-            var registration = updated.snapshot.connections.first {
-                $0.registration.connectionID == connectionID
-            }?.registration
-            if registration == nil {
-                // Re-checked above so a straggler cannot resurrect a connection binding
-                // after `unregisterDomainRoutingWindow` tore the window down.
-                let registered = await coordinator.registerConnection(
-                    connectionID: connectionID,
-                    operationID: UUID()
-                )
-                registration = registered.snapshot.connections.first {
-                    $0.registration.connectionID == connectionID
-                }?.registration
-            }
-            guard let registration else { return }
-            routeResources.retainConnection(registration)
-            guard !domainRoutingWindowIsClosing else { return }
-            let bound = await coordinator.bind(
-                connection: registration,
-                binding: binding,
-                operationID: UUID()
-            )
-            if bound.disposition != .applied, bound.disposition != .unchanged {
-                logger.warning("Domain routing bind rejected: \(bound.diagnostic ?? String(describing: bound.disposition))")
-            }
-        }
-    }
-
-    @MainActor
-    func publishDomainRoutingRelease(connectionID: UUID) {
-        let previousPublish = domainRoutingPublishTask
-        domainRoutingPublishTask = Task { @MainActor [resources = routeResources] in
-            await previousPublish?.value
-            await resources.releaseDisconnectedConnection(connectionID)
-        }
-    }
-
     /// Decides whether a scoped read may (re)issue `coordinator.bind` for its connection.
     ///
     /// The binding publication that follows a routed tab switch is asynchronous, so a connection
@@ -549,9 +451,6 @@ extension MCPServerViewModel {
     func unregisterDomainRoutingWindow() async {
         routeResources.closeDomainAdmission()
         domainReadAppExecutionContexts.removeAll()
-        let pendingPublish = domainRoutingPublishTask
-        domainRoutingPublishTask = nil
-        await pendingPublish?.value
         await routeResources.closeDomainRoute()
     }
 }

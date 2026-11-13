@@ -18,11 +18,6 @@ import RepoPromptWorkspaceCore
 #endif
 
 extension MCPServerViewModel {
-    struct DetachedContextBuilderTabContext {
-        let connectionID: UUID
-        let context: MCPTabContextSnapshot
-    }
-
     struct ContextBuilderCommittedTabSnapshot {
         let identity: WorkspaceSelectionIdentity
         let nestedRunID: UUID
@@ -183,14 +178,6 @@ extension MCPServerViewModel {
 
     typealias PendingPolicyRunIDMappingToken = MCPRunRouteBindings.PendingPolicyToken
 
-    /// Ordered, immutable coordinator lanes displaced by one pending-policy replacement.
-    /// Keys retain connection and binding-generation identity so later replacement churn cannot
-    /// redirect a drain to another tab, workspace, run, or context generation.
-    struct ReadFileAutoSelectionHandoverLineage {
-        let successorKey: MCPReadFileAutoSelectionCoordinator.ContextKey
-        let predecessorKeys: [MCPReadFileAutoSelectionCoordinator.ContextKey]
-    }
-
     enum PendingPolicyRunIDMappingRollbackResult: Equatable {
         case restored
         case supersededBySameConnection
@@ -252,145 +239,6 @@ extension MCPServerViewModel {
 
     typealias ConnectionBindingSnapshot = MCPConnectionBindingSnapshot
 
-    @MainActor
-    struct PendingRunScopedContextStore {
-        private var storage: [String: [Int: [UUID: MCPTabContextSnapshot]]] = [:]
-
-        var isEmpty: Bool {
-            storage.isEmpty
-        }
-
-        func contains(clientName: String, windowID: Int, runID: UUID) -> Bool {
-            storage[clientName]?[windowID]?[runID] != nil
-        }
-
-        func contains(clientName: String, runID: UUID) -> Bool {
-            storage[clientName]?.values.contains { $0[runID] != nil } == true
-        }
-
-        @discardableResult
-        mutating func enqueueReplacing(_ context: MCPTabContextSnapshot, clientName: String, windowID: Int) -> Int {
-            guard let runID = context.runID else { return queueLength(clientName: clientName, windowID: windowID) }
-
-            // Keep exactly one pending entry per run for a client. If the run is reinstalled
-            // for a different window/tab before a socket claims it, the newest exact run
-            // context wins deterministically instead of leaving FIFO order to decide.
-            if var windowMap = storage[clientName] {
-                for existingWindowID in Array(windowMap.keys) {
-                    windowMap[existingWindowID]?.removeValue(forKey: runID)
-                    if windowMap[existingWindowID]?.isEmpty == true {
-                        windowMap.removeValue(forKey: existingWindowID)
-                    }
-                }
-                storage[clientName] = windowMap.isEmpty ? nil : windowMap
-            }
-
-            var windowMap = storage[clientName] ?? [:]
-            var runMap = windowMap[windowID] ?? [:]
-            runMap[runID] = context
-            windowMap[windowID] = runMap
-            storage[clientName] = windowMap
-            return runMap.count
-        }
-
-        mutating func pop(clientName: String, windowID: Int, runID: UUID) -> (context: MCPTabContextSnapshot?, remaining: Int) {
-            guard var windowMap = storage[clientName],
-                  var runMap = windowMap[windowID]
-            else {
-                return (nil, 0)
-            }
-
-            let context = runMap.removeValue(forKey: runID)
-            if runMap.isEmpty {
-                windowMap.removeValue(forKey: windowID)
-            } else {
-                windowMap[windowID] = runMap
-            }
-            if windowMap.isEmpty {
-                storage.removeValue(forKey: clientName)
-            } else {
-                storage[clientName] = windowMap
-            }
-            return (context, runMap.count)
-        }
-
-        mutating func popByRunID(clientName: String, runID: UUID) -> (context: MCPTabContextSnapshot?, windowID: Int?, remaining: Int) {
-            guard var windowMap = storage[clientName] else {
-                return (nil, nil, 0)
-            }
-
-            for windowID in windowMap.keys.sorted() {
-                guard var runMap = windowMap[windowID], let context = runMap.removeValue(forKey: runID) else {
-                    continue
-                }
-                if runMap.isEmpty {
-                    windowMap.removeValue(forKey: windowID)
-                } else {
-                    windowMap[windowID] = runMap
-                }
-                if windowMap.isEmpty {
-                    storage.removeValue(forKey: clientName)
-                } else {
-                    storage[clientName] = windowMap
-                }
-                return (context, windowID, runMap.count)
-            }
-
-            return (nil, nil, 0)
-        }
-
-        func queueLength(clientName: String, windowID: Int) -> Int {
-            storage[clientName]?[windowID]?.count ?? 0
-        }
-
-        mutating func clear(clientName: String) {
-            storage.removeValue(forKey: clientName)
-        }
-
-        /// Clear only one window queue for a given client.
-        @discardableResult
-        mutating func clear(clientName: String, windowID: Int) -> Int {
-            guard var windowMap = storage[clientName] else { return 0 }
-            let removed = windowMap[windowID]?.count ?? 0
-            windowMap.removeValue(forKey: windowID)
-            if windowMap.isEmpty {
-                storage.removeValue(forKey: clientName)
-            } else {
-                storage[clientName] = windowMap
-            }
-            return removed
-        }
-
-        mutating func purge(tabID: UUID) -> [MCPTabContextSnapshot] {
-            var removed: [MCPTabContextSnapshot] = []
-            let clientNames = Array(storage.keys)
-
-            for clientName in clientNames {
-                guard var windowMap = storage[clientName] else { continue }
-                for windowID in Array(windowMap.keys) {
-                    guard var runMap = windowMap[windowID] else { continue }
-                    for (runID, context) in runMap where context.tabID == tabID {
-                        removed.append(context)
-                        runMap.removeValue(forKey: runID)
-                    }
-                    if runMap.isEmpty {
-                        windowMap.removeValue(forKey: windowID)
-                    } else {
-                        windowMap[windowID] = runMap
-                    }
-                }
-
-                if windowMap.isEmpty {
-                    storage.removeValue(forKey: clientName)
-                } else {
-                    storage[clientName] = windowMap
-                }
-            }
-
-            return removed
-        }
-    }
-
     // MARK: - Auto-binding for headless clients
 
     /// Identify headless agent clients we want to auto-bind
@@ -400,14 +248,14 @@ extension MCPServerViewModel {
 
     @MainActor
     private func recordLastContext(clientName: String, context: MCPTabContextSnapshot) {
-        var perWindow = lastContextByClientAndWindow[clientName] ?? [:]
+        var perWindow = runRouteBindings.lastContextByClientAndWindow[clientName] ?? [:]
         perWindow[context.windowID] = context
-        lastContextByClientAndWindow[clientName] = perWindow
+        runRouteBindings.lastContextByClientAndWindow[clientName] = perWindow
     }
 
     @MainActor
     private static func popPendingContextForBinding(
-        from store: inout PendingRunScopedContextStore,
+        from store: inout MCPRunRouteBindings.PendingRunScopedContextStore,
         clientName: String,
         windowID: Int,
         runHint: UUID?
@@ -458,9 +306,9 @@ extension MCPServerViewModel {
         // This allows the client to rebind to the new active tab.
         if let clientName, isHeadlessClientName(clientName) {
             let hasPending: Bool = if let runID = connectionIDToRunID[connectionID] {
-                pendingRunScopedTabContexts.contains(clientName: clientName, windowID: bound.windowID, runID: runID)
+                runRouteBindings.pendingRunScopedTabContexts.contains(clientName: clientName, windowID: bound.windowID, runID: runID)
             } else {
-                pendingRunScopedTabContexts.queueLength(clientName: clientName, windowID: bound.windowID) > 0
+                runRouteBindings.pendingRunScopedTabContexts.queueLength(clientName: clientName, windowID: bound.windowID) > 0
             }
             let isActiveTab = (manager.workspaces[workspaceIndex].activeComposeTabID == bound.tabID)
             if !hasPending, !isActiveTab {
@@ -497,8 +345,8 @@ extension MCPServerViewModel {
 
     @MainActor
     private func activateReadFileAutoSelection(_ context: inout MCPTabContextSnapshot) {
-        nextReadFileAutoSelectionBindingGeneration &+= 1
-        context.readFileAutoSelectionGeneration = nextReadFileAutoSelectionBindingGeneration
+        runRouteBindings.nextReadFileAutoSelectionBindingGeneration &+= 1
+        context.readFileAutoSelectionGeneration = runRouteBindings.nextReadFileAutoSelectionBindingGeneration
     }
 
     @MainActor
@@ -524,11 +372,11 @@ extension MCPServerViewModel {
 
     @MainActor
     private func releaseBinding(connectionID: UUID, preserveConnectionRunIDMapping: Bool = false) {
-        readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
+        runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
         fileToolLookupContextCacheByConnectionID.removeValue(forKey: connectionID)
         pendingFileToolLookupContextResolutionByConnectionID.removeValue(forKey: connectionID)?.task.cancel()
         guard let context = tabContextByConnectionID.removeValue(forKey: connectionID) else { return }
-        publishDomainRoutingRelease(connectionID: connectionID)
+        routeResources.publishRelease(connectionID: connectionID)
         invalidateReadFileAutoSelection(connectionID: connectionID, context: context)
         endMirroringForConnection(connectionID)
         presentationWindowByConnection.removeValue(forKey: connectionID)
@@ -680,7 +528,7 @@ extension MCPServerViewModel {
 
     @MainActor
     func pendingContextQueueLength(clientName: String, windowID: Int) -> Int {
-        pendingRunScopedTabContexts.queueLength(clientName: clientName, windowID: windowID)
+        runRouteBindings.pendingRunScopedTabContexts.queueLength(clientName: clientName, windowID: windowID)
     }
 
     // MARK: - Tab Binding APIs for MCP Routing
@@ -832,7 +680,7 @@ extension MCPServerViewModel {
         }
 
         for connectionID in boundConnections {
-            readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
+            runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
             fileToolLookupContextCacheByConnectionID.removeValue(forKey: connectionID)
             pendingFileToolLookupContextResolutionByConnectionID.removeValue(forKey: connectionID)?.task.cancel()
             guard let context = tabContextByConnectionID.removeValue(forKey: connectionID) else { continue }
@@ -846,17 +694,17 @@ extension MCPServerViewModel {
             tabContextLog("purgeClosedTabContext removed bound context connectionID=\(connectionID) tab=\(tabID)")
         }
 
-        let removedPending = pendingRunScopedTabContexts.purge(tabID: tabID)
+        let removedPending = runRouteBindings.pendingRunScopedTabContexts.purge(tabID: tabID)
         if !removedPending.isEmpty {
             tabContextLog("purgeClosedTabContext removed \(removedPending.count) pending contexts for tab=\(tabID)")
         }
 
-        for (clientName, perWindow) in lastContextByClientAndWindow {
+        for (clientName, perWindow) in runRouteBindings.lastContextByClientAndWindow {
             let filtered = perWindow.filter { $0.value.tabID != tabID }
             if filtered.isEmpty {
-                lastContextByClientAndWindow.removeValue(forKey: clientName)
+                runRouteBindings.lastContextByClientAndWindow.removeValue(forKey: clientName)
             } else if filtered.count != perWindow.count {
-                lastContextByClientAndWindow[clientName] = filtered
+                runRouteBindings.lastContextByClientAndWindow[clientName] = filtered
             }
         }
     }
@@ -1052,7 +900,7 @@ extension MCPServerViewModel {
 
         activateReadFileAutoSelection(&context)
         tabContextByConnectionID[connectionID] = context
-        publishDomainRoutingBinding(connectionID: connectionID, context: context)
+        routeResources.publishBinding(connectionID: connectionID, context: context)
         presentationWindowByConnection[connectionID] = windowID
         if let runID {
             let mappingSucceeded = registerRunIDMapping(connectionID: connectionID, runID: runID, windowID: windowID)
@@ -1200,14 +1048,14 @@ extension MCPServerViewModel {
             }
 
             tabContextLog("installTabContext immediate bind connectionID=\(uuid)")
-            readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: uuid)
+            runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: uuid)
             if let previous = tabContextByConnectionID[uuid] {
                 invalidateReadFileAutoSelection(connectionID: uuid, context: previous)
                 endMirroringForConnection(uuid)
             }
             activateReadFileAutoSelection(&context)
             tabContextByConnectionID[uuid] = context
-            publishDomainRoutingBinding(connectionID: uuid, context: context)
+            routeResources.publishBinding(connectionID: uuid, context: context)
             presentationWindowByConnection[uuid] = context.windowID
             var pendingPolicyToken: PendingPolicyRunIDMappingToken?
             if let runID = context.runID {
@@ -1227,7 +1075,7 @@ extension MCPServerViewModel {
                 }
                 // Consume any queued intent for this exact run after direct installation.
                 if let clientName {
-                    let popped = pendingRunScopedTabContexts.popByRunID(clientName: clientName, runID: runID)
+                    let popped = runRouteBindings.pendingRunScopedTabContexts.popByRunID(clientName: clientName, runID: runID)
                     if popped.context != nil {
                         tabContextLog("installTabContext consumed queued intent for client=\(clientName) runID=\(runID) window=\(windowID) remaining=\(popped.remaining)")
                     }
@@ -1255,8 +1103,8 @@ extension MCPServerViewModel {
             tabContextLog("enqueuePendingContext skipped runless context clientName=\(clientName) window=\(windowID) tab=\(context.tabID)")
             return
         }
-        let queueBefore = pendingRunScopedTabContexts.queueLength(clientName: clientName, windowID: windowID)
-        let queueSize = pendingRunScopedTabContexts.enqueueReplacing(context, clientName: clientName, windowID: windowID)
+        let queueBefore = runRouteBindings.pendingRunScopedTabContexts.queueLength(clientName: clientName, windowID: windowID)
+        let queueSize = runRouteBindings.pendingRunScopedTabContexts.enqueueReplacing(context, clientName: clientName, windowID: windowID)
         recordLastContext(clientName: clientName, context: context)
         tabContextLog("enqueuePendingContext clientName=\(clientName) window=\(windowID) tab=\(context.tabID) queueBefore=\(queueBefore) queueAfter=\(queueSize) runID=\(runID.uuidString)")
     }
@@ -1268,7 +1116,7 @@ extension MCPServerViewModel {
         connectionID: UUID,
         registerRunMapping: Bool = true
     ) -> MCPTabContextSnapshot? {
-        let queueBefore = pendingRunScopedTabContexts.queueLength(clientName: clientName, windowID: windowID)
+        let queueBefore = runRouteBindings.pendingRunScopedTabContexts.queueLength(clientName: clientName, windowID: windowID)
         let runHint = connectionIDToRunID[connectionID]
 
         // Only set a hint mapping if we don't already have one; do not override
@@ -1281,8 +1129,8 @@ extension MCPServerViewModel {
            let existing = tabContextByConnectionID[previousConnection]
         {
             if existing.windowID == windowID {
-                readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: previousConnection)
-                readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
+                runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: previousConnection)
+                runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
                 fileToolLookupContextCacheByConnectionID.removeValue(forKey: previousConnection)
                 pendingFileToolLookupContextResolutionByConnectionID.removeValue(forKey: previousConnection)?.task.cancel()
                 tabContextByConnectionID.removeValue(forKey: previousConnection)
@@ -1306,7 +1154,7 @@ extension MCPServerViewModel {
             }
         }
         let result = Self.popPendingContextForBinding(
-            from: &pendingRunScopedTabContexts,
+            from: &runRouteBindings.pendingRunScopedTabContexts,
             clientName: clientName,
             windowID: windowID,
             runHint: runHint
@@ -1322,10 +1170,10 @@ extension MCPServerViewModel {
             return nil
         }
 
-        readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
+        runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
         activateReadFileAutoSelection(&context)
         tabContextByConnectionID[connectionID] = context
-        publishDomainRoutingBinding(connectionID: connectionID, context: context)
+        routeResources.publishBinding(connectionID: connectionID, context: context)
         presentationWindowByConnection[connectionID] = context.windowID
         if let runID = context.runID {
             if registerRunMapping {
@@ -1354,7 +1202,7 @@ extension MCPServerViewModel {
     ) -> MCPTabContextSnapshot? {
         guard connectionIDToRunID[connectionID] != nil,
               let runID = connectionIDToRunID[connectionID],
-              pendingRunScopedTabContexts.contains(
+              runRouteBindings.pendingRunScopedTabContexts.contains(
                   clientName: clientName,
                   windowID: windowID,
                   runID: runID
@@ -1385,7 +1233,7 @@ extension MCPServerViewModel {
         else { return }
         context.frozenFileToolAuthority = authority
         tabContextByConnectionID[connectionID] = context
-        publishDomainRoutingBinding(connectionID: connectionID, context: context)
+        routeResources.publishBinding(connectionID: connectionID, context: context)
     }
 
     @MainActor
@@ -3350,8 +3198,8 @@ extension MCPServerViewModel {
             }
         }
 
-        readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: previousConnection)
-        readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
+        runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: previousConnection)
+        runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
         fileToolLookupContextCacheByConnectionID.removeValue(forKey: previousConnection)
         supersedePendingFileToolLookupContextResolution(connectionID: previousConnection)
         tabContextByConnectionID.removeValue(forKey: previousConnection)
@@ -3995,7 +3843,7 @@ extension MCPServerViewModel {
 
     @MainActor
     static func test_popPendingContextForBinding(
-        from store: inout PendingRunScopedContextStore,
+        from store: inout MCPRunRouteBindings.PendingRunScopedContextStore,
         clientName: String,
         windowID: Int,
         runHint: UUID?
@@ -4045,7 +3893,7 @@ extension MCPServerViewModel {
         signalRoutingFailure: Bool = true,
         routingWaitGeneration: UUID? = nil
     ) {
-        readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
+        runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
         if connectionIDByRunID[runID] == connectionID {
             connectionIDByRunID.removeValue(forKey: runID)
             pendingPolicyRunIDMappingTokenIDByRunID.removeValue(forKey: runID)
@@ -4145,7 +3993,7 @@ extension MCPServerViewModel {
         var inherited = displacedContext
         activateReadFileAutoSelection(&inherited)
         tabContextByConnectionID[token.connectionID] = inherited
-        publishDomainRoutingBinding(connectionID: token.connectionID, context: inherited)
+        routeResources.publishBinding(connectionID: token.connectionID, context: inherited)
         if let clientName { recordLastContext(clientName: clientName, context: inherited) }
         beginMirroringForConnection(token.connectionID, context: inherited)
         tabContextLog("registerPendingPolicyRunIDMapping inherited run context runID=\(token.runID) \(displacedConnectionID) -> \(token.connectionID)")
@@ -4158,7 +4006,7 @@ extension MCPServerViewModel {
         guard let successorContext = tabContextByConnectionID[token.connectionID],
               successorContext.runID == token.runID
         else {
-            readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: token.connectionID)
+            runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: token.connectionID)
             return
         }
         let successorKey = readFileAutoSelectionContextKey(
@@ -4170,14 +4018,14 @@ extension MCPServerViewModel {
             let preservesCurrentSuccessor = token.displacedConnectionRunID == token.runID
                 && connectionIDByRunID[token.runID] == token.connectionID
                 && connectionIDToRunID[token.connectionID] == token.runID
-                && readFileAutoSelectionHandoverLineageByConnectionID[token.connectionID]?.successorKey == successorKey
+                && runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID[token.connectionID]?.successorKey == successorKey
             if !preservesCurrentSuccessor {
-                readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: token.connectionID)
+                runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: token.connectionID)
             }
             return
         }
 
-        readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: token.connectionID)
+        runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: token.connectionID)
         guard token.displacedConnectionRunID == token.runID,
               let displacedContext = tabContextByConnectionID[displacedConnectionID],
               displacedContext.runID == token.runID,
@@ -4191,7 +4039,7 @@ extension MCPServerViewModel {
             context: displacedContext
         )
         var predecessorKeys: [MCPReadFileAutoSelectionCoordinator.ContextKey] = []
-        if let inherited = readFileAutoSelectionHandoverLineageByConnectionID[displacedConnectionID],
+        if let inherited = runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID[displacedConnectionID],
            inherited.successorKey == displacedKey
         {
             predecessorKeys.append(contentsOf: inherited.predecessorKeys)
@@ -4199,7 +4047,7 @@ extension MCPServerViewModel {
         if !predecessorKeys.contains(displacedKey) {
             predecessorKeys.append(displacedKey)
         }
-        readFileAutoSelectionHandoverLineageByConnectionID[token.connectionID] = .init(
+        runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID[token.connectionID] = .init(
             successorKey: successorKey,
             predecessorKeys: predecessorKeys
         )
@@ -4248,7 +4096,7 @@ extension MCPServerViewModel {
                       boundContext.tabID == promotedContext.tabID,
                       boundContext.windowID == promotedContext.windowID,
                       boundContext.workspaceID == promotedContext.workspaceID,
-                      !pendingRunScopedTabContexts.contains(
+                      !runRouteBindings.pendingRunScopedTabContexts.contains(
                           clientName: promotedContextClientName,
                           runID: promotedRunID
                       )
@@ -4265,7 +4113,7 @@ extension MCPServerViewModel {
                 removeQueuedPendingContext: false
             )
             if let promotedContextToRestore {
-                _ = pendingRunScopedTabContexts.enqueueReplacing(
+                _ = runRouteBindings.pendingRunScopedTabContexts.enqueueReplacing(
                     promotedContextToRestore.context,
                     clientName: promotedContextToRestore.clientName,
                     windowID: promotedContextToRestore.windowID
@@ -4289,16 +4137,16 @@ extension MCPServerViewModel {
               connectionIDToRunID[connectionID] == runID,
               let context = tabContextByConnectionID[connectionID],
               context.runID == runID,
-              detachedContextBuilderTabContextByRunID[runID] == nil
+              runRouteBindings.detachedContextBuilderTabContextByRunID[runID] == nil
         else { return false }
 
-        detachedContextBuilderTabContextByRunID[runID] = DetachedContextBuilderTabContext(
+        runRouteBindings.detachedContextBuilderTabContextByRunID[runID] = .init(
             connectionID: connectionID,
             context: context
         )
         invalidateReadFileAutoSelection(connectionID: connectionID, context: context)
         endMirroringForConnection(connectionID)
-        readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
+        runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
         fileToolLookupContextCacheByConnectionID.removeValue(forKey: connectionID)
         pendingFileToolLookupContextResolutionByConnectionID.removeValue(forKey: connectionID)?.task.cancel()
         tabContextByConnectionID.removeValue(forKey: connectionID)
@@ -4318,17 +4166,17 @@ extension MCPServerViewModel {
         {
             return connectionID
         }
-        return detachedContextBuilderTabContextByRunID[runID]?.connectionID
+        return runRouteBindings.detachedContextBuilderTabContextByRunID[runID]?.connectionID
     }
 
     @MainActor
     func isDetachedContextBuilderConnection(connectionID: UUID, runID: UUID) -> Bool {
-        detachedContextBuilderTabContextByRunID[runID]?.connectionID == connectionID
+        runRouteBindings.detachedContextBuilderTabContextByRunID[runID]?.connectionID == connectionID
     }
 
     @MainActor
     func discardDetachedContextBuilderTabContext(runID: UUID) {
-        detachedContextBuilderTabContextByRunID.removeValue(forKey: runID)
+        runRouteBindings.detachedContextBuilderTabContextByRunID.removeValue(forKey: runID)
     }
 
     @MainActor
@@ -4351,13 +4199,13 @@ extension MCPServerViewModel {
         let alreadyFinishedAutoSelection: Bool
         if tabContextByConnectionID[connectionID]?.runID == expectedRunID {
             alreadyFinishedAutoSelection = false
-        } else if let detached = detachedContextBuilderTabContextByRunID[expectedRunID],
+        } else if let detached = runRouteBindings.detachedContextBuilderTabContextByRunID[expectedRunID],
                   detached.connectionID == connectionID,
                   detached.context.runID == expectedRunID
         {
             // Destructively claim the run-owned snapshot and move it into the existing
             // commit implementation without suspending between removal and insertion.
-            detachedContextBuilderTabContextByRunID.removeValue(forKey: expectedRunID)
+            runRouteBindings.detachedContextBuilderTabContextByRunID.removeValue(forKey: expectedRunID)
             tabContextByConnectionID[connectionID] = detached.context
             alreadyFinishedAutoSelection = true
         } else {
@@ -4390,8 +4238,8 @@ extension MCPServerViewModel {
         // Peer EOF may have transferred the live context while its auto-selection lane
         // was finishing. The locally captured commit snapshot remains authoritative;
         // consume any duplicate detached ownership exactly once.
-        if detachedContextBuilderTabContextByRunID[expectedRunID]?.connectionID == connectionID {
-            detachedContextBuilderTabContextByRunID.removeValue(forKey: expectedRunID)
+        if runRouteBindings.detachedContextBuilderTabContextByRunID[expectedRunID]?.connectionID == connectionID {
+            runRouteBindings.detachedContextBuilderTabContextByRunID.removeValue(forKey: expectedRunID)
         }
 
         if let committedWrite {
@@ -4483,7 +4331,7 @@ extension MCPServerViewModel {
         // mutate state being committed. Successful Context Builder completion may retain
         // the connection/run routing maps until its independently-owned transport teardown joins.
         endMirroringForConnection(connectionID)
-        readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
+        runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
         fileToolLookupContextCacheByConnectionID.removeValue(forKey: connectionID)
         pendingFileToolLookupContextResolutionByConnectionID.removeValue(forKey: connectionID)?.task.cancel()
         tabContextByConnectionID.removeValue(forKey: connectionID)
@@ -4533,7 +4381,7 @@ extension MCPServerViewModel {
                   let runID = context.runID,
                   connectionIDByRunID[runID] == connectionID,
                   connectionIDToRunID[connectionID] == runID,
-                  let lineage = readFileAutoSelectionHandoverLineageByConnectionID[connectionID],
+                  let lineage = runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID[connectionID],
                   lineage.successorKey == readFileAutoSelectionContextKey(
                       connectionID: connectionID,
                       context: context
@@ -4574,7 +4422,7 @@ extension MCPServerViewModel {
         removeQueuedPendingContext: Bool = true
     ) {
         if let connectionID {
-            readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
+            runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
             if let context = tabContextByConnectionID[connectionID],
                runID == nil || context.runID == runID
             {
@@ -4583,7 +4431,7 @@ extension MCPServerViewModel {
                 fileToolLookupContextCacheByConnectionID.removeValue(forKey: connectionID)
                 pendingFileToolLookupContextResolutionByConnectionID.removeValue(forKey: connectionID)?.task.cancel()
                 tabContextByConnectionID.removeValue(forKey: connectionID)
-                publishDomainRoutingRelease(connectionID: connectionID)
+                routeResources.publishRelease(connectionID: connectionID)
                 presentationWindowByConnection.removeValue(forKey: connectionID)
 
                 if let boundRunID = context.runID,
@@ -4619,10 +4467,10 @@ extension MCPServerViewModel {
         }
 
         if let runID, connectionID == nil {
-            detachedContextBuilderTabContextByRunID.removeValue(forKey: runID)
+            runRouteBindings.detachedContextBuilderTabContextByRunID.removeValue(forKey: runID)
             // This is an explicit cleanup by runID (called when discovery ends)
             for (boundConnectionID, context) in tabContextByConnectionID where context.runID == runID {
-                readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: boundConnectionID)
+                runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: boundConnectionID)
             }
             if let mappedConnection = connectionIDByRunID[runID] {
                 connectionIDToRunID.removeValue(forKey: mappedConnection)
@@ -4642,14 +4490,14 @@ extension MCPServerViewModel {
     @MainActor
     private func removePendingContext(clientName: String, windowID: Int?, runID: UUID) {
         if let windowID {
-            let result = pendingRunScopedTabContexts.pop(clientName: clientName, windowID: windowID, runID: runID)
+            let result = runRouteBindings.pendingRunScopedTabContexts.pop(clientName: clientName, windowID: windowID, runID: runID)
             if result.context != nil {
                 tabContextLog("removePendingContext removed pending context clientName=\(clientName) window=\(windowID) runID=\(runID.uuidString) remaining=\(result.remaining)")
             }
             return
         }
 
-        let result = pendingRunScopedTabContexts.popByRunID(clientName: clientName, runID: runID)
+        let result = runRouteBindings.pendingRunScopedTabContexts.popByRunID(clientName: clientName, runID: runID)
         if let _ = result.context, let windowID = result.windowID {
             tabContextLog("removePendingContext removed pending context clientName=\(clientName) window=\(windowID) runID=\(runID.uuidString) remaining=\(result.remaining)")
         } else {

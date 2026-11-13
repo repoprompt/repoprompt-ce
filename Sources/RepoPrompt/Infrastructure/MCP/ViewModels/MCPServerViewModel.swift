@@ -2261,21 +2261,13 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     @MainActor
-    var detachedContextBuilderTabContextByRunID: [UUID: DetachedContextBuilderTabContext] = [:]
-    @MainActor
     let contextBuilderTeardownPublicationCoordinator = ContextBuilderTeardownPublicationCoordinator()
-    @MainActor
-    var readFileAutoSelectionHandoverLineageByConnectionID: [UUID: ReadFileAutoSelectionHandoverLineage] = [:]
-    @MainActor
-    var nextReadFileAutoSelectionBindingGeneration: UInt64 = 0
     #if DEBUG
         @MainActor
         var readFileAutoSelectionPersistenceWillResolveHandlerForTesting: (() async -> Void)?
         @MainActor
         var readFileAutoSelectionFinalRevalidationHandlerForTesting: (() async -> Void)?
     #endif
-    @MainActor
-    var pendingRunScopedTabContexts = PendingRunScopedContextStore()
     @MainActor
     var connectionIDByRunID: [UUID: UUID] {
         get { runRouteBindings.connectionIDByRunID }
@@ -2314,18 +2306,12 @@ final class MCPServerViewModel: ObservableObject {
         set { routeResources.descriptor = newValue }
     }
 
-    var domainWindowPresentationRevision: UInt64 = 0
     var domainRoutingWindowIsClosing: Bool {
         routeResources.isClosing
     }
 
-    /// Serializes routing publications (bind/release) so rapid tab transitions cannot
-    /// commit bindings out of order and teardown can drain in-flight publications.
-    var domainRoutingPublishTask: Task<Void, Never>?
     @MainActor
     var tabContextCancellablesByConnectionID: [UUID: Set<AnyCancellable>] = [:]
-    @MainActor
-    var lastContextByClientAndWindow: [String: [Int: TabContextSnapshot]] = [:]
     var isMultiWindowModeEffectivelyActive: Bool {
         WindowStatesManager.shared.isMultiWindowModeEffectivelyActive
     }
@@ -4514,7 +4500,7 @@ final class MCPServerViewModel: ObservableObject {
         successorKey: MCPReadFileAutoSelectionCoordinator.ContextKey
     ) -> [MCPReadFileAutoSelectionCoordinator.ContextKey] {
         guard let connectionID = metadata.connectionID,
-              let lineage = readFileAutoSelectionHandoverLineageByConnectionID[connectionID],
+              let lineage = runRouteBindings.readFileAutoSelectionHandoverLineageByConnectionID[connectionID],
               lineage.successorKey == successorKey,
               case let .bound(successorConnectionID, successorRunID) = successorKey.route,
               successorConnectionID == connectionID,

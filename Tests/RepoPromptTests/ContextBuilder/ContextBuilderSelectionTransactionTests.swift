@@ -50,17 +50,27 @@ final class MCPHostRouteResourceTests: XCTestCase {
         XCTAssertEqual(descriptor?.windowID, owner.identity.routeID)
         XCTAssertEqual(WindowState.windowCounter, windowCount)
         let connectionID = UUID()
-        let original = await runtime.routingCoordinator.registerConnection(connectionID: connectionID, operationID: UUID())
-        let receipt = try XCTUnwrap(original.snapshot.connections.first { $0.registration.connectionID == connectionID }?.registration)
-        owner.retainConnection(receipt)
+        let context = MCPTabContextSnapshot(
+            tabID: UUID(), windowID: owner.identity.routeID, workspaceID: nil,
+            promptText: "", selection: .init(), selectedMetaPromptIDs: [], tabName: "Host",
+            runID: nil, explicitlyBound: true
+        )
+        owner.publishBinding(connectionID: connectionID, context: context)
+        await owner.settleRoutingPublications()
+        let published = await runtime.routingCoordinator.snapshot()
+        let receipt = try XCTUnwrap(published.connections.first { $0.registration.connectionID == connectionID }?.registration)
+        XCTAssertEqual(published.windows.first?.activeContextID, context.tabID)
         _ = await runtime.routingCoordinator.unregisterConnection(receipt, operationID: UUID())
         let replacement = await runtime.routingCoordinator.registerConnection(connectionID: connectionID, operationID: UUID())
         let successor = try XCTUnwrap(replacement.snapshot.connections.first { $0.registration.connectionID == connectionID }?.registration)
         XCTAssertNotEqual(successor, receipt)
+        let pendingConnection = UUID()
+        owner.publishBinding(connectionID: pendingConnection, context: context)
         await owner.closeDomainRoute()
         await owner.closeDomainRoute()
         let final = await runtime.routingCoordinator.snapshot()
         XCTAssertFalse(final.windows.contains { $0.windowID == owner.identity.routeID })
+        XCTAssertFalse(final.connections.contains { $0.registration.connectionID == pendingConnection }, "Close joins queued publications without resurrecting a route")
         XCTAssertTrue(final.connections.contains { $0.registration == successor }, "Old owner must never retract a replacement registration")
         let refused = await owner.ensureRegistered(workspaceID: nil, contextID: nil, revision: 0)
         XCTAssertNil(refused)
@@ -645,7 +655,7 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
             clientName: "devin"
         ))
 
-        await server.domainRoutingPublishTask?.value
+        await server.routeResources.settleRoutingPublications()
         XCTAssertNotNil(server.tabContextCancellablesByConnectionID[successorID])
         let coordinator = try XCTUnwrap(server.domainRoutingCoordinator)
         let beforeRollback = await coordinator.snapshot()
@@ -662,7 +672,7 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         )
 
         // Rollback drops only the successor's inherited copy; the displaced snapshot is untouched.
-        await server.domainRoutingPublishTask?.value
+        await server.routeResources.settleRoutingPublications()
         let afterRollback = await coordinator.snapshot()
         XCTAssertFalse(afterRollback.connections.contains { $0.registration.connectionID == successorID })
         XCTAssertTrue(afterRollback.connections.contains { $0.registration.connectionID == fixture.connectionID })

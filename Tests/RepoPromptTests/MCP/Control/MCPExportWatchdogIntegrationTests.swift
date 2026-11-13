@@ -4541,7 +4541,7 @@ import XCTest
             let object = try responseObject(from: bind)
             let result = try XCTUnwrap(object["result"] as? [String: Any])
             XCTAssertNotEqual(result["isError"] as? Bool, true)
-            await context.window.mcpServer.domainRoutingPublishTask?.value
+            await context.window.mcpServer.routeResources.settleRoutingPublications()
         }
 
         private static func prepareProtectedExportFixture(
@@ -4574,7 +4574,7 @@ import XCTest
             )
             let bindText = try toolResultText(bindResponse)
             XCTAssertFalse(bindText.contains("Error:"), bindText)
-            await context.window.mcpServer.domainRoutingPublishTask?.value
+            await context.window.mcpServer.routeResources.settleRoutingPublications()
         }
 
         private static func assertPromptExportDelayedWatchdogCompletion(

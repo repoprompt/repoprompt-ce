@@ -380,7 +380,7 @@ import XCTest
                 arguments: ["op": "bind", "context_id": fixture.contextA.tabID.uuidString]
             )
             XCTAssertFalse(bind.rawJSON.contains("\"isError\":true"), bind.rawJSON)
-            await fixture.contextA.window.mcpServer.domainRoutingPublishTask?.value
+            await fixture.contextA.window.mcpServer.routeResources.settleRoutingPublications()
             return endpoint
         }
 
