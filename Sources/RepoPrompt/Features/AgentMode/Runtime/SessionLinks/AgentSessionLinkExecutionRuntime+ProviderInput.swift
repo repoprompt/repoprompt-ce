@@ -65,13 +65,24 @@ extension AgentSessionLinkExecutionRuntime {
     }
 
     func prepareResumeRecoveryHandoff(
-        for session: AgentTabSession, sourceTitle: String, environment: ManagedInputEnvironment
+        for session: AgentTabSession, sourceTitle: String, environment: ManagedInputEnvironment,
+        command suppliedCommand: AgentSessionRuntimeStore.Command? = nil
     ) async -> AgentSessionHandoffRuntime.RecoveryResult {
         guard let owner = scope, let membership = owner.membership(of: session),
               environment.resourcesAreCurrent() else { return .refused }
-        // Recovery also serves a legacy unbound local draft. That path retains its exact slot;
-        // a restored, workspace-bound session must retain its full admitted writer instead.
-        let command = try? owner.admit(session: session)
+        // Initial worktree preparation already owns an explicit creation command. Preserve that
+        // exact requirement instead of reconstructing restored admission before its first save.
+        // A stale supplied command must never fall back to today's writer or creation owner.
+        let command: AgentSessionRuntimeStore.Command?
+        if let suppliedCommand {
+            guard suppliedCommand.writer.scope === owner, suppliedCommand.writer.session === session,
+                  suppliedCommand.isCurrent else { return .refused }
+            command = suppliedCommand
+        } else {
+            command = try? owner.admit(session: session)
+        }
+        // A legacy unbound local draft retains its exact slot; bound recovery requires the
+        // captured command, either restored or the caller's explicit creation capability.
         if let workspaceID = session.persistentSessionBindingIdentity?.workspaceID {
             guard command != nil, environment.workspaceID == workspaceID else { return .refused }
         }

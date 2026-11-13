@@ -103,7 +103,7 @@ final class AgentSessionWorktreeRuntime {
     struct Effects {
         let drainOracle: @MainActor (AgentTabSession) async -> Bool
         let cancelRun: @MainActor (AgentTabSession) async -> Void
-        let stageRecovery: @MainActor (AgentTabSession) async -> AgentSessionHandoffRuntime.RecoveryResult
+        let stageRecovery: @MainActor (AgentSessionRuntimeStore.Command) async -> AgentSessionHandoffRuntime.RecoveryResult
         /// Must detach synchronously before its first await and retire only captured instances.
         let retireProvider: @MainActor (AgentTabSession) async -> Void
     }
@@ -322,7 +322,7 @@ final class AgentSessionWorktreeRuntime {
                     try commitAuthority? {}
                     try requireCurrent()
                     let previousHandoff = session.pendingHandoff
-                    switch await effects.stageRecovery(session) {
+                    switch await effects.stageRecovery(command) {
                     case let .staged(staged): handoffRollback = (previousHandoff, staged)
                     case .unchanged: break
                     case .refused: throw TransitionError.stale

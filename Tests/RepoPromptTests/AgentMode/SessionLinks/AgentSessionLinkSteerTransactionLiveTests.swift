@@ -795,7 +795,9 @@ final class AgentSessionManagedInputRuntimeTests: XCTestCase {
         let candidate: AgentSessionLinkEndpointCandidate
     }
 
-    private func fixture() throws -> Fixture {
+    private func fixture(
+        initialThreadInput: @escaping @MainActor (AgentTabSession) -> AgentSessionProviderInputRuntime.InitialThreadInput? = { _ in nil }
+    ) throws -> Fixture {
         let scope = AgentSessionRuntimeStore().makeScope()
         let session = scope.makeSession(tabID: UUID())
         let workspaceID = UUID(), sessionID = UUID()
@@ -807,7 +809,7 @@ final class AgentSessionManagedInputRuntimeTests: XCTestCase {
         let links = scope.makeLinkExecution(routeID: 401, commands: .init(
             isAvailable: { true }, modelAvailability: { .init() }, workspaceID: { _ in workspaceID },
             input: scope.providerInput(skillCatalog: AgentSkillCatalog(), perfRecorder: NoopAgentModePerfRecorder()),
-            workspacePaths: { [] }, inputWorkspace: { _ in nil }, initialThreadInput: { _ in nil },
+            workspacePaths: { [] }, inputWorkspace: { _ in nil }, initialThreadInput: initialThreadInput,
             modelDisplayName: { $0.selectedModelRaw },
             start: { _, _, _, _, _ in XCTFail("Active managed input must not call the legacy start adapter")
                 return nil
@@ -987,6 +989,76 @@ final class AgentSessionManagedInputRuntimeTests: XCTestCase {
         guard case .refused = refused else { return XCTFail("Stale resources staged recovery") }
         XCTAssertNil(stale.session.pendingHandoff.payload)
         XCTAssertEqual(stale.session.items.count(where: { $0.kind == .user }), 1)
+    }
+
+    func testRecoveryRequiresTheOriginalExplicitCreationCommandWithoutRestorationBypass() async throws {
+        for variant in ["current", "missing-command", "reacquired", "reacquired-at-context", "cancelled-before-entry", "missing-resources"] {
+            var capture: (@MainActor (AgentTabSession) -> Void)?
+            let f = try fixture(initialThreadInput: { session in
+                capture?(session)
+                return nil
+            })
+            let session = f.scope.makeSession(tabID: UUID())
+            let claim = AgentSessionCreationClaim(workspaceID: f.candidate.workspaceID)
+            session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: claim.sessionID, workspaceID: claim.workspaceID))
+            let creation = try XCTUnwrap(session.acceptFreshCreation(claim, workspaceID: claim.workspaceID))
+            session.appendItem(.user("Preserve the creation context", sequenceIndex: session.nextSequenceIndex))
+            f.scope.replaceSessions([session.tabID: session])
+            let command = try f.scope.admit(session: session, requirement: .creation(creation))
+            XCTAssertThrowsError(try f.scope.admit(session: session), "\(variant): ordinary restored admission must remain closed")
+            let before = session.pendingHandoff
+            if variant == "reacquired" {
+                f.scope.replaceSessions([:])
+                f.scope.replaceSessions([session.tabID: session])
+            } else if variant == "reacquired-at-context" {
+                // Reentrant resource capture cannot turn the old receipt into today's writer.
+                // The final staging fence must still validate the originally supplied command.
+                capture = { [weak scope = f.scope] session in
+                    guard let scope else { return XCTFail("The originating test scope was released") }
+                    scope.replaceSessions([:])
+                    scope.replaceSessions([session.tabID: session])
+                }
+            }
+            let environment = environment(f, isCurrent: { variant != "missing-resources" })
+            let supplied = variant == "missing-command" ? nil : command
+            let result: AgentSessionHandoffRuntime.RecoveryResult
+            if variant == "cancelled-before-entry" {
+                let task = Task { @MainActor in
+                    await f.links.prepareResumeRecoveryHandoff(
+                        for: session, sourceTitle: "Creation owner", environment: environment, command: supplied
+                    )
+                }
+                task.cancel()
+                result = await task.value
+            } else {
+                result = await f.links.prepareResumeRecoveryHandoff(
+                    for: session, sourceTitle: "Creation owner", environment: environment, command: supplied
+                )
+            }
+            if variant == "current" {
+                guard case let .staged(handoff) = result else {
+                    XCTFail("\(variant): the actual creation capability must permit recovery")
+                    continue
+                }
+                XCTAssertTrue(handoff.payload?.contains("Preserve the creation context") == true)
+                XCTAssertEqual(session.pendingHandoff, handoff)
+                XCTAssertTrue(command.isCurrent, variant)
+            } else {
+                guard case .refused = result else {
+                    XCTFail("\(variant): recovery must not infer or reacquire creation admission")
+                    continue
+                }
+                XCTAssertEqual(session.pendingHandoff, before, variant)
+            }
+            XCTAssertTrue(session.creationHandleIsCurrent(creation), variant)
+            XCTAssertThrowsError(try f.scope.admit(session: session), "\(variant): staging is not configured first-save acknowledgement")
+            if variant.hasPrefix("reacquired") {
+                let successor = try f.scope.admit(session: session, requirement: .creation(creation))
+                XCTAssertNotEqual(successor.identity, command.identity, variant)
+                XCTAssertTrue(successor.isCurrent, variant)
+                XCTAssertFalse(command.isCurrent, variant)
+            }
+        }
     }
 
     func testProviderInputProofDoesNotFollowAChangedResourceGeneration() async throws {

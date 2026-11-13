@@ -6793,7 +6793,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     }
 
     func testPeriodicClaudeResumeFailureDoesNotStartFreshButUserRecoveryStillWorks() async throws {
-        for periodic in [true, false] {
+        for (periodic, hasResources) in [(true, true), (false, true), (false, false)] {
             let (fixture, clock, endpoint) = try periodicFixture()
             if periodic { _ = try reservePeriodic(fixture, clock: clock, endpoint: endpoint) }
             else { fixture.session.oversight.retirePeriodicScheduling() }
@@ -6809,9 +6809,23 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                     return creations == 1 ? controller : freshController
                 }
             )
+            // Recovery requires the same concrete workspace owner as production admission,
+            // not a restored-looking binding to an unrelated UUID on a resource-less test VM.
+            let manager: WorkspaceManagerViewModel?
+            let workspaceID: UUID
+            if hasResources {
+                manager = AgentSessionLinkEndpointTestSupport.installWorkspace(
+                    on: host, tabID: fixture.tabID, name: "Claude resume recovery"
+                )
+                workspaceID = try XCTUnwrap(manager?.activeWorkspaceID)
+            } else {
+                manager = nil
+                workspaceID = UUID()
+            }
+            defer { withExtendedLifetime(manager) {} }
             let session = host.session(for: fixture.tabID)
             session.hasLoadedPersistedState = true
-            session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: UUID()))
+            session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID(), workspaceID: workspaceID))
             session.recordRestorationAuthoritative(.persistedPayloadApplied)
             XCTAssertNil(session.operationAdmissionFailureMessage)
             session.oversight.pendingAutoWake = fixture.session.oversight.pendingAutoWake
@@ -6833,6 +6847,13 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 XCTAssertEqual(attempts, ["missing-original-session"])
                 XCTAssertEqual(creations, 1)
                 XCTAssertEqual(session.providerSessionID, "missing-original-session")
+            } else if !hasResources {
+                XCTAssertEqual(result, .superseded, "A bound-looking session without its workspace is not recovery admission")
+                XCTAssertEqual(attempts, ["missing-original-session"])
+                XCTAssertEqual(creations, 1)
+                XCTAssertNil(session.pendingHandoff.payload)
+                let messages = await freshController.sentMessages
+                XCTAssertTrue(messages.isEmpty, "Missing resources must not start or replay into a fresh provider")
             } else {
                 XCTAssertEqual(result, .ready)
                 XCTAssertEqual(attempts, ["missing-original-session", nil])

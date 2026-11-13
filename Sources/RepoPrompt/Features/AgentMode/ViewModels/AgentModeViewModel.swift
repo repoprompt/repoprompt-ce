@@ -8231,9 +8231,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 AgentSessionInteractionRuntime.cancelPendingInstruction(for: session)
                 await runService.cancelRun(tabID: session.tabID, session: session, intent: .executionLocationChange, completion: .terminalPublished)
             },
-            stageRecovery: { [weak self] session in
+            stageRecovery: { [weak self] command in
                 guard let self else { return .refused }
-                return await prepareResumeRecoveryHandoff(for: session)
+                return await prepareResumeRecoveryHandoff(for: command.writer.session, command: command)
             },
             retireProvider: { [weak self] session in
                 await self?.invalidateProviderContextForExecutionLocationChange(session)
@@ -17314,11 +17314,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     /// The host supplies workspace context; exact-incarnation staging and consumption belong
     /// to the runtime. Capture before the context read, not after its suspension.
-    private func prepareResumeRecoveryHandoff(for session: TabSession) async -> AgentSessionHandoffRuntime.RecoveryResult {
+    private func prepareResumeRecoveryHandoff(for session: TabSession, command: AgentSessionRuntimeStore.Command? = nil) async -> AgentSessionHandoffRuntime.RecoveryResult {
         await linkExecutionRuntime.prepareResumeRecoveryHandoff(
             for: session,
             sourceTitle: normalizedSessionTitle(workspaceManager?.composeTabName(with: session.tabID)),
-            environment: managedInputEnvironment()
+            environment: managedInputEnvironment(), command: command
         )
     }
 
