@@ -40,6 +40,8 @@ final class AgentSessionLinkExecutionRuntime {
     }
 
     var pendingSendEffects: [UUID: PendingSendEffect] = [:]
+    /// Provider producers join separately from terminal-save effects to avoid a terminal cycle.
+    var pendingManagedInputEffects: [UUID: PendingSendEffect] = [:]
     var pendingStopEffects: [UUID: PendingSendEffect] = [:]
     let routeID: Int
     let commands: Commands

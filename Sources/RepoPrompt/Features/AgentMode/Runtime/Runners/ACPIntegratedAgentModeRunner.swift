@@ -745,8 +745,10 @@ final class ACPIntegratedAgentModeRunner {
         targetRunID: UUID?,
         targetRunAttemptID: UUID?,
         targetController: ACPAgentSessionController,
-        writeReceipt: ACPAgentSessionController.PromptWriteReceipt? = nil
+        writeReceipt: ACPAgentSessionController.PromptWriteReceipt? = nil,
+        inputResourcesAreCurrent: @escaping @MainActor () -> Bool = { true }
     ) async -> Bool {
+        guard inputResourcesAreCurrent() else { return false }
         guard session.operationAdmissionFailureMessage == nil else { return false }
         guard runRequest.agentKind == session.selectedAgent,
               runRequest.agentKind.acpProviderID != nil,
@@ -766,7 +768,7 @@ final class ACPIntegratedAgentModeRunner {
             log("active prompt preflight rejected incompatible ACP request model=\(runRequest.modelString ?? "default") workspace=\(runRequest.workspacePath ?? "nil")", runID: runID)
             return false
         }
-        guard session.runState == .running,
+        guard inputResourcesAreCurrent(), session.runState == .running,
               session.runID == runID,
               session.activeRunAttemptID == runAttemptID,
               session.acpController === controller
@@ -792,7 +794,7 @@ final class ACPIntegratedAgentModeRunner {
             return false
         }
 
-        guard session.runState == .running,
+        guard inputResourcesAreCurrent(), session.runState == .running,
               session.runID == runID,
               session.activeRunAttemptID == runAttemptID,
               session.acpController === controller
@@ -839,7 +841,7 @@ final class ACPIntegratedAgentModeRunner {
                 return false
             }
             inputProof = await hooks.providerInput.proveAgentSessionLinkProviderInput(session, decorated.claim)
-            guard retainPhysicalDispatchAfterProof(
+            guard inputResourcesAreCurrent(), retainPhysicalDispatchAfterProof(
                 session: session, runID: runID, runAttemptID: runAttemptID,
                 controller: controller, dispatch: oversightDispatch
             ) else {
@@ -871,6 +873,7 @@ final class ACPIntegratedAgentModeRunner {
         }
 
         do {
+            guard inputResourcesAreCurrent() else { return false }
             log("active steering session/prompt begin attempt=\(runAttemptID)", runID: runID)
             let released = inputProof.map { hooks.providerInput.handoffAgentSessionLinkProviderInput(session, oversightDispatch, monitoring?.claim, $0) }
             guard released?.mustAbortDispatch != true else { return false }

@@ -725,6 +725,8 @@ final class AgentTabSession: ObservableObject {
         var skipsSlashExpansion = false
         /// Provider-only list after read-only composer preparation; original chips remain recoverable.
         var providerTaggedFileAttachments: [AgentTaggedFileAttachment]?
+        /// Managed input keeps the exact admitted writer/resource generation until its write.
+        var runtimeInputAdmission: AgentSessionProviderInputRuntime.Admission?
     }
 
     var pendingClaudeSteeringInstructions: [ClaudeSteeringInstruction] = [] {
@@ -806,6 +808,8 @@ final class AgentTabSession: ObservableObject {
         var skipsSlashExpansion = false
         /// Provider-only list after read-only composer preparation; original chips remain recoverable.
         var providerTaggedFileAttachments: [AgentTaggedFileAttachment]?
+        /// Managed input keeps the exact admitted writer/resource generation until its write.
+        var runtimeInputAdmission: AgentSessionProviderInputRuntime.Admission?
     }
 
     /// Lifecycle disposal withdraws only rows from the exact binding that accepted the steer.

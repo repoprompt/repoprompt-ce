@@ -374,7 +374,8 @@ final class AgentSessionRunStartRuntime {
         attachments: [AgentFileAttachment], taggedFiles: [AgentTaggedFileAttachment],
         draftText: String, userItem: AgentChatItem, localComposerCandidate: UUID?,
         skipsSlashExpansion: Bool, providerTaggedFiles: [AgentTaggedFileAttachment]? = nil,
-        accepted: (() -> Void)? = nil
+        accepted: (() -> Void)? = nil,
+        inputAdmission: AgentSessionProviderInputRuntime.Admission? = nil
     ) -> Bool {
         guard let owner = scope, owner.sessions[session.tabID] === session,
               !owner.hasReleasedWriterClaims else { return false }
@@ -392,7 +393,8 @@ final class AgentSessionRunStartRuntime {
             createdAt: Date(),
             supersedingProtectedTurnIDs: [],
             skipsSlashExpansion: skipsSlashExpansion,
-            providerTaggedFileAttachments: providerTaggedFiles
+            providerTaggedFileAttachments: providerTaggedFiles,
+            runtimeInputAdmission: inputAdmission
         )
         session.pendingClaudeSteeringInstructions.append(steering)
         session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
