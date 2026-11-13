@@ -3072,9 +3072,13 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 connectionLifecycleGeneration: XCTUnwrap(state.connectionLifecycleGeneration)
             )
             try server.bindTabForConnection(
-                connectionID: connectionID, clientName: nil, tabID: fixture.tabID,
+                route: server.routeResources,
+                connectionID: connectionID,
+                clientName: nil,
+                tabID: fixture.tabID,
                 workspaceID: XCTUnwrap(fixture.workspaceManager.activeWorkspaceID),
-                windowID: endpoint.windowID, runID: runID
+                windowID: endpoint.windowID,
+                runID: runID
             )
             fixture.viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { _, _, _ in token }
             // The synthetic async authority query needs an explicit final-fence hook;

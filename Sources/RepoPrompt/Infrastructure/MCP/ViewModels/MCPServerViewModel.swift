@@ -618,11 +618,12 @@ final class MCPServerViewModel: ObservableObject {
             liveRunPurpose: { connectionID in await ServerNetworkManager.shared.runPurpose(for: connectionID) },
             resolveTabContextSnapshot: { [self] metadata in
                 try resolveTabContextSnapshot(
+                    route: routeResources,
                     from: metadata,
                     toolName: MCPWindowToolName.oracleSend
                 )
             },
-            requireCurrentTabContext: { [self] toolName in try await requireCurrentTabContext(toolName: toolName) },
+            requireCurrentTabContext: { [self] toolName in try await requireCurrentTabContext(route: routeResources, toolName: toolName) },
             stabilizedVirtualContext: { [self] context in
                 await stabilizedVirtualContext(for: context)
             },
@@ -693,7 +694,7 @@ final class MCPServerViewModel: ObservableObject {
                 try resolveRequestedTabIDForAgentControl(args: args)
             },
             resolveSpawnParentSourceTabID: { [self] metadata in
-                await resolveSpawnParentSourceTabIDForAgentSessionCreation(metadata: metadata)
+                await resolveSpawnParentSourceTabIDForAgentSessionCreation(route: routeResources, metadata: metadata)
             },
             resolveOracleReviewLaunchSource: { [self] metadata, targetWindow in
                 try await resolveAgentRunOracleReviewLaunchSource(
@@ -705,7 +706,7 @@ final class MCPServerViewModel: ObservableObject {
                 try await validateAgentRunStartRouting(metadata: metadata, resolvedSourceTabID: sourceTabID)
             },
             resolveSpawnParentSessionID: { [self] metadata, targetWindow in
-                await resolveSpawnParentSessionID(metadata: metadata, targetWindow: targetWindow)
+                await resolveSpawnParentSessionID(route: routeResources, metadata: metadata, targetWindow: targetWindow)
             },
             resolveSpawnParentSessionIDFromSourceTabID: { sourceTabID, targetWindow in
                 targetWindow.agentModeViewModel.mcpSpawnParentSessionID(sourceTabID: sourceTabID)
@@ -772,6 +773,7 @@ final class MCPServerViewModel: ObservableObject {
         targetWindow: WindowState
     ) async throws -> ResolvedAgentRunOracleReviewLaunchSource {
         let snapshot = try await resolveAgentRunOracleReviewLaunchSnapshot(
+            route: routeResources,
             metadata: metadata,
             targetWindow: targetWindow
         )
@@ -977,10 +979,10 @@ final class MCPServerViewModel: ObservableObject {
             captureRequestMetadata: { [self] in await captureRequestMetadata() },
             requireTargetWindow: { [self] in try requireTargetWindow() },
             resolveSpawnSourceTabID: { [self] metadata in
-                await resolveSpawnSourceTabIDForAgentSessionCreation(metadata: metadata)
+                await resolveSpawnSourceTabIDForAgentSessionCreation(route: routeResources, metadata: metadata)
             },
             resolveSpawnParentSessionID: { [self] metadata, targetWindow in
-                await resolveSpawnParentSessionID(metadata: metadata, targetWindow: targetWindow)
+                await resolveSpawnParentSessionID(route: routeResources, metadata: metadata, targetWindow: targetWindow)
             },
             withHeartbeat: { [self] connectionID, tool, stage, message, operation in
                 try await withHeartbeat(
@@ -1027,10 +1029,10 @@ final class MCPServerViewModel: ObservableObject {
             captureRequestMetadata: { [self] in await captureRequestMetadata() },
             requireTargetWindow: { [self] in try requireTargetWindow() },
             resolveSpawnSourceTabID: { [self] metadata in
-                await resolveSpawnSourceTabIDForAgentSessionCreation(metadata: metadata)
+                await resolveSpawnSourceTabIDForAgentSessionCreation(route: routeResources, metadata: metadata)
             },
             resolveSpawnParentSessionID: { [self] metadata, targetWindow in
-                await resolveSpawnParentSessionID(metadata: metadata, targetWindow: targetWindow)
+                await resolveSpawnParentSessionID(route: routeResources, metadata: metadata, targetWindow: targetWindow)
             },
             bindCurrentRequestToTab: { [self] tabID, metadata in
                 try await bindCurrentRequestToTabIfPossible(tabID: tabID, metadata: metadata)
@@ -1043,7 +1045,7 @@ final class MCPServerViewModel: ObservableObject {
             captureRequestMetadata: { [self] in await captureRequestMetadata() },
             requireTargetWindow: { [self] in try requireTargetWindow() },
             resolveObserverEndpoint: { [self] metadata, targetWindow in
-                await resolveAgentSessionLinkObserverEndpoint(metadata: metadata, targetWindow: targetWindow)
+                await resolveAgentSessionLinkObserverEndpoint(route: routeResources, metadata: metadata, targetWindow: targetWindow)
             },
             captureCallOrigin: { AgentSelfMCPCallOrigin.current },
             enterNoop: { window, origin, invocationID, argumentsAreEmpty in
@@ -1107,6 +1109,7 @@ final class MCPServerViewModel: ObservableObject {
             // be supplied, hinted, or explicitly bound by the caller.
             resolveObserverEndpoint: { [self] metadata, targetWindow in
                 await resolveAgentSessionLinkObserverEndpoint(
+                    route: routeResources,
                     metadata: metadata,
                     targetWindow: targetWindow
                 )
@@ -1429,7 +1432,7 @@ final class MCPServerViewModel: ObservableObject {
         },
         requireCurrentTabContext: { [weak self] toolName in
             guard let self else { throw MCPError.internalError("Window deallocated while resolving tab context") }
-            return try await requireCurrentTabContext(toolName: toolName)
+            return try await requireCurrentTabContext(route: routeResources, toolName: toolName)
         },
         requireAgentModeConnection: { invocationContext, toolName in
             guard let connectionID = invocationContext.connectionID else {
@@ -1481,6 +1484,7 @@ final class MCPServerViewModel: ObservableObject {
         bindTabForConnection: { [weak self] connectionID, clientName, tabID, workspaceID, windowID in
             guard let self else { throw MCPError.internalError("Window deallocated while binding tab context") }
             try bindTabForConnection(
+                route: routeResources,
                 connectionID: connectionID,
                 clientName: clientName,
                 tabID: tabID,
@@ -1612,17 +1616,18 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else {
                 throw MCPError.internalError("Window deallocated while resolving the Context Builder Git target")
             }
-            return try await resolveImplicitContextBuilderGitTarget(metadata: metadata)
+            return try await resolveImplicitContextBuilderGitTarget(route: routeResources, metadata: metadata)
         },
         validateContextBuilderGitArtifactSelection: { [weak self] metadata, target in
             guard let self else {
                 throw MCPError.internalError("Window deallocated while validating Context Builder Git publication")
             }
-            try await validateContextBuilderGitArtifactSelection(metadata: metadata, target: target)
+            try await validateContextBuilderGitArtifactSelection(route: routeResources, metadata: metadata, target: target)
         },
         resolveTabContextSnapshot: { [weak self] metadata, toolName in
             guard let self else { throw MCPError.internalError("Window deallocated while resolving tab context") }
             return try resolveTabContextSnapshot(
+                route: routeResources,
                 from: metadata,
                 toolName: toolName
             )
@@ -1655,7 +1660,7 @@ final class MCPServerViewModel: ObservableObject {
         },
         boundTabID: { [weak self] connectionID in
             guard let self, let connectionID else { return nil }
-            return boundTabID(forConnection: connectionID)
+            return boundTabID(route: routeResources, forConnection: connectionID)
         },
         mapFileManagerErrorToMCP: { [weak self] error, action, path in
             guard let self else { return MCPError.internalError("Window deallocated while mapping file manager error") }
@@ -1675,6 +1680,7 @@ final class MCPServerViewModel: ObservableObject {
                 throw MCPError.internalError("Window deallocated while committing Git artifacts")
             }
             return try await commitPrimaryGitArtifactsToCurrentTab(
+                route: routeResources,
                 toolName: toolName,
                 candidates: candidates,
                 sourceSelection: sourceSelection,
@@ -1686,6 +1692,7 @@ final class MCPServerViewModel: ObservableObject {
                 throw MCPError.internalError("Window deallocated while registering Git artifact aliases")
             }
             return try await replaceAdvertisedGitArtifactsForCurrentTab(
+                route: routeResources,
                 toolName: toolName,
                 artifacts: artifacts,
                 expectedSelectionRevision: expectedSelectionRevision,
@@ -1695,6 +1702,7 @@ final class MCPServerViewModel: ObservableObject {
         invalidateAdvertisedGitArtifactsForCurrentTab: { [weak self] toolName, capturedContext in
             guard let self else { return }
             await invalidateAdvertisedGitArtifactsForCurrentTab(
+                route: routeResources,
                 toolName: toolName,
                 capturedContext: capturedContext
             )
@@ -1712,19 +1720,19 @@ final class MCPServerViewModel: ObservableObject {
         },
         resolveFileToolLookupContext: { [weak self] metadata in
             guard let self else { return .visibleWorkspace }
-            return await resolveFileToolLookupContext(from: metadata)
+            return await resolveFileToolLookupContext(route: routeResources, from: metadata)
         },
         requiredFileToolLookupContext: { [weak self] metadata in
             guard let self else {
                 throw MCPError.internalError("Window deallocated while resolving file-tool authority")
             }
-            return try await requiredFileToolLookupContext(from: metadata)
+            return try await requiredFileToolLookupContext(route: routeResources, from: metadata)
         },
         resolveMutationFileToolContext: { [weak self] metadata, toolName in
             guard let self else {
                 throw MCPError.internalError("Window deallocated while resolving mutation worktree scope")
             }
-            return try await resolveMutationFileToolContext(from: metadata, toolName: toolName)
+            return try await resolveMutationFileToolContext(route: routeResources, from: metadata, toolName: toolName)
         },
         stabilizedVirtualSelection: { [weak self] context in
             guard let self else { return context.selection }
@@ -1821,6 +1829,7 @@ final class MCPServerViewModel: ObservableObject {
                 return .unavailable(reason: "window deallocated during selection commit")
             }
             return await commitManageSelectionArtifactMutation(
+                route: routeResources,
                 resolvedContext: resolvedContext,
                 metadata: metadata,
                 expectedPhysicalSelection: expectedPhysicalSelection,
@@ -1861,7 +1870,7 @@ final class MCPServerViewModel: ObservableObject {
         },
         persistResolvedTabContextSnapshot: { [weak self] resolvedContext, metadata, mutated in
             guard let self else { return nil }
-            return await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: mutated)
+            return await persistResolvedTabContextSnapshot(route: routeResources, resolvedContext, metadata: metadata, mutated: mutated)
         },
         selectCreatedFile: { [weak self] file, resolvedContext, metadata, lookupContext in
             guard let self else { return "The file was created, but its selection was not confirmed because the window closed." }
@@ -2181,10 +2190,12 @@ final class MCPServerViewModel: ObservableObject {
         oracleProvider: oracleToolProvider,
         sharedBindings: domainReadToolProvider.bindings,
         resolveSpawnParentSessionID: { [weak self] metadata, targetWindow in
-            await self?.resolveSpawnParentSessionID(metadata: metadata, targetWindow: targetWindow)
+            guard let self else { return nil }
+            return await resolveSpawnParentSessionID(route: routeResources, metadata: metadata, targetWindow: targetWindow)
         },
         resolveObserverEndpoint: { [weak self] metadata, targetWindow in
-            await self?.resolveAgentSessionLinkObserverEndpoint(metadata: metadata, targetWindow: targetWindow)
+            guard let self else { return nil }
+            return await resolveAgentSessionLinkObserverEndpoint(route: routeResources, metadata: metadata, targetWindow: targetWindow)
         }
     )
     private var cancellables: Set<AnyCancellable> = []
@@ -2254,13 +2265,6 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     @MainActor
-    var tabContextByConnectionID: [UUID: TabContextSnapshot] {
-        get { runRouteBindings.tabContextByConnectionID }
-        set { runRouteBindings.tabContextByConnectionID = newValue }
-        _modify { yield &runRouteBindings.tabContextByConnectionID }
-    }
-
-    @MainActor
     let contextBuilderTeardownPublicationCoordinator = ContextBuilderTeardownPublicationCoordinator()
     #if DEBUG
         @MainActor
@@ -2268,34 +2272,6 @@ final class MCPServerViewModel: ObservableObject {
         @MainActor
         var readFileAutoSelectionFinalRevalidationHandlerForTesting: (() async -> Void)?
     #endif
-    @MainActor
-    var connectionIDByRunID: [UUID: UUID] {
-        get { runRouteBindings.connectionIDByRunID }
-        set { runRouteBindings.connectionIDByRunID = newValue }
-        _modify { yield &runRouteBindings.connectionIDByRunID }
-    }
-
-    @MainActor
-    var connectionIDToRunID: [UUID: UUID] {
-        get { runRouteBindings.connectionIDToRunID }
-        set { runRouteBindings.connectionIDToRunID = newValue }
-        _modify { yield &runRouteBindings.connectionIDToRunID }
-    }
-
-    @MainActor
-    var pendingPolicyRunIDMappingTokenIDByRunID: [UUID: UUID] {
-        get { runRouteBindings.pendingPolicyTokenIDByRunID }
-        set { runRouteBindings.pendingPolicyTokenIDByRunID = newValue }
-        _modify { yield &runRouteBindings.pendingPolicyTokenIDByRunID }
-    }
-
-    @MainActor
-    var presentationWindowByConnection: [UUID: Int] {
-        get { runRouteBindings.presentationWindowByConnection }
-        set { runRouteBindings.presentationWindowByConnection = newValue }
-        _modify { yield &runRouteBindings.presentationWindowByConnection }
-    }
-
     let domainRoutingCoordinator: DomainRoutingCoordinator?
     let domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient?
     let domainReadSideEffectCoordinator: DomainReadSideEffectCoordinator
@@ -2516,7 +2492,7 @@ final class MCPServerViewModel: ObservableObject {
         let candidateWindowIDs = [
             managerWindowID,
             metadata.windowID,
-            presentationWindowByConnection[connectionID]
+            routeResources.runRouteBindings.presentationWindowByConnection[connectionID]
         ].compactMap(\.self)
 
         for candidateWindowID in candidateWindowIDs where candidateWindowID != windowID {
@@ -2536,6 +2512,7 @@ final class MCPServerViewModel: ObservableObject {
         guard !sessionIDs.isEmpty else { return nil }
         toolExecutionRuntime.purgeStaleAgentRunWaitScopes(source: "begin")
         let resolvedContext = try? resolveTabContextSnapshot(
+            route: routeResources,
             from: metadata,
             toolName: "agent_run_wait_scope"
         )
@@ -2583,7 +2560,7 @@ final class MCPServerViewModel: ObservableObject {
         resolvedContext: ResolvedTabContextSnapshot?
     ) async -> UUID? {
         if let connectionID = metadata.connectionID,
-           let runID = connectionIDToRunID[connectionID]
+           let runID = routeResources.runRouteBindings.connectionIDToRunID[connectionID]
         {
             return runID
         }
@@ -2594,6 +2571,7 @@ final class MCPServerViewModel: ObservableObject {
             let context = resolvedContext.snapshot
             if let connectionID = metadata.connectionID {
                 _ = registerRunIDMapping(
+                    route: routeResources,
                     connectionID: connectionID,
                     runID: runID,
                     windowID: context.windowID
@@ -3526,6 +3504,7 @@ final class MCPServerViewModel: ObservableObject {
             modelRoute = nil
         }
         let resolvedContext = modelOnly ? nil : try? resolveTabContextSnapshot(
+            route: routeResources,
             from: metadata,
             toolName: name
         )
@@ -3628,6 +3607,7 @@ final class MCPServerViewModel: ObservableObject {
             return
         }
         try rebindToTabIfNeeded(
+            route: routeResources,
             connectionID: connectionID,
             clientName: metadata.clientName,
             windowID: windowID,
@@ -3662,7 +3642,7 @@ final class MCPServerViewModel: ObservableObject {
             await service.currentRequestConnectionID()
         }
         if let resolvedConnectionID,
-           let boundTab = boundTabID(forConnection: resolvedConnectionID),
+           let boundTab = boundTabID(route: routeResources, forConnection: resolvedConnectionID),
            composeTabExists(boundTab)
         {
             return boundTab
@@ -3724,7 +3704,7 @@ final class MCPServerViewModel: ObservableObject {
         if requiresBoundAgentSessionContext,
            let resolvedConnectionID
         {
-            guard let boundContext = tabContextByConnectionID[resolvedConnectionID],
+            guard let boundContext = routeResources.runRouteBindings.tabContextByConnectionID[resolvedConnectionID],
                   boundContext.windowID == windowID
             else {
                 throw MCPError.invalidParams(
@@ -3744,7 +3724,7 @@ final class MCPServerViewModel: ObservableObject {
                 )
         }
         if let resolvedConnectionID,
-           let boundContext = tabContextByConnectionID[resolvedConnectionID],
+           let boundContext = routeResources.runRouteBindings.tabContextByConnectionID[resolvedConnectionID],
            boundContext.windowID == windowID
         {
             guard composeTabExists(boundContext.tabID) else {
@@ -3824,6 +3804,7 @@ final class MCPServerViewModel: ObservableObject {
             return
         }
         try bindTabForConnection(
+            route: routeResources,
             connectionID: connectionID,
             clientName: metadata.clientName,
             tabID: tabID,
@@ -3849,6 +3830,7 @@ final class MCPServerViewModel: ObservableObject {
             return false
         }
         if (try? resolveTabContextSnapshot(
+            route: routeResources,
             from: metadata,
             toolName: "agent_run_source_binding"
         )) != nil {
@@ -3928,7 +3910,7 @@ final class MCPServerViewModel: ObservableObject {
 
     private func existingTabContextBindingAcrossWindows(for connectionID: UUID) -> ConnectionBindingSnapshot? {
         let snapshots = WindowStatesManager.shared.allWindows.map {
-            $0.mcpServer.connectionBindingSnapshot(forConnection: connectionID)
+            $0.mcpServer.connectionBindingSnapshot(route: $0.mcpServer.routeResources, forConnection: connectionID)
         }
         if let explicit = snapshots.first(where: { $0.bindingKind == .tabContext && $0.explicitlyBound && $0.runID == nil }) {
             return explicit
@@ -3984,6 +3966,7 @@ final class MCPServerViewModel: ObservableObject {
 
         do {
             let resolution = try targetWindow.mcpServer.resolveTabContext(
+                route: targetWindow.mcpServer.routeResources,
                 connectionID: connectionID,
                 clientName: clientName,
                 providedWindowID: targetWindow.windowID,
@@ -4054,6 +4037,7 @@ final class MCPServerViewModel: ObservableObject {
                 )
             } else {
                 lookupContext = try await targetWindow.mcpServer.resolveFileToolLookupContext(
+                    route: targetWindow.mcpServer.routeResources,
                     tabID: context.tabID,
                     workspaceID: context.workspaceID
                 )
@@ -4255,11 +4239,12 @@ final class MCPServerViewModel: ObservableObject {
                 await captureRequestMetadata()
             }
             let lookupContext = await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.AutoSelect.fullLookupContext) {
-                await resolveFileToolLookupContext(from: metadata)
+                await resolveFileToolLookupContext(route: routeResources, from: metadata)
             }
             let lookupRootScope = lookupContext.rootScope
             var resolvedContext = try EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.AutoSelect.fullSnapshotResolution) {
                 try resolveTabContextSnapshot(
+                    route: routeResources,
                     from: metadata,
                     toolName: "autoSelectReadFile"
                 )
@@ -4311,7 +4296,7 @@ final class MCPServerViewModel: ObservableObject {
                 EditFlowPerf.Stage.ReadFile.AutoSelect.persistence,
                 EditFlowPerf.Dimensions(outcome: "attempted")
             ) {
-                await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)
+                await persistResolvedTabContextSnapshot(route: routeResources, resolvedContext, metadata: metadata, mutated: true)
             }
             _ = try MCPSelectionToolProvider.requireCanonicalSelection(
                 verification,
@@ -4356,6 +4341,7 @@ final class MCPServerViewModel: ObservableObject {
         let resolvedContext: ResolvedTabContextSnapshot
         do {
             resolvedContext = try resolveTabContextSnapshot(
+                route: routeResources,
                 from: metadata,
                 toolName: "enqueueReadFileAutoSelection"
             )
@@ -4423,6 +4409,7 @@ final class MCPServerViewModel: ObservableObject {
             resolvedPaths: [absolutePhysicalPath]
         )
         let currentResolvedContext = try resolveTabContextSnapshot(
+            route: routeResources,
             from: metadata,
             toolName: "enqueueReadFileAutoSelection"
         )
@@ -4450,6 +4437,7 @@ final class MCPServerViewModel: ObservableObject {
         requirement: MCPReadFileAutoSelectionCoordinator.DrainRequirement
     ) async throws -> MCPReadFileAutoSelectionCoordinator.DrainResult {
         let resolvedContext = try resolveTabContextSnapshot(
+            route: routeResources,
             from: metadata,
             toolName: "drainReadFileAutoSelection"
         )
@@ -4505,8 +4493,8 @@ final class MCPServerViewModel: ObservableObject {
               case let .bound(successorConnectionID, successorRunID) = successorKey.route,
               successorConnectionID == connectionID,
               let successorRunID,
-              connectionIDByRunID[successorRunID] == connectionID,
-              connectionIDToRunID[connectionID] == successorRunID
+              routeResources.runRouteBindings.connectionIDByRunID[successorRunID] == connectionID,
+              routeResources.runRouteBindings.connectionIDToRunID[connectionID] == successorRunID
         else { return [] }
         return lineage.predecessorKeys
     }
@@ -4586,7 +4574,7 @@ final class MCPServerViewModel: ObservableObject {
             tabID: UUID?,
             expectedRunID: UUID?
         ) -> [DebugReadFileAutoSelectionTarget] {
-            tabContextByConnectionID.compactMap { connectionID, context in
+            routeResources.runRouteBindings.tabContextByConnectionID.compactMap { connectionID, context in
                 guard context.windowID == windowID else { return nil }
                 if let targetConnectionID, connectionID != targetConnectionID { return nil }
                 if targetConnectionID == nil {
@@ -4597,7 +4585,7 @@ final class MCPServerViewModel: ObservableObject {
                 }
                 if let expectedRunID, context.runID != expectedRunID { return nil }
                 if let runID = context.runID,
-                   connectionIDByRunID[runID] != connectionID || connectionIDToRunID[connectionID] != runID
+                   routeResources.runRouteBindings.connectionIDByRunID[runID] != connectionID || routeResources.runRouteBindings.connectionIDToRunID[connectionID] != runID
                 {
                     return nil
                 }
@@ -4638,7 +4626,7 @@ final class MCPServerViewModel: ObservableObject {
                   let context = readFileAutoSelectionContext(for: target.contextKey),
                   context.activeAgentSessionID == target.agentSessionID
             else { return nil }
-            return await resolveFileToolLookupContext(from: RequestMetadata(
+            return await resolveFileToolLookupContext(route: routeResources, from: RequestMetadata(
                 connectionID: target.connectionID,
                 clientName: nil,
                 windowID: target.contextKey.windowID,
@@ -4752,7 +4740,7 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     func isReadFileAutoSelectionContextCurrent(_ key: MCPReadFileAutoSelectionCoordinator.ContextKey) -> Bool {
         guard case let .bound(connectionID, runID) = key.route,
-              let context = tabContextByConnectionID[connectionID]
+              let context = routeResources.runRouteBindings.tabContextByConnectionID[connectionID]
         else { return false }
         return context.windowID == key.windowID
             && context.workspaceID == key.workspaceID
@@ -5136,6 +5124,7 @@ final class MCPServerViewModel: ObservableObject {
             else { continue }
 
             guard let authoritativeResult = await acceptReadFileAutoSelection(
+                route: routeResources,
                 selection: selection,
                 lookupContext: authoritativeLookupContext,
                 contextKey: key,
@@ -5201,13 +5190,14 @@ final class MCPServerViewModel: ObservableObject {
         for key: MCPReadFileAutoSelectionCoordinator.ContextKey
     ) -> TabContextSnapshot? {
         guard case let .bound(connectionID, _) = key.route else { return nil }
-        return tabContextByConnectionID[connectionID]
+        return routeResources.runRouteBindings.tabContextByConnectionID[connectionID]
     }
 
     private func autoSelectedFullFilePaths() async -> [String] {
         let metadata = await captureRequestMetadata()
-        let lookupRootScope = await resolveFileToolLookupContext(from: metadata).rootScope
+        let lookupRootScope = await resolveFileToolLookupContext(route: routeResources, from: metadata).rootScope
         guard let resolvedContext = try? resolveTabContextSnapshot(
+            route: routeResources,
             from: metadata,
             toolName: "autoSelectedFullFilePaths"
         ) else { return [] }
@@ -5283,6 +5273,7 @@ final class MCPServerViewModel: ObservableObject {
         let resolvedContext: ResolvedTabContextSnapshot
         do {
             resolvedContext = try resolveTabContextSnapshot(
+                route: routeResources,
                 from: metadata,
                 toolName: "enqueueFileSearchAutoSelection"
             )
@@ -5363,9 +5354,10 @@ final class MCPServerViewModel: ObservableObject {
     ) async throws -> MCPSelectionSlicesMutationResult {
         do {
             let metadata = await captureRequestMetadata()
-            let lookupContext = await resolveFileToolLookupContext(from: metadata)
+            let lookupContext = await resolveFileToolLookupContext(route: routeResources, from: metadata)
             let lookupRootScope = lookupContext.rootScope
             let resolvedContext = try resolveTabContextSnapshot(
+                route: routeResources,
                 from: metadata,
                 toolName: "applySelectionSlices"
             )
@@ -5421,7 +5413,7 @@ final class MCPServerViewModel: ObservableObject {
         )
         if computed.mutated {
             resolvedContext.snapshot.selection = computed.selection
-            let verification = await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)
+            let verification = await persistResolvedTabContextSnapshot(route: routeResources, resolvedContext, metadata: metadata, mutated: true)
             _ = try MCPSelectionToolProvider.requireCanonicalSelection(
                 verification,
                 requested: computed.selection,
@@ -5515,6 +5507,7 @@ final class MCPServerViewModel: ObservableObject {
         precondition(maximumSeedCount > 0)
         try Task.checkCancellation()
         let resolved = try resolveTabContextSnapshot(
+            route: routeResources,
             from: metadata,
             toolName: MCPWindowToolName.getCodeStructure
         )
@@ -6076,6 +6069,7 @@ final class MCPServerViewModel: ObservableObject {
         ) else { return nil }
 
         guard var resolvedContext = try? resolveTabContextSnapshot(
+            route: routeResources,
             from: metadata,
             toolName: MCPWindowToolName.readFile
         ) else { return nil }
@@ -6399,6 +6393,7 @@ final class MCPServerViewModel: ObservableObject {
         try Task.checkCancellation()
         let metadata = await captureRequestMetadata()
         let (resolvedContext, lookupContext) = try await resolveMutationFileToolContext(
+            route: routeResources,
             from: metadata,
             toolName: MCPWindowToolName.fileActions
         )
@@ -6964,6 +6959,7 @@ final class MCPServerViewModel: ObservableObject {
     private func storedSelectionForCurrentTabContext(includeCodemapPathsWhenSelectedUsage: Bool) async throws -> StoredSelection {
         let metadata = await captureRequestMetadata()
         let resolved = try resolveTabContextSnapshot(
+            route: routeResources,
             from: metadata,
             toolName: MCPWindowToolName.getFileTree
         )
@@ -7302,9 +7298,9 @@ extension MCPServerViewModel {
     ) -> DomainAgentSessionLinkEndpointIdentity? {
         guard let window = WindowStatesManager.shared.modelRoutingWindow(withID: route.windowID),
               window.mcpServer === self,
-              connectionIDToRunID[connectionID] == route.runID,
-              connectionIDByRunID[route.runID] == connectionID,
-              let context = tabContextByConnectionID[connectionID],
+              routeResources.runRouteBindings.connectionIDToRunID[connectionID] == route.runID,
+              routeResources.runRouteBindings.connectionIDByRunID[route.runID] == connectionID,
+              let context = routeResources.runRouteBindings.tabContextByConnectionID[connectionID],
               context.runID == route.runID, context.windowID == route.windowID,
               context.workspaceID == route.workspaceID, context.tabID == route.tabID,
               hint.map({ Self.hint($0, matches: context) }) ?? true,

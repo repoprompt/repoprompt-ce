@@ -145,6 +145,7 @@ extension MCPServerViewModel {
             await captureRequestMetadata()
         }
         let resolved = try resolveTabContextSnapshot(
+            route: routeResources,
             from: metadata,
             toolName: "selection",
             startMirroring: false
@@ -168,6 +169,7 @@ extension MCPServerViewModel {
                 await captureRequestMetadata()
             }
             let resolved = try resolveTabContextSnapshot(
+                route: routeResources,
                 from: metadata,
                 toolName: "selection",
                 startMirroring: false

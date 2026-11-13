@@ -145,7 +145,7 @@ import XCTest
                 ))
                 driver.streamBody = { runID in
                     let connection = try await driver.connectChild(runID: runID)
-                    let binding = driver.window.mcpServer.connectionBindingSnapshot(forConnection: connection.connectionID)
+                    let binding = driver.window.mcpServer.connectionBindingSnapshot(route: driver.window.mcpServer.routeResources, forConnection: connection.connectionID)
                     XCTAssertEqual(binding.runID, runID)
                     XCTAssertEqual(binding.workspaceID, driver.fixture.workspace.id)
                     try await driver.discover(using: connection)
@@ -2103,7 +2103,7 @@ import XCTest
             discovery: BoundDiscovery,
             runID: UUID
         ) throws {
-            let binding = driver.window.mcpServer.connectionBindingSnapshot(forConnection: child.connectionID)
+            let binding = driver.window.mcpServer.connectionBindingSnapshot(route: driver.window.mcpServer.routeResources, forConnection: child.connectionID)
             XCTAssertEqual(binding.runID, runID)
             XCTAssertEqual(binding.workspaceID, driver.fixture.workspace.id)
             let snapshot = try driver.promotedSnapshot(for: child)

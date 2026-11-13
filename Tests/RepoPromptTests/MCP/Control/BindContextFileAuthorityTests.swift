@@ -45,6 +45,7 @@ import XCTest
         func testCurrentTabContextRejectsAmbientConnectionWithoutCapturedInvocation() async throws {
             let fixture = try await makeFixture(rootPaths: [makeTemporaryRoot().path])
             try fixture.window.mcpServer.bindTabForConnection(
+                route: fixture.window.mcpServer.routeResources,
                 connectionID: fixture.connectionID,
                 clientName: "BindContextFileAuthorityTests",
                 tabID: fixture.contextID,
@@ -54,7 +55,7 @@ import XCTest
             do {
                 _ = try await ServerNetworkManager.currentConnectionIDTaskLocal.withValue(fixture.connectionID) {
                     try await MCPInvocationContextBridge.currentTaskLocal.withValue(nil) {
-                        try await fixture.window.mcpServer.requireCurrentTabContext(toolName: "metadata_test")
+                        try await fixture.window.mcpServer.requireCurrentTabContext(route: fixture.window.mcpServer.routeResources, toolName: "metadata_test")
                     }
                 }
                 XCTFail("Ambient connection affinity must not replace a captured invocation")
@@ -128,6 +129,7 @@ import XCTest
         func testFrozenLookupReplacementInvalidatesOnlyTheChangedSnapshotCopy() async throws {
             let fixture = try await makeFixture(rootPaths: [makeTemporaryRoot().path])
             let authority = try await fixture.window.mcpServer.resolveFileToolAuthority(
+                route: fixture.window.mcpServer.routeResources,
                 tabID: fixture.contextID,
                 workspaceID: fixture.workspace.id
             )
@@ -157,6 +159,7 @@ import XCTest
         func testFrozenAuthorityCommitPropagatesOperationErrorAndFencesSupersededTicket() async throws {
             let fixture = try await makeFixture(rootPaths: [makeTemporaryRoot().path])
             let authority = try await fixture.window.mcpServer.resolveFileToolAuthority(
+                route: fixture.window.mcpServer.routeResources,
                 tabID: fixture.contextID,
                 workspaceID: fixture.workspace.id
             )
@@ -184,11 +187,13 @@ import XCTest
         func testBindStoresAuthorityConsumedByNextFileOperation() async throws {
             let fixture = try await makeFixture(rootPaths: [makeTemporaryRoot().path])
             let authority = try await fixture.window.mcpServer.resolveFileToolAuthority(
+                route: fixture.window.mcpServer.routeResources,
                 tabID: fixture.contextID,
                 workspaceID: fixture.workspace.id
             )
 
             try fixture.window.mcpServer.bindTabForConnection(
+                route: fixture.window.mcpServer.routeResources,
                 connectionID: fixture.connectionID,
                 clientName: "BindContextFileAuthorityTests",
                 tabID: fixture.contextID,
@@ -197,6 +202,7 @@ import XCTest
                 frozenFileToolAuthority: authority
             )
             let consumed = try await fixture.window.mcpServer.requiredFileToolLookupContext(
+                route: fixture.window.mcpServer.routeResources,
                 from: metadata(for: fixture)
             )
 
@@ -208,10 +214,12 @@ import XCTest
         func testRepeatedBindRefreshesStoredAuthorityWithoutChangingRoute() async throws {
             let fixture = try await makeFixture(rootPaths: [makeTemporaryRoot().path])
             let first = try await fixture.window.mcpServer.resolveFileToolAuthority(
+                route: fixture.window.mcpServer.routeResources,
                 tabID: fixture.contextID,
                 workspaceID: fixture.workspace.id
             )
             try fixture.window.mcpServer.bindTabForConnection(
+                route: fixture.window.mcpServer.routeResources,
                 connectionID: fixture.connectionID,
                 clientName: nil,
                 tabID: fixture.contextID,
@@ -221,17 +229,20 @@ import XCTest
             )
             fixture.window.workspaceManager.republishReadyRootCatalogWithNextGenerationForTesting()
             let refreshed = try await fixture.window.mcpServer.resolveFileToolAuthority(
+                route: fixture.window.mcpServer.routeResources,
                 tabID: fixture.contextID,
                 workspaceID: fixture.workspace.id
             )
 
             fixture.window.mcpServer.updateBoundFileToolAuthority(
+                route: fixture.window.mcpServer.routeResources,
                 connectionID: fixture.connectionID,
                 tabID: fixture.contextID,
                 workspaceID: fixture.workspace.id,
                 authority: refreshed
             )
             let consumed = try await fixture.window.mcpServer.requiredFileToolLookupContext(
+                route: fixture.window.mcpServer.routeResources,
                 from: metadata(for: fixture)
             )
 
@@ -243,10 +254,12 @@ import XCTest
         func testFailedReplacementPreservesPriorBinding() async throws {
             let fixture = try await makeFixture(rootPaths: [makeTemporaryRoot().path])
             let authority = try await fixture.window.mcpServer.resolveFileToolAuthority(
+                route: fixture.window.mcpServer.routeResources,
                 tabID: fixture.contextID,
                 workspaceID: fixture.workspace.id
             )
             try fixture.window.mcpServer.bindTabForConnection(
+                route: fixture.window.mcpServer.routeResources,
                 connectionID: fixture.connectionID,
                 clientName: nil,
                 tabID: fixture.contextID,
@@ -255,10 +268,12 @@ import XCTest
                 frozenFileToolAuthority: authority
             )
             let prior = fixture.window.mcpServer.connectionBindingSnapshot(
+                route: fixture.window.mcpServer.routeResources,
                 forConnection: fixture.connectionID
             )
 
             XCTAssertThrowsError(try fixture.window.mcpServer.bindTabForConnection(
+                route: fixture.window.mcpServer.routeResources,
                 connectionID: fixture.connectionID,
                 clientName: nil,
                 tabID: UUID(),
@@ -268,6 +283,7 @@ import XCTest
             ))
 
             let retained = fixture.window.mcpServer.connectionBindingSnapshot(
+                route: fixture.window.mcpServer.routeResources,
                 forConnection: fixture.connectionID
             )
             XCTAssertEqual(retained.windowID, prior.windowID)
@@ -280,6 +296,7 @@ import XCTest
         func testSupersededCatalogRejectsPreviouslyIssuedAuthority() async throws {
             let fixture = try await makeFixture(rootPaths: [makeTemporaryRoot().path])
             let authority = try await fixture.window.mcpServer.resolveFileToolAuthority(
+                route: fixture.window.mcpServer.routeResources,
                 tabID: fixture.contextID,
                 workspaceID: fixture.workspace.id
             )
@@ -297,6 +314,7 @@ import XCTest
 
             var enteredCommit = false
             let performed = try await fixture.window.mcpServer.performIfFileToolAuthorityIsCurrent(
+                route: fixture.window.mcpServer.routeResources,
                 authority,
                 tabID: fixture.contextID,
                 workspaceID: fixture.workspace.id
@@ -311,6 +329,7 @@ import XCTest
         func testCanonicalRootMutationAfterCaptureRejectsAuthority() async throws {
             let fixture = try await makeFixture(rootPaths: [makeTemporaryRoot().path])
             let authority = try await fixture.window.mcpServer.resolveFileToolAuthority(
+                route: fixture.window.mcpServer.routeResources,
                 tabID: fixture.contextID,
                 workspaceID: fixture.workspace.id
             )
@@ -339,10 +358,12 @@ import XCTest
             let prior = try await makeFixture(rootPaths: [makeTemporaryRoot().path])
             let replacement = try await makeFixture(rootPaths: [makeTemporaryRoot().path])
             let priorAuthority = try await prior.window.mcpServer.resolveFileToolAuthority(
+                route: prior.window.mcpServer.routeResources,
                 tabID: prior.contextID,
                 workspaceID: prior.workspace.id
             )
             try prior.window.mcpServer.bindTabForConnection(
+                route: prior.window.mcpServer.routeResources,
                 connectionID: prior.connectionID,
                 clientName: nil,
                 tabID: prior.contextID,
@@ -351,6 +372,7 @@ import XCTest
                 frozenFileToolAuthority: priorAuthority
             )
             let replacementAuthority = try await replacement.window.mcpServer.resolveFileToolAuthority(
+                route: replacement.window.mcpServer.routeResources,
                 tabID: replacement.contextID,
                 workspaceID: replacement.workspace.id
             )
@@ -379,13 +401,13 @@ import XCTest
                 XCTAssertTrue(error is AffinityFailure)
             }
 
-            let retained = prior.window.mcpServer.connectionBindingSnapshot(forConnection: prior.connectionID)
+            let retained = prior.window.mcpServer.connectionBindingSnapshot(route: prior.window.mcpServer.routeResources, forConnection: prior.connectionID)
             XCTAssertEqual(retained.windowID, prior.window.windowID)
             XCTAssertEqual(retained.workspaceID, prior.workspace.id)
             XCTAssertEqual(retained.tabID, prior.contextID)
-            let consumed = try await prior.window.mcpServer.requiredFileToolLookupContext(from: metadata(for: prior))
+            let consumed = try await prior.window.mcpServer.requiredFileToolLookupContext(route: prior.window.mcpServer.routeResources, from: metadata(for: prior))
             XCTAssertTrue(priorAuthority.hasSameRoutingAuthority(as: consumed))
-            XCTAssertNil(replacement.window.mcpServer.boundTabID(forConnection: prior.connectionID))
+            XCTAssertNil(replacement.window.mcpServer.boundTabID(route: replacement.window.mcpServer.routeResources, forConnection: prior.connectionID))
         }
 
         @MainActor
@@ -393,15 +415,23 @@ import XCTest
             let prior = try await makeFixture(rootPaths: [makeTemporaryRoot().path])
             let replacement = try await makeFixture(rootPaths: [makeTemporaryRoot().path])
             let priorAuthority = try await prior.window.mcpServer.resolveFileToolAuthority(
-                tabID: prior.contextID, workspaceID: prior.workspace.id
+                route: prior.window.mcpServer.routeResources,
+                tabID: prior.contextID,
+                workspaceID: prior.workspace.id
             )
             try prior.window.mcpServer.bindTabForConnection(
-                connectionID: prior.connectionID, clientName: nil, tabID: prior.contextID,
-                workspaceID: prior.workspace.id, windowID: prior.window.windowID,
+                route: prior.window.mcpServer.routeResources,
+                connectionID: prior.connectionID,
+                clientName: nil,
+                tabID: prior.contextID,
+                workspaceID: prior.workspace.id,
+                windowID: prior.window.windowID,
                 frozenFileToolAuthority: priorAuthority
             )
             let replacementAuthority = try await replacement.window.mcpServer.resolveFileToolAuthority(
-                tabID: replacement.contextID, workspaceID: replacement.workspace.id
+                route: replacement.window.mcpServer.routeResources,
+                tabID: replacement.contextID,
+                workspaceID: replacement.workspace.id
             )
             let previousWindows = WindowStatesManager.shared.allWindows
             WindowStatesManager.shared.allWindows = [prior.window, replacement.window]
@@ -440,15 +470,17 @@ import XCTest
             } catch {}
             let retainedWindow = await network.selectedWindow(for: prior.connectionID)
             XCTAssertEqual(retainedWindow, prior.window.windowID)
-            XCTAssertEqual(prior.window.mcpServer.boundTabID(forConnection: prior.connectionID), prior.contextID)
-            XCTAssertNil(replacement.window.mcpServer.boundTabID(forConnection: prior.connectionID))
-            let consumed = try await prior.window.mcpServer.requiredFileToolLookupContext(from: metadata(for: prior))
+            XCTAssertEqual(prior.window.mcpServer.boundTabID(route: prior.window.mcpServer.routeResources, forConnection: prior.connectionID), prior.contextID)
+            XCTAssertNil(replacement.window.mcpServer.boundTabID(route: replacement.window.mcpServer.routeResources, forConnection: prior.connectionID))
+            let consumed = try await prior.window.mcpServer.requiredFileToolLookupContext(route: prior.window.mcpServer.routeResources, from: metadata(for: prior))
             XCTAssertTrue(priorAuthority.hasSameRoutingAuthority(as: consumed))
 
             // A failed transaction must settle and permit a subsequent valid replacement.
             replacement.window.mcpServer.setAfterFileToolLookupContextRootValidationForTesting(nil)
             let refreshed = try await replacement.window.mcpServer.resolveFileToolAuthority(
-                tabID: replacement.contextID, workspaceID: replacement.workspace.id
+                route: replacement.window.mcpServer.routeResources,
+                tabID: replacement.contextID,
+                workspaceID: replacement.workspace.id
             )
             let changed = try await ServerNetworkManager.currentConnectionIDTaskLocal.withValue(prior.connectionID) {
                 try await service.test_bindTarget(
@@ -460,8 +492,8 @@ import XCTest
             XCTAssertTrue(changed)
             let finalWindow = await network.selectedWindow(for: prior.connectionID)
             XCTAssertEqual(finalWindow, replacement.window.windowID)
-            XCTAssertNil(prior.window.mcpServer.boundTabID(forConnection: prior.connectionID))
-            XCTAssertEqual(replacement.window.mcpServer.boundTabID(forConnection: prior.connectionID), replacement.contextID)
+            XCTAssertNil(prior.window.mcpServer.boundTabID(route: prior.window.mcpServer.routeResources, forConnection: prior.connectionID))
+            XCTAssertEqual(replacement.window.mcpServer.boundTabID(route: replacement.window.mcpServer.routeResources, forConnection: prior.connectionID), replacement.contextID)
         }
 
         @MainActor
@@ -543,14 +575,20 @@ import XCTest
             let fixture = try await makeFixture(rootPaths: [root.path])
             let server = fixture.window.mcpServer
             let authority = try await server.resolveFileToolAuthority(
-                tabID: fixture.contextID, workspaceID: fixture.workspace.id
+                route: server.routeResources,
+                tabID: fixture.contextID,
+                workspaceID: fixture.workspace.id
             )
             try server.bindTabForConnection(
-                connectionID: fixture.connectionID, clientName: nil, tabID: fixture.contextID,
-                workspaceID: fixture.workspace.id, windowID: fixture.window.windowID,
+                route: server.routeResources,
+                connectionID: fixture.connectionID,
+                clientName: nil,
+                tabID: fixture.contextID,
+                workspaceID: fixture.workspace.id,
+                windowID: fixture.window.windowID,
                 frozenFileToolAuthority: authority
             )
-            let context = try XCTUnwrap(server.tabContextByConnectionID[fixture.connectionID])
+            let context = try XCTUnwrap(server.runRouteBindings.tabContextByConnectionID[fixture.connectionID])
             let key = MCPReadFileAutoSelectionCoordinator.ContextKey(
                 windowID: fixture.window.windowID, workspaceID: fixture.workspace.id,
                 tabID: fixture.contextID, route: .bound(connectionID: fixture.connectionID, runID: nil),
@@ -598,7 +636,9 @@ import XCTest
             let fixture = try await makeFixture(rootPaths: [makeTemporaryRoot().path])
             let server = fixture.window.mcpServer
             let canonical = try await server.resolveFileToolAuthority(
-                tabID: fixture.contextID, workspaceID: fixture.workspace.id
+                route: server.routeResources,
+                tabID: fixture.contextID,
+                workspaceID: fixture.workspace.id
             )
             let store = fixture.window.workspaceFileContextStore
             let physicalURL = try makeTemporaryRoot()
@@ -622,11 +662,15 @@ import XCTest
                 store: store, sourceIdentity: canonical.sourceIdentity
             )
             try server.bindTabForConnection(
-                connectionID: fixture.connectionID, clientName: nil, tabID: fixture.contextID,
-                workspaceID: fixture.workspace.id, windowID: fixture.window.windowID,
+                route: server.routeResources,
+                connectionID: fixture.connectionID,
+                clientName: nil,
+                tabID: fixture.contextID,
+                workspaceID: fixture.workspace.id,
+                windowID: fixture.window.windowID,
                 frozenFileToolAuthority: authority
             )
-            let bound = try XCTUnwrap(server.tabContextByConnectionID[fixture.connectionID])
+            let bound = try XCTUnwrap(server.runRouteBindings.tabContextByConnectionID[fixture.connectionID])
             let key = MCPReadFileAutoSelectionCoordinator.ContextKey(
                 windowID: fixture.window.windowID, workspaceID: fixture.workspace.id, tabID: fixture.contextID,
                 route: .bound(connectionID: fixture.connectionID, runID: nil),
@@ -644,14 +688,18 @@ import XCTest
             }
             let apply = Task { @MainActor in
                 await server.acceptReadFileAutoSelection(
+                    route: server.routeResources,
                     selection: StoredSelection(
                         selectedPaths: prior.selectedPaths + [physicalURL.appendingPathComponent("Sentinel.swift").path],
                         manualCodemapPaths: prior.manualCodemapPaths,
                         slices: prior.slices,
                         codemapAutoEnabled: false
                     ),
-                    lookupContext: context, contextKey: key, expectedBaseSelection: prior,
-                    automaticCodemapDisposition: .disableAutomaticPreservingManual, authority: authority
+                    lookupContext: context,
+                    contextKey: key,
+                    expectedBaseSelection: prior,
+                    automaticCodemapDisposition: .disableAutomaticPreservingManual,
+                    authority: authority
                 )
             }
             await gate.waitUntilHeld()
@@ -852,6 +900,7 @@ import XCTest
         func testGenuinelyRootlessBindProducesExplicitEmptyAuthority() async throws {
             let fixture = try await makeFixture(rootPaths: [])
             let authority = try await fixture.window.mcpServer.resolveFileToolAuthority(
+                route: fixture.window.mcpServer.routeResources,
                 tabID: fixture.contextID,
                 workspaceID: fixture.workspace.id
             )
@@ -914,7 +963,7 @@ import XCTest
                 "_rawJSON": .bool(true)
             ])
             XCTAssertNotEqual(selected.isError, true, toolText(selected))
-            XCTAssertNil(fixture.window.mcpServer.boundTabID(forConnection: connection.connectionID))
+            XCTAssertNil(fixture.window.mcpServer.boundTabID(route: fixture.window.mcpServer.routeResources, forConnection: connection.connectionID))
             XCTAssertEqual(fixture.window.workspaceManager.composeTab(for: identity)?.selection, initialSelection)
         }
 
@@ -922,9 +971,9 @@ import XCTest
         func testRunScopedOneShotHintStillRequiresConnectionAuthority() async throws {
             let fixture = try await makeFixture(rootPaths: [makeTemporaryRoot().path])
             let runID = UUID()
-            fixture.window.mcpServer.connectionIDToRunID[fixture.connectionID] = runID
+            fixture.window.mcpServer.runRouteBindings.connectionIDToRunID[fixture.connectionID] = runID
             addTeardownBlock { @MainActor in
-                fixture.window.mcpServer.connectionIDToRunID.removeValue(forKey: fixture.connectionID)
+                fixture.window.mcpServer.runRouteBindings.connectionIDToRunID.removeValue(forKey: fixture.connectionID)
             }
             let metadata = MCPRequestMetadata(
                 connectionID: fixture.connectionID,
@@ -938,7 +987,7 @@ import XCTest
             )
 
             do {
-                _ = try await fixture.window.mcpServer.requiredFileToolLookupContext(from: metadata)
+                _ = try await fixture.window.mcpServer.requiredFileToolLookupContext(route: fixture.window.mcpServer.routeResources, from: metadata)
                 XCTFail("A run-scoped hint without a connection binding must fail closed")
             } catch let failure as MCPFileToolAuthorityFailure {
                 XCTAssertEqual(failure, .superseded)
@@ -987,8 +1036,8 @@ import XCTest
             let fixture = try await makeFixture(rootPaths: [makeTemporaryRoot().path], extraTabIDs: [childTabID])
             let server = fixture.window.mcpServer
             let metadata = metadata(for: fixture)
-            try server.bindTabForConnection(connectionID: fixture.connectionID, clientName: nil, tabID: fixture.contextID, workspaceID: fixture.workspace.id, windowID: fixture.window.windowID)
-            let prior = server.connectionBindingSnapshot(forConnection: fixture.connectionID)
+            try server.bindTabForConnection(route: server.routeResources, connectionID: fixture.connectionID, clientName: nil, tabID: fixture.contextID, workspaceID: fixture.workspace.id, windowID: fixture.window.windowID)
+            let prior = server.connectionBindingSnapshot(route: server.routeResources, forConnection: fixture.connectionID)
             let gate = RootHydrationSuspensionGate()
             var bindingReached = false
             server.test_shouldPreserveAgentRunSourceBinding = { _, _ in bindingReached = true
@@ -1027,11 +1076,11 @@ import XCTest
             XCTAssertEqual(reply.objectValue?["status"], .string("running"))
             await gate.release()
             await fulfillment(of: [dispatched], timeout: 3)
-            XCTAssertEqual(server.connectionBindingSnapshot(forConnection: fixture.connectionID).tabID, prior.tabID)
+            XCTAssertEqual(server.connectionBindingSnapshot(route: server.routeResources, forConnection: fixture.connectionID).tabID, prior.tabID)
             XCTAssertNotNil(try vm.mcpRuntime.registration(sessionID: XCTUnwrap(target.sessionID)))
             // Nil tokens preserve the existing manage-session binding policy.
             try await server.bindCurrentRequestToTabIfPossible(tabID: childTabID, metadata: metadata)
-            XCTAssertEqual(server.connectionBindingSnapshot(forConnection: fixture.connectionID).tabID, childTabID)
+            XCTAssertEqual(server.connectionBindingSnapshot(route: server.routeResources, forConnection: fixture.connectionID).tabID, childTabID)
         }
 
         private func failureValue(tool: String, args: [String: Value]) throws -> Value {

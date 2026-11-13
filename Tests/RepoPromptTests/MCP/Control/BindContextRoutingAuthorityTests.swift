@@ -455,6 +455,7 @@ final class BindContextRoutingAuthorityTests: XCTestCase {
             XCTAssertNotEqual(bindResult.isError, true, toolText(bindResult))
 
             let boundBeforeCall = targetWindow.mcpServer.connectionBindingSnapshot(
+                route: targetWindow.mcpServer.routeResources,
                 forConnection: connection.connectionID
             )
             XCTAssertEqual(boundBeforeCall.windowID, targetWindow.windowID)
@@ -503,6 +504,7 @@ final class BindContextRoutingAuthorityTests: XCTestCase {
             XCTAssertFalse(status.binding.runScoped)
 
             let boundAfterCall = targetWindow.mcpServer.connectionBindingSnapshot(
+                route: targetWindow.mcpServer.routeResources,
                 forConnection: connection.connectionID
             )
             XCTAssertEqual(boundAfterCall.windowID, boundBeforeCall.windowID)

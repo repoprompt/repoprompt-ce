@@ -713,7 +713,7 @@ final class WindowRoutingService: Service {
         }
 
         let windows = windowStates.allWindows
-        let snapshots = windows.map { ($0.windowID, $0.mcpServer.connectionBindingSnapshot(forConnection: connectionID)) }
+        let snapshots = windows.map { ($0.windowID, $0.mcpServer.connectionBindingSnapshot(route: $0.mcpServer.routeResources, forConnection: connectionID)) }
 
         if let explicit = snapshots.first(where: { $0.1.bindingKind == .tabContext && $0.1.explicitlyBound && $0.1.runID == nil }) {
             return explicit.1
@@ -1639,7 +1639,7 @@ final class WindowRoutingService: Service {
         excludingWindowID: Int? = nil
     ) {
         for window in windowStates.allWindows where window.windowID != excludingWindowID {
-            _ = window.mcpServer.clearNonRunScopedBinding(forConnection: connectionID)
+            _ = window.mcpServer.clearNonRunScopedBinding(route: window.mcpServer.routeResources, forConnection: connectionID)
         }
     }
 
@@ -1666,6 +1666,7 @@ final class WindowRoutingService: Service {
                     throw staleBindTargetError()
                 }
                 let didBind = try await targetWindow.mcpServer.performIfFileToolAuthorityIsCurrent(
+                    route: targetWindow.mcpServer.routeResources,
                     expectedFileAuthority,
                     tabID: target.tabID,
                     workspaceID: target.workspaceID
@@ -1674,10 +1675,12 @@ final class WindowRoutingService: Service {
                         throw staleBindTargetError()
                     }
                     let existingBinding = targetWindow.mcpServer.connectionBindingSnapshot(
+                        route: targetWindow.mcpServer.routeResources,
                         forConnection: connectionID
                     )
                     guard !connectionBindingMatchesTarget(existingBinding, target: target) else {
                         targetWindow.mcpServer.updateBoundFileToolAuthority(
+                            route: targetWindow.mcpServer.routeResources,
                             connectionID: connectionID,
                             tabID: target.tabID,
                             workspaceID: target.workspaceID,
@@ -1686,6 +1689,7 @@ final class WindowRoutingService: Service {
                         return
                     }
                     try targetWindow.mcpServer.bindTabForConnection(
+                        route: targetWindow.mcpServer.routeResources,
                         connectionID: connectionID,
                         clientName: clientName,
                         tabID: target.tabID,
@@ -1704,12 +1708,14 @@ final class WindowRoutingService: Service {
                 }
             } else {
                 let existingBinding = targetWindow.mcpServer.connectionBindingSnapshot(
+                    route: targetWindow.mcpServer.routeResources,
                     forConnection: connectionID
                 )
                 guard !connectionBindingMatchesTarget(existingBinding, target: target) else {
                     return false
                 }
                 try targetWindow.mcpServer.bindTabForConnection(
+                    route: targetWindow.mcpServer.routeResources,
                     connectionID: connectionID,
                     clientName: clientName,
                     tabID: target.tabID,
@@ -1853,6 +1859,7 @@ final class WindowRoutingService: Service {
     ) async throws -> MCPFrozenFileToolAuthority {
         let window = try resolveWindowForBinding(windowID: target.windowID)
         let resolution = try await window.mcpServer.resolveFileToolAuthority(
+            route: window.mcpServer.routeResources,
             tabID: target.tabID,
             workspaceID: target.workspaceID
         )
@@ -1880,6 +1887,7 @@ final class WindowRoutingService: Service {
     ) async throws -> MCPFrozenFileToolAuthority {
         let window = try resolveWindowForBinding(windowID: target.windowID)
         return try await window.mcpServer.resolveFileToolAuthority(
+            route: window.mcpServer.routeResources,
             tabID: target.tabID,
             workspaceID: target.workspaceID
         )
@@ -2888,7 +2896,7 @@ final class WindowRoutingService: Service {
                             workspace,
                             workspace?.activeComposeTabID,
                             workspace?.composeTabs ?? [],
-                            targetWindow.mcpServer.boundTabID(forConnection: connectionID)
+                            targetWindow.mcpServer.boundTabID(route: targetWindow.mcpServer.routeResources, forConnection: connectionID)
                         )
                     }
 
@@ -2939,6 +2947,7 @@ final class WindowRoutingService: Service {
                     try await routingService.networkMgr.setActiveWindowForCurrentConnection(targetWindow.windowID)
                     try await MainActor.run {
                         try targetWindow.mcpServer.bindTabForConnection(
+                            route: targetWindow.mcpServer.routeResources,
                             connectionID: connectionID,
                             clientName: clientName,
                             tabID: tab.id,
@@ -2968,7 +2977,7 @@ final class WindowRoutingService: Service {
                             workspace,
                             workspace?.activeComposeTabID,
                             workspace?.composeTabs ?? [],
-                            targetWindow.mcpServer.boundTabID(forConnection: connectionID)
+                            targetWindow.mcpServer.boundTabID(route: targetWindow.mcpServer.routeResources, forConnection: connectionID)
                         )
                     }
 
@@ -3010,6 +3019,7 @@ final class WindowRoutingService: Service {
                     if shouldBind, let connectionID {
                         try await MainActor.run {
                             try targetWindow.mcpServer.bindTabForConnection(
+                                route: targetWindow.mcpServer.routeResources,
                                 connectionID: connectionID,
                                 clientName: clientName,
                                 tabID: newTab.id,
@@ -3047,7 +3057,7 @@ final class WindowRoutingService: Service {
                             workspace,
                             workspace?.activeComposeTabID,
                             workspace?.composeTabs ?? [],
-                            targetWindow.mcpServer.boundTabID(forConnection: connectionID)
+                            targetWindow.mcpServer.boundTabID(route: targetWindow.mcpServer.routeResources, forConnection: connectionID)
                         )
                     }
 
@@ -3089,7 +3099,9 @@ final class WindowRoutingService: Service {
                     }
 
                     let callerID = await targetWindow.mcpServer.resolveSpawnParentSessionID(
-                        metadata: invocationContext.metadata, targetWindow: targetWindow
+                        route: targetWindow.mcpServer.routeResources,
+                        metadata: invocationContext.metadata,
+                        targetWindow: targetWindow
                     )
                     await targetWindow.promptManager.closeComposeTab(tab.id, deletionOrigin: .mcpClient(callerID))
 

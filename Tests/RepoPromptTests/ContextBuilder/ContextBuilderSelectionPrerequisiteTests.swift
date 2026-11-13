@@ -34,7 +34,9 @@ import XCTest
                 }
                 try await prerequisite.awaitPendingWaiter()
                 prerequisite.server.removeTabContext(
-                    forConnectionID: prerequisite.connection.connectionID, clientName: nil,
+                    route: prerequisite.server.routeResources,
+                    forConnectionID: prerequisite.connection.connectionID,
+                    clientName: nil,
                     windowID: prerequisite.owner.windowID
                 )
                 try await prerequisite.driver.fixture.awaitGateEvent(completed)
@@ -43,7 +45,7 @@ import XCTest
                 XCTAssertFalse(MCPToolExecutionCancelledError.matches(error))
                 XCTAssertEqual(String(describing: error), Self.invalidatedDescription)
                 XCTAssertEqual(error.localizedDescription, Self.invalidatedDescription)
-                XCTAssertNil(prerequisite.server.tabContextByConnectionID[prerequisite.connection.connectionID])
+                XCTAssertNil(prerequisite.server.runRouteBindings.tabContextByConnectionID[prerequisite.connection.connectionID])
                 prerequisite.assertRejectedWithoutRollback(bindingPreserved: false)
             }
         }
@@ -313,7 +315,10 @@ import XCTest
                 coordinator.setMirrorWaitTimeoutForTesting(.seconds(10))
                 server.setReadFileAutoSelectionMirrorGateForTesting(nil)
                 server.removeTabContext(
-                    forConnectionID: connection.connectionID, clientName: nil, windowID: owner.windowID
+                    route: server.routeResources,
+                    forConnectionID: connection.connectionID,
+                    clientName: nil,
+                    windowID: owner.windowID
                 )
                 mirrorGate.release()
                 if !mirrorJoined, probe.events().contains(where: { $0.lane == .mirror && $0.kind == .workerStarted }) {

@@ -363,7 +363,7 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         XCTAssertEqual(fixture.window.workspaceManager.composeTab(for: fixture.identity)?.promptText, "Y1+X")
         let freshConnectionID = UUID()
         try fixture.bindPromptConnection(freshConnectionID)
-        XCTAssertEqual(server.tabContextByConnectionID[freshConnectionID]?.promptText, "Y1+X")
+        XCTAssertEqual(server.runRouteBindings.tabContextByConnectionID[freshConnectionID]?.promptText, "Y1+X")
         XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, activeTabID)
         XCTAssertEqual(fixture.window.promptManager.promptText, activePrompt)
     }
@@ -479,28 +479,43 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         let activeTabID = fixture.window.workspaceManager.activeWorkspace?.activeComposeTabID
         XCTAssertNotEqual(activeTabID, fixture.tabID)
 
+        let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil)
+        XCTAssertNotEqual(route.identity.routeID, fixture.window.windowID)
         // Queue through the provider hint, then promote with Cursor's observed initialize name.
-        // A route mapping alone is insufficient: the exact frozen run context must follow it.
+        // The real physical operations must use the supplied host route, not the window's maps.
         try server.installFrozenTabContext(
+            route: route,
             clientID: nil,
             clientName: XCTUnwrap(AgentProviderKind.cursor.mcpClientNameHint),
-            context: fixture.makeContext(selection: selection)
+            context: fixture.makeContext(selection: selection, routeID: route.identity.routeID)
         )
         let token = try XCTUnwrap(server.registerPendingPolicyRunIDMapping(
+            route: route,
             connectionID: fixture.connectionID,
             runID: fixture.runID,
-            windowID: fixture.window.windowID,
+            windowID: route.identity.routeID,
             clientName: "Cursor"
         ))
         let promoted = try XCTUnwrap(token.promotedContext)
         XCTAssertEqual(promoted.runID, fixture.runID)
-        XCTAssertEqual(promoted.windowID, fixture.window.windowID)
+        XCTAssertEqual(promoted.windowID, route.identity.routeID)
         XCTAssertEqual(promoted.workspaceID, fixture.workspaceID)
         XCTAssertEqual(promoted.tabID, fixture.tabID)
         XCTAssertEqual(promoted.selection, selection)
-        XCTAssertEqual(fixture.boundContext?.selection, selection)
-        XCTAssertEqual(server.pendingContextQueueLength(clientName: "Cursor", windowID: fixture.window.windowID), 0)
-        XCTAssertEqual(server.contextBuilderFinalContextConnectionID(runID: fixture.runID), fixture.connectionID)
+        XCTAssertEqual(route.runRouteBindings.tabContextByConnectionID[fixture.connectionID]?.selection, selection)
+        XCTAssertNil(fixture.boundContext, "A host context must not enter the physical route")
+        XCTAssertEqual(server.boundTabID(route: route, forConnection: fixture.connectionID), fixture.tabID)
+        XCTAssertEqual(server.pendingContextQueueLength(route: route, clientName: "Cursor", windowID: route.identity.routeID), 0)
+        XCTAssertEqual(server.contextBuilderFinalContextConnectionID(route: route, runID: fixture.runID), fixture.connectionID)
+        let resolved = try server.resolveTabContextSnapshot(
+            route: route,
+            from: MCPRequestMetadata(connectionID: fixture.connectionID, clientName: "Cursor", windowID: route.identity.routeID),
+            toolName: "host-context-test"
+        )
+        XCTAssertEqual(resolved.snapshot.windowID, route.identity.routeID)
+        server.removeTabContext(route: route, forConnectionID: fixture.connectionID, clientName: "Cursor", windowID: route.identity.routeID, runID: fixture.runID)
+        await route.close()
+        XCTAssertNil(route.runRouteBindings.tabContextByConnectionID[fixture.connectionID])
         XCTAssertEqual(fixture.window.workspaceManager.activeWorkspace?.activeComposeTabID, activeTabID)
     }
 
@@ -582,44 +597,50 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         try await fixture.seedCanonical(initialSelection)
         let server = fixture.window.mcpServer
         try server.installFrozenTabContext(
+            route: server.routeResources,
             clientID: nil,
             clientName: "devin",
             context: fixture.makeContext(selection: initialSelection)
         )
         XCTAssertNotNil(server.registerPendingPolicyRunIDMapping(
+            route: server.routeResources,
             connectionID: fixture.connectionID,
             runID: fixture.runID,
             windowID: fixture.window.windowID,
             clientName: "devin"
         ))
         let discoveredSelection = StoredSelection(selectedPaths: [fixture.fileB.path])
-        server.tabContextByConnectionID[fixture.connectionID]?.selection = discoveredSelection
+        server.runRouteBindings.tabContextByConnectionID[fixture.connectionID]?.selection = discoveredSelection
 
         let successorID = UUID()
         let token = try XCTUnwrap(server.registerPendingPolicyRunIDMapping(
+            route: server.routeResources,
             connectionID: successorID,
             runID: fixture.runID,
             windowID: fixture.window.windowID,
             clientName: "devin"
         ))
         XCTAssertEqual(token.displacedConnectionID, fixture.connectionID)
-        XCTAssertEqual(server.tabContextByConnectionID[successorID]?.runID, fixture.runID)
-        XCTAssertEqual(server.tabContextByConnectionID[successorID]?.selection, discoveredSelection)
+        XCTAssertEqual(server.runRouteBindings.tabContextByConnectionID[successorID]?.runID, fixture.runID)
+        XCTAssertEqual(server.runRouteBindings.tabContextByConnectionID[successorID]?.selection, discoveredSelection)
 
         // The displaced connection is then torn down as a replacement, not a discovery EOF.
         XCTAssertFalse(server.detachContextBuilderTabContextForDiscoveryTeardown(
+            route: server.routeResources,
             connectionID: fixture.connectionID,
             runID: fixture.runID
         ))
         server.removeTabContext(
+            route: server.routeResources,
             forConnectionID: fixture.connectionID,
             clientName: "devin",
             windowID: fixture.window.windowID,
             runID: nil
         )
 
-        XCTAssertEqual(server.contextBuilderFinalContextConnectionID(runID: fixture.runID), successorID)
+        XCTAssertEqual(server.contextBuilderFinalContextConnectionID(route: server.routeResources, runID: fixture.runID), successorID)
         let result = await server.commitContextBuilderTabContext(
+            route: server.routeResources,
             connectionID: successorID,
             expectedRunID: fixture.runID,
             isStillCurrent: { true }
@@ -645,8 +666,9 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         defer { fixture.cleanup() }
         let selection = StoredSelection(selectedPaths: [fixture.fileA.path])
         let server = fixture.window.mcpServer
-        try server.installFrozenTabContext(clientID: nil, clientName: "devin", context: fixture.makeContext(selection: selection))
+        try server.installFrozenTabContext(route: server.routeResources, clientID: nil, clientName: "devin", context: fixture.makeContext(selection: selection))
         XCTAssertNotNil(server.registerPendingPolicyRunIDMapping(
+            route: server.routeResources,
             connectionID: fixture.connectionID,
             runID: fixture.runID,
             windowID: fixture.window.windowID,
@@ -654,6 +676,7 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         ))
         let successorID = UUID()
         let token = try XCTUnwrap(server.registerPendingPolicyRunIDMapping(
+            route: server.routeResources,
             connectionID: successorID,
             runID: fixture.runID,
             windowID: fixture.window.windowID,
@@ -668,6 +691,7 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
 
         XCTAssertEqual(
             server.rollbackPendingPolicyRunIDMapping(
+                route: server.routeResources,
                 token,
                 clientName: "devin",
                 windowID: fixture.window.windowID,
@@ -682,10 +706,10 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         XCTAssertFalse(afterRollback.connections.contains { $0.registration.connectionID == successorID })
         XCTAssertTrue(afterRollback.connections.contains { $0.registration.connectionID == fixture.connectionID })
         XCTAssertNil(server.tabContextCancellablesByConnectionID[successorID])
-        XCTAssertNil(server.tabContextByConnectionID[successorID])
+        XCTAssertNil(server.runRouteBindings.tabContextByConnectionID[successorID])
         XCTAssertEqual(fixture.boundContext?.runID, fixture.runID)
         XCTAssertEqual(fixture.boundContext?.selection, selection)
-        XCTAssertEqual(server.pendingContextQueueLength(clientName: "devin", windowID: fixture.window.windowID), 0)
+        XCTAssertEqual(server.pendingContextQueueLength(route: server.routeResources, clientName: "devin", windowID: fixture.window.windowID), 0)
     }
 
     func testDiscoveryRoutingErrorDoesNotSuggestDisabledBindContext() {
@@ -705,6 +729,7 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         let context = try fixture.installContext(selection: source)
 
         let verification = await fixture.window.mcpServer.persistResolvedTabContextSnapshot(
+            route: fixture.window.mcpServer.routeResources,
             .init(snapshot: context.withSelection(discovered)),
             metadata: fixture.metadata,
             mutated: true
@@ -725,17 +750,20 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         let context = try fixture.installContext(selection: source)
 
         _ = await fixture.window.mcpServer.persistResolvedTabContextSnapshot(
+            route: fixture.window.mcpServer.routeResources,
             .init(snapshot: context.withSelection(discovered)),
             metadata: fixture.metadata,
             mutated: true
         )
         fixture.window.mcpServer.removeTabContext(
+            route: fixture.window.mcpServer.routeResources,
             forConnectionID: fixture.connectionID,
             clientName: nil,
             windowID: fixture.window.windowID,
             runID: fixture.runID
         )
         let failedCommit = await fixture.window.mcpServer.commitContextBuilderTabContext(
+            route: fixture.window.mcpServer.routeResources,
             connectionID: fixture.connectionID,
             expectedRunID: fixture.runID,
             isStillCurrent: { true }
@@ -757,12 +785,14 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
 
         let contextBuilderContext = try fixture.installContext(selection: source)
         let firstVerification = await fixture.window.mcpServer.persistResolvedTabContextSnapshot(
+            route: fixture.window.mcpServer.routeResources,
             .init(snapshot: contextBuilderContext.withSelection(first)),
             metadata: fixture.metadata,
             mutated: true
         )
         let ordinaryAgentContext = try XCTUnwrap(fixture.boundContext)
         let secondVerification = await fixture.window.mcpServer.persistResolvedTabContextSnapshot(
+            route: fixture.window.mcpServer.routeResources,
             .init(snapshot: ordinaryAgentContext.withSelection(second)),
             metadata: fixture.metadata,
             mutated: true
@@ -783,6 +813,7 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         let context = try fixture.installContext(selection: source)
 
         _ = await fixture.window.mcpServer.persistResolvedTabContextSnapshot(
+            route: fixture.window.mcpServer.routeResources,
             .init(snapshot: context.withSelection(discovered)),
             metadata: fixture.metadata,
             mutated: true
@@ -808,6 +839,7 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         let context = try fixture.installContext(selection: source)
 
         _ = await fixture.window.mcpServer.persistResolvedTabContextSnapshot(
+            route: fixture.window.mcpServer.routeResources,
             .init(snapshot: context.withSelection(discovered)),
             metadata: fixture.metadata,
             mutated: true
@@ -845,9 +877,10 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
             source: .runtimeMutation,
             mirrorToUIIfActive: false
         )
-        fixture.window.mcpServer.tabContextByConnectionID[fixture.connectionID] = staleRunContext
+        fixture.window.mcpServer.runRouteBindings.tabContextByConnectionID[fixture.connectionID] = staleRunContext
 
         let result = await fixture.window.mcpServer.commitContextBuilderTabContext(
+            route: fixture.window.mcpServer.routeResources,
             connectionID: fixture.connectionID,
             expectedRunID: fixture.runID,
             isStillCurrent: { true }
@@ -935,7 +968,7 @@ private struct Fixture {
     }
 
     var boundContext: MCPServerViewModel.TabContextSnapshot? {
-        window.mcpServer.tabContextByConnectionID[connectionID]
+        window.mcpServer.runRouteBindings.tabContextByConnectionID[connectionID]
     }
 
     func seedCanonical(_ selection: StoredSelection) async throws {
@@ -959,6 +992,7 @@ private struct Fixture {
 
     func bindPromptConnection(_ connectionID: UUID) throws {
         try window.mcpServer.bindTabForConnection(
+            route: window.mcpServer.routeResources,
             connectionID: connectionID,
             clientName: "prompt-mutation-test",
             tabID: tabID,
@@ -982,15 +1016,15 @@ private struct Fixture {
 
     func installContext(selection: StoredSelection) throws -> MCPServerViewModel.TabContextSnapshot {
         let context = try makeContext(selection: selection)
-        window.mcpServer.tabContextByConnectionID[connectionID] = context
+        window.mcpServer.runRouteBindings.tabContextByConnectionID[connectionID] = context
         return context
     }
 
-    func makeContext(selection: StoredSelection) throws -> MCPServerViewModel.TabContextSnapshot {
+    func makeContext(selection: StoredSelection, routeID: Int? = nil) throws -> MCPServerViewModel.TabContextSnapshot {
         let tab = try XCTUnwrap(window.workspaceManager.composeTab(for: identity))
         return MCPServerViewModel.TabContextSnapshot(
             tabID: tabID,
-            windowID: window.windowID,
+            windowID: routeID ?? window.windowID,
             workspaceID: workspaceID,
             promptText: tab.promptText,
             selection: selection,

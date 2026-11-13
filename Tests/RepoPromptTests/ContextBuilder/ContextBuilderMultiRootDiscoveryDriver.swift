@@ -216,19 +216,19 @@ import XCTest
             // Once routed, their connection/run bindings are authoritative; keeping the old
             // bootstrap PID would make the next parent correctly fail as ambiguous_run_policy.
             for prior in parentRuns where connections.contains(where: {
-                window.mcpServer.connectionBindingSnapshot(forConnection: $0.connectionID).runID == prior.runID
+                window.mcpServer.connectionBindingSnapshot(route: window.mcpServer.routeResources, forConnection: $0.connectionID).runID == prior.runID
             }) {
                 await ServerNetworkManager.shared.clearExpectedAgentPID(getpid(), for: prior.clientName, runID: prior.runID)
             }
             parentRuns.append((lease, runID, name))
             let acquired = await lease.acquire()
             XCTAssertTrue(acquired)
-            window.mcpServer.installFrozenTabContext(clientID: nil, clientName: name, context: context.frozenTabContext)
+            window.mcpServer.installFrozenTabContext(route: window.mcpServer.routeResources, clientID: nil, clientName: name, context: context.frozenTabContext)
             await ServerNetworkManager.shared.registerExpectedAgentPID(getpid(), for: name, runID: runID)
             let connection = try await connect(name: name, purpose: .agentModeRun)
             let routed = await lease.releaseWhenRouted(timeoutMs: 5000)
             XCTAssertTrue(routed)
-            XCTAssertEqual(window.mcpServer.connectionBindingSnapshot(forConnection: connection.connectionID).runID, runID)
+            XCTAssertEqual(window.mcpServer.connectionBindingSnapshot(route: window.mcpServer.routeResources, forConnection: connection.connectionID).runID, runID)
             XCTAssertEqual(try promotedSnapshot(for: connection).activeAgentSessionID, context.frozenTabContext.activeAgentSessionID)
             return connection
         }
@@ -352,8 +352,10 @@ import XCTest
 
         func promotedSnapshot(for connection: RoutedConnection) throws -> MCPServerViewModel.TabContextSnapshot {
             try window.mcpServer.resolveTabContextSnapshot(
+                route: window.mcpServer.routeResources,
                 from: .init(connectionID: connection.connectionID, clientName: nil, windowID: window.windowID),
-                toolName: "read_file", startMirroring: false
+                toolName: "read_file",
+                startMirroring: false
             ).snapshot
         }
 
@@ -501,7 +503,7 @@ import XCTest
                 }
                 for parent in parentRuns {
                     await parent.lease.cancelAndCleanup()
-                    window.mcpServer.removeTabContext(forConnectionID: nil, clientName: parent.clientName, windowID: window.windowID, runID: parent.runID)
+                    window.mcpServer.removeTabContext(route: window.mcpServer.routeResources, forConnectionID: nil, clientName: parent.clientName, windowID: window.windowID, runID: parent.runID)
                 }
                 for connection in connections {
                     await connection.cleanup()

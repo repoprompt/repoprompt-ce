@@ -281,7 +281,7 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
 
         // Server-installed run routing for this connection; no purpose recorded anywhere. A bound
         // context carrying a run ID resolves as `.runInstall`.
-        window.mcpServer.tabContextByConnectionID[connectionID] = MCPServerViewModel.TabContextSnapshot(
+        window.mcpServer.runRouteBindings.tabContextByConnectionID[connectionID] = MCPServerViewModel.TabContextSnapshot(
             tabID: tabID,
             windowID: window.windowID,
             workspaceID: workspace.id,
@@ -292,7 +292,7 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
             runID: runID,
             explicitlyBound: false
         )
-        defer { window.mcpServer.tabContextByConnectionID.removeValue(forKey: connectionID) }
+        defer { window.mcpServer.runRouteBindings.tabContextByConnectionID.removeValue(forKey: connectionID) }
 
         let metadata = MCPServerViewModel.RequestMetadata(
             connectionID: connectionID,
@@ -338,11 +338,11 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let connectionID = UUID()
         let runID = UUID()
-        window.mcpServer.connectionIDToRunID[connectionID] = runID
-        window.mcpServer.connectionIDByRunID[runID] = connectionID
+        window.mcpServer.runRouteBindings.connectionIDToRunID[connectionID] = runID
+        window.mcpServer.runRouteBindings.connectionIDByRunID[runID] = connectionID
         defer {
-            window.mcpServer.connectionIDToRunID.removeValue(forKey: connectionID)
-            window.mcpServer.connectionIDByRunID.removeValue(forKey: runID)
+            window.mcpServer.runRouteBindings.connectionIDToRunID.removeValue(forKey: connectionID)
+            window.mcpServer.runRouteBindings.connectionIDByRunID.removeValue(forKey: runID)
         }
 
         let metadata = MCPServerViewModel.RequestMetadata(

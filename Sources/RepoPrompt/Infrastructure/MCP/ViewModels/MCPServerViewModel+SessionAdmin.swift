@@ -14,7 +14,7 @@ extension MCPServerViewModel {
             captureRequestMetadata: { [self] in await captureRequestMetadata() },
             requireTargetWindow: requireTargetWindow,
             resolveObserverEndpoint: { [self] metadata, targetWindow in
-                await resolveAgentSessionLinkObserverEndpoint(metadata: metadata, targetWindow: targetWindow)
+                await resolveAgentSessionLinkObserverEndpoint(route: routeResources, metadata: metadata, targetWindow: targetWindow)
             },
             scopes: { scopes },
             administration: { AgentSessionLinkRuntimeBridge.shared.sessionAdministrationFrontDoor }

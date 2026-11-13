@@ -870,9 +870,9 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
                     if entry == "agent_close" {
                         await ServerNetworkManager.shared.setRunPurpose(.agentModeRun, for: connection)
                         actor = fixture.viewModel.sessions[fixture.tabBID]?.activeAgentSessionID
-                        fixture.window.mcpServer.tabContextByConnectionID[connection] = .init(tabID: fixture.tabBID, windowID: fixture.window.windowID, workspaceID: fixture.workspaceID, promptText: "", selection: StoredSelection(), selectedMetaPromptIDs: [], tabName: "Beta", runID: UUID(), explicitlyBound: false)
+                        fixture.window.mcpServer.runRouteBindings.tabContextByConnectionID[connection] = .init(tabID: fixture.tabBID, windowID: fixture.window.windowID, workspaceID: fixture.workspaceID, promptText: "", selection: StoredSelection(), selectedMetaPromptIDs: [], tabName: "Beta", runID: UUID(), explicitlyBound: false)
                     }
-                    defer { fixture.window.mcpServer.tabContextByConnectionID.removeValue(forKey: connection) }
+                    defer { fixture.window.mcpServer.runRouteBindings.tabContextByConnectionID.removeValue(forKey: connection) }
                     let service = WindowRoutingService(windowStates: .shared, networkMgr: .shared)
                     await service.prepareDomainTools()
                     let tools = await service.tools

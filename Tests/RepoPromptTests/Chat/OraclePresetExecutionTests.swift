@@ -141,7 +141,7 @@ final class OraclePresetExecutionTests: XCTestCase {
                     await fixture.networkManager.debugRemoveConnection(endpoint.connectionID)
                     await fixture.networkManager.clearClientConnectionPolicy(for: endpoint.clientName)
                     await fixture.networkManager.debugClearPersistedRoutingState(for: endpoint.clientName)
-                    fixture.contextA.window.mcpServer.removeTabContext(forConnectionID: endpoint.connectionID, clientName: endpoint.clientName, windowID: nil, runID: nil)
+                    fixture.contextA.window.mcpServer.removeTabContext(route: fixture.contextA.window.mcpServer.routeResources, forConnectionID: endpoint.connectionID, clientName: endpoint.clientName, windowID: nil, runID: nil)
                 }
                 do {
                     let window = fixture.contextA.window

@@ -548,8 +548,8 @@ import XCTest
 
             /// Releases the exact binding while the tool waits, which invalidates its drain context.
             func invalidateBinding() {
-                server.removeTabContext(forConnectionID: connection.connectionID, clientName: nil, windowID: owner.windowID)
-                XCTAssertNil(server.tabContextByConnectionID[connection.connectionID])
+                server.removeTabContext(route: server.routeResources, forConnectionID: connection.connectionID, clientName: nil, windowID: owner.windowID)
+                XCTAssertNil(server.runRouteBindings.tabContextByConnectionID[connection.connectionID])
                 XCTAssertFalse(server.isReadFileAutoSelectionContextCurrent(owner))
             }
 
@@ -671,7 +671,10 @@ import XCTest
                 server.setReadFileAutoSelectionMirrorGateForTesting(nil)
                 server.setReadFileAutoSelectionCanonicalApplyGateForTesting(nil)
                 server.removeTabContext(
-                    forConnectionID: connection.connectionID, clientName: nil, windowID: owner.windowID
+                    route: server.routeResources,
+                    forConnectionID: connection.connectionID,
+                    clientName: nil,
+                    windowID: owner.windowID
                 )
                 if canonicalGate != nil, probe.events().contains(where: { $0.lane == .canonical && $0.kind == .workerStarted }) {
                     let result = await XCTWaiter.fulfillment(of: [probe.canonicalStopped], timeout: 5)

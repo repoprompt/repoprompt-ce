@@ -106,6 +106,7 @@ extension MCPServerViewModel {
         let resolved: ResolvedTabContextSnapshot
         do {
             resolved = try resolveTabContextSnapshot(
+                route: routeResources,
                 from: metadata,
                 toolName: toolName
             )
@@ -167,7 +168,7 @@ extension MCPServerViewModel {
         // File authority must be complete before coordinator registration or rebinding so a
         // retryable hydration failure cannot replace the connection's last usable domain route.
         let prevalidatedFileAuthority: FrozenFileToolAuthority? = if requiresFrozenFileAuthority(toolName: toolName) {
-            try await targetServer.requiredFileToolLookupContext(from: metadata)
+            try await targetServer.requiredFileToolLookupContext(route: targetServer.routeResources, from: metadata)
         } else {
             nil
         }
@@ -385,7 +386,7 @@ extension MCPServerViewModel {
         )
         let targetServer = WindowStatesManager.shared.window(withID: context.windowID)?.mcpServer ?? self
         let frozenFileToolAuthority: FrozenFileToolAuthority? = if requiresFrozenFileAuthority(toolName: toolName) {
-            try await targetServer.requiredFileToolLookupContext(from: metadata)
+            try await targetServer.requiredFileToolLookupContext(route: targetServer.routeResources, from: metadata)
         } else {
             nil
         }
@@ -396,6 +397,7 @@ extension MCPServerViewModel {
         }
         if requiresFrozenFileAuthority(toolName: toolName) {
             let currentResolved = try targetServer.resolveTabContextSnapshot(
+                route: targetServer.routeResources,
                 from: metadata,
                 toolName: toolName
             )

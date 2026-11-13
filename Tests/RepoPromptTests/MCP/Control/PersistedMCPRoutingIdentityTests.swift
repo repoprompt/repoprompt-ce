@@ -189,7 +189,7 @@ import RepoPromptSettingsCore
             XCTAssertNil(second.windowID)
             XCTAssertEqual(second.purpose, .unknown)
             XCTAssertTrue(second.restrictedTools.isEmpty)
-            XCTAssertNil(window.mcpServer.connectionIDToRunID[secondConnectionID])
+            XCTAssertNil(window.mcpServer.runRouteBindings.connectionIDToRunID[secondConnectionID])
             XCTAssertEqual(window.mcpServer.runRouteBindings.connectionID(forRunID: runID), initialConnectionID)
 
             // The original capability token still authorizes a reconnect handover.
@@ -424,7 +424,7 @@ import RepoPromptSettingsCore
             _ = try await connection.client.listTools()
             let selectedAfterPreCallBinding = await manager.selectedWindow(for: connection.connectionID)
             XCTAssertNil(selectedAfterPreCallBinding)
-            XCTAssertNil(liveB.mcpServer.connectionBindingSnapshot(forConnection: connection.connectionID).windowID)
+            XCTAssertNil(liveB.mcpServer.connectionBindingSnapshot(route: liveB.mcpServer.routeResources, forConnection: connection.connectionID).windowID)
 
             let rejected = try await connection.client.callTool(
                 name: "get_file_tree",
