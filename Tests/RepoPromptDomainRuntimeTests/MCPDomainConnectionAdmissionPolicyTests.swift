@@ -7,11 +7,11 @@ import XCTest
         func testCanonicalClassificationUsesDefaultPhysicalLanesAndRetainsPermitsUntilSettlement() async throws {
             let cases: [(tool: String, lane: MCPDomainConnectionCallLane, limit: Int)] = [
                 ("file_actions", .ordinary, 1),
-                ("agent_session_link", .control, 8),
-                ("get_file_tree", .smallRead, 2),
+                ("agent_session_link", .control, MCPDomainToolAdmissionLimits.controlConnection),
+                ("get_file_tree", .smallRead, MCPDomainToolAdmissionLimits.smallReadConnection),
                 ("read_file", .fileRead, ContentReadConcurrencyCapacity.maximumConcurrentReads),
-                ("git", .gitRead, 2),
-                ("file_search", .fileSearch, 4)
+                ("git", .gitRead, MCPDomainToolAdmissionLimits.gitReadConnection),
+                ("file_search", .fileSearch, MCPDomainToolAdmissionLimits.fileSearchConnection)
             ]
             XCTAssertEqual(Set(cases.map(\.lane)), Set(MCPDomainConnectionCallLane.allCases))
             let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

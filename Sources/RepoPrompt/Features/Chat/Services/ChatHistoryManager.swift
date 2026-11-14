@@ -386,6 +386,9 @@ actor ChatDataService {
                 let fileURL = files[index]
                 group.addTask {
                     do {
+                        let lease = try await HostResourceBudget.shared.acquire(.io)
+                        defer { lease.release() }
+                        try Task.checkCancellation()
                         let session = try Self.loadChatSessionStubFromDisk(from: fileURL)
                         return .success(index: index, session: session)
                     } catch {

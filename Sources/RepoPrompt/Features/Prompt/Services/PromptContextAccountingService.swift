@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptSettingsCore
@@ -120,7 +121,7 @@ private struct ResolvedEntryAccountingReadResult {
 }
 
 actor PromptContextAccountingService {
-    private static let selectedFileAccountingReadConcurrencyLimit = 4
+    private static let selectedFileAccountingReadConcurrencyLimit = ContentReadConcurrencyCapacity.maximumConcurrentReads
 
     private let tokenCalculationService: TokenCalculationService
     private let resolvedContentReader: PromptContextResolvedContentReader
