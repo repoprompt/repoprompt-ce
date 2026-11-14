@@ -9,7 +9,8 @@ package struct HostResourceSample: Equatable {
     package let memoryPressure: Pressure
     package let thermalPressure: Pressure
     package let descriptorLimit: Int
-    package let openDescriptors: Int
+    /// Nil means no successful observation yet; retain the cached descriptor envelope.
+    package let openDescriptors: Int?
     /// Free + inactive pages: reclaimable/compressible estimate, not guaranteed free RAM.
     package let availableMemoryBytes: UInt64?
     package let memoryGrowthBytesPerSecond: UInt64
@@ -21,7 +22,7 @@ package struct HostResourceSample: Equatable {
         memoryPressure: Pressure = .normal,
         thermalPressure: Pressure = .normal,
         descriptorLimit: Int,
-        openDescriptors: Int,
+        openDescriptors: Int?,
         availableMemoryBytes: UInt64? = nil,
         memoryGrowthBytesPerSecond: UInt64 = 0
     ) {
@@ -57,7 +58,7 @@ package struct HostResourceCapacity: Equatable {
     /// descriptor limits shape lifetime defaults. Live headroom is enforced at leaves.
     package static let baseline = resolve(HostResourceMonitor.sample(memoryPressure: .normal, unpressured: true))
 
-    package static func resolve(_ sample: HostResourceSample) -> Self {
+    package static func resolve(_ sample: HostResourceSample, cachedCapacity: Self? = nil) -> Self {
         // Foreground bursts may use logical cores, but never multiply across callers.
         // Performance-core count shapes the background share, not an artificial foreground cap.
         let logical = max(1, sample.logicalCores)
@@ -77,7 +78,11 @@ package struct HostResourceCapacity: Equatable {
         // Leave descriptor headroom for transports, persistence and the UI. A process needs
         // stdin/stdout/stderr pipes plus temporary/spool files; reads need fewer descriptors.
         let reserve = max(64, sample.descriptorLimit / 8)
-        let freeDescriptors = max(0, sample.descriptorLimit - sample.openDescriptors)
+        // A first-sample failure leaves the current envelope unchanged, rather than
+        // manufacturing exhaustion. Still clamp to a newly lowered soft limit. Once a
+        // count is known, the sampler carries it forward across transient failures.
+        let cached = sample.openDescriptors == nil ? (cachedCapacity ?? baseline) : nil
+        let freeDescriptors = max(0, sample.descriptorLimit - (sample.openDescriptors ?? 0))
         let headroom = max(0, freeDescriptors - reserve)
         // Preserve progress inside the reserve when there is physically enough space.
         // Zero is reserved for actual exhaustion, not a conservative slack estimate.
@@ -88,8 +93,8 @@ package struct HostResourceCapacity: Equatable {
         return Self(
             total: effectiveTotal,
             cpu: effectiveCPU,
-            io: min(effectiveTotal, ioSlots),
-            subprocess: min(effectiveCPU, processSlots),
+            io: min(effectiveTotal, ioSlots, cached?.io ?? ioSlots),
+            subprocess: min(effectiveCPU, processSlots, cached?.subprocess ?? processSlots),
             background: critical ? 0 : max(1, min(effectiveTotal - 1, sample.performanceCores, effectiveCPU / 2)),
             // One live transport descriptor/connection, plus the shared reserve above.
             // Retain the existing 128-client ingress/flood ceiling until larger client
@@ -100,7 +105,10 @@ package struct HostResourceCapacity: Equatable {
             )),
             // Descriptor classes also share this weighted envelope; independent class
             // limits must not each spend the same remaining descriptor headroom.
-            descriptorBudget: max(headroom, min(freeDescriptors, subprocessDescriptorCost)),
+            descriptorBudget: min(
+                max(headroom, min(freeDescriptors, subprocessDescriptorCost)),
+                cached?.descriptorBudget ?? Int.max
+            ),
             // A newline-heavy 10 MB file can build ~320 MB of line-index arrays
             // (NSRange + UTF-16/UTF-8 starts). Retain a 512 MiB envelope per search
             // pipeline, separately from the smaller physical-read working envelope.
@@ -124,8 +132,10 @@ final class HostResourceMonitor: @unchecked Sendable {
     private var lastRefresh = DispatchTime.now().uptimeNanoseconds
     private var previousMemory: (time: UInt64, pages: UInt64)? // confined to queue
     private var previousGrowth: UInt64 = 0 // confined to queue
+    private var cachedCapacity: HostResourceCapacity // confined to queue
 
-    init(onChange: @escaping @Sendable (HostResourceCapacity) -> Void) {
+    init(capacity: HostResourceCapacity = .baseline, onChange: @escaping @Sendable (HostResourceCapacity) -> Void) {
+        cachedCapacity = capacity
         memorySource = DispatchSource.makeMemoryPressureSource(eventMask: [.normal, .warning, .critical], queue: queue)
         timer = DispatchSource.makeTimerSource(queue: queue)
         memorySource.setEventHandler { [weak self] in
@@ -179,8 +189,12 @@ final class HostResourceMonitor: @unchecked Sendable {
             // amplifying a sub-second compression spike into two seconds of debt.
             if elapsed == nil || (elapsed ?? 0) >= 1_000_000_000 { previousMemory = (now, memory.growthPages) }
         }
-        let next = HostResourceCapacity.resolve(Self.sample(memoryPressure: pressure, memory: memory, growth: previousGrowth))
-        onChange(recovery.ingest(next, now: now))
+        let next = HostResourceCapacity.resolve(
+            Self.sample(memoryPressure: pressure, memory: memory, growth: previousGrowth),
+            cachedCapacity: cachedCapacity
+        )
+        cachedCapacity = recovery.ingest(next, now: now)
+        onChange(cachedCapacity)
         activityLock.withLock { lastRefresh = now
             refreshPending = false
         }
@@ -240,18 +254,6 @@ final class HostResourceMonitor: @unchecked Sendable {
         }
         var descriptors = rlimit()
         let limit = getrlimit(RLIMIT_NOFILE, &descriptors) == 0 ? Int(clamping: descriptors.rlim_cur) : 256
-        // The nil-buffer call returns an allocation estimate, NOT the number of open fds.
-        // Use the populated buffer's returned byte count. Bound allocation even if the
-        // process has an exceptionally large soft limit; uncertainty throttles safely.
-        let descriptorBytes = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, nil, 0)
-        let stride = MemoryLayout<proc_fdinfo>.stride
-        let bufferCount = min(65536, max(32, Int(max(0, descriptorBytes)) / stride + 32))
-        var buffer = [proc_fdinfo](repeating: proc_fdinfo(), count: bufferCount)
-        let actualBytes = buffer.withUnsafeMutableBytes { bytes in
-            proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, bytes.baseAddress, Int32(clamping: bytes.count))
-        }
-        let openCount = actualBytes > 0 && Int(actualBytes) < bufferCount * stride
-            ? Int(actualBytes) / stride : limit // Unknown/truncated headroom must not manufacture free fds.
         let thermal: HostResourceSample.Pressure = switch info.thermalState {
         case .nominal, .fair: .normal
         case .serious: .warning
@@ -262,7 +264,7 @@ final class HostResourceMonitor: @unchecked Sendable {
             logicalCores: info.activeProcessorCount, performanceCores: max(1, Int(performanceCores)),
             memoryBytes: info.physicalMemory, memoryPressure: memoryPressure,
             thermalPressure: unpressured ? .normal : thermal, descriptorLimit: limit,
-            openDescriptors: unpressured ? 0 : openCount,
+            openDescriptors: unpressured ? 0 : HostDescriptorSampler.shared.sample(),
             availableMemoryBytes: unpressured ? nil : (memory ?? memorySnapshot())?.available,
             memoryGrowthBytesPerSecond: unpressured ? 0 : growth
         )

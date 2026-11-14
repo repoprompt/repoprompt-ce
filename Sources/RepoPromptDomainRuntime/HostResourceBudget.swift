@@ -13,10 +13,11 @@ package final class HostResourceBudget: @unchecked Sendable {
     package enum AdmissionError: Error { case queueFull }
     package typealias Lease = MCPDomainToolResourceAdmissionController.Lease
     package static let shared: HostResourceBudget = {
-        let budget = HostResourceBudget(capacity: HostResourceCapacity.resolve(
+        let capacity = HostResourceCapacity.resolve(
             HostResourceMonitor.sample(memoryPressure: HostResourceMonitor.currentMemoryPressure(fallback: .normal))
-        ))
-        let monitor = HostResourceMonitor { [weak budget] in budget?.updateCapacity($0) }
+        )
+        let budget = HostResourceBudget(capacity: capacity)
+        let monitor = HostResourceMonitor(capacity: capacity) { [weak budget] in budget?.updateCapacity($0) }
         budget.lock.withLock { budget.monitor = monitor }
         return budget
     }()
